@@ -40,7 +40,10 @@ impl<B: NeuralBackend> AudioTower<B> {
                     vocabulary: config.num_codebooks * config.codebook_size,
                     dimensions: config.text_hidden_size,
                     weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    quantization: config.linear_format_for(name).weight_quantization(),
+                    format: crate::linear_format::standard_linear_format(
+                        name,
+                        config.linear_format_for(name),
+                    )?,
                 },
                 context,
             )?,

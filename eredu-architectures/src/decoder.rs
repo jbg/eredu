@@ -933,7 +933,10 @@ impl<B: NeuralBackend> Attention<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias,
-                    format: config.weight_quantization(&weight_name).into(),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight_name,
+                        config.weight_quantization(&weight_name).into(),
+                    )?,
                 },
                 context,
             )
@@ -1340,7 +1343,10 @@ impl<B: NeuralBackend> Mlp<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias,
-                    format: config.weight_quantization(&weight_name).into(),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight_name,
+                        config.weight_quantization(&weight_name).into(),
+                    )?,
                 },
                 context,
             )
@@ -1935,10 +1941,15 @@ impl<B: NeuralBackend> Decoder<B, Mlp<B>> {
                         config.parameter_root()
                     ))
                     .map_err(Error::backend)?,
-                    quantization: config.weight_quantization(&format!(
-                        "{}.embed_tokens.weight",
-                        config.parameter_root()
-                    )),
+                    format: crate::linear_format::standard_linear_format(
+                        &format!("{}.embed_tokens.weight", config.parameter_root()),
+                        config
+                            .weight_quantization(&format!(
+                                "{}.embed_tokens.weight",
+                                config.parameter_root()
+                            ))
+                            .into(),
+                    )?,
                 },
                 context,
             )?,
@@ -2091,7 +2102,10 @@ impl<B: NeuralBackend> Model<B> {
                     output: config.vocabulary_size(),
                     weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
                     bias: None,
-                    format: config.weight_quantization("lm_head.weight").into(),
+                    format: crate::linear_format::standard_linear_format(
+                        "lm_head.weight",
+                        config.weight_quantization("lm_head.weight").into(),
+                    )?,
                 },
                 context,
             )?)
@@ -2202,7 +2216,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                 vocabulary: spec.vocabulary,
                 dimensions: spec.hidden_size,
                 weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
-                quantization: spec.embedding_quantization,
+                format: crate::linear_format::standard_linear_format(
+                    &spec.embedding_weight,
+                    spec.embedding_quantization.into(),
+                )?,
             },
             context,
         )?;
@@ -2232,7 +2249,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                     output: spec.vocabulary,
                     weight: ParameterSpec::trainable(&spec.head_weight).map_err(Error::backend)?,
                     bias: None,
-                    format: spec.head_format,
+                    format: crate::linear_format::standard_linear_format(
+                        &spec.head_weight,
+                        spec.head_format,
+                    )?,
                 },
                 context,
             )?)
@@ -2257,7 +2277,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                 vocabulary: spec.vocabulary,
                 dimensions: spec.hidden_size,
                 weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
-                quantization: spec.embedding_quantization,
+                format: crate::linear_format::standard_linear_format(
+                    &spec.embedding_weight,
+                    spec.embedding_quantization.into(),
+                )?,
             },
             embedding_range,
             context,
@@ -2300,7 +2323,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                         weight: ParameterSpec::trainable(&spec.head_weight)
                             .map_err(Error::backend)?,
                         bias: None,
-                        format: spec.head_format,
+                        format: crate::linear_format::standard_linear_format(
+                            &spec.head_weight,
+                            spec.head_format,
+                        )?,
                     },
                     range,
                     context,

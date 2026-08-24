@@ -263,7 +263,10 @@ impl<B: NeuralBackend> SubsampleProjection<B> {
                     output: config.hidden_size,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(&weight, 32 * second),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        config.linear_format_for(&weight, 32 * second),
+                    )?,
                 },
                 context,
             )?,
@@ -481,7 +484,10 @@ impl<B: NeuralBackend> AudioAttention<B> {
                     output: hidden,
                     weight: ParameterSpec::trainable(&relative_weight).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(&relative_weight, hidden),
+                    format: crate::linear_format::standard_linear_format(
+                        &relative_weight,
+                        config.linear_format_for(&relative_weight, hidden),
+                    )?,
                 },
                 context,
             )?,
@@ -764,7 +770,10 @@ impl<B: NeuralBackend> AudioStatic<B> {
                     ParameterSpec::trainable("model.audio_tower.output_proj.bias")
                         .map_err(Error::backend)?,
                 ),
-                format: config.linear_format_for(weight, config.hidden_size),
+                format: crate::linear_format::standard_linear_format(
+                    weight,
+                    config.linear_format_for(weight, config.hidden_size),
+                )?,
             },
             context,
         )?;

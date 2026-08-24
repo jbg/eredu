@@ -11,7 +11,6 @@ extern crate self as eredu_nn;
 use std::fmt::Debug;
 
 pub use eredu_checkpoint::LinearFormat;
-use eredu_checkpoint::WeightQuantization;
 
 pub use eredu_nn_macros::Parameterized;
 
@@ -796,8 +795,8 @@ pub struct LinearSpec {
     pub weight: ParameterSpec,
     /// Optional stable bias slot.
     pub bias: Option<ParameterSpec>,
-    /// Complete physical checkpoint encoding selected for this parameter.
-    pub format: LinearFormat,
+    /// Complete physical checkpoint encoding and exact companion identities.
+    pub format: LinearFormatSpec,
 }
 
 /// Complete construction specification for a token embedding table.
@@ -809,8 +808,120 @@ pub struct EmbeddingSpec {
     pub dimensions: i32,
     /// Stable embedding weight slot.
     pub weight: ParameterSpec,
-    /// Physical checkpoint encoding selected for this parameter.
-    pub quantization: Option<WeightQuantization>,
+    /// Complete physical checkpoint encoding and exact companion identities.
+    pub format: LinearFormatSpec,
+}
+
+/// Architecture-owned physical encoding and exact companion parameters.
+///
+/// Backends consume these identities literally. They must never derive scale
+/// or affine-bias names from the primary weight identity.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LinearFormatSpec {
+    format: LinearFormat,
+    scale: Option<ParameterSpec>,
+    affine_bias: Option<ParameterSpec>,
+}
+
+impl LinearFormatSpec {
+    /// Declares a dense or checkpoint-native encoding with no companions.
+    pub fn unscaled(format: LinearFormat) -> Result<Self, Error> {
+        let spec = Self {
+            format,
+            scale: None,
+            affine_bias: None,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Declares an encoding with one exact scale companion.
+    pub fn scaled(format: LinearFormat, scale: ParameterSpec) -> Result<Self, Error> {
+        let spec = Self {
+            format,
+            scale: Some(scale),
+            affine_bias: None,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Declares an affine encoding with exact scale and bias companions.
+    pub fn affine(
+        format: LinearFormat,
+        scale: ParameterSpec,
+        affine_bias: ParameterSpec,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            format,
+            scale: Some(scale),
+            affine_bias: Some(affine_bias),
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Physical tensor encoding.
+    pub const fn encoding(&self) -> LinearFormat {
+        self.format
+    }
+
+    /// Exact scale companion, when stored separately.
+    pub const fn scale(&self) -> Option<&ParameterSpec> {
+        self.scale.as_ref()
+    }
+
+    /// Exact affine-bias companion, when stored separately.
+    pub const fn affine_bias(&self) -> Option<&ParameterSpec> {
+        self.affine_bias.as_ref()
+    }
+
+    /// Validates that companion cardinality matches the physical encoding.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.format.validate().map_err(Error::backend)?;
+        let expected = match self.format {
+            LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => (false, false),
+            LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => (true, false),
+            LinearFormat::Affine(_) => (true, true),
+        };
+        if (self.scale.is_some(), self.affine_bias.is_some()) != expected {
+            return Err(Error::backend(format!(
+                "linear format {:?} requires scale/bias companions {:?}, got {:?}",
+                self.format,
+                expected,
+                (self.scale.is_some(), self.affine_bias.is_some())
+            )));
+        }
+        if self
+            .scale
+            .as_ref()
+            .zip(self.affine_bias.as_ref())
+            .is_some_and(|(scale, bias)| scale.id == bias.id)
+        {
+            return Err(Error::backend(
+                "linear scale and affine-bias companions require distinct identities",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates companions against the primary weight identity.
+    pub fn validate_for_weight(&self, weight: &ParameterSpec) -> Result<(), Error> {
+        self.validate()?;
+        if self
+            .scale
+            .as_ref()
+            .into_iter()
+            .chain(self.affine_bias.as_ref())
+            .any(|companion| companion.id == weight.id)
+        {
+            return Err(Error::backend(format!(
+                "linear format companion reuses primary weight identity {}",
+                weight.id
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// One rank's validated contiguous vocabulary ownership.
@@ -1431,8 +1542,8 @@ pub struct TopKRouterSpec {
     pub input_transform: Option<RouterInputTransformSpec>,
     /// Optional learned per-expert multiplier gathered after route selection.
     pub route_scale: Option<ParameterSpec>,
-    /// Optional physical encoding of the router projection.
-    pub quantization: Option<WeightQuantization>,
+    /// Physical encoding and exact companion identities of the router projection.
+    pub format: LinearFormatSpec,
     /// Architecture-selected scoring and selection semantics.
     pub routing: TopKRoutingSpec,
 }
@@ -1451,6 +1562,7 @@ pub struct RouterInputTransformSpec {
 impl TopKRouterSpec {
     /// Validates positive input geometry.
     pub fn validate(&self) -> Result<(), Error> {
+        self.format.validate_for_weight(&self.weight)?;
         if self.input_dimensions <= 0 {
             return Err(Error::backend(format!(
                 "router input dimensions must be positive, got {}",
@@ -1817,63 +1929,20 @@ pub struct ExpertProjectionSpec {
     pub weight: ParameterSpec,
     /// Optional ordinary per-output projection bias.
     pub bias: Option<ParameterSpec>,
-    /// Complete physical checkpoint encoding.
-    pub format: LinearFormat,
-    /// Explicit identities of separately stored quantization parameters.
-    ///
-    /// Dense and checkpoint-native GGUF projections have no companions.
-    /// Packed formats declare every companion rather than relying on a backend
-    /// to derive checkpoint names from the weight identity.
-    pub quantization: Option<ExpertQuantizationSpec>,
-}
-
-/// Explicit parameter identities stored alongside one quantized expert weight.
-#[derive(Debug, Clone)]
-pub struct ExpertQuantizationSpec {
-    /// Per-group or per-block scale parameter.
-    pub scales: ParameterSpec,
-    /// Affine zero-point or bias parameter, when the encoding requires one.
-    pub biases: Option<ParameterSpec>,
+    /// Complete physical checkpoint encoding and exact companion identities.
+    pub format: LinearFormatSpec,
 }
 
 impl ExpertProjectionSpec {
     fn validate(&self) -> Result<(), Error> {
-        self.format.validate().map_err(Error::backend)?;
-        let expected_biases = match self.format {
-            LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => {
-                if self.quantization.is_some() {
-                    return Err(Error::backend(format!(
-                        "expert projection {} declares quantization companions for a format that stores none",
-                        self.weight.id
-                    )));
-                }
-                return Ok(());
-            }
-            LinearFormat::Affine(_) => true,
-            LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => false,
-        };
-        let quantization = self.quantization.as_ref().ok_or_else(|| {
-            Error::backend(format!(
-                "expert projection {} is missing explicit quantization companion identities",
-                self.weight.id
-            ))
-        })?;
-        if quantization.biases.is_some() != expected_biases {
-            return Err(Error::backend(format!(
-                "expert projection {} has a quantization-bias declaration inconsistent with its physical format",
-                self.weight.id
-            )));
-        }
-        Ok(())
+        self.format.validate_for_weight(&self.weight)
     }
 
     fn parameters(&self) -> Vec<&ParameterSpec> {
         let mut parameters = vec![&self.weight];
         parameters.extend(self.bias.as_ref());
-        if let Some(quantization) = &self.quantization {
-            parameters.push(&quantization.scales);
-            parameters.extend(quantization.biases.as_ref());
-        }
+        parameters.extend(self.format.scale());
+        parameters.extend(self.format.affine_bias());
         parameters
     }
 }
@@ -4418,25 +4487,26 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
 mod routed_contract_tests {
     use super::*;
 
+    fn dense_format() -> LinearFormatSpec {
+        LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap()
+    }
+
     fn parameters(prefix: &str) -> GatedProductExpertParameters {
         GatedProductExpertParameters {
             gate: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.gate.weight")).unwrap(),
                 bias: None,
-                format: LinearFormat::Dense,
-                quantization: None,
+                format: dense_format(),
             },
             up: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.up.weight")).unwrap(),
                 bias: None,
-                format: LinearFormat::Dense,
-                quantization: None,
+                format: dense_format(),
             },
             down: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.down.weight")).unwrap(),
                 bias: None,
-                format: LinearFormat::Dense,
-                quantization: None,
+                format: dense_format(),
             },
         }
     }
@@ -4485,7 +4555,7 @@ mod routed_contract_tests {
             correction_bias: Some(shared_bias),
             input_transform: None,
             route_scale: None,
-            quantization: None,
+            format: dense_format(),
             routing: TopKRoutingSpec::new(2, 1, RoutingScoring::SelectedSoftmax, false).unwrap(),
         };
 
@@ -4523,14 +4593,12 @@ mod routed_contract_tests {
                 gate_up: ExpertProjectionSpec {
                     weight: shared.clone(),
                     bias: Some(shared),
-                    format: LinearFormat::Dense,
-                    quantization: None,
+                    format: dense_format(),
                 },
                 down: ExpertProjectionSpec {
                     weight: ParameterSpec::trainable("experts.down").unwrap(),
                     bias: None,
-                    format: LinearFormat::Dense,
-                    quantization: None,
+                    format: dense_format(),
                 },
             },
         };
@@ -4542,17 +4610,20 @@ mod routed_contract_tests {
     fn quantized_expert_projection_requires_explicit_companion_identities() {
         let format =
             LinearFormat::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
-        let projection = |quantization| ExpertProjectionSpec {
+        let projection = |format| ExpertProjectionSpec {
             weight: ParameterSpec::trainable("arbitrary.expert.matrix").unwrap(),
             bias: None,
             format,
-            quantization,
         };
-        assert!(projection(None).validate().is_err());
-        assert!(projection(Some(ExpertQuantizationSpec {
-            scales: ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
-            biases: Some(ParameterSpec::trainable("unrelated.affine.identity").unwrap()),
-        }))
+        assert!(LinearFormatSpec::unscaled(format).is_err());
+        assert!(projection(
+            LinearFormatSpec::affine(
+                format,
+                ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
+                ParameterSpec::trainable("unrelated.affine.identity").unwrap(),
+            )
+            .unwrap()
+        )
         .validate()
         .is_ok());
     }

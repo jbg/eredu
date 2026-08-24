@@ -177,7 +177,10 @@ impl<B: NeuralBackend> Attention<B> {
                         .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
                         .transpose()
                         .map_err(Error::backend)?,
-                    format: args.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )
@@ -503,7 +506,10 @@ impl<B: NeuralBackend> DenseMlp<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )
@@ -1461,9 +1467,10 @@ impl<B: RoutedNeuralBackend> TextModel<B> {
                     dimensions: args.hidden_size,
                     weight: ParameterSpec::trainable("model.embed_tokens.weight")
                         .map_err(Error::backend)?,
-                    quantization: args
-                        .linear_format_for("model.embed_tokens.weight")
-                        .weight_quantization(),
+                    format: crate::linear_format::standard_linear_format(
+                        "model.embed_tokens.weight",
+                        args.linear_format_for("model.embed_tokens.weight"),
+                    )?,
                 },
                 context,
             )?,
@@ -1478,7 +1485,10 @@ impl<B: RoutedNeuralBackend> TextModel<B> {
                     output: args.vocab_size,
                     weight: ParameterSpec::trainable(output_weight).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(output_weight),
+                    format: crate::linear_format::standard_linear_format(
+                        output_weight,
+                        args.linear_format_for(output_weight),
+                    )?,
                 },
                 context,
             )?,

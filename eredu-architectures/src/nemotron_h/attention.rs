@@ -53,7 +53,10 @@ pub fn new_attention_at<B: NeuralBackend>(
                     .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
                     .transpose()
                     .map_err(Error::backend)?,
-                format: args.weight_quantization_for(&weight).into(),
+                format: crate::linear_format::standard_linear_format(
+                    &weight,
+                    args.weight_quantization_for(&weight).into(),
+                )?,
             },
             context,
         )

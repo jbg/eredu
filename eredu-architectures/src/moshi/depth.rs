@@ -48,7 +48,10 @@ impl<B: NeuralBackend> DepthSlice<B> {
                 vocabulary: input_vocabulary,
                 dimensions: transformer.hidden_size(),
                 weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                quantization: config.native_quantization(),
+                format: crate::linear_format::standard_linear_format(
+                    &embedding_name,
+                    config.native_quantization().into(),
+                )?,
             },
             context,
         )?;
@@ -58,7 +61,10 @@ impl<B: NeuralBackend> DepthSlice<B> {
                 output: transformer.hidden_size(),
                 weight: ParameterSpec::trainable(&input_name).map_err(Error::backend)?,
                 bias: None,
-                format: config.native_quantization().into(),
+                format: crate::linear_format::standard_linear_format(
+                    &input_name,
+                    config.native_quantization().into(),
+                )?,
             },
             context,
         )?;
@@ -68,7 +74,10 @@ impl<B: NeuralBackend> DepthSlice<B> {
                 output: config.audio_vocabulary_size(),
                 weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
                 bias: None,
-                format: config.native_quantization().into(),
+                format: crate::linear_format::standard_linear_format(
+                    &output_name,
+                    config.native_quantization().into(),
+                )?,
             },
             context,
         )?;
@@ -107,7 +116,10 @@ impl<B: NeuralBackend> DepthSlice<B> {
                 vocabulary: input_vocabulary,
                 dimensions: transformer.hidden_size(),
                 weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                quantization: config.native_quantization(),
+                format: crate::linear_format::standard_linear_format(
+                    &embedding_name,
+                    config.native_quantization().into(),
+                )?,
             },
             VocabularyParallelRange {
                 global_vocabulary: input_vocabulary as usize,
@@ -125,7 +137,10 @@ impl<B: NeuralBackend> DepthSlice<B> {
                 weight: ParameterSpec::trainable(format!("{prefix}.linear_in.weight"))
                     .map_err(Error::backend)?,
                 bias: None,
-                format: config.native_quantization().into(),
+                format: crate::linear_format::standard_linear_format(
+                    &format!("{prefix}.linear_in.weight"),
+                    config.native_quantization().into(),
+                )?,
             },
             context,
         )?;
@@ -135,7 +150,10 @@ impl<B: NeuralBackend> DepthSlice<B> {
                 output: config.audio_vocabulary_size(),
                 weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
                 bias: None,
-                format: config.native_quantization().into(),
+                format: crate::linear_format::standard_linear_format(
+                    &output_name,
+                    config.native_quantization().into(),
+                )?,
             },
             VocabularyParallelRange {
                 global_vocabulary: config.audio_vocabulary_size() as usize,

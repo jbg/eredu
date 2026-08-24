@@ -77,9 +77,9 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
                 LinearSpec {
                     input,
                     output,
-                    weight: parameter(name)?,
+                    weight: parameter(&name)?,
                     bias: None,
-                    format,
+                    format: crate::linear_format::standard_linear_format(&name, format)?,
                 },
                 context,
             )

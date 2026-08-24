@@ -44,6 +44,10 @@ use eredu_runtime::{
     SubmissionBackend, TensorPlacement, TokenDomain,
 };
 
+fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
+    eredu_nn::LinearFormatSpec::unscaled(eredu_nn::LinearFormat::Dense).unwrap()
+}
+
 #[derive(Debug, Clone)]
 struct NumericTensor {
     shape: Vec<i32>,
@@ -4288,14 +4292,12 @@ fn numeric_expert_bank_spec(
             gate_up: eredu_nn::ExpertProjectionSpec {
                 weight: parameter("test.experts.gate_up_proj"),
                 bias: None,
-                format: eredu_nn::LinearFormat::Dense,
-                quantization: None,
+                format: dense_linear_format(),
             },
             down: eredu_nn::ExpertProjectionSpec {
                 weight: parameter("test.experts.down_proj"),
                 bias: None,
-                format: eredu_nn::LinearFormat::Dense,
-                quantization: None,
+                format: dense_linear_format(),
             },
         },
     }
@@ -4767,7 +4769,7 @@ impl RoutedNeuralBackend for NumericBackend {
                 output: routing.expert_count(),
                 weight: spec.weight,
                 bias: spec.bias,
-                format: spec.quantization.into(),
+                format: spec.format,
             },
             context,
         )?;
@@ -5708,7 +5710,7 @@ fn zero_sentinel_and_ordered_multi_table_sum_have_exact_scalar_results() {
                 vocabulary: 3,
                 dimensions: 2,
                 weight: ParameterSpec::trainable("first.weight").unwrap(),
-                quantization: None,
+                format: dense_linear_format(),
             },
             lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
         },
@@ -5718,7 +5720,7 @@ fn zero_sentinel_and_ordered_multi_table_sum_have_exact_scalar_results() {
                 vocabulary: 3,
                 dimensions: 2,
                 weight: ParameterSpec::trainable("second.weight").unwrap(),
-                quantization: None,
+                format: dense_linear_format(),
             },
             lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
         },
@@ -6541,7 +6543,7 @@ fn forward(model_type: &str, tied: bool) -> Result<ForwardResult, Error> {
                     output: args.vocab_size,
                     weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
                     bias: None,
-                    format: eredu_checkpoint::LinearFormat::Dense,
+                    format: dense_linear_format(),
                 },
                 &context,
             )
@@ -10666,7 +10668,7 @@ fn selected_softmax_router_projection_bias_affects_ids_and_weights() {
             ),
             input_transform: None,
             route_scale: None,
-            quantization: None,
+            format: dense_linear_format(),
             routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::SelectedSoftmax, false)
                 .unwrap(),
         },
@@ -10762,14 +10764,12 @@ fn gated_product_policy_and_projection_biases_match_analytical_value() {
                 gate_up: eredu_nn::ExpertProjectionSpec {
                     weight: parameter("experts.gate_up_proj"),
                     bias: Some(parameter("experts.gate_up_proj_bias")),
-                    format: eredu_nn::LinearFormat::Dense,
-                    quantization: None,
+                    format: dense_linear_format(),
                 },
                 down: eredu_nn::ExpertProjectionSpec {
                     weight: parameter("experts.down_proj"),
                     bias: Some(parameter("experts.down_proj_bias")),
-                    format: eredu_nn::LinearFormat::Dense,
-                    quantization: None,
+                    format: dense_linear_format(),
                 },
             },
         },
@@ -10817,7 +10817,7 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
                 output: 2,
                 weight: parameter("low_rank.first.weight"),
                 bias: None,
-                format: eredu_nn::LinearFormat::Dense,
+                format: dense_linear_format(),
             }),
             normalization: NormalizationSpec {
                 dimensions: 2,
@@ -10829,7 +10829,7 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
                 output: 1,
                 weight: parameter("low_rank.second.weight"),
                 bias: None,
-                format: eredu_nn::LinearFormat::Dense,
+                format: dense_linear_format(),
             },
         },
         &NumericContext::default(),
@@ -10926,7 +10926,7 @@ fn gated_short_convolution_matches_chunked_state_continuation() {
         output,
         weight: parameter(name),
         bias: None,
-        format: eredu_checkpoint::LinearFormat::Dense,
+        format: dense_linear_format(),
     };
     let spec = GatedShortConvolutionSpec {
         input_dimensions: 2,
@@ -12699,7 +12699,7 @@ fn embedded_v3_and_v4_prediction_layers_reuse_target_blocks() {
             output: v4.vocab_size,
             weight: ParameterSpec::trainable("head.weight").unwrap(),
             bias: None,
-            format: v4.linear_format,
+            format: eredu_nn::LinearFormatSpec::unscaled(v4.linear_format).unwrap(),
         },
         &context,
     )

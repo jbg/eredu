@@ -109,7 +109,11 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
                 route_scale: None,
                 // Published routers remain dense unless the checkpoint itself
                 // carries an exact native encoding for this identity.
-                quantization: args.checkpoint_weight_quantization_for(&router_weight),
+                format: crate::linear_format::standard_linear_format(
+                    &router_weight,
+                    args.checkpoint_weight_quantization_for(&router_weight)
+                        .into(),
+                )?,
                 routing,
             },
             context,

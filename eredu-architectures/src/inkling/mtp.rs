@@ -103,7 +103,10 @@ impl<B: RoutedNeuralBackend> MtpModel<B> {
                         output: text.hidden_size,
                         weight: ParameterSpec::trainable(&input_weight).map_err(Error::backend)?,
                         bias: None,
-                        format: text.linear_format_for(&input_weight),
+                        format: crate::linear_format::standard_linear_format(
+                            &input_weight,
+                            text.linear_format_for(&input_weight),
+                        )?,
                     },
                     context,
                 )?,

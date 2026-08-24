@@ -9,7 +9,7 @@ use eredu_runtime::{
     StateLayout, TensorPlacement,
 };
 
-use crate::linear_format::standard_linear_format_parameter;
+use crate::linear_format::standard_parallel_linear_format;
 
 use super::{
     state_layout, AudioLayer, AudioStatic, FamilyConfig, FeedForwardPolicy, ModalityProjector,
@@ -517,7 +517,7 @@ pub fn static_parameter_groups(
         )?);
     }
     expand_linear_format_parameter_groups(groups, |member| {
-        standard_linear_format_parameter(member, args.linear_format_for(member.target()))
+        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
     })
 }
 
@@ -737,7 +737,7 @@ pub fn layer_parameter_groups(
         replicated_members,
     )?);
     expand_linear_format_parameter_groups(groups, |member| {
-        standard_linear_format_parameter(member, args.linear_format_for(member.target()))
+        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
     })
 }
 

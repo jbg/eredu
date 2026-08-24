@@ -218,7 +218,7 @@ impl<B: NeuralBackend> ClippedLinear<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias: None,
-                    format,
+                    format: crate::linear_format::standard_linear_format(&weight_name, format)?,
                 },
                 context,
             )?,
@@ -281,8 +281,10 @@ impl<B: NeuralBackend> PatchEmbedder<B> {
                     output: config.hidden_size,
                     weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
                     bias: None,
-                    format: config
-                        .linear_format_for(weight, 3 * config.patch_size * config.patch_size),
+                    format: crate::linear_format::standard_linear_format(
+                        weight,
+                        config.linear_format_for(weight, 3 * config.patch_size * config.patch_size),
+                    )?,
                 },
                 context,
             )?,

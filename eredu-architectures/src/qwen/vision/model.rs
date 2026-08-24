@@ -200,7 +200,10 @@ fn linear<B: NeuralBackend>(
             output,
             weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
             bias: Some(ParameterSpec::trainable(format!("{prefix}.bias")).map_err(Error::backend)?),
-            format: config.linear_format(relative_vision_name(&weight)),
+            format: crate::linear_format::standard_linear_format(
+                &weight,
+                config.linear_format(relative_vision_name(&weight)),
+            )?,
         },
         context,
     )
@@ -651,7 +654,10 @@ impl<B: NeuralBackend> VisionStatic<B> {
                 dimensions: config.hidden_size,
                 weight: ParameterSpec::trainable(rooted(parameter_root, "pos_embed.weight"))
                     .map_err(Error::backend)?,
-                quantization: None,
+                format: crate::linear_format::standard_linear_format(
+                    &rooted(parameter_root, "pos_embed.weight"),
+                    eredu_checkpoint::LinearFormat::Dense,
+                )?,
             },
             context,
         )?;

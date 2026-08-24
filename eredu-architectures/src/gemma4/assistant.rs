@@ -483,7 +483,10 @@ impl<B: NeuralBackend> MaskedHead<B> {
                     weight: ParameterSpec::trainable("masked_embedding.centroids.weight")
                         .map_err(Error::backend)?,
                     bias: None,
-                    format: LinearFormat::Dense,
+                    format: crate::linear_format::standard_linear_format(
+                        "masked_embedding.centroids.weight",
+                        LinearFormat::Dense,
+                    )?,
                 },
                 context,
             )?,
@@ -561,7 +564,7 @@ impl<B: RoutedNeuralBackend> Assistant<B> {
                     output,
                     weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
                     bias: None,
-                    format: format(name),
+                    format: crate::linear_format::standard_linear_format(name, format(name))?,
                 },
                 context,
             )
@@ -578,9 +581,10 @@ impl<B: RoutedNeuralBackend> Assistant<B> {
                         dimensions: args.hidden_size,
                         weight: ParameterSpec::trainable("model.embed_tokens.weight")
                             .map_err(Error::backend)?,
-                        quantization: args
-                            .linear_format_for("model.embed_tokens.weight")
-                            .weight_quantization(),
+                        format: crate::linear_format::standard_linear_format(
+                            "model.embed_tokens.weight",
+                            args.linear_format_for("model.embed_tokens.weight"),
+                        )?,
                     },
                     context,
                 )

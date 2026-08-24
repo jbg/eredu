@@ -10,7 +10,7 @@ use std::{
 };
 
 use eredu_checkpoint::LinearFormat;
-use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
+use eredu_nn::{LinearFormatSpec, ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
 
 /// Architecture-neutral information for one rank-local parallel model.
 #[derive(Debug, Clone)]
@@ -162,62 +162,6 @@ pub struct ParameterMemberSpec {
     target: String,
     global_shape: Vec<usize>,
     sharding: MemberSharding,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum LinearFormatCompanions {
-    None,
-    Scaled { scale: String, bias: Option<String> },
-}
-
-/// Architecture declaration of a linear matrix's physical checkpoint format.
-///
-/// Runtime uses this declaration only for format geometry. Architectures own
-/// eligibility and the exact identities of every physical companion.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LinearFormatParameter {
-    format: LinearFormat,
-    companions: LinearFormatCompanions,
-}
-
-impl LinearFormatParameter {
-    /// Declares an encoding with no separate physical companions.
-    pub const fn unscaled(format: LinearFormat) -> Self {
-        Self {
-            format,
-            companions: LinearFormatCompanions::None,
-        }
-    }
-
-    /// Declares an encoding with an exact scale target.
-    pub fn scaled(format: LinearFormat, scale: impl Into<String>) -> Self {
-        Self {
-            format,
-            companions: LinearFormatCompanions::Scaled {
-                scale: scale.into(),
-                bias: None,
-            },
-        }
-    }
-
-    /// Declares an encoding with exact scale and affine-bias targets.
-    pub fn affine(format: LinearFormat, scale: impl Into<String>, bias: impl Into<String>) -> Self {
-        Self {
-            format,
-            companions: LinearFormatCompanions::Scaled {
-                scale: scale.into(),
-                bias: Some(bias.into()),
-            },
-        }
-    }
-
-    const fn format(&self) -> LinearFormat {
-        self.format
-    }
-
-    const fn companions(&self) -> &LinearFormatCompanions {
-        &self.companions
-    }
 }
 
 impl ParameterMemberSpec {
@@ -693,14 +637,14 @@ pub fn aligned_partition_units(
 /// in the same atomic parameter group.
 pub fn expand_linear_format_parameter_groups(
     groups: Vec<ParameterGroupSpec>,
-    declaration: impl Fn(&ParameterMemberSpec) -> Option<LinearFormatParameter>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     groups
         .into_iter()
         .map(|group| {
             let mut members = Vec::new();
             for source in group.members() {
-                members.extend(match declaration(source) {
+                members.extend(match declaration(source)? {
                     Some(declaration) => expand_linear_format_member(source, &declaration)?,
                     None => vec![source.clone()],
                 });
@@ -775,17 +719,18 @@ fn remap_linear_segments(
 
 fn expand_linear_format_member(
     source: &ParameterMemberSpec,
-    declaration: &LinearFormatParameter,
+    declaration: &LinearFormatSpec,
 ) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
     let name = source.target();
     let shape = source.global_shape();
-    let format = declaration.format();
+    let format = declaration.encoding();
     if format == LinearFormat::Dense {
-        return match declaration.companions() {
-            LinearFormatCompanions::None => Ok(vec![source.clone()]),
-            LinearFormatCompanions::Scaled { .. } => Err(ParallelPlanError::InvalidGroup(format!(
+        return if declaration.scale().is_none() && declaration.affine_bias().is_none() {
+            Ok(vec![source.clone()])
+        } else {
+            Err(ParallelPlanError::InvalidGroup(format!(
                 "dense linear parameter {name} declares physical companions"
-            ))),
+            )))
         };
     }
     if shape.len() < 2 {
@@ -799,12 +744,16 @@ fn expand_linear_format_member(
     match format {
         LinearFormat::Dense => unreachable!(),
         LinearFormat::E4M3BlockFp8(fp8) => {
-            let LinearFormatCompanions::Scaled { scale, bias: None } = declaration.companions()
-            else {
+            let Some(scale) = declaration.scale() else {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "block-FP8 linear parameter {name} must declare exactly one scale companion"
                 )));
             };
+            if declaration.affine_bias().is_some() {
+                return Err(ParallelPlanError::InvalidGroup(format!(
+                    "block-FP8 linear parameter {name} must not declare an affine-bias companion"
+                )));
+            }
             fp8.validate().map_err(|error| invalid(error.to_string()))?;
             let rows = usize::try_from(fp8.block_rows)
                 .map_err(|_| invalid(format!("invalid block rows for {name}")))?;
@@ -817,11 +766,11 @@ fn expand_linear_format_member(
                 .and_then(|value| remap_linear_segments(&value, column_axis, columns, name))?;
             Ok(vec![
                 source.clone(),
-                ParameterMemberSpec::new(scale, scale_shape, scale_sharding),
+                ParameterMemberSpec::new(scale.id.as_str(), scale_shape, scale_sharding),
             ])
         }
         LinearFormat::GgufIQuant { ggml_type, .. } => {
-            if declaration.companions() != &LinearFormatCompanions::None {
+            if declaration.scale().is_some() || declaration.affine_bias().is_some() {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "GGUF linear parameter {name} must not declare companion tensors"
                 )));
@@ -849,11 +798,12 @@ fn expand_linear_format_member(
         }
         LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
             let quantization = format.weight_quantization().expect("packed format");
-            let LinearFormatCompanions::Scaled { scale, bias } = declaration.companions() else {
+            let Some(scale) = declaration.scale() else {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "packed linear parameter {name} must declare a scale companion"
                 )));
             };
+            let bias = declaration.affine_bias();
             if quantization.has_biases() != bias.is_some() {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "packed linear parameter {name} declares companions inconsistent with its format"
@@ -884,13 +834,13 @@ fn expand_linear_format_member(
             let companion_sharding =
                 remap_linear_segments(source.sharding(), column_axis, group, name)?;
             members.push(ParameterMemberSpec::new(
-                scale,
+                scale.id.as_str(),
                 companion.clone(),
                 companion_sharding.clone(),
             ));
             if let Some(bias) = bias {
                 members.push(ParameterMemberSpec::new(
-                    bias,
+                    bias.id.as_str(),
                     companion,
                     companion_sharding,
                 ));
@@ -1166,7 +1116,13 @@ mod tests {
         );
 
         let expanded = expand_linear_format_parameter_groups(groups, |_| {
-            Some(LinearFormatParameter::scaled(format, "opaque_scale"))
+            Ok(Some(
+                LinearFormatSpec::scaled(
+                    format,
+                    eredu_nn::ParameterSpec::trainable("opaque_scale").unwrap(),
+                )
+                .unwrap(),
+            ))
         })
         .unwrap();
         assert_eq!(expanded.len(), 1);

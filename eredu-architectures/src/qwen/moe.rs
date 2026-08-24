@@ -67,7 +67,10 @@ impl<B: RoutedNeuralBackend> RoutedGatedProduct<B> {
                 correction_bias: None,
                 input_transform: None,
                 route_scale: None,
-                quantization: args.weight_quantization_for(&router_name),
+                format: crate::linear_format::standard_linear_format(
+                    &router_name,
+                    args.weight_quantization_for(&router_name).into(),
+                )?,
                 routing,
             },
             context,

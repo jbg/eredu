@@ -178,7 +178,10 @@ impl<B: RoutedNeuralBackend> PredictionUnit<B> {
                             output: args.hidden_size,
                             weight: parameter(fusion_name.clone())?,
                             bias: None,
-                            format: args.weight_quantization_for(&fusion_name).into(),
+                            format: crate::linear_format::standard_linear_format(
+                                &fusion_name,
+                                args.weight_quantization_for(&fusion_name).into(),
+                            )?,
                         },
                         context,
                     )

@@ -92,11 +92,14 @@ impl<B: NeuralBackend> LinearAttention<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: if force_dense {
-                        eredu_checkpoint::LinearFormat::Dense
-                    } else {
-                        config.linear_format(&weight)
-                    },
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        if force_dense {
+                            eredu_checkpoint::LinearFormat::Dense
+                        } else {
+                            config.linear_format(&weight)
+                        },
+                    )?,
                 },
                 context,
             )

@@ -38,7 +38,10 @@ impl<B: RoutedNeuralBackend> DenseSwiGlu<B> {
                     output,
                     weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
                     bias: None,
-                    format: args.weight_quantization_for(&name).into(),
+                    format: crate::linear_format::standard_linear_format(
+                        &name,
+                        args.weight_quantization_for(&name).into(),
+                    )?,
                 },
                 context,
             )
@@ -115,7 +118,10 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 ),
                 input_transform: None,
                 route_scale: None,
-                quantization: args.weight_quantization_for(&gate_name),
+                format: crate::linear_format::standard_linear_format(
+                    &gate_name,
+                    args.weight_quantization_for(&gate_name).into(),
+                )?,
                 routing,
             },
             context,

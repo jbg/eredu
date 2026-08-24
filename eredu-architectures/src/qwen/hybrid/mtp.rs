@@ -105,7 +105,10 @@ impl<B: RoutedNeuralBackend> PredictionUnit<B> {
                     output: config.hidden_size,
                     weight: ParameterSpec::trainable("mtp.fc.weight").map_err(Error::backend)?,
                     bias: None,
-                    format: eredu_checkpoint::LinearFormat::Dense,
+                    format: crate::linear_format::standard_linear_format(
+                        "mtp.fc.weight",
+                        eredu_checkpoint::LinearFormat::Dense,
+                    )?,
                 },
                 context,
             )?,

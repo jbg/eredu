@@ -1984,7 +1984,10 @@ impl<B: HyperNeuralBackend> DsparkStatic<B> {
                     vocabulary: args.vocab_size,
                     dimensions: config.markov_rank,
                     weight: parameter(format!("mtp.{last}.markov_head.markov_w1.weight"))?,
-                    quantization: None,
+                    format: crate::linear_format::standard_linear_format(
+                        &format!("mtp.{last}.markov_head.markov_w1.weight"),
+                        LinearFormat::Dense,
+                    )?,
                 },
                 context,
             )?,
@@ -2973,13 +2976,14 @@ fn projection<B: eredu_nn::NeuralBackend>(
     format: LinearFormat,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Linear, Error> {
+    let name = name.into();
     B::linear(
         LinearSpec {
             input,
             output,
-            weight: parameter(name)?,
+            weight: parameter(&name)?,
             bias: None,
-            format,
+            format: crate::linear_format::standard_linear_format(&name, format)?,
         },
         context,
     )

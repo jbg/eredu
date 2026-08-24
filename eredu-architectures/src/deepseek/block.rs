@@ -494,7 +494,10 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
                     output,
                     weight: parameter(&name)?,
                     bias: None,
-                    format: args.linear_format_for(&name),
+                    format: crate::linear_format::standard_linear_format(
+                        &name,
+                        args.linear_format_for(&name),
+                    )?,
                 },
                 context,
             )

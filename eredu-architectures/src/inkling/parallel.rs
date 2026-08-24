@@ -10,7 +10,7 @@ use eredu_runtime::{
     StateLayout, TensorPlacement,
 };
 
-use crate::linear_format::standard_linear_format_parameter;
+use crate::linear_format::standard_parallel_linear_format;
 
 use super::{FeedForwardPolicy, ModelArgs};
 
@@ -331,7 +331,7 @@ pub fn static_parameter_groups(
         } else {
             args.text_config.linear_format_for(name)
         };
-        standard_linear_format_parameter(member, format)
+        standard_parallel_linear_format(member, format)
     })
 }
 
@@ -407,10 +407,7 @@ pub fn mtp_parameter_groups(
         ));
     }
     expand_linear_format_parameter_groups(vec![replicated("model.mtp", members)?], |member| {
-        standard_linear_format_parameter(
-            member,
-            args.text_config.linear_format_for(member.target()),
-        )
+        standard_parallel_linear_format(member, args.text_config.linear_format_for(member.target()))
     })
 }
 
@@ -603,10 +600,7 @@ pub fn layer_parameter_groups(
         replicated_members,
     )?);
     expand_linear_format_parameter_groups(groups, |member| {
-        standard_linear_format_parameter(
-            member,
-            args.text_config.linear_format_for(member.target()),
-        )
+        standard_parallel_linear_format(member, args.text_config.linear_format_for(member.target()))
     })
 }
 

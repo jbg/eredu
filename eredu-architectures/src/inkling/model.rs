@@ -62,9 +62,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                     dimensions: text.hidden_size,
                     weight: ParameterSpec::trainable("model.embed_tokens.weight")
                         .map_err(Error::backend)?,
-                    quantization: text
-                        .linear_format_for("model.embed_tokens.weight")
-                        .weight_quantization(),
+                    format: crate::linear_format::standard_linear_format(
+                        "model.embed_tokens.weight",
+                        text.linear_format_for("model.embed_tokens.weight"),
+                    )?,
                 },
                 context,
             )?,
@@ -76,7 +77,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                     output: text.vocab_size,
                     weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
                     bias: None,
-                    format: text.linear_format_for("lm_head.weight"),
+                    format: crate::linear_format::standard_linear_format(
+                        "lm_head.weight",
+                        text.linear_format_for("lm_head.weight"),
+                    )?,
                 },
                 context,
             )?,
@@ -117,9 +121,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                     dimensions: text.hidden_size,
                     weight: ParameterSpec::trainable("model.embed_tokens.weight")
                         .map_err(Error::backend)?,
-                    quantization: text
-                        .linear_format_for("model.embed_tokens.weight")
-                        .weight_quantization(),
+                    format: crate::linear_format::standard_linear_format(
+                        "model.embed_tokens.weight",
+                        text.linear_format_for("model.embed_tokens.weight"),
+                    )?,
                 },
                 geometry.embedding_range().clone(),
                 context,
@@ -132,7 +137,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                     output: text.vocab_size,
                     weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
                     bias: None,
-                    format: text.linear_format_for("lm_head.weight"),
+                    format: crate::linear_format::standard_linear_format(
+                        "lm_head.weight",
+                        text.linear_format_for("lm_head.weight"),
+                    )?,
                 },
                 geometry.output_range().clone(),
                 context,

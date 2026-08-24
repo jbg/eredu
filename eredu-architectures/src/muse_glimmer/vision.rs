@@ -128,7 +128,10 @@ impl<B: NeuralBackend> PatchEmbedder<B> {
                     output: config.hidden_size,
                     weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(weight),
+                    format: crate::linear_format::standard_linear_format(
+                        weight,
+                        config.linear_format_for(weight),
+                    )?,
                 },
                 context,
             )?,
@@ -137,7 +140,10 @@ impl<B: NeuralBackend> PatchEmbedder<B> {
                     vocabulary: config.position_height * config.position_width,
                     dimensions: config.hidden_size,
                     weight: ParameterSpec::trainable(position).map_err(Error::backend)?,
-                    quantization: config.weight_quantization_for(position),
+                    format: crate::linear_format::standard_linear_format(
+                        position,
+                        config.linear_format_for(position),
+                    )?,
                 },
                 context,
             )?,
@@ -206,7 +212,10 @@ impl<B: NeuralBackend> VisionAttention<B> {
                         ParameterSpec::trainable(format!("{prefix}.{field}.bias"))
                             .map_err(Error::backend)?,
                     ),
-                    format: config.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        config.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )
@@ -318,7 +327,10 @@ impl<B: NeuralBackend> VisionBlock<B> {
                         ParameterSpec::trainable(format!("{prefix}.mlp.{field}.bias"))
                             .map_err(Error::backend)?,
                     ),
-                    format: config.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        config.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )
@@ -408,7 +420,10 @@ impl<B: NeuralBackend> VisionStatic<B> {
                     output,
                     weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(name),
+                    format: crate::linear_format::standard_linear_format(
+                        name,
+                        config.linear_format_for(name),
+                    )?,
                 },
                 context,
             )

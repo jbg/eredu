@@ -67,7 +67,10 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
                 correction_bias: None,
                 input_transform: None,
                 route_scale: None,
-                quantization: config.quantization,
+                format: crate::linear_format::standard_linear_format(
+                    &router_name,
+                    config.quantization.into(),
+                )?,
                 routing,
             },
             context,
@@ -571,7 +574,10 @@ fn new_linear<B: RoutedNeuralBackend>(
             bias: bias
                 .then(|| parameter(format!("{prefix}.bias")))
                 .transpose()?,
-            format: config.linear_format(&weight),
+            format: crate::linear_format::standard_linear_format(
+                &weight,
+                config.linear_format(&weight),
+            )?,
         },
         context,
     )

@@ -42,7 +42,7 @@ impl ProjectionPolicy {
                 output,
                 weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
                 bias: None,
-                format,
+                format: crate::linear_format::standard_linear_format(weight, format)?,
             })
         };
         LowRankProjection::new(

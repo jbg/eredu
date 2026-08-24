@@ -37,7 +37,10 @@ impl<B: NeuralBackend> ModalityProjector<B> {
                     output: args.hidden_size,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )?,

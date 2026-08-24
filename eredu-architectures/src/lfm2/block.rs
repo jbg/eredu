@@ -103,7 +103,10 @@ impl<B: RoutedNeuralBackend> Block<B> {
                             output,
                             weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
                             bias: None,
-                            format: args.weight_quantization_for(&name).into(),
+                            format: crate::linear_format::standard_linear_format(
+                                &name,
+                                args.weight_quantization_for(&name).into(),
+                            )?,
                         },
                         context,
                     )
@@ -367,7 +370,10 @@ fn short_convolution_spec(
                 .conv_bias
                 .then(|| parameter(format!("{prefix}.{field}.bias")))
                 .transpose()?,
-            format: args.weight_quantization_for(&weight_name).into(),
+            format: crate::linear_format::standard_linear_format(
+                &weight_name,
+                args.weight_quantization_for(&weight_name).into(),
+            )?,
         })
     };
     Ok(GatedShortConvolutionSpec {

@@ -822,13 +822,14 @@ fn linear<B: NeuralBackend>(
     format: eredu_checkpoint::LinearFormat,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Linear, Error> {
+    let name = name.into();
     B::linear(
         LinearSpec {
             input,
             output,
-            weight: parameter(name)?,
+            weight: parameter(&name)?,
             bias: None,
-            format,
+            format: crate::linear_format::standard_linear_format(&name, format)?,
         },
         context,
     )

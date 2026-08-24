@@ -97,9 +97,9 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
             Ok(LinearSpec {
                 input,
                 output,
-                weight: parameter(name)?,
+                weight: parameter(name.clone())?,
                 bias: None,
-                format,
+                format: crate::linear_format::standard_linear_format(&name, format)?,
             })
         };
         let query = if let Some(rank) = args.q_lora_rank {

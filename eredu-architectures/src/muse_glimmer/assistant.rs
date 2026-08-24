@@ -506,7 +506,10 @@ impl<B: NeuralBackend> DFlashAttention<B> {
                     output,
                     weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(&name),
+                    format: crate::linear_format::standard_linear_format(
+                        &name,
+                        config.linear_format_for(&name),
+                    )?,
                 },
                 context,
             )
@@ -670,7 +673,10 @@ impl<B: NeuralBackend> DFlashBlock<B> {
                     output,
                     weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(&name),
+                    format: crate::linear_format::standard_linear_format(
+                        &name,
+                        config.linear_format_for(&name),
+                    )?,
                 },
                 context,
             )
@@ -741,7 +747,10 @@ impl<B: NeuralBackend> DFlash<B> {
                 output: config.hidden_size,
                 weight: ParameterSpec::trainable(encoder_name).map_err(Error::backend)?,
                 bias: None,
-                format: config.linear_format_for(encoder_name),
+                format: crate::linear_format::standard_linear_format(
+                    encoder_name,
+                    config.linear_format_for(encoder_name),
+                )?,
             },
             context,
         )?;

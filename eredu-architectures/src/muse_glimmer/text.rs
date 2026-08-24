@@ -128,7 +128,10 @@ impl<B: RoutedNeuralBackend> Attention<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )
@@ -339,7 +342,10 @@ impl<B: RoutedNeuralBackend> Mlp<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )
@@ -404,9 +410,10 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                     correction_bias: None,
                     input_transform: None,
                     route_scale: None,
-                    quantization: args
-                        .linear_format_for(&format!("{prefix}.gate.weight"))
-                        .weight_quantization(),
+                    format: crate::linear_format::standard_linear_format(
+                        &format!("{prefix}.gate.weight"),
+                        args.linear_format_for(&format!("{prefix}.gate.weight")),
+                    )?,
                     routing: TopKRoutingSpec::new(
                         args.num_experts,
                         args.num_experts_per_tok,
@@ -839,7 +846,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                     vocabulary: args.vocab_size,
                     dimensions: args.hidden_size,
                     weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                    quantization: args.weight_quantization_for(embedding),
+                    format: crate::linear_format::standard_linear_format(
+                        embedding,
+                        args.linear_format_for(embedding),
+                    )?,
                 },
                 context,
             )?,
@@ -860,7 +870,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                             output: args.vocab_size,
                             weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
                             bias: None,
-                            format: args.linear_format_for(head),
+                            format: crate::linear_format::standard_linear_format(
+                                head,
+                                args.linear_format_for(head),
+                            )?,
                         },
                         context,
                     )
@@ -886,7 +899,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                     vocabulary: args.vocab_size,
                     dimensions: args.hidden_size,
                     weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                    quantization: args.weight_quantization_for(embedding),
+                    format: crate::linear_format::standard_linear_format(
+                        embedding,
+                        args.linear_format_for(embedding),
+                    )?,
                 },
                 geometry.embedding_range().clone(),
                 context,
@@ -908,7 +924,10 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                             output: args.vocab_size,
                             weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
                             bias: None,
-                            format: args.linear_format_for(head),
+                            format: crate::linear_format::standard_linear_format(
+                                head,
+                                args.linear_format_for(head),
+                            )?,
                         },
                         geometry
                             .output_range()

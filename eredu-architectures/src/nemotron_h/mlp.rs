@@ -40,7 +40,10 @@ impl<B: RoutedNeuralBackend> DenseMlp<B> {
                         .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
                         .transpose()
                         .map_err(Error::backend)?,
-                    format: args.weight_quantization_for(&weight).into(),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.weight_quantization_for(&weight).into(),
+                    )?,
                 },
                 context,
             )
@@ -146,7 +149,10 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 ),
                 input_transform: None,
                 route_scale: None,
-                quantization: args.weight_quantization_for(&gate_weight),
+                format: crate::linear_format::standard_linear_format(
+                    &gate_weight,
+                    args.weight_quantization_for(&gate_weight).into(),
+                )?,
                 routing,
             },
             context,

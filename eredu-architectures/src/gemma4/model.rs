@@ -2234,7 +2234,10 @@ pub(crate) mod model_text {
                         vocabulary: args.vocab_size,
                         dimensions: args.hidden_size,
                         weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                        quantization: args.linear_format_for(embedding).weight_quantization(),
+                        format: crate::linear_format::standard_linear_format(
+                            embedding,
+                            args.linear_format_for(embedding),
+                        )?,
                     },
                     context,
                 )?,
@@ -2248,9 +2251,10 @@ pub(crate) mod model_text {
                                 dimensions: per_layer_width,
                                 weight: ParameterSpec::trainable(per_layer_embedding)
                                     .map_err(Error::backend)?,
-                                quantization: args
-                                    .linear_format_for(per_layer_embedding)
-                                    .weight_quantization(),
+                                format: crate::linear_format::standard_linear_format(
+                                    per_layer_embedding,
+                                    args.linear_format_for(per_layer_embedding),
+                                )?,
                             },
                             context,
                         )
@@ -2265,7 +2269,10 @@ pub(crate) mod model_text {
                                 weight: ParameterSpec::trainable(per_layer_projection)
                                     .map_err(Error::backend)?,
                                 bias: None,
-                                format: args.linear_format_for(per_layer_projection),
+                                format: crate::linear_format::standard_linear_format(
+                                    per_layer_projection,
+                                    args.linear_format_for(per_layer_projection),
+                                )?,
                             },
                             context,
                         )
@@ -2303,7 +2310,10 @@ pub(crate) mod model_text {
                                 output: args.vocab_size,
                                 weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
                                 bias: None,
-                                format: args.linear_format_for(head),
+                                format: crate::linear_format::standard_linear_format(
+                                    head,
+                                    args.linear_format_for(head),
+                                )?,
                             },
                             context,
                         )
@@ -2331,7 +2341,10 @@ pub(crate) mod model_text {
                         vocabulary: args.vocab_size,
                         dimensions: args.hidden_size,
                         weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                        quantization: args.linear_format_for(embedding).weight_quantization(),
+                        format: crate::linear_format::standard_linear_format(
+                            embedding,
+                            args.linear_format_for(embedding),
+                        )?,
                     },
                     geometry.embedding_range().clone(),
                     context,
@@ -2346,9 +2359,10 @@ pub(crate) mod model_text {
                                 dimensions: combined_width,
                                 weight: ParameterSpec::trainable(per_layer_embedding)
                                     .map_err(Error::backend)?,
-                                quantization: args
-                                    .linear_format_for(per_layer_embedding)
-                                    .weight_quantization(),
+                                format: crate::linear_format::standard_linear_format(
+                                    per_layer_embedding,
+                                    args.linear_format_for(per_layer_embedding),
+                                )?,
                             },
                             context,
                         )
@@ -2363,7 +2377,10 @@ pub(crate) mod model_text {
                                 weight: ParameterSpec::trainable(per_layer_projection)
                                     .map_err(Error::backend)?,
                                 bias: None,
-                                format: args.linear_format_for(per_layer_projection),
+                                format: crate::linear_format::standard_linear_format(
+                                    per_layer_projection,
+                                    args.linear_format_for(per_layer_projection),
+                                )?,
                             },
                             context,
                         )
@@ -2402,7 +2419,10 @@ pub(crate) mod model_text {
                             output: args.vocab_size,
                             weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
                             bias: None,
-                            format: args.linear_format_for(head),
+                            format: crate::linear_format::standard_linear_format(
+                                head,
+                                args.linear_format_for(head),
+                            )?,
                         },
                         geometry.output_range().cloned().ok_or_else(|| {
                             Error::backend("untied Gemma 4 output has no local range")

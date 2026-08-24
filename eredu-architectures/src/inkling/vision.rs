@@ -36,7 +36,10 @@ impl<B: NeuralBackend> VisionLayer<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: config.linear_format_for(&weight),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        config.linear_format_for(&weight),
+                    )?,
                 },
                 context,
             )?,

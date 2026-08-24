@@ -68,7 +68,10 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
                     output,
                     weight: parameter(weight.clone())?,
                     bias: None,
-                    format: args.weight_quantization_for(&weight).into(),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight,
+                        args.weight_quantization_for(&weight).into(),
+                    )?,
                 },
                 context,
             )

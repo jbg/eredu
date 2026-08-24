@@ -96,7 +96,10 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
                     .transpose()?,
                 input_transform: None,
                 route_scale: None,
-                quantization: None,
+                format: crate::linear_format::standard_linear_format(
+                    &policy.router_weight,
+                    eredu_checkpoint::LinearFormat::Dense,
+                )?,
                 routing,
             },
             context,
@@ -109,7 +112,7 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
                     output,
                     weight: parameter(weight)?,
                     bias: None,
-                    format,
+                    format: crate::linear_format::standard_linear_format(weight, format)?,
                 },
                 context,
             )

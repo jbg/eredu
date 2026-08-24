@@ -99,7 +99,10 @@ impl<B: NeuralBackend> Attention<B> {
                         .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
                         .transpose()
                         .map_err(Error::backend)?,
-                    format: args.linear_format_for(&weight_name),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight_name,
+                        args.linear_format_for(&weight_name),
+                    )?,
                 },
                 context,
             )
@@ -332,7 +335,10 @@ impl<B: NeuralBackend> DenseMlp<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(&weight_name),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight_name,
+                        args.linear_format_for(&weight_name),
+                    )?,
                 },
                 context,
             )
@@ -468,7 +474,10 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias: None,
-                    format: args.linear_format_for(&weight_name),
+                    format: crate::linear_format::standard_linear_format(
+                        &weight_name,
+                        args.linear_format_for(&weight_name),
+                    )?,
                 },
                 context,
             )
@@ -500,7 +509,10 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                         ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
                             .map_err(Error::backend)?,
                     ),
-                    quantization: args.linear_format_for(&router_weight).weight_quantization(),
+                    format: crate::linear_format::standard_linear_format(
+                        &router_weight,
+                        args.linear_format_for(&router_weight),
+                    )?,
                     routing: TopKRoutingSpec::new(
                         expert_count,
                         top_k,

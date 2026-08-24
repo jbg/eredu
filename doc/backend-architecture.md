@@ -290,12 +290,17 @@ Architecture implementations also provide any released-checkpoint rewrite
 recipes for their static modules, so alias and fused-layout handling does not
 reintroduce checkpoint roots into a backend.
 
-Architecture parallel plans explicitly select every encoded linear parameter
-and declare the exact scale and affine-bias companion targets. Neutral runtime
-code derives packed shapes and remaps declared sharding geometry from that
-typed declaration; it does not decide that a parameter is quantizable or
-construct companion identities from weight, projection, scale, or bias name
-suffixes.
+`eredu-nn::LinearFormatSpec` is the single neutral declaration of a matrix's
+physical encoding and exact scale and affine-bias companion parameters.
+Ordinary linear, embedding, router, and expert construction specifications use
+it directly, and architecture parallel plans return the same declaration for
+encoded parameters. Neutral runtime code derives packed shapes and remaps
+declared sharding geometry from that typed declaration. Architectures may
+centralize a released checkpoint's standard naming convention when creating
+the declaration, but runtime and reusable backends never decide that a
+parameter is quantizable or construct companion identities from weight,
+projection, scale, or bias name suffixes. Native backend slot names are local
+implementation details mapped to the literal neutral identities.
 
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution

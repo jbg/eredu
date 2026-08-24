@@ -8,7 +8,6 @@ use std::{
     sync::Arc,
 };
 
-use eredu_checkpoint::WeightQuantization;
 use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
@@ -17,14 +16,15 @@ use eredu_nn::{
     GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
     GatedProductPolicy, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
-    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
-    NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SegmentedAttentionInput,
-    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TensorParallelExpertOutput, TopKRouterSpec, VocabularyParallelRange,
+    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearFormatSpec,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, NormalizationScale, NormalizationSpec, ParameterMetadata, ParameterSpec,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
+    PooledPositionInput, RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
+    RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
+    RoutingResult, RoutingScoring, SegmentedAttentionInput, SelectiveStateSpaceScanInput,
+    SelectiveStateSpaceScanOutput, Tensor, TensorParallelExpertOutput, TopKRouterSpec,
+    VocabularyParallelRange,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use ref_cast::RefCast;
@@ -65,21 +65,6 @@ fn compute_tensor(
     result: Result<Array, safemlx::error::Exception>,
 ) -> Result<MlxTensor, ComputeError> {
     compute(result).map(MlxTensor::from_array)
-}
-
-fn companion_spec(weight: &ParameterSpec, component: &str) -> ParameterSpec {
-    let prefix = weight
-        .id
-        .as_str()
-        .strip_suffix(".weight")
-        .unwrap_or_else(|| weight.id.as_str());
-    ParameterSpec {
-        id: eredu_nn::ParameterId::new(format!("{prefix}.{component}"))
-            .expect("authoritative weight identity produces a non-empty companion identity"),
-        trainable: weight.trainable,
-        alias_of: None,
-        group: Some(weight.id.as_str().to_owned()),
-    }
 }
 
 impl BlockwiseAttentionBackend for MlxNeuralBackend {
@@ -130,7 +115,9 @@ fn parameter_topology(
     module: &impl ModuleParameters,
     weight: ParameterSpec,
     bias: Option<ParameterSpec>,
+    format: &LinearFormatSpec,
 ) -> Result<BTreeMap<String, ParameterSpec>, ComputeError> {
+    format.validate_for_weight(&weight)?;
     module
         .parameters()
         .flatten()
@@ -143,9 +130,16 @@ fn parameter_topology(
                         "backend operator exposed unexpected bias parameter {local:?}"
                     ))
                 })?,
-                "scales" => companion_spec(&weight, "scales"),
-                "biases" => companion_spec(&weight, "biases"),
-                "weight_scale_inv" => companion_spec(&weight, "weight_scale_inv"),
+                "scales" | "weight_scale_inv" => format.scale().cloned().ok_or_else(|| {
+                    ComputeError::backend(format!(
+                        "backend operator exposed scale slot {local:?} but the architecture declared none"
+                    ))
+                })?,
+                "biases" => format.affine_bias().cloned().ok_or_else(|| {
+                    ComputeError::backend(
+                        "backend operator exposed affine-bias slot but the architecture declared none",
+                    )
+                })?,
                 "e_score_correction_bias" => bias.clone().ok_or_else(|| {
                     ComputeError::backend(format!(
                         "backend operator exposed unexpected correction-bias parameter {local:?}"
@@ -1440,10 +1434,10 @@ impl NeuralBackend for MlxNeuralBackend {
             spec.input,
             spec.output,
             spec.bias.is_some(),
-            spec.format,
+            spec.format.encoding(),
             context,
         ))?;
-        let topology = parameter_topology(&module, spec.weight, spec.bias)?;
+        let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
         Ok(MlxLinear {
             module,
             topology,
@@ -1455,10 +1449,10 @@ impl NeuralBackend for MlxNeuralBackend {
         let module = compute(common::linear::unloaded_maybe_quantized_embedding(
             spec.vocabulary,
             spec.dimensions,
-            spec.quantization,
+            spec.format.encoding().weight_quantization(),
             context,
         ))?;
-        let topology = parameter_topology(&module, spec.weight, None)?;
+        let topology = parameter_topology(&module, spec.weight, None, &spec.format)?;
         Ok(MlxEmbedding {
             module,
             topology,
@@ -1478,10 +1472,10 @@ impl NeuralBackend for MlxNeuralBackend {
         let module = compute(common::linear::unloaded_maybe_quantized_embedding(
             local,
             spec.dimensions,
-            spec.quantization,
+            spec.format.encoding().weight_quantization(),
             context,
         ))?;
-        let topology = parameter_topology(&module, spec.weight, None)?;
+        let topology = parameter_topology(&module, spec.weight, None, &spec.format)?;
         Ok(MlxEmbedding {
             module,
             topology,
@@ -1501,10 +1495,10 @@ impl NeuralBackend for MlxNeuralBackend {
             spec.input,
             local,
             spec.bias.is_some(),
-            spec.format,
+            spec.format.encoding(),
             context,
         ))?;
-        let topology = parameter_topology(&module, spec.weight, spec.bias)?;
+        let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
         Ok(MlxLinear {
             module,
             topology,
@@ -1635,7 +1629,7 @@ impl NeuralBackend for MlxNeuralBackend {
                     Dtype::Float32,
                     context,
                 ))?;
-                let topology = parameter_topology(&module, weight, None)?;
+                let topology = exact_parameter_topology(&module, [("weight", weight)])?;
                 (Some(module), topology)
             }
             None => (None, BTreeMap::new()),
@@ -2592,7 +2586,7 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
                     .is_some_and(|transform| transform.inverse_sqrt_dimensions),
                 route_scale: spec.route_scale.is_some(),
             },
-            spec.quantization,
+            spec.format.encoding().weight_quantization(),
             context,
         ))?;
         let weight = spec.weight;
@@ -2600,14 +2594,11 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
         if let Some(bias) = spec.bias {
             topology.push(("bias", bias));
         }
-        if let Some(quantization) = spec
-            .quantization
-            .filter(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
-        {
-            topology.push(("scales", companion_spec(&weight, "scales")));
-            if quantization.has_biases() {
-                topology.push(("biases", companion_spec(&weight, "biases")));
-            }
+        if let Some(scale) = spec.format.scale() {
+            topology.push(("scales", scale.clone()));
+        }
+        if let Some(bias) = spec.format.affine_bias() {
+            topology.push(("biases", bias.clone()));
         }
         if let Some(correction_bias) = spec.correction_bias {
             topology.push(("e_score_correction_bias", correction_bias));
@@ -2639,7 +2630,7 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
                 "independent expert units must be acquired through a runtime expert provider",
             ));
         };
-        let native_fp8 = match (gate_up.format, down.format) {
+        let native_fp8 = match (gate_up.format.encoding(), down.format.encoding()) {
             (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
                 if gate == down
                     && gate.scale_encoding == eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 =>
@@ -2662,8 +2653,8 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             spec.expert_count,
             spec.input_dimensions,
             spec.intermediate_dimensions,
-            gate_up.format.weight_quantization(),
-            down.format.weight_quantization(),
+            gate_up.format.encoding().weight_quantization(),
+            down.format.encoding().weight_quantization(),
             [gate_up.bias.is_some(), down.bias.is_some()],
             context,
         ))?;
@@ -2681,17 +2672,17 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
         if let Some(bias) = &down.bias {
             topology.push(("down_proj_bias", bias.clone()));
         }
-        if let Some(quantization) = &gate_up.quantization {
-            topology.push(("gate_up_proj_scales", quantization.scales.clone()));
-            if let Some(biases) = &quantization.biases {
-                topology.push(("gate_up_proj_biases", biases.clone()));
-            }
+        if let Some(scale) = gate_up.format.scale() {
+            topology.push(("gate_up_proj_scales", scale.clone()));
         }
-        if let Some(quantization) = &down.quantization {
-            topology.push(("down_proj_scales", quantization.scales.clone()));
-            if let Some(biases) = &quantization.biases {
-                topology.push(("down_proj_biases", biases.clone()));
-            }
+        if let Some(bias) = gate_up.format.affine_bias() {
+            topology.push(("gate_up_proj_biases", bias.clone()));
+        }
+        if let Some(scale) = down.format.scale() {
+            topology.push(("down_proj_scales", scale.clone()));
+        }
+        if let Some(bias) = down.format.affine_bias() {
+            topology.push(("down_proj_biases", bias.clone()));
         }
         Ok(MlxGatedProductExpertBank {
             spec,
@@ -2714,8 +2705,8 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             spec.hidden_dimensions,
             spec.intermediate_dimensions,
             [
-                spec.up.format.weight_quantization(),
-                spec.down.format.weight_quantization(),
+                spec.up.format.encoding().weight_quantization(),
+                spec.down.format.encoding().weight_quantization(),
             ],
             context,
         ))?;
@@ -2723,17 +2714,17 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             ("up_proj", spec.up.weight.clone()),
             ("down_proj", spec.down.weight.clone()),
         ];
-        if let Some(quantization) = &spec.up.quantization {
-            topology.push(("up_proj_scales", quantization.scales.clone()));
-            if let Some(biases) = &quantization.biases {
-                topology.push(("up_proj_biases", biases.clone()));
-            }
+        if let Some(scale) = spec.up.format.scale() {
+            topology.push(("up_proj_scales", scale.clone()));
         }
-        if let Some(quantization) = &spec.down.quantization {
-            topology.push(("down_proj_scales", quantization.scales.clone()));
-            if let Some(biases) = &quantization.biases {
-                topology.push(("down_proj_biases", biases.clone()));
-            }
+        if let Some(bias) = spec.up.format.affine_bias() {
+            topology.push(("up_proj_biases", bias.clone()));
+        }
+        if let Some(scale) = spec.down.format.scale() {
+            topology.push(("down_proj_scales", scale.clone()));
+        }
+        if let Some(bias) = spec.down.format.affine_bias() {
+            topology.push(("down_proj_biases", bias.clone()));
         }
         Ok(MlxRelu2ExpertBank {
             module: MlxNamedModule::with_exact_topology(module, topology)?,
@@ -2820,12 +2811,11 @@ mod neutral_semantic_operator_tests {
     use eredu_checkpoint::{AffineQuantization, LinearFormat, WeightQuantization};
     use eredu_nn::{
         reference_expand_heads, reference_segmented_attention, EmbeddingLookupPolicy,
-        EmbeddingOperator, EmbeddingSpec, ExpertProjectionSpec, ExpertQuantizationSpec,
-        FusedProjectionLayout, FusedProjectionSegment, GatedProductExpertBankSpec,
-        GatedProductExpertLayout, HeadExpansion, JointExpertRoutingInput, LinearOperator,
-        LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationScale,
-        ParameterSpec, RelativeAttentionInput, Relu2ExpertBankSpec, RoutedNeuralBackend,
-        SegmentedAttentionInput, Tensor,
+        EmbeddingOperator, EmbeddingSpec, ExpertProjectionSpec, FusedProjectionLayout,
+        FusedProjectionSegment, GatedProductExpertBankSpec, GatedProductExpertLayout,
+        HeadExpansion, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
+        NormalizationConstructionSpec, NormalizationScale, ParameterSpec, RelativeAttentionInput,
+        Relu2ExpertBankSpec, RoutedNeuralBackend, SegmentedAttentionInput, Tensor,
     };
     use safemlx::{
         ops::{quantize_with_mode, QuantizationMode},
@@ -2890,23 +2880,114 @@ mod neutral_semantic_operator_tests {
         ParameterSpec::trainable(name).unwrap()
     }
 
+    fn test_format(weight: &str, format: LinearFormat) -> eredu_nn::LinearFormatSpec {
+        let prefix = weight.strip_suffix(".weight").unwrap_or(weight);
+        match format {
+            LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => {
+                eredu_nn::LinearFormatSpec::unscaled(format).unwrap()
+            }
+            LinearFormat::E4M3BlockFp8(_) => eredu_nn::LinearFormatSpec::scaled(
+                format,
+                parameter(&format!("{prefix}.weight_scale_inv")),
+            )
+            .unwrap(),
+            LinearFormat::MxFp4 => {
+                eredu_nn::LinearFormatSpec::scaled(format, parameter(&format!("{prefix}.scales")))
+                    .unwrap()
+            }
+            LinearFormat::Affine(_) => eredu_nn::LinearFormatSpec::affine(
+                format,
+                parameter(&format!("{prefix}.scales")),
+                parameter(&format!("{prefix}.biases")),
+            )
+            .unwrap(),
+        }
+    }
+
     fn affine_expert_projection(weight: &str, scales: &str, biases: &str) -> ExpertProjectionSpec {
         ExpertProjectionSpec {
             weight: parameter(weight),
             bias: None,
-            format: LinearFormat::Affine(AffineQuantization::new(32, 4).unwrap()),
-            quantization: Some(ExpertQuantizationSpec {
-                scales: parameter(scales),
-                biases: Some(parameter(biases)),
-            }),
+            format: eredu_nn::LinearFormatSpec::affine(
+                LinearFormat::Affine(AffineQuantization::new(32, 4).unwrap()),
+                parameter(scales),
+                parameter(biases),
+            )
+            .unwrap(),
         }
     }
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn mlx_expert_topology_uses_literal_neutral_identities() {
+    fn mlx_quantized_topologies_use_literal_neutral_identities() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = execution.stream();
+        let affine = LinearFormat::Affine(AffineQuantization::new(32, 4).unwrap());
+        let linear = <MlxNeuralBackend as NeuralBackend>::linear(
+            LinearSpec {
+                input: 32,
+                output: 32,
+                weight: parameter("arbitrary.linear.matrix"),
+                bias: None,
+                format: eredu_nn::LinearFormatSpec::affine(
+                    affine,
+                    parameter("arbitrary.linear.scale"),
+                    parameter("arbitrary.linear.affine"),
+                )
+                .unwrap(),
+            },
+            stream,
+        )
+        .unwrap();
+        let linear_ids = eredu_nn::validate_parameter_topology::<MlxTensor, _>(&linear)
+            .unwrap()
+            .into_iter()
+            .map(|parameter| parameter.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            linear_ids,
+            [
+                "arbitrary.linear.affine",
+                "arbitrary.linear.matrix",
+                "arbitrary.linear.scale",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+
+        let embedding = <MlxNeuralBackend as NeuralBackend>::embedding(
+            EmbeddingSpec {
+                vocabulary: 32,
+                dimensions: 32,
+                weight: parameter("arbitrary.embedding.table"),
+                format: eredu_nn::LinearFormatSpec::affine(
+                    affine,
+                    parameter("arbitrary.embedding.scale"),
+                    parameter("arbitrary.embedding.affine"),
+                )
+                .unwrap(),
+            },
+            stream,
+        )
+        .unwrap();
+        let embedding_ids = eredu_nn::validate_parameter_topology::<MlxTensor, _>(&embedding)
+            .unwrap()
+            .into_iter()
+            .map(|parameter| parameter.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            embedding_ids,
+            [
+                "arbitrary.embedding.affine",
+                "arbitrary.embedding.scale",
+                "arbitrary.embedding.table",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+
         let gate = affine_expert_projection(
             "arbitrary.gated.matrix_a",
             "arbitrary.gated.scale_a",
@@ -3037,7 +3118,7 @@ mod neutral_semantic_operator_tests {
                 output,
                 weight: parameter(name),
                 bias: None,
-                format,
+                format: test_format(name, format),
             },
             stream,
         )
@@ -3083,7 +3164,7 @@ mod neutral_semantic_operator_tests {
                 vocabulary,
                 dimensions,
                 weight: parameter(name),
-                quantization,
+                format: test_format(name, quantization.into()),
             },
             stream,
         )
@@ -3317,7 +3398,7 @@ mod neutral_semantic_operator_tests {
                         vocabulary: 4,
                         dimensions,
                         weight: parameter(&format!("tables.{table}.weight")),
-                        quantization,
+                        format: test_format(&format!("tables.{table}.weight"), quantization.into()),
                     },
                     lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
                 })

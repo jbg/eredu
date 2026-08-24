@@ -590,8 +590,12 @@ fn execute_cached_gated_product_inner(
                 acquired.identities().len() as i32,
                 spec.input_dimensions,
                 spec.intermediate_dimensions,
-                gate_up.format.weight_quantization().or(load_time),
-                down.format.weight_quantization().or(load_time),
+                gate_up
+                    .format
+                    .encoding()
+                    .weight_quantization()
+                    .or(load_time),
+                down.format.encoding().weight_quantization().or(load_time),
                 [gate_up.bias.is_some(), down.bias.is_some()],
                 stream,
             )?
@@ -676,8 +680,16 @@ pub fn execute_cached_relu2(
                 spec.hidden_dimensions,
                 spec.intermediate_dimensions,
                 [
-                    spec.up.format.weight_quantization().or(load_time),
-                    spec.down.format.weight_quantization().or(load_time),
+                    spec.up
+                        .format
+                        .encoding()
+                        .weight_quantization()
+                        .or(load_time),
+                    spec.down
+                        .format
+                        .encoding()
+                        .weight_quantization()
+                        .or(load_time),
                 ],
                 stream,
             )?;

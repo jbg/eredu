@@ -340,11 +340,11 @@ mod tests {
             panic!("GPT-OSS experts must use packed architecture geometry");
         };
         assert_eq!(
-            gate_up.format.weight_quantization(),
+            gate_up.format.encoding().weight_quantization(),
             Some(eredu_checkpoint::WeightQuantization::MxFp4)
         );
         assert_eq!(
-            down.format.weight_quantization(),
+            down.format.encoding().weight_quantization(),
             Some(eredu_checkpoint::WeightQuantization::MxFp4)
         );
         assert!(gate_up.bias.is_some());

@@ -102,7 +102,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                 vocabulary: text_input_vocabulary,
                 dimensions: config.temporal().hidden_size(),
                 weight: ParameterSpec::trainable("text_emb.weight").map_err(Error::backend)?,
-                quantization: config.native_quantization(),
+                format: crate::linear_format::standard_linear_format(
+                    "text_emb.weight",
+                    config.native_quantization().into(),
+                )?,
             },
             lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
         });
@@ -113,8 +116,11 @@ impl<B: NeuralBackend> StaticModules<B> {
                 embedding: EmbeddingSpec {
                     vocabulary: audio_input_vocabulary,
                     dimensions: config.temporal().hidden_size(),
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    quantization: config.native_quantization(),
+                    weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+                    format: crate::linear_format::standard_linear_format(
+                        &name,
+                        config.native_quantization().into(),
+                    )?,
                 },
                 lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
             });
@@ -138,7 +144,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                 output: config.text_vocabulary_size(),
                 weight: ParameterSpec::trainable("text_linear.weight").map_err(Error::backend)?,
                 bias: None,
-                format: config.native_quantization().into(),
+                format: crate::linear_format::standard_linear_format(
+                    "text_linear.weight",
+                    config.native_quantization().into(),
+                )?,
             },
             context,
         )?;
@@ -197,7 +206,10 @@ impl<B: NeuralBackend> StaticModules<B> {
                 output: config.text_vocabulary_size(),
                 weight: ParameterSpec::trainable("text_linear.weight").map_err(Error::backend)?,
                 bias: None,
-                format: config.native_quantization().into(),
+                format: crate::linear_format::standard_linear_format(
+                    "text_linear.weight",
+                    config.native_quantization().into(),
+                )?,
             },
             VocabularyParallelRange {
                 global_vocabulary: config.text_vocabulary_size() as usize,
