@@ -24,9 +24,9 @@ pub use conditional::{
 pub use config::{
     fp8_block_row_widths, fused_projection_widths, model_args_from_config_value,
     model_args_from_gguf_catalog, prompt_cache_architecture_fingerprint, state_layout,
-    state_layout_with_geometry, with_gguf_vision_projector, HybridConfig, HybridConfigError,
-    HybridLayerPolicy, HybridStateGeometry, HybridVariant, ParsedHybridConfig,
-    QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
+    state_layout_with_geometry, vision_config_from_gguf_catalog, with_gguf_vision_projector,
+    HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry, HybridVariant,
+    ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use linear_attention::LinearAttention;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};

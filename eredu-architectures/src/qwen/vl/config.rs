@@ -14,7 +14,7 @@ use eredu_runtime::StateLayout;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::qwen::vision::{VisionConfig, VisionConfigSource};
+use crate::qwen::vision::{VisionConfig, VisionConfigSource, VisionGgufCatalog, VisionMode};
 use crate::{
     qwen::{self, TextConfigContext},
     GgufArchitecture,
@@ -41,6 +41,15 @@ pub struct ModelArgs {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("{0}")]
 pub struct VlConfigError(pub String);
+
+/// Parses a shared projector GGUF with Qwen3-VL DeepStack semantics.
+pub fn vision_config_from_gguf_catalog(
+    catalog: &impl VisionGgufCatalog,
+    metadata: &HashMap<String, MetadataValue>,
+) -> Result<VisionConfig, VlConfigError> {
+    crate::qwen::vision::config_from_gguf_catalog(catalog, metadata, VisionMode::DeepStack)
+        .map_err(|error| invalid(error.to_string()))
+}
 
 /// Parses dense or MoE Qwen3-VL into shared neutral components.
 pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, VlConfigError> {
@@ -149,6 +158,9 @@ pub fn model_args_from_gguf_parts(
     metadata: &HashMap<String, MetadataValue>,
     vision: VisionConfig,
 ) -> Result<ModelArgs, VlConfigError> {
+    vision
+        .validate_for(VisionMode::DeepStack)
+        .map_err(|error| invalid(error.to_string()))?;
     if !text.tie_word_embeddings {
         return Err(invalid("Qwen3-VL GGUF requires tied word embeddings"));
     }

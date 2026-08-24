@@ -608,41 +608,36 @@ pub struct VisionStatic<B: NeuralBackend> {
     pub(super) deepstack_mergers: Vec<Merger<B>>,
     #[parameter(skip)]
     config: VisionConfig,
-    #[parameter(skip)]
-    mode: VisionMode,
 }
 
 impl<B: NeuralBackend> VisionStatic<B> {
     /// Builds static modules for one explicit vision mode.
     pub fn new(
         config: VisionConfig,
-        mode: VisionMode,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_root(config, mode, "", context)
+        Self::new_with_root(config, "", context)
     }
 
     /// Builds pinned vision modules below an explicit canonical root.
     pub fn new_with_root(
         config: VisionConfig,
-        mode: VisionMode,
         parameter_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let width = config.hidden_size * config.spatial_merge_size * config.spatial_merge_size;
         let intermediates = vec![width; config.deepstack_layer_count() + 1];
-        Self::new_parallel_with_root(config, mode, parameter_root, &intermediates, context)
+        Self::new_parallel_with_root(config, parameter_root, &intermediates, context)
     }
 
     /// Builds pinned modules with rank-local merger intermediate widths.
     pub fn new_parallel_with_root(
         config: VisionConfig,
-        mode: VisionMode,
         parameter_root: &str,
         merger_intermediates: &[i32],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate(mode).map_err(Error::backend)?;
+        config.validate().map_err(Error::backend)?;
         if merger_intermediates.len() != config.deepstack_layer_count() + 1
             || merger_intermediates.iter().any(|width| *width <= 0)
         {
@@ -665,7 +660,7 @@ impl<B: NeuralBackend> VisionStatic<B> {
             &config,
             &rooted(parameter_root, "merger"),
             false,
-            mode == VisionMode::WindowScheduled,
+            config.mode == VisionMode::WindowScheduled,
             merger_intermediates[0],
             context,
         )?;
@@ -687,7 +682,6 @@ impl<B: NeuralBackend> VisionStatic<B> {
             merger,
             deepstack_mergers,
             config,
-            mode,
         })
     }
 
@@ -704,7 +698,7 @@ impl<B: NeuralBackend> VisionStatic<B> {
         )
         .map_err(Error::backend)?;
         let mut hidden = self.patch.forward(input.pixels, context)?;
-        let positions = match self.mode {
+        let positions = match self.config.mode {
             VisionMode::DeepStack => interpolated_positions::<B>(
                 &mut self.position,
                 input.grid,
@@ -722,7 +716,7 @@ impl<B: NeuralBackend> VisionStatic<B> {
         hidden = hidden.add(&positions, context)?;
         let full_chunks = attention_chunk_lengths(input.grid).map_err(Error::backend)?;
         let unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
-        let (permutation, window_chunks) = match self.mode {
+        let (permutation, window_chunks) = match self.config.mode {
             VisionMode::DeepStack => ((0..hidden.dim(0) / unit).collect(), full_chunks.clone()),
             VisionMode::WindowScheduled => {
                 let p = window_partition(
@@ -877,16 +871,14 @@ impl<B: NeuralBackend> VisionTower<B> {
     /// Builds one shared tower.
     pub fn new(
         config: VisionConfig,
-        mode: VisionMode,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_root(config, mode, "", context)
+        Self::new_with_root(config, "", context)
     }
 
     /// Builds the tower below an explicit canonical parameter root.
     pub fn new_with_root(
         config: VisionConfig,
-        mode: VisionMode,
         parameter_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
@@ -894,7 +886,7 @@ impl<B: NeuralBackend> VisionTower<B> {
             .map(|i| VisionBlock::new_with_root(&config, parameter_root, i, context))
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            static_modules: VisionStatic::new_with_root(config, mode, parameter_root, context)?,
+            static_modules: VisionStatic::new_with_root(config, parameter_root, context)?,
             blocks,
         })
     }

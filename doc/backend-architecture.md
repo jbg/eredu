@@ -221,6 +221,11 @@ Catalog-dependent configuration normalization likewise receives a neutral
 physical tensor-name catalog: the architecture owns exact-name probes and the
 semantic configuration choices they control, while concrete backends only
 adapt their native catalogs to that contract.
+Shared projector formats retain their architecture-selected execution mode in
+the normalized configuration. In particular, Qwen3-VL DeepStack and Qwen3.5
+window-scheduled position, attention, and merger semantics are selected while
+parsing the projector and consumed unchanged by inspection, checkpoint
+planning, and execution.
 Packed recipes expose format semantics rather than a concrete accelerator's
 storage units. In particular, canonical MXFP4 expert recipes describe logical
 F4 values regardless of whether a source stores byte blocks or integer words;

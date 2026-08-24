@@ -533,6 +533,19 @@ pub struct ParsedHybridConfig {
     pub vision: Option<VisionConfig>,
 }
 
+/// Parses a shared projector GGUF with Qwen3.5 window-scheduled semantics.
+pub fn vision_config_from_gguf_catalog(
+    catalog: &impl crate::qwen::vision::VisionGgufCatalog,
+    metadata: &HashMap<String, MetadataValue>,
+) -> Result<VisionConfig, HybridConfigError> {
+    crate::qwen::vision::config_from_gguf_catalog(
+        catalog,
+        metadata,
+        crate::qwen::vision::VisionMode::WindowScheduled,
+    )
+    .map_err(|error| invalid(error.to_string()))
+}
+
 /// Strictly normalizes every admitted hybrid family model type.
 pub fn model_args_from_config_value(
     value: &Value,
@@ -851,6 +864,9 @@ pub fn with_gguf_vision_projector(
     if parsed.text.variant == HybridVariant::Qwen3Next {
         return Err(invalid("Qwen3-Next GGUF cannot attach a vision projector"));
     }
+    vision
+        .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+        .map_err(|error| invalid(error.to_string()))?;
     if vision.out_hidden_size != parsed.text.hidden_size {
         return Err(invalid(format!(
             "Qwen3.5 projector output {} does not match text hidden size {}",

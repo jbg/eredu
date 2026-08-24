@@ -23,16 +23,18 @@ pub fn load_time_quantization(
     target.vision.apply_load_time_quantization(quantization);
     target
         .vision
-        .validate(vision::VisionMode::DeepStack)
+        .validate_for(vision::VisionMode::DeepStack)
         .map_err(|error| error.to_string())?;
     Ok(target)
 }
 
 /// Builds one strict catalog for the ordinary Qwen decoder plus shared vision tower.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
+    args.vision
+        .validate_for(vision::VisionMode::DeepStack)
+        .map_err(|error| error.to_string())?;
     let mut text = qwen::safetensors_plan_with_root(&args.text, &args.text.parameter_root, true)?;
-    let vision =
-        vision::safetensors_plan(&args.vision, vision::VisionMode::DeepStack, "model.visual")?;
+    let vision = vision::safetensors_plan(&args.vision, "model.visual")?;
     text.common_tensors.extend(vision.common_tensors);
     text.layout_groups.extend(vision.layout_groups);
     let policy = text.catalog_policy;
@@ -209,7 +211,7 @@ mod tests {
         target.text.validate().unwrap();
         target
             .vision
-            .validate(vision::VisionMode::DeepStack)
+            .validate_for(vision::VisionMode::DeepStack)
             .unwrap();
     }
 

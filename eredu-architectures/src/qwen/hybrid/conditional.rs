@@ -569,6 +569,9 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
             .vision
             .clone()
             .ok_or_else(|| Error::backend("conditional Qwen3.5 requires vision config"))?;
+        vision
+            .validate_for(VisionMode::WindowScheduled)
+            .map_err(Error::backend)?;
         let text_model = super::LayeredModel::<B>::new(parsed.text.clone(), context)?;
         let text = text_model.into_static_modules();
         let target_layers =
@@ -579,12 +582,7 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
             parsed,
             static_modules: ConditionalStaticModules {
                 text,
-                vision: VisionStatic::new_with_root(
-                    vision,
-                    VisionMode::WindowScheduled,
-                    "model.visual",
-                    context,
-                )?,
+                vision: VisionStatic::new_with_root(vision, "model.visual", context)?,
             },
             target_layers,
             prediction_steps,
@@ -648,6 +646,9 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
             .vision
             .clone()
             .ok_or_else(|| Error::backend("conditional Qwen3.5 requires vision config"))?;
+        vision_config
+            .validate_for(VisionMode::WindowScheduled)
+            .map_err(Error::backend)?;
         let text_model = super::LayeredModel::<B>::new_parallel(
             parsed.text.clone(),
             geometry.text().clone(),
@@ -663,7 +664,6 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
                 text: text_model.into_static_modules(),
                 vision: VisionStatic::new_parallel_with_root(
                     vision_config,
-                    VisionMode::WindowScheduled,
                     "model.visual",
                     geometry.merger_widths(),
                     context,

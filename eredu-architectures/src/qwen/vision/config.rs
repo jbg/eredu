@@ -46,6 +46,8 @@ pub enum VisionMode {
 /// Shared vision encoder configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisionConfig {
+    /// Architecture-owned position, scheduling, and merger semantics.
+    pub mode: VisionMode,
     /// Authoritative ordered execution policy for every block.
     pub layer_schedule: LayerSchedule<VisionLayerPolicy>,
     /// Vision transformer hidden size.
@@ -107,9 +109,14 @@ impl VisionConfig {
         layers.into_iter().map(|(_, layer)| layer).collect()
     }
 
-    /// Stable schedule identity used by diagnostics and prompt fingerprints.
+    /// Stable execution identity used by diagnostics and prompt fingerprints.
     pub fn layer_schedule_fingerprint(&self) -> String {
-        self.layer_schedule
+        let mode = match self.mode {
+            VisionMode::DeepStack => "deepstack",
+            VisionMode::WindowScheduled => "window_scheduled",
+        };
+        let schedule = self
+            .layer_schedule
             .iter()
             .map(|policy| {
                 let attention = match policy.attention {
@@ -122,7 +129,8 @@ impl VisionConfig {
                 )
             })
             .collect::<Vec<_>>()
-            .join(",")
+            .join(",");
+        format!("{mode}:{schedule}")
     }
 
     /// Resolves one canonical parameter's complete linear format.
@@ -171,7 +179,7 @@ impl VisionConfig {
     }
 
     /// Validates exact shared geometry and mode-specific scheduling.
-    pub fn validate(&self, mode: VisionMode) -> Result<(), VisionConfigError> {
+    pub fn validate(&self) -> Result<(), VisionConfigError> {
         for (name, value) in [
             ("hidden_size", self.hidden_size),
             ("intermediate_size", self.intermediate_size),
@@ -218,7 +226,7 @@ impl VisionConfig {
                 "DeepStack merger banks must be unique and contiguous from zero, got {mergers:?}"
             )));
         }
-        if mode == VisionMode::DeepStack
+        if self.mode == VisionMode::DeepStack
             && self
                 .layer_schedule
                 .iter()
@@ -249,6 +257,18 @@ impl VisionConfig {
                 .map_err(|error| VisionConfigError::Invalid(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Validates this configuration for the consuming Qwen family without
+    /// allowing the consumer to reinterpret its execution mode.
+    pub fn validate_for(&self, expected: VisionMode) -> Result<(), VisionConfigError> {
+        if self.mode != expected {
+            return Err(VisionConfigError::Invalid(format!(
+                "vision mode {:?} does not match required {:?} semantics",
+                self.mode, expected
+            )));
+        }
+        self.validate()
     }
 }
 
@@ -374,6 +394,7 @@ impl VisionConfigSource {
             VisionConfigError::Invalid(format!("{architecture} vision {error}"))
         })?;
         let config = VisionConfig {
+            mode,
             layer_schedule,
             hidden_size: self.hidden_size,
             hidden_act: self.hidden_act,
@@ -388,7 +409,7 @@ impl VisionConfigSource {
             out_hidden_size: self.out_hidden_size,
             linear_formats: HashMap::new(),
         };
-        config.validate(mode)?;
+        config.validate()?;
         Ok(config)
     }
 }
@@ -419,10 +440,12 @@ pub trait VisionGgufCatalog {
     fn shape(&self, name: &str) -> Option<Vec<usize>>;
 }
 
-/// Normalizes the shared llama.cpp Qwen vision projector contract.
+/// Normalizes the shared llama.cpp Qwen vision projector contract under the
+/// consuming family's explicit execution mode.
 pub fn config_from_gguf_catalog(
     catalog: &impl VisionGgufCatalog,
     metadata: &HashMap<String, MetadataValue>,
+    mode: VisionMode,
 ) -> Result<VisionConfig, VisionConfigError> {
     let string = |key: &str| match metadata.get(key) {
         Some(MetadataValue::String(value)) => Ok(value.as_str()),
@@ -496,6 +519,7 @@ pub fn config_from_gguf_catalog(
         })
         .collect::<Vec<_>>();
     let config = VisionConfig {
+        mode,
         layer_schedule: LayerSchedule::new(depth, policies)
             .map_err(|error| VisionConfigError::Invalid(error.to_string()))?,
         hidden_size,
@@ -513,7 +537,7 @@ pub fn config_from_gguf_catalog(
         out_hidden_size: integer("clip.vision.projection_dim")?,
         linear_formats: HashMap::new(),
     };
-    config.validate(VisionMode::DeepStack)?;
+    config.validate()?;
     Ok(config)
 }
 
@@ -568,6 +592,53 @@ mod tests {
 
     use super::*;
 
+    struct Catalog;
+
+    impl VisionGgufCatalog for Catalog {
+        fn shape(&self, name: &str) -> Option<Vec<usize>> {
+            (name == "v.position_embd.weight").then_some(vec![16, 16])
+        }
+    }
+
+    fn projector_metadata() -> HashMap<String, MetadataValue> {
+        HashMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("clip".into()),
+            ),
+            (
+                "clip.projector_type".into(),
+                MetadataValue::String("qwen3vl_merger".into()),
+            ),
+            (
+                "clip.vision.embedding_length".into(),
+                MetadataValue::Uint32(16),
+            ),
+            (
+                "clip.vision.feed_forward_length".into(),
+                MetadataValue::Uint32(24),
+            ),
+            (
+                "clip.vision.attention.head_count".into(),
+                MetadataValue::Uint32(4),
+            ),
+            ("clip.vision.block_count".into(), MetadataValue::Uint32(2)),
+            ("clip.vision.patch_size".into(), MetadataValue::Uint32(2)),
+            (
+                "clip.vision.spatial_merge_size".into(),
+                MetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.projection_dim".into(),
+                MetadataValue::Uint32(32),
+            ),
+            (
+                "clip.vision.is_deepstack_layers".into(),
+                MetadataValue::Array(MetadataArray::Bool(vec![true, false])),
+            ),
+        ])
+    }
+
     #[test]
     fn freezes_full_and_windowed_schedules_with_deepstack_identity() {
         let deepstack: VisionConfigSource = serde_json::from_value(json!({
@@ -585,7 +656,11 @@ mod tests {
         }))
         .unwrap();
         let deepstack = deepstack.normalize_qwen3_vl().unwrap();
-        assert_eq!(deepstack.layer_schedule_fingerprint(), "f,fd0,f,fd1");
+        assert_eq!(
+            deepstack.layer_schedule_fingerprint(),
+            "deepstack:f,fd0,f,fd1"
+        );
+        assert_eq!(deepstack.mode, VisionMode::DeepStack);
         assert_eq!(deepstack.deepstack_layers(), vec![1, 3]);
 
         let windowed: VisionConfigSource = serde_json::from_value(json!({
@@ -605,7 +680,11 @@ mod tests {
         }))
         .unwrap();
         let windowed = windowed.normalize_qwen3_5().unwrap();
-        assert_eq!(windowed.layer_schedule_fingerprint(), "w,f,wd0,f");
+        assert_eq!(
+            windowed.layer_schedule_fingerprint(),
+            "window_scheduled:w,f,wd0,f"
+        );
+        assert_eq!(windowed.mode, VisionMode::WindowScheduled);
     }
 
     #[test]
@@ -625,5 +704,26 @@ mod tests {
         }))
         .unwrap();
         assert!(duplicate.normalize_qwen3_5().is_err());
+    }
+
+    #[test]
+    fn gguf_projector_retains_the_consuming_family_mode() {
+        let metadata = projector_metadata();
+        let qwen3_vl =
+            crate::qwen::vl::vision_config_from_gguf_catalog(&Catalog, &metadata).unwrap();
+        let qwen35 =
+            crate::qwen::hybrid::vision_config_from_gguf_catalog(&Catalog, &metadata).unwrap();
+
+        assert_eq!(qwen3_vl.mode, VisionMode::DeepStack);
+        assert_eq!(qwen35.mode, VisionMode::WindowScheduled);
+        assert!(qwen3_vl.validate_for(VisionMode::WindowScheduled).is_err());
+        assert!(qwen35.validate_for(VisionMode::DeepStack).is_err());
+        assert_eq!(qwen3_vl.deepstack_layers(), vec![0]);
+        assert_eq!(qwen35.deepstack_layers(), vec![0]);
+        assert_eq!(qwen3_vl.layer_schedule_fingerprint(), "deepstack:fd0,f");
+        assert_eq!(
+            qwen35.layer_schedule_fingerprint(),
+            "window_scheduled:fd0,f"
+        );
     }
 }

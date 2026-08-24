@@ -1120,6 +1120,7 @@ mod tests {
     #[test]
     fn qwen_plan_owns_window_geometry_and_grid_validation() {
         let config = VisionConfig {
+            mode: crate::qwen::vision::VisionMode::WindowScheduled,
             layer_schedule: eredu_core::attention::LayerSchedule::new(
                 2,
                 vec![

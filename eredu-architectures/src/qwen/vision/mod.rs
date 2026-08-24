@@ -6,9 +6,10 @@ mod model;
 mod parallel;
 
 pub use checkpoint::{gguf_plan, safetensors_plan, translate_gguf_weight_name};
+pub(crate) use config::config_from_gguf_catalog;
 pub use config::{
-    config_from_gguf_catalog, VisionAttentionPolicy, VisionConfig, VisionConfigError,
-    VisionConfigSource, VisionGgufCatalog, VisionLayerPolicy, VisionMode,
+    VisionAttentionPolicy, VisionConfig, VisionConfigError, VisionConfigSource, VisionGgufCatalog,
+    VisionLayerPolicy, VisionMode,
 };
 pub use model::{VisionBlock, VisionInput, VisionOutput, VisionState, VisionStatic, VisionTower};
 pub use parallel::{

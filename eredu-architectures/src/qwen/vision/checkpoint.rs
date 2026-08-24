@@ -6,15 +6,14 @@ use eredu_checkpoint::schema::{
     StoredDtypeConstraint, TensorOperation,
 };
 
-use super::{VisionConfig, VisionMode};
+use super::VisionConfig;
 
 /// Builds the strict canonical vision catalog below an optional artifact prefix.
 pub fn safetensors_plan(
     config: &VisionConfig,
-    mode: VisionMode,
     prefix: &str,
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    config.validate(mode).map_err(|error| error.to_string())?;
+    config.validate().map_err(|error| error.to_string())?;
     let hidden = dim(config.hidden_size)?;
     let intermediate = dim(config.intermediate_size)?;
     let merge = dim(config.spatial_merge_size)?;

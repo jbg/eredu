@@ -1022,7 +1022,7 @@ pub fn prepare_gguf_pipeline(
     let projector_metadata =
         crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
-        vision::config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
+        vl::vision_config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
@@ -1095,7 +1095,7 @@ pub fn load_gguf(
     let projector_metadata =
         crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
-        vision::config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
+        vl::vision_config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);

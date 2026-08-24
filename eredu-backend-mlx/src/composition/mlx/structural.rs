@@ -1114,7 +1114,14 @@ pub fn validate_qwen3_vl_projector_gguf(
         Ok(text) => text,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    validate_neutral_qwen_projector(checkpoint, metadata, text.hidden_size, true)
+    let vision = match eredu_architectures::qwen::vl::vision_config_from_gguf_catalog(
+        &NeutralQwenVisionGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(vision) => vision,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    validate_neutral_qwen_projector(checkpoint, vision, text.hidden_size)
 }
 
 pub fn validate_qwen35_projector_gguf(
@@ -1130,7 +1137,14 @@ pub fn validate_qwen35_projector_gguf(
         Ok(parsed) => parsed.text,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    validate_neutral_qwen_projector(checkpoint, metadata, text.hidden_size, false)
+    let vision = match eredu_architectures::qwen::hybrid::vision_config_from_gguf_catalog(
+        &NeutralQwenVisionGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(vision) => vision,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    validate_neutral_qwen_projector(checkpoint, vision, text.hidden_size)
 }
 
 struct NeutralQwenVisionGgufCatalog<'a>(&'a GgufCheckpoint);
@@ -1154,27 +1168,13 @@ impl eredu_architectures::qwen::vision::VisionGgufCatalog for NeutralQwenVisionG
 
 fn validate_neutral_qwen_projector(
     checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+    vision: eredu_architectures::qwen::vision::VisionConfig,
     text_hidden: i32,
-    allow_deepstack: bool,
 ) -> StructuralValidation {
-    let vision = match eredu_architectures::qwen::vision::config_from_gguf_catalog(
-        &NeutralQwenVisionGgufCatalog(checkpoint),
-        metadata,
-    ) {
-        Ok(vision) => vision,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
     if vision.out_hidden_size != text_hidden {
         return invalid_geometry(format!(
             "Qwen projector output {} does not match language hidden size {text_hidden}",
             vision.out_hidden_size
-        ));
-    }
-    if !allow_deepstack && vision.deepstack_layer_count() != 0 {
-        return invalid_geometry(format!(
-            "Qwen3.5 projector declares {} unsupported DeepStack outputs",
-            vision.deepstack_layer_count()
         ));
     }
     let deepstack = vision.deepstack_layers();

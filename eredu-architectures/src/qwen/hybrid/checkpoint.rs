@@ -40,7 +40,7 @@ pub fn conditional_load_time_quantization(
     if let Some(vision) = target.vision.as_mut() {
         vision.apply_load_time_quantization(quantization);
         vision
-            .validate(crate::qwen::vision::VisionMode::WindowScheduled)
+            .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
             .map_err(|error| error.to_string())?;
     }
     Ok(target)

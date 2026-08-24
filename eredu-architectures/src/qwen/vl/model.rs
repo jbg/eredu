@@ -529,13 +529,11 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VISION,
         )?;
+        args.vision
+            .validate_for(VisionMode::DeepStack)
+            .map_err(Error::backend)?;
         let text = qwen::StaticModules::new(&args.text, context)?;
-        let vision = VisionStatic::new_with_root(
-            args.vision.clone(),
-            VisionMode::DeepStack,
-            "model.visual",
-            context,
-        )?;
+        let vision = VisionStatic::new_with_root(args.vision.clone(), "model.visual", context)?;
         Ok(Self {
             args,
             static_modules: StaticModules { text, vision },
@@ -553,11 +551,13 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VISION,
         )?;
+        args.vision
+            .validate_for(VisionMode::DeepStack)
+            .map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let text = qwen::StaticModules::new_parallel(&args.text, geometry.text(), context)?;
         let vision = VisionStatic::new_parallel_with_root(
             args.vision.clone(),
-            VisionMode::DeepStack,
             "model.visual",
             geometry.merger_widths(),
             context,

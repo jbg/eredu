@@ -732,9 +732,11 @@ fn prepare_hybrid_gguf_store(
     };
     let projector_metadata =
         crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
-    let mut vision =
-        vision::config_from_gguf_catalog(&HybridVisionGgufCatalog(projector), &projector_metadata)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let mut vision = hybrid::vision_config_from_gguf_catalog(
+        &HybridVisionGgufCatalog(projector),
+        &projector_metadata,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate = |name: &str| hybrid::translate_vision_gguf_weight_name(name, &deepstack);
     projector
