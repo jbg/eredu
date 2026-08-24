@@ -405,7 +405,16 @@ impl Drop for MlxCompletion {
 
 impl MlxCompletion {
     pub fn submission(output: Array) -> Result<Submission<Array, Self>, Error> {
-        let retained = vec![output.clone()];
+        Self::submission_retaining(output, std::iter::empty())
+    }
+
+    pub(crate) fn submission_retaining(
+        output: Array,
+        additional: impl IntoIterator<Item = Array>,
+    ) -> Result<Submission<Array, Self>, Error> {
+        let retained = std::iter::once(output.clone())
+            .chain(additional)
+            .collect::<Vec<_>>();
         let event = async_eval_with_event(retained.iter())?;
         Ok(Submission {
             output,

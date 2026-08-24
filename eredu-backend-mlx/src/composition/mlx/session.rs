@@ -21,6 +21,7 @@ use safemlx::{
 use std::path::Path;
 
 use crate::{
+    backend::nn::tensor::{TokenValidationBatch, TokenValidationScope},
     backend::runtime::generation::sampler::{Sampler, SpeculativeSampler},
     backend::runtime::media::input,
     backend::{error::Error, MlxModelKind},
@@ -332,7 +333,10 @@ impl MlxTextSampler {
 }
 
 enum MlxSessionCompletionKind {
-    Model(MlxCompletion),
+    Model {
+        completion: MlxCompletion,
+        token_validations: TokenValidationBatch,
+    },
     Pipeline(PipelineStageCompletion),
 }
 
@@ -341,14 +345,20 @@ impl Completion for MlxSessionCompletion {
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
         match &self.inner {
-            MlxSessionCompletionKind::Model(completion) => completion.is_complete(),
+            MlxSessionCompletionKind::Model { completion, .. } => completion.is_complete(),
             MlxSessionCompletionKind::Pipeline(completion) => completion.is_complete(),
         }
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
         match &self.inner {
-            MlxSessionCompletionKind::Model(completion) => completion.wait(),
+            MlxSessionCompletionKind::Model {
+                completion,
+                token_validations,
+            } => {
+                completion.wait()?;
+                token_validations.validate_completed().map_err(Into::into)
+            }
             MlxSessionCompletionKind::Pipeline(completion) => completion.synchronize(),
         }
     }
@@ -1077,6 +1087,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model, cache) => {
+                let token_validation_scope = TokenValidationScope::begin()?;
                 let output = match &self.distributed {
                     Some(distributed) => input.with_borrowed(|input| {
                         prefill_model_tensor_parallel(
@@ -1091,7 +1102,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         prefill_model(model, cache, input, backend.stream())
                     })?,
                 };
-                model_submission(output)
+                model_submission(output, token_validation_scope.finish())
             }
             MlxSessionKind::Pipeline(model, cache) => {
                 let distributed = self.distributed.as_ref().ok_or_else(|| {
@@ -1134,6 +1145,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model, cache) => {
+                let token_validation_scope = TokenValidationScope::begin()?;
                 let output = match &self.distributed {
                     Some(distributed) => decode_model_tensor_parallel(
                         model,
@@ -1144,7 +1156,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     )?,
                     None => decode_model(model, cache, &input, backend.stream())?,
                 };
-                model_submission(output)
+                model_submission(output, token_validation_scope.finish())
             }
             MlxSessionKind::Pipeline(model, cache) => {
                 let distributed = self.distributed.as_ref().ok_or_else(|| {
@@ -1329,12 +1341,17 @@ fn sample_text_submission(
 
 fn model_submission(
     output: Array,
+    token_validations: TokenValidationBatch,
 ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
-    let submission = MlxCompletion::submission(output)?;
+    let submission =
+        MlxCompletion::submission_retaining(output, token_validations.arrays().cloned())?;
     Ok(Submission {
         output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
         completion: MlxSessionCompletion {
-            inner: MlxSessionCompletionKind::Model(submission.completion),
+            inner: MlxSessionCompletionKind::Model {
+                completion: submission.completion,
+                token_validations,
+            },
         },
     })
 }
@@ -1628,6 +1645,8 @@ fn forward_model_tensor_parallel(
 mod tests {
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
 
+    use crate::backend::nn::tensor::validate_token_domain;
+
     use super::*;
 
     #[test]
@@ -1662,6 +1681,22 @@ mod tests {
         fn assert_inspectable<T: InspectableBackendSession<MlxBackend<'static>>>() {}
         assert_session::<MlxModelSession>();
         assert_inspectable::<MlxModelSession>();
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn complete_model_submission_completes_token_validation() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let submit = |token| {
+            let scope = TokenValidationScope::begin().unwrap();
+            validate_token_domain(&Array::from_int(token), 4, None, stream).unwrap();
+            model_submission(Array::from_int(0), scope.finish()).unwrap()
+        };
+
+        submit(3).completion.wait().unwrap();
+        let error = submit(4).completion.wait().unwrap_err();
+        assert!(error.to_string().contains("outside 0..4"));
     }
 
     #[test]
