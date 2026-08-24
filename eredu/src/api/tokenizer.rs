@@ -62,6 +62,9 @@ pub(super) fn load_tokenizer_for_kind(
     kind: ModelKind,
     model_dir: &Path,
 ) -> Result<Tokenizer, TextMetadataError> {
+    if is_gguf_file(model_dir) {
+        return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
+    }
     match kind {
         ModelKind::KimiLinear => {
             let converted = model_dir.join("tokenizer.json");

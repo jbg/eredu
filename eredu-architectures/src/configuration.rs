@@ -415,9 +415,6 @@ struct TextConfigMetadata {
 }
 
 fn effective_model_type(metadata: &ConfigMetadata) -> String {
-    if metadata.model_type == "inkling_mm_model" {
-        return metadata.model_type.clone();
-    }
     if matches!(
         metadata.model_type.as_str(),
         "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
@@ -427,14 +424,8 @@ fn effective_model_type(metadata: &ConfigMetadata) -> String {
             .as_ref()
             .and_then(|text| text.model_type.clone())
             .unwrap_or_else(|| metadata.model_type.clone())
-    } else if ModelKind::resolve_model_type(&metadata.model_type).is_ok() {
-        metadata.model_type.clone()
     } else {
-        metadata
-            .text_config
-            .as_ref()
-            .and_then(|text| text.model_type.clone())
-            .unwrap_or_else(|| metadata.model_type.clone())
+        metadata.model_type.clone()
     }
 }
 
@@ -606,14 +597,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_wrapper_can_delegate_to_a_known_nested_text_family() {
-        let resolved = resolve_model_identity(&serde_json::json!({
+    fn unknown_wrapper_cannot_delegate_to_a_known_nested_text_family() {
+        let error = resolve_model_identity(&serde_json::json!({
             "model_type": "third_party_wrapper",
             "text_config": { "model_type": "qwen3_vl_moe_text" }
         }))
-        .unwrap();
-        assert_eq!(resolved.kind, ModelKind::Qwen3VlMoe);
-        assert_eq!(resolved.effective_model_type, "qwen3_vl_moe_text");
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::UnsupportedModelType(model_type)
+                if model_type == "third_party_wrapper"
+        ));
     }
 
     #[test]

@@ -563,15 +563,18 @@ where
             eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
         let external_artifact = match &plan.drafting {
             DraftingPlan::External { model, .. } => {
-                let draft_tokenizer = super::load_tokenizer(Path::new(model))
-                    .map_err(LoadedModelLoadError::Metadata)?;
+                let preparation = eredu_architectures::prepare_external_assistant(model)
+                    .map_err(LoadedModelLoadError::Artifact)?;
+                let draft_tokenizer = super::tokenizer::load_tokenizer_for_kind(
+                    preparation.tokenizer_model_kind(),
+                    Path::new(model),
+                )
+                .map_err(LoadedModelLoadError::Metadata)?;
                 let tokenizer_compatibility = TokenizerCompatibilityProof::prove(
                     target_tokenizer_fingerprint,
                     eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer),
                 )
                 .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))?;
-                let preparation = eredu_architectures::prepare_external_assistant(model)
-                    .map_err(LoadedModelLoadError::Artifact)?;
                 Some(ExternalDraftArtifact {
                     preparation,
                     tokenizer_compatibility,

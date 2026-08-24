@@ -130,7 +130,13 @@ companion paths; it neither recognizes family strings nor exposes an exhaustive
 family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
-in `eredu-architectures`. Once that resolver admits a GGUF artifact,
+in `eredu-architectures`. Nested `text_config.model_type` normalization is
+available only to outer wrapper identities explicitly admitted by that closed
+registry; an unknown outer `model_type` is rejected even when its nested text
+identity is known. External assistant admission remains separate: its closed
+resolver explicitly selects the ordinary family tokenizer contract carried by
+the admitted assistant plan, without admitting assistant identities as ordinary
+models. Once that resolver admits a GGUF artifact,
 `eredu-core` applies only container-generic catalog checks; it does not require
 family metadata keys or tensor names. Facades and concrete backend adapters
 select that shared registry. Backend composition converts the resolved

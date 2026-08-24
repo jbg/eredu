@@ -66,6 +66,16 @@ pub enum ExternalAssistantPreparationPlan {
     MuseGlimmer(MuseGlimmerAssistantPreparationPlan),
 }
 
+impl ExternalAssistantPreparationPlan {
+    /// Architecture identity whose tokenizer contract the assistant shares.
+    pub const fn tokenizer_model_kind(&self) -> crate::configuration::ModelKind {
+        match self {
+            Self::Gemma4(_) => crate::configuration::ModelKind::Gemma4,
+            Self::MuseGlimmer(_) => crate::configuration::ModelKind::MuseGlimmer,
+        }
+    }
+}
+
 /// Inspects and admits an external draft assistant without selecting a backend.
 ///
 /// Configuration, container format, family dispatch, GGUF metadata, and the
