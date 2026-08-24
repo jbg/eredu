@@ -77,6 +77,26 @@ pub struct QwenVisionIngressPlan {
     pub patch_grid: Vec<(i32, i32, i32)>,
 }
 
+/// Architecture-owned Inkling ingress policy for one prepared tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InklingIngressPlan {
+    /// Placeholder token selected for the input modality.
+    pub placeholder_token_id: u32,
+    /// Decoder placeholder span after architecture-specific projection.
+    pub placeholder_count: u64,
+}
+
+/// Architecture-owned Muse-Glimmer ingress policy for one prepared tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseGlimmerIngressPlan {
+    /// Placeholder token selected for the input modality.
+    pub placeholder_token_id: u32,
+    /// Decoder placeholder span after spatial merging.
+    pub placeholder_count: u64,
+    /// Validated `(time, height, width)` rows consumed by vision execution.
+    pub patch_grid: Vec<(i32, i32, i32)>,
+}
+
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
     u64::try_from(value).map_err(|_| CapabilityError::InvalidConfiguration {
         field,
@@ -842,19 +862,16 @@ pub fn inkling(
                     "loaded Inkling model has no audio configuration",
                 )
             })?;
-            let (padded_frames, payload_codebooks) = match input.payload_shape.as_slice() {
-                [frames, codebooks] => (*frames, *codebooks),
-                [1, frames, codebooks] => (*frames, *codebooks),
-                _ => {
-                    return Err(unsupported(
-                        &args.model_type,
-                        format!(
-                            "Inkling audio tokens must be [frames, codebooks] or [1, frames, codebooks], got {:?}",
-                            input.payload_shape
-                        ),
-                    ));
-                }
+            let [1, padded_frames, payload_codebooks] = input.payload_shape.as_slice() else {
+                return Err(unsupported(
+                    &args.model_type,
+                    format!(
+                        "Inkling audio tokens must be [1, frames, codebooks], got {:?}",
+                        input.payload_shape
+                    ),
+                ));
             };
+            let (padded_frames, payload_codebooks) = (*padded_frames, *payload_codebooks);
             let codebooks = positive(config.num_codebooks, "Inkling audio codebooks")?;
             if payload_codebooks != codebooks {
                 return Err(unsupported(
@@ -876,10 +893,15 @@ pub fn inkling(
                         ),
                     ));
                 }
-                u64::try_from(mask.values.iter().filter(|value| **value).count()).map_err(|_| {
-                    CapabilityError::ArithmeticOverflow {
-                        operation: "Inkling valid audio frame count",
-                    }
+                let frames = mask.values.iter().take_while(|value| **value).count();
+                if mask.values[frames..].iter().any(|value| *value) {
+                    return Err(unsupported(
+                        &args.model_type,
+                        "Inkling audio mask must describe one valid prefix",
+                    ));
+                }
+                u64::try_from(frames).map_err(|_| CapabilityError::ArithmeticOverflow {
+                    operation: "Inkling valid audio frame count",
                 })?
             } else {
                 padded_frames
@@ -908,6 +930,28 @@ pub fn inkling(
     }
 }
 
+/// Derives the authoritative Inkling placeholder token and span for execution.
+pub fn inkling_ingress(
+    args: &crate::inkling::ModelArgs,
+    input: &PreparedMediaInput,
+) -> Result<InklingIngressPlan, CapabilityError> {
+    let shape = inkling(args, input)?;
+    let placeholder_token_id = match input.modality {
+        MediaModality::Image => args.image_token_id,
+        MediaModality::Audio => args.audio_token_id,
+        MediaModality::Video => {
+            return Err(unsupported(
+                &args.model_type,
+                "video is not a supported Inkling modality",
+            ))
+        }
+    };
+    Ok(InklingIngressPlan {
+        placeholder_token_id,
+        placeholder_count: shape.decoder_positions,
+    })
+}
+
 /// Derives prepared Muse-Glimmer media geometry and artifact modality policy.
 pub fn muse_glimmer(
     args: &crate::muse_glimmer::DecoderConfig,
@@ -931,7 +975,7 @@ pub fn muse_glimmer(
             "Muse-Glimmer media requires patch_grid metadata",
         )
     })?;
-    if grid.shape.len() != 2 || grid.shape[1] != 3 {
+    if grid.shape.len() != 2 || grid.shape[0] == 0 || grid.shape[1] != 3 {
         return Err(unsupported(
             &args.model_type,
             format!(
@@ -999,6 +1043,42 @@ pub fn muse_glimmer(
     Ok(MediaShapePlan {
         decoder_positions: positions,
         execution_workspace_scalars: checked_mul(graph, 8, "Muse vision graph multiplier")?,
+    })
+}
+
+/// Derives the authoritative Muse-Glimmer placeholder span and vision grid.
+pub fn muse_glimmer_ingress(
+    args: &crate::muse_glimmer::DecoderConfig,
+    input: &PreparedMediaInput,
+) -> Result<MuseGlimmerIngressPlan, CapabilityError> {
+    let shape = muse_glimmer(args, input)?;
+    let placeholder_token_id = match input.modality {
+        MediaModality::Image => args.image_token_id,
+        MediaModality::Video => args.video_token_id,
+        MediaModality::Audio => {
+            return Err(unsupported(
+                &args.model_type,
+                "loaded Muse-Glimmer artifact does not support audio",
+            ))
+        }
+    };
+    let patch_grid = input
+        .patch_grid
+        .as_ref()
+        .ok_or_else(|| {
+            unsupported(
+                &args.model_type,
+                "Muse-Glimmer media requires patch_grid metadata",
+            )
+        })?
+        .values
+        .chunks_exact(3)
+        .map(|entry| (entry[0], entry[1], entry[2]))
+        .collect();
+    Ok(MuseGlimmerIngressPlan {
+        placeholder_token_id,
+        placeholder_count: shape.decoder_positions,
+        patch_grid,
     })
 }
 
@@ -1186,8 +1266,13 @@ mod tests {
     #[test]
     fn inkling_plan_owns_hmlp_and_dmel_shapes() {
         let args = tiny_inkling();
-        let image_plan = inkling(&args, &input(MediaModality::Image, &[1, 2, 40, 40, 3])).unwrap();
+        let image = input(MediaModality::Image, &[1, 2, 40, 40, 3]);
+        let image_plan = inkling(&args, &image).unwrap();
         assert_eq!(image_plan.decoder_positions, 1);
+        assert_eq!(
+            inkling_ingress(&args, &image).unwrap().placeholder_token_id,
+            args.image_token_id
+        );
 
         let mut audio = input(MediaModality::Audio, &[1, 3, 80]);
         audio.audio_mask = Some(MediaMetadata {
@@ -1196,6 +1281,19 @@ mod tests {
         });
         let audio_plan = inkling(&args, &audio).unwrap();
         assert_eq!(audio_plan.decoder_positions, 2);
+        let ingress = inkling_ingress(&args, &audio).unwrap();
+        assert_eq!(ingress.placeholder_token_id, args.audio_token_id);
+        assert_eq!(ingress.placeholder_count, 2);
+
+        audio.audio_mask.as_mut().unwrap().values = vec![true, false, true];
+        assert!(matches!(
+            inkling_ingress(&args, &audio),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+        assert!(matches!(
+            inkling(&args, &input(MediaModality::Audio, &[3, 80])),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
         assert!(matches!(
             inkling(&args, &input(MediaModality::Video, &[1, 2])),
             Err(CapabilityError::UnsupportedInput { .. })
@@ -1233,6 +1331,10 @@ mod tests {
         let mut args = tiny_muse();
         let plan = muse_glimmer(&args, &prepared).unwrap();
         assert_eq!(plan.decoder_positions, 1);
+        let ingress = muse_glimmer_ingress(&args, &prepared).unwrap();
+        assert_eq!(ingress.placeholder_token_id, 23);
+        assert_eq!(ingress.placeholder_count, 1);
+        assert_eq!(ingress.patch_grid, vec![(1, 2, 2)]);
 
         args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
         assert!(matches!(

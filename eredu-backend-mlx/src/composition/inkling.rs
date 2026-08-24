@@ -6,8 +6,11 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::inkling::{
-    AudioInput, DecoderInputPart, LayeredModel as Architecture, ModelArgs, ModelInput, Unit,
+use eredu_architectures::{
+    inkling::{
+        AudioInput, DecoderInputPart, LayeredModel as Architecture, ModelArgs, ModelInput, Unit,
+    },
+    media_plan,
 };
 use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
@@ -1189,45 +1192,45 @@ impl PreparedInklingInput {
                     projected.push(None);
                 }
                 (input::Modality::Image, input::InputPayload::Tensor(value)) => {
-                    let count = value.dim(0);
-                    tokens.push(crate::MlxTensor::from_array(Array::from_slice(
-                        &vec![args.image_token_id; count as usize],
-                        &[1, count],
-                    )));
+                    let architecture_input =
+                        input::prepared_media_input(part.modality, value, part.metadata)?;
+                    let plan = media_plan::inkling_ingress(args, &architecture_input)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    let count = usize::try_from(plan.placeholder_count).map_err(|_| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling image placeholder span exceeds host capacity".into(),
+                        )
+                    })?;
+                    tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
+                        &vec![plan.placeholder_token_id; count],
+                        stream,
+                    )?));
                     kinds.push(input::Modality::Image);
                     projected.push(None);
                     images.push(value.clone());
                 }
                 (input::Modality::Audio, input::InputPayload::Tensor(value)) => {
-                    let frames = value.dim(1);
-                    if let Some(mask) = part.metadata.audio_mask {
-                        if mask.shape() != [1, frames] {
-                            return Err(Error::UnsupportedArchitecture(format!(
-                                "Inkling audio mask must be shaped [1, {frames}], got {:?}",
-                                mask.shape()
-                            )));
-                        }
-                    }
-                    let count = match part.metadata.audio_valid_frames {
-                        Some(valid) if valid > 0 && valid <= frames => valid,
-                        Some(valid) => {
-                            return Err(Error::UnsupportedArchitecture(format!(
-                                "Inkling audio valid-frame extent {valid} is outside 1..={frames}"
-                            )))
-                        }
-                        None if part.metadata.audio_mask.is_none() => frames,
-                        None => return Err(Error::UnsupportedArchitecture(
-                            "Inkling masked audio input requires a host-known valid-frame extent"
-                                .into(),
-                        )),
-                    };
-                    tokens.push(crate::MlxTensor::from_array(Array::from_slice(
-                        &vec![args.audio_token_id; count as usize],
-                        &[1, count],
-                    )));
+                    let architecture_input =
+                        input::prepared_media_input(part.modality, value, part.metadata)?;
+                    let plan = media_plan::inkling_ingress(args, &architecture_input)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    let count = usize::try_from(plan.placeholder_count).map_err(|_| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling audio placeholder span exceeds host capacity".into(),
+                        )
+                    })?;
+                    let retained_frames = i32::try_from(plan.placeholder_count).map_err(|_| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling audio placeholder span exceeds tensor capacity".into(),
+                        )
+                    })?;
+                    tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
+                        &vec![plan.placeholder_token_id; count],
+                        stream,
+                    )?));
                     kinds.push(input::Modality::Audio);
                     projected.push(None);
-                    audio.push(value.try_index_device((.., ..count, ..), stream)?);
+                    audio.push(value.try_index_device((.., ..retained_frames, ..), stream)?);
                 }
                 (
                     modality @ (input::Modality::Image | input::Modality::Audio),

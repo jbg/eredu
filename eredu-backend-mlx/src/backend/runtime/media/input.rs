@@ -254,32 +254,75 @@ pub fn token_ids_array(token_ids: &[u32], stream: &Stream) -> Result<Array, Exce
     Array::from(token_ids).try_index_device(NewAxis, stream)
 }
 
-/// Reads validated `(time, height, width)` patch-grid rows from a small metadata tensor.
-pub fn patch_grid_from_array(
-    patch_grid: &Array,
-    stream: &Stream,
-) -> Result<Vec<(i32, i32, i32)>, Exception> {
-    let shape = patch_grid.shape();
-    if shape.len() != 2 || shape[1] != 3 || shape[0] <= 0 {
-        return Err(Exception::custom(format!(
-            "patch grid must be shaped [items, 3], got {shape:?}"
-        )));
+/// Extracts backend-neutral media geometry from one native runtime input.
+///
+/// This function only observes array facts. Family admission and all derived
+/// execution geometry remain owned by `eredu-architectures` media plans.
+pub fn prepared_media_input(
+    modality: Modality,
+    payload: &Array,
+    metadata: InputMetadata<'_>,
+) -> Result<eredu_architectures::media_plan::PreparedMediaInput, Exception> {
+    use eredu_architectures::media_plan::{MediaMetadata, MediaModality, PreparedMediaInput};
+
+    fn shape(array: &Array) -> Result<Vec<u64>, Exception> {
+        array
+            .shape()
+            .iter()
+            .map(|dimension| {
+                u64::try_from(*dimension)
+                    .map_err(|_| Exception::custom("prepared media dimension is negative"))
+            })
+            .collect()
     }
-    let mut grid = Vec::with_capacity(shape[0] as usize);
-    for index in 0..shape[0] {
-        grid.push((
-            patch_grid
-                .try_index_device((index, 0), stream)?
-                .item::<i32>(stream),
-            patch_grid
-                .try_index_device((index, 1), stream)?
-                .item::<i32>(stream),
-            patch_grid
-                .try_index_device((index, 2), stream)?
-                .item::<i32>(stream),
-        ));
+
+    fn i32_metadata(array: Option<&Array>) -> Result<Option<MediaMetadata<i32>>, Exception> {
+        array
+            .map(|array| {
+                let evaluated = array.evaluated()?;
+                let values = evaluated
+                    .try_as_slice::<i32>()
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                Ok(MediaMetadata {
+                    shape: shape(array)?,
+                    values: values.to_vec(),
+                })
+            })
+            .transpose()
     }
-    Ok(grid)
+
+    fn bool_metadata(array: Option<&Array>) -> Result<Option<MediaMetadata<bool>>, Exception> {
+        array
+            .map(|array| {
+                let evaluated = array.evaluated()?;
+                let values = evaluated
+                    .try_as_slice::<bool>()
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                Ok(MediaMetadata {
+                    shape: shape(array)?,
+                    values: values.to_vec(),
+                })
+            })
+            .transpose()
+    }
+
+    let modality = match modality {
+        Modality::Image => MediaModality::Image,
+        Modality::Audio => MediaModality::Audio,
+        Modality::Video => MediaModality::Video,
+        Modality::Text => {
+            return Err(Exception::custom(
+                "prepared media geometry is unavailable for text input",
+            ))
+        }
+    };
+    Ok(PreparedMediaInput {
+        modality,
+        payload_shape: shape(payload)?,
+        patch_grid: i32_metadata(metadata.patch_grid)?,
+        patch_positions: i32_metadata(metadata.patch_positions)?,
+        audio_mask: bool_metadata(metadata.audio_mask)?,
+    })
 }
 
 fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Exception> {

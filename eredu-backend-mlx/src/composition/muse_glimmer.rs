@@ -2,8 +2,12 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use eredu_architectures::muse_glimmer::{
-    DecoderConfig, DecoderInputPart, LayeredModel as Architecture, ModelInput, Unit, VisionInput,
+use eredu_architectures::{
+    media_plan,
+    muse_glimmer::{
+        DecoderConfig, DecoderInputPart, LayeredModel as Architecture, ModelInput, Unit,
+        VisionInput,
+    },
 };
 use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
@@ -18,7 +22,7 @@ use eredu_runtime::{
 use safemlx::{
     error::Exception,
     ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
+    Stream,
 };
 
 use crate::backend::{
@@ -514,7 +518,6 @@ pub fn prepare_muse_input(
     let mut media = Vec::with_capacity(typed.parts.len());
     let mut pixels = Vec::new();
     let mut grid = Vec::new();
-    let merge = args.vision_config.merge_size;
     for part in typed.parts {
         match (part.modality, part.payload) {
             (input::Modality::Text, input::InputPayload::TokenIds(value)) => {
@@ -522,41 +525,25 @@ pub fn prepare_muse_input(
                 media.push(false);
             }
             (
-                modality @ (input::Modality::Image | input::Modality::Video),
+                input::Modality::Image | input::Modality::Video,
                 input::InputPayload::Tensor(value),
             ) => {
-                if modality == input::Modality::Video
-                    && args.weight_convention
-                        == eredu_architectures::muse_glimmer::WeightConvention::Gguf
-                {
-                    return Err(Error::UnsupportedArchitecture(
-                        "the released Muse-Glimmer GGUF projector is image-only".into(),
-                    ));
-                }
-                let entries = input::patch_grid_from_array(
-                    part.metadata.patch_grid.ok_or_else(|| {
-                        Error::UnsupportedArchitecture(
-                            "Muse-Glimmer media requires patch_grid metadata".into(),
-                        )
-                    })?,
+                let architecture_input =
+                    input::prepared_media_input(part.modality, value, part.metadata)?;
+                let plan = media_plan::muse_glimmer_ingress(args, &architecture_input)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                let count = usize::try_from(plan.placeholder_count).map_err(|_| {
+                    Error::UnsupportedArchitecture(
+                        "Muse-Glimmer placeholder span exceeds host capacity".into(),
+                    )
+                })?;
+                tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
+                    &vec![plan.placeholder_token_id; count],
                     stream,
-                )?;
-                let count = entries
-                    .iter()
-                    .map(|(t, h, w)| t * (h / merge) * (w / merge))
-                    .sum::<i32>();
-                let id = if modality == input::Modality::Image {
-                    args.image_token_id
-                } else {
-                    args.video_token_id
-                };
-                tokens.push(crate::MlxTensor::from_array(Array::from_slice(
-                    &vec![id; count as usize],
-                    &[1, count],
-                )));
+                )?));
                 media.push(true);
                 pixels.push(value.clone());
-                grid.extend(entries);
+                grid.extend(plan.patch_grid);
             }
             (modality, _) => {
                 return Err(Error::UnsupportedArchitecture(format!(
