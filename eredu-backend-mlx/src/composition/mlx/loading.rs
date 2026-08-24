@@ -365,7 +365,12 @@ fn requires_distributed_stage_loader(
         || topology.expert_parallel_size > 1
         || matches!(
             kind,
-            ModelKind::Qwen3Next | ModelKind::Qwen35 | ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe
+            ModelKind::DeepSeekV3
+                | ModelKind::DeepSeekV4
+                | ModelKind::Qwen3Next
+                | ModelKind::Qwen35
+                | ModelKind::Qwen3Vl
+                | ModelKind::Qwen3VlMoe
         )
 }
 
@@ -423,6 +428,16 @@ mod runtime_state_dtype_tests {
     use eredu_architectures::ModelKind;
     use eredu_core::checkpoint::TensorDtype;
     use safemlx::DeviceType;
+
+    #[test]
+    fn deepseek_pure_tp_uses_distributed_stage_loader() {
+        let topology =
+            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        for kind in [ModelKind::DeepSeekV3, ModelKind::DeepSeekV4] {
+            assert!(requires_distributed_stage_loader(kind, topology));
+        }
+    }
 
     #[test]
     fn specialized_qwen_tp_uses_distributed_stage_loader() {
@@ -553,15 +568,8 @@ fn materialize_tensor_parallel(
         eredu_runtime::ShardingPolicy::Require,
     );
     match kind {
-        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Ok(Model::DeepSeek(
-            kind,
-            Box::new(crate::composition::deepseek::load_safetensors(
-                artifact,
-                options.weight_residency,
-                options.quantization,
-                stream,
-                weights_stream,
-            )?),
+        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Err(Error::Parallel(
+            "DeepSeek tensor parallelism requires distributed-stage materialization".into(),
         )),
         ModelKind::Gemma4 => Ok(Model::Gemma4(
             kind,
@@ -800,17 +808,9 @@ fn materialize_gguf_tensor_parallel(
                 )?;
             Ok((Model::KimiLinear(kind, model), eos))
         }
-        GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => {
-            let (model, eos) = crate::composition::deepseek::load_gguf(
-                checkpoint,
-                metadata,
-                architecture == GgufArchitecture::DeepSeek4,
-                options.weight_residency,
-                stream,
-                weights_stream,
-            )?;
-            Ok((Model::DeepSeek(kind, Box::new(model)), eos))
-        }
+        GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => Err(Error::Parallel(
+            "DeepSeek GGUF tensor parallelism requires distributed-stage materialization".into(),
+        )),
         GgufArchitecture::GptOss => {
             let (model, eos) =
                 crate::composition::gpt_oss::load_gpt_oss_gguf_tensor_parallel_model(

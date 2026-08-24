@@ -14014,8 +14014,8 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 /// Materializes an executable rank-local distributed stage for the MLX backend.
 ///
 /// The placed stage adapter also owns pure tensor-parallel materialization for
-/// Qwen3-Next, Qwen3.5, and Qwen3-VL; those families share the same semantic
-/// parameter placement for TP-only and Cartesian execution.
+/// DeepSeek-V3/R1/V4, Qwen3-Next, Qwen3.5, and Qwen3-VL; those families share
+/// the same semantic parameter placement for TP-only and Cartesian execution.
 ///
 /// Llama/Mistral, DeepSeek-V3/R1/V4, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
 /// LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP stages, plus
