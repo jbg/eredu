@@ -2,8 +2,6 @@
 
 use eredu_nn::{Error, RoutedNeuralBackend, Tensor};
 
-use crate::decoder::StaticModules;
-
 use super::{
     block::{GptOssBlockFactory, TransformerBlock},
     config::ModelArgs,
@@ -11,9 +9,6 @@ use super::{
 
 /// Shared layered lifecycle specialized to GPT-OSS blocks.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, GptOssBlockFactory>;
-
-/// Pinned token embedding, final normalization, and separate vocabulary head.
-pub type GptOssStaticModules<B> = StaticModules<B>;
 
 /// Builds one layered GPT-OSS model with pinned static modules.
 pub fn new_layered_model<B: RoutedNeuralBackend>(

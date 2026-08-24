@@ -25,7 +25,9 @@ The `eredu` facade is also portable when built with
 adapter under `eredu::api`; it does not reproduce the implementation crate's
 backend or composition module tree. Backend fixture APIs are activated only by
 the facade's development dependency; the production `mlx` feature does not
-enable backend `test-support`.
+enable backend `test-support`. The facade does not directly depend on
+`eredu-nn` in production; facade tests that exercise neutral neural contracts
+use it as a development dependency.
 
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
