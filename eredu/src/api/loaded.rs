@@ -263,7 +263,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             options.max_draft_tokens,
             caller_stop_sequences,
         )?;
-        let mut output = B::with_speculative_execution(
+        let output = B::with_speculative_execution(
             &mut self.runtime,
             SpeculativeGenerationBatchRequest {
                 drafting,
@@ -281,10 +281,14 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             eredu_runtime::RunSpeculativeGeneration::new(options.scheduler),
         )
         .map_err(PreparedChatMtpError::Backend)?;
-        Ok(output
-            .requests
-            .pop()
-            .expect("one speculative lane produces one terminal output"))
+        let request: Result<[SpeculativeGenerationOutput; 1], _> = output.requests.try_into();
+        match request {
+            Ok([request]) => Ok(request),
+            Err(requests) => Err(PreparedChatMtpError::OutputCardinality {
+                expected: 1,
+                actual: requests.len(),
+            }),
+        }
     }
 
     /// Generates independent prepared chats through one fair speculative scheduler.

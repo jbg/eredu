@@ -19,8 +19,8 @@ use eredu::{
         ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, Media,
         ModelChatTemplate, MultimodalRequest, MultimodalSegment, PreparedChat, PreparedChatError,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest, RgbImage,
+        PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpError,
+        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, RgbImage,
     },
     core::{
         checkpoint::TensorDtype, BoundedResidencyRequirement, CandidateAdmission,
@@ -59,6 +59,8 @@ use tokenizers::{
 
 const QWEN_TEMPLATE: &str =
     include_str!("fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
+const NO_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX;
+const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 
 struct TestDirectory(PathBuf);
 
@@ -821,6 +823,11 @@ impl SpeculativeGenerationBackend for MockBackend {
         V: SpeculativeGenerationVisitor,
     {
         assert!(matches!(request.drafting, SpeculativeDraft::Embedded));
+        let result_cardinality = request
+            .lanes
+            .first()
+            .and_then(|lane| lane.prompt.first())
+            .copied();
         let mut caches = vec![0; request.lanes.len()];
         let mut prepared = Vec::with_capacity(request.lanes.len());
         for (lane, cache) in request.lanes.into_iter().zip(caches.iter_mut()) {
@@ -847,7 +854,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                 },
             });
         }
-        visitor
+        let mut output = visitor
             .run(
                 &mut MockSpeculativeExecutor,
                 prepared,
@@ -856,7 +863,19 @@ impl SpeculativeGenerationBackend for MockBackend {
                 false,
                 (),
             )
-            .map_err(|error| MockError::Speculative(error.to_string()))
+            .map_err(|error| MockError::Speculative(error.to_string()))?;
+        match result_cardinality {
+            Some(NO_SPECULATIVE_RESULTS_PROMPT_TOKEN) => output.requests.clear(),
+            Some(MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN) => {
+                output.requests.push(SpeculativeGenerationOutput {
+                    token_ids: Vec::new(),
+                    finish_reason: FinishReason::MaxTokens,
+                    stats: Default::default(),
+                });
+            }
+            _ => {}
+        }
+        Ok(output)
     }
 }
 
@@ -1060,6 +1079,42 @@ fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
         })
         .unwrap();
     (output, events)
+}
+
+fn assert_single_lane_speculative_cardinality_is_validated(
+    model: &mut LoadedModel<MockBackend>,
+    prepared: &PreparedChat,
+) {
+    for (prompt, actual) in [
+        (vec![NO_SPECULATIVE_RESULTS_PROMPT_TOKEN], 0),
+        (vec![MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN], 2),
+    ] {
+        let result = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
+            input: PreparedChatInput::prepared_backend_input(prepared, prompt),
+            drafting: SpeculativeDraft::Embedded,
+            settings: PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            options: PreparedChatMtpGenerationOptions::default(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        });
+        let Err(error) = result else {
+            panic!("malformed backend cardinality must be rejected");
+        };
+        assert!(matches!(
+            error,
+            PreparedChatMtpError::OutputCardinality {
+                expected: 1,
+                actual: observed,
+            } if observed == actual
+        ));
+    }
 }
 
 fn write_loadable_text_artifact(root: &std::path::Path) {
@@ -1513,6 +1568,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
             },
         ]
     );
+
+    assert_single_lane_speculative_cardinality_is_validated(&mut model, &prepared);
 
     let (batch, batch_events) = speculative_batch_client_code(&mut model, &prepared);
     assert_eq!(batch.requests.len(), 1);

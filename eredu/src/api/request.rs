@@ -185,6 +185,16 @@ pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
     /// The prepared semantic plan or parser state was invalid.
     #[error("prepared-chat semantic generation failed: {0}")]
     Semantic(String),
+    /// A backend returned the wrong number of results for the submitted lanes.
+    #[error(
+        "selected backend returned {actual} speculative results, but the facade expected {expected}"
+    )]
+    OutputCardinality {
+        /// Number of results required by the facade operation.
+        expected: usize,
+        /// Number of results returned by the backend.
+        actual: usize,
+    },
 }
 
 /// One speculative MTP response from a [`PreparedChat`].
