@@ -12,13 +12,17 @@ use eredu_runtime::{ConstrainedSampler, GenerationSampler};
 use safemlx::{error::Exception, Array};
 
 use super::{
+    distributed::pipeline::{PipelineCache, PipelineEmbeddedMtpTarget},
+    session::MlxSpeculativeSessionParts,
     speculative::{
+        embedded::DistributedEmbeddedMtpSampler,
         scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
-        MlxDrafter, MlxDrafterKind, MlxMtpCache, MlxSpeculativeSampling, MtpExecutionStreams,
+        MlxDrafter, MlxDrafterKind, MlxSpeculativeSampling, MtpExecutionStreams,
     },
     MlxBackend, MlxModelInput, Model, ModelCache,
 };
 use crate::backend::error::Error;
+use crate::backend::runtime::generation::sampler::SpeculativeSampler;
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
@@ -48,7 +52,6 @@ struct MlxSpeculativeSession<'runtime, 'world> {
 
 struct MlxSpeculativeLaneRuntime<'a, C> {
     input: MlxModelInput,
-    cache: &'a mut ModelCache,
     config: MtpConfig,
     prng_key: Option<Array>,
     sampler: MlxPreparedSampler<C>,
@@ -63,7 +66,9 @@ pub fn validate_external_drafter(
     runtime: &ModelRuntime<MlxBackend<'_>>,
     drafter: &MlxDrafter,
 ) -> Result<(), Error> {
-    let model = runtime.session().complete_model();
+    let model = runtime.session().complete_model().ok_or_else(|| {
+        Error::Speculative("external drafting is unavailable for pipeline sessions".into())
+    })?;
     match (model, drafter.kind()) {
         (Model::Gemma4(_, target), MlxDrafterKind::Gemma4Assistant) => {
             let assistant = drafter.gemma4();
@@ -91,25 +96,34 @@ pub fn validate_external_drafter(
     Ok(())
 }
 
-fn run_speculative_batch<'a, B, C>(
+fn run_speculative_batch<'a, B, C, S, K>(
     backend: &'a mut B,
     lanes: Vec<MlxSpeculativeLaneRuntime<'a, C>>,
-    cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
+    caches: &'a mut [K],
+    cache_for_lane: fn(&mut K) -> Option<&mut B::Cache>,
     cache_kind: &str,
+    wrap_sampler: impl Fn(MlxPreparedSampler<C>) -> Result<S, Exception>,
     streams: MtpExecutionStreams<'a>,
     visitor: impl SpeculativeGenerationVisitor,
 ) -> Result<SpeculativeGenerationBatchOutput, Exception>
 where
     B: MlxSpeculativeRuntime<'a>,
     C: SpeculativeTokenFilterController + 'a,
+    S: SpeculativeSampler + Clone + 'a,
 {
+    if caches.len() != lanes.len() {
+        return Err(Exception::custom(format!(
+            "MTP cache has {} lanes but the request has {} lanes",
+            caches.len(),
+            lanes.len()
+        )));
+    }
     let topology = streams.topology();
     let component_timings_collected = component_timing_enabled() && backend.supports_telemetry();
     let mut prepared = Vec::with_capacity(lanes.len());
-    for (lane_index, lane) in lanes.into_iter().enumerate() {
+    for (lane_index, (lane, cache)) in lanes.into_iter().zip(caches.iter_mut()).enumerate() {
         let MlxSpeculativeLaneRuntime {
             input,
-            cache,
             config,
             prng_key,
             sampler,
@@ -122,8 +136,8 @@ where
                 "prepared-chat {cache_kind} MTP cache type mismatch at lane {lane_index}"
             ))
         })?;
-        let sampling = MlxSpeculativeSampling::new(sampler);
-        let randomness = <MlxSpeculativeSampling<MlxPreparedSampler<C>> as SpeculativeSampling>::initialize_randomness(
+        let sampling = MlxSpeculativeSampling::new(wrap_sampler(sampler)?);
+        let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
             prng_key,
             config.temperature,
             streams,
@@ -217,6 +231,10 @@ fn nemotron_mtp_cache(
     }
 }
 
+fn pipeline_mtp_cache(cache: &mut PipelineCache) -> Option<&mut PipelineCache> {
+    Some(cache)
+}
+
 impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     fn new(
         runtime: &'runtime mut ModelRuntime<MlxBackend<'world>>,
@@ -226,10 +244,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             runtime,
             tokenizer_fingerprint,
         }
-    }
-
-    fn model_and_cache(&mut self) -> (&mut Model, &mut ModelCache) {
-        self.runtime.session_mut().complete_parts_mut()
     }
 
     fn prepare_mlx_speculative_sampling<C>(
@@ -266,20 +280,12 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     fn prepare_speculative_batch_lanes<'a, C>(
         &self,
         lanes: Vec<SpeculativeGenerationLane<'a, MlxBackend<'world>, C>>,
-        cache: &'a mut MlxMtpCache,
     ) -> Result<Vec<MlxSpeculativeLaneRuntime<'a, C>>, Error>
     where
         C: SpeculativeTokenFilterController,
     {
-        if cache.len() != lanes.len() {
-            return Err(Error::Speculative(format!(
-                "MTP cache has {} lanes but the request has {} lanes",
-                cache.len(),
-                lanes.len()
-            )));
-        }
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
-        for (lane, cache) in lanes.into_iter().zip(cache.lanes.iter_mut()) {
+        for lane in lanes {
             let SpeculativeGenerationLane {
                 prompt,
                 generation,
@@ -293,7 +299,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 Self::prepare_mlx_speculative_sampling(generation, constraint)?;
             prepared_lanes.push(MlxSpeculativeLaneRuntime {
                 input: prompt,
-                cache,
                 config,
                 prng_key,
                 sampler,
@@ -343,10 +348,21 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let target_stream = self.runtime.backend().stream().clone();
         let draft_stream = drafter.stream().clone();
         let streams = MtpExecutionStreams::new(&target_stream, &draft_stream)?;
-        let mut cache = self.new_mtp_cache(lanes.len());
-        let prepared_lanes = self.prepare_speculative_batch_lanes(lanes, &mut cache)?;
+        let prepared_lanes = self.prepare_speculative_batch_lanes(lanes)?;
+        let lane_count = prepared_lanes.len();
+        let model = match self.runtime.session_mut().speculative_parts_mut()? {
+            MlxSpeculativeSessionParts::Complete { model, .. } => model,
+            MlxSpeculativeSessionParts::Pipeline { .. } => {
+                return Err(Error::Speculative(
+                    "external drafting is unavailable for pipeline sessions".into(),
+                ))
+            }
+        };
+        let mut caches = (0..lane_count)
+            .map(|_| model.new_cache())
+            .collect::<Vec<_>>();
 
-        match (self.model_and_cache().0, drafter.kind()) {
+        match (model, drafter.kind()) {
             (Model::Gemma4(_, target), MlxDrafterKind::Gemma4Assistant) => {
                 let mut backend =
                     crate::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
@@ -356,8 +372,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     neutral_gemma_mtp_cache,
                     "Gemma 4 external assistant",
+                    Ok,
                     streams,
                     visitor,
                 )
@@ -371,8 +389,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     neutral_muse_mtp_cache,
                     "Muse-Glimmer DFlash",
+                    Ok,
                     streams,
                     visitor,
                 )
@@ -396,10 +416,115 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         V: SpeculativeGenerationVisitor,
     {
         let stream = self.runtime.backend().stream().clone();
-        let mut cache = self.new_mtp_cache(lanes.len());
-        let prepared_lanes = self.prepare_speculative_batch_lanes(lanes, &mut cache)?;
+        let prepared_lanes = self.prepare_speculative_batch_lanes(lanes)?;
+        let lane_count = prepared_lanes.len();
         let streams = MtpExecutionStreams::single(&stream);
-        match self.model_and_cache().0 {
+        match self.runtime.session_mut().speculative_parts_mut()? {
+            MlxSpeculativeSessionParts::Complete { model, execution } => {
+                let mut caches = (0..lane_count)
+                    .map(|_| model.new_cache())
+                    .collect::<Vec<_>>();
+                if let Some(execution) = execution {
+                    let topology = execution.topology();
+                    if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
+                        return Err(Error::Speculative(
+                            "complete-model embedded MTP requires pure tensor parallelism".into(),
+                        ));
+                    }
+                    let tensor = execution.tensor_context()?;
+                    let tensor_group = tensor.group().ok_or_else(|| {
+                        Error::Speculative(
+                            "distributed embedded MTP requires an active tensor subgroup".into(),
+                        )
+                    })?;
+                    let sampling_rank = topology
+                        .global_rank_for(eredu_core::ParallelCoordinates {
+                            tensor: 0,
+                            pipeline: 0,
+                            expert: 0,
+                            data: topology.data_parallel_rank,
+                        })
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    let world = execution.world();
+                    let synchronized = |sampler| {
+                        DistributedEmbeddedMtpSampler::new(sampler, sampling_rank, world)
+                            .map_err(|error| Exception::custom(error.to_string()))
+                    };
+                    return match model {
+                        Model::NemotronH(_, target) => {
+                            let mut target =
+                                crate::composition::nemotron_h::NemotronHTensorMtpTarget::new(
+                                    target,
+                                    tensor_group,
+                                );
+                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+                            run_speculative_batch(
+                                &mut backend,
+                                prepared_lanes,
+                                &mut caches,
+                                nemotron_mtp_cache,
+                                "tensor-parallel Nemotron-H embedded",
+                                synchronized,
+                                streams,
+                                visitor,
+                            )
+                            .map_err(|error| Error::Speculative(error.to_string()))
+                        }
+                        Model::Inkling(_, target) => {
+                            let mut target =
+                                crate::composition::inkling::InklingTensorMtpTarget::new(
+                                    target,
+                                    tensor_group,
+                                );
+                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+                            run_speculative_batch(
+                                &mut backend,
+                                prepared_lanes,
+                                &mut caches,
+                                neutral_inkling_mtp_cache,
+                                "tensor-parallel Inkling embedded",
+                                synchronized,
+                                streams,
+                                visitor,
+                            )
+                            .map_err(|error| Error::Speculative(error.to_string()))
+                        }
+                        Model::Qwen3Next(_, target) => {
+                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                            run_speculative_batch(
+                                &mut backend,
+                                prepared_lanes,
+                                &mut caches,
+                                qwen_next_mtp_cache,
+                                "tensor-parallel Qwen3-Next embedded",
+                                synchronized,
+                                streams,
+                                visitor,
+                            )
+                            .map_err(|error| Error::Speculative(error.to_string()))
+                        }
+                        Model::Qwen35(_, target) => {
+                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                            run_speculative_batch(
+                                &mut backend,
+                                prepared_lanes,
+                                &mut caches,
+                                qwen35_mtp_cache,
+                                "tensor-parallel Qwen3.5 embedded",
+                                synchronized,
+                                streams,
+                                visitor,
+                            )
+                            .map_err(|error| Error::Speculative(error.to_string()))
+                        }
+                        model => Err(Error::Speculative(format!(
+                            "distributed prepared-chat embedded MTP is unavailable for model type {} ({:?})",
+                            model.effective_model_type(),
+                            model.mtp_capability()
+                        ))),
+                    };
+                }
+                match model {
             Model::DeepSeek(_, target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
@@ -408,8 +533,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     neutral_deepseek_mtp_cache,
                     "DeepSeek embedded",
+                    Ok,
                     streams,
                     visitor,
                 )
@@ -423,8 +550,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     nemotron_mtp_cache,
                     "Nemotron-H embedded",
+                    Ok,
                     streams,
                     visitor,
                 )
@@ -438,8 +567,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     neutral_inkling_mtp_cache,
                     "Inkling embedded",
+                    Ok,
                     streams,
                     visitor,
                 )
@@ -453,8 +584,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     qwen_next_mtp_cache,
                     "Qwen3-Next embedded",
+                    Ok,
                     streams,
                     visitor,
                 )
@@ -468,27 +601,56 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
+                    &mut caches,
                     qwen35_mtp_cache,
                     "Qwen3.5 embedded",
+                    Ok,
                     streams,
                     visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
             model => Err(Error::Speculative(format!(
-            "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
-            model.effective_model_type(),
-            model.mtp_capability()
-        ))),
+                "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
+                model.effective_model_type(),
+                model.mtp_capability()
+            ))),
+                }
+            }
+            MlxSpeculativeSessionParts::Pipeline { model, execution } => {
+                let mut caches = (0..lane_count)
+                    .map(|_| model.new_cache())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let topology = execution.topology();
+                let sampling_rank = topology
+                    .global_rank_for(eredu_core::ParallelCoordinates {
+                        tensor: 0,
+                        pipeline: topology.pipeline_parallel_size - 1,
+                        expert: 0,
+                        data: topology.data_parallel_rank,
+                    })
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                let world = execution.world();
+                let mut target = PipelineEmbeddedMtpTarget::new(model, execution);
+                let mut backend =
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        &mut target,
+                    );
+                run_speculative_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    &mut caches,
+                    pipeline_mtp_cache,
+                    "pipeline embedded",
+                    |sampler| {
+                        DistributedEmbeddedMtpSampler::new(sampler, sampling_rank, world)
+                            .map_err(|error| Exception::custom(error.to_string()))
+                    },
+                    streams,
+                    visitor,
+                )
+                .map_err(|error| Error::Speculative(error.to_string()))
+            }
         }
-    }
-
-    // Independent target caches are an implementation detail of prepared-chat MTP.
-    fn new_mtp_cache(&self, batch_size: usize) -> MlxMtpCache {
-        MlxMtpCache::new(
-            (0..batch_size)
-                .map(|_| self.runtime.session().new_complete_cache())
-                .collect(),
-        )
     }
 }

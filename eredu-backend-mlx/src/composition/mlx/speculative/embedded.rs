@@ -40,10 +40,6 @@ impl<'a, S> DistributedEmbeddedMtpSampler<'a, S> {
             _group: group,
         })
     }
-
-    pub fn into_inner(self) -> S {
-        self.sampler
-    }
 }
 
 impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler<'_, S> {

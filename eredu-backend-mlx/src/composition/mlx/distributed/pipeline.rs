@@ -85,7 +85,6 @@ use crate::{
         quantize_pipeline_stage_store_with, shard_layer_bindings, DenseStreamController,
         DenseTransferWindow, PipelineStageQuantizationSelection,
     },
-    backend::runtime::generation::sampler::SpeculativeSampler,
     backend::runtime::media::{prepared_identity_wire_arrays, PreparedModelInput},
     backend::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
@@ -99,9 +98,7 @@ use crate::{
     backend::MlxParallelContext,
     backend::ModelLoadOptions,
     composition::llama::checkpoint as llama_checkpoint,
-    composition::mlx::speculative::embedded::{
-        DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
-    },
+    composition::mlx::speculative::embedded::{EmbeddedMtpOutput, EmbeddedMtpTarget},
     composition::{
         gemma4::{Gemma4Bindings, Gemma4PipelineUnit, PreparedParts as Gemma4PreparedParts},
         gpt_oss as neutral_gpt_oss,
@@ -123,11 +120,10 @@ use eredu_architectures::{gpt_oss, ModelKind};
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::{
     cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
-    generation::MtpConfig,
     residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
-    MtpCapability, MtpCheckpointKind, MtpStats, ParallelCoordinates,
+    MtpCapability, MtpCheckpointKind,
 };
 use eredu_runtime::DenseDiskStreamReport;
 use eredu_runtime::ExecutionGroupReadySet;
@@ -458,6 +454,8 @@ pub struct PipelineStageInfo {
     pub owns_embedded_mtp: bool,
     /// Number of predictor layers owned by this rank.
     pub embedded_mtp_layers: usize,
+    /// Number of checkpoint-embedded predictor layers in the complete pipeline.
+    pub global_embedded_mtp_layers: usize,
     /// Global decoder-layer indices owned by this stage.
     pub global_layer_range: Range<usize>,
     /// Complete encoder/projector/merge/finalization unit geometry.
@@ -1319,7 +1317,7 @@ pub struct PipelineCache {
 }
 
 #[derive(Debug, Clone, Default)]
-enum PipelineMtpCache {
+pub(in crate::composition::mlx) enum PipelineMtpCache {
     #[default]
     None,
     DeepSeek(Vec<CompressedLatentCache>),
@@ -9756,9 +9754,18 @@ pub struct PipelineModel {
     last_placed_ingress_schedule: PlacedIngressScheduleReport,
 }
 
-struct PipelineEmbeddedMtpTarget<'a> {
-    model: &'a mut PipelineModel,
-    execution: &'a crate::backend::MlxDistributedSession<'a>,
+pub(in crate::composition::mlx) struct PipelineEmbeddedMtpTarget<'session, 'world> {
+    model: &'session mut PipelineModel,
+    execution: &'session crate::backend::MlxDistributedSession<'world>,
+}
+
+impl<'session, 'world> PipelineEmbeddedMtpTarget<'session, 'world> {
+    pub(in crate::composition::mlx) fn new(
+        model: &'session mut PipelineModel,
+        execution: &'session crate::backend::MlxDistributedSession<'world>,
+    ) -> Self {
+        Self { model, execution }
+    }
 }
 
 fn pipeline_mtp_token_identity(
@@ -10436,16 +10443,11 @@ impl PipelineModel {
         output.submit(token_validation_scope.finish())
     }
 
-    /// Reports whether this pipeline stage participates in checkpoint-embedded
-    /// multi-token prediction. Predictor weights are owned by the final PP
-    /// coordinate and sharded by its active TP/EP subgroups.
+    /// Reports the complete pipeline's checkpoint-embedded prediction support.
+    /// Predictor weights remain stage-local, but every rank must advertise the
+    /// same capability because speculative execution is a collective session.
     pub fn mtp_capability(&self) -> MtpCapability {
-        if self
-            .stage
-            .embedded_mtp()
-            .map_or(0, PipelineEmbeddedMtp::embedded_mtp_len)
-            > 0
-        {
+        if self.info.global_embedded_mtp_layers > 0 {
             MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             }
@@ -10931,68 +10933,6 @@ impl PipelineModel {
         Ok(decoder_payload)
     }
 
-    /// Generates through final-stage-owned embedded predictor layers while the
-    /// target executes through the selected distributed session.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
-        &mut self,
-        cache: &mut PipelineCache,
-        input: crate::backend::runtime::media::input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-        execution: &crate::backend::MlxDistributedSession<'_>,
-    ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        if execution.topology() != self.topology {
-            return Err(Exception::custom(
-                "pipeline embedded MTP topology does not match distributed session",
-            ));
-        }
-        let stream = execution.stream();
-        if !matches!(
-            self.mtp_capability(),
-            MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded
-            }
-        ) {
-            return Err(Exception::custom(format!(
-                "embedded MTP is unavailable for pipeline model {:?}",
-                self.info.model_kind
-            )));
-        }
-        let sampling_rank = self
-            .topology
-            .global_rank_for(ParallelCoordinates {
-                tensor: 0,
-                pipeline: self.topology.pipeline_parallel_size - 1,
-                expert: 0,
-                data: self.topology.data_parallel_rank,
-            })
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut synchronized =
-            DistributedEmbeddedMtpSampler::new(sampler.clone(), sampling_rank, execution.world())
-                .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut target = PipelineEmbeddedMtpTarget {
-            model: self,
-            execution,
-        };
-        let mut executor =
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
-        let result = crate::composition::mlx::speculative::scheduler::generate_tokens(
-            &mut executor,
-            cache,
-            input,
-            config,
-            prng_key,
-            &mut synchronized,
-            crate::composition::mlx::speculative::MtpExecutionStreams::single(stream),
-            eredu_core::generation::MtpSchedulerOptions::default(),
-            |_| Ok(()),
-        );
-        *sampler = synchronized.into_inner();
-        result
-    }
-
     /// Samples complete final-stage logits and propagates the token backward
     /// through each pipeline column without crossing a world collective after
     /// point-to-point activation traffic.
@@ -11386,7 +11326,7 @@ impl PipelineModel {
     }
 }
 
-impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
+impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
     type Cache = PipelineCache;
     type DraftCache = PipelineMtpCache;
 
@@ -11644,7 +11584,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
     }
 }
 
-impl PipelineEmbeddedMtpTarget<'_> {
+impl PipelineEmbeddedMtpTarget<'_, '_> {
     fn forward_fused_draft(
         &mut self,
         hidden: &Array,
@@ -11811,6 +11751,7 @@ fn base_info(
         is_last: stage == last,
         owns_embedded_mtp: false,
         embedded_mtp_layers: 0,
+        global_embedded_mtp_layers: 0,
         global_layer_range: range,
         global_encoder_units: 0,
         local_encoder_units: 0,
@@ -18226,6 +18167,7 @@ fn load_nemotron_h_pipeline(
     let owns_mtp = stage.range().end == target_units && prediction_steps > 0;
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_steps } else { 0 };
+    info.global_embedded_mtp_layers = prediction_steps;
     if owns_mtp {
         for &group in &prediction_groups {
             stage.prediction_layers.push(
@@ -19469,6 +19411,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
+    info.global_embedded_mtp_layers = prediction_units.len();
     if owns_mtp {
         for &(group, index) in &prediction_units {
             let unit = <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
@@ -19929,6 +19872,7 @@ fn load_neutral_qwen_conditional_pipeline(
     let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
+    info.global_embedded_mtp_layers = prediction_units.len();
     if owns_mtp {
         for &(prediction_group, prediction_index) in &prediction_units {
             let unit = stage
@@ -21814,6 +21758,7 @@ fn load_neutral_deepseek_v3_pipeline(
     );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
+    info.global_embedded_mtp_layers = prediction_units.len();
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -22240,6 +22185,7 @@ fn load_neutral_deepseek_v4_pipeline(
         .ok_or_else(|| Error::Parallel("neutral DeepSeek V4 activation width overflowed".into()))?;
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
+    info.global_embedded_mtp_layers = prediction_units.len();
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();

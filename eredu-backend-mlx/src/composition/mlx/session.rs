@@ -22,19 +22,18 @@ use std::path::Path;
 
 use crate::{
     backend::nn::tensor::{TokenValidationBatch, TokenValidationScope},
-    backend::runtime::generation::sampler::{Sampler, SpeculativeSampler},
+    backend::runtime::generation::sampler::Sampler,
     backend::runtime::media::input,
     backend::{error::Error, MlxModelKind},
     composition::mlx::distributed::pipeline::{
-        PipelineCache, PipelineStageCompletion, PipelineStep,
+        PipelineCache, PipelineModel, PipelineStageCompletion, PipelineStep,
     },
     MlxTensor,
 };
 #[cfg(feature = "media")]
 use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
-use eredu_core::generation::MtpConfig;
-use eredu_core::{MtpCapability, MtpStats};
+use eredu_core::MtpCapability;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, Model, ModelCache};
@@ -502,6 +501,17 @@ enum MlxSessionKind {
     ),
 }
 
+pub(super) enum MlxSpeculativeSessionParts<'session, 'world> {
+    Complete {
+        model: &'session mut Model,
+        execution: Option<&'session MlxDistributedSession<'world>>,
+    },
+    Pipeline {
+        model: &'session mut PipelineModel,
+        execution: &'session MlxDistributedSession<'world>,
+    },
+}
+
 impl<'a> MlxModelSession<'a> {
     pub fn from_model(
         model: MlxModel,
@@ -682,12 +692,10 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    pub fn complete_model(&self) -> &Model {
+    pub(super) fn complete_model(&self) -> Option<&Model> {
         match &self.inner {
-            MlxSessionKind::Complete(model, _) => model,
-            MlxSessionKind::Pipeline(_, _) => {
-                unreachable!("replicated facade contains a distributed MLX session")
-            }
+            MlxSessionKind::Complete(model, _) => Some(model),
+            MlxSessionKind::Pipeline(_, _) => None,
         }
     }
 
@@ -711,17 +719,24 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    pub fn complete_parts_mut(&mut self) -> (&mut Model, &mut ModelCache) {
+    pub(super) fn speculative_parts_mut(
+        &mut self,
+    ) -> Result<MlxSpeculativeSessionParts<'_, 'a>, Error> {
         match &mut self.inner {
-            MlxSessionKind::Complete(model, cache) => (model, cache),
-            MlxSessionKind::Pipeline(_, _) => {
-                unreachable!("replicated facade contains a distributed MLX session")
+            MlxSessionKind::Complete(model, _) => Ok(MlxSpeculativeSessionParts::Complete {
+                model,
+                execution: self.distributed.as_ref(),
+            }),
+            MlxSessionKind::Pipeline(model, _) => {
+                let execution = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel(
+                        "pipeline speculative execution requires session-owned communication"
+                            .into(),
+                    )
+                })?;
+                Ok(MlxSpeculativeSessionParts::Pipeline { model, execution })
             }
         }
-    }
-
-    pub fn new_complete_cache(&self) -> ModelCache {
-        self.complete_model().new_cache()
     }
 
     #[cfg(test)]
@@ -860,49 +875,6 @@ impl<'a> MlxModelSession<'a> {
             }
         };
         Ok(manifest)
-    }
-
-    /// Runs embedded multi-token prediction through this session's opaque
-    /// model, cache, and optional distributed capability.
-    pub fn generate_embedded_mtp<S: SpeculativeSampler + Clone>(
-        &mut self,
-        backend: &MlxBackend<'a>,
-        input: MlxModelInput,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-    ) -> Result<(Vec<u32>, MtpStats), Error> {
-        let distributed = self.distributed.as_ref();
-        input.with_borrowed(|input| match &mut self.inner {
-            MlxSessionKind::Complete(model, cache) => match distributed {
-                Some(execution) => model.generate_embedded_mtp_distributed(
-                    cache, input, config, prng_key, sampler, execution,
-                ),
-                None => model.generate_embedded_mtp_input_with_sampler(
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    backend.stream(),
-                ),
-            }
-            .map_err(Into::into),
-            MlxSessionKind::Pipeline(model, cache) => model
-                .generate_embedded_mtp_distributed(
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    distributed.ok_or_else(|| {
-                        safemlx::error::Exception::custom(
-                            "pipeline embedded MTP requires session-owned communication",
-                        )
-                    })?,
-                )
-                .map_err(Into::into),
-        })
     }
 
     /// Returns communication when this is a distributed session.

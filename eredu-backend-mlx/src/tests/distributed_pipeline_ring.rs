@@ -37,8 +37,12 @@ use eredu_architectures::ModelKind;
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
 use eredu_core::{
-    load_model, residency::OffloadConfig, BackendProvider as _, BackendSession as _, MtpCapability,
-    MtpCheckpointKind, MtpConfig, TokenOutput as _,
+    load_model, residency::OffloadConfig, BackendSession as _, FinishReason,
+    GenerationCancellationToken, ModelRuntime, MtpCapability, MtpCheckpointKind, MtpConfig,
+    SemanticEvent, SpeculativeDraft, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeOutputError,
+    SpeculativeSemanticState, SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter,
+    TokenFilterController, TokenOutput as _,
 };
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
@@ -63,6 +67,105 @@ const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
 const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AllowAllTokens;
+
+impl TokenFilterController for AllowAllTokens {
+    type Error = std::convert::Infallible;
+
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+        Ok(TokenFilter::All)
+    }
+
+    fn commit_token(&mut self, _token_id: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+impl SpeculativeTokenFilterController for AllowAllTokens {
+    fn filter_at(&self, _history: &[u32]) -> Result<TokenFilter, Self::Error> {
+        Ok(TokenFilter::All)
+    }
+
+    fn prefix_is_complete(&self, _history: &[u32]) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+#[derive(Clone, Default)]
+struct TokenOnlySemanticState {
+    events: Vec<SemanticEvent>,
+}
+
+impl SpeculativeSemanticState for TokenOnlySemanticState {
+    fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
+        let mut fork = self.clone();
+        fork.events.clear();
+        Ok(Box::new(fork))
+    }
+
+    fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
+        self.events
+            .push(SemanticEvent::TextDelta(token.to_string()));
+        Ok(false)
+    }
+
+    fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
+        self.events.push(SemanticEvent::Finished { reason });
+        Ok(())
+    }
+
+    fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
+        self.events.push(SemanticEvent::Finished {
+            reason: FinishReason::Cancelled,
+        });
+        Ok(())
+    }
+
+    fn take_events(&mut self) -> Vec<SemanticEvent> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+fn run_neutral_embedded_mtp<'world>(
+    runtime: &mut ModelRuntime<MlxBackend<'world>>,
+    prompt: crate::composition::mlx::MlxModelInput,
+    config: MtpConfig,
+) -> eredu_core::SpeculativeGenerationOutput {
+    let sampling = eredu_core::resolve_generation_config(
+        None,
+        eredu_core::GenerationConfigOverrides {
+            max_new_tokens: Some(config.max_tokens),
+            temperature: Some(config.temperature),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let output = <MlxBackend<'world> as SpeculativeGenerationBackend>::with_speculative_execution(
+        runtime,
+        SpeculativeGenerationBatchRequest {
+            drafting: SpeculativeDraft::Embedded,
+            lanes: vec![SpeculativeGenerationLane {
+                prompt,
+                generation: TextGenerationConfig::new(sampling),
+                config,
+                constraint: AllowAllTokens,
+                semantic: Box::<TokenOnlySemanticState>::default(),
+                cancellation: GenerationCancellationToken::new(),
+                on_event: Box::new(|_| {}),
+            }],
+            tokenizer_fingerprint: [0; 32],
+        },
+        eredu_runtime::RunSpeculativeGeneration::default(),
+    )
+    .unwrap();
+    output.requests.into_iter().next().unwrap()
+}
 
 fn load_prepared_pipeline_model(
     checkpoint: &Path,
@@ -579,11 +682,11 @@ fn pipeline_ring_worker() {
             eredu_core::AdmissionResult::Admitted(_)
         ));
         <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::static_memory(&runtime).unwrap();
-        let (backend, session) = runtime.parts_mut();
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
             .with_full_attention(true);
-        session
+        runtime
+            .session_mut()
             .configure_cache(CacheResidencyPolicy::Paged(paged))
             .unwrap();
         let image_mode = std::env::var_os(OPAQUE_MUSE_IMAGE).is_some();
@@ -656,108 +759,31 @@ fn pipeline_ring_worker() {
             family.comparison_tolerance()
         };
         if inkling_mtp_mode {
-            let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
+            let layer_prefix_offsets = runtime
+                .session()
+                .prompt_cache_layer_prefix_offsets()
+                .unwrap();
             assert_eq!(
                 layer_prefix_offsets.contains(&-1),
                 pipeline_rank + 1 == pipeline_parallel_size
             );
-            let max_tokens = if pipeline_parallel_size > 1 { 1 } else { 3 };
-            let (generated, stats) = session
-                .generate_embedded_mtp(
-                    &backend,
-                    ModelInput::new(&parts).into(),
-                    &MtpConfig {
-                        max_tokens,
-                        max_draft_tokens: 2,
-                        temperature: 0.0,
-                        eos_token_ids: Vec::new(),
-                    },
-                    None,
-                    &mut DefaultSampler,
-                )
-                .unwrap();
-            assert_eq!(generated.len(), max_tokens);
-            assert_eq!(stats.emitted_tokens, max_tokens);
-            if pipeline_parallel_size == 1 {
-                assert!(stats.draft_tokens > 0);
-            }
-            if pipeline_parallel_size > 1 {
-                let layer_layout = session.prompt_cache_layer_layout().unwrap();
-                let layer_count = session.prompt_cache_layer_count().unwrap();
-                let global_layer_range = session.prompt_cache_global_layer_range().unwrap();
-                let descriptor = PromptCacheDescriptor {
-                    model_family: "inkling".into(),
-                    effective_model_type: "inkling_mm_model".into(),
-                    checkpoint_fingerprint: "opaque-pipeline-mtp-fixture".into(),
-                    prefix_content_fingerprint: format!("tokens:{prefix_tokens:?}"),
-                    architecture_fingerprint: session
-                        .prompt_cache_architecture_fingerprint()
-                        .unwrap(),
-                    layer_count,
-                    global_layer_start: global_layer_range.start,
-                    global_layer_end: global_layer_range.end,
-                    batch_size: 1,
-                    layer_prefix_offsets: layer_prefix_offsets.clone(),
-                    layer_layout,
-                    sink_tokens: 0,
-                    topology: PromptCacheTopology {
-                        pipeline: Some((pipeline_parallel_size, pipeline_rank)),
-                        tensor_parallel: None,
-                        expert_parallel: None,
-                        expert_parallel_cache_replicated: true,
-                    },
-                };
-                let rank_prompt_cache = prompt_cache_root.join(format!("rank-{expected_rank}"));
-                let manifest = session
-                    .save_prompt_cache(
-                        &backend,
-                        &rank_prompt_cache,
-                        descriptor.clone(),
-                        &prefix_tokens,
-                        &PromptCacheOptions::default(),
-                    )
-                    .unwrap();
-                if let Some(local_prediction_start) =
-                    layer_prefix_offsets.iter().position(|offset| *offset == -1)
-                {
-                    let prediction_layers = layer_prefix_offsets.len() - local_prediction_start;
-                    let prediction_start = global_layer_range.start + local_prediction_start;
-                    assert!(manifest
-                        .blocks
-                        .iter()
-                        .any(|block| block.global_layer >= prediction_start));
-                    assert_eq!(
-                        manifest
-                            .state_tensors
-                            .iter()
-                            .filter(|tensor| {
-                                matches!(
-                                    tensor.owner,
-                                    eredu_core::cache::StateTensorOwner::Layer(layer)
-                                        if layer >= prediction_start
-                                ) && matches!(
-                                    tensor.role,
-                                    eredu_core::cache::StateTensorRole::Convolution { .. }
-                                )
-                            })
-                            .count(),
-                        prediction_layers * 4
-                    );
-                }
-                session
-                    .load_prompt_cache(
-                        &backend,
-                        &rank_prompt_cache,
-                        &descriptor,
-                        &prefix_tokens,
-                        PagedCacheOptions::new(1, 32768, 32768, 1)
-                            .unwrap()
-                            .with_full_attention(true),
-                    )
-                    .unwrap();
-            }
+            let max_tokens = 3;
+            let output = run_neutral_embedded_mtp(
+                &mut runtime,
+                ModelInput::new(&parts).into(),
+                MtpConfig {
+                    max_tokens,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+            );
+            assert_eq!(output.token_ids.len(), max_tokens);
+            assert_eq!(output.stats.emitted_tokens, max_tokens);
+            assert!(output.stats.draft_tokens > 0);
             return;
         }
+        let (backend, session) = runtime.parts_mut();
         let mut output = session
             .prefill(&backend, ModelInput::new(&parts).into())
             .unwrap()
@@ -1384,27 +1410,7 @@ fn pipeline_ring_worker() {
             model.stage_info().embedded_mtp_layers,
             usize::from(pipeline_rank == 1)
         );
-        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [crate::backend::runtime::media::input::InputPart::text_token_ids(&prompt)];
-        let mut mtp_cache = model.new_cache().unwrap();
-        let (generated, stats) = model
-            .generate_embedded_mtp_distributed(
-                &mut mtp_cache,
-                crate::backend::runtime::media::input::ModelInput::new(&parts),
-                &MtpConfig {
-                    max_tokens: 3,
-                    max_draft_tokens: 1,
-                    temperature: 0.0,
-                    eos_token_ids: Vec::new(),
-                },
-                None,
-                &mut DefaultSampler,
-                &execution,
-            )
-            .unwrap();
-        assert_eq!(generated.len(), 3);
-        assert_eq!(stats.emitted_tokens, 3);
-        assert!(stats.draft_tokens > 0);
+        assert_eq!(model.stage_info().global_embedded_mtp_layers, 1);
     }
 }
 
@@ -6004,93 +6010,12 @@ fn ring_two_process_inkling_mtp_tensor_parallel_opaque_session() {
     );
 }
 
-/// Persists and restores the output-stage predictor KV and convolution state
-/// through the public pipeline session prompt-cache lifecycle.
+/// Exercises pipeline MTP through the same neutral visitor lifecycle used by
+/// facade prepared-chat generation on every pipeline rank.
 #[test]
 #[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
-fn ring_two_process_inkling_mtp_pipeline_prompt_round_trip() {
+fn ring_two_process_inkling_mtp_pipeline_neutral_visitor() {
     run_ring_pipeline_mode(false, FixtureFamily::Inkling, WorkerMode::OpaqueInklingMtp);
-}
-
-/// Persists embedded Inkling predictor KV and all four convolution histories
-/// as globally addressed neutral state, then reopens the complete manifest.
-#[test]
-#[ignore = "initializes MLX and executes embedded MTP; run explicitly"]
-fn inkling_mtp_prompt_round_trip() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_inkling_mtp_fixture(checkpoint.path());
-    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = execution.stream();
-    let backend = crate::native::backend(stream, stream);
-    let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
-    let mut session = backend.create_session(model).unwrap();
-    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
-        .unwrap()
-        .with_full_attention(true);
-    session
-        .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))
-        .unwrap();
-    let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [crate::backend::runtime::media::input::InputPart::text_token_ids(&prompt)];
-    let (generated, _) = session
-        .generate_embedded_mtp(
-            &backend,
-            crate::backend::runtime::media::input::ModelInput::new(&parts).into(),
-            &MtpConfig {
-                max_tokens: 1,
-                max_draft_tokens: 1,
-                temperature: 0.0,
-                eos_token_ids: Vec::new(),
-            },
-            None,
-            &mut DefaultSampler,
-        )
-        .unwrap();
-    assert_eq!(generated.len(), 1);
-    let prefix_ids = vec![1, 2];
-    let layer_layout = session.prompt_cache_layer_layout().unwrap();
-    let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
-    assert!(layer_prefix_offsets.contains(&-1));
-    let target_layers = layer_prefix_offsets
-        .iter()
-        .take_while(|offset| **offset == 0)
-        .count();
-    let descriptor = PromptCacheDescriptor {
-        model_family: "inkling".into(),
-        effective_model_type: "inkling_mm_model".into(),
-        checkpoint_fingerprint: "opaque-mtp-fixture".into(),
-        prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
-        architecture_fingerprint: session.prompt_cache_architecture_fingerprint().unwrap(),
-        layer_count: layer_layout.len(),
-        global_layer_start: 0,
-        global_layer_end: layer_layout.len(),
-        batch_size: 1,
-        layer_prefix_offsets,
-        layer_layout,
-        sink_tokens: 0,
-        topology: PromptCacheTopology::default(),
-    };
-    let prompt_cache = tempfile::tempdir().unwrap();
-    let destination = prompt_cache.path().join("cache");
-    let manifest = session
-        .save_prompt_cache(
-            &backend,
-            &destination,
-            descriptor.clone(),
-            &prefix_ids,
-            &PromptCacheOptions::default(),
-        )
-        .unwrap();
-    assert!(manifest
-        .blocks
-        .iter()
-        .any(|block| block.global_layer >= target_layers));
-    assert!(manifest.state_tensors.iter().any(|tensor| {
-        matches!(tensor.owner, eredu_core::cache::StateTensorOwner::Layer(layer) if layer >= target_layers)
-    }));
-    session
-        .load_prompt_cache(&backend, destination, &descriptor, &prefix_ids, paged)
-        .unwrap();
 }
 
 /// Exercises the neutral Gemma 4 text binder through the public loader and

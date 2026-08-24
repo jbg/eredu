@@ -26,7 +26,6 @@ use crate::{
     backend::runtime::generation::sampler::SpeculativeSampler,
     backend::ModelLoadOptions,
     composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
-    composition::mlx::ModelCache,
     composition::muse_glimmer::{
         load_dflash_gguf, load_dflash_safetensors, MuseGlimmerDFlashModel,
     },
@@ -51,21 +50,6 @@ pub enum MlxDrafterKind {
     Gemma4Assistant,
     /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
     MuseGlimmerDFlash,
-}
-
-/// Adapter-owned target caches for independently progressing prepared-chat lanes.
-pub struct MlxMtpCache {
-    pub lanes: Vec<ModelCache>,
-}
-
-impl MlxMtpCache {
-    pub fn new(lanes: Vec<ModelCache>) -> Self {
-        Self { lanes }
-    }
-
-    pub fn len(&self) -> usize {
-        self.lanes.len()
-    }
 }
 
 impl MlxDrafter {
