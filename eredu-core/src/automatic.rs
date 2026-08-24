@@ -632,9 +632,11 @@ impl<B: ModelLoadingBackend> ExecutionPlanTarget<B> {
     }
 }
 
-/// Portable tokenizer identities required to validate an external assistant.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ExternalDraftArtifact {
+/// Architecture-prepared assistant artifact and portable tokenizer identities.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExternalDraftArtifact<P> {
+    /// Inspected, backend-neutral assistant materialization plan.
+    pub preparation: P,
     /// Stable token-id vocabulary identity of the target model.
     pub target_tokenizer_fingerprint: [u8; 32],
     /// Stable token-id vocabulary identity of the external assistant.
@@ -676,6 +678,8 @@ impl<D> RealizedDrafting<D> {
 pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     /// Backend implementation created for the selected model/session.
     type Backend: ModelLoadingBackend;
+    /// Architecture-owned preparation consumed by assistant materialization.
+    type DrafterPreparation;
     /// Backend-owned separately prepared assistant type.
     type Drafter;
 
@@ -691,14 +695,14 @@ pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     /// Realizes the plan's complete drafting mode against a prepared target session.
     ///
     /// `external_artifact` is present exactly for [`DraftingPlan::External`].
-    /// It is assembled by the portable facade, which owns tokenizer loading,
-    /// while the backend owns assistant materialization, placement, and target
-    /// compatibility validation.
+    /// It is assembled by the portable facade, which owns architecture
+    /// inspection and tokenizer loading, while the backend owns only assistant
+    /// materialization, placement, and target compatibility validation.
     fn realize_drafting(
         &self,
         plan: &ExecutionPlan,
         target: &ModelRuntime<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact>,
+        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
     ) -> Result<RealizedDrafting<Self::Drafter>, AutomaticPlanningError>;
 }
 
@@ -754,9 +758,9 @@ pub fn realize_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
     factory: &F,
     plan: &ExecutionPlan,
     target: &ModelRuntime<F::Backend>,
-    external_artifact: Option<ExternalDraftArtifact>,
+    external_artifact: Option<ExternalDraftArtifact<F::DrafterPreparation>>,
 ) -> Result<RealizedDrafting<F::Drafter>, AutomaticPlanningError> {
-    match (&plan.drafting, external_artifact) {
+    match (&plan.drafting, external_artifact.as_ref()) {
         (DraftingPlan::External { .. }, None) => {
             return Err(AutomaticPlanningError::Invalid(
                 "external drafting requires target and assistant tokenizer identities".into(),

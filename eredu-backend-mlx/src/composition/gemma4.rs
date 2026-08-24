@@ -47,7 +47,7 @@ use crate::backend::{
                 materialize_module_bindings, parameter_name_in_targets, parameter_role_targets,
                 populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
             },
-            load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
+            load::{gguf_metadata, gguf_quantization_configs},
             quantization::should_quantize_on_load,
         },
         execution::{
@@ -337,6 +337,7 @@ impl Gemma4AssistantModel {
 /// Loads the released SafeTensors assistant into the backend-neutral module.
 pub fn load_assistant_safetensors(
     model_dir: &Path,
+    source_config: eredu_architectures::gemma4::AssistantConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -354,9 +355,6 @@ pub fn load_assistant_safetensors(
             "Gemma 4 assistant loading requires replicated placement".into(),
         ));
     }
-    let bytes = std::fs::read(model_dir.join("config.json"))?;
-    let source_config = eredu_architectures::gemma4::AssistantConfig::from_json(&bytes)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let requested = options
         .quantization
         .map(|requested| {
@@ -402,7 +400,9 @@ pub fn load_assistant_safetensors(
 }
 
 pub fn load_assistant_gguf(
-    gguf_file: &Path,
+    checkpoint: eredu_gguf::Checkpoint,
+    resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
+    mut source_config: eredu_architectures::gemma4::AssistantConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -420,47 +420,34 @@ pub fn load_assistant_gguf(
             "Gemma 4 assistant loading requires replicated placement".into(),
         ));
     }
-    struct Catalog<'a>(&'a GgufCheckpoint);
-    impl eredu_architectures::gemma4::GgufTensorCatalog for Catalog<'_> {
-        fn contains(&self, name: &str) -> bool {
-            self.0.contains_gguf_tensor(name)
-        }
-    }
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    let mut config = eredu_architectures::gemma4::AssistantConfig::from_gguf_metadata(
-        &Catalog(&checkpoint),
-        &metadata,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let mlx_checkpoint = GgufCheckpoint::from_portable(checkpoint.clone());
+    let metadata = gguf_metadata(&mlx_checkpoint);
     let formats = gguf_quantization_configs(
-        &checkpoint,
+        &mlx_checkpoint,
         eredu_architectures::gemma4::translate_assistant_gguf_weight_name,
     )?;
     if !formats.is_empty() {
-        config.text_config.quantized_weight_configs = Some(formats);
+        source_config.text_config.quantized_weight_configs = Some(formats);
     }
-    if config.use_ordered_embeddings && options.quantization.is_some() {
+    if source_config.use_ordered_embeddings && options.quantization.is_some() {
         return Err(Error::Quantization(
             "Gemma 4 ordered assistant heads cannot be quantized".into(),
         ));
     }
     crate::composition::mlx::validate_gguf_quantization_source(
-        &checkpoint,
+        &mlx_checkpoint,
         &metadata,
         options.quantization,
     )?;
-    let plan = eredu_architectures::gemma4::assistant_gguf_plan(&config)
-        .map_err(Error::UnsupportedArchitecture)?;
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(options.weight_residency.max_mapped_shards())?
-            .add_checkpoint(checkpoint.catalog().clone(), &plan, |name| {
+            .add_resolved_checkpoint(checkpoint, &resolution, |name| {
                 eredu_architectures::gemma4::translate_assistant_gguf_weight_name(name)
             })?
             .build()?,
     );
-    let source_config = config.clone();
+    let mut config = source_config.clone();
     let (store, config) = if let Some(requested) = options.quantization {
         config.quantization = Some(requested);
         config.text_config.weight_quantization = Some(requested);

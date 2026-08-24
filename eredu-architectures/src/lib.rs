@@ -18,6 +18,12 @@ pub mod capability;
 /// Authoritative model-family identity and Hugging Face/GGUF configuration parsing.
 pub mod configuration;
 pub use configuration::{GgufArchitecture, ModelKind};
+/// Architecture-owned external assistant inspection and preparation.
+pub mod external_assistant;
+pub use external_assistant::{
+    prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
+    Gemma4AssistantPreparationPlan, MuseGlimmerAssistantPreparationPlan,
+};
 mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;

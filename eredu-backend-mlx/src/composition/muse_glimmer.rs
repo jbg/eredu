@@ -231,6 +231,7 @@ impl MuseGlimmerDFlashModel {
 
 pub fn load_dflash_safetensors(
     model_dir: &Path,
+    source_config: eredu_architectures::muse_glimmer::DFlashConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -248,9 +249,6 @@ pub fn load_dflash_safetensors(
             "Muse-Glimmer DFlash requires replicated placement".into(),
         ));
     }
-    let bytes = std::fs::read(model_dir.join("config.json"))?;
-    let source_config = eredu_architectures::muse_glimmer::DFlashConfig::from_hf_json(&bytes)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let requested = options
         .quantization
         .map(|requested| {
@@ -285,7 +283,9 @@ pub fn load_dflash_safetensors(
 }
 
 pub fn load_dflash_gguf(
-    gguf_file: &Path,
+    checkpoint: eredu_gguf::Checkpoint,
+    resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
+    mut source_config: eredu_architectures::muse_glimmer::DFlashConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -303,30 +303,26 @@ pub fn load_dflash_gguf(
             "Muse-Glimmer DFlash requires replicated placement".into(),
         ));
     }
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    let mut config = eredu_architectures::muse_glimmer::DFlashConfig::from_gguf_metadata(&metadata)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    config.quantized_weights = gguf_quantization_configs(
-        &checkpoint,
+    let mlx_checkpoint = GgufCheckpoint::from_portable(checkpoint.clone());
+    let metadata = gguf_metadata(&mlx_checkpoint);
+    source_config.quantized_weights = gguf_quantization_configs(
+        &mlx_checkpoint,
         eredu_architectures::muse_glimmer::translate_dflash_gguf_weight_name,
     )?;
     crate::composition::mlx::validate_gguf_quantization_source(
-        &checkpoint,
+        &mlx_checkpoint,
         &metadata,
         options.quantization,
     )?;
-    let plan = eredu_architectures::muse_glimmer::dflash_gguf_plan(&config)
-        .map_err(Error::UnsupportedArchitecture)?;
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(options.weight_residency.max_mapped_shards())?
-            .add_checkpoint(checkpoint.catalog().clone(), &plan, |name| {
+            .add_resolved_checkpoint(checkpoint, &resolution, |name| {
                 eredu_architectures::muse_glimmer::translate_dflash_gguf_weight_name(name)
             })?
             .build()?,
     );
-    let source_config = config.clone();
+    let mut config = source_config.clone();
     let (store, config) = if let Some(requested) = options.quantization {
         config.quantization = Some(requested);
         config.quantized_weights.clear();

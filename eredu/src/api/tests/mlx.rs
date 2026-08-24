@@ -1607,12 +1607,13 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     .unwrap();
     let assistant_module = eredu_architectures::gemma4::Assistant::<
         eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
-    >::new(assistant_config, stream)
+    >::new(assistant_config.clone(), stream)
     .unwrap();
     save_zero_neutral_checkpoint(&assistant_module, &assistant_dir, stream);
     let mut assistant =
         eredu_backend_mlx::testing::composition::gemma4::load_assistant_safetensors(
             &assistant_dir,
+            assistant_config,
             ModelLoadOptions::default(),
             stream,
             weights_stream,

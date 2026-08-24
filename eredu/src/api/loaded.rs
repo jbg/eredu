@@ -540,7 +540,10 @@ where
         plan: &eredu_core::ExecutionPlan,
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError<B::Error>>
     where
-        F: eredu_core::ExecutionPlanBackendFactory<Backend = B>,
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
+        >,
     {
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
@@ -551,9 +554,12 @@ where
             eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
         let external_artifact = match &plan.drafting {
             DraftingPlan::External { model, .. } => {
+                let preparation = eredu_architectures::prepare_external_assistant(model)
+                    .map_err(LoadedModelLoadError::Artifact)?;
                 let draft_tokenizer = super::load_tokenizer(Path::new(model))
                     .map_err(LoadedModelLoadError::Metadata)?;
                 Some(ExternalDraftArtifact {
+                    preparation,
                     target_tokenizer_fingerprint,
                     draft_tokenizer_fingerprint: eredu_text::tokenizer::vocabulary_fingerprint(
                         &draft_tokenizer,
@@ -588,7 +594,10 @@ where
         PlannedModelLoadError<B::Error>,
     >
     where
-        F: eredu_core::ExecutionPlanBackendFactory<Backend = B>,
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
+        >,
     {
         let report = planner.plan(factory, request)?;
         let model = Self::load_execution_plan(factory, &request.model_path, &report.plan)?;

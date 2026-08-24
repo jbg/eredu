@@ -563,6 +563,7 @@ impl AutomaticPlanningBackend for MockBackend {
 
 impl ExecutionPlanBackendFactory for MockBackend {
     type Backend = Self;
+    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan;
     type Drafter = MockDrafter;
 
     fn realize_target(
@@ -576,7 +577,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
         &self,
         plan: &ExecutionPlan,
         _: &ModelRuntime<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact>,
+        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
     ) -> Result<RealizedDrafting<MockDrafter>, AutomaticPlanningError> {
         Ok(match plan.drafting {
             DraftingPlan::Disabled => {
@@ -886,6 +887,23 @@ fn write_loadable_text_artifact(root: &std::path::Path) {
         .unwrap();
 }
 
+fn write_loadable_assistant_artifact(root: &std::path::Path) {
+    write_loadable_text_artifact(root);
+    std::fs::write(
+        root.join("config.json"),
+        r#"{
+          "model_type":"gemma4_assistant","backbone_hidden_size":32,
+          "use_ordered_embeddings":false,"tie_word_embeddings":false,"block_size":4,
+          "text_config":{"model_type":"gemma4_text","hidden_size":32,
+            "num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+            "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":false,
+            "attention_k_eq_v":false,"layer_types":["full_attention"]}
+        }"#,
+    )
+    .unwrap();
+}
+
 fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
     backend: &B,
     model_path: &Path,
@@ -911,7 +929,9 @@ fn planned_loading_client_code<F>(
     eredu::ExecutionPlanReport,
 )
 where
-    F: ExecutionPlanBackendFactory,
+    F: ExecutionPlanBackendFactory<
+        DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
+    >,
     F::Backend: TextGenerationBackend,
 {
     let request = AutomaticPlanRequest::new(
@@ -1014,8 +1034,10 @@ fn assert_automatic_planning_conformance() {
     ));
 
     let mut external = report.plan.clone();
+    let assistant = TestDirectory::new();
+    write_loadable_assistant_artifact(assistant.path());
     external.drafting = DraftingPlan::External {
-        model: artifact.path().display().to_string(),
+        model: assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 4,
         lookahead: true,

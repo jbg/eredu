@@ -343,6 +343,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Backend = MlxBackend<'static>;
+    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan;
     type Drafter = MlxDrafter;
 
     fn realize_target(
@@ -363,7 +364,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         &self,
         plan: &ExecutionPlan,
         target: &ModelRuntime<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact>,
+        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
     ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
         let capability =
             <MlxBackend<'static> as SpeculativeGenerationBackend>::mtp_capability(target);
@@ -381,9 +382,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 }
                 Ok(RealizedDrafting::Embedded)
             }
-            DraftingPlan::External {
-                model, placement, ..
-            } => {
+            DraftingPlan::External { placement, .. } => {
                 if capability
                     != (MtpCapability::Ready {
                         checkpoint: MtpCheckpointKind::Separate,
@@ -406,8 +405,8 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 };
                 let options = mlx_drafter_load_options(plan)
                     .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                let drafter = MlxDrafter::load_with_fingerprint(
-                    model,
+                let drafter = MlxDrafter::materialize_with_fingerprint(
+                    artifact.preparation,
                     artifact.draft_tokenizer_fingerprint,
                     options,
                     &draft_stream,

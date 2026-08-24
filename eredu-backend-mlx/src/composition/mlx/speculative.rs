@@ -9,8 +9,6 @@ pub mod scheduler;
 
 pub use scheduler::MtpComponentTimingGuard;
 
-use std::path::Path;
-
 use eredu_core::{
     Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
     SpeculativeRandomness, SpeculativeSampling,
@@ -71,63 +69,61 @@ impl MlxMtpCache {
 }
 
 impl MlxDrafter {
-    /// Loads a drafter using a facade-computed tokenizer vocabulary fingerprint.
-    pub fn load_with_fingerprint(
-        source: impl AsRef<Path>,
+    /// Materializes an architecture-inspected drafter with its tokenizer identity.
+    pub(crate) fn materialize_with_fingerprint(
+        preparation: eredu_architectures::ExternalAssistantPreparationPlan,
         tokenizer_fingerprint: [u8; 32],
         options: ModelLoadOptions,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        let source = source.as_ref();
-        let is_gguf = source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
-        let model = if is_gguf {
-            let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
-            let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-            match eredu_architectures::configuration::resolve_gguf_assistant_model_kind(&metadata)?
-            {
-                eredu_architectures::configuration::AssistantModelKind::MuseGlimmer => {
-                    MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_gguf(
-                        source,
+        use eredu_architectures::{ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan};
+        let model = match preparation {
+            ExternalAssistantPreparationPlan::Gemma4(plan) => {
+                let (checkpoint, config) = plan.into_parts();
+                let model = match checkpoint {
+                    ExternalAssistantCheckpoint::SafeTensors { source } => {
+                        load_assistant_safetensors(
+                            &source,
+                            config,
+                            options,
+                            stream,
+                            weights_stream,
+                        )?
+                    }
+                    ExternalAssistantCheckpoint::Gguf {
+                        checkpoint,
+                        resolution,
+                    } => load_assistant_gguf(
+                        checkpoint,
+                        resolution,
+                        config,
                         options,
                         stream,
                         weights_stream,
-                    )?))
-                }
-                eredu_architectures::configuration::AssistantModelKind::Gemma4 => {
-                    MlxDrafterModel::Gemma4(Box::new(load_assistant_gguf(
-                        source,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?))
-                }
+                    )?,
+                };
+                MlxDrafterModel::Gemma4(Box::new(model))
             }
-        } else {
-            let config: serde_json::Value =
-                serde_json::from_reader(std::fs::File::open(source.join("config.json"))?)?;
-            match eredu_architectures::configuration::resolve_safetensors_assistant_model_kind(
-                &config,
-            )? {
-                eredu_architectures::configuration::AssistantModelKind::MuseGlimmer => {
-                    MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_safetensors(
-                        source,
+            ExternalAssistantPreparationPlan::MuseGlimmer(plan) => {
+                let (checkpoint, config) = plan.into_parts();
+                let model = match checkpoint {
+                    ExternalAssistantCheckpoint::SafeTensors { source } => {
+                        load_dflash_safetensors(&source, config, options, stream, weights_stream)?
+                    }
+                    ExternalAssistantCheckpoint::Gguf {
+                        checkpoint,
+                        resolution,
+                    } => load_dflash_gguf(
+                        checkpoint,
+                        resolution,
+                        config,
                         options,
                         stream,
                         weights_stream,
-                    )?))
-                }
-                eredu_architectures::configuration::AssistantModelKind::Gemma4 => {
-                    MlxDrafterModel::Gemma4(Box::new(load_assistant_safetensors(
-                        source,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?))
-                }
+                    )?,
+                };
+                MlxDrafterModel::MuseGlimmerDFlash(Box::new(model))
             }
         };
         Ok(Self {
@@ -137,7 +133,7 @@ impl MlxDrafter {
         })
     }
 
-    /// Architecture detected from the checkpoint itself.
+    /// Architecture fixed by the inspected preparation plan.
     pub(crate) const fn kind(&self) -> MlxDrafterKind {
         match self.model {
             MlxDrafterModel::Gemma4(_) => MlxDrafterKind::Gemma4Assistant,
