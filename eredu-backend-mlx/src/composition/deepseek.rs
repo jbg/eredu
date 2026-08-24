@@ -21,8 +21,7 @@ use safemlx::{
 };
 
 use crate::backend::runtime::{
-    distributed::parallel::ParallelBuildContext,
-    execution::layerwise::{open_safetensors_weight_store, shard_layer_bindings},
+    distributed::parallel::ParallelBuildContext, execution::layerwise::shard_layer_bindings,
     media::input,
 };
 use crate::backend::{
@@ -2506,31 +2505,20 @@ pub fn quantize_v4_store(
 
 /// Loads a SafeTensors DeepSeek family through the neutral architecture.
 pub fn load_safetensors(
-    model_dir: &Path,
-    residency: WeightResidency,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekModel, Error> {
-    load_safetensors_internal(model_dir, residency, quantization, stream, weights_stream)
-}
-
-fn load_safetensors_internal(
-    model_dir: &Path,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
     let expert_options = residency.expert_cache();
-    let value: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-    let store = open_safetensors_weight_store(model_dir, residency.max_mapped_shards())?;
-    let configuration = eredu_architectures::configuration::resolve_model_identity(&value)?;
+    let value = artifact.config()?;
+    let store = artifact.store();
+    let configuration = eredu_architectures::configuration::resolve_model_identity(value)?;
     match configuration.kind {
         eredu_architectures::ModelKind::DeepSeekV3 => {
-            let args = deepseek::parse_v3_config(&value)
-                .map_err(|error| unsupported(error.to_string()))?;
+            let args =
+                deepseek::parse_v3_config(value).map_err(|error| unsupported(error.to_string()))?;
             let plan = deepseek::v3_safetensors_plan(&args, true).map_err(unsupported)?;
             let store = resolve_safetensors_store(store, &plan, &args.model_type)?;
             let (store, args, materialization) = match quantization {
@@ -2558,8 +2546,8 @@ fn load_safetensors_internal(
             Ok(model)
         }
         eredu_architectures::ModelKind::DeepSeekV4 => {
-            let args = deepseek::parse_v4_config(&value)
-                .map_err(|error| unsupported(error.to_string()))?;
+            let args =
+                deepseek::parse_v4_config(value).map_err(|error| unsupported(error.to_string()))?;
             let plan = deepseek::v4_safetensors_plan(&args).map_err(unsupported)?;
             let store = resolve_safetensors_store(store, &plan, &args.model_type)?;
             let (store, args, materialization) = match quantization {

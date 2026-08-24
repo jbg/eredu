@@ -187,6 +187,12 @@ pub enum WeightStoreError {
         /// Deterministically ordered pinned shard paths.
         leased_shards: Vec<PathBuf>,
     },
+    /// Physical checkpoint metadata changed after preparation.
+    #[error("checkpoint tensor {key:?} no longer matches the prepared catalog")]
+    PreparedCatalogMismatch {
+        /// Logical tensor whose metadata changed.
+        key: String,
+    },
     /// Filesystem access failed.
     #[error("I/O error for {path}: {source}", path = .path.display())]
     Io {
@@ -475,6 +481,9 @@ pub fn neutral_store_error(error: eredu_checkpoint::store::StoreError) -> Weight
             max_mapped_shards: maximum,
             leased_shards: leased,
         },
+        StoreError::PreparedCatalogMismatch { key } => {
+            WeightStoreError::PreparedCatalogMismatch { key }
+        }
         StoreError::Io { path, message } => {
             WeightStoreError::MalformedSafetensors { path, message }
         }

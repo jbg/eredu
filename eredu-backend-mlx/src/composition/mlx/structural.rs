@@ -1,6 +1,7 @@
 //! MLX architecture binding against portable checkpoint catalogs.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -55,20 +56,6 @@ pub(crate) fn admit_gguf(
         checkpoint,
         metadata,
     })
-}
-
-pub(crate) fn admit_gguf_path(
-    path: &Path,
-    options: ModelLoadOptions,
-) -> Result<AdmittedGguf, Error> {
-    let inspection = eredu_architectures::configuration::inspect_artifact(path)?;
-    let validated = inspection.validated_gguf().ok_or_else(|| {
-        Error::UnsupportedArchitecture("GGUF admission received a non-GGUF artifact".into())
-    })?;
-    let architecture = GgufArchitecture::resolve(&inspection.configuration().declared_model_type)?;
-    let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
-    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    admit_gguf(architecture, checkpoint, metadata, options)
 }
 
 const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {

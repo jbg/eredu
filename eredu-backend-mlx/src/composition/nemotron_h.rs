@@ -42,10 +42,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{
-                open_safetensors_weight_store, quantize_module_store_with_bindings,
-                shard_layer_bindings,
-            },
+            layerwise::{quantize_module_store_with_bindings, shard_layer_bindings},
         },
         media::input,
         residency::expert_cache::ExpertCatalogEntry,
@@ -352,12 +349,6 @@ enum NemotronHExecution {
     Layerwise(Box<BoundedRuntime>),
     TensorParallelResident(Box<ParallelResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
-}
-
-pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
-    let file = std::fs::File::open(model_dir.join("config.json"))?;
-    eredu_architectures::nemotron_h::model_args_from_config_reader(file)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 fn resolve_store(
@@ -1951,16 +1942,16 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
 
 /// Loads SafeTensors Nemotron-H through one neutral model object.
 pub fn load_nemotron_h_model(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHModel, Error> {
-    let model_dir = model_dir.as_ref();
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    let args = load_model_args(model_dir)?;
+    let args = eredu_architectures::nemotron_h::model_args_from_config_value(artifact.config()?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let quantize = quantization
         .map(|requested| {
             should_quantize_on_load("Nemotron-H", args.weight_quantization, requested)
@@ -1968,7 +1959,7 @@ pub fn load_nemotron_h_model(
         })
         .transpose()?
         .flatten();
-    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     if let Some(quantization) = quantize {
         let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
@@ -2021,16 +2012,16 @@ fn attach_expert_cache(
 
 /// Loads SafeTensors Nemotron-H through generalized tensor-parallel placement.
 pub fn load_nemotron_h_tensor_parallel_model(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let args = load_model_args(model_dir)?;
     let options = options.into();
-    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
+    let args = eredu_architectures::nemotron_h::model_args_from_config_value(artifact.config()?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
 }

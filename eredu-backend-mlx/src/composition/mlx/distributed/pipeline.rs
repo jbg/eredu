@@ -87,8 +87,8 @@ use crate::{
     },
     backend::runtime::distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
     backend::runtime::execution::layerwise::{
-        open_safetensors_weight_store, quantize_pipeline_stage_store_with, shard_layer_bindings,
-        DenseStreamController, DenseTransferWindow, PipelineStageQuantizationSelection,
+        quantize_pipeline_stage_store_with, shard_layer_bindings, DenseStreamController,
+        DenseTransferWindow, PipelineStageQuantizationSelection,
     },
     backend::runtime::generation::sampler::SpeculativeSampler,
     backend::runtime::media::{prepared_identity_wire_arrays, PreparedModelInput},
@@ -14076,7 +14076,7 @@ pub fn load_pipeline_model_with_options(
     };
     let max_mapped_shards = options.weight_residency.max_mapped_shards();
 
-    let (model_dir, configuration) = match artifact {
+    let artifact = match artifact {
         ModelArtifact::Gguf {
             path: model_dir,
             configuration,
@@ -14414,15 +14414,17 @@ pub fn load_pipeline_model_with_options(
         ModelArtifact::SafeTensors {
             path,
             configuration,
-            ..
-        } => (path, configuration),
+            tensors,
+        } => crate::composition::mlx::artifact::PreparedSafetensorsArtifact::open(
+            path,
+            configuration,
+            tensors,
+            max_mapped_shards,
+        )?,
     };
 
-    let config = configuration.json.as_ref().ok_or_else(|| {
-        Error::UnsupportedArchitecture(
-            "SafeTensors preparation plan omitted normalized JSON configuration".into(),
-        )
-    })?;
+    let configuration = artifact.configuration();
+    let config = artifact.config()?;
     let kind = ModelKind::resolve_family(&configuration.family)?;
     if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
         return Err(Error::UnsupportedArchitecture(
@@ -14439,7 +14441,7 @@ pub fn load_pipeline_model_with_options(
         "SafeTensors",
         &configuration.effective_model_type,
     )?;
-    let store = open_safetensors_weight_store(&model_dir, max_mapped_shards)?;
+    let store = artifact.store();
     match kind {
         ModelKind::Llama => {
             let args = eredu_architectures::llama::model_args_from_config_value(config)

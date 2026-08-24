@@ -1,7 +1,5 @@
 //! Thinking Machines Lab Inkling image and dMel host preprocessing.
 
-use std::path::Path;
-
 #[cfg(feature = "media")]
 use std::collections::HashMap;
 
@@ -33,8 +31,8 @@ pub struct InklingProcessor {
 }
 
 impl InklingProcessor {
-    pub fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
-        InklingProcessorPlan::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
+    pub fn load(model: &[u8]) -> Result<Option<Self>, Error> {
+        InklingProcessorPlan::from_hf_json(model)
             .map_err(processor_error)
             .map(|plan| plan.map(|plan| Self { plan }))
     }

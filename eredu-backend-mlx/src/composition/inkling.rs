@@ -50,10 +50,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{
-                open_safetensors_weight_store, quantize_module_store_with_bindings,
-                shard_layer_bindings,
-            },
+            layerwise::{quantize_module_store_with_bindings, shard_layer_bindings},
         },
         media::input,
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
@@ -1959,16 +1956,15 @@ fn load_parallel_store(
 
 /// Loads an Inkling SafeTensors checkpoint for pure tensor parallelism.
 pub fn load_safetensors_tensor_parallel(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     layer_policy: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let args = ModelArgs::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
+    let args = ModelArgs::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let store = open_safetensors_weight_store(model_dir, layer_policy.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
 }
@@ -2016,17 +2012,16 @@ fn attach_expert_cache(
 
 /// Loads SafeTensors into one neutral model across resident/bounded policies.
 pub fn load_safetensors(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
     let expert_options = residency.expert_cache();
-    let model_dir = model_dir.as_ref();
-    let args = ModelArgs::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
+    let args = ModelArgs::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let store = open_safetensors_weight_store(model_dir, residency.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     let requested = quantization
         .map(|requested| {

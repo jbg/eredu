@@ -40,12 +40,11 @@ pub struct Gemma4Processor {
 }
 
 impl Gemma4Processor {
-    pub fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
-        let model = fs::read(model_dir.join("config.json"))?;
+    pub fn load(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
         let image = read_optional(&model_dir.join(PROCESSOR_CONFIG_FILENAME))?;
         let video = read_optional(&model_dir.join(VIDEO_PROCESSOR_CONFIG_FILENAME))?;
         let Some(plan) =
-            Gemma4ProcessorPlan::from_hf_json(&model, image.as_deref(), video.as_deref())
+            Gemma4ProcessorPlan::from_hf_json(model, image.as_deref(), video.as_deref())
                 .map_err(processor_error)?
         else {
             return Ok(None);

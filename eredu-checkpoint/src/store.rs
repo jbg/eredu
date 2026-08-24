@@ -755,6 +755,12 @@ pub enum StoreError {
         /// Deterministically ordered pinned paths.
         leased: Vec<PathBuf>,
     },
+    /// Physical checkpoint metadata no longer matches an admitted catalog.
+    #[error("checkpoint tensor {key:?} no longer matches the prepared catalog")]
+    PreparedCatalogMismatch {
+        /// Logical tensor whose physical metadata changed.
+        key: String,
+    },
     /// Filesystem or container access failed.
     #[error("checkpoint I/O failed for {path}: {message}", path = .path.display())]
     Io {

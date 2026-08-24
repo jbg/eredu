@@ -291,6 +291,14 @@ that exact normalized configuration. Backends translate those neutral flags
 into report and build-feature readiness, but do not infer image, audio, or
 video support from a family name. Text-only and partially multimodal variants
 therefore do not acquire processor or feature requirements they cannot use.
+SafeTensors materialization retains the normalized configuration and validated
+tensor catalog from the preparation plan, opens one catalog-checked checkpoint
+store, and passes that composition object to every family loader. Family
+composition does not reopen `config.json`, rediscover checkpoint shards, or
+select a second catalog after admission; media processor construction also
+uses the retained model configuration while reading only its processor
+sidecars. The catalog-bound store revalidates tensor metadata when leases are
+acquired so later header changes cannot silently replace the admitted catalog.
 For composite GGUF artifacts, the architecture additionally owns the plan that
 maps a validated sibling media projector to the resulting input modalities.
 Inspection applies that plan after projector discovery and structural

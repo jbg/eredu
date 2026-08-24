@@ -141,8 +141,8 @@ impl<'a> PortableMediaView<'a> {
 }
 
 impl ModelProcessor {
-    pub fn load_gemma4(model_dir: &Path) -> Result<Option<Self>, Error> {
-        gemma4::Gemma4Processor::load(model_dir).map(|processor| {
+    pub fn load_gemma4(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
+        gemma4::Gemma4Processor::load(model_dir, model).map(|processor| {
             processor.map(|processor| Self {
                 kind: ProcessorKind::Gemma4(processor),
             })
@@ -162,8 +162,8 @@ impl ModelProcessor {
         })
     }
 
-    pub fn load_inkling(model_dir: &Path) -> Result<Option<Self>, Error> {
-        inkling::InklingProcessor::load(model_dir).map(|processor| {
+    pub fn load_inkling(model: &[u8]) -> Result<Option<Self>, Error> {
+        inkling::InklingProcessor::load(model).map(|processor| {
             processor.map(|processor| Self {
                 kind: ProcessorKind::Inkling(processor),
             })
@@ -199,8 +199,17 @@ impl ModelProcessor {
     }
 
     #[cfg(feature = "image")]
-    pub fn load_qwen(model_dir: &Path) -> Result<Option<Self>, Error> {
-        qwen::QwenProcessor::load(model_dir).map(|processor| {
+    pub fn load_qwen(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
+        qwen::QwenProcessor::load(model_dir, model).map(|processor| {
+            processor.map(|processor| Self {
+                kind: ProcessorKind::Qwen(processor),
+            })
+        })
+    }
+
+    #[cfg(feature = "image")]
+    pub fn load_qwen_directory(model_dir: &Path) -> Result<Option<Self>, Error> {
+        qwen::QwenProcessor::load_directory(model_dir).map(|processor| {
             processor.map(|processor| Self {
                 kind: ProcessorKind::Qwen(processor),
             })
@@ -261,11 +270,13 @@ impl ModelProcessor {
 pub fn load_processor(
     kind: eredu_architectures::ModelKind,
     model_dir: impl AsRef<Path>,
+    config: &serde_json::Value,
 ) -> Result<Option<ModelProcessor>, Error> {
     let model_dir = model_dir.as_ref();
+    let model = serde_json::to_vec(config)?;
     match kind {
-        eredu_architectures::ModelKind::Inkling => ModelProcessor::load_inkling(model_dir),
-        eredu_architectures::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir),
+        eredu_architectures::ModelKind::Inkling => ModelProcessor::load_inkling(&model),
+        eredu_architectures::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir, &model),
         eredu_architectures::ModelKind::MuseGlimmer => {
             #[cfg(feature = "image")]
             {
@@ -281,7 +292,7 @@ pub fn load_processor(
         | eredu_architectures::ModelKind::Qwen35 => {
             #[cfg(feature = "image")]
             {
-                ModelProcessor::load_qwen(model_dir)
+                ModelProcessor::load_qwen(model_dir, &model)
             }
             #[cfg(not(feature = "image"))]
             {

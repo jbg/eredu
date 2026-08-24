@@ -45,9 +45,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{
-                open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
-            },
+            layerwise::{quantize_parameterized_store, shard_layer_bindings},
         },
         media::input,
         residency::expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry},
@@ -426,13 +424,6 @@ impl Parameterized<crate::MlxTensor> for DenseUnit {
     fn set_trainable(&mut self, trainable: bool) {
         self.block.set_trainable(trainable);
     }
-}
-
-/// Reads normalized GPT-OSS arguments from a SafeTensors model directory.
-pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
-    let file = std::fs::File::open(model_dir.join("config.json"))?;
-    eredu_architectures::gpt_oss::model_args_from_config_reader(file)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 fn resolve_safetensors_store(
@@ -1632,16 +1623,16 @@ fn attach_expert_cache(
 
 /// Loads SafeTensors GPT-OSS using the selected weight-residency policy.
 pub fn load_gpt_oss_safetensors_mlx(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     weight_residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
-    let model_dir = model_dir.as_ref();
     let expert_options = weight_residency.expert_cache();
     let execution_options = weight_residency.layers();
-    let args = load_model_args(model_dir)?;
+    let args = eredu_architectures::gpt_oss::model_args_from_config_value(artifact.config()?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("GPT-OSS", args.quantization, requested)
@@ -1649,7 +1640,7 @@ pub fn load_gpt_oss_safetensors_mlx(
         })
         .transpose()?
         .flatten();
-    let store = open_safetensors_weight_store(model_dir, execution_options.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_safetensors_store(store, &args)?;
     let (store, args, materialization) = match quantize_on_load {
         Some(quantization) => {
@@ -1675,14 +1666,14 @@ pub fn load_gpt_oss_safetensors_mlx(
 
 /// Loads a SafeTensors checkpoint through unified layered residency.
 pub fn load_gpt_oss_layerwise_model(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
     load_gpt_oss_safetensors_mlx(
-        model_dir,
+        artifact,
         WeightResidency::with_layers(options.into()),
         quantization,
         stream,
@@ -1692,7 +1683,7 @@ pub fn load_gpt_oss_layerwise_model(
 
 /// Loads GPT-OSS with experts managed independently from ordinary blocks.
 pub fn load_gpt_oss_expert_cache_model(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     non_expert: eredu_runtime::NonExpertWeightResidency,
     options: eredu_runtime::ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
@@ -1700,7 +1691,7 @@ pub fn load_gpt_oss_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
     load_gpt_oss_safetensors_mlx(
-        model_dir,
+        artifact,
         WeightResidency::with_expert_cache(non_expert, options),
         quantization,
         stream,
@@ -1710,34 +1701,16 @@ pub fn load_gpt_oss_expert_cache_model(
 
 /// Loads SafeTensors or an inspected GGUF through the neutral GPT-OSS tensor-parallel graph.
 pub fn load_gpt_oss_tensor_parallel_model(
-    model_path: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
-    let model_path = model_path.as_ref();
     let options = options.into();
-    if model_path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-    {
-        let admitted = crate::composition::mlx::structural::admit_gguf_path(
-            model_path,
-            crate::backend::ModelLoadOptions::default()
-                .with_weight_residency(WeightResidency::with_layers(options)),
-        )?;
-        return load_gpt_oss_gguf_tensor_parallel_model(
-            &admitted,
-            options,
-            build,
-            stream,
-            weights_stream,
-        )
-        .map(|(model, _)| model);
-    }
-    let args = load_model_args(model_path)?;
-    let store = open_safetensors_weight_store(model_path, options.max_mapped_shards())?;
+    let args = eredu_architectures::gpt_oss::model_args_from_config_value(artifact.config()?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let store = artifact.store();
     let store = resolve_safetensors_store(store, &args)?;
     load_neutral_parallel_with_store(store, args, options, build, stream, weights_stream, false)
 }

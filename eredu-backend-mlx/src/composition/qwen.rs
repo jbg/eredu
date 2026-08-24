@@ -42,9 +42,7 @@ use crate::{
         prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
         MlxUnitPopulator,
     },
-    backend::runtime::execution::layerwise::{
-        open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
-    },
+    backend::runtime::execution::layerwise::{quantize_parameterized_store, shard_layer_bindings},
     backend::runtime::media::input,
     backend::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
     backend::runtime::residency::manager::ResidentUnitLease,
@@ -264,12 +262,6 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
             .observe_routing(routing)
             .map_err(|error| eredu_nn::Error::backend(error.to_string()))
     }
-}
-
-pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
-    let file = std::fs::File::open(model_dir.join("config.json"))?;
-    eredu_architectures::qwen::model_args_from_config_reader(file)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 fn resolve_qwen_safetensors_store(
@@ -1131,16 +1123,16 @@ impl CausalModel<MlxKeyValueState> for QwenModel {
 }
 
 pub fn load_qwen_safetensors_mlx(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     weight_residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
-    let model_dir = model_dir.as_ref();
     let expert_options = weight_residency.expert_cache();
     let execution_options = weight_residency.layers();
-    let args = load_model_args(model_dir)?;
+    let args = eredu_architectures::qwen::model_args_from_config_value(artifact.config()?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen", args.weight_quantization(), requested)
@@ -1148,7 +1140,7 @@ pub fn load_qwen_safetensors_mlx(
         })
         .transpose()?
         .flatten();
-    let store = open_safetensors_weight_store(model_dir, execution_options.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_qwen_safetensors_store(store, &args)?;
     if let Some(quantization) = quantize_on_load {
         let (store, args, report) =
@@ -1383,34 +1375,16 @@ fn load_neutral_qwen_parallel(
 
 /// Loads Qwen/Mistral through the generalized tensor-parallel execution engine.
 pub fn load_qwen_tensor_parallel_model(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
-    let model_dir = model_dir.as_ref();
     let options = options.into();
-    if model_dir
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-    {
-        let admitted = crate::composition::mlx::structural::admit_gguf_path(
-            model_dir,
-            crate::backend::ModelLoadOptions::default()
-                .with_weight_residency(WeightResidency::with_layers(options)),
-        )?;
-        return load_qwen_gguf_tensor_parallel_model(
-            &admitted,
-            options,
-            build,
-            stream,
-            weights_stream,
-        )
-        .map(|(model, _)| model);
-    }
-    let args = load_model_args(model_dir)?;
-    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
+    let args = eredu_architectures::qwen::model_args_from_config_value(artifact.config()?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let store = artifact.store();
     let store = resolve_qwen_safetensors_store(store, &args)?;
     load_neutral_qwen_parallel(store, args, options, build, stream, weights_stream, false)
 }

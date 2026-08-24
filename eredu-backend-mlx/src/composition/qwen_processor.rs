@@ -25,11 +25,15 @@ pub struct QwenProcessor {
 }
 
 impl QwenProcessor {
-    pub fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
+    pub fn load_directory(model_dir: &Path) -> Result<Option<Self>, Error> {
         let model = fs::read(model_dir.join("config.json"))?;
+        Self::load(model_dir, &model)
+    }
+
+    pub fn load(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
         let image = read_optional(&model_dir.join(PROCESSOR_CONFIG_FILENAME))?;
         let video = read_optional(&model_dir.join(VIDEO_PROCESSOR_CONFIG_FILENAME))?;
-        QwenProcessorPlan::from_hf_json(&model, image.as_deref(), video.as_deref())
+        QwenProcessorPlan::from_hf_json(model, image.as_deref(), video.as_deref())
             .map_err(processor_error)
             .map(|plan| plan.map(|plan| Self { plan }))
     }

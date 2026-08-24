@@ -1615,16 +1615,15 @@ fn load_parallel_store(
 }
 
 pub fn load_safetensors_tensor_parallel(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let args = DecoderConfig::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
+    let args = DecoderConfig::from_hf_value(artifact.config()?)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let store = open_safetensors_weight_store(model_dir, residency.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
@@ -1672,17 +1671,16 @@ fn attach_expert_cache(
 
 /// Loads SafeTensors through one neutral family model and one residency policy.
 pub fn load_safetensors(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
     let expert_options = residency.expert_cache();
-    let model_dir = model_dir.as_ref();
-    let args = DecoderConfig::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
+    let args = DecoderConfig::from_hf_value(artifact.config()?)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let store = open_safetensors_weight_store(model_dir, residency.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     let current = args.quantization.or(args.quantization_config);
     let requested = quantization

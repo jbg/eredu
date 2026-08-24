@@ -73,7 +73,7 @@ use crate::backend::{
                 construct_architecture_unit, prepare_layerwise_policy_with_bindings,
                 MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
             },
-            layerwise::{open_safetensors_weight_store, quantize_parameterized_store},
+            layerwise::quantize_parameterized_store,
         },
         media::input,
         residency::expert_cache::ExpertCache,
@@ -1186,14 +1186,14 @@ pub fn load_gguf(
 
 /// Loads a Qwen3-VL SafeTensors artifact through the generic component engine.
 pub fn load_safetensors(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
     load_safetensors_with_residency(
-        model_dir,
+        artifact,
         WeightResidency::with_layers(options.into()),
         quantization,
         stream,
@@ -1202,16 +1202,13 @@ pub fn load_safetensors(
 }
 
 pub fn load_safetensors_with_residency(
-    model_dir: impl AsRef<Path>,
+    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let value: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-    let mut args = vl::model_args_from_config_value(&value)
+    let mut args = vl::model_args_from_config_value(artifact.config()?)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
@@ -1222,7 +1219,7 @@ pub fn load_safetensors_with_residency(
         .flatten();
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
+    let store = artifact.store();
     let store = resolve_store(store, &args)?;
     let (store, materialization) = if let Some(quantization) = quantize_on_load {
         let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
