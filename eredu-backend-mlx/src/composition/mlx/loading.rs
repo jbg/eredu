@@ -38,13 +38,10 @@ fn materialize_gguf_model(
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<MaterializedGgufModel, Error> {
+) -> Result<Model, Error> {
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     let kind = source.architecture().model_kind();
-    #[cfg(feature = "media")]
-    let mut processor = None;
-
     let (model, _architecture_eos_token_ids) = match source.architecture() {
         GgufArchitecture::KimiLinear => {
             let (loaded, eos_token_ids) =
@@ -101,10 +98,6 @@ fn materialize_gguf_model(
             (Model::GptOss(kind, loaded), eos_token_ids)
         }
         GgufArchitecture::Inkling => {
-            #[cfg(feature = "media")]
-            if projector.is_some() {
-                processor = Some(ModelProcessor::load_inkling_gguf(metadata)?);
-            }
             if options.quantization.is_some() {
                 return Err(Error::UnsupportedArchitecture(
                     "load-time Inkling quantization is not bound on the neutral loader".into(),
@@ -122,13 +115,6 @@ fn materialize_gguf_model(
             (Model::Inkling(kind, loaded), eos_token_ids)
         }
         GgufArchitecture::Gemma4 => {
-            #[cfg(any(feature = "image", feature = "audio"))]
-            if let Some(mmproj) = projector {
-                processor = Some(ModelProcessor::load_gemma4_gguf(
-                    metadata,
-                    &crate::backend::runtime::checkpoint::load::gguf_metadata(mmproj),
-                )?);
-            }
             if options.quantization.is_some() {
                 return Err(Error::UnsupportedArchitecture(
                     "load-time Gemma 4 quantization is not bound on the neutral loader".into(),
@@ -160,12 +146,6 @@ fn materialize_gguf_model(
                     "Muse-Glimmer preparation omitted its required media projector".into(),
                 )
             })?;
-            #[cfg(feature = "image")]
-            {
-                processor = Some(ModelProcessor::load_muse_glimmer_gguf(
-                    &crate::backend::runtime::checkpoint::load::gguf_metadata(projector),
-                )?);
-            }
             if options.quantization.is_some() {
                 return Err(Error::UnsupportedArchitecture(
                     "load-time Muse-Glimmer quantization is not bound on the neutral loader".into(),
@@ -253,11 +233,7 @@ fn materialize_gguf_model(
             (model, eos_token_ids)
         }
     };
-    Ok(MaterializedGgufModel {
-        model,
-        #[cfg(feature = "media")]
-        processor,
-    })
+    Ok(model)
 }
 
 pub fn materialize_model_plan(
@@ -275,21 +251,24 @@ pub fn materialize_model_plan(
         let kind = ModelKind::resolve_family(&plan.inspection().configuration().family)?;
         if requires_distributed_stage_loader(kind, topology) {
             #[cfg(feature = "media")]
-            let processor = if plan.inspection().format() == eredu_core::ArtifactFormat::SafeTensors
-            {
-                let config =
-                    plan.inspection()
-                        .configuration()
-                        .json
-                        .as_ref()
-                        .ok_or_else(|| {
-                            Error::UnsupportedArchitecture(
-                        "SafeTensors preparation plan omitted normalized JSON configuration".into(),
-                    )
-                        })?;
-                load_processor(kind, plan.inspection().path(), config)?
-            } else {
-                None
+            let processor = match plan.inspection().format() {
+                eredu_core::ArtifactFormat::SafeTensors => {
+                    let config =
+                        plan.inspection()
+                            .configuration()
+                            .json
+                            .as_ref()
+                            .ok_or_else(|| {
+                                Error::UnsupportedArchitecture(
+                                "SafeTensors preparation plan omitted normalized JSON configuration"
+                                    .into(),
+                            )
+                            })?;
+                    load_processor(kind, plan.inspection().path(), config)?
+                }
+                eredu_core::ArtifactFormat::Gguf => {
+                    load_inspected_gguf_processor(plan.inspection())?
+                }
             };
             let model =
                 crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
@@ -423,11 +402,15 @@ fn mlx_runtime_state_dtype_bytes(
 
 #[cfg(test)]
 mod runtime_state_dtype_tests {
+    #[cfg(feature = "image")]
+    use super::load_gguf_processor;
     use super::{
         mlx_runtime_state_dtype_bytes, reject_complete_tensor_parallel_quantization,
         requires_distributed_stage_loader,
     };
     use crate::backend::{DeviceAssignment, MlxParallelContext};
+    #[cfg(feature = "image")]
+    use eredu_architectures::GgufArchitecture;
     use eredu_architectures::ModelKind;
     use eredu_checkpoint::WeightQuantization;
     use eredu_core::checkpoint::TensorDtype;
@@ -486,6 +469,47 @@ mod runtime_state_dtype_tests {
             ModelKind::Llama,
             topology
         ));
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn shared_gguf_processor_loader_covers_qwen_vl_and_qwen35() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_path = directory.path().join("model.gguf");
+        std::fs::write(
+            directory.path().join("config.json"),
+            br#"{"vision_start_token_id":44,"vision_end_token_id":45}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("preprocessor_config.json"),
+            br#"{
+                "size":{"shortest_edge":16,"longest_edge":16},
+                "patch_size":2,"temporal_patch_size":2,"merge_size":2,
+                "image_mean":[0.0,0.0,0.0],"image_std":[1.0,1.0,1.0],
+                "min_frames":1,"max_frames":8
+            }"#,
+        )
+        .unwrap();
+        let metadata = std::collections::HashMap::new();
+
+        for architecture in [
+            GgufArchitecture::Qwen3Vl,
+            GgufArchitecture::Qwen3VlMoe,
+            GgufArchitecture::Qwen35,
+            GgufArchitecture::Qwen35Moe,
+        ] {
+            assert!(
+                load_gguf_processor(&model_path, architecture, &metadata, Some(&metadata),)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            load_gguf_processor(&model_path, GgufArchitecture::Qwen35, &metadata, None,)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -549,6 +573,67 @@ fn complete_gguf_model(
     #[cfg(feature = "media")]
     let model = model.with_processor(materialized.processor);
     model
+}
+
+#[cfg(feature = "media")]
+fn load_gguf_processor(
+    _model_path: &std::path::Path,
+    architecture: GgufArchitecture,
+    model_metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    projector_metadata: Option<&std::collections::HashMap<String, GgufMetadataValue>>,
+) -> Result<Option<ModelProcessor>, Error> {
+    match architecture {
+        GgufArchitecture::Inkling if projector_metadata.is_some() => {
+            ModelProcessor::load_inkling_gguf(model_metadata).map(Some)
+        }
+        #[cfg(any(feature = "image", feature = "audio"))]
+        GgufArchitecture::Gemma4 => projector_metadata
+            .map(|metadata| ModelProcessor::load_gemma4_gguf(model_metadata, metadata))
+            .transpose(),
+        #[cfg(feature = "image")]
+        GgufArchitecture::MuseGlimmer => projector_metadata
+            .map(ModelProcessor::load_muse_glimmer_gguf)
+            .transpose(),
+        #[cfg(feature = "image")]
+        GgufArchitecture::Qwen3Vl
+        | GgufArchitecture::Qwen3VlMoe
+        | GgufArchitecture::Qwen35
+        | GgufArchitecture::Qwen35Moe
+            if projector_metadata.is_some() =>
+        {
+            ModelProcessor::load_qwen_directory(
+                _model_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(feature = "media")]
+fn load_inspected_gguf_processor(
+    inspection: &eredu_core::ArtifactInspection,
+) -> Result<Option<ModelProcessor>, Error> {
+    let validated = inspection.validated_gguf().ok_or_else(|| {
+        Error::UnsupportedArchitecture(
+            "GGUF preparation plan omitted its validated checkpoint".into(),
+        )
+    })?;
+    let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
+    let model_metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let projector_metadata = validated
+        .companion(&eredu_core::GgufCompanionRole::MediaProjector)
+        .map(|companion| {
+            let checkpoint = GgufCheckpoint::from_portable(companion.checkpoint().clone());
+            crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint)
+        });
+    load_gguf_processor(
+        inspection.path(),
+        GgufArchitecture::resolve(&inspection.configuration().declared_model_type)?,
+        &model_metadata,
+        projector_metadata.as_ref(),
+    )
 }
 
 fn materialize_tensor_parallel(
@@ -731,6 +816,18 @@ fn materialize_gguf_artifact(
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;
+    #[cfg(feature = "media")]
+    let processor = {
+        let projector_metadata = projector
+            .as_ref()
+            .map(|checkpoint| crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint));
+        load_gguf_processor(
+            &_model_path,
+            architecture,
+            metadata,
+            projector_metadata.as_ref(),
+        )?
+    };
     if options
         .parallel
         .is_some_and(|topology| !topology.is_replicated())
@@ -742,47 +839,19 @@ fn materialize_gguf_artifact(
             stream,
             weights_stream,
         )?;
-        #[cfg(feature = "media")]
-        let processor = match architecture {
-            GgufArchitecture::Inkling if projector.is_some() => {
-                Some(ModelProcessor::load_inkling_gguf(&metadata)?)
-            }
-            #[cfg(any(feature = "image", feature = "audio"))]
-            GgufArchitecture::Gemma4 => projector
-                .as_ref()
-                .map(|checkpoint| {
-                    ModelProcessor::load_gemma4_gguf(
-                        &metadata,
-                        &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
-                    )
-                })
-                .transpose()?,
-            #[cfg(feature = "image")]
-            GgufArchitecture::MuseGlimmer => projector
-                .as_ref()
-                .map(|checkpoint| {
-                    ModelProcessor::load_muse_glimmer_gguf(
-                        &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
-                    )
-                })
-                .transpose()?,
-            #[cfg(feature = "image")]
-            GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe if projector.is_some() => {
-                ModelProcessor::load_qwen_directory(
-                    _model_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new(".")),
-                )?
-            }
-            _ => None,
-        };
         return Ok(MaterializedGgufModel {
             model,
             #[cfg(feature = "media")]
             processor,
         });
     }
-    materialize_gguf_model(&source, projector.as_ref(), options, stream, weights_stream)
+    let model =
+        materialize_gguf_model(&source, projector.as_ref(), options, stream, weights_stream)?;
+    Ok(MaterializedGgufModel {
+        model,
+        #[cfg(feature = "media")]
+        processor,
+    })
 }
 
 fn materialize_gguf_tensor_parallel(
