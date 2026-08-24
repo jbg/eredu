@@ -65,11 +65,6 @@ path = "tests/automatic_planner_api.rs"
 required-features = ["mlx"]
 
 [[test]]
-name = "distributed_realtime_ring"
-path = "tests/distributed_realtime_ring.rs"
-required-features = ["mlx"]
-
-[[test]]
 name = "native_tool_checkpoints"
 path = "tests/native_tool_checkpoints.rs"
 required-features = ["mlx"]

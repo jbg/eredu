@@ -9,19 +9,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::{
-    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
-    RealtimeScheduler,
-};
-use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
-use eredu_backend_mlx::native::{
+use crate::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
-use eredu_backend_mlx::{
+use crate::{
     DeviceAssignment, MlxParallelContext, MlxRealtimeBackend, MlxRealtimeInput, ModelLoadOptions,
 };
+use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
+use eredu_core::{
+    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
+    RealtimeScheduler,
+};
 
 const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";
 const MODEL_WORKER_RANK: &str = "EREDU_MOSHI_RING_MODEL_WORKER";
@@ -37,7 +37,7 @@ fn balanced_widths(total: usize) -> [usize; 2] {
 fn verify_canonical_vocabulary(
     total: usize,
     rank: usize,
-    group: &eredu_backend_mlx::native::distributed::Group,
+    group: &crate::native::distributed::Group,
     stream: &Stream,
 ) {
     let widths = balanced_widths(total);
@@ -295,7 +295,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_realtime_ring moshi_ring_tp2_collective_order_and_vocab -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-backend-mlx tests::distributed_realtime_ring::moshi_ring_tp2_collective_order_and_vocab -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns two local Ring ranks and opens loopback sockets; run explicitly"]
 fn moshi_ring_tp2_collective_order_and_vocab() {
@@ -319,7 +319,11 @@ fn moshi_ring_tp2_collective_order_and_vocab() {
     for rank in 0..2 {
         children.0.push(
             Command::new(&executable)
-                .args(["--exact", "moshi_ring_collective_worker", "--nocapture"])
+                .args([
+                    "--exact",
+                    "tests::distributed_realtime_ring::moshi_ring_collective_worker",
+                    "--nocapture",
+                ])
                 .env(WORKER_RANK, rank.to_string())
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)
@@ -400,7 +404,11 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
     for rank in 0..2 {
         children.0.push(
             Command::new(&executable)
-                .args(["--exact", "moshi_ring_model_parity_worker", "--nocapture"])
+                .args([
+                    "--exact",
+                    "tests::distributed_realtime_ring::moshi_ring_model_parity_worker",
+                    "--nocapture",
+                ])
                 .env(MODEL_WORKER_RANK, rank.to_string())
                 .env(MODEL_WORKER_FIXTURE, &fixture)
                 .env(MODEL_WORKER_PROFILE, profile)

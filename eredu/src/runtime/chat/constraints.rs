@@ -145,7 +145,7 @@ impl ConstraintController {
         })
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn constraint_is_active(&self) -> bool {
         matches!(self.runtime, ConstraintRuntime::Active(_))
     }
@@ -187,7 +187,7 @@ impl ConstraintController {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, ConstraintError> {
         match &mut self.runtime {
             ConstraintRuntime::Active(grammar) => grammar
@@ -489,7 +489,7 @@ impl ConstraintCompiler {
             .expect("single-byte tokenizer with EOS aliases must support llguidance")
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn synthetic_with_tokens_for_tests(extra_tokens: &[&[u8]]) -> Self {
         use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
 

@@ -5,14 +5,12 @@
 
 use eredu::{
     api::{
-        LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput,
+        local_device_plan, LoadedModel, LocalBackendFactory, LocalDevice,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
-    FinishReason, SemanticEvent,
+    ExecutionPlan, FinishReason, ResidencyPlan, SemanticEvent,
 };
-use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
-use eredu_backend_mlx::ModelLoadOptions;
 use serde_json::json;
 
 fn profile_requires_structural_tool_tokens(identity: &str) -> bool {
@@ -25,23 +23,19 @@ fn profile_requires_structural_tool_tokens(identity: &str) -> bool {
 }
 
 fn smoke(environment: &str, expected_profile_prefix: &str) {
-    smoke_with_options(
-        environment,
-        expected_profile_prefix,
-        ModelLoadOptions::default(),
-    );
+    smoke_with_plan(environment, expected_profile_prefix, accelerator_plan());
 }
 
-fn smoke_with_options(environment: &str, expected_profile_prefix: &str, options: ModelLoadOptions) {
+fn accelerator_plan() -> ExecutionPlan {
+    ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)))
+}
+
+fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: ExecutionPlan) {
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
-    let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let mut model = LoadedModel::load(
-        eredu_backend_mlx::native::backend(execution.stream(), execution.stream()),
-        &path,
-        options,
-    )
-    .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
+    let planned = LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &path, &plan)
+        .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
+    let (mut model, _) = planned.into_parts();
     let prepared = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![json!({
@@ -210,21 +204,14 @@ fn smoke_with_options(environment: &str, expected_profile_prefix: &str, options:
 }
 
 fn qwen_residency_smoke(environment: &str) {
-    smoke_with_options(
-        environment,
-        "qwen.",
-        ModelLoadOptions::default()
-            .with_weight_residency(eredu_runtime::WeightResidency::fully_resident()),
-    );
-    smoke_with_options(
-        environment,
-        "qwen.",
-        ModelLoadOptions::default().with_weight_residency(
-            eredu_runtime::WeightResidency::layerwise_host(
-                eredu_runtime::LayerwiseLoadOptions::default(),
-            ),
-        ),
-    );
+    smoke_with_plan(environment, "qwen.", accelerator_plan());
+    let mut layerwise = accelerator_plan();
+    layerwise.residency = ResidencyPlan::LayerwiseHost {
+        device_layer_window: 1,
+        device_budget_bytes: None,
+        host_budget_bytes: None,
+    };
+    smoke_with_plan(environment, "qwen.", layerwise);
 }
 
 #[test]

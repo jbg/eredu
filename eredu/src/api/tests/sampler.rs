@@ -1,12 +1,5 @@
-//! MLX sampler integration tests that exercise facade-owned chat policy.
+//! Backend-neutral sampler tests for facade-owned chat policy.
 
-use eredu_backend_mlx::{
-    native::{
-        error::Exception, ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType,
-        ExecutionContext, Stream,
-    },
-    MlxTensor,
-};
 use serde_json::json;
 
 use crate::runtime::chat::constraints::{
@@ -20,11 +13,14 @@ use crate::{
     },
     runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
 };
-use eredu_backend_mlx::backend::runtime::generation::sampler::{
-    MlxSamplingBackend, Sampler, SpeculativeSampler,
+use eredu_core::{
+    generation::{FinishReason, SemanticEvent},
+    TokenFilter,
 };
-use eredu_core::generation::{FinishReason, SemanticEvent};
-use eredu_runtime::{ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler};
+use eredu_runtime::{
+    ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, PenaltyConfig,
+    Sampler, SamplingBackend, SpeculativeSampler, TokenDomain,
+};
 
 const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
     envelope: ExactEnvelope {
@@ -82,23 +78,176 @@ struct CountingPolicy {
     commits: usize,
 }
 
-impl eredu_runtime::SpeculativeSampler<MlxSamplingBackend> for CountingPolicy {
+#[derive(Debug, Clone, Copy)]
+struct TestSamplingBackend;
+
+impl SamplingBackend for TestSamplingBackend {
+    type Logits = Vec<f32>;
+    type Token = u32;
+    type RandomState = ();
+    type Context = ();
+    type Error = String;
+
+    fn error(message: String) -> Self::Error {
+        message
+    }
+
+    fn validate_token(
+        token: &Self::Token,
+        domain: TokenDomain,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        (usize::try_from(*token).unwrap() < domain.cardinality())
+            .then_some(*token)
+            .ok_or_else(|| "token is outside its decision domain".into())
+    }
+
+    fn scale_temperature(
+        logits: &Self::Logits,
+        temperature: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.iter().map(|logit| logit / temperature).collect())
+    }
+
+    fn apply_penalties(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_top_k(
+        mut logits: Self::Logits,
+        top_k: i32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        if top_k > 0 && (top_k as usize) < logits.len() {
+            let mut ranked = logits.clone();
+            ranked.sort_by(|left, right| right.total_cmp(left));
+            let threshold = ranked[top_k as usize - 1];
+            for logit in &mut logits {
+                if *logit < threshold {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Ok(logits)
+    }
+
+    fn apply_top_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_min_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_token_filter(
+        logits: &Self::Logits,
+        filter: &TokenFilter,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        let mut masked = logits.clone();
+        if let Some(allowed) = filter.allowed_mask() {
+            if allowed.len() != masked.len() {
+                return Err("test filter does not match the vocabulary".into());
+            }
+            for (logit, allowed) in masked.iter_mut().zip(allowed) {
+                if !allowed {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Ok(masked)
+    }
+
+    fn apply_mirostat(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: f32,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn sample_raw(
+        logits: &Self::Logits,
+        _: f32,
+        _: Option<&mut Self::RandomState>,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        argmax(logits)
+    }
+
+    fn sample_processed(
+        logits: &Self::Logits,
+        _: f32,
+        _: Option<&mut Self::RandomState>,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        argmax(logits)
+    }
+
+    fn token_id(token: &Self::Token, _: &Self::Context) -> Result<u32, Self::Error> {
+        Ok(*token)
+    }
+
+    fn token_probability(
+        logits: &Self::Logits,
+        token: u32,
+        _: &Self::Context,
+    ) -> Result<f32, Self::Error> {
+        let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denominator = logits
+            .iter()
+            .map(|logit| (*logit - maximum).exp())
+            .sum::<f32>();
+        logits
+            .get(token as usize)
+            .map(|logit| (*logit - maximum).exp() / denominator)
+            .ok_or_else(|| "token is outside the test vocabulary".into())
+    }
+}
+
+fn argmax(logits: &[f32]) -> Result<u32, String> {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(token, _)| token as u32)
+        .ok_or_else(|| "cannot sample an empty vocabulary".into())
+}
+
+impl SpeculativeSampler<TestSamplingBackend> for CountingPolicy {
     fn process_logits(
         &mut self,
-        logits: &MlxTensor,
+        logits: &Vec<f32>,
         _temperature: f32,
         _history: &[u32],
-        _stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
+        _context: &(),
+    ) -> Result<Vec<f32>, String> {
         Ok(logits.clone())
     }
 
     fn commit_token(
         &mut self,
-        _processed_logits: &MlxTensor,
+        _processed_logits: &Vec<f32>,
         _token: u32,
-        _stream: &Stream,
-    ) -> Result<(), Exception> {
+        _context: &(),
+    ) -> Result<(), String> {
         self.commits += 1;
         Ok(())
     }
@@ -160,28 +309,55 @@ fn boundary_plan() -> GenerationRuntimePlan {
         .unwrap()
 }
 
-fn test_context() -> ExecutionContext {
-    ExecutionContext::new(Device::new(DeviceType::Cpu, 0))
+fn placeholder_logits() -> Vec<f32> {
+    vec![0.0; SYNTHETIC_VOCAB_SIZE]
 }
 
-fn placeholder_logits() -> Array {
-    Array::from_slice(
-        &vec![0.0f32; SYNTHETIC_VOCAB_SIZE],
-        &[1, SYNTHETIC_VOCAB_SIZE as i32],
-    )
-}
-
-fn commit_bytes<S: SpeculativeSampler>(
+fn commit_bytes<S: SpeculativeSampler<TestSamplingBackend>>(
     sampler: &mut S,
     bytes: &[u8],
-    logits: &Array,
-    stream: &Stream,
+    logits: &Vec<f32>,
+    context: &(),
 ) {
     for &byte in bytes {
         sampler
-            .commit_token(logits, u32::from(byte), stream)
+            .commit_token(logits, u32::from(byte), context)
             .unwrap();
     }
+}
+
+fn process_logits<S: SpeculativeSampler<TestSamplingBackend>>(
+    sampler: &mut S,
+    logits: &Vec<f32>,
+    history: &[u32],
+) -> Vec<f32> {
+    sampler.process_logits(logits, 0.0, history, &()).unwrap()
+}
+
+fn sample_processed<S: SpeculativeSampler<TestSamplingBackend>>(
+    sampler: &S,
+    logits: &Vec<f32>,
+) -> u32 {
+    sampler.sample_processed(logits, 0.0, None, &()).unwrap()
+}
+
+fn commit_token<S: SpeculativeSampler<TestSamplingBackend>>(
+    sampler: &mut S,
+    logits: &Vec<f32>,
+    token: u32,
+) {
+    sampler.commit_token(logits, token, &()).unwrap();
+}
+
+fn supports_exact_promotion<S: SpeculativeSampler<TestSamplingBackend>>(sampler: &S) -> bool {
+    sampler.supports_exact_optimistic_promotion()
+}
+
+fn prefix_is_complete<S: SpeculativeSampler<TestSamplingBackend>>(
+    sampler: &S,
+    history: &[u32],
+) -> bool {
+    sampler.prefix_is_complete(history).unwrap()
 }
 
 #[test]
@@ -201,36 +377,30 @@ fn generation_sampler_accepts_external_token_history() {
 
 #[test]
 fn constraint_mask_precedes_existing_top_k_and_selects_lower_valid_token() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = synthetic_plan(ToolChoice::Required);
     let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
     let mut sampler = constrained_sampler(policy, &plan).unwrap();
     let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
     values[b'x' as usize] = 100.0;
     values[b'{' as usize] = 10.0;
-    let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+    let raw = values;
 
-    let processed = sampler.process_logits(&raw, 0.0, &[], stream).unwrap();
-    let invalid = processed
-        .try_index_device((0, i32::from(b'x')), stream)
-        .unwrap();
-    let valid = processed
-        .try_index_device((0, i32::from(b'{')), stream)
-        .unwrap();
-    let selected = Sampler::sample(&mut sampler, &raw, 0.0, None, stream).unwrap();
-    eval([&invalid, &valid, &selected]).unwrap();
+    let processed = process_logits(&mut sampler, &raw, &[]);
+    let invalid = processed[b'x' as usize];
+    let valid = processed[b'{' as usize];
+    let selected =
+        Sampler::<TestSamplingBackend>::sample(&mut sampler, &raw, 0.0, None, context).unwrap();
 
-    assert!(invalid.item::<f32>(stream) < -1.0e30);
-    assert_eq!(valid.item::<f32>(stream), 10.0);
-    assert_eq!(selected.item::<u32>(stream), u32::from(b'{'));
+    assert!(invalid.is_infinite() && invalid.is_sign_negative());
+    assert_eq!(valid, 10.0);
+    assert_eq!(selected, u32::from(b'{'));
     assert_eq!(sampler.policy().generated_tokens(), &[u32::from(b'{')]);
 }
 
 #[test]
 fn auto_ignores_partial_and_near_triggers() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = synthetic_plan(ToolChoice::Auto);
     let logits = placeholder_logits();
 
@@ -239,28 +409,27 @@ fn auto_ignores_partial_and_near_triggers() {
         &mut partial,
         &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
         &logits,
-        stream,
+        context,
     );
     assert!(!partial.controller().constraint_is_active());
     assert_eq!(partial.controller_mut().valid_token_ids().unwrap(), None);
 
     let mut near = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
-    commit_bytes(&mut near, br#"{"callx":"#, &logits, stream);
+    commit_bytes(&mut near, br#"{"callx":"#, &logits, context);
     assert!(!near.controller().constraint_is_active());
     assert_eq!(near.controller_mut().valid_token_ids().unwrap(), None);
 }
 
 #[test]
 fn exact_auto_trigger_spans_tokens_and_reports_completion_once() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = synthetic_plan(ToolChoice::Auto);
     let logits = placeholder_logits();
     let mut sampler = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
 
     for (index, &byte) in AUTO_TRIGGER.iter().enumerate() {
         sampler
-            .commit_token(&logits, u32::from(byte), stream)
+            .commit_token(&logits, u32::from(byte), context)
             .unwrap();
         assert_eq!(
             sampler.controller().constraint_is_active(),
@@ -272,7 +441,7 @@ fn exact_auto_trigger_spans_tokens_and_reports_completion_once() {
         &mut sampler,
         &COMPLETE_CALL[AUTO_TRIGGER.len()..],
         &logits,
-        stream,
+        context,
     );
 
     assert!(sampler.grammar_is_complete().unwrap());
@@ -281,106 +450,83 @@ fn exact_auto_trigger_spans_tokens_and_reports_completion_once() {
 
 #[test]
 fn ordinary_auto_activation_masks_and_commits_a_token_past_the_trigger() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = boundary_plan();
     let vocab_size = SYNTHETIC_VOCAB_SIZE + BOUNDARY_TOKENS.len();
     let mut values = vec![-100.0f32; vocab_size];
     values[INVALID_ACTIVATION_TOKEN as usize] = 100.0;
     values[QUOTED_OPEN_TOKEN as usize] = 10.0;
-    let logits = Array::from_slice(&values, &[1, vocab_size as i32]);
+    let logits = values;
     let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
     let mut sampler = constrained_sampler(policy, &plan).unwrap();
 
-    let selected = Sampler::sample(&mut sampler, &logits, 0.0, None, stream).unwrap();
-    eval([&selected]).unwrap();
+    let selected =
+        Sampler::<TestSamplingBackend>::sample(&mut sampler, &logits, 0.0, None, context).unwrap();
 
-    assert_eq!(selected.item::<u32>(stream), QUOTED_OPEN_TOKEN);
+    assert_eq!(selected, QUOTED_OPEN_TOKEN);
     assert!(sampler.controller().constraint_is_active());
 
     let mut continuation_values = vec![-100.0f32; vocab_size];
     continuation_values[b'x' as usize] = 100.0;
     continuation_values[b'c' as usize] = 10.0;
-    let continuation = Array::from_slice(&continuation_values, &[1, vocab_size as i32]);
-    let next = Sampler::sample(&mut sampler, &continuation, 0.0, None, stream).unwrap();
-    eval([&next]).unwrap();
-    assert_eq!(next.item::<u32>(stream), u32::from(b'c'));
+    let continuation = continuation_values;
+    let next =
+        Sampler::<TestSamplingBackend>::sample(&mut sampler, &continuation, 0.0, None, context)
+            .unwrap();
+    assert_eq!(next, u32::from(b'c'));
 }
 
 #[test]
 fn canonical_mtp_history_activates_inside_a_prefixed_token() {
-    let context = test_context();
-    let stream = context.stream();
     let plan = boundary_plan();
     let vocab_size = SYNTHETIC_VOCAB_SIZE + BOUNDARY_TOKENS.len();
     let mut values = vec![-100.0f32; vocab_size];
     values[b'x' as usize] = 100.0;
     values[b'c' as usize] = 10.0;
-    let logits = Array::from_slice(&values, &[1, vocab_size as i32]);
+    let logits = values;
     let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
     let mut sampler = constrained_sampler(policy, &plan).unwrap();
 
-    let processed = sampler
-        .process_logits(&logits, 0.0, &[PREFIXED_QUOTED_OPEN_TOKEN], stream)
-        .unwrap();
-    let selected = sampler
-        .sample_processed(&processed, 0.0, None, stream)
-        .unwrap();
-    eval([&selected]).unwrap();
+    let processed = process_logits(&mut sampler, &logits, &[PREFIXED_QUOTED_OPEN_TOKEN]);
+    let selected = sample_processed(&sampler, &processed);
 
-    assert_eq!(selected.item::<u32>(stream), u32::from(b'c'));
+    assert_eq!(selected, u32::from(b'c'));
     assert!(!sampler.controller().constraint_is_active());
-    sampler
-        .commit_token(&logits, PREFIXED_QUOTED_OPEN_TOKEN, stream)
-        .unwrap();
-    sampler
-        .commit_token(&processed, u32::from(b'c'), stream)
-        .unwrap();
+    commit_token(&mut sampler, &logits, PREFIXED_QUOTED_OPEN_TOKEN);
+    commit_token(&mut sampler, &processed, u32::from(b'c'));
     assert!(sampler.controller().constraint_is_active());
 }
 
 #[test]
 fn optimistic_mtp_fork_validates_trigger_and_argument_bytes_in_one_token() {
-    let context = test_context();
-    let stream = context.stream();
     let plan = boundary_plan();
     let vocab_size = SYNTHETIC_VOCAB_SIZE + BOUNDARY_TOKENS.len();
     let mut values = vec![-100.0f32; vocab_size];
     values[b'x' as usize] = 100.0;
     values[b'{' as usize] = 10.0;
-    let logits = Array::from_slice(&values, &[1, vocab_size as i32]);
+    let logits = values;
     let mut sampler = constrained_sampler(DefaultSampler, &plan).unwrap();
     let mut optimistic = sampler.clone();
 
-    let processed = optimistic
-        .process_logits(&logits, 0.0, &[TRIGGER_AND_ARGUMENT_TOKEN], stream)
-        .unwrap();
-    let selected = optimistic
-        .sample_processed(&processed, 0.0, None, stream)
-        .unwrap();
-    eval([&selected]).unwrap();
+    let processed = process_logits(&mut optimistic, &logits, &[TRIGGER_AND_ARGUMENT_TOKEN]);
+    let selected = sample_processed(&optimistic, &processed);
 
-    assert_eq!(selected.item::<u32>(stream), u32::from(b'{'));
+    assert_eq!(selected, u32::from(b'{'));
     assert!(!sampler.controller().constraint_is_active());
-    sampler
-        .commit_token(&logits, TRIGGER_AND_ARGUMENT_TOKEN, stream)
-        .unwrap();
-    sampler
-        .commit_token(&processed, u32::from(b'{'), stream)
-        .unwrap();
+    commit_token(&mut sampler, &logits, TRIGGER_AND_ARGUMENT_TOKEN);
+    commit_token(&mut sampler, &processed, u32::from(b'{'));
     assert!(sampler.controller().constraint_is_active());
 }
 
 #[test]
 fn runtime_plan_creates_independent_sampler_instances() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = synthetic_plan(ToolChoice::Auto);
     let logits = placeholder_logits();
     let mut first = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
     let mut second = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
 
-    commit_bytes(&mut first, AUTO_TRIGGER, &logits, stream);
+    commit_bytes(&mut first, AUTO_TRIGGER, &logits, context);
 
     assert!(first.controller().constraint_is_active());
     assert!(!second.controller().constraint_is_active());
@@ -395,14 +541,13 @@ fn constrained_sampler_advertises_only_wrapped_exact_promotion() {
     let exact = constrained_sampler(DefaultSampler, &plan).unwrap();
     let adaptive = constrained_sampler(MirostatV2Sampler::default(), &plan).unwrap();
 
-    assert!(exact.supports_exact_optimistic_promotion());
-    assert!(!adaptive.supports_exact_optimistic_promotion());
+    assert!(supports_exact_promotion(&exact));
+    assert!(!supports_exact_promotion(&adaptive));
 }
 
 #[test]
 fn none_masks_and_rejects_the_tool_call_trigger() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = synthetic_plan(ToolChoice::None);
     let logits = placeholder_logits();
     let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
@@ -414,27 +559,27 @@ fn none_masks_and_rejects_the_tool_call_trigger() {
         &mut sampler,
         &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
         &logits,
-        stream,
+        context,
     );
 
     let final_trigger_byte = *AUTO_TRIGGER.last().unwrap();
     let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
     values[final_trigger_byte as usize] = 100.0;
     values[b'x' as usize] = 10.0;
-    let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
-    let selected = Sampler::sample(&mut sampler, &raw, 0.0, None, stream).unwrap();
-    eval([&selected]).unwrap();
-    assert_eq!(selected.item::<u32>(stream), u32::from(b'x'));
+    let raw = values;
+    let selected =
+        Sampler::<TestSamplingBackend>::sample(&mut sampler, &raw, 0.0, None, context).unwrap();
+    assert_eq!(selected, u32::from(b'x'));
 
     let mut rejecting = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
     commit_bytes(
         &mut rejecting,
         &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
         &logits,
-        stream,
+        context,
     );
     let error = rejecting
-        .commit_token(&logits, u32::from(final_trigger_byte), stream)
+        .commit_token(&logits, u32::from(final_trigger_byte), context)
         .unwrap_err();
     assert!(error.to_string().contains("tool_choice is None"), "{error}");
     assert_eq!(
@@ -446,8 +591,6 @@ fn none_masks_and_rejects_the_tool_call_trigger() {
 
 #[test]
 fn none_masks_trigger_completion_in_speculative_history() {
-    let context = test_context();
-    let stream = context.stream();
     let plan = synthetic_plan(ToolChoice::None);
     let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
     let mut sampler = constrained_sampler(policy, &plan).unwrap();
@@ -455,19 +598,16 @@ fn none_masks_trigger_completion_in_speculative_history() {
     let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
     values[final_trigger_byte as usize] = 100.0;
     values[b'x' as usize] = 10.0;
-    let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+    let raw = values;
     let history = AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1]
         .iter()
         .copied()
         .map(u32::from)
         .collect::<Vec<_>>();
 
-    let processed = sampler.process_logits(&raw, 0.0, &history, stream).unwrap();
-    let selected = sampler
-        .sample_processed(&processed, 0.0, None, stream)
-        .unwrap();
-    eval([&selected]).unwrap();
-    assert_eq!(selected.item::<u32>(stream), u32::from(b'x'));
+    let processed = process_logits(&mut sampler, &raw, &history);
+    let selected = sample_processed(&sampler, &processed);
+    assert_eq!(selected, u32::from(b'x'));
 }
 
 #[test]
@@ -501,8 +641,7 @@ fn forbidden_trigger_matching_handles_whole_tokens_and_overlaps() {
 
 #[test]
 fn required_is_immediate_and_sampler_clones_are_independent() {
-    let context = test_context();
-    let stream = context.stream();
+    let context = &();
     let plan = synthetic_plan(ToolChoice::Required);
     let logits = placeholder_logits();
     let mut sampler = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
@@ -511,7 +650,7 @@ fn required_is_immediate_and_sampler_clones_are_independent() {
     let initial = sampler.controller_mut().valid_token_ids().unwrap().unwrap();
     assert!(initial.contains(&u32::from(b'{')));
     sampler
-        .commit_token(&logits, u32::from(b'{'), stream)
+        .commit_token(&logits, u32::from(b'{'), context)
         .unwrap();
     let after_open = sampler.controller_mut().valid_token_ids().unwrap().unwrap();
     let mut fork = sampler.clone();
@@ -521,7 +660,7 @@ fn required_is_immediate_and_sampler_clones_are_independent() {
     );
 
     sampler
-        .commit_token(&logits, u32::from(b'"'), stream)
+        .commit_token(&logits, u32::from(b'"'), context)
         .unwrap();
 
     assert_eq!(
@@ -534,47 +673,40 @@ fn required_is_immediate_and_sampler_clones_are_independent() {
 
 #[test]
 fn speculative_history_uses_a_state_fork_without_early_activation() {
-    let context = test_context();
-    let stream = context.stream();
     let plan = synthetic_plan(ToolChoice::Auto);
     let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
     let mut sampler = constrained_sampler(policy, &plan).unwrap();
     let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
     values[b'x' as usize] = 100.0;
     values[b'[' as usize] = 10.0;
-    let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+    let raw = values;
     let history = AUTO_TRIGGER
         .iter()
         .copied()
         .map(u32::from)
         .collect::<Vec<_>>();
 
-    let processed = sampler.process_logits(&raw, 0.0, &history, stream).unwrap();
-    let selected = sampler
-        .sample_processed(&processed, 0.0, None, stream)
-        .unwrap();
-    eval([&selected]).unwrap();
+    let processed = process_logits(&mut sampler, &raw, &history);
+    let selected = sample_processed(&sampler, &processed);
 
-    assert_eq!(selected.item::<u32>(stream), u32::from(b'['));
+    assert_eq!(selected, u32::from(b'['));
     assert!(!sampler.controller().constraint_is_active());
-    assert!(!sampler
-        .prefix_is_complete(
-            &COMPLETE_CALL[..COMPLETE_CALL.len() - 1]
-                .iter()
-                .copied()
-                .map(u32::from)
-                .collect::<Vec<_>>()
-        )
-        .unwrap());
-    assert!(sampler
-        .prefix_is_complete(
-            &COMPLETE_CALL
-                .iter()
-                .copied()
-                .map(u32::from)
-                .collect::<Vec<_>>()
-        )
-        .unwrap());
+    assert!(!prefix_is_complete(
+        &sampler,
+        &COMPLETE_CALL[..COMPLETE_CALL.len() - 1]
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    ));
+    assert!(prefix_is_complete(
+        &sampler,
+        &COMPLETE_CALL
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    ));
     assert!(
         !sampler.controller().constraint_is_active(),
         "history-relative queries must not activate canonical grammar state"
@@ -607,27 +739,4 @@ fn mirostat_v2_validates_configuration() {
     let mut sampler = MirostatV2Sampler::default();
     assert!(sampler.accept_token(0, 0.0).is_err());
     assert!(sampler.accept_token(0, 1.1).is_err());
-}
-
-#[test]
-#[ignore = "requires MLX runtime execution"]
-fn mirostat_v2_samples_and_updates_mu() {
-    use eredu_backend_mlx::native::{
-        random::{self, RandomState},
-        Array, Device, DeviceType, ExecutionContext,
-    };
-
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let logits = Array::from_slice(&[0.0f32, -100.0, -100.0], &[1, 3]);
-    let mut state = RandomState::from_key(random::key(0).unwrap());
-    let mut sampler = MirostatV2Sampler::new(5.0, 0.1).unwrap();
-
-    let token = sampler
-        .sample(&logits, 1.0, Some(&mut state), stream)
-        .unwrap();
-
-    assert_eq!(token.item::<u32>(stream), 0);
-    assert!(sampler.mu() > 10.0);
-    assert_eq!(sampler.generated_tokens(), &[0]);
 }

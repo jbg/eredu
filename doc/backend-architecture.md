@@ -34,8 +34,11 @@ the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
 application-facing adapter as an explicit flat root API and deliberately makes
 its reusable `backend` module tree public for backend authors. Family
 composition and architecture-erased dispatch remain crate-private. Native
-facade integration tests use only the flat adapter, while tests that require
-composition internals live in `eredu-backend-mlx`. The backend crate does not
+facade integration tests realize execution plans through
+`eredu::api::LocalBackendFactory`; they do not construct native devices,
+streams, tensors, samplers, or backend load options. Tests that require those
+backend facilities live in `eredu-backend-mlx`, while facade sampling-policy
+tests use neutral sampling traits and mock backends. The backend crate does not
 alias neutral crates into its namespace; direct backend consumers import
 neutral contracts from their owning crates.
 
