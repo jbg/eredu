@@ -4289,11 +4289,13 @@ fn numeric_expert_bank_spec(
                 weight: parameter("test.experts.gate_up_proj"),
                 bias: None,
                 format: eredu_nn::LinearFormat::Dense,
+                quantization: None,
             },
             down: eredu_nn::ExpertProjectionSpec {
                 weight: parameter("test.experts.down_proj"),
                 bias: None,
                 format: eredu_nn::LinearFormat::Dense,
+                quantization: None,
             },
         },
     }
@@ -10761,11 +10763,13 @@ fn gated_product_policy_and_projection_biases_match_analytical_value() {
                     weight: parameter("experts.gate_up_proj"),
                     bias: Some(parameter("experts.gate_up_proj_bias")),
                     format: eredu_nn::LinearFormat::Dense,
+                    quantization: None,
                 },
                 down: eredu_nn::ExpertProjectionSpec {
                     weight: parameter("experts.down_proj"),
                     bias: Some(parameter("experts.down_proj_bias")),
                     format: eredu_nn::LinearFormat::Dense,
+                    quantization: None,
                 },
             },
         },

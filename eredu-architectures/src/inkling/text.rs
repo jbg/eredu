@@ -4,12 +4,14 @@ use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error,
-    ExpertProjectionSpec, GatedProductExpertBankOperator, GatedProductExpertBankSpec,
-    GatedProductExpertLayout, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec, Parameterized,
-    RelativeAttentionInput, RoutedNeuralBackend, RoutingResult, Tensor,
+    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
+    NormalizationSpec, Parameter, ParameterSpec, Parameterized, RelativeAttentionInput,
+    RoutedNeuralBackend, RoutingResult, Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
+
+use crate::linear_format::standard_expert_projection;
 
 use super::{FeedForwardPolicy, LayerPolicy, ModelArgs, TextArgs};
 
@@ -907,16 +909,8 @@ fn expert_bank_spec_at(
         output_dimensions: args.hidden_size,
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         layout: GatedProductExpertLayout::Packed {
-            gate_up: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
-                bias: None,
-                format: args.linear_format_for(&gate_up),
-            },
-            down: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
-                bias: None,
-                format: args.linear_format_for(&down),
-            },
+            gate_up: standard_expert_projection(&gate_up, None, args.linear_format_for(&gate_up))?,
+            down: standard_expert_projection(&down, None, args.linear_format_for(&down))?,
         },
     })
 }

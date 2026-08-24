@@ -4,16 +4,17 @@ use std::collections::HashMap;
 
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
-    AttentionCache, AttentionStateSource, AttentionValueSource, Error, ExpertProjectionSpec,
-    GatedProductExpertBankSpec, GatedProductExpertLayout, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec,
-    Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend,
-    RouterInputTransformSpec, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec,
-    TopKRoutingSpec,
+    AttentionCache, AttentionStateSource, AttentionValueSource, Error, GatedProductExpertBankSpec,
+    GatedProductExpertLayout, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
+    NormalizationSpec, Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySpec, RotarySubspace, RoutedNeuralBackend, RouterInputTransformSpec, RoutingOperator,
+    RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
 };
+
+use crate::linear_format::standard_expert_projection;
 
 use super::{FeedForwardPolicy, LayerPolicy, ModelArgs};
 
@@ -795,16 +796,12 @@ fn expert_bank_spec_at(
         output_dimensions: args.hidden_size,
         policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
         layout: GatedProductExpertLayout::Packed {
-            gate_up: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
-                bias: None,
-                format: args.linear_format_for(&gate_up_name),
-            },
-            down: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-                bias: None,
-                format: args.linear_format_for(&down_name),
-            },
+            gate_up: standard_expert_projection(
+                &gate_up_name,
+                None,
+                args.linear_format_for(&gate_up_name),
+            )?,
+            down: standard_expert_projection(&down_name, None, args.linear_format_for(&down_name))?,
         },
     })
 }

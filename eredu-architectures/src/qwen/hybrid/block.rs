@@ -1,17 +1,20 @@
 //! Shared Qwen3-Next/Qwen3.5 decoder block.
 
 use eredu_nn::{
-    AttentionCache, Error, ExpertProjectionSpec, GatedProductExpertBankSpec,
-    GatedProductExpertLayout, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, ParameterSpec, Parameterized, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    AttentionCache, Error, GatedProductExpertBankSpec, GatedProductExpertLayout, LinearOperator,
+    LinearSpec, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
+    ParameterSpec, Parameterized, RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingScoring,
+    Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
     RuntimeStateComponents,
 };
 
-use crate::decoder::{Attention, AttentionInput, FeedForwardOperator, Mlp};
+use crate::{
+    decoder::{Attention, AttentionInput, FeedForwardOperator, Mlp},
+    linear_format::standard_expert_projection,
+};
 
 use super::{HybridConfig, HybridLayerPolicy, LinearAttention};
 
@@ -194,16 +197,12 @@ fn expert_bank_spec_at(
         output_dimensions: config.hidden_size,
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         layout: GatedProductExpertLayout::Packed {
-            gate_up: ExpertProjectionSpec {
-                weight: parameter(&gate_up_name)?,
-                bias: None,
-                format: config.linear_format(&gate_up_name),
-            },
-            down: ExpertProjectionSpec {
-                weight: parameter(&down_name)?,
-                bias: None,
-                format: config.linear_format(&down_name),
-            },
+            gate_up: standard_expert_projection(
+                &gate_up_name,
+                None,
+                config.linear_format(&gate_up_name),
+            )?,
+            down: standard_expert_projection(&down_name, None, config.linear_format(&down_name))?,
         },
     })
 }

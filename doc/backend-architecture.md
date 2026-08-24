@@ -296,8 +296,11 @@ suffixes.
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution
 paths all consume that same geometry, projection encoding, bias layout, and
-activation policy; backend residency adapters must not reconstruct a parallel
-family descriptor from model arguments. Architecture APIs derive localized
+activation policy. Each expert projection also declares the exact identities
+of its scale and affine-bias companions; reusable backends bind those identities
+to native slots without imposing projection suffixes or synthesizing checkpoint
+names. Backend residency adapters must not reconstruct a parallel family
+descriptor from model arguments. Architecture APIs derive localized
 expert-bank specifications for placement-resolved expert counts and projection
 widths while preserving canonical parameter identities and physical formats;
 backend composition only materializes those returned specifications.

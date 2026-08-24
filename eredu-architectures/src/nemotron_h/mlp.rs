@@ -1,11 +1,12 @@
 //! Nemotron-H dense and routed ReLU-squared feed-forward operators.
 
 use eredu_nn::{
-    Error, ExpertProjectionSpec, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
-    Relu2ExpertBankSpec, RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor,
-    TopKRouterSpec, TopKRoutingSpec,
+    Error, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Relu2ExpertBankSpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
+
+use crate::linear_format::standard_expert_projection;
 
 use super::ModelArgs;
 
@@ -311,16 +312,16 @@ fn expert_bank_spec_at(
         expert_count,
         hidden_dimensions: args.hidden_size,
         intermediate_dimensions,
-        up: ExpertProjectionSpec {
-            weight: ParameterSpec::trainable(&up_name).map_err(Error::backend)?,
-            bias: None,
-            format: args.weight_quantization_for(&up_name).into(),
-        },
-        down: ExpertProjectionSpec {
-            weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-            bias: None,
-            format: args.weight_quantization_for(&down_name).into(),
-        },
+        up: standard_expert_projection(
+            &up_name,
+            None,
+            args.weight_quantization_for(&up_name).into(),
+        )?,
+        down: standard_expert_projection(
+            &down_name,
+            None,
+            args.weight_quantization_for(&down_name).into(),
+        )?,
     };
     spec.validate()?;
     Ok(spec)

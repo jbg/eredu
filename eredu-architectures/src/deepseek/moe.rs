@@ -2,14 +2,16 @@
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
-    Error, ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    GatedProductPolicy, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, GatedProductExpertBankSpec, GatedProductExpertLayout, GatedProductPolicy,
+    LinearOperator, LinearSpec, ParameterSpec, Parameterized, RoutedNeuralBackend, RoutingOperator,
+    RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
     RoutedExpertProvider, RoutedExpertRequest, RoutingObservation,
 };
+
+use crate::linear_format::standard_expert_projection;
 
 /// Complete family-neutral assembly policy for one DeepSeek MoE layer.
 #[derive(Debug, Clone)]
@@ -287,16 +289,12 @@ pub fn expert_bank_spec(policy: &MoePolicy) -> Result<GatedProductExpertBankSpec
         output_dimensions: policy.hidden,
         policy: policy.limit.unwrap_or_default(),
         layout: GatedProductExpertLayout::Packed {
-            gate_up: ExpertProjectionSpec {
-                weight: parameter(&policy.expert_gate_up)?,
-                bias: None,
-                format: policy.expert_gate_up_format,
-            },
-            down: ExpertProjectionSpec {
-                weight: parameter(&policy.expert_down)?,
-                bias: None,
-                format: policy.expert_down_format,
-            },
+            gate_up: standard_expert_projection(
+                &policy.expert_gate_up,
+                None,
+                policy.expert_gate_up_format,
+            )?,
+            down: standard_expert_projection(&policy.expert_down, None, policy.expert_down_format)?,
         },
     })
 }

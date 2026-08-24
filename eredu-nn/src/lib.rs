@@ -1819,6 +1819,63 @@ pub struct ExpertProjectionSpec {
     pub bias: Option<ParameterSpec>,
     /// Complete physical checkpoint encoding.
     pub format: LinearFormat,
+    /// Explicit identities of separately stored quantization parameters.
+    ///
+    /// Dense and checkpoint-native GGUF projections have no companions.
+    /// Packed formats declare every companion rather than relying on a backend
+    /// to derive checkpoint names from the weight identity.
+    pub quantization: Option<ExpertQuantizationSpec>,
+}
+
+/// Explicit parameter identities stored alongside one quantized expert weight.
+#[derive(Debug, Clone)]
+pub struct ExpertQuantizationSpec {
+    /// Per-group or per-block scale parameter.
+    pub scales: ParameterSpec,
+    /// Affine zero-point or bias parameter, when the encoding requires one.
+    pub biases: Option<ParameterSpec>,
+}
+
+impl ExpertProjectionSpec {
+    fn validate(&self) -> Result<(), Error> {
+        self.format.validate().map_err(Error::backend)?;
+        let expected_biases = match self.format {
+            LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => {
+                if self.quantization.is_some() {
+                    return Err(Error::backend(format!(
+                        "expert projection {} declares quantization companions for a format that stores none",
+                        self.weight.id
+                    )));
+                }
+                return Ok(());
+            }
+            LinearFormat::Affine(_) => true,
+            LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => false,
+        };
+        let quantization = self.quantization.as_ref().ok_or_else(|| {
+            Error::backend(format!(
+                "expert projection {} is missing explicit quantization companion identities",
+                self.weight.id
+            ))
+        })?;
+        if quantization.biases.is_some() != expected_biases {
+            return Err(Error::backend(format!(
+                "expert projection {} has a quantization-bias declaration inconsistent with its physical format",
+                self.weight.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn parameters(&self) -> Vec<&ParameterSpec> {
+        let mut parameters = vec![&self.weight];
+        parameters.extend(self.bias.as_ref());
+        if let Some(quantization) = &self.quantization {
+            parameters.push(&quantization.scales);
+            parameters.extend(quantization.biases.as_ref());
+        }
+        parameters
+    }
 }
 
 /// Logical parameter layout for a gated-product expert bank.
@@ -1888,9 +1945,9 @@ impl GatedProductExpertBankSpec {
         };
         let mut identities = std::collections::BTreeSet::new();
         for projection in projections {
-            for identity in std::iter::once(&projection.weight.id)
-                .chain(projection.bias.as_ref().map(|bias| &bias.id))
-            {
+            projection.validate()?;
+            for parameter in projection.parameters() {
+                let identity = &parameter.id;
                 if !identities.insert(identity) {
                     return Err(Error::backend(format!(
                         "gated-product expert parameter identity {identity} is duplicated"
@@ -1974,6 +2031,19 @@ impl Relu2ExpertBankSpec {
             || self.intermediate_dimensions <= 0
         {
             return Err(Error::backend("invalid ReLU2 expert-bank geometry"));
+        }
+        self.up.validate()?;
+        self.down.validate()?;
+        let mut identities = std::collections::BTreeSet::new();
+        for projection in [&self.up, &self.down] {
+            for parameter in projection.parameters() {
+                if !identities.insert(&parameter.id) {
+                    return Err(Error::backend(format!(
+                        "ReLU2 expert parameter identity {} is duplicated",
+                        parameter.id
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -4354,16 +4424,19 @@ mod routed_contract_tests {
                 weight: ParameterSpec::trainable(format!("{prefix}.gate.weight")).unwrap(),
                 bias: None,
                 format: LinearFormat::Dense,
+                quantization: None,
             },
             up: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.up.weight")).unwrap(),
                 bias: None,
                 format: LinearFormat::Dense,
+                quantization: None,
             },
             down: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.down.weight")).unwrap(),
                 bias: None,
                 format: LinearFormat::Dense,
+                quantization: None,
             },
         }
     }
@@ -4451,16 +4524,37 @@ mod routed_contract_tests {
                     weight: shared.clone(),
                     bias: Some(shared),
                     format: LinearFormat::Dense,
+                    quantization: None,
                 },
                 down: ExpertProjectionSpec {
                     weight: ParameterSpec::trainable("experts.down").unwrap(),
                     bias: None,
                     format: LinearFormat::Dense,
+                    quantization: None,
                 },
             },
         };
 
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn quantized_expert_projection_requires_explicit_companion_identities() {
+        let format =
+            LinearFormat::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let projection = |quantization| ExpertProjectionSpec {
+            weight: ParameterSpec::trainable("arbitrary.expert.matrix").unwrap(),
+            bias: None,
+            format,
+            quantization,
+        };
+        assert!(projection(None).validate().is_err());
+        assert!(projection(Some(ExpertQuantizationSpec {
+            scales: ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
+            biases: Some(ParameterSpec::trainable("unrelated.affine.identity").unwrap()),
+        }))
+        .validate()
+        .is_ok());
     }
 }
 

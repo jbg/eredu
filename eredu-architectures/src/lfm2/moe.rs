@@ -1,13 +1,13 @@
 //! Dense and routed LFM2 feed-forward policies.
 
 use eredu_nn::{
-    Error, ExpertProjectionSpec, GatedProductExpertBankOperator, GatedProductExpertBankSpec,
-    GatedProductExpertLayout, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    LinearOperator, LinearSpec, ParameterSpec, Parameterized, RoutedNeuralBackend, RoutingOperator,
+    RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
 
-use crate::decoder::FeedForwardOperator;
+use crate::{decoder::FeedForwardOperator, linear_format::standard_expert_projection};
 
 use super::{FeedForwardPolicy, ModelArgs};
 
@@ -143,16 +143,16 @@ fn expert_bank_spec_with_width(
         output_dimensions: args.hidden_size,
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         layout: GatedProductExpertLayout::Packed {
-            gate_up: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
-                bias: None,
-                format: args.weight_quantization_for(&gate_up_name).into(),
-            },
-            down: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-                bias: None,
-                format: args.weight_quantization_for(&down_name).into(),
-            },
+            gate_up: standard_expert_projection(
+                &gate_up_name,
+                None,
+                args.weight_quantization_for(&gate_up_name).into(),
+            )?,
+            down: standard_expert_projection(
+                &down_name,
+                None,
+                args.weight_quantization_for(&down_name).into(),
+            )?,
         },
     })
 }

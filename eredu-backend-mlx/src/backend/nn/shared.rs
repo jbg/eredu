@@ -82,16 +82,6 @@ fn companion_spec(weight: &ParameterSpec, component: &str) -> ParameterSpec {
     }
 }
 
-fn packed_expert_companion_spec(weight: &ParameterSpec, component: &str) -> ParameterSpec {
-    ParameterSpec {
-        id: eredu_nn::ParameterId::new(format!("{}_{}", weight.id.as_str(), component))
-            .expect("authoritative expert identity produces a non-empty companion identity"),
-        trainable: weight.trainable,
-        alias_of: None,
-        group: Some(weight.id.as_str().to_owned()),
-    }
-}
-
 impl BlockwiseAttentionBackend for MlxNeuralBackend {
     type BlockwiseAccumulator = BlockwiseAttentionAccumulator;
 
@@ -491,134 +481,6 @@ impl<M: ModuleParameters> Parameterized<MlxTensor> for MlxNamedModule<M> {
         V: ParameterVisitorMut<'a, MlxTensor>,
     {
         visit_module_parameters_mut(&mut self.inner, &self.topology, visitor);
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        set_module_trainable(&mut self.inner, trainable);
-    }
-}
-
-/// Generic neutral parameter view over an existing native MLX module tree.
-///
-/// The tree is inspected once during model construction and its complete
-/// checkpoint-facing identities are then frozen for all loading and residency
-/// operations. This capability is architecture-agnostic and never runs in a
-/// forward loop.
-#[derive(Debug, Clone)]
-pub struct MlxParameterTree<M> {
-    inner: M,
-    topology: BTreeMap<String, ParameterSpec>,
-}
-
-impl<M: ModuleParameters> MlxParameterTree<M> {
-    /// Captures one native module's complete stable parameter topology.
-    pub fn new(inner: M, prefix: &str) -> Result<Self, ComputeError> {
-        Self::new_filtered(inner, prefix, |_| true)
-    }
-
-    /// Captures a stable subset of one native module's parameter topology.
-    ///
-    /// This is used when a reusable execution unit contains parameters whose
-    /// residency is owned by another policy, such as independently cached
-    /// experts. The predicate is evaluated once on checkpoint-facing names;
-    /// hot-path visitation remains statically dispatched over the retained
-    /// native slots.
-    pub fn new_filtered(
-        inner: M,
-        prefix: &str,
-        include: impl Fn(&str) -> bool,
-    ) -> Result<Self, ComputeError> {
-        let mut topology = BTreeMap::new();
-        for local in inner.parameters().flatten().into_keys() {
-            let id = if prefix.is_empty() {
-                local.to_string()
-            } else {
-                format!("{prefix}.{local}")
-            };
-            if !include(&id) {
-                continue;
-            }
-            let group = ["scales", "biases"].into_iter().find_map(|component| {
-                id.strip_suffix(&format!(".{component}"))
-                    .map(|base| format!("{base}.weight"))
-            });
-            topology.insert(
-                local.to_string(),
-                ParameterSpec {
-                    id: eredu_nn::ParameterId::new(id).map_err(ComputeError::backend)?,
-                    trainable: true,
-                    alias_of: None,
-                    group,
-                },
-            );
-        }
-        Ok(Self { inner, topology })
-    }
-
-    /// Decomposes the cold-path view without cloning native parameter handles.
-    #[cfg(test)]
-    pub fn into_inner(self) -> M {
-        self.inner
-    }
-}
-
-impl<M> std::ops::Deref for MlxParameterTree<M> {
-    type Target = M;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<M> std::ops::DerefMut for MlxParameterTree<M> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl<M: ModuleParameters> Parameterized<MlxTensor> for MlxParameterTree<M> {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        let trainable = self
-            .inner
-            .trainable_parameters()
-            .flatten()
-            .into_keys()
-            .map(|name| name.to_string())
-            .collect::<BTreeSet<_>>();
-        for (local, value) in self.inner.parameters().flatten() {
-            let Some(spec) = self.topology.get(local.as_ref()) else {
-                continue;
-            };
-            visitor.visit(
-                ParameterMetadata::from_spec(spec, trainable.contains(local.as_ref())),
-                MlxTensor::ref_cast(value),
-            );
-        }
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, MlxTensor>,
-    {
-        let trainable = self
-            .inner
-            .trainable_parameters()
-            .flatten()
-            .into_keys()
-            .map(|name| name.to_string())
-            .collect::<BTreeSet<_>>();
-        for (local, value) in self.inner.parameters_mut().flatten() {
-            let Some(spec) = self.topology.get(local.as_ref()) else {
-                continue;
-            };
-            visitor.visit_mut(
-                ParameterMetadata::from_spec(spec, trainable.contains(local.as_ref())),
-                MlxTensor::ref_cast_mut(value),
-            );
-        }
     }
 
     fn set_trainable(&mut self, trainable: bool) {
@@ -1226,7 +1088,7 @@ impl GatedProductExpertBankOperator<MlxTensor> for MlxGatedProductExpertBank {
 /// MLX packed execution bank for backend-neutral routed ReLU2 experts.
 #[derive(Debug, Clone)]
 pub struct MlxRelu2ExpertBank {
-    module: MlxParameterTree<common::moe::PackedRelu2Experts>,
+    module: MlxNamedModule<common::moe::PackedRelu2Experts>,
 }
 
 impl Parameterized<MlxTensor> for MlxRelu2ExpertBank {
@@ -2777,21 +2639,6 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
                 "independent expert units must be acquired through a runtime expert provider",
             ));
         };
-        let prefix = gate_up
-            .weight
-            .id
-            .as_str()
-            .strip_suffix(".gate_up_proj")
-            .ok_or_else(|| {
-                ComputeError::backend("packed gate/up identity must end in .gate_up_proj")
-            })?;
-        let expected_down = format!("{prefix}.down_proj");
-        if down.weight.id.as_str() != expected_down {
-            return Err(ComputeError::backend(format!(
-                "packed down identity {:?} does not match {expected_down:?}",
-                down.weight.id.as_str()
-            )));
-        }
         let native_fp8 = match (gate_up.format, down.format) {
             (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
                 if gate == down
@@ -2834,47 +2681,17 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
         if let Some(bias) = &down.bias {
             topology.push(("down_proj_bias", bias.clone()));
         }
-        if native_fp8
-            || gate_up
-                .format
-                .weight_quantization()
-                .is_some_and(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
-        {
-            topology.push((
-                "gate_up_proj_scales",
-                packed_expert_companion_spec(&gate_up.weight, "scales"),
-            ));
+        if let Some(quantization) = &gate_up.quantization {
+            topology.push(("gate_up_proj_scales", quantization.scales.clone()));
+            if let Some(biases) = &quantization.biases {
+                topology.push(("gate_up_proj_biases", biases.clone()));
+            }
         }
-        if gate_up
-            .format
-            .weight_quantization()
-            .is_some_and(WeightQuantization::has_biases)
-        {
-            topology.push((
-                "gate_up_proj_biases",
-                packed_expert_companion_spec(&gate_up.weight, "biases"),
-            ));
-        }
-        if native_fp8
-            || down
-                .format
-                .weight_quantization()
-                .is_some_and(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
-        {
-            topology.push((
-                "down_proj_scales",
-                packed_expert_companion_spec(&down.weight, "scales"),
-            ));
-        }
-        if down
-            .format
-            .weight_quantization()
-            .is_some_and(WeightQuantization::has_biases)
-        {
-            topology.push((
-                "down_proj_biases",
-                packed_expert_companion_spec(&down.weight, "biases"),
-            ));
+        if let Some(quantization) = &down.quantization {
+            topology.push(("down_proj_scales", quantization.scales.clone()));
+            if let Some(biases) = &quantization.biases {
+                topology.push(("down_proj_biases", biases.clone()));
+            }
         }
         Ok(MlxGatedProductExpertBank {
             spec,
@@ -2887,18 +2704,9 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<Self::Relu2ExpertBank, ComputeError> {
         spec.validate()?;
-        let prefix = spec
-            .up
-            .weight
-            .id
-            .as_str()
-            .strip_suffix(".up_proj")
-            .ok_or_else(|| {
-                ComputeError::backend("packed ReLU2 up identity must end in .up_proj")
-            })?;
-        if spec.down.weight.id.as_str() != format!("{prefix}.down_proj") {
+        if spec.up.bias.is_some() || spec.down.bias.is_some() {
             return Err(ComputeError::backend(
-                "packed ReLU2 projections must share one parameter prefix",
+                "MLX packed ReLU2 experts do not support ordinary projection biases",
             ));
         }
         let module = compute(common::moe::PackedRelu2Experts::new(
@@ -2911,8 +2719,24 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             ],
             context,
         ))?;
+        let mut topology = vec![
+            ("up_proj", spec.up.weight.clone()),
+            ("down_proj", spec.down.weight.clone()),
+        ];
+        if let Some(quantization) = &spec.up.quantization {
+            topology.push(("up_proj_scales", quantization.scales.clone()));
+            if let Some(biases) = &quantization.biases {
+                topology.push(("up_proj_biases", biases.clone()));
+            }
+        }
+        if let Some(quantization) = &spec.down.quantization {
+            topology.push(("down_proj_scales", quantization.scales.clone()));
+            if let Some(biases) = &quantization.biases {
+                topology.push(("down_proj_biases", biases.clone()));
+            }
+        }
         Ok(MlxRelu2ExpertBank {
-            module: MlxParameterTree::new(module, prefix)?,
+            module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }
 }
@@ -2996,9 +2820,11 @@ mod neutral_semantic_operator_tests {
     use eredu_checkpoint::{AffineQuantization, LinearFormat, WeightQuantization};
     use eredu_nn::{
         reference_expand_heads, reference_segmented_attention, EmbeddingLookupPolicy,
-        EmbeddingOperator, EmbeddingSpec, FusedProjectionLayout, FusedProjectionSegment,
-        HeadExpansion, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
-        NormalizationConstructionSpec, NormalizationScale, ParameterSpec, RelativeAttentionInput,
+        EmbeddingOperator, EmbeddingSpec, ExpertProjectionSpec, ExpertQuantizationSpec,
+        FusedProjectionLayout, FusedProjectionSegment, GatedProductExpertBankSpec,
+        GatedProductExpertLayout, HeadExpansion, JointExpertRoutingInput, LinearOperator,
+        LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationScale,
+        ParameterSpec, RelativeAttentionInput, Relu2ExpertBankSpec, RoutedNeuralBackend,
         SegmentedAttentionInput, Tensor,
     };
     use safemlx::{
@@ -3062,6 +2888,108 @@ mod neutral_semantic_operator_tests {
 
     fn parameter(name: &str) -> ParameterSpec {
         ParameterSpec::trainable(name).unwrap()
+    }
+
+    fn affine_expert_projection(weight: &str, scales: &str, biases: &str) -> ExpertProjectionSpec {
+        ExpertProjectionSpec {
+            weight: parameter(weight),
+            bias: None,
+            format: LinearFormat::Affine(AffineQuantization::new(32, 4).unwrap()),
+            quantization: Some(ExpertQuantizationSpec {
+                scales: parameter(scales),
+                biases: Some(parameter(biases)),
+            }),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn mlx_expert_topology_uses_literal_neutral_identities() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let gate = affine_expert_projection(
+            "arbitrary.gated.matrix_a",
+            "arbitrary.gated.scale_a",
+            "arbitrary.gated.affine_a",
+        );
+        let down = affine_expert_projection(
+            "arbitrary.gated.matrix_b",
+            "arbitrary.gated.scale_b",
+            "arbitrary.gated.affine_b",
+        );
+        let gated = <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(
+            GatedProductExpertBankSpec {
+                expert_count: 2,
+                input_dimensions: 32,
+                intermediate_dimensions: 32,
+                output_dimensions: 32,
+                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                layout: GatedProductExpertLayout::Packed {
+                    gate_up: gate,
+                    down,
+                },
+            },
+            stream,
+        )
+        .unwrap();
+        let gated_ids = eredu_nn::validate_parameter_topology::<MlxTensor, _>(&gated)
+            .unwrap()
+            .into_iter()
+            .map(|parameter| parameter.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            gated_ids,
+            [
+                "arbitrary.gated.affine_a",
+                "arbitrary.gated.affine_b",
+                "arbitrary.gated.matrix_a",
+                "arbitrary.gated.matrix_b",
+                "arbitrary.gated.scale_a",
+                "arbitrary.gated.scale_b",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+
+        let relu = <MlxNeuralBackend as RoutedNeuralBackend>::relu2_expert_bank(
+            Relu2ExpertBankSpec {
+                expert_count: 2,
+                hidden_dimensions: 32,
+                intermediate_dimensions: 32,
+                up: affine_expert_projection(
+                    "arbitrary.relu.matrix_a",
+                    "arbitrary.relu.scale_a",
+                    "arbitrary.relu.affine_a",
+                ),
+                down: affine_expert_projection(
+                    "arbitrary.relu.matrix_b",
+                    "arbitrary.relu.scale_b",
+                    "arbitrary.relu.affine_b",
+                ),
+            },
+            stream,
+        )
+        .unwrap();
+        let relu_ids = eredu_nn::validate_parameter_topology::<MlxTensor, _>(&relu)
+            .unwrap()
+            .into_iter()
+            .map(|parameter| parameter.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            relu_ids,
+            [
+                "arbitrary.relu.affine_a",
+                "arbitrary.relu.affine_b",
+                "arbitrary.relu.matrix_a",
+                "arbitrary.relu.matrix_b",
+                "arbitrary.relu.scale_a",
+                "arbitrary.relu.scale_b",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
     }
 
     fn bind_linear(

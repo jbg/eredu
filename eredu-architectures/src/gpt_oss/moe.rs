@@ -2,15 +2,14 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::{
-    Error, ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    ParameterSpec, Parameterized, RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor,
-    TopKRouterSpec, TopKRoutingSpec,
+    Error, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec, Parameterized,
+    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
 };
 
-use crate::decoder::FeedForwardOperator;
+use crate::{decoder::FeedForwardOperator, linear_format::standard_expert_projection};
 
 use super::config::ModelArgs;
 
@@ -199,16 +198,16 @@ pub fn expert_bank_spec(
         output_dimensions: args.hidden_size,
         policy: args.gated_product_policy,
         layout: GatedProductExpertLayout::Packed {
-            gate_up: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&gate_up_weight).map_err(Error::backend)?,
-                bias: Some(ParameterSpec::trainable(&gate_up_bias).map_err(Error::backend)?),
-                format: WeightQuantization::MxFp4.into(),
-            },
-            down: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(&down_weight).map_err(Error::backend)?,
-                bias: Some(ParameterSpec::trainable(&down_bias).map_err(Error::backend)?),
-                format: WeightQuantization::MxFp4.into(),
-            },
+            gate_up: standard_expert_projection(
+                &gate_up_weight,
+                Some(&gate_up_bias),
+                WeightQuantization::MxFp4.into(),
+            )?,
+            down: standard_expert_projection(
+                &down_weight,
+                Some(&down_bias),
+                WeightQuantization::MxFp4.into(),
+            )?,
         },
     })
 }
