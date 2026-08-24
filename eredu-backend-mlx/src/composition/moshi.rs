@@ -8,10 +8,9 @@ use eredu_checkpoint::{
     store::{CheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource},
 };
 use eredu_runtime::{
-    DefaultSampler, DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredTraversalHook, LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport,
-    ResidentLayerGroupReport, SequentialDecisionDriver, SequentialDecisionTraversal,
-    ShardingPolicy,
+    DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture, LayeredTraversalHook,
+    LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport, ResidentLayerGroupReport, Sampler,
+    SequentialDecisionDriver, SequentialDecisionTraversal, ShardingPolicy,
 };
 use safemlx::{module::ModuleParameters, Array, Stream};
 
@@ -185,13 +184,16 @@ impl MoshiModel {
     }
 
     /// Runs one neutral temporal/depth pass through the shared decision traversal.
-    pub fn forward_realtime<'a>(
+    pub fn forward_realtime<'a, S>(
         &mut self,
         input: moshi::Input<'a, Array>,
         state: &mut MlxKeyValueState,
-        driver: &mut SequentialDecisionDriver<MlxSamplingBackend, DefaultSampler>,
+        driver: &mut SequentialDecisionDriver<MlxSamplingBackend, S>,
         stream: &Stream,
-    ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error> {
+    ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error>
+    where
+        S: Sampler<MlxSamplingBackend>,
+    {
         let mut boundary = moshi::DecisionBoundary::new(&self.target_config)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut traversal = SequentialDecisionTraversal::new(driver, &mut boundary);
@@ -241,14 +243,17 @@ impl MoshiModel {
     }
 
     /// Runs one rank-local tensor-parallel temporal/depth pass.
-    pub fn forward_realtime_parallel<'a>(
+    pub fn forward_realtime_parallel<'a, S>(
         &mut self,
         input: moshi::Input<'a, Array>,
         state: &mut MlxKeyValueState,
-        driver: &mut SequentialDecisionDriver<MlxSamplingBackend, DefaultSampler>,
+        driver: &mut SequentialDecisionDriver<MlxSamplingBackend, S>,
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error> {
+    ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error>
+    where
+        S: Sampler<MlxSamplingBackend>,
+    {
         let mut boundary = moshi::DecisionBoundary::new(&self.target_config)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut traversal = SequentialDecisionTraversal::new(driver, &mut boundary);

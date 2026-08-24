@@ -62,6 +62,8 @@ execution, distributed, and model-composition support.
 
 The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
 `personaplex_quantization_eval` examples require `codec`.
+The quantization example is a thin MLX composition entry point over the
+backend-neutral driver in `eredu-evaluation`.
 
 ## Migration notes
 

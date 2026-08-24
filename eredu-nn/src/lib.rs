@@ -3589,6 +3589,20 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "I32 tensor construction is not implemented by this backend",
         ))
     }
+    /// Explicitly materializes floating-point tensor values on the host.
+    fn to_f32_vec(&self, context: &Self::Context) -> Result<Vec<f32>, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "F32 host materialization is not implemented by this backend",
+        ))
+    }
+    /// Explicitly materializes signed 32-bit integer tensor values on the host.
+    fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "I32 host materialization is not implemented by this backend",
+        ))
+    }
     /// Creates a floating-point tensor filled with one scalar.
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         let _ = (value, shape, context);

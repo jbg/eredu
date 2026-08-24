@@ -179,6 +179,20 @@ def eval_command(
     ]
 
 
+def build_command() -> list[str]:
+    return [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "eredu-backend-mlx",
+        "--features",
+        "codec",
+        "--example",
+        "personaplex_quantization_eval",
+    ]
+
+
 def weighted_mean(records: list[tuple[float, int]]) -> float:
     weight = sum(item[1] for item in records)
     return sum(value * count for value, count in records) / max(weight, 1)
@@ -381,21 +395,7 @@ def run_suite(args: argparse.Namespace) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     binary = (args.binary or repo_root / "target/release/examples/personaplex_quantization_eval").resolve()
     if not binary.is_file() and not args.dry_run:
-        subprocess.run(
-            [
-                "cargo",
-                "build",
-                "--release",
-                "-p",
-                "eredu-codec",
-                "--features",
-                "mlx",
-                "--example",
-                "personaplex_quantization_eval",
-            ],
-            cwd=repo_root,
-            check=True,
-        )
+        subprocess.run(build_command(), cwd=repo_root, check=True)
     commands = [
         eval_command(binary, common, trial, args.output_dir / "cases" / trial["id"])
         for trial in trials

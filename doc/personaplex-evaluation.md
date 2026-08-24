@@ -37,8 +37,8 @@ cargo run --release -p eredu-backend-mlx --features codec \
   128
 ```
 
-The final required argument is the maximum number of 80 ms frames. Optional
-arguments can override the assistant text prompt and sampling seed.
+The output directory is the final required argument. Optional arguments select
+the maximum number of 80 ms frames, assistant text prompt, and sampling seed.
 
 The output directory contains:
 
@@ -81,10 +81,10 @@ suite file has this shape:
 Run and summarize it with:
 
 ```sh
-python eredu-codec/scripts/personaplex_quantization_suite.py run \
+python eredu-evaluation/scripts/personaplex_quantization_suite.py run \
   suite.json /tmp/personaplex-quantization-suite
 
-python eredu-codec/scripts/personaplex_quantization_suite.py summarize \
+python eredu-evaluation/scripts/personaplex_quantization_suite.py summarize \
   /tmp/personaplex-quantization-suite \
   /tmp/personaplex-quantization-suite/human_ratings.json
 ```
@@ -102,7 +102,7 @@ comparison. The included reference runner consumes that file:
 ```sh
 PYTORCH_ENABLE_MPS_FALLBACK=1 \
 PYTHONPATH=/path/to/upstream/moshi:/path/to/python/dependencies \
-python eredu-codec/scripts/personaplex_pytorch_backend_reference.py \
+python eredu-evaluation/scripts/personaplex_pytorch_backend_reference.py \
   --moshi-source /path/to/upstream/moshi \
   --model /path/to/personaplex/model.safetensors \
   --mimi /path/to/tokenizer.safetensors \

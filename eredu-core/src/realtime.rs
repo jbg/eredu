@@ -270,6 +270,16 @@ pub enum RealtimeConfigError {
         /// Invalid audio temperature.
         audio: f32,
     },
+    /// Top-k truncation, when selected, must admit at least one token.
+    #[error(
+        "realtime sampling top-k must be positive when set, got text={text:?} audio={audio:?}"
+    )]
+    SamplingTopK {
+        /// Invalid text top-k value.
+        text: Option<usize>,
+        /// Invalid audio top-k value.
+        audio: Option<usize>,
+    },
 }
 
 /// Canonical stream slot in a text-plus-audio realtime schedule.
@@ -872,6 +882,8 @@ fn slots(total_audio_codebooks: usize) -> impl Iterator<Item = RealtimeFrameSlot
 pub struct RealtimeSampling {
     text_temperature: f32,
     audio_temperature: f32,
+    text_top_k: Option<usize>,
+    audio_top_k: Option<usize>,
     seed: u64,
 }
 
@@ -884,10 +896,13 @@ impl<'de> Deserialize<'de> for RealtimeSampling {
         struct Raw {
             text_temperature: f32,
             audio_temperature: f32,
+            text_top_k: Option<usize>,
+            audio_top_k: Option<usize>,
             seed: u64,
         }
         let raw = Raw::deserialize(deserializer)?;
         Self::new(raw.text_temperature, raw.audio_temperature, raw.seed)
+            .and_then(|sampling| sampling.with_top_k(raw.text_top_k, raw.audio_top_k))
             .map_err(serde::de::Error::custom)
     }
 }
@@ -912,8 +927,27 @@ impl RealtimeSampling {
         Ok(Self {
             text_temperature,
             audio_temperature,
+            text_top_k: None,
+            audio_top_k: None,
             seed,
         })
+    }
+
+    /// Applies optional top-k truncation independently to text and audio decisions.
+    pub fn with_top_k(
+        mut self,
+        text_top_k: Option<usize>,
+        audio_top_k: Option<usize>,
+    ) -> Result<Self, RealtimeConfigError> {
+        if text_top_k == Some(0) || audio_top_k == Some(0) {
+            return Err(RealtimeConfigError::SamplingTopK {
+                text: text_top_k,
+                audio: audio_top_k,
+            });
+        }
+        self.text_top_k = text_top_k;
+        self.audio_top_k = audio_top_k;
+        Ok(self)
     }
 
     /// Deterministic greedy sampling.
@@ -921,6 +955,8 @@ impl RealtimeSampling {
         Self {
             text_temperature: 0.0,
             audio_temperature: 0.0,
+            text_top_k: None,
+            audio_top_k: None,
             seed: 0,
         }
     }
@@ -931,6 +967,14 @@ impl RealtimeSampling {
     /// Audio sampling temperature.
     pub const fn audio_temperature(self) -> f32 {
         self.audio_temperature
+    }
+    /// Optional number of highest-scoring text tokens admitted for sampling.
+    pub const fn text_top_k(self) -> Option<usize> {
+        self.text_top_k
+    }
+    /// Optional number of highest-scoring audio tokens admitted for sampling.
+    pub const fn audio_top_k(self) -> Option<usize> {
+        self.audio_top_k
     }
     /// Deterministic root seed interpreted by the selected backend.
     pub const fn seed(self) -> u64 {
@@ -945,6 +989,173 @@ impl RealtimeSampling {
 impl Default for RealtimeSampling {
     fn default() -> Self {
         Self::greedy()
+    }
+}
+
+/// Portable host representation of one realtime input frame.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RealtimeInputFrame {
+    batch: usize,
+    input_audio_tokens: Vec<i32>,
+    forced_generated_audio_tokens: Option<Vec<i32>>,
+    forced_generated_audio_codebooks: Option<Vec<bool>>,
+    forced_text_tokens: Option<Vec<i32>>,
+    retain_diagnostics: bool,
+}
+
+impl RealtimeInputFrame {
+    /// Creates one batch-major encoded input-audio frame.
+    pub fn new(batch: usize, input_audio_tokens: Vec<i32>) -> Self {
+        Self {
+            batch,
+            input_audio_tokens,
+            forced_generated_audio_tokens: None,
+            forced_generated_audio_codebooks: None,
+            forced_text_tokens: None,
+            retain_diagnostics: false,
+        }
+    }
+
+    /// Forces every generated-audio decision from batch-major token values.
+    pub fn with_forced_generated_audio(mut self, tokens: Vec<i32>) -> Self {
+        self.forced_generated_audio_tokens = Some(tokens);
+        self.forced_generated_audio_codebooks = None;
+        self
+    }
+
+    /// Forces selected generated-audio codebooks from batch-major token values.
+    pub fn with_partially_forced_generated_audio(
+        mut self,
+        tokens: Vec<i32>,
+        codebooks: Vec<bool>,
+    ) -> Self {
+        self.forced_generated_audio_tokens = Some(tokens);
+        self.forced_generated_audio_codebooks = Some(codebooks);
+        self
+    }
+
+    /// Forces one text decision per batch row.
+    pub fn with_forced_text(mut self, tokens: Vec<i32>) -> Self {
+        self.forced_text_tokens = Some(tokens);
+        self
+    }
+
+    /// Requests complete decision logits in the observed step output.
+    pub fn with_diagnostics(mut self) -> Self {
+        self.retain_diagnostics = true;
+        self
+    }
+
+    /// Batch dimension.
+    pub const fn batch(&self) -> usize {
+        self.batch
+    }
+    /// Batch-major input-audio tokens.
+    pub fn input_audio_tokens(&self) -> &[i32] {
+        &self.input_audio_tokens
+    }
+    /// Optional batch-major generated-audio forcing tokens.
+    pub fn forced_generated_audio_tokens(&self) -> Option<&[i32]> {
+        self.forced_generated_audio_tokens.as_deref()
+    }
+    /// Optional generated-codebook forcing mask.
+    pub fn forced_generated_audio_codebooks(&self) -> Option<&[bool]> {
+        self.forced_generated_audio_codebooks.as_deref()
+    }
+    /// Optional forced text tokens, one per batch row.
+    pub fn forced_text_tokens(&self) -> Option<&[i32]> {
+        self.forced_text_tokens.as_deref()
+    }
+    /// Whether complete decision diagnostics were requested.
+    pub const fn retains_diagnostics(&self) -> bool {
+        self.retain_diagnostics
+    }
+}
+
+/// Materialized logits for one ordered realtime decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RealtimeDecisionDiagnostics {
+    prediction: usize,
+    shape: Vec<usize>,
+    logits: Vec<f32>,
+}
+
+impl RealtimeDecisionDiagnostics {
+    /// Creates one portable diagnostic observation.
+    pub fn new(prediction: usize, shape: Vec<usize>, logits: Vec<f32>) -> Self {
+        Self {
+            prediction,
+            shape,
+            logits,
+        }
+    }
+    /// Decision ordinal in text-then-depth order.
+    pub const fn prediction(&self) -> usize {
+        self.prediction
+    }
+    /// Complete materialized logits shape.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    /// Complete row-major logits values.
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
+    }
+}
+
+/// Portable host observation of one completed realtime output frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RealtimeOutputFrame {
+    batch: usize,
+    text_tokens: Vec<i32>,
+    decision_audio_tokens: Vec<i32>,
+    sampled_audio_tokens: Vec<i32>,
+    output_audio_tokens: Option<Vec<i32>>,
+    diagnostics: Vec<RealtimeDecisionDiagnostics>,
+}
+
+impl RealtimeOutputFrame {
+    /// Creates a completed host observation in batch-major order.
+    pub fn new(
+        batch: usize,
+        text_tokens: Vec<i32>,
+        decision_audio_tokens: Vec<i32>,
+        sampled_audio_tokens: Vec<i32>,
+        output_audio_tokens: Option<Vec<i32>>,
+        diagnostics: Vec<RealtimeDecisionDiagnostics>,
+    ) -> Self {
+        Self {
+            batch,
+            text_tokens,
+            decision_audio_tokens,
+            sampled_audio_tokens,
+            output_audio_tokens,
+            diagnostics,
+        }
+    }
+    /// Batch dimension.
+    pub const fn batch(&self) -> usize {
+        self.batch
+    }
+    /// One sampled text token per batch row.
+    pub fn text_tokens(&self) -> &[i32] {
+        &self.text_tokens
+    }
+    /// Batch-major audio tokens resolved at every ordered depth decision.
+    pub fn decision_audio_tokens(&self) -> &[i32] {
+        &self.decision_audio_tokens
+    }
+    /// Batch-major generated-audio tokens resolved for this frame.
+    pub fn sampled_audio_tokens(&self) -> &[i32] {
+        &self.sampled_audio_tokens
+    }
+    /// Optional batch-major delay-aligned output-audio tokens.
+    pub fn output_audio_tokens(&self) -> Option<&[i32]> {
+        self.output_audio_tokens.as_deref()
+    }
+    /// Ordered decision diagnostics, empty unless explicitly requested.
+    pub fn diagnostics(&self) -> &[RealtimeDecisionDiagnostics] {
+        &self.diagnostics
     }
 }
 
@@ -983,6 +1194,14 @@ pub trait RealtimeBackend {
     }
     /// Returns portable codec geometry.
     fn speech_config(&self, model: &Self::Model) -> RealtimeSpeechConfig;
+    /// Materializes a portable encoded or forced frame for this backend.
+    fn materialize_input(
+        &self,
+        model: &Self::Model,
+        frame: &RealtimeInputFrame,
+    ) -> Result<Self::Input, Self::Error>;
+    /// Materializes tokens and requested diagnostics from one completed output.
+    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error>;
     /// Creates one request-local session.
     fn create_session(
         &self,
@@ -1594,6 +1813,29 @@ mod tests {
             )
             .unwrap()
         }
+        fn materialize_input(
+            &self,
+            _: &u64,
+            frame: &RealtimeInputFrame,
+        ) -> Result<Frame, Infallible> {
+            Ok(Frame(
+                frame
+                    .input_audio_tokens()
+                    .iter()
+                    .map(|token| *token as u32)
+                    .collect(),
+            ))
+        }
+        fn observe_output(&self, output: &u32) -> Result<RealtimeOutputFrame, Infallible> {
+            Ok(RealtimeOutputFrame::new(
+                1,
+                vec![*output as i32],
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+            ))
+        }
         fn create_session(
             &self,
             _: &u64,
@@ -1786,12 +2028,28 @@ mod tests {
                 .unwrap(),
             config
         );
-        let sampling = RealtimeSampling::new(0.7, 0.9, 42).unwrap();
+        let sampling = RealtimeSampling::new(0.7, 0.9, 42)
+            .unwrap()
+            .with_top_k(Some(25), Some(250))
+            .unwrap();
+        assert_eq!(sampling.text_top_k(), Some(25));
+        assert_eq!(sampling.audio_top_k(), Some(250));
+        assert!(RealtimeSampling::greedy()
+            .with_top_k(Some(0), None)
+            .is_err());
         assert_eq!(
             serde_json::from_str::<RealtimeSampling>(&serde_json::to_string(&sampling).unwrap())
                 .unwrap(),
             sampling
         );
+        let frame = RealtimeInputFrame::new(1, vec![1, 2])
+            .with_forced_generated_audio(vec![3, 4])
+            .with_forced_text(vec![5])
+            .with_diagnostics();
+        assert_eq!(frame.input_audio_tokens(), [1, 2]);
+        assert_eq!(frame.forced_generated_audio_tokens(), Some(&[3, 4][..]));
+        assert_eq!(frame.forced_text_tokens(), Some(&[5][..]));
+        assert!(frame.retains_diagnostics());
         assert!(RealtimeSpeechConfig::new(
             4,
             1,

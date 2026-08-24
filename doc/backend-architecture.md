@@ -67,6 +67,12 @@ Facade examples follow the same rule and construct selected local sessions
 through `eredu::api`. Backend-author probes that intentionally manipulate MLX
 tensors, streams, distributed groups, caches, or checkpoint packing live as
 `eredu-backend-mlx` examples and depend downward on neutral contracts.
+Realtime applications exchange portable host token frames and observations
+through `RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
+Backends retain native tensors internally, while explicit observations may
+materialize completed tokens and requested decision logits for diagnostics.
+Backend-neutral evaluation drivers live in `eredu-evaluation`; concrete backend
+examples only select execution contexts and materialize model and codec artifacts.
 
 ## Ownership boundary
 

@@ -11,14 +11,17 @@ use eredu_architectures::moshi::{
 use eredu_core::{
     backend::{Completion, Submission},
     realtime::{
-        RealtimeBackend, RealtimeError, RealtimeFrameForcing, RealtimeFrameSlot, RealtimeModel,
-        RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler, RealtimeSlotCoordinate,
+        RealtimeBackend, RealtimeDecisionDiagnostics, RealtimeError, RealtimeFrameForcing,
+        RealtimeFrameSlot, RealtimeInputFrame, RealtimeModel, RealtimeModelLoadingBackend,
+        RealtimeOutputFrame, RealtimeSampling, RealtimeScheduler, RealtimeSlotCoordinate,
         RealtimeSpeechConfig, RealtimeTargetSource, RealtimeTemporalSource,
     },
     scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
 };
+#[cfg(test)]
+use eredu_runtime::DefaultSampler;
 use eredu_runtime::{
-    DefaultSampler, PredictionDirective, RealtimeGenerationBranch, RealtimeGenerationState,
+    GenerationSampler, PredictionDirective, RealtimeGenerationBranch, RealtimeGenerationState,
     RuntimeState, SequentialDecisionPlan,
 };
 use safemlx::{
@@ -110,6 +113,8 @@ pub struct MlxRealtimeInput {
     pub forced_generated_audio_codebooks: Option<Vec<bool>>,
     /// Optional text token forced by a prompt frame.
     pub forced_text_token: Option<Array>,
+    /// Whether complete decision logits are retained for host observation.
+    pub retain_diagnostics: bool,
 }
 
 impl MlxRealtimeInput {
@@ -120,6 +125,7 @@ impl MlxRealtimeInput {
             forced_generated_audio_tokens: None,
             forced_generated_audio_codebooks: None,
             forced_text_token: None,
+            retain_diagnostics: false,
         }
     }
 
@@ -146,6 +152,12 @@ impl MlxRealtimeInput {
         self.forced_text_token = Some(token.clone());
         self
     }
+
+    /// Retains complete text and depth-decision logits in the completed output.
+    pub fn with_diagnostics(mut self) -> Self {
+        self.retain_diagnostics = true;
+        self
+    }
 }
 
 impl WorkDescriptor for MlxRealtimeInput {
@@ -164,7 +176,9 @@ impl WorkDescriptor for MlxRealtimeInput {
             }
             None => output.push(0),
         }
-        encode_optional_array_descriptor(self.forced_text_token.as_ref(), output)
+        encode_optional_array_descriptor(self.forced_text_token.as_ref(), output)?;
+        output.push(u32::from(self.retain_diagnostics));
+        Ok(())
     }
 }
 
@@ -172,10 +186,14 @@ impl WorkDescriptor for MlxRealtimeInput {
 pub struct MlxRealtimeOutput {
     /// Text token sampled at this model step, shaped `[batch, 1]`.
     pub text_token: Array,
+    /// Audio tokens resolved at every depth decision, shaped `[batch, depth]`.
+    pub decision_audio_tokens: Array,
     /// Newly sampled generated-codebook tokens before delay alignment.
     pub sampled_audio_tokens: Array,
     /// Delay-aligned codec frame ready for decoding.
     pub output_audio_tokens: Option<Array>,
+    /// Complete text-then-depth decision logits when requested by the input.
+    pub diagnostics: Vec<Array>,
 }
 
 /// MLX text tokens and delay-aligned codec tokens from offline generation.
@@ -339,6 +357,27 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
     }
 }
 
+fn realtime_sampler(top_k: Option<usize>) -> Result<GenerationSampler, Error> {
+    let top_k = top_k
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Error::Parallel("realtime top-k exceeds i32".into()))?
+        .unwrap_or(0);
+    Ok(GenerationSampler::new().top_k(top_k).top_p(1.0).min_p(0.0))
+}
+
+fn realtime_samplers(
+    schedule: &RealtimeSpeechConfig,
+    sampling: RealtimeSampling,
+) -> Result<Vec<GenerationSampler>, Error> {
+    std::iter::once(realtime_sampler(sampling.text_top_k()))
+        .chain(std::iter::repeat_with(|| {
+            realtime_sampler(sampling.audio_top_k())
+        }))
+        .take(schedule.depth_audio_codebooks() + 1)
+        .collect()
+}
+
 fn materialize_realtime_model(
     preparation: RealtimePreparationPlan,
     options: ModelLoadOptions,
@@ -421,6 +460,40 @@ fn realtime_error(error: RealtimeError<Error>) -> Error {
     Error::Parallel(error.to_string())
 }
 
+fn array_i32_host(array: &Array) -> Result<Vec<i32>, Error> {
+    let evaluated = array.evaluated()?;
+    match array.dtype() {
+        Dtype::Int32 => Ok(evaluated.as_slice::<i32>().to_vec()),
+        Dtype::Uint32 => evaluated
+            .as_slice::<u32>()
+            .iter()
+            .map(|value| i32::try_from(*value).map_err(|error| Error::Parallel(error.to_string())))
+            .collect(),
+        Dtype::Int64 => evaluated
+            .as_slice::<i64>()
+            .iter()
+            .map(|value| i32::try_from(*value).map_err(|error| Error::Parallel(error.to_string())))
+            .collect(),
+        Dtype::Uint64 => evaluated
+            .as_slice::<u64>()
+            .iter()
+            .map(|value| i32::try_from(*value).map_err(|error| Error::Parallel(error.to_string())))
+            .collect(),
+        dtype => Err(Error::Parallel(format!(
+            "realtime token observation expected integer values, got {dtype:?}"
+        ))),
+    }
+}
+
+fn array_f32_host(array: &Array, stream: &Stream) -> Result<Vec<f32>, Error> {
+    let array = if array.dtype() == Dtype::Float32 {
+        array.clone()
+    } else {
+        array.as_dtype(Dtype::Float32, stream)?
+    };
+    Ok(array.evaluated()?.as_slice::<f32>().to_vec())
+}
+
 /// Complete artifact and execution identity for MLX realtime state handoff.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MlxRealtimeModelIdentity {
@@ -491,7 +564,7 @@ impl SemanticStateTransaction for MlxRealtimeModelState {
 pub struct MlxRealtimeSession {
     generation: RealtimeGenerationState<
         MlxRealtimeModelState,
-        DefaultSampler,
+        GenerationSampler,
         RandomState,
         MlxRealtimeCompletion,
     >,
@@ -509,7 +582,7 @@ impl MlxRealtimeSession {
         &self,
     ) -> &RealtimeGenerationState<
         MlxRealtimeModelState,
-        DefaultSampler,
+        GenerationSampler,
         RandomState,
         MlxRealtimeCompletion,
     > {
@@ -521,6 +594,12 @@ impl MlxRealtimeSession {
             .is_stochastic()
             .then(|| random::key(sampling.seed()).map(RandomState::from_key))
             .transpose()?;
+        self.generation
+            .set_samplers(realtime_samplers(
+                self.generation.schedule_state().schedule(),
+                sampling,
+            )?)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         self.generation.set_random_state(random);
         self.sampling = sampling;
         Ok(())
@@ -531,7 +610,7 @@ impl MlxRealtimeSession {
 pub struct MlxRealtimeSessionBranch {
     generation: RealtimeGenerationBranch<
         MlxRealtimeModelStateBranch,
-        DefaultSampler,
+        GenerationSampler,
         RandomState,
         MlxRealtimeCompletion,
     >,
@@ -584,8 +663,10 @@ impl MlxRealtimeCompletion {
         token_validations: TokenValidationBatch,
     ) -> Result<Self, Error> {
         let mut retained = std::iter::once(output.text_token.clone())
+            .chain(std::iter::once(output.decision_audio_tokens.clone()))
             .chain(std::iter::once(output.sampled_audio_tokens.clone()))
             .chain(output.output_audio_tokens.iter().cloned())
+            .chain(output.diagnostics.iter().cloned())
             .chain(state_values)
             .collect::<Vec<_>>();
         retained.extend(token_validations.arrays().cloned());
@@ -761,12 +842,14 @@ fn submit_neutral_step(
     if !transition.model_call_required() {
         let output = MlxRealtimeOutput {
             text_token: padding_token(RealtimeFrameSlot::Text, &config, batch, stream)?,
+            decision_audio_tokens: Array::zeros::<i32>(&[batch, 0], stream)?,
             sampled_audio_tokens: Array::full::<i32>(
                 &[batch, schedule.generated_audio_codebooks() as i32],
                 Array::from_int(schedule.audio_padding_token()),
                 stream,
             )?,
             output_audio_tokens: None,
+            diagnostics: Vec::new(),
         };
         let retained = {
             let state = branch.generation.model_state_mut();
@@ -836,8 +919,12 @@ fn submit_neutral_step(
             })
             .collect::<Result<Vec<_>, Error>>()?
     };
-    let plan = SequentialDecisionPlan::new(directives, false, true)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let plan = SequentialDecisionPlan::new(
+        directives,
+        input.retain_diagnostics,
+        !input.retain_diagnostics,
+    )
+    .map_err(|error| Error::Parallel(error.to_string()))?;
     let temperatures = std::iter::once(branch.sampling.text_temperature())
         .chain(std::iter::repeat_n(
             branch.sampling.audio_temperature(),
@@ -880,6 +967,11 @@ fn submit_neutral_step(
         .iter()
         .map(|decision| decision.token().as_array().clone())
         .collect::<Vec<_>>();
+    let diagnostics = driver
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.logits().as_array().clone())
+        .collect::<Vec<_>>();
     branch
         .generation
         .adopt_decision_driver(driver)
@@ -898,6 +990,11 @@ fn submit_neutral_step(
             stream,
         )?
         .squeeze_axes(&[-1], stream)?
+    };
+    let decision_audio_tokens = if decisions.len() <= 1 {
+        Array::zeros::<i32>(&[batch, 0], stream)?
+    } else {
+        stack_axis(&decisions[1..], 1, stream)?.squeeze_axes(&[-1], stream)?
     };
     let (output_audio_tokens, retained) = {
         let state = branch.generation.model_state_mut();
@@ -943,8 +1040,10 @@ fn submit_neutral_step(
     };
     let output = MlxRealtimeOutput {
         text_token,
+        decision_audio_tokens,
         sampled_audio_tokens,
         output_audio_tokens,
+        diagnostics,
     };
     let completion =
         MlxRealtimeCompletion::submit(&output, retained, token_validation_scope.finish())?;
@@ -984,6 +1083,120 @@ impl RealtimeBackend for MlxRealtimeBackend {
         model.config().frame_schedule().clone()
     }
 
+    fn materialize_input(
+        &self,
+        model: &Self::Model,
+        frame: &RealtimeInputFrame,
+    ) -> Result<Self::Input, Self::Error> {
+        let schedule = model.config().frame_schedule();
+        let batch = frame.batch();
+        if batch == 0 {
+            return Err(Error::Parallel(
+                "portable realtime input batch must be positive".into(),
+            ));
+        }
+        let batch_i32 = i32::try_from(batch)
+            .map_err(|_| Error::Parallel("realtime input batch exceeds i32".into()))?;
+        let input_codebooks = schedule.input_audio_codebooks();
+        let expected_input = batch
+            .checked_mul(input_codebooks)
+            .ok_or_else(|| Error::Parallel("realtime input shape overflow".into()))?;
+        if frame.input_audio_tokens().len() != expected_input {
+            return Err(Error::Parallel(format!(
+                "portable realtime input has {} audio tokens, expected {expected_input}",
+                frame.input_audio_tokens().len()
+            )));
+        }
+        let input_audio_tokens = Array::from_slice(
+            frame.input_audio_tokens(),
+            &[batch_i32, input_codebooks as i32],
+        )
+        .copy(&self.stream)?;
+        let mut input = MlxRealtimeInput::encoded_audio(&input_audio_tokens);
+        if let Some(tokens) = frame.forced_generated_audio_tokens() {
+            let generated = schedule.generated_audio_codebooks();
+            let expected = batch
+                .checked_mul(generated)
+                .ok_or_else(|| Error::Parallel("realtime forcing shape overflow".into()))?;
+            if tokens.len() != expected {
+                return Err(Error::Parallel(format!(
+                    "portable realtime generated-audio forcing has {} tokens, expected {expected}",
+                    tokens.len()
+                )));
+            }
+            let tokens =
+                Array::from_slice(tokens, &[batch_i32, generated as i32]).copy(&self.stream)?;
+            input = match frame.forced_generated_audio_codebooks() {
+                Some(mask) => {
+                    if mask.len() != generated {
+                        return Err(Error::Parallel(format!(
+                            "portable realtime forcing mask has {} entries, expected {generated}",
+                            mask.len()
+                        )));
+                    }
+                    input.with_partially_forced_generated_audio(&tokens, mask.to_vec())
+                }
+                None => input.with_forced_generated_audio(&tokens),
+            };
+        } else if frame.forced_generated_audio_codebooks().is_some() {
+            return Err(Error::Parallel(
+                "portable realtime forcing mask has no generated-audio tokens".into(),
+            ));
+        }
+        if let Some(tokens) = frame.forced_text_tokens() {
+            if tokens.len() != batch {
+                return Err(Error::Parallel(format!(
+                    "portable realtime text forcing has {} tokens, expected {batch}",
+                    tokens.len()
+                )));
+            }
+            let tokens = Array::from_slice(tokens, &[batch_i32, 1]).copy(&self.stream)?;
+            input = input.with_forced_text(&tokens);
+        }
+        if frame.retains_diagnostics() {
+            input = input.with_diagnostics();
+        }
+        Ok(input)
+    }
+
+    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error> {
+        let batch = usize::try_from(output.text_token.dim(0))
+            .map_err(|_| Error::Parallel("negative realtime output batch".into()))?;
+        let diagnostics = output
+            .diagnostics
+            .iter()
+            .enumerate()
+            .map(|(prediction, logits)| {
+                let shape = logits
+                    .shape()
+                    .iter()
+                    .map(|dimension| {
+                        usize::try_from(*dimension).map_err(|_| {
+                            Error::Parallel("negative realtime diagnostic dimension".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RealtimeDecisionDiagnostics::new(
+                    prediction,
+                    shape,
+                    array_f32_host(logits, &self.stream)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(RealtimeOutputFrame::new(
+            batch,
+            array_i32_host(&output.text_token)?,
+            array_i32_host(&output.decision_audio_tokens)?,
+            array_i32_host(&output.sampled_audio_tokens)?,
+            output
+                .output_audio_tokens
+                .as_ref()
+                .map(array_i32_host)
+                .transpose()?,
+            diagnostics,
+        ))
+    }
+
     fn create_session(
         &self,
         model: &Self::Model,
@@ -1001,7 +1214,7 @@ impl RealtimeBackend for MlxRealtimeBackend {
         let generation = RealtimeGenerationState::new(
             model_state,
             schedule.clone(),
-            vec![DefaultSampler; schedule.depth_audio_codebooks() + 1],
+            realtime_samplers(&schedule, sampling)?,
             random_state,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;

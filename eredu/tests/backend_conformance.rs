@@ -1662,6 +1662,34 @@ impl RealtimeBackend for MockRealtimeBackend {
         .unwrap()
     }
 
+    fn materialize_input(
+        &self,
+        _: &Self::Model,
+        frame: &eredu::RealtimeInputFrame,
+    ) -> Result<Self::Input, Self::Error> {
+        Ok(MockFrame(
+            frame
+                .input_audio_tokens()
+                .iter()
+                .map(|token| *token as u32)
+                .collect(),
+        ))
+    }
+
+    fn observe_output(
+        &self,
+        output: &Self::Output,
+    ) -> Result<eredu::RealtimeOutputFrame, Self::Error> {
+        Ok(eredu::RealtimeOutputFrame::new(
+            1,
+            vec![*output as i32],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        ))
+    }
+
     fn create_session(
         &self,
         _: &Self::Model,

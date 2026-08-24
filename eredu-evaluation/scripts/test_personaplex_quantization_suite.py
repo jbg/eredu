@@ -1,10 +1,12 @@
 import argparse
 import json
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import personaplex_quantization_suite as suite
 
 
@@ -24,6 +26,22 @@ def quality(distributions, value):
 
 
 class QuantizationSuiteTests(unittest.TestCase):
+    def test_builds_backend_owned_codec_example(self):
+        self.assertEqual(
+            suite.build_command(),
+            [
+                "cargo",
+                "build",
+                "--release",
+                "-p",
+                "eredu-backend-mlx",
+                "--features",
+                "codec",
+                "--example",
+                "personaplex_quantization_eval",
+            ],
+        )
+
     def test_rejects_silent_and_duplicate_case_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

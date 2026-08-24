@@ -143,6 +143,16 @@ where
         self.random_state = random_state;
     }
 
+    /// Replaces sampler state while the canonical request is idle.
+    pub fn set_samplers(
+        &mut self,
+        samplers: Vec<S>,
+    ) -> Result<(), RealtimeGenerationTransactionError<M::Error, C::Error>> {
+        validate_sampler_cardinality(self.schedule_state.schedule(), samplers.len())?;
+        self.samplers = samplers;
+        Ok(())
+    }
+
     /// Publishes a branch only after the concrete backend's exact completion
     /// has reported completion and successful waiting.
     ///

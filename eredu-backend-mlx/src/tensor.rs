@@ -104,6 +104,24 @@ impl Tensor for MlxTensor {
         tensor(Array::from_slice(values, shape).copy(context))
     }
 
+    fn to_f32_vec(&self, context: &Self::Context) -> Result<Vec<f32>, Error> {
+        let array = if self.0.dtype() == Dtype::Float32 {
+            self.0.clone()
+        } else {
+            backend(self.0.as_dtype(Dtype::Float32, context))?
+        };
+        Ok(backend(array.evaluated())?.as_slice::<f32>().to_vec())
+    }
+
+    fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
+        let array = if self.0.dtype() == Dtype::Int32 {
+            self.0.clone()
+        } else {
+            backend(self.0.as_dtype(Dtype::Int32, context))?
+        };
+        Ok(backend(array.evaluated())?.as_slice::<i32>().to_vec())
+    }
+
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::full::<f32>(shape, Array::from_f32(value), context))
     }
