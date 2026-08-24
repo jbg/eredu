@@ -114,6 +114,8 @@ impl Deref for OwnedParameterGroupSpec {
 /// Complete, validated parameter-ownership declaration for an architecture.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ArchitectureParameterDescription {
+    graph: ExecutionGraph,
+    unit_layout: ExecutionUnitLayout,
     groups: Vec<OwnedParameterGroupSpec>,
 }
 
@@ -190,7 +192,43 @@ impl ArchitectureParameterDescription {
                 target.clone(),
             ));
         }
-        Ok(Self { groups })
+        Ok(Self {
+            graph: graph.clone(),
+            unit_layout: layout.clone(),
+            groups,
+        })
+    }
+
+    /// Returns the canonical execution graph that owns these parameter groups.
+    pub const fn graph(&self) -> &ExecutionGraph {
+        &self.graph
+    }
+
+    /// Returns the canonical architecture-global execution-unit layout that
+    /// owns these parameter groups.
+    pub const fn unit_layout(&self) -> &ExecutionUnitLayout {
+        &self.unit_layout
+    }
+
+    /// Proves that this description still matches a concrete neutral architecture.
+    pub fn validate_architecture<B, S, M>(
+        &self,
+        architecture: &M,
+    ) -> Result<(), ArchitecturePartitionError>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: crate::RuntimeState<B>,
+        M: crate::LayeredArchitecture<B, S>,
+        M::Error: std::fmt::Display,
+    {
+        let (graph, unit_layout) = canonical_architecture_layout::<B, S, M>(architecture)?;
+        if graph != self.graph {
+            return Err(ArchitecturePartitionError::ArchitectureGraphMismatch);
+        }
+        if unit_layout != self.unit_layout {
+            return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
+        }
+        Ok(())
     }
 
     /// Returns every explicitly tagged neutral parameter group.
@@ -1310,6 +1348,8 @@ mod tests {
         )
         .unwrap();
         let partition = valid_partition();
+        assert_eq!(description.graph(), partition.graph());
+        assert_eq!(description.unit_layout(), partition.unit_layout());
         let selected = description.select_owned(&partition);
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].logical_name(), "embedding");

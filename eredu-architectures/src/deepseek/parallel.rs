@@ -1280,6 +1280,9 @@ mod tests {
     #[test]
     fn plans_name_attention_experts_indexes_hyper_streams_and_draft_groups() {
         let v3 = v3_args();
+        let v3_description = v3_parameter_description(&v3).unwrap();
+        assert_eq!(v3_description.unit_layout().group_range(0), Some(0..2));
+        assert_eq!(v3_description.unit_layout().group_range(1), Some(2..3));
         let v3_groups = v3_layer_parameter_groups(&v3, 2).unwrap();
         assert!(v3_groups
             .iter()
@@ -1289,6 +1292,9 @@ mod tests {
             .any(|group| group.role() == ParameterRole::ExpertIntermediate));
 
         let v4 = v4_args();
+        let v4_description = v4_parameter_description(&v4).unwrap();
+        assert_eq!(v4_description.unit_layout().group_range(0), Some(0..3));
+        assert_eq!(v4_description.unit_layout().group_range(1), Some(3..4));
         let target = v4_layer_parameter_groups(&v4, 1).unwrap();
         assert!(target
             .iter()

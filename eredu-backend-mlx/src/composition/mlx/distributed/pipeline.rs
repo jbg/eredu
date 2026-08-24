@@ -4178,6 +4178,55 @@ where
         })
 }
 
+fn architecture_prediction_groups<A, S>(architecture: &A) -> Result<Vec<usize>, Error>
+where
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Error: std::fmt::Display,
+{
+    let graph = architecture
+        .execution_graph()
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok((0..graph.groups().len())
+        .filter(|&group| {
+            let transport = architecture.group_transport(group);
+            transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder
+                && transport.placement == eredu_runtime::ArchitectureGroupPlacement::OutputOwner
+        })
+        .collect())
+}
+
+fn architecture_single_prediction_units<A, S>(
+    architecture: &A,
+    description: &eredu_runtime::ArchitectureParameterDescription,
+) -> Result<Vec<(usize, usize)>, Error>
+where
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Error: std::fmt::Display,
+{
+    architecture_prediction_groups::<A, S>(architecture)?
+        .into_iter()
+        .map(|group| {
+            let range = description
+                .unit_layout()
+                .group_range(group)
+                .ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "parameter description has no execution group {group}"
+                    ))
+                })?;
+            if range.len() != 1 {
+                return Err(Error::Parallel(format!(
+                    "output-owner prediction group {group} declares {} units, expected one",
+                    range.len()
+                )));
+            }
+            Ok((group, range.start))
+        })
+        .collect()
+}
+
 /// Executes one complete architecture-owned output group while composition
 /// supplies only resident units, mutable state, expert residency, and the
 /// optional tensor-parallel communicator.
@@ -5272,11 +5321,10 @@ fn qwen_hybrid_pipeline_prompt_cache_identity(
     args: &eredu_architectures::qwen::hybrid::HybridConfig,
     topology: MlxParallelContext,
     range: Range<usize>,
+    ownership: &eredu_runtime::PartitionOwnership,
     complete: &eredu_runtime::StateLayout,
 ) -> Result<PromptCacheModelIdentity, Error> {
-    let target_layers = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::Parallel("invalid Qwen hybrid target layer count".into()))?;
-    let state_end = if range.end == target_layers {
+    let state_end = if ownership.owns_output() {
         complete.len()
     } else {
         range.end
@@ -5325,14 +5373,30 @@ fn qwen_hybrid_pipeline_cache_identity_preserves_prediction_frontiers() {
     )
     .unwrap();
 
-    let identity =
-        qwen_hybrid_pipeline_prompt_cache_identity(&parsed.text, topology, 1..2, &complete)
-            .unwrap();
+    let identity = qwen_hybrid_pipeline_prompt_cache_identity(
+        &parsed.text,
+        topology,
+        1..2,
+        &eredu_runtime::PartitionOwnership::new(false, true, std::iter::empty::<&str>()).unwrap(),
+        &complete,
+    )
+    .unwrap();
 
     assert_eq!(identity.layer_count, 4);
     assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..4);
     assert_eq!(identity.layer_prefix_offsets, [0, -1, -1]);
     assert_eq!(identity.layer_layout.len(), 3);
+
+    let interior = qwen_hybrid_pipeline_prompt_cache_identity(
+        &parsed.text,
+        topology,
+        0..1,
+        &eredu_runtime::PartitionOwnership::new(false, false, std::iter::empty::<&str>()).unwrap(),
+        &complete,
+    )
+    .unwrap();
+    assert_eq!(interior.global_layer_start..interior.global_layer_end, 0..1);
+    assert_eq!(interior.layer_layout.len(), 1);
 }
 
 fn gemma4_pipeline_prompt_cache_identity(
@@ -6057,20 +6121,31 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
 
 impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
     fn embedded_mtp_len(&self) -> usize {
-        self.args().num_nextn_predict_layers as usize
+        self.mtp_layers.len()
     }
 
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let target = self.args().num_hidden_layers as usize;
         let caches = (0..self.mtp_layers.len())
-            .map(|depth| match &paged {
-                Some((manager, rank)) => {
-                    CompressedLatentCache::new_paged(manager.clone(), target + depth, *rank)
+            .map(|depth| -> Result<_, Error> {
+                let group =
+                    architecture_prediction_group::<_, MlxHybridState>(&self.architecture, depth)?;
+                let ordinal = self
+                    .partition
+                    .unit_layout()
+                    .ordinal(group, 0)
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("V3 parameter layout has no MTP depth {depth}"))
+                    })?;
+                match &paged {
+                    Some((manager, rank)) => {
+                        CompressedLatentCache::new_paged(manager.clone(), ordinal, *rank)
+                            .map_err(Into::into)
+                    }
+                    None => Ok(CompressedLatentCache::new()),
                 }
-                None => Ok(CompressedLatentCache::new()),
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PipelineMtpCache::DeepSeek(caches))
@@ -6099,7 +6174,15 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
                 "neutral DeepSeek V3 MTP cache mismatch".into(),
             ));
         };
-        let layer = self.args().num_hidden_layers as usize + depth;
+        let prediction_group =
+            architecture_prediction_group::<_, MlxHybridState>(&self.architecture, depth)?;
+        let layer = self
+            .partition
+            .unit_layout()
+            .ordinal(prediction_group, 0)
+            .ok_or_else(|| {
+                Error::Parallel(format!("V3 parameter layout has no MTP depth {depth}"))
+            })?;
         let unit_args = self
             .architecture
             .shared_parallel_geometry()
@@ -6559,19 +6642,28 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
 
 impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
     fn embedded_mtp_len(&self) -> usize {
-        self.args().num_nextn_predict_layers as usize
+        self.mtp_layers.len()
     }
 
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let target = self.args().num_hidden_layers as usize;
         let layout = eredu_architectures::deepseek::v4::state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let caches = (0..self.mtp_layers.len())
             .map(|depth| {
-                let layer = target + depth;
+                let group = architecture_prediction_group::<
+                    _,
+                    eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+                >(&self.architecture, depth)?;
+                let layer = self
+                    .partition
+                    .unit_layout()
+                    .ordinal(group, 0)
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("V4 parameter layout has no MTP depth {depth}"))
+                    })?;
                 let policy = layout.layer(layer).ok_or_else(|| {
                     Error::Parallel(format!("missing V4 MTP state layout layer {layer}"))
                 })?;
@@ -6621,7 +6713,17 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
                 "neutral DeepSeek V4 MTP cache mismatch".into(),
             ));
         };
-        let layer = self.args().num_hidden_layers as usize + depth;
+        let prediction_group = architecture_prediction_group::<
+            _,
+            eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+        >(&self.architecture, depth)?;
+        let layer = self
+            .partition
+            .unit_layout()
+            .ordinal(prediction_group, 0)
+            .ok_or_else(|| {
+                Error::Parallel(format!("V4 parameter layout has no MTP depth {depth}"))
+            })?;
         let unit_args = self
             .architecture
             .shared_parallel_geometry()
@@ -9130,6 +9232,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
             &self.args().text,
             topology,
             self.range().clone(),
+            self.partition.ownership(),
             &layout,
         )
     }
@@ -19715,6 +19818,7 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
             self.args(),
             topology,
             self.range().clone(),
+            self.partition.ownership(),
             &complete,
         )
     }
@@ -22313,41 +22417,13 @@ fn resolve_pipeline_safetensors_store(
     ))
 }
 
-fn v3_parallel_parameter_groups(
-    args: &eredu_architectures::deepseek::V3Args,
-) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
-    let mut groups = eredu_architectures::deepseek::parallel::v3_static_parameter_groups(args)?;
-    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-        .map_err(|_| Error::Parallel("invalid V3 unit count".into()))?;
-    for layer in 0..total {
-        groups.extend(
-            eredu_architectures::deepseek::parallel::v3_layer_parameter_groups(args, layer)?,
-        );
-    }
-    Ok(groups)
-}
-
-fn v4_parallel_parameter_groups(
-    args: &eredu_architectures::deepseek::V4Args,
-) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
-    let mut groups = eredu_architectures::deepseek::parallel::v4_static_parameter_groups(args)?;
-    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-        .map_err(|_| Error::Parallel("invalid V4 unit count".into()))?;
-    for layer in 0..total {
-        groups.extend(
-            eredu_architectures::deepseek::parallel::v4_layer_parameter_groups(args, layer)?,
-        );
-    }
-    Ok(groups)
-}
-
 fn deepseek_parallel_layout(
-    groups: &[eredu_runtime::ParameterGroupSpec],
+    description: &eredu_runtime::ArchitectureParameterDescription,
     topology: MlxParallelContext,
 ) -> Result<eredu_runtime::LocalModelLayout, Error> {
     let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
-    for group in groups.iter().cloned() {
-        planner.register(group)?;
+    for group in description.groups() {
+        planner.register(group.group().clone())?;
     }
     planner.finish().map(|(_, layout)| layout)
 }
@@ -22411,12 +22487,6 @@ fn load_neutral_deepseek_v3_pipeline(
             )
         })
         .transpose()?;
-    topology.preflight(
-        Some(source_args.num_hidden_layers as usize),
-        expert_assignment
-            .as_ref()
-            .map(ExpertAssignment::global_expert_count),
-    )?;
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v3_store(
@@ -22429,16 +22499,37 @@ fn load_neutral_deepseek_v3_pipeline(
         }
         None => (store, source_args, None),
     };
-    let range = topology.layer_range(args.num_hidden_layers as usize)?;
-    let owns_mtp = topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size
-        && args.num_nextn_predict_layers > 0;
-    let parameter_groups = v3_parallel_parameter_groups(&args)?;
-    let tensor_parallel = topology.tensor_parallel_size > 1;
-    let parallel_layout = tensor_parallel
-        .then(|| deepseek_parallel_layout(&parameter_groups, topology))
-        .transpose()?;
     let seed_architecture = NeutralV3Architecture::new(args.clone(), stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parameter_description =
+        eredu_architectures::deepseek::parallel::v3_parameter_description(&args)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+    parameter_description
+        .validate_architecture::<MlxNeuralBackend, MlxHybridState, _>(&seed_architecture)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&seed_architecture)?;
+    let target_units = parameter_description
+        .unit_layout()
+        .group_range(decoder_group)
+        .ok_or_else(|| Error::Parallel("V3 parameter description has no target group".into()))?
+        .len();
+    let prediction_units = architecture_single_prediction_units::<_, MlxHybridState>(
+        &seed_architecture,
+        &parameter_description,
+    )?;
+    topology.preflight(
+        Some(target_units),
+        expert_assignment
+            .as_ref()
+            .map(ExpertAssignment::global_expert_count),
+    )?;
+    let range = topology.layer_range(target_units)?;
+    let owns_mtp = topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size
+        && !prediction_units.is_empty();
+    let tensor_parallel = topology.tensor_parallel_size > 1;
+    let parallel_layout = tensor_parallel
+        .then(|| deepseek_parallel_layout(&parameter_description, topology))
+        .transpose()?;
     let seed_static_module = MlxModule::new(seed_architecture.static_modules().clone());
     let all_static_bindings = build_module_bindings(&seed_static_module, "", store.as_ref())?;
     let mut architecture = match parallel_layout.as_ref() {
@@ -22464,11 +22555,7 @@ fn load_neutral_deepseek_v3_pipeline(
         args.hidden_size,
     );
     info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp {
-        args.num_nextn_predict_layers as usize
-    } else {
-        0
-    };
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -22489,9 +22576,6 @@ fn load_neutral_deepseek_v3_pipeline(
             eredu_architectures::deepseek::v3::TargetBoundarySchema::from_args(&args),
             std::iter::empty(),
         )?;
-    let parameter_description =
-        eredu_architectures::deepseek::parallel::v3_parameter_description(&args)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
@@ -22585,12 +22669,10 @@ fn load_neutral_deepseek_v3_pipeline(
             }
         }
     }
-    let target_layers = args.num_hidden_layers as usize;
     let mut mtp_layers = if owns_mtp {
-        (0..args.num_nextn_predict_layers as usize)
-            .map(|depth| {
-                let prediction_group =
-                    architecture_prediction_group::<_, MlxHybridState>(&architecture, depth)?;
+        prediction_units
+            .iter()
+            .map(|&(prediction_group, _)| {
                 architecture
                     .construct_unit(prediction_group, 0, stream)
                     .map(MlxModule::new)
@@ -22600,13 +22682,13 @@ fn load_neutral_deepseek_v3_pipeline(
     } else {
         Vec::new()
     };
-    for (depth, unit) in mtp_layers.iter_mut().enumerate() {
-        let prediction_group =
-            architecture_prediction_group::<_, MlxHybridState>(&architecture, depth)?;
+    for ((prediction_group, ordinal), unit) in
+        prediction_units.iter().copied().zip(mtp_layers.iter_mut())
+    {
         let bindings = match &parallel_layout {
             Some(layout) => v3_sharded_unit_bindings(
                 &args,
-                target_layers + depth,
+                ordinal,
                 store.as_ref(),
                 external_experts,
                 layout,
@@ -22614,7 +22696,7 @@ fn load_neutral_deepseek_v3_pipeline(
             )?,
             None => crate::composition::deepseek::v3_unit_bindings(
                 &args,
-                target_layers + depth,
+                ordinal,
                 unit,
                 store.as_ref(),
                 external_experts,
@@ -22741,11 +22823,26 @@ fn load_neutral_deepseek_v3_pipeline(
             }
             None => crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?,
         };
+        let owned_unit_ordinals = range
+            .clone()
+            .map(|index| {
+                parameter_description
+                    .unit_layout()
+                    .ordinal(decoder_group, index)
+                    .expect("V3 target range derives from the parameter layout")
+            })
+            .chain(
+                owns_mtp
+                    .then_some(prediction_units.iter().map(|(_, ordinal)| *ordinal))
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect::<BTreeSet<_>>();
         let entries = catalog
             .into_iter()
             .filter(|entry| {
                 let layer = entry.identity().layer;
-                (range.contains(&layer) || (owns_mtp && layer >= target_layers))
+                owned_unit_ordinals.contains(&layer)
                     && assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
             })
             .collect::<Vec<_>>();
@@ -22802,12 +22899,6 @@ fn load_neutral_deepseek_v4_pipeline(
             )
         })
         .transpose()?;
-    topology.preflight(
-        Some(source_args.num_hidden_layers as usize),
-        expert_assignment
-            .as_ref()
-            .map(ExpertAssignment::global_expert_count),
-    )?;
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v4_store(
@@ -22820,16 +22911,44 @@ fn load_neutral_deepseek_v4_pipeline(
         }
         None => (store, source_args, None),
     };
-    let range = topology.layer_range(args.num_hidden_layers as usize)?;
-    let owns_mtp = topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size
-        && args.num_nextn_predict_layers > 0;
-    let parameter_groups = v4_parallel_parameter_groups(&args)?;
-    let tensor_parallel = topology.tensor_parallel_size > 1;
-    let parallel_layout = tensor_parallel
-        .then(|| deepseek_parallel_layout(&parameter_groups, topology))
-        .transpose()?;
     let seed_architecture = NeutralV4Architecture::new(args.clone(), stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parameter_description =
+        eredu_architectures::deepseek::parallel::v4_parameter_description(&args)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+    parameter_description
+        .validate_architecture::<
+            MlxNeuralBackend,
+            eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+            _,
+        >(&seed_architecture)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let decoder_group = architecture_decoder_group::<
+        _,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+    >(&seed_architecture)?;
+    let target_units = parameter_description
+        .unit_layout()
+        .group_range(decoder_group)
+        .ok_or_else(|| Error::Parallel("V4 parameter description has no target group".into()))?
+        .len();
+    let prediction_units = architecture_single_prediction_units::<
+        _,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+    >(&seed_architecture, &parameter_description)?;
+    topology.preflight(
+        Some(target_units),
+        expert_assignment
+            .as_ref()
+            .map(ExpertAssignment::global_expert_count),
+    )?;
+    let range = topology.layer_range(target_units)?;
+    let owns_mtp = topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size
+        && !prediction_units.is_empty();
+    let tensor_parallel = topology.tensor_parallel_size > 1;
+    let parallel_layout = tensor_parallel
+        .then(|| deepseek_parallel_layout(&parameter_description, topology))
+        .transpose()?;
     let seed_static_module = MlxModule::new(seed_architecture.static_modules().clone());
     let all_static_bindings = build_module_bindings(&seed_static_module, "", store.as_ref())?;
     let mut architecture = match parallel_layout.as_ref() {
@@ -22862,11 +22981,7 @@ fn load_neutral_deepseek_v4_pipeline(
         .checked_mul(args.hc_mult)
         .ok_or_else(|| Error::Parallel("neutral DeepSeek V4 activation width overflowed".into()))?;
     info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp {
-        args.num_nextn_predict_layers as usize
-    } else {
-        0
-    };
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -22891,9 +23006,6 @@ fn load_neutral_deepseek_v4_pipeline(
         eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args),
         std::iter::empty(),
     )?;
-    let parameter_description =
-        eredu_architectures::deepseek::parallel::v4_parameter_description(&args)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info.placement.realize_architecture_partition::<
@@ -22989,14 +23101,10 @@ fn load_neutral_deepseek_v4_pipeline(
             }
         }
     }
-    let target_layers = args.num_hidden_layers as usize;
     let mut mtp_layers = if owns_mtp {
-        (0..args.num_nextn_predict_layers as usize)
-            .map(|depth| {
-                let prediction_group = architecture_prediction_group::<
-                    _,
-                    eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
-                >(&architecture, depth)?;
+        prediction_units
+            .iter()
+            .map(|&(prediction_group, _)| {
                 architecture
                     .construct_unit(prediction_group, 0, stream)
                     .map(MlxModule::new)
@@ -23006,15 +23114,13 @@ fn load_neutral_deepseek_v4_pipeline(
     } else {
         Vec::new()
     };
-    for (depth, unit) in mtp_layers.iter_mut().enumerate() {
-        let prediction_group = architecture_prediction_group::<
-            _,
-            eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
-        >(&architecture, depth)?;
+    for ((prediction_group, ordinal), unit) in
+        prediction_units.iter().copied().zip(mtp_layers.iter_mut())
+    {
         let bindings = match &parallel_layout {
             Some(layout) => v4_sharded_unit_bindings(
                 &args,
-                target_layers + depth,
+                ordinal,
                 store.as_ref(),
                 external_experts,
                 layout,
@@ -23022,7 +23128,7 @@ fn load_neutral_deepseek_v4_pipeline(
             )?,
             None => crate::composition::deepseek::v4_unit_bindings(
                 &args,
-                target_layers + depth,
+                ordinal,
                 unit,
                 store.as_ref(),
                 external_experts,
@@ -23146,11 +23252,26 @@ fn load_neutral_deepseek_v4_pipeline(
             }
             None => crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?,
         };
+        let owned_unit_ordinals = range
+            .clone()
+            .map(|index| {
+                parameter_description
+                    .unit_layout()
+                    .ordinal(decoder_group, index)
+                    .expect("V4 target range derives from the parameter layout")
+            })
+            .chain(
+                owns_mtp
+                    .then_some(prediction_units.iter().map(|(_, ordinal)| *ordinal))
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect::<BTreeSet<_>>();
         let entries = catalog
             .into_iter()
             .filter(|entry| {
                 let layer = entry.identity().layer;
-                (range.contains(&layer) || (owns_mtp && layer >= target_layers))
+                owned_unit_ordinals.contains(&layer)
                     && assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
             })
             .collect::<Vec<_>>();

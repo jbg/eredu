@@ -271,6 +271,11 @@ remains a separate artifact capability because it does not imply an
 expert-parallel execution plan. Distributed backend preflight consumes these
 facts from that exact normalized report instead of reconstructing support from
 raw or wrapper `model_type` values.
+Validated architecture parameter descriptions retain their canonical
+execution-unit layout alongside owner-tagged parameter groups. Pipeline
+composition consumes those declared group ranges and flat unit ordinals for
+target and prediction placement; it does not rebuild target/MTP counts from
+family configuration fields.
 
 The MLX backend materializes every active expert-parallel axis through its
 single distributed-stage loader. Pure EP, PP+EP, TP+EP, and TP+PP+EP therefore
