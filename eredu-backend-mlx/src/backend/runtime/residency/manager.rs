@@ -1,7 +1,7 @@
 //! MLX materialization and transfer execution for immutable weight units.
 //!
 //! A [`crate::backend::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
-//! checkpoint selections from a [`crate::backend::runtime::checkpoint::store::WeightStore`] into
+//! checkpoint selections from an [`eredu_checkpoint::store::CheckpointSource`] into
 //! immutable typed host-transfer buffers or execution-stream arrays. The
 //! manager accounts for logical host and device copies independently, even on
 //! unified-memory systems.

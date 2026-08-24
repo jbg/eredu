@@ -112,9 +112,4 @@ toktrie_hf_tokenizers = "=1.7.6"
 
 [dev-dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-eredu-nn = { workspace = true, default-features = false }
-lazy_static = "1"
-libc = "0.2"
-safetensors = "0.8"
 tempfile.workspace = true

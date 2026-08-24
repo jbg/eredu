@@ -13,7 +13,8 @@
 //! exclusive `eredu_checkpoint::schema::AlternativeLayoutGroup` variants. Companion tensors
 //! are ordinary constraints supplied by the architecture; validation contains
 //! no companion naming convention. Architecture adapters feed the same
-//! physical plan to structural admission and its [`binding_plan::BindingPlan`]
+//! physical plan to structural admission and its
+//! [`BindingPlan`](crate::backend::runtime::checkpoint::binding_plan::BindingPlan)
 //! to resident, layerwise, or streamed loading.
 
 /// Stable identities for loaded checkpoint artifacts.
