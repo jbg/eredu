@@ -103,10 +103,11 @@ pub use inspection::{
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParallelSubgroup, CompositeLayeredTraversalHook,
-    LayeredArchitecture, LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint,
-    LayeredUnitAction, LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime,
-    LayerwiseRuntimeError, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LayeredTraversalHook,
+    LayeredTraversalPoint, LayeredUnitAction, LayerwiseAcquireError, LayerwisePolicy,
+    LayerwiseRuntime, LayerwiseRuntimeError, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, ResidentRuntime,
+    ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture,
 };
 pub use parallel::{
     aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,
@@ -123,8 +124,9 @@ pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
     ArchitectureParameterDescription, ArchitectureParameterError, ArchitecturePartition,
     ArchitecturePartitionError, BoundaryTensorDimension, BoundaryTensorDtype, BoundaryTensorSpec,
-    BoundaryWireSchema, NoAuxiliaryBoundary, OwnedParameterGroupSpec, ParameterGroupOwner,
-    PartitionGroup, PartitionOwnership, PartitionState, ResolvedBoundaryTensorSpec,
+    BoundaryWireSchema, LayeredPartitionDriver, LayeredPartitionError, LayeredPartitionOutput,
+    NoAuxiliaryBoundary, OwnedParameterGroupSpec, ParameterGroupOwner, PartitionGroup,
+    PartitionOwnership, PartitionState, ResolvedBoundaryTensorSpec,
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{

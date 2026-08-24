@@ -527,6 +527,53 @@ where
     ) -> Result<B::Tensor, Self::Error>;
 }
 
+/// Input accepted at a rank-local layered partition boundary.
+///
+/// The first partition embeds borrowed token ids. Later partitions consume an
+/// owned hidden tensor received from the preceding pipeline owner.
+#[derive(Debug)]
+pub enum LayeredPartitionInput<'a, T> {
+    /// Token ids supplied to the architecture input owner.
+    Tokens(&'a T),
+    /// Hidden state supplied to a non-input partition.
+    Hidden(T),
+}
+
+/// Architecture-owned preparation for rank-local partition execution.
+///
+/// The neutral partition driver owns validation, group setup, completion, and
+/// output ownership. Architectures implement only the semantic conversion of
+/// a partition input into their typed forward state.
+pub trait PartitionedLayeredArchitecture<B, S>: ParallelLayeredArchitecture<B, S>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+{
+    /// Prepares a replicated partition from tokens or upstream hidden state.
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &crate::StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Prepares the tensor-parallel form of the same partition.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &crate::StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+}
+
 /// Provider-aware unit execution for architectures with routed feed-forward work.
 ///
 /// Partition drivers retain ownership of expert residency while the neutral

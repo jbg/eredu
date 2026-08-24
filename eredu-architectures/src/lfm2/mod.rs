@@ -36,9 +36,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, ModelStateIdentity, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, ModelStateIdentity,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    ParameterGroupOwner, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
 use crate::{
@@ -263,9 +264,9 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     }
 
     /// Starts a pipeline partition from token ids or an upstream hidden state.
-    pub fn begin_partition<S>(
+    fn prepare_partition<S>(
         &mut self,
-        input: crate::decoder::PartitionInput<'_, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
@@ -277,12 +278,12 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         S::LayerState: RuntimeStateComponents<B>,
     {
         let hidden = match input {
-            crate::decoder::PartitionInput::Tokens(tokens) => self
+            LayeredPartitionInput::Tokens(tokens) => self
                 .decoder
                 .static_modules_mut()
                 .embeddings
                 .forward(tokens, context)?,
-            crate::decoder::PartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden(hidden) => hidden,
         };
         self.begin_embedded_partition_with_layout(
             hidden,
@@ -296,9 +297,9 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
     /// Starts the tensor-parallel form of the same neutral partition entry.
     #[allow(clippy::too_many_arguments)]
-    pub fn begin_partition_parallel<S>(
+    fn prepare_partition_parallel<S>(
         &mut self,
-        input: crate::decoder::PartitionInput<'_, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
@@ -311,14 +312,14 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         S::LayerState: RuntimeStateComponents<B>,
     {
         let hidden = match input {
-            crate::decoder::PartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
+            LayeredPartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
                 &mut self.decoder.static_modules_mut().embeddings,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             )?,
-            crate::decoder::PartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden(hidden) => hidden,
         };
         self.begin_embedded_partition_with_layout(
             hidden,
@@ -371,35 +372,6 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             hidden,
             context: ForwardContext { mask },
         })
-    }
-
-    /// Applies the replicated output boundary for a final pipeline partition.
-    pub fn finish_partition(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.finish_logits(hidden, context)
-    }
-
-    /// Applies the tensor-parallel output boundary for a final pipeline partition.
-    pub fn finish_partition_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        let modules = self.decoder.static_modules_mut();
-        let hidden = modules.norm.forward(hidden, context)?;
-        match &mut modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
     }
 
     /// Executes one neutral block for placement-aware compositions.
@@ -700,6 +672,55 @@ where
                 context,
             ),
         }
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        LayeredModel::prepare_partition(
+            self,
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        LayeredModel::prepare_partition_parallel(
+            self,
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+        )
     }
 }
 

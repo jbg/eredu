@@ -4441,12 +4441,234 @@ where
     Ok((logits, hidden))
 }
 
-/// Runs one shared-decoder partition through the neutral layered lifecycle.
+/// Runs one dense partition through the neutral layered lifecycle.
 ///
 /// The canonical architecture partition supplies the group, local unit range,
 /// state layout, and input/output ownership. Composition retains only MLX
 /// residency leases and transport payloads; embedding, masking, unit math, and
 /// output projection remain methods of the neutral architecture.
+#[allow(clippy::too_many_arguments)]
+fn execute_layered_partition<A, U, F, G, Boundary>(
+    architecture: &mut A,
+    partition: &eredu_runtime::ArchitecturePartition<G, Boundary>,
+    storage_range: Range<usize>,
+    resident_layers: &mut [MlxModule<U>],
+    dense_layers: Option<&PipelineLayerStorage>,
+    input: PipelineStageInput<'_>,
+    step: PipelineStep,
+    explicit_mask: Option<&Array>,
+    caches: &mut [PipelineLayerCache],
+    execution: Option<&ParallelExecutionContext<'_>>,
+    stream: &Stream,
+) -> Result<PipelineStageOutput, Error>
+where
+    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    F: 'static,
+    for<'state> A: eredu_runtime::PartitionedLayeredArchitecture<
+        MlxNeuralBackend,
+        PipelineRangeState<'state>,
+        Unit = U,
+        ForwardContext = F,
+    >,
+    for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
+        std::fmt::Display,
+{
+    let driver = eredu_runtime::LayeredPartitionDriver::new(partition, storage_range)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parallel = execution
+        .filter(|execution| execution.is_tensor_parallel())
+        .map(|execution| {
+            execution.group().ok_or_else(|| {
+                Error::Parallel("tensor-sharded partition has no TP communicator".into())
+            })
+        })
+        .transpose()?;
+    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
+    let (input, auxiliary) = match input {
+        PipelineStageInput::Tokens(tokens) => (
+            eredu_runtime::LayeredPartitionInput::Tokens(crate::composition::tensor_ref(tokens)),
+            PipelineAuxiliaryState::default(),
+        ),
+        PipelineStageInput::Hidden(payload) => (
+            eredu_runtime::LayeredPartitionInput::Hidden(crate::MlxTensor::from_array(
+                payload.hidden.clone(),
+            )),
+            payload.auxiliary.clone(),
+        ),
+    };
+    let input = driver
+        .input(input)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let state_layout = driver.state_layout().clone();
+    let range = driver.range();
+    let mut forward = {
+        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
+        driver
+            .begin(
+                architecture,
+                input,
+                crate::composition::tensor_opt(explicit_mask),
+                &mut state,
+                parallel,
+                execution_stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+    };
+    let hidden = execute_neutral_partition_group(
+        architecture,
+        driver.group_index(),
+        range.clone(),
+        resident_layers,
+        dense_layers,
+        step,
+        caches,
+        &state_layout,
+        &mut forward,
+        parallel,
+        execution_stream,
+    )?;
+    let output = {
+        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
+        driver
+            .finish(
+                architecture,
+                crate::composition::tensor_ref(&hidden),
+                &mut state,
+                &mut forward.context,
+                parallel,
+                execution_stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+    };
+    Ok(match output {
+        eredu_runtime::LayeredPartitionOutput::Output(output) => {
+            PipelineStageOutput::Logits(output.into_array())
+        }
+        eredu_runtime::LayeredPartitionOutput::Hidden(hidden) => {
+            PipelineStageOutput::Hidden(PipelinePayload {
+                hidden: hidden.into_array(),
+                auxiliary,
+            })
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_routed_layered_partition<A, U, F, G, Boundary, P>(
+    architecture: &mut A,
+    partition: &eredu_runtime::ArchitecturePartition<G, Boundary>,
+    storage_range: Range<usize>,
+    resident_layers: &mut [MlxModule<U>],
+    dense_layers: Option<&PipelineLayerStorage>,
+    input: PipelineStageInput<'_>,
+    step: PipelineStep,
+    explicit_mask: Option<&Array>,
+    caches: &mut [PipelineLayerCache],
+    execution: Option<&ParallelExecutionContext<'_>>,
+    pass: ExpertPass,
+    provider: &mut P,
+    stream: &Stream,
+) -> Result<PipelineStageOutput, Error>
+where
+    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    F: 'static,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+    P::Error: std::fmt::Display,
+    for<'state> A: eredu_runtime::PartitionedLayeredArchitecture<
+            MlxNeuralBackend,
+            PipelineRangeState<'state>,
+            Unit = U,
+            ForwardContext = F,
+        > + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<
+            MlxNeuralBackend,
+            PipelineRangeState<'state>,
+        >,
+    for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
+        std::fmt::Display,
+{
+    let driver = eredu_runtime::LayeredPartitionDriver::new(partition, storage_range)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parallel = execution
+        .filter(|execution| execution.is_tensor_parallel())
+        .map(|execution| {
+            execution.group().ok_or_else(|| {
+                Error::Parallel("tensor-sharded routed partition has no TP communicator".into())
+            })
+        })
+        .transpose()?;
+    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
+    let (input, auxiliary) = match input {
+        PipelineStageInput::Tokens(tokens) => (
+            eredu_runtime::LayeredPartitionInput::Tokens(crate::composition::tensor_ref(tokens)),
+            PipelineAuxiliaryState::default(),
+        ),
+        PipelineStageInput::Hidden(payload) => (
+            eredu_runtime::LayeredPartitionInput::Hidden(crate::MlxTensor::from_array(
+                payload.hidden.clone(),
+            )),
+            payload.auxiliary.clone(),
+        ),
+    };
+    let input = driver
+        .input(input)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let state_layout = driver.state_layout().clone();
+    let range = driver.range();
+    let mut forward = {
+        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
+        driver
+            .begin(
+                architecture,
+                input,
+                crate::composition::tensor_opt(explicit_mask),
+                &mut state,
+                parallel,
+                execution_stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+    };
+    let hidden = execute_neutral_routed_partition_group(
+        architecture,
+        driver.group_index(),
+        range.clone(),
+        resident_layers,
+        dense_layers,
+        step,
+        caches,
+        &state_layout,
+        &mut forward,
+        pass,
+        provider,
+        parallel,
+        execution_stream,
+    )?;
+    let output = {
+        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
+        driver
+            .finish(
+                architecture,
+                crate::composition::tensor_ref(&hidden),
+                &mut state,
+                &mut forward.context,
+                parallel,
+                execution_stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+    };
+    Ok(match output {
+        eredu_runtime::LayeredPartitionOutput::Output(output) => {
+            PipelineStageOutput::Logits(output.into_array())
+        }
+        eredu_runtime::LayeredPartitionOutput::Hidden(hidden) => {
+            PipelineStageOutput::Hidden(PipelinePayload {
+                hidden: hidden.into_array(),
+                auxiliary,
+            })
+        }
+    })
+}
+
 fn execute_neutral_decoder_partition<C, P, Bindings>(
     stage: &mut DecoderPipelineRealization<
         eredu_architectures::decoder::LayeredModel<MlxNeuralBackend, C, P>,
@@ -4467,186 +4689,20 @@ where
     eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, P::FeedForward>:
         eredu_nn::Parameterized<crate::MlxTensor>,
 {
-    let partition = &stage.partition;
-    let [group] = partition.groups() else {
-        return Err(Error::Parallel(format!(
-            "shared decoder partition owns {} execution groups, expected exactly one",
-            partition.groups().len()
-        )));
-    };
-    let group_index = group.group_index();
-    let range = group.global_units();
-    if stage.range() != range {
-        return Err(Error::Parallel(format!(
-            "decoder storage range {:?} disagrees with canonical partition range {:?}",
-            stage.range(),
-            range
-        )));
-    }
-    let partition_state = partition
-        .state()
-        .ok_or_else(|| Error::Parallel("decoder partition has no runtime state".into()))?;
-    if partition_state.global_layers() != range {
-        return Err(Error::Parallel(format!(
-            "decoder state range {:?} disagrees with canonical unit range {:?}",
-            partition_state.global_layers(),
-            range
-        )));
-    }
-    let state_layout = partition_state.layout().clone();
-    let owns_input = partition.ownership().owns_input();
-    let owns_output = partition.ownership().owns_output();
-    let parallel = execution
-        .filter(|execution| execution.is_tensor_parallel())
-        .map(|execution| {
-            execution.group().ok_or_else(|| {
-                Error::Parallel("tensor-sharded decoder stage has no TP communicator".into())
-            })
-        })
-        .transpose()?;
-    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (partition_input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) if owns_input => (
-            eredu_architectures::decoder::PartitionInput::Tokens(crate::composition::tensor_ref(
-                tokens,
-            )),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Tokens(_) => {
-            return Err(Error::Parallel(
-                "non-input decoder partition received token ids".into(),
-            ))
-        }
-        PipelineStageInput::Hidden(payload) if !owns_input => (
-            eredu_architectures::decoder::PartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
-        PipelineStageInput::Hidden(_) => {
-            return Err(Error::Parallel(
-                "input-owning decoder partition received upstream hidden state".into(),
-            ))
-        }
-    };
-
-    let architecture = &mut stage.architecture;
-    let mut forward = {
-        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
-        let mut forward = match parallel {
-            Some(parallel) => architecture.begin_partition_parallel(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                parallel,
-                execution_stream,
-            ),
-            None => architecture.begin_partition(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                P,
-            > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group_parallel(
-                architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                P,
-            > as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group(
-                architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward
-    };
-
-    let hidden = execute_neutral_partition_group(
-        architecture,
-        group_index,
-        range.clone(),
+    let storage_range = stage.range();
+    execute_layered_partition(
+        &mut stage.architecture,
+        &stage.partition,
+        storage_range,
         &mut stage.layers,
         stage.dense_layers.as_ref(),
+        input,
         step,
+        explicit_mask,
         caches,
-        &state_layout,
-        &mut forward,
-        parallel,
-        execution_stream,
-    )?;
-
-    if owns_output {
-        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
-        let logits = match parallel {
-            Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                P,
-            > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward_parallel(
-                architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                P,
-            > as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward(
-                architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(PipelineStageOutput::Logits(logits.into_array()))
-    } else {
-        Ok(PipelineStageOutput::Hidden(PipelinePayload {
-            hidden,
-            auxiliary,
-        }))
-    }
+        execution,
+        stream,
+    )
 }
 
 /// Runs one routed shared-decoder partition through the same neutral lifecycle.
@@ -4678,176 +4734,22 @@ where
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
-    let partition = &stage.partition;
-    let [group] = partition.groups() else {
-        return Err(Error::Parallel(format!(
-            "routed decoder partition owns {} groups, expected one",
-            partition.groups().len()
-        )));
-    };
-    let group_index = group.group_index();
-    let range = group.global_units();
-    if stage.range() != range {
-        return Err(Error::Parallel(
-            "routed decoder storage range disagrees with canonical partition".into(),
-        ));
-    }
-    let partition_state = partition
-        .state()
-        .ok_or_else(|| Error::Parallel("routed decoder partition has no state".into()))?;
-    let state_layout = partition_state.layout().clone();
-    let owns_input = partition.ownership().owns_input();
-    let owns_output = partition.ownership().owns_output();
-    let parallel = execution
-        .filter(|execution| execution.is_tensor_parallel())
-        .map(|execution| {
-            execution
-                .group()
-                .ok_or_else(|| Error::Parallel("routed decoder TP communicator is missing".into()))
-        })
-        .transpose()?;
-    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (partition_input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) if owns_input => (
-            eredu_architectures::decoder::PartitionInput::Tokens(crate::composition::tensor_ref(
-                tokens,
-            )),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Hidden(payload) if !owns_input => (
-            eredu_architectures::decoder::PartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
-        PipelineStageInput::Tokens(_) => {
-            return Err(Error::Parallel(
-                "non-input routed decoder partition received token ids".into(),
-            ))
-        }
-        PipelineStageInput::Hidden(_) => {
-            return Err(Error::Parallel(
-                "input-owning routed decoder partition received hidden state".into(),
-            ))
-        }
-    };
-    let architecture = &mut stage.architecture;
-    let mut forward = {
-        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
-        let mut forward = match parallel {
-            Some(parallel) => architecture.begin_partition_parallel(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                parallel,
-                execution_stream,
-            ),
-            None => architecture.begin_partition(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                BF,
-            > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group_parallel(
-                architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                BF,
-            > as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group(
-                architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward
-    };
-    let hidden = execute_neutral_routed_partition_group(
-        architecture,
-        group_index,
-        range.clone(),
+    let storage_range = stage.range();
+    execute_routed_layered_partition(
+        &mut stage.architecture,
+        &stage.partition,
+        storage_range,
         &mut stage.layers,
         stage.dense_layers.as_ref(),
+        input,
         step,
+        explicit_mask,
         caches,
-        &state_layout,
-        &mut forward,
+        execution,
         pass,
         provider,
-        parallel,
-        execution_stream,
-    )?;
-    if owns_output {
-        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
-        let logits = match parallel {
-            Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                BF,
-            > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward_parallel(
-                architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::decoder::LayeredModel<
-                MlxNeuralBackend,
-                C,
-                BF,
-            > as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward(
-                architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(PipelineStageOutput::Logits(logits.into_array()))
-    } else {
-        Ok(PipelineStageOutput::Hidden(PipelinePayload {
-            hidden,
-            auxiliary,
-        }))
-    }
+        stream,
+    )
 }
 
 /// Executes an LFM2 partition through its neutral hybrid architecture.
@@ -4861,157 +4763,20 @@ fn execute_neutral_lfm2_partition(
     execution: Option<&ParallelExecutionContext<'_>>,
     stream: &Stream,
 ) -> Result<PipelineStageOutput, Error> {
-    let [group] = stage.partition.groups() else {
-        return Err(Error::Parallel(format!(
-            "LFM2 partition owns {} groups, expected one",
-            stage.partition.groups().len()
-        )));
-    };
-    let group_index = group.group_index();
-    let range = group.global_units();
-    if range != stage.range() {
-        return Err(Error::Parallel(
-            "LFM2 storage range disagrees with its canonical partition".into(),
-        ));
-    }
-    let partition_state = stage
-        .partition
-        .state()
-        .ok_or_else(|| Error::Parallel("LFM2 partition has no state".into()))?;
-    let state_layout = partition_state.layout().clone();
-    let owns_input = stage.partition.ownership().owns_input();
-    let owns_output = stage.partition.ownership().owns_output();
-    let parallel = execution
-        .filter(|execution| execution.is_tensor_parallel())
-        .map(|execution| {
-            execution
-                .group()
-                .ok_or_else(|| Error::Parallel("LFM2 TP communicator is missing".into()))
-        })
-        .transpose()?;
-    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) if owns_input => (
-            eredu_architectures::decoder::PartitionInput::Tokens(crate::composition::tensor_ref(
-                tokens,
-            )),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Hidden(payload) if !owns_input => (
-            eredu_architectures::decoder::PartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
-        PipelineStageInput::Tokens(_) => {
-            return Err(Error::Parallel(
-                "non-input LFM2 partition received token ids".into(),
-            ))
-        }
-        PipelineStageInput::Hidden(_) => {
-            return Err(Error::Parallel(
-                "input LFM2 partition received upstream hidden state".into(),
-            ))
-        }
-    };
-    let mut forward = {
-        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
-        let mut forward = match parallel {
-            Some(parallel) => stage.architecture.begin_partition_parallel(
-                input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                parallel,
-                execution_stream,
-            ),
-            None => stage.architecture.begin_partition(
-                input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group_parallel(
-                &mut stage.architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group(
-                &mut stage.architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward
-    };
-    let hidden = execute_neutral_partition_group(
+    let storage_range = stage.range();
+    execute_layered_partition(
         &mut stage.architecture,
-        group_index,
-        range.clone(),
+        &stage.partition,
+        storage_range,
         &mut stage.layers,
         stage.dense_layers.as_ref(),
+        input,
         step,
+        explicit_mask,
         caches,
-        &state_layout,
-        &mut forward,
-        parallel,
-        execution_stream,
-    )?;
-    if owns_output {
-        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
-        let logits = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward_parallel(
-                &mut stage.architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward(
-                &mut stage.architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(PipelineStageOutput::Logits(logits.into_array()))
-    } else {
-        Ok(PipelineStageOutput::Hidden(PipelinePayload {
-            hidden,
-            auxiliary,
-        }))
-    }
+        execution,
+        stream,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5030,148 +4795,22 @@ where
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
-    let [group] = stage.partition.groups() else {
-        return Err(Error::Parallel(
-            "LFM2 routed partition must own one group".into(),
-        ));
-    };
-    let group_index = group.group_index();
-    let range = group.global_units();
-    let partition_state = stage
-        .partition
-        .state()
-        .ok_or_else(|| Error::Parallel("LFM2 routed partition has no state".into()))?;
-    let state_layout = partition_state.layout().clone();
-    let owns_input = stage.partition.ownership().owns_input();
-    let owns_output = stage.partition.ownership().owns_output();
-    let parallel = execution
-        .filter(|execution| execution.is_tensor_parallel())
-        .map(|execution| {
-            execution
-                .group()
-                .ok_or_else(|| Error::Parallel("LFM2 routed TP communicator is missing".into()))
-        })
-        .transpose()?;
-    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) if owns_input => (
-            eredu_architectures::decoder::PartitionInput::Tokens(crate::composition::tensor_ref(
-                tokens,
-            )),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Hidden(payload) if !owns_input => (
-            eredu_architectures::decoder::PartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
-        _ => {
-            return Err(Error::Parallel(
-                "LFM2 routed input disagrees with partition ownership".into(),
-            ))
-        }
-    };
-    let mut forward = {
-        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
-        let mut forward = match parallel {
-            Some(parallel) => stage.architecture.begin_partition_parallel(
-                input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                parallel,
-                execution_stream,
-            ),
-            None => stage.architecture.begin_partition(
-                input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group_parallel(
-                &mut stage.architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group(
-                &mut stage.architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward
-    };
-    let hidden = execute_neutral_routed_partition_group(
+    let storage_range = stage.range();
+    execute_routed_layered_partition(
         &mut stage.architecture,
-        group_index,
-        range.clone(),
+        &stage.partition,
+        storage_range,
         &mut stage.layers,
         stage.dense_layers.as_ref(),
+        input,
         step,
+        explicit_mask,
         caches,
-        &state_layout,
-        &mut forward,
+        execution,
         pass,
         provider,
-        parallel,
-        execution_stream,
-    )?;
-    if owns_output {
-        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
-        let logits = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward_parallel(
-                &mut stage.architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward(
-                &mut stage.architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(PipelineStageOutput::Logits(logits.into_array()))
-    } else {
-        Ok(PipelineStageOutput::Hidden(PipelinePayload {
-            hidden,
-            auxiliary,
-        }))
-    }
+        stream,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5190,149 +4829,22 @@ where
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
-    let [group] = stage.partition.groups() else {
-        return Err(Error::Parallel(
-            "Kimi routed partition must own one group".into(),
-        ));
-    };
-    let group_index = group.group_index();
-    let range = group.global_units();
-    let state_layout = stage
-        .partition
-        .state()
-        .ok_or_else(|| Error::Parallel("Kimi routed partition has no state".into()))?
-        .layout()
-        .clone();
-    let owns_input = stage.partition.ownership().owns_input();
-    let owns_output = stage.partition.ownership().owns_output();
-    let parallel = execution
-        .filter(|execution| execution.is_tensor_parallel())
-        .map(|execution| {
-            execution
-                .group()
-                .ok_or_else(|| Error::Parallel("Kimi routed TP communicator is missing".into()))
-        })
-        .transpose()?;
-    let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) if owns_input => (
-            eredu_architectures::decoder::PartitionInput::Tokens(crate::composition::tensor_ref(
-                tokens,
-            )),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Hidden(payload) if !owns_input => (
-            eredu_architectures::decoder::PartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
-        _ => {
-            return Err(Error::Parallel(
-                "Kimi routed input disagrees with partition ownership".into(),
-            ))
-        }
-    };
-    let mut forward = {
-        let mut state = PipelineRangeState::new(state_layout.clone(), range.clone(), caches)?;
-        let mut forward = match parallel {
-            Some(parallel) => stage.architecture.begin_partition_parallel(
-                input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                parallel,
-                execution_stream,
-            ),
-            None => stage.architecture.begin_partition(
-                input,
-                crate::composition::tensor_opt(explicit_mask),
-                &mut state,
-                &state_layout,
-                range.start,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group_parallel(
-                &mut stage.architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::begin_execution_group(
-                &mut stage.architecture,
-                group_index,
-                &forward.hidden,
-                &[],
-                &mut state,
-                &mut forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward
-    };
-    let hidden = execute_neutral_routed_partition_group(
+    let storage_range = stage.range();
+    execute_routed_layered_partition(
         &mut stage.architecture,
-        group_index,
-        range.clone(),
+        &stage.partition,
+        storage_range,
         &mut stage.layers,
         stage.dense_layers.as_ref(),
+        input,
         step,
+        explicit_mask,
         caches,
-        &state_layout,
-        &mut forward,
+        execution,
         pass,
         provider,
-        parallel,
-        execution_stream,
-    )?;
-    if owns_output {
-        let mut state = PipelineRangeState::new(state_layout, range, caches)?;
-        let logits = match parallel {
-            Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward_parallel(
-                &mut stage.architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                parallel,
-                execution_stream,
-            ),
-            None => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::finish_forward(
-                &mut stage.architecture,
-                crate::composition::tensor_ref(&hidden),
-                &mut state,
-                &forward.context,
-                execution_stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(PipelineStageOutput::Logits(logits.into_array()))
-    } else {
-        Ok(PipelineStageOutput::Hidden(PipelinePayload {
-            hidden,
-            auxiliary,
-        }))
-    }
+        stream,
+    )
 }
 
 fn qwen_hybrid_pipeline_prompt_cache_identity(

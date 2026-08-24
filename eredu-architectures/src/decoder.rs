@@ -17,9 +17,10 @@ use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     partitioned_projection_group, segmented_projection_group, ArchitectureParameterDescription,
     ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterRole, ProjectionSharding, StateLayout, TensorPlacement,
+    LayeredForwardState, LayeredPartitionInput, LocalModelLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelPlanError, ParameterGroupOwner,
+    ParameterGroupSpec, ParameterRole, PartitionedLayeredArchitecture, ProjectionSharding,
+    StateLayout, TensorPlacement,
 };
 
 /// Canonical field segments used by one shared decoder block.
@@ -2373,19 +2374,6 @@ pub struct LayeredInput<'a, T> {
     pub mask: Option<&'a T>,
 }
 
-/// Input crossing a pipeline partition boundary for a shared decoder.
-///
-/// The first partition embeds token ids while every later partition resumes
-/// the exact same architecture lifecycle from the upstream hidden state.
-/// Keeping this distinction in the neutral architecture prevents backend
-/// compositions from reimplementing embedding and mask preparation.
-pub enum PartitionInput<'a, T> {
-    /// Token ids owned by the input partition.
-    Tokens(&'a T),
-    /// Hidden state received from an upstream partition.
-    Hidden(T),
-}
-
 /// Shared declaration and validation for one ordered decoder execution group.
 #[derive(Debug, Clone)]
 pub struct SequentialGroup {
@@ -2810,9 +2798,9 @@ where
 
     /// Starts one replicated pipeline partition from tokens or upstream hidden
     /// state using the partition's authoritative local state layout.
-    pub fn begin_partition<S>(
+    fn prepare_partition<S>(
         &mut self,
-        input: PartitionInput<'_, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         supplied_mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
@@ -2824,10 +2812,10 @@ where
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let hidden = match input {
-            PartitionInput::Tokens(tokens) => {
+            LayeredPartitionInput::Tokens(tokens) => {
                 self.static_modules.embeddings.forward(tokens, context)?
             }
-            PartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden(hidden) => hidden,
         };
         self.begin_embedded_with_layout_at(
             hidden,
@@ -2842,9 +2830,9 @@ where
 
     /// Starts one tensor-parallel pipeline partition through the same neutral
     /// entry point, including vocabulary-parallel embedding on the input rank.
-    pub fn begin_partition_parallel<S>(
+    fn prepare_partition_parallel<S>(
         &mut self,
-        input: PartitionInput<'_, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         supplied_mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
@@ -2857,14 +2845,14 @@ where
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let hidden = match input {
-            PartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
+            LayeredPartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
                 &mut self.static_modules.embeddings,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             )?,
-            PartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden(hidden) => hidden,
         };
         self.begin_embedded_with_layout_at(
             hidden,
@@ -3400,6 +3388,57 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.finish_hidden_parallel(hidden, parallel, context)
+    }
+}
+
+impl<B, C, P, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
+where
+    B: NeuralBackend,
+    C: Config,
+    P: BlockFactory<B, C>,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        LayeredModel::prepare_partition(
+            self,
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        LayeredModel::prepare_partition_parallel(
+            self,
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+        )
     }
 }
 

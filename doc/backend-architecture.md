@@ -686,6 +686,13 @@ concrete neutral architecture. Backend placement code supplies rank-local
 ranges and ownership, but cannot substitute a caller-built topology that only
 resembles the architecture it will execute.
 
+`LayeredPartitionDriver` executes that canonical partition contract. It
+validates backend unit storage and mutable-state ranges, enforces input and
+output ownership, and owns execution-group setup, completion, and final
+projection for both replicated and tensor-parallel paths. Architectures supply
+typed partition input preparation through `PartitionedLayeredArchitecture`;
+concrete backends supply only unit residency, state storage, and collectives.
+
 The partition also carries an architecture-owned boundary schema. That schema
 declares every auxiliary tensor's stable role, canonical order, symbolic shape,
 logical dtype, and configuration-dependent cardinality, and it owns conversion

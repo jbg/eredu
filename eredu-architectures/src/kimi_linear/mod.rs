@@ -40,9 +40,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, ModelStateIdentity, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, ModelStateIdentity,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    ParameterGroupOwner, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
 use crate::decoder::{LayeredInput, SequentialGroup, StaticModuleSpec, StaticModules};
@@ -332,9 +333,9 @@ where
 
     /// Starts a replicated graph partition from tokens or an upstream hidden
     /// tensor while using the partition's authoritative state offset.
-    pub fn begin_partition<S>(
+    fn prepare_partition<S>(
         &mut self,
-        input: crate::decoder::PartitionInput<'_, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
@@ -346,10 +347,10 @@ where
         S::LayerState: RuntimeStateComponents<B>,
     {
         let hidden = match input {
-            crate::decoder::PartitionInput::Tokens(tokens) => {
+            LayeredPartitionInput::Tokens(tokens) => {
                 self.static_modules.embeddings.forward(tokens, context)?
             }
-            crate::decoder::PartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden(hidden) => hidden,
         };
         self.begin_embedded_with_layout_at(
             hidden,
@@ -363,9 +364,9 @@ where
 
     /// Starts a tensor-parallel graph partition through the same neutral
     /// lifecycle, including rank-local vocabulary lookup on the input rank.
-    pub fn begin_partition_parallel<S>(
+    fn prepare_partition_parallel<S>(
         &mut self,
-        input: crate::decoder::PartitionInput<'_, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
@@ -383,14 +384,14 @@ where
             ));
         }
         let hidden = match input {
-            crate::decoder::PartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
+            LayeredPartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
                 &mut self.static_modules.embeddings,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             )?,
-            crate::decoder::PartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden(hidden) => hidden,
         };
         self.begin_embedded_with_layout_at(
             hidden,
@@ -402,9 +403,7 @@ where
         )
     }
 
-    /// Applies replicated final normalization and vocabulary projection for a
-    /// partition that owns the architecture output boundary.
-    pub fn finish_partition(
+    fn project_output(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
@@ -416,9 +415,7 @@ where
         }
     }
 
-    /// Applies tensor-parallel final normalization and complete vocabulary
-    /// projection for a partition that owns the output boundary.
-    pub fn finish_partition_parallel(
+    fn project_output_parallel(
         &mut self,
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
@@ -612,8 +609,8 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let expected = self.state_layout()?;
-        self.begin_partition(
-            crate::decoder::PartitionInput::Tokens(input.tokens),
+        self.prepare_partition(
+            LayeredPartitionInput::Tokens(input.tokens),
             input.mask,
             state,
             &expected,
@@ -655,7 +652,7 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_partition(hidden, context)
+        self.project_output(hidden, context)
     }
 
     fn retained_context_values<'a>(
@@ -687,8 +684,8 @@ where
             .ok_or_else(|| Error::backend("Kimi model was not built with local geometry"))?
             .state_layout()
             .clone();
-        self.begin_partition_parallel(
-            crate::decoder::PartitionInput::Tokens(input.tokens),
+        self.prepare_partition_parallel(
+            LayeredPartitionInput::Tokens(input.tokens),
             input.mask,
             state,
             &expected,
@@ -721,7 +718,56 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_partition_parallel(hidden, parallel, context)
+        self.project_output_parallel(hidden, parallel, context)
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+{
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        LayeredModel::prepare_partition(
+            self,
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        LayeredModel::prepare_partition_parallel(
+            self,
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+        )
     }
 }
 

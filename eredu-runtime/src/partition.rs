@@ -4,7 +4,9 @@ use std::ops::Deref;
 use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
 use crate::{
-    ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, ParameterGroupSpec, StateLayout,
+    ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, LayeredForwardState,
+    LayeredPartitionInput, ParameterGroupSpec, PartitionedLayeredArchitecture, RuntimeState,
+    StateLayout,
 };
 
 /// Architecture-owned location of one neutral parameter group.
@@ -1055,6 +1057,228 @@ impl<G, A> ArchitecturePartition<G, A> {
     }
 }
 
+/// Validated execution metadata for one rank-local layered partition.
+///
+/// This driver is the single owner of partition input/output checks, canonical
+/// storage and state ranges, execution-group setup/completion, and final output
+/// projection. Concrete backends retain only state storage and unit residency.
+#[derive(Debug, Clone)]
+pub struct LayeredPartitionDriver {
+    group: usize,
+    range: Range<usize>,
+    state_layout: StateLayout,
+    owns_input: bool,
+    owns_output: bool,
+}
+
+impl LayeredPartitionDriver {
+    /// Validates a canonical partition against its concrete unit storage.
+    pub fn new<G, A>(
+        partition: &ArchitecturePartition<G, A>,
+        storage_range: Range<usize>,
+    ) -> Result<Self, LayeredPartitionError> {
+        let [group] = partition.groups() else {
+            return Err(LayeredPartitionError::GroupCount {
+                actual: partition.groups().len(),
+            });
+        };
+        let range = group.global_units();
+        if storage_range != range {
+            return Err(LayeredPartitionError::StorageRange {
+                storage: storage_range,
+                partition: range,
+            });
+        }
+        let state = partition
+            .state()
+            .ok_or(LayeredPartitionError::MissingState)?;
+        if state.global_layers() != range {
+            return Err(LayeredPartitionError::StateRange {
+                state: state.global_layers(),
+                partition: range,
+            });
+        }
+        Ok(Self {
+            group: group.group_index(),
+            range,
+            state_layout: state.layout().clone(),
+            owns_input: partition.ownership().owns_input(),
+            owns_output: partition.ownership().owns_output(),
+        })
+    }
+
+    /// Returns the canonical group-local global unit range.
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    /// Returns the canonical architecture execution-group slot.
+    pub const fn group_index(&self) -> usize {
+        self.group
+    }
+
+    /// Returns the architecture-global state layout for this partition.
+    pub const fn state_layout(&self) -> &StateLayout {
+        &self.state_layout
+    }
+
+    /// Validates input form against architecture boundary ownership.
+    pub fn input<'a, T>(
+        &self,
+        input: LayeredPartitionInput<'a, T>,
+    ) -> Result<LayeredPartitionInput<'a, T>, LayeredPartitionError> {
+        match (&input, self.owns_input) {
+            (LayeredPartitionInput::Tokens(_), true)
+            | (LayeredPartitionInput::Hidden(_), false) => Ok(input),
+            (LayeredPartitionInput::Tokens(_), false) => {
+                Err(LayeredPartitionError::TokensOnNonInputOwner)
+            }
+            (LayeredPartitionInput::Hidden(_), true) => {
+                Err(LayeredPartitionError::HiddenOnInputOwner)
+            }
+        }
+    }
+
+    /// Prepares the partition and starts its canonical execution group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin<'a, B, S, M>(
+        &self,
+        architecture: &mut M,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, M::ForwardContext>, M::Error>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+    {
+        let mut forward = match parallel {
+            Some(parallel) => architecture.begin_partition_parallel(
+                input,
+                mask,
+                state,
+                &self.state_layout,
+                self.range.start,
+                parallel,
+                context,
+            ),
+            None => architecture.begin_partition(
+                input,
+                mask,
+                state,
+                &self.state_layout,
+                self.range.start,
+                context,
+            ),
+        }?;
+        forward.hidden = match parallel {
+            Some(parallel) => architecture.begin_execution_group_parallel(
+                self.group,
+                &forward.hidden,
+                &[],
+                state,
+                &mut forward.context,
+                parallel,
+                context,
+            ),
+            None => architecture.begin_execution_group(
+                self.group,
+                &forward.hidden,
+                &[],
+                state,
+                &mut forward.context,
+                context,
+            ),
+        }?;
+        Ok(forward)
+    }
+
+    /// Completes the canonical group and applies output projection only on its owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish<B, S, M>(
+        &self,
+        architecture: &mut M,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut M::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, M::Error>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+    {
+        let hidden = match parallel {
+            Some(parallel) => architecture.complete_execution_group_parallel(
+                self.group, hidden, state, forward, parallel, context,
+            ),
+            None => {
+                architecture.complete_execution_group(self.group, hidden, state, forward, context)
+            }
+        }?;
+        if self.owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    architecture.finish_forward_parallel(&hidden, state, forward, parallel, context)
+                }
+                None => architecture.finish_forward(&hidden, state, forward, context),
+            }?;
+            Ok(LayeredPartitionOutput::Output(output))
+        } else {
+            Ok(LayeredPartitionOutput::Hidden(hidden))
+        }
+    }
+}
+
+/// Output of one rank-local partition lifecycle.
+#[derive(Debug, Clone)]
+pub enum LayeredPartitionOutput<T> {
+    /// Complete architecture output produced by the output owner.
+    Output(T),
+    /// Hidden state to transport to the next pipeline owner.
+    Hidden(T),
+}
+
+/// Invalid concrete realization or boundary use of a layered partition.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum LayeredPartitionError {
+    /// Partition execution currently requires exactly one owned group.
+    #[error("layered partition owns {actual} execution groups, expected exactly one")]
+    GroupCount {
+        /// Number of groups owned by the partition.
+        actual: usize,
+    },
+    /// Concrete unit storage does not match canonical ownership.
+    #[error("partition storage range {storage:?} disagrees with canonical range {partition:?}")]
+    StorageRange {
+        /// Concrete backend storage range.
+        storage: Range<usize>,
+        /// Canonical partition range.
+        partition: Range<usize>,
+    },
+    /// Partition omitted mutable state geometry.
+    #[error("layered partition has no runtime state")]
+    MissingState,
+    /// Mutable state geometry does not match canonical unit ownership.
+    #[error("partition state range {state:?} disagrees with canonical range {partition:?}")]
+    StateRange {
+        /// Architecture-global state range.
+        state: Range<usize>,
+        /// Canonical partition range.
+        partition: Range<usize>,
+    },
+    /// Token ids were supplied after the architecture input boundary.
+    #[error("non-input partition received token ids")]
+    TokensOnNonInputOwner,
+    /// Hidden state was supplied to the architecture input boundary.
+    #[error("input-owning partition received upstream hidden state")]
+    HiddenOnInputOwner,
+}
+
 fn canonical_architecture_layout<B, S, M>(
     architecture: &M,
 ) -> Result<(ExecutionGraph, ExecutionUnitLayout), ArchitecturePartitionError>
@@ -1768,5 +1992,78 @@ mod tests {
             error,
             ArchitecturePartitionError::DuplicateParameterTarget("shared.weight".into())
         );
+    }
+
+    fn layered_partition(
+        storage_state: Range<usize>,
+        owns_input: bool,
+    ) -> ArchitecturePartition<(), ()> {
+        let graph = ExecutionGraph::chain(["decoder"]).unwrap();
+        let layout = ExecutionUnitLayout::new(&graph, [4]).unwrap();
+        ArchitecturePartition::new(
+            graph,
+            layout,
+            [("decoder", 1..3)],
+            PartitionOwnership::new(owns_input, false, std::iter::empty::<String>()).unwrap(),
+            Some(
+                PartitionState::new(state_layout(storage_state.len()), storage_state.start)
+                    .unwrap(),
+            ),
+            (),
+            (),
+            std::iter::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn layered_driver_rejects_storage_and_state_range_drift() {
+        let partition = layered_partition(1..3, true);
+        assert!(LayeredPartitionDriver::new(&partition, 1..3).is_ok());
+        assert_eq!(
+            LayeredPartitionDriver::new(&partition, 0..2).unwrap_err(),
+            LayeredPartitionError::StorageRange {
+                storage: 0..2,
+                partition: 1..3,
+            }
+        );
+
+        let partition = layered_partition(0..2, true);
+        assert_eq!(
+            LayeredPartitionDriver::new(&partition, 1..3).unwrap_err(),
+            LayeredPartitionError::StateRange {
+                state: 0..2,
+                partition: 1..3,
+            }
+        );
+    }
+
+    #[test]
+    fn layered_driver_enforces_partition_boundary_ownership() {
+        let input_owner =
+            LayeredPartitionDriver::new(&layered_partition(1..3, true), 1..3).unwrap();
+        assert!(matches!(
+            input_owner.input(LayeredPartitionInput::Tokens(&7)),
+            Ok(LayeredPartitionInput::Tokens(7))
+        ));
+        assert_eq!(
+            input_owner
+                .input(LayeredPartitionInput::Hidden(7))
+                .unwrap_err(),
+            LayeredPartitionError::HiddenOnInputOwner
+        );
+
+        let hidden_owner =
+            LayeredPartitionDriver::new(&layered_partition(1..3, false), 1..3).unwrap();
+        assert_eq!(
+            hidden_owner
+                .input(LayeredPartitionInput::Tokens(&7))
+                .unwrap_err(),
+            LayeredPartitionError::TokensOnNonInputOwner
+        );
+        assert!(matches!(
+            hidden_owner.input(LayeredPartitionInput::Hidden(7)),
+            Ok(LayeredPartitionInput::Hidden(7))
+        ));
     }
 }
