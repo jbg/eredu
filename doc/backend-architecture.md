@@ -413,10 +413,12 @@ Artifact loading has four stages:
 1. Portable inspection validates checkpoint metadata and tensor catalogs,
    asks the architecture registry for a canonical family, neutral loading
    protocol, and companion requirements, then resolves any sibling artifacts.
-2. The selected backend validates the requested policy against normalized
-   architecture facts and its own capabilities.
-3. Portable planning combines the artifact description with topology,
-   quantization, and residency policy.
+2. The selected backend validates the exact requested topology and remaining
+   policy against normalized architecture facts and its own capabilities.
+3. Portable planning binds the artifact description to that exact topology,
+   quantization, and residency policy. Materialization options must reproduce
+   the bound topology rather than supplying a merely distributed/non-distributed
+   equivalent.
 4. The selected backend materializes the plan into its executable model and
    creates a stateful session.
 

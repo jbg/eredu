@@ -118,6 +118,17 @@ fn validate_preparation_capability_intersection(
     policy: eredu_core::PreparationPolicy,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
+    if let Some(topology) = policy.topology {
+        validate_parallel_capabilities(
+            capabilities,
+            topology,
+            match format {
+                eredu_core::ArtifactFormat::SafeTensors => "SafeTensors",
+                eredu_core::ArtifactFormat::Gguf => "GGUF",
+            },
+            kind.canonical_name(),
+        )?;
+    }
     if format == eredu_core::ArtifactFormat::SafeTensors
         && policy.quantization.is_some()
         && policy.residency != eredu_core::ResidencyRequest::FullyResident
@@ -141,10 +152,37 @@ fn requires_architecture_capabilities(
     format: eredu_core::ArtifactFormat,
     policy: eredu_core::PreparationPolicy,
 ) -> bool {
-    policy.residency == eredu_core::ResidencyRequest::ExpertCache
+    policy
+        .topology
+        .is_some_and(|topology| !topology.is_replicated())
+        || policy.residency == eredu_core::ResidencyRequest::ExpertCache
         || (format == eredu_core::ArtifactFormat::SafeTensors
             && policy.quantization.is_some()
             && policy.residency != eredu_core::ResidencyRequest::FullyResident)
+}
+
+pub(crate) fn validate_parallel_capabilities(
+    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
+    topology: eredu_core::ParallelTopology,
+    artifact: &str,
+    architecture: &str,
+) -> Result<(), Error> {
+    let plan = capabilities.parallel_plan();
+    let unsupported = |capability: &str| {
+        Error::Parallel(format!(
+            "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
+        ))
+    };
+    if topology.is_axis_active(eredu_core::ParallelAxis::Pipeline) && !plan.pipeline_parallel() {
+        return Err(unsupported("pipeline-parallel"));
+    }
+    if topology.is_axis_active(eredu_core::ParallelAxis::Tensor) && !plan.tensor_parallel() {
+        return Err(unsupported("tensor-parallel"));
+    }
+    if topology.is_axis_active(eredu_core::ParallelAxis::Expert) && !plan.expert_parallel() {
+        return Err(unsupported("expert-parallel"));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_safetensors_preparation(
@@ -1214,6 +1252,45 @@ mod admission_policy_tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn preparation_rejects_an_unsupported_exact_parallel_axis() {
+        let topology = crate::backend::MlxParallelContext::for_rank(
+            0,
+            1,
+            1,
+            2,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+        let error = validate_safetensors_preparation(
+            ModelKind::Qwen3,
+            &dense_qwen3_config(),
+            ModelLoadOptions::with_parallel(topology),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Parallel(message) if message.contains("expert-parallel")));
+    }
+
+    #[test]
+    fn preparation_accepts_supported_exact_parallel_axes() {
+        let topology = crate::backend::MlxParallelContext::for_rank(
+            0,
+            2,
+            3,
+            1,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+
+        validate_safetensors_preparation(
+            ModelKind::Qwen3,
+            &dense_qwen3_config(),
+            ModelLoadOptions::with_parallel(topology),
+        )
+        .unwrap();
     }
 
     #[test]

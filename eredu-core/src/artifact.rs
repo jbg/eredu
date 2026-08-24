@@ -273,8 +273,8 @@ pub struct PreparationPolicy {
     pub quantization: Option<QuantizationRequest>,
     /// Requested residency family.
     pub residency: ResidencyRequest,
-    /// Whether a non-replicated distributed topology was requested.
-    pub distributed: bool,
+    /// Exact parallel topology selected for materialization, when explicitly configured.
+    pub topology: Option<crate::topology::ParallelTopology>,
 }
 
 /// Canonical materialization recipe selected by the core planner.
@@ -1072,11 +1072,12 @@ mod tests {
     }
 
     #[test]
-    fn distributed_policy_uses_the_same_neutral_preparation_plan() {
+    fn parallel_policy_binds_the_exact_neutral_topology() {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "llama");
+        let topology = crate::topology::ParallelTopology::new(2, 3, 4, 1).unwrap();
         let policy = PreparationPolicy {
-            distributed: true,
+            topology: Some(topology),
             ..PreparationPolicy::default()
         };
 
@@ -1087,6 +1088,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.policy(), policy);
+        assert_eq!(plan.policy().topology, Some(topology));
         assert_eq!(plan.route(), MaterializationRoute::Resident);
     }
 

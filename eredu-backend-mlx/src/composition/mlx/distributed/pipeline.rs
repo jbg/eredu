@@ -13719,21 +13719,17 @@ fn validate_distributed_stage_capabilities(
     artifact: &str,
     architecture: &str,
 ) -> Result<(), Error> {
-    let plan = capabilities.parallel_plan();
+    crate::composition::mlx::structural::validate_parallel_capabilities(
+        capabilities,
+        topology.topology(),
+        artifact,
+        architecture,
+    )?;
     let unsupported = |capability: &str| {
         Error::Parallel(format!(
             "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
         ))
     };
-    if topology.pipeline_parallel_size > 1 && !plan.pipeline_parallel() {
-        return Err(unsupported("pipeline-parallel"));
-    }
-    if topology.tensor_parallel_size > 1 && !plan.tensor_parallel() {
-        return Err(unsupported("tensor-parallel"));
-    }
-    if topology.expert_parallel_size > 1 && !plan.expert_parallel() {
-        return Err(unsupported("expert-parallel"));
-    }
     if expert_cache && !capabilities.independently_addressable_experts() {
         return Err(unsupported("independent expert-residency"));
     }

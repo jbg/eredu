@@ -79,9 +79,7 @@ impl ModelLoadOptions {
         Ok(eredu_core::PreparationPolicy {
             quantization,
             residency,
-            distributed: self
-                .parallel
-                .is_some_and(|topology| !topology.is_replicated()),
+            topology: self.parallel.map(MlxParallelContext::topology),
         })
     }
 }
@@ -104,7 +102,8 @@ mod tests {
     use eredu_checkpoint::WeightQuantization;
     use eredu_runtime::LayerwiseLoadOptions;
 
-    use super::ModelLoadOptions;
+    use super::{MlxParallelContext, ModelLoadOptions};
+    use crate::backend::DeviceAssignment;
     use eredu_runtime::WeightResidency;
 
     #[test]
@@ -122,5 +121,36 @@ mod tests {
             policy.residency,
             eredu_core::ResidencyRequest::LayerwiseHost
         );
+    }
+
+    #[test]
+    fn preparation_policy_preserves_exact_parallel_topology() {
+        let topology = MlxParallelContext::for_rank(
+            5,
+            2,
+            3,
+            2,
+            DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+        let policy = ModelLoadOptions::with_parallel(topology)
+            .preparation_policy()
+            .unwrap();
+        assert_eq!(policy.topology, Some(topology.topology()));
+    }
+
+    #[test]
+    fn preparation_policies_distinguish_parallel_axes() {
+        let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
+        let tensor_pipeline = MlxParallelContext::for_rank(0, 2, 3, 1, device).unwrap();
+        let tensor_expert = MlxParallelContext::for_rank(0, 2, 1, 3, device).unwrap();
+        let tensor_pipeline_policy = ModelLoadOptions::with_parallel(tensor_pipeline)
+            .preparation_policy()
+            .unwrap();
+        let tensor_expert_policy = ModelLoadOptions::with_parallel(tensor_expert)
+            .preparation_policy()
+            .unwrap();
+
+        assert_ne!(tensor_pipeline_policy, tensor_expert_policy);
     }
 }

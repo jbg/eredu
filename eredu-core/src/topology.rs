@@ -89,6 +89,19 @@ impl ParallelTopology {
     pub fn world_size(self) -> usize {
         self.tensor * self.pipeline * self.expert * self.data
     }
+    /// Returns whether every parallel dimension is a singleton.
+    pub const fn is_replicated(self) -> bool {
+        self.tensor == 1 && self.pipeline == 1 && self.expert == 1 && self.data == 1
+    }
+    /// Returns whether an axis contains more than one rank.
+    pub const fn is_axis_active(self, axis: ParallelAxis) -> bool {
+        match axis {
+            ParallelAxis::Tensor => self.tensor > 1,
+            ParallelAxis::Pipeline => self.pipeline > 1,
+            ParallelAxis::Expert => self.expert > 1,
+            ParallelAxis::Data => self.data > 1,
+        }
+    }
     /// Converts a pipeline-major, tensor, expert-minor rank to coordinates.
     ///
     /// Data parallelism is the outermost dimension. Within one data replica,
