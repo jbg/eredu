@@ -543,6 +543,11 @@ impl ArtifactProcessorPlan {
         }
     }
 
+    /// Whether authoritative artifact inspection admitted a media processor.
+    pub const fn has_processor(&self) -> bool {
+        self.processor.is_some()
+    }
+
     /// Returns the retained Gemma 4 processor plan, when admitted.
     pub const fn gemma4(&self) -> Option<&Gemma4ProcessorPlan> {
         match &self.processor {

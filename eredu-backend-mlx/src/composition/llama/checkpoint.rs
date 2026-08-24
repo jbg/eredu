@@ -14,14 +14,12 @@ use serde_json::Value;
 
 use crate::backend::error::Error;
 use crate::backend::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
-use eredu_checkpoint::store::SafetensorsWeightStore;
-use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 pub fn validate_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl eredu_checkpoint::validation::SafetensorsCatalog + ?Sized),
 ) -> CheckpointValidation {
     let args = match eredu_architectures::llama::model_args_from_config_value(config) {
         Ok(args) => args,

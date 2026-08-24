@@ -7,18 +7,91 @@ use std::{
 
 use crate::composition::mlx::structural;
 use eredu_architectures::GgufArchitecture;
-use eredu_checkpoint::store::WeightStore;
 use eredu_core::{
+    checkpoint::{TensorCatalog, TensorDtype},
     ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, InputModalities, InspectionIssue,
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
     ModelInspectionReport, Observed,
 };
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::ops::GgufCheckpoint;
-use serde_json::Value;
 
 use super::*;
-use eredu_checkpoint::store::SafetensorsWeightStore;
+
+struct InspectedSafetensorsCatalog<'a>(&'a TensorCatalog);
+
+impl eredu_checkpoint::validation::SafetensorsCatalog for InspectedSafetensorsCatalog<'_> {
+    fn keys(&self) -> Vec<String> {
+        self.0
+            .descriptors()
+            .map(|tensor| tensor.name.clone())
+            .collect()
+    }
+
+    fn metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::validation::CatalogTensorMetadata, String> {
+        let tensor = self
+            .0
+            .get(key)
+            .ok_or_else(|| format!("unknown checkpoint tensor {key:?}"))?;
+        Ok(eredu_checkpoint::validation::CatalogTensorMetadata {
+            shape: tensor.shape.clone(),
+            stored_dtype: inspected_stored_dtype(&tensor.dtype),
+        })
+    }
+}
+
+impl eredu_checkpoint::recipe::RecipeCatalog for InspectedSafetensorsCatalog<'_> {
+    fn tensor_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        let tensor =
+            self.0
+                .get(key)
+                .ok_or_else(|| eredu_checkpoint::store::StoreError::UnknownTensor {
+                    key: key.into(),
+                })?;
+        Ok(eredu_checkpoint::store::TensorMetadata {
+            name: tensor.name.clone(),
+            logical_shape: tensor.shape.clone(),
+            physical_shape: tensor.shape.clone(),
+            stored_dtype: inspected_stored_dtype(&tensor.dtype),
+            encoded_byte_len: tensor.storage.as_ref().map_or(0, |storage| storage.length),
+            backing_shard: tensor
+                .storage
+                .as_ref()
+                .map(|storage| PathBuf::from(&storage.member)),
+        })
+    }
+}
+
+fn inspected_stored_dtype(dtype: &TensorDtype) -> eredu_checkpoint::StoredDtype {
+    use eredu_checkpoint::StoredDtype;
+    match dtype {
+        TensorDtype::Bool => StoredDtype::Bool,
+        TensorDtype::U8 => StoredDtype::U8,
+        TensorDtype::I8 => StoredDtype::I8,
+        TensorDtype::I16 => StoredDtype::I16,
+        TensorDtype::U16 => StoredDtype::U16,
+        TensorDtype::F16 => StoredDtype::F16,
+        TensorDtype::Bf16 => StoredDtype::BF16,
+        TensorDtype::I32 => StoredDtype::I32,
+        TensorDtype::U32 => StoredDtype::U32,
+        TensorDtype::F32 => StoredDtype::F32,
+        TensorDtype::F64 => StoredDtype::F64,
+        TensorDtype::I64 => StoredDtype::I64,
+        TensorDtype::U64 => StoredDtype::U64,
+        TensorDtype::Complex64 => StoredDtype::C64,
+        TensorDtype::Encoded(name) if name == "F8_E4M3" => StoredDtype::F8E4M3,
+        TensorDtype::Encoded(name) if name == "F4" => StoredDtype::F4,
+        TensorDtype::Encoded(name) if name == "F8_E8M0" => StoredDtype::F8E8M0,
+        TensorDtype::Encoded(name) if name == "F8_E5M2" => StoredDtype::F8E5M2,
+        TensorDtype::Encoded(name) => StoredDtype::Other(name.clone()),
+    }
+}
 
 /// Options applied while inspecting a model artifact.
 #[derive(Debug, Clone, Default)]
@@ -92,219 +165,178 @@ fn resolve_projector(
 
 fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
     let mut report = ModelInspectionReport::unverified(path, ArtifactFormat::SafeTensors);
-    let mut resolved_kind = None;
-    let config_path = path.join("config.json");
-    let config: Option<Value> = match std::fs::read_to_string(&config_path) {
-        Ok(raw) => match serde_json::from_str(&raw) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                report.container = InspectionReadiness::Invalid;
-                report.model_loadability = InspectionReadiness::Invalid;
-                report.requested_load = InspectionReadiness::Invalid;
-                report.issue(
-                    InspectionIssueCode::InvalidConfiguration,
-                    InspectionSeverity::Error,
-                    format!("invalid config.json: {error}"),
-                    Some(config_path.clone()),
-                );
-                None
-            }
-        },
+    let portable = match eredu_architectures::configuration::inspect_artifact(path) {
+        Ok(inspection) => inspection,
         Err(error) => {
-            report.container = if error.kind() == std::io::ErrorKind::NotFound {
-                InspectionReadiness::Missing
-            } else {
-                InspectionReadiness::Invalid
-            };
-            report.model_loadability = report.container;
-            report.requested_load = report.container;
+            reject_portable_safetensors(&mut report, path, &error);
+            return report;
+        }
+    };
+    let configuration = portable.configuration();
+    let architecture_plan = portable.architecture_plan();
+    let kind = architecture_plan
+        .model_kind()
+        .expect("architecture inspection must retain its normalized model family");
+    let config = configuration
+        .json
+        .as_ref()
+        .expect("SafeTensors inspection must retain normalized JSON configuration");
+    let catalog = portable.tensors();
+    let inspected_catalog = InspectedSafetensorsCatalog(catalog);
+
+    report.container = InspectionReadiness::Ready;
+    report.model_family = Some(configuration.family.clone());
+    report.architecture = Some(configuration.effective_model_type.clone());
+    report.architecture_support = InspectionReadiness::Ready;
+    report.tensor_count = Some(catalog.len());
+    let mut shards = BTreeSet::new();
+    let mut encodings = BTreeSet::new();
+    let mut stored_tensor_bytes = Some(0_u64);
+    let mut largest_stored_tensor_bytes = 0_u64;
+    for tensor in catalog.descriptors() {
+        encodings.insert(format!("{:?}", inspected_stored_dtype(&tensor.dtype)));
+        if let Some(storage) = &tensor.storage {
+            shards.insert(storage.member.clone());
+            stored_tensor_bytes =
+                stored_tensor_bytes.and_then(|total| total.checked_add(storage.length));
+            largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(storage.length);
+        } else {
+            stored_tensor_bytes = None;
+        }
+    }
+    report.checkpoint_shards = Some(shards.len());
+    report.tensor_encodings = encodings
+        .into_iter()
+        .map(|name| ArtifactTensorEncoding {
+            name,
+            ggml_type_code: None,
+        })
+        .collect();
+    match stored_tensor_bytes {
+        Some(total) => {
+            report.resources.stored_tensor_bytes =
+                Observed::exact(total, "authoritative SafeTensors tensor catalog");
+            report.resources.largest_stored_tensor_bytes = Observed::exact(
+                largest_stored_tensor_bytes,
+                "authoritative SafeTensors tensor catalog",
+            );
+        }
+        None => {
+            report.resources.stored_tensor_bytes =
+                Observed::unavailable("SafeTensors payload-byte catalog was incomplete");
+            report.resources.largest_stored_tensor_bytes =
+                Observed::unavailable("SafeTensors payload-byte catalog was incomplete");
+        }
+    }
+
+    match eredu_architectures::preparation::safetensors_capabilities(kind, config) {
+        Ok(capabilities) => {
+            record_embedded_drafting(&mut report, capabilities);
+            report.expected_modalities = artifact_modalities(capabilities.input_modalities());
+            apply_structural_validation(
+                &mut report,
+                structural::validate_safetensors(kind, config, &inspected_catalog, options.load),
+                path,
+            );
+            match options
+                .load
+                .preparation_policy()
+                .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
+            {
+                Ok(()) => report.requested_load = InspectionReadiness::Ready,
+                Err(error) => reject_load_policy(&mut report, &error),
+            }
+            inspect_safetensors_media(&mut report, architecture_plan);
+        }
+        Err(error) => {
+            report.architecture_support = InspectionReadiness::Invalid;
+            report.model_loadability = InspectionReadiness::Invalid;
+            report.structural_binding = InspectionReadiness::Invalid;
+            report.requested_load = InspectionReadiness::Invalid;
+            report.multimodal = InspectionReadiness::Invalid;
             report.issue(
                 InspectionIssueCode::InvalidConfiguration,
                 InspectionSeverity::Error,
-                format!("could not read config.json: {error}"),
-                Some(config_path.clone()),
-            );
-            None
-        }
-    };
-
-    if let Some(config) = &config {
-        match eredu_architectures::configuration::resolve_model_config(config) {
-            Ok(supported) => {
-                report.model_family = Some(supported.kind.canonical_name().into());
-                report.architecture = Some(supported.effective_model_type);
-                match eredu_architectures::preparation::safetensors_capabilities(
-                    supported.kind,
-                    config,
-                ) {
-                    Ok(capabilities) => {
-                        resolved_kind = Some(supported.kind);
-                        record_embedded_drafting(&mut report, capabilities);
-                        report.expected_modalities =
-                            artifact_modalities(capabilities.input_modalities());
-                        report.architecture_support = InspectionReadiness::Ready;
-                        match structural::validate_safetensors_preparation(
-                            supported.kind,
-                            config,
-                            options.load,
-                        ) {
-                            Ok(_) => report.requested_load = InspectionReadiness::Ready,
-                            Err(error) => reject_load_policy(&mut report, &error),
-                        }
-                    }
-                    Err(error) => {
-                        report.architecture_support = InspectionReadiness::Invalid;
-                        report.model_loadability = InspectionReadiness::Invalid;
-                        report.structural_binding = InspectionReadiness::Invalid;
-                        report.requested_load = InspectionReadiness::Invalid;
-                        report.issue(
-                            InspectionIssueCode::InvalidConfiguration,
-                            InspectionSeverity::Error,
-                            error.to_string(),
-                            Some(config_path.clone()),
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                report.architecture_support = match &error {
-                    eredu_core::artifact::ArtifactError::UnsupportedModelType(_) => {
-                        InspectionReadiness::Unsupported
-                    }
-                    _ => InspectionReadiness::Invalid,
-                };
-                report.model_loadability = report.architecture_support;
-                report.structural_binding = report.architecture_support;
-                report.requested_load = report.model_loadability;
-                report.issue(
-                    match &error {
-                        eredu_core::artifact::ArtifactError::UnsupportedModelType(_) => {
-                            InspectionIssueCode::UnsupportedArchitecture
-                        }
-                        _ => InspectionIssueCode::InvalidConfiguration,
-                    },
-                    InspectionSeverity::Error,
-                    error.to_string(),
-                    Some(config_path),
-                );
-            }
-        }
-    }
-
-    match SafetensorsWeightStore::open(path) {
-        Ok(store) => {
-            let keys = store.keys();
-            let mut encodings = BTreeSet::new();
-            let mut shards = BTreeSet::new();
-            let mut catalog_error = None;
-            let mut stored_tensor_bytes = Some(0_u64);
-            let mut largest_stored_tensor_bytes = 0_u64;
-            for key in &keys {
-                match store.metadata(key) {
-                    Ok(metadata) => {
-                        encodings.insert(format!("{:?}", metadata.stored_dtype));
-                        if let Some(shard) = metadata.backing_shard {
-                            shards.insert(shard);
-                        }
-                        let bytes = metadata.encoded_byte_len;
-                        stored_tensor_bytes =
-                            stored_tensor_bytes.and_then(|total| total.checked_add(bytes));
-                        largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(bytes);
-                    }
-                    Err(error) => {
-                        catalog_error = Some(error);
-                        break;
-                    }
-                }
-            }
-            report.tensor_count = Some(keys.len());
-            report.checkpoint_shards = Some(shards.len());
-            report.tensor_encodings = encodings
-                .into_iter()
-                .map(|name| ArtifactTensorEncoding {
-                    name,
-                    ggml_type_code: None,
-                })
-                .collect();
-            match stored_tensor_bytes {
-                Some(total) if !keys.is_empty() => {
-                    report.resources.stored_tensor_bytes =
-                        Observed::exact(total, "validated SafeTensors tensor headers");
-                    report.resources.largest_stored_tensor_bytes = Observed::exact(
-                        largest_stored_tensor_bytes,
-                        "validated SafeTensors tensor headers",
-                    );
-                }
-                Some(_) => {}
-                None => {
-                    report.resources.stored_tensor_bytes =
-                        Observed::unavailable("SafeTensors payload-byte total overflowed u64");
-                    report.resources.largest_stored_tensor_bytes =
-                        Observed::unavailable("SafeTensors payload-byte catalog was incomplete");
-                }
-            }
-            if keys.is_empty() {
-                report.container = InspectionReadiness::Invalid;
-                report.model_loadability = InspectionReadiness::Invalid;
-                report.requested_load = InspectionReadiness::Invalid;
-                report.issue(
-                    InspectionIssueCode::InvalidContainer,
-                    InspectionSeverity::Error,
-                    "SafeTensors checkpoint contains no tensors",
-                    Some(path.to_path_buf()),
-                );
-            } else if let Some(error) = catalog_error {
-                report.container = InspectionReadiness::Invalid;
-                report.model_loadability = InspectionReadiness::Invalid;
-                report.requested_load = InspectionReadiness::Invalid;
-                let missing = matches!(
-                    error,
-                    eredu_checkpoint::store::StoreError::MissingShard { .. }
-                );
-                report.issue(
-                    if missing {
-                        InspectionIssueCode::MissingCheckpointShard
-                    } else {
-                        InspectionIssueCode::InvalidContainer
-                    },
-                    InspectionSeverity::Error,
-                    error.to_string(),
-                    Some(path.to_path_buf()),
-                );
-            } else if report.container == InspectionReadiness::Unverified {
-                report.container = InspectionReadiness::Ready;
-                if let (Some(kind), Some(config)) = (resolved_kind, config.as_ref()) {
-                    apply_structural_validation(
-                        &mut report,
-                        structural::validate_safetensors(kind, config, &store, options.load),
-                        path,
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            report.container = InspectionReadiness::Invalid;
-            report.model_loadability = InspectionReadiness::Invalid;
-            report.requested_load = InspectionReadiness::Invalid;
-            let missing = matches!(
-                error,
-                eredu_checkpoint::store::StoreError::MissingShard { .. }
-            );
-            report.issue(
-                if missing {
-                    InspectionIssueCode::MissingCheckpointShard
-                } else {
-                    InspectionIssueCode::InvalidContainer
-                },
-                InspectionSeverity::Error,
                 error.to_string(),
-                Some(path.to_path_buf()),
+                Some(path.join("config.json")),
             );
         }
     }
-
-    inspect_safetensors_media(&mut report, path);
     report
+}
+
+fn reject_portable_safetensors(
+    report: &mut ModelInspectionReport,
+    path: &Path,
+    error: &eredu_core::artifact::ArtifactError,
+) {
+    let detail = error.to_string();
+    let invalid_plan = matches!(
+        error,
+        eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(_)
+    );
+    let (code, container, architecture) = match error {
+        eredu_core::artifact::ArtifactError::UnsupportedModelType(_) => (
+            InspectionIssueCode::UnsupportedArchitecture,
+            InspectionReadiness::Unverified,
+            InspectionReadiness::Unsupported,
+        ),
+        eredu_core::artifact::ArtifactError::Io(error)
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            (
+                InspectionIssueCode::MissingCheckpointShard,
+                InspectionReadiness::Missing,
+                InspectionReadiness::Unverified,
+            )
+        }
+        eredu_core::artifact::ArtifactError::Json(_) => (
+            InspectionIssueCode::InvalidConfiguration,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Invalid,
+        ),
+        eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(_) => (
+            InspectionIssueCode::InvalidConfiguration,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Invalid,
+        ),
+        eredu_core::artifact::ArtifactError::DuplicateTensor(_)
+        | eredu_core::artifact::ArtifactError::UnsafeShardPath(_)
+        | eredu_core::artifact::ArtifactError::Catalog(_) => (
+            InspectionIssueCode::InvalidContainer,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Unverified,
+        ),
+        _ => (
+            InspectionIssueCode::InvalidContainer,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Invalid,
+        ),
+    };
+    report.container = container;
+    report.architecture_support = architecture;
+    report.structural_binding = if invalid_plan {
+        InspectionReadiness::Invalid
+    } else {
+        container
+    };
+    report.multimodal = if invalid_plan {
+        InspectionReadiness::Invalid
+    } else {
+        InspectionReadiness::Unverified
+    };
+    report.model_loadability = if architecture == InspectionReadiness::Unsupported {
+        InspectionReadiness::Unsupported
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.requested_load = report.model_loadability;
+    report.issue(
+        code,
+        InspectionSeverity::Error,
+        detail,
+        Some(path.to_path_buf()),
+    );
 }
 
 fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
@@ -447,6 +479,7 @@ fn reject_portable_gguf(
             None,
         ),
         eredu_core::artifact::ArtifactError::InvalidArtifact(_)
+        | eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(_)
         | eredu_core::artifact::ArtifactError::DuplicateTensor(_)
         | eredu_core::artifact::ArtifactError::Catalog(_) => (
             InspectionIssueCode::InvalidConfiguration,
@@ -848,16 +881,15 @@ fn reject_projector(
     );
 }
 
-fn inspect_safetensors_media(report: &mut ModelInspectionReport, path: &Path) {
+fn inspect_safetensors_media(
+    report: &mut ModelInspectionReport,
+    plan: &eredu_architectures::processor_plan::ArtifactProcessorPlan,
+) {
     if report.expected_modalities == [ArtifactModality::Text] {
         report.multimodal = InspectionReadiness::NotApplicable;
         return;
     }
-    let sidecar = ["processor_config.json", "preprocessor_config.json"]
-        .into_iter()
-        .map(|name| path.join(name))
-        .find(|candidate| candidate.exists());
-    if let Some(sidecar) = sidecar {
+    if plan.has_processor() {
         let features_available = report
             .expected_modalities
             .iter()
@@ -877,19 +909,20 @@ fn inspect_safetensors_media(report: &mut ModelInspectionReport, path: &Path) {
             code: InspectionIssueCode::MissingProcessor,
             readiness: report.multimodal,
             detail: if features_available {
-                "processor sidecar and required media build features are available".into()
+                "authoritative processor plan and required media build features are available"
+                    .into()
             } else {
-                "processor sidecar exists, but required image/audio processing features are not enabled".into()
+                "authoritative processor plan is available, but required image/audio processing features are not enabled".into()
             },
-            path: Some(sidecar),
+            path: None,
         });
     } else {
         report.multimodal = InspectionReadiness::Missing;
         report.issue(
             InspectionIssueCode::MissingProcessor,
             InspectionSeverity::Warning,
-            "the resolved multimodal architecture has no processor_config.json or preprocessor_config.json sidecar",
-            Some(path.to_path_buf()),
+            "authoritative architecture inspection admitted no media processor",
+            Some(report.path.clone()),
         );
     }
 }
@@ -966,6 +999,40 @@ fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn write_safetensors_fixture(root: &Path, config: &serde_json::Value) {
+        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_vec(config).unwrap(),
+        )
+        .unwrap();
+        let bytes = 0.0_f32.to_le_bytes();
+        let view = TensorView::new(Dtype::F32, vec![1], &bytes).unwrap();
+        serialize_to_file(
+            [("model.language_model.embed_tokens.weight", view)],
+            None,
+            &root.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    fn qwen_vl_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
+            "vision_start_token_id":44, "vision_end_token_id":45,
+            "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":64, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.000001,
+                "vocab_size":64, "max_position_embeddings":128, "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}},
+            "vision_config":{"depth":1,"hidden_size":16,"intermediate_size":24,
+                "num_heads":4,"num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]}
+        })
+    }
+
     fn write_minimal_llama_gguf(
         path: &Path,
         include_embedding_length: bool,
@@ -1011,12 +1078,63 @@ mod tests {
             ModelInspectionReport::unverified(Path::new("unused"), ArtifactFormat::SafeTensors);
         report.expected_modalities = artifact_modalities(InputModalities::TEXT);
 
-        inspect_safetensors_media(&mut report, Path::new("unused"));
+        inspect_safetensors_media(
+            &mut report,
+            &eredu_architectures::processor_plan::ArtifactProcessorPlan::default(),
+        );
 
         assert_eq!(report.expected_modalities, [ArtifactModality::Text]);
         assert_eq!(report.multimodal, InspectionReadiness::NotApplicable);
         assert!(report.requirements.is_empty());
         assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn safetensors_inspection_rejects_malformed_processor_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(root.path(), &qwen_vl_config());
+        std::fs::write(
+            root.path()
+                .join(eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME),
+            b"{",
+        )
+        .unwrap();
+
+        let report = inspect_model(root.path(), MlxInspectionOptions::default()).unwrap();
+
+        assert_eq!(report.container, InspectionReadiness::Ready);
+        assert_eq!(report.multimodal, InspectionReadiness::Invalid);
+        assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+        assert_eq!(report.requested_load, InspectionReadiness::Invalid);
+        assert!(!report.is_loadable());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::InvalidConfiguration
+                && issue.detail.contains("processor")
+        }));
+    }
+
+    #[test]
+    fn safetensors_inspection_rejects_wrong_family_processor_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(root.path(), &qwen_vl_config());
+        std::fs::write(
+            root.path()
+                .join(eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME),
+            br#"{"image_processor":{},"video_processor":{}}"#,
+        )
+        .unwrap();
+
+        let report = inspect_model(root.path(), MlxInspectionOptions::default()).unwrap();
+
+        assert_eq!(report.container, InspectionReadiness::Ready);
+        assert_eq!(report.multimodal, InspectionReadiness::Invalid);
+        assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+        assert_eq!(report.requested_load, InspectionReadiness::Invalid);
+        assert!(!report.is_loadable());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::InvalidConfiguration
+                && issue.detail.contains("processor")
+        }));
     }
 
     #[test]

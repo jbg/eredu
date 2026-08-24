@@ -11,12 +11,16 @@ use super::ModelLoadOptions;
 use crate::backend::error::Error;
 use crate::backend::runtime::checkpoint::load::GgufTensorNames;
 use crate::composition::llama::checkpoint as llama_checkpoint;
-use eredu_checkpoint::store::SafetensorsWeightStore;
+use eredu_checkpoint::{recipe::RecipeCatalog, validation::SafetensorsCatalog};
 
 pub use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
     CheckpointValidation as StructuralValidation,
 };
+
+pub(crate) trait StructuralSafetensorsCatalog: SafetensorsCatalog + RecipeCatalog {}
+
+impl<T> StructuralSafetensorsCatalog for T where T: SafetensorsCatalog + RecipeCatalog + ?Sized {}
 
 /// Native GGUF source admitted by composition-level structural validation.
 ///
@@ -255,7 +259,8 @@ pub(crate) fn validate_parallel_capabilities(
     Ok(())
 }
 
-pub(crate) fn validate_safetensors_preparation(
+#[cfg(test)]
+fn validate_safetensors_preparation_for_test(
     kind: ModelKind,
     config: &Value,
     options: ModelLoadOptions,
@@ -351,7 +356,7 @@ fn validate_gguf_load_policy(
 pub fn validate_safetensors(
     kind: ModelKind,
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
     options: ModelLoadOptions,
 ) -> StructuralValidation {
     let validation = match kind {
@@ -379,7 +384,7 @@ pub fn validate_safetensors(
 
 fn validate_neutral_moshi_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let config = match eredu_architectures::moshi::MoshiConfig::from_config_value(Some(config)) {
         Ok(config) => config,
@@ -457,7 +462,7 @@ pub fn validate_gguf(
 
 fn validate_neutral_gemma4_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let bytes = match serde_json::to_vec(config) {
         Ok(bytes) => bytes,
@@ -476,7 +481,7 @@ fn validate_neutral_gemma4_safetensors(
 
 fn validate_neutral_gpt_oss_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::gpt_oss::model_args_from_config_value(config) {
         Ok(args) => args,
@@ -491,7 +496,7 @@ fn validate_neutral_gpt_oss_safetensors(
 
 fn validate_neutral_inkling_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let bytes = match serde_json::to_vec(config) {
         Ok(bytes) => bytes,
@@ -510,7 +515,7 @@ fn validate_neutral_inkling_safetensors(
 
 fn validate_neutral_muse_glimmer_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let bytes = match serde_json::to_vec(config) {
         Ok(bytes) => bytes,
@@ -619,7 +624,7 @@ fn validate_neutral_muse_glimmer_gguf(
 
 fn validate_neutral_qwen_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::qwen::model_args_from_config_value(config) {
         Ok(args) => args,
@@ -634,7 +639,7 @@ fn validate_neutral_qwen_safetensors(
 
 fn validate_neutral_lfm2_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::lfm2::model_args_from_config_value(config) {
         Ok(args) => args,
@@ -649,7 +654,7 @@ fn validate_neutral_lfm2_safetensors(
 
 fn validate_neutral_nemotron_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::nemotron_h::model_args_from_config_value(config) {
         Ok(args) => args,
@@ -664,7 +669,7 @@ fn validate_neutral_nemotron_safetensors(
 
 fn validate_neutral_kimi_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::kimi_linear::model_args_from_config_value(config) {
         Ok(args) => args,
@@ -787,7 +792,7 @@ fn validate_neutral_nemotron_gguf(
 
 fn validate_neutral_deepseek_v3_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::deepseek::parse_v3_config(config) {
         Ok(args) => args,
@@ -802,7 +807,7 @@ fn validate_neutral_deepseek_v3_safetensors(
 
 fn validate_neutral_deepseek_v4_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::deepseek::parse_v4_config(config) {
         Ok(args) => args,
@@ -901,7 +906,7 @@ fn validate_neutral_qwen_gguf(
 
 fn validate_neutral_qwen_hybrid_safetensors(
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let parsed = match eredu_architectures::qwen::hybrid::model_args_from_config_value(config) {
         Ok(parsed) => parsed,
@@ -917,7 +922,7 @@ fn validate_neutral_qwen_hybrid_safetensors(
 fn validate_neutral_qwen_vl_safetensors(
     kind: ModelKind,
     config: &Value,
-    store: &SafetensorsWeightStore,
+    store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
     let args = match eredu_architectures::qwen::vl::model_args_from_config_value(config) {
         Ok(args) => args,
@@ -1326,8 +1331,9 @@ mod admission_policy_tests {
     #[test]
     fn expert_cache_admits_normalized_gemma4_and_muse_glimmer_moe() {
         let options = expert_cache_options();
-        validate_safetensors_preparation(ModelKind::Gemma4, &gemma4_config(true), options).unwrap();
-        validate_safetensors_preparation(
+        validate_safetensors_preparation_for_test(ModelKind::Gemma4, &gemma4_config(true), options)
+            .unwrap();
+        validate_safetensors_preparation_for_test(
             ModelKind::MuseGlimmer,
             &muse_glimmer_config(true),
             options,
@@ -1342,8 +1348,12 @@ mod admission_policy_tests {
                 .with_weight_residency(eredu_runtime::WeightResidency::layerwise_host(
                     eredu_runtime::LayerwiseLoadOptions::default(),
                 ));
-        validate_safetensors_preparation(ModelKind::KimiLinear, &kimi_linear_config(), options)
-            .unwrap();
+        validate_safetensors_preparation_for_test(
+            ModelKind::KimiLinear,
+            &kimi_linear_config(),
+            options,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1360,9 +1370,12 @@ mod admission_policy_tests {
             ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
                 .with_parallel_topology(topology);
 
-        let error =
-            validate_safetensors_preparation(ModelKind::Qwen3, &dense_qwen3_config(), options)
-                .unwrap_err();
+        let error = validate_safetensors_preparation_for_test(
+            ModelKind::Qwen3,
+            &dense_qwen3_config(),
+            options,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1386,7 +1399,8 @@ mod admission_policy_tests {
             ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
                 .with_parallel_topology(topology);
 
-        validate_safetensors_preparation(ModelKind::Qwen3, &dense_qwen3_config(), options).unwrap();
+        validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
+            .unwrap();
     }
 
     #[test]
@@ -1429,7 +1443,7 @@ mod admission_policy_tests {
             (ModelKind::Qwen3, dense_qwen3_config()),
         ] {
             assert!(matches!(
-                validate_safetensors_preparation(kind, &config, options),
+                validate_safetensors_preparation_for_test(kind, &config, options),
                 Err(Error::Artifact(
                     eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(_)
                 ))
@@ -1447,7 +1461,7 @@ mod admission_policy_tests {
             crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
         )
         .unwrap();
-        let error = validate_safetensors_preparation(
+        let error = validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
             &dense_qwen3_config(),
             ModelLoadOptions::with_parallel(topology),
@@ -1468,7 +1482,7 @@ mod admission_policy_tests {
         )
         .unwrap();
 
-        validate_safetensors_preparation(
+        validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
             &dense_qwen3_config(),
             ModelLoadOptions::with_parallel(topology),

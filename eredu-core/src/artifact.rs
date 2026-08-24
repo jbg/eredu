@@ -795,12 +795,20 @@ fn inspect_safetensors_header(path: &Path) -> Result<Vec<TensorDescriptor>, Arti
 
 fn safetensors_dtype(dtype: &str) -> TensorDtype {
     match dtype {
-        "F32" => TensorDtype::F32,
+        "BOOL" => TensorDtype::Bool,
+        "U8" => TensorDtype::U8,
+        "I8" => TensorDtype::I8,
+        "I16" => TensorDtype::I16,
+        "U16" => TensorDtype::U16,
         "F16" => TensorDtype::F16,
         "BF16" => TensorDtype::Bf16,
-        "I8" => TensorDtype::I8,
-        "U8" => TensorDtype::U8,
         "I32" => TensorDtype::I32,
+        "U32" => TensorDtype::U32,
+        "F32" => TensorDtype::F32,
+        "F64" => TensorDtype::F64,
+        "I64" => TensorDtype::I64,
+        "U64" => TensorDtype::U64,
+        "C64" => TensorDtype::Complex64,
         other => TensorDtype::Encoded(other.into()),
     }
 }
@@ -832,6 +840,9 @@ pub enum ArtifactError {
     /// Header/catalog content is contradictory.
     #[error("invalid model artifact: {0}")]
     InvalidArtifact(String),
+    /// Architecture-owned artifact planning rejected the inspected inputs.
+    #[error("invalid architecture artifact plan: {0}")]
+    InvalidArchitecturePlan(String),
     /// A tensor name occurred more than once.
     #[error("duplicate checkpoint tensor {0:?}")]
     DuplicateTensor(String),
@@ -1087,6 +1098,19 @@ mod tests {
         let (artifact, architecture_plan, _, _) = plan.into_parts();
         assert!(matches!(artifact, ModelArtifact::SafeTensors { .. }));
         assert_eq!(architecture_plan.format, Some(ArtifactFormat::SafeTensors));
+    }
+
+    #[test]
+    fn safetensors_native_dtypes_remain_typed_in_the_portable_catalog() {
+        assert_eq!(safetensors_dtype("BOOL"), TensorDtype::Bool);
+        assert_eq!(safetensors_dtype("I64"), TensorDtype::I64);
+        assert_eq!(safetensors_dtype("U32"), TensorDtype::U32);
+        assert_eq!(safetensors_dtype("F64"), TensorDtype::F64);
+        assert_eq!(safetensors_dtype("C64"), TensorDtype::Complex64);
+        assert_eq!(
+            safetensors_dtype("F8_E4M3"),
+            TensorDtype::Encoded("F8_E4M3".into())
+        );
     }
 
     #[test]

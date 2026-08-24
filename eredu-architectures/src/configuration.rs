@@ -108,7 +108,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 )
             }
         };
-        plan.map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))
+        plan.map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))
     }
 }
 
