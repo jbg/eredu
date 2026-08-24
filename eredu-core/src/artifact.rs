@@ -314,7 +314,7 @@ fn inspect_gguf(
         .and_then(MetadataValue::as_str)
         .ok_or(ArtifactError::MissingGgufArchitecture)?;
     let configuration = resolver.resolve_gguf(architecture_name, &checkpoint)?;
-    validate_gguf_floor(architecture_name, &checkpoint)?;
+    validate_gguf_container(&checkpoint)?;
     let tensors = checkpoint
         .tensors()
         .map(|tensor| {
@@ -349,39 +349,10 @@ fn inspect_gguf(
     })
 }
 
-fn validate_gguf_floor(
-    architecture: &str,
-    checkpoint: &GgufCheckpoint,
-) -> Result<(), ArtifactError> {
+fn validate_gguf_container(checkpoint: &GgufCheckpoint) -> Result<(), ArtifactError> {
     if checkpoint.physical_tensor_count() == 0 {
         return Err(ArtifactError::InvalidArtifact(
             "GGUF model checkpoint contains no tensors".into(),
-        ));
-    }
-    let prefix = architecture;
-    for suffix in ["block_count", "embedding_length"] {
-        let key = format!("{prefix}.{suffix}");
-        let value = checkpoint
-            .metadata()
-            .get(&key)
-            .and_then(MetadataValue::as_i64)
-            .ok_or_else(|| {
-                ArtifactError::InvalidArtifact(format!(
-                    "GGUF metadata key {key:?} must be a present integer"
-                ))
-            })?;
-        if value <= 0 {
-            return Err(ArtifactError::InvalidArtifact(format!(
-                "GGUF metadata key {key:?} must be positive, got {value}"
-            )));
-        }
-    }
-    if !checkpoint
-        .tensors()
-        .any(|tensor| tensor.descriptor().name == "token_embd.weight")
-    {
-        return Err(ArtifactError::InvalidArtifact(
-            "GGUF model checkpoint is missing required tensor \"token_embd.weight\"".into(),
         ));
     }
     Ok(())
@@ -638,6 +609,7 @@ mod tests {
         ) -> Result<ModelConfiguration, ArtifactError> {
             let family = match architecture {
                 "llama" => "llama",
+                "future" => "future_family",
                 other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
             };
             Ok(ModelConfiguration {
@@ -844,5 +816,36 @@ mod tests {
         };
         assert_eq!(configuration.family, "llama");
         assert_eq!(checkpoint.physical_tensor_count(), 1);
+    }
+
+    #[test]
+    fn core_accepts_architecture_owned_gguf_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("model.gguf");
+        let data = 1.0_f32.to_le_bytes();
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("future".into()),
+            ),
+            ("future.state_width".into(), MetadataValue::Uint32(1)),
+        ]);
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &metadata,
+                &[TensorInput {
+                    name: "state.in_proj",
+                    dimensions: &[1],
+                    ggml_type: GgmlType::F32,
+                    data: &data,
+                }],
+            )
+            .unwrap();
+
+        let inspection = inspect_artifact(&path, &FixtureResolver).unwrap();
+
+        assert_eq!(inspection.configuration().family, "future_family");
+        assert!(inspection.tensors().get("state.in_proj").is_some());
     }
 }

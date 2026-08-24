@@ -99,10 +99,13 @@ routes that protocol; it neither recognizes family strings nor exposes an
 exhaustive family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
-in `eredu-architectures`. Facades and concrete backend adapters select that
-shared registry. Backend composition converts the resolved canonical family
-through the architecture registry and consumes architecture parser outputs,
-never a second raw `model_type` or `general.architecture` dispatch table.
+in `eredu-architectures`. Once that resolver admits a GGUF artifact,
+`eredu-core` applies only container-generic catalog checks; it does not require
+family metadata keys or tensor names. Facades and concrete backend adapters
+select that shared registry. Backend composition converts the resolved
+canonical family through the architecture registry and consumes architecture
+parser outputs, never a second raw `model_type` or `general.architecture`
+dispatch table.
 Loaded backend models and sessions preserve these as two distinct identities:
 `model_family()` returns the canonical architecture-owned `ModelKind`, while
 `effective_model_type()` returns the parsed implementation or nested text-model
