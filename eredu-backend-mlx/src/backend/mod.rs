@@ -38,6 +38,17 @@ use crate::{
     composition::mlx::{distributed::pipeline::PipelineModel, MlxModelSession, Model},
 };
 
+fn backend_capabilities(has_world: bool) -> BackendCapabilities {
+    BackendCapabilities {
+        exact_completion: true,
+        transfers: true,
+        collectives: has_world,
+        persistent_cache: true,
+        output_observation: true,
+        activation_inspection: true,
+    }
+}
+
 /// Opaque MLX executable selected for one complete model session.
 ///
 /// Replicated, tensor-, pipeline-, and expert-parallel materializations share
@@ -293,14 +304,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
                 family,
                 memory_bytes: None,
             },
-            BackendCapabilities {
-                exact_completion: true,
-                transfers: true,
-                collectives: true,
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: true,
-            },
+            backend_capabilities(self.world.is_some()),
         )])
     }
 
@@ -337,6 +341,28 @@ impl<'a> BackendProvider for MlxBackend<'a> {
             None => None,
         };
         MlxModelSession::from_model(model.into_inner(), distributed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backend_capabilities, MlxBackend};
+    use eredu_core::BackendProvider as _;
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    #[test]
+    fn collective_capability_requires_an_attached_world() {
+        assert!(!backend_capabilities(false).collectives);
+        assert!(backend_capabilities(true).collectives);
+    }
+
+    #[test]
+    fn ordinary_backend_device_report_is_fail_closed_for_collectives() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let backend = MlxBackend::new(execution.stream(), execution.stream());
+        let devices = backend.devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(!devices[0].1.collectives);
     }
 }
 

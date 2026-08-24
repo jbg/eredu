@@ -39,7 +39,7 @@ use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTo
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, FinishReason,
     GenerationCancellationToken, ModelRuntime, MtpCapability, MtpCheckpointKind, MtpConfig,
-    SemanticEvent, SpeculativeDraft, SpeculativeGenerationBackend,
+    ObservationRequest, SemanticEvent, SpeculativeDraft, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeOutputError,
     SpeculativeSemanticState, SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter,
     TokenFilterController, TokenOutput as _,
@@ -2484,6 +2484,57 @@ fn write_gpt_oss_fixture(directory: &Path) {
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
+    fn inspect(
+        write_fixture: impl FnOnce(&Path) -> PathBuf,
+        options: ModelLoadOptions,
+        expected_observation: &str,
+    ) {
+        let checkpoint = tempfile::tempdir().unwrap();
+        let artifact = write_fixture(checkpoint.path());
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let backend = crate::native::backend(stream, stream);
+        let model = load_model(&backend, artifact, options).unwrap();
+        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [crate::backend::runtime::media::input::InputPart::text_token_ids(&tokens)];
+        let input = crate::composition::mlx::MlxModelInput::from(
+            crate::backend::runtime::media::input::ModelInput::new(&parts),
+        );
+        let inspected = runtime
+            .inspect_prefill(input, &ObservationRequest::all())
+            .unwrap();
+        assert!(
+            inspected.observations.get(expected_observation).is_some(),
+            "missing {expected_observation:?} in {:?}",
+            inspected.observations
+        );
+    }
+
+    inspect(
+        |directory| {
+            write_gpt_oss_fixture(directory);
+            directory.to_path_buf()
+        },
+        ModelLoadOptions::default().with_weight_residency(WeightResidency::with_expert_cache(
+            NonExpertWeightResidency::FullyResident,
+            ExpertCacheLoadOptions::default(),
+        )),
+        "model.layers.0.output",
+    );
+    inspect(
+        |directory| {
+            write_nemotron_fixture(directory);
+            directory.to_path_buf()
+        },
+        ModelLoadOptions::default(),
+        "model.layers.0.output",
+    );
 }
 
 struct QuantizedGgufFixtureTensor {

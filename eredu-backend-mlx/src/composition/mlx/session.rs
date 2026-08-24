@@ -980,6 +980,12 @@ impl<'a> MlxModelSession<'a> {
                 observer.observe("model.logits", output.as_array())?;
                 Ok(output.into_array())
             }
+            (Model::GptOss(_, model), ModelCache::GptOss(cache)) => {
+                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
+            (Model::NemotronH(_, model), ModelCache::Hybrid(cache)) => {
+                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
             (model, _) => {
                 return Err(Error::ArchitectureModel(format!(
                     "activation observation is unavailable for model type {} or the supplied cache does not match",

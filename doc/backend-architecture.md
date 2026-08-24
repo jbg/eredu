@@ -784,6 +784,11 @@ The adapter translates native failures into structured backend errors and
 populates portable capability, inspection, memory, admission, and telemetry
 reports. MLX arrays, streams, devices, events, groups, and exceptions do not
 appear in core or generic facade signatures.
+Collective capability is reported only by an MLX backend instance with an
+attached world communicator. Replicated activation inspection dispatches every
+family observer implemented by MLX composition through the same erased session
+path; missing family/cache pairs fail before execution instead of falling back
+to an uninstrumented pass.
 
 Backend-neutral `TextGenerationConfig` also selects standard or Mirostat V2
 sampling. The chosen backend owns the corresponding logits, random state, and
