@@ -462,7 +462,7 @@ fn reserve_ports() -> (TcpListener, TcpListener, u16, u16) {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_expert_exchange_ring ring_two_process_all_to_all_v_and_dispatch_sharded -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-backend-mlx --lib tests::distributed_expert_exchange_ring::ring_two_process_all_to_all_v_and_dispatch_sharded -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_all_to_all_v_and_dispatch_sharded() {

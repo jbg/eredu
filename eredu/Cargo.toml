@@ -98,12 +98,9 @@ eredu-architectures.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }
-base64 = "0.22"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-idna_adapter = "1" 
 thiserror = "2"
 serde_json = "1"
-minijinja = "2"
 sha2.workspace = true
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
 toktrie_hf_tokenizers = "=1.7.6"

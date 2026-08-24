@@ -4719,7 +4719,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_pipeline_ring ring_two_process_pipeline -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-backend-mlx --lib tests::distributed_pipeline_ring::ring_two_process_pipeline -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_pipeline() {
@@ -4796,7 +4796,7 @@ fn ring_two_process_pipeline_opaque_session_cache_policy() {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_pipeline_ring ring_two_process_dense_stream_pipeline -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-backend-mlx --lib tests::distributed_pipeline_ring::ring_two_process_dense_stream_pipeline -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_dense_stream_pipeline() {

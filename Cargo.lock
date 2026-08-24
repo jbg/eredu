@@ -844,7 +844,6 @@ name = "eredu"
 version = "0.4.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "clap",
  "eredu-architectures",
  "eredu-backend-mlx",
@@ -854,11 +853,9 @@ dependencies = [
  "eredu-nn",
  "eredu-runtime",
  "eredu-text",
- "idna_adapter",
  "lazy_static",
  "libc",
  "llguidance",
- "minijinja",
  "safetensors",
  "serde",
  "serde_json",

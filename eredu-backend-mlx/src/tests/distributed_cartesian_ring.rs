@@ -367,7 +367,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_cartesian_ring ring_four_process_pairwise_topologies -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-backend-mlx --lib tests::distributed_cartesian_ring::ring_four_process_pairwise_topologies -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns four Ring workers and opens loopback sockets; run explicitly"]
 fn ring_four_process_pairwise_topologies() {
