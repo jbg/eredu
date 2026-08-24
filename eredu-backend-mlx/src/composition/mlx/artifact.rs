@@ -31,8 +31,7 @@ pub struct PreparedSafetensorsArtifact {
 }
 
 impl PreparedSafetensorsArtifact {
-    /// Inspects and opens one SafeTensors artifact as a single immutable
-    /// composition input.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inspect(path: impl AsRef<Path>, max_mapped_shards: usize) -> Result<Self, Error> {
         let inspection = eredu_architectures::configuration::inspect_artifact(path.as_ref())?;
         if inspection.format() != eredu_core::ArtifactFormat::SafeTensors {

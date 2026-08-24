@@ -127,10 +127,6 @@ pub enum Error {
     #[error("media processor error: {0}")]
     Processor(String),
 
-    /// Portable GGUF header or catalog parsing failed.
-    #[error(transparent)]
-    Gguf(#[from] eredu_gguf::Error),
-
     /// MLX speculative execution failed.
     #[error("MLX speculative generation failed: {0}")]
     Speculative(String),

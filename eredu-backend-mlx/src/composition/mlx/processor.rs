@@ -2,11 +2,13 @@
 
 use std::path::Path;
 
+#[cfg(feature = "image")]
+use eredu_core::VideoSampling;
 use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment};
 
 #[cfg(feature = "image")]
 use crate::{
-    backend::runtime::media::{RgbImageView, VideoSampling},
+    backend::runtime::media::RgbImageView,
     composition::{muse_glimmer_processor as muse_glimmer, qwen::processor as qwen},
 };
 use crate::{

@@ -3,6 +3,8 @@
 /// Typed runtime inputs for model prefill.
 pub mod input;
 
+#[cfg(feature = "image")]
+use eredu_core::VideoSampling;
 use eredu_core::{
     checkpoint::TensorDtype, InputExtent, InputMetadataKey, InputModality, InputTensorIdentity,
     PreparedInputIdentity,
@@ -93,10 +95,6 @@ pub enum ProcessorInput<'a> {
     /// Decoded media to preprocess and insert at this exact position.
     Media(MediaInput<'a>),
 }
-
-#[cfg(feature = "image")]
-/// Portable frame-selection policy shared with architecture processor plans.
-pub use eredu_core::VideoSampling;
 
 /// Borrowed sequence of decoded RGB8 video frames.
 #[cfg(feature = "image")]

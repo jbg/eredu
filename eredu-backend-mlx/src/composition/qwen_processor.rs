@@ -306,13 +306,14 @@ fn pack_video_patches(
 #[cfg(test)]
 mod tests {
     use eredu_architectures::processor_plan::{QwenPatchPlan, QwenProcessorPlan};
+    use eredu_core::VideoSampling;
 
     use super::{pack_image_patches, QwenProcessor};
     use crate::{
         backend::runtime::media::input::{InputPayload, Modality},
         backend::runtime::media::{
             image::{rescale_and_normalize_rgb8, RgbImageView},
-            MediaInput, ProcessorInput, VideoSampling,
+            MediaInput, ProcessorInput,
         },
     };
 

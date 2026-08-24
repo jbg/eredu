@@ -315,12 +315,13 @@ mod tests {
     use std::collections::HashMap;
 
     use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
+    use eredu_core::VideoSampling;
     use safemlx::ops::GgufMetadataValue;
 
     use super::Gemma4Processor;
     use crate::{
         backend::runtime::media::input::{InputPayload, Modality},
-        backend::runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
+        backend::runtime::media::{MediaInput, ProcessorInput, RgbImageView},
     };
 
     fn tiny_processor() -> Gemma4Processor {

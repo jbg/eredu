@@ -1,7 +1,7 @@
 //! Compare the MLX realtime backend with a native `moshi_mlx` fixture.
 //!
 //! ```text
-//! python scripts/moshi_mlx_token_fixture.py \
+//! python eredu/scripts/moshi_mlx_token_fixture.py \
 //!   /models/moshi /fixtures/moshi-native.safetensors \
 //!   --require-mlx-version VERSION
 //! cargo run -p eredu-backend-mlx --example moshi_token_parity -- \
