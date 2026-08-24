@@ -743,7 +743,7 @@ fn pipeline_ring_worker() {
             .wait()
             .unwrap();
         if let (Some(actual), Some((expected, _))) = (output.logits(), &reference) {
-            assert_final_logits_close(actual, expected, reference_tolerance);
+            assert_final_logits_close(actual.as_array(), expected, reference_tolerance);
         }
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
@@ -820,11 +820,16 @@ fn pipeline_ring_worker() {
             .wait()
             .unwrap();
         if let (Some(actual), Some((_, expected))) = (uninterrupted.logits(), &reference) {
-            assert_final_logits_close(actual, expected, reference_tolerance);
+            assert_final_logits_close(actual.as_array(), expected, reference_tolerance);
         }
-        let uninterrupted_logits = uninterrupted
-            .logits()
-            .map(|logits| logits.evaluated().unwrap().as_slice::<f32>().to_vec());
+        let uninterrupted_logits = uninterrupted.logits().map(|logits| {
+            logits
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        });
         session
             .load_prompt_cache(
                 &backend,
@@ -841,9 +846,14 @@ fn pipeline_ring_worker() {
             .unwrap()
             .wait()
             .unwrap();
-        let restored_logits = output
-            .logits()
-            .map(|logits| logits.evaluated().unwrap().as_slice::<f32>().to_vec());
+        let restored_logits = output.logits().map(|logits| {
+            logits
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        });
         assert_eq!(uninterrupted_logits, restored_logits);
         for _ in 0..2 {
             assert_eq!(

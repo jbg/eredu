@@ -3,12 +3,11 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
 use eredu_backend_mlx::native::{
     transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext,
 };
-use eredu_backend_mlx::{
-    InputPart, MlxBackend, MlxModelInput, MlxModelSession, ModelInput, ModelLoadOptions,
-};
+use eredu_backend_mlx::{MlxBackend, MlxModelInput, MlxModelSession, MlxTensor, ModelLoadOptions};
 use eredu_core::{
     cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
     load_model, AttentionPolicy, BackendProvider as _, BackendSession as _,
@@ -69,6 +68,7 @@ fn prefill_tokens(
         .prefill(backend, input)?
         .wait()?
         .into_logits()
+        .map(MlxTensor::into_array)
         .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own prefill logits"))
 }
 
@@ -81,6 +81,7 @@ fn decode_tokens(
         .decode(backend, tokens.clone())?
         .wait()?
         .into_logits()
+        .map(MlxTensor::into_array)
         .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own decode logits"))
 }
 

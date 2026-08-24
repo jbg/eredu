@@ -3,8 +3,9 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
+use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
 use eredu_backend_mlx::native::{sample, Array, Device, DeviceType, ExecutionContext};
-use eredu_backend_mlx::{InputPart, ModelInput, ModelLoadOptions};
+use eredu_backend_mlx::ModelLoadOptions;
 use eredu_core::{
     load_model,
     residency::{MemoryTier, OffloadConfig, TransferDirection},
@@ -156,7 +157,7 @@ fn main() -> anyhow::Result<()> {
 
     let decode_started = Instant::now();
     for _ in 0..args.decode_tokens {
-        let token = sample(&logits, 0.0, None, stream)?;
+        let token = sample(logits.as_array(), 0.0, None, stream)?;
         stream.synchronize()?;
         let token = token.reshape(&[1, 1], stream)?;
         logits = session

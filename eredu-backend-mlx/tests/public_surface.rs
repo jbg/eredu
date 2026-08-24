@@ -7,7 +7,7 @@ use eredu_backend_mlx::backend::{
 use eredu_backend_mlx::native::{
     error::Exception, random::RandomState, sample, Array, Sampler, Stream,
 };
-use eredu_backend_mlx::{EffectiveModelType, MlxRealtimeModel};
+use eredu_backend_mlx::{EffectiveModelType, MlxModelOutput, MlxRealtimeModel, MlxTensor};
 
 fn assert_public_type<T: ?Sized>() {}
 
@@ -31,4 +31,10 @@ fn realtime_adapter_exposes_architecture_owned_identity() {
     let _: fn(&MlxRealtimeModel) -> eredu_architectures::moshi::EffectiveModelType =
         MlxRealtimeModel::effective_model_type;
     let _: EffectiveModelType = eredu_architectures::moshi::EffectiveModelType::Moshi;
+}
+
+#[test]
+fn model_output_exposes_backend_owned_tensors() {
+    let _: fn(&MlxModelOutput) -> Option<&MlxTensor> = MlxModelOutput::logits;
+    let _: fn(MlxModelOutput) -> Option<MlxTensor> = MlxModelOutput::into_logits;
 }

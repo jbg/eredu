@@ -79,21 +79,21 @@ where
 /// logits. The final rank and every non-pipeline session complete with logits.
 #[derive(Debug, Clone)]
 pub struct MlxModelOutput {
-    logits: Option<Array>,
+    logits: Option<MlxTensor>,
 }
 
 impl MlxModelOutput {
-    const fn new(logits: Option<Array>) -> Self {
+    const fn new(logits: Option<MlxTensor>) -> Self {
         Self { logits }
     }
 
     /// Borrows local logits when this rank owns them.
-    pub const fn logits(&self) -> Option<&Array> {
+    pub const fn logits(&self) -> Option<&MlxTensor> {
         self.logits.as_ref()
     }
 
     /// Consumes the output and returns local logits when present.
-    pub fn into_logits(self) -> Option<Array> {
+    pub fn into_logits(self) -> Option<MlxTensor> {
         self.logits
     }
 }
@@ -719,7 +719,7 @@ impl<'a> MlxModelSession<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn sample_and_synchronize<S: Sampler>(
         &self,
-        logits: Option<&Array>,
+        logits: Option<&MlxTensor>,
         batch_size: i32,
         sampler: &mut S,
         temperature: f32,
@@ -729,6 +729,7 @@ impl<'a> MlxModelSession<'a> {
         let distributed = self.distributed.as_ref().ok_or_else(|| {
             Error::Parallel("sampling synchronization requires a distributed model session".into())
         })?;
+        let logits = logits.map(MlxTensor::as_array);
         match &self.inner {
             MlxSessionKind::Pipeline(model, _) => model.sample_and_synchronize_token(
                 logits,
@@ -1065,8 +1066,11 @@ fn sample_text_submission(
     let logits = submission.output.into_logits().ok_or_else(|| {
         Error::Parallel("text generation requires logits on the local session rank".into())
     })?;
-    let logits =
-        crate::backend::runtime::generation::sampler::apply_token_filter(&logits, filter, &stream)?;
+    let logits = crate::backend::runtime::generation::sampler::apply_token_filter(
+        logits.as_array(),
+        filter,
+        &stream,
+    )?;
     let token = state
         .sampler
         .sample(&logits, state.temperature, state.prng.as_mut(), &stream)?;
@@ -1088,7 +1092,7 @@ fn model_submission(
 ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
     let submission = MlxCompletion::submission(output)?;
     Ok(Submission {
-        output: MlxModelOutput::new(Some(submission.output)),
+        output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
         completion: MlxSessionCompletion {
             inner: MlxSessionCompletionKind::Model(submission.completion),
         },
@@ -1098,7 +1102,7 @@ fn model_submission(
 fn pipeline_submission(
     completion: PipelineStageCompletion,
 ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
-    let output = MlxModelOutput::new(completion.logits().cloned());
+    let output = MlxModelOutput::new(completion.logits().cloned().map(MlxTensor::from_array));
     Ok(Submission {
         output,
         completion: MlxSessionCompletion {

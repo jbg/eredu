@@ -1,12 +1,11 @@
 //! Minimal MLX sparse-cache Ring expert-parallel generation probe.
 
+use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
 };
-use eredu_backend_mlx::{
-    DeviceAssignment, InputPart, MlxParallelContext, ModelInput, ModelLoadOptions,
-};
+use eredu_backend_mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions};
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 use eredu_runtime::{ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency};
@@ -58,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..8 {
         let synchronized = session.sample_and_synchronize(
             Some(&logits),
-            logits.dim(0),
+            logits.as_array().dim(0),
             &mut sampler,
             0.0,
             None,

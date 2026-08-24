@@ -1,12 +1,11 @@
 //! Minimal MLX two-or-more-process microbatched pipeline generation probe.
 
+use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
 };
-use eredu_backend_mlx::{
-    DeviceAssignment, InputPart, MlxParallelContext, ModelInput, ModelLoadOptions,
-};
+use eredu_backend_mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions};
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 
