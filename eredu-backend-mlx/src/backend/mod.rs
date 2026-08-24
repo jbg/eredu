@@ -325,7 +325,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
             Some(topology) => {
                 let world = self.world.ok_or_else(|| {
                     Error::Parallel(
-                        "distributed model session creation requires MlxBackend::with_distributed_world"
+                        "distributed model session creation requires native::distributed_backend"
                             .into(),
                     )
                 })?;
