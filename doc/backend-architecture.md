@@ -85,6 +85,13 @@ and GGUF headers. Backend weight inspection and materialization do not parse
 tokenizer or EOS policy metadata: malformed or unsupported facade-owned policy
 cannot reject an otherwise valid weight artifact.
 
+For an external speculative assistant, the facade reconstructs both target and
+assistant tokenizers and establishes the neutral `TokenizerCompatibilityProof`
+before assistant materialization. Equality of their token-id vocabulary
+fingerprints is portable compatibility policy. Backend factories receive that
+proof and its shared fingerprint; they own assistant placement, materialization,
+and architecture compatibility, but do not decide tokenizer compatibility.
+
 `eredu-runtime` owns statically dispatched resident and bounded execution,
 parameter binding, residency, mutable state, exact completion, distributed-plan
 realization, and generation-facing causal-model contracts.

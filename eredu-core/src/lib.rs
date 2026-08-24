@@ -63,7 +63,8 @@ pub use automatic::{
     ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
     HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, MtpTelemetry, ObservationKind,
     Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, RealizedDrafting,
-    ResidencyTelemetry, TimingTelemetry, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
+    ResidencyTelemetry, TimingTelemetry, TokenizerCompatibilityError, TokenizerCompatibilityProof,
+    TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
     load_model, prepare_inspected_model, BackendCapabilities, BackendDescriptor, BackendError,

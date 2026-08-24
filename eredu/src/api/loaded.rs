@@ -6,7 +6,7 @@ use eredu_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
     DraftingPlan, ExternalDraftArtifact, MtpCapability, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeGenerationOutput,
+    SpeculativeGenerationOutput, TokenizerCompatibilityProof,
 };
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use eredu_text::{
@@ -560,16 +560,18 @@ where
             eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
         let external_artifact = match &plan.drafting {
             DraftingPlan::External { model, .. } => {
-                let preparation = eredu_architectures::prepare_external_assistant(model)
-                    .map_err(LoadedModelLoadError::Artifact)?;
                 let draft_tokenizer = super::load_tokenizer(Path::new(model))
                     .map_err(LoadedModelLoadError::Metadata)?;
+                let tokenizer_compatibility = TokenizerCompatibilityProof::prove(
+                    target_tokenizer_fingerprint,
+                    eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer),
+                )
+                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))?;
+                let preparation = eredu_architectures::prepare_external_assistant(model)
+                    .map_err(LoadedModelLoadError::Artifact)?;
                 Some(ExternalDraftArtifact {
                     preparation,
-                    target_tokenizer_fingerprint,
-                    draft_tokenizer_fingerprint: eredu_text::tokenizer::vocabulary_fingerprint(
-                        &draft_tokenizer,
-                    ),
+                    tokenizer_compatibility,
                 })
             }
             DraftingPlan::Disabled | DraftingPlan::Embedded { .. } => None,

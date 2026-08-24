@@ -394,7 +394,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 }
                 let artifact = external_artifact.ok_or_else(|| {
                     AutomaticPlanningError::Invalid(
-                        "external drafting is missing tokenizer identities".into(),
+                        "external drafting is missing proven tokenizer compatibility".into(),
                     )
                 })?;
                 let draft_stream = match placement {
@@ -405,15 +405,15 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 };
                 let options = mlx_drafter_load_options(plan)
                     .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                let drafter = MlxDrafter::materialize_with_fingerprint(
+                let drafter = MlxDrafter::materialize_with_compatibility(
                     artifact.preparation,
-                    artifact.draft_tokenizer_fingerprint,
+                    artifact.tokenizer_compatibility,
                     options,
                     &draft_stream,
                     target.backend().weights_stream(),
                 )
                 .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                validate_external_drafter(target, artifact.target_tokenizer_fingerprint, &drafter)
+                validate_external_drafter(target, &drafter)
                     .map_err(|error| planning_backend_error("validate_external_drafter", error))?;
                 draft_stream.synchronize().map_err(|error| {
                     planning_backend_error("complete_external_drafter_load", error)

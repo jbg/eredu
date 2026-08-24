@@ -78,7 +78,8 @@ pub use eredu_core::{
     SpeculativeTokenFilterController, StateLayout, StateMemoryAssumptions, StaticMemoryReport,
     SubgroupMembership, Submission, TextGeneration, TextGenerationBackend, TextGenerationConfig,
     TextSamplingStrategy, TimingTelemetry, TokenFilter, TokenFilterController, TokenFilterError,
-    TokenOutput, TokenizedMultimodalRequest, TokenizedMultimodalSegment, TopologyPreflightReport,
+    TokenOutput, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
+    TokenizerCompatibilityError, TokenizerCompatibilityProof, TopologyPreflightReport,
     TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
     AUTOMATIC_SCHEMA_VERSION, EXECUTION_PLAN_SCHEMA_VERSION,
 };

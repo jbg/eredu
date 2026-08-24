@@ -61,7 +61,6 @@ type MlxPreparedSampler<C> = ConstrainedSampler<GenerationSampler, C>;
 
 pub fn validate_external_drafter(
     runtime: &ModelRuntime<MlxBackend<'_>>,
-    target_tokenizer_fingerprint: [u8; 32],
     drafter: &MlxDrafter,
 ) -> Result<(), Error> {
     let model = runtime.session().complete_model();
@@ -88,11 +87,6 @@ pub fn validate_external_drafter(
                 model.mtp_capability()
             )))
         }
-    }
-    if drafter.tokenizer_fingerprint() != target_tokenizer_fingerprint {
-        return Err(Error::UnsupportedArchitecture(
-            "assistant token-id vocabulary mapping does not match the target".into(),
-        ));
     }
     Ok(())
 }
@@ -259,10 +253,14 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     ///
     /// Repository names and revisions are deliberately not compatibility keys.
     /// The validation covers the target architecture, shared tensor geometry,
-    /// and the token-id vocabulary mapping when the drafter carries tokenizer
-    /// metadata.
+    /// and the portable token-id vocabulary compatibility contract.
     fn validate_drafter_compatibility(&self, drafter: &MlxDrafter) -> Result<(), Error> {
-        validate_external_drafter(self.runtime, self.tokenizer_fingerprint, drafter)
+        validate_external_drafter(self.runtime, drafter)?;
+        drafter
+            .tokenizer_compatibility()
+            .validate_target(self.tokenizer_fingerprint)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        Ok(())
     }
 
     fn prepare_speculative_batch_lanes<'a, C>(

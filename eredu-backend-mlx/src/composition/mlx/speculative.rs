@@ -11,7 +11,7 @@ pub use scheduler::MtpComponentTimingGuard;
 
 use eredu_core::{
     Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
-    SpeculativeRandomness, SpeculativeSampling,
+    SpeculativeRandomness, SpeculativeSampling, TokenizerCompatibilityProof,
 };
 use safemlx::{
     error::Exception,
@@ -35,7 +35,7 @@ use crate::{
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
 pub struct MlxDrafter {
     model: MlxDrafterModel,
-    tokenizer_fingerprint: [u8; 32],
+    tokenizer_compatibility: TokenizerCompatibilityProof,
     stream: Stream,
 }
 
@@ -69,10 +69,10 @@ impl MlxMtpCache {
 }
 
 impl MlxDrafter {
-    /// Materializes an architecture-inspected drafter with its tokenizer identity.
-    pub(crate) fn materialize_with_fingerprint(
+    /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
+    pub(crate) fn materialize_with_compatibility(
         preparation: eredu_architectures::ExternalAssistantPreparationPlan,
-        tokenizer_fingerprint: [u8; 32],
+        tokenizer_compatibility: TokenizerCompatibilityProof,
         options: ModelLoadOptions,
         stream: &Stream,
         weights_stream: &Stream,
@@ -128,7 +128,7 @@ impl MlxDrafter {
         };
         Ok(Self {
             model,
-            tokenizer_fingerprint,
+            tokenizer_compatibility,
             stream: stream.clone(),
         })
     }
@@ -177,8 +177,9 @@ impl MlxDrafter {
         }
     }
 
-    pub const fn tokenizer_fingerprint(&self) -> [u8; 32] {
-        self.tokenizer_fingerprint
+    /// Returns the portable proof established before this assistant was materialized.
+    pub const fn tokenizer_compatibility(&self) -> TokenizerCompatibilityProof {
+        self.tokenizer_compatibility
     }
 
     /// Execution stream selected when this drafter was loaded.

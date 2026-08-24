@@ -632,15 +632,59 @@ impl<B: ModelLoadingBackend> ExecutionPlanTarget<B> {
     }
 }
 
-/// Architecture-prepared assistant artifact and portable tokenizer identities.
+/// Proof that a target and external assistant use the same token-id vocabulary mapping.
+///
+/// The fingerprint is exposed only after both portable tokenizer identities have
+/// been compared. Backend factories consume this proof instead of deciding
+/// tokenizer compatibility themselves.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TokenizerCompatibilityProof {
+    fingerprint: [u8; 32],
+}
+
+impl TokenizerCompatibilityProof {
+    /// Establishes compatibility from independently reconstructed tokenizer identities.
+    pub fn prove(
+        target_fingerprint: [u8; 32],
+        assistant_fingerprint: [u8; 32],
+    ) -> Result<Self, TokenizerCompatibilityError> {
+        if target_fingerprint != assistant_fingerprint {
+            return Err(TokenizerCompatibilityError);
+        }
+        Ok(Self {
+            fingerprint: target_fingerprint,
+        })
+    }
+
+    /// Returns the shared token-id vocabulary fingerprint established by this proof.
+    pub const fn fingerprint(self) -> [u8; 32] {
+        self.fingerprint
+    }
+
+    /// Verifies that this proof is being applied to the target it was established for.
+    pub fn validate_target(
+        self,
+        target_fingerprint: [u8; 32],
+    ) -> Result<(), TokenizerCompatibilityError> {
+        if self.fingerprint != target_fingerprint {
+            return Err(TokenizerCompatibilityError);
+        }
+        Ok(())
+    }
+}
+
+/// A target and external assistant do not share the same token-id vocabulary mapping.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error("assistant token-id vocabulary mapping does not match the target")]
+pub struct TokenizerCompatibilityError;
+
+/// Architecture-prepared assistant artifact and proven portable tokenizer compatibility.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExternalDraftArtifact<P> {
     /// Inspected, backend-neutral assistant materialization plan.
     pub preparation: P,
-    /// Stable token-id vocabulary identity of the target model.
-    pub target_tokenizer_fingerprint: [u8; 32],
-    /// Stable token-id vocabulary identity of the external assistant.
-    pub draft_tokenizer_fingerprint: [u8; 32],
+    /// Proof that the target and external assistant share one token-id vocabulary mapping.
+    pub tokenizer_compatibility: TokenizerCompatibilityProof,
 }
 
 /// Backend-owned drafting resources realized for one complete execution plan.
@@ -697,7 +741,7 @@ pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     /// `external_artifact` is present exactly for [`DraftingPlan::External`].
     /// It is assembled by the portable facade, which owns architecture
     /// inspection and tokenizer loading, while the backend owns only assistant
-    /// materialization, placement, and target compatibility validation.
+    /// materialization, placement, and architecture compatibility validation.
     fn realize_drafting(
         &self,
         plan: &ExecutionPlan,
@@ -763,12 +807,12 @@ pub fn realize_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
     match (&plan.drafting, external_artifact.as_ref()) {
         (DraftingPlan::External { .. }, None) => {
             return Err(AutomaticPlanningError::Invalid(
-                "external drafting requires target and assistant tokenizer identities".into(),
+                "external drafting requires proven tokenizer compatibility".into(),
             ));
         }
         (DraftingPlan::Disabled | DraftingPlan::Embedded { .. }, Some(_)) => {
             return Err(AutomaticPlanningError::Invalid(
-                "tokenizer identities were supplied for a plan without an external assistant"
+                "tokenizer compatibility was supplied for a plan without an external assistant"
                     .into(),
             ));
         }
@@ -1398,6 +1442,22 @@ mod tests {
         );
         let unavailable = serde_json::to_value(Observed::<u64>::unavailable("unknown")).unwrap();
         assert!(unavailable.get("value").is_none());
+    }
+
+    #[test]
+    fn tokenizer_compatibility_requires_identical_vocabularies() {
+        let fingerprint = [7; 32];
+        let proof = TokenizerCompatibilityProof::prove(fingerprint, fingerprint).unwrap();
+        assert_eq!(proof.fingerprint(), fingerprint);
+        assert_eq!(proof.validate_target(fingerprint), Ok(()));
+        assert_eq!(
+            proof.validate_target([8; 32]),
+            Err(TokenizerCompatibilityError)
+        );
+        assert_eq!(
+            TokenizerCompatibilityProof::prove(fingerprint, [8; 32]),
+            Err(TokenizerCompatibilityError)
+        );
     }
 
     #[test]

@@ -595,10 +595,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
             }
             DraftingPlan::External { .. } => {
                 let artifact = external_artifact.expect("external drafting carries identities");
-                assert_eq!(
-                    artifact.target_tokenizer_fingerprint,
-                    artifact.draft_tokenizer_fingerprint
-                );
+                let _shared_tokenizer_fingerprint = artifact.tokenizer_compatibility.fingerprint();
                 RealizedDrafting::External(MockDrafter)
             }
         })
@@ -1105,6 +1102,20 @@ fn write_loadable_assistant_artifact(root: &std::path::Path) {
     .unwrap();
 }
 
+fn replace_with_incompatible_tokenizer(root: &std::path::Path) {
+    let vocabulary = [("[UNK]".to_owned(), 0), ("goodbye".to_owned(), 1)]
+        .into_iter()
+        .collect();
+    let tokenizer = WordLevel::builder()
+        .vocab(vocabulary)
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    Tokenizer::new(tokenizer)
+        .save(root.join("tokenizer.json"), false)
+        .unwrap();
+}
+
 fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
     backend: &B,
     model_path: &Path,
@@ -1251,6 +1262,23 @@ fn assert_automatic_planning_conformance() {
     assert!(matches!(
         drafting.as_speculative_draft(),
         Some(SpeculativeDraft::External(_))
+    ));
+
+    let incompatible_assistant = TestDirectory::new();
+    write_loadable_assistant_artifact(incompatible_assistant.path());
+    replace_with_incompatible_tokenizer(incompatible_assistant.path());
+    external.drafting = DraftingPlan::External {
+        model: incompatible_assistant.path().display().to_string(),
+        placement: DraftPlacementPlan::Target,
+        max_draft_tokens: 4,
+        lookahead: true,
+        adaptive_lookahead: true,
+    };
+    assert!(matches!(
+        LoadedModel::load_execution_plan(&backend, artifact.path(), &external),
+        Err(eredu::api::PlannedModelLoadError::Planning(
+            AutomaticPlanningError::Invalid(message)
+        )) if message.contains("assistant token-id vocabulary mapping does not match the target")
     ));
 }
 
