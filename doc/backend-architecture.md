@@ -105,7 +105,9 @@ family metadata keys or tensor names. Facades and concrete backend adapters
 select that shared registry. Backend composition converts the resolved
 canonical family through the architecture registry and consumes architecture
 parser outputs, never a second raw `model_type` or `general.architecture`
-dispatch table.
+dispatch table. Unsupported family identities therefore remain architecture
+resolver errors transported through the backend-neutral artifact error;
+concrete backends do not declare a parallel model-type dispatch error.
 Loaded backend models and sessions preserve these as two distinct identities:
 `model_family()` returns the canonical architecture-owned `ModelKind`, while
 `effective_model_type()` returns the parsed implementation or nested text-model

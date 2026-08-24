@@ -119,10 +119,6 @@ pub enum Error {
     #[error("checkpoint quantization error: {0}")]
     Quantization(String),
 
-    /// The `model_type` in `config.json` is not supported by this crate.
-    #[error("unsupported model type: {0}")]
-    UnsupportedModelType(String),
-
     /// The model family is recognized but this specific architecture is unsupported.
     #[error("unsupported model architecture: {0}")]
     UnsupportedArchitecture(String),
