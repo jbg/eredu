@@ -14,8 +14,8 @@ pub use crate::backend::{
     ModelLoadOptions,
 };
 pub use crate::composition::mlx::automatic::{
-    discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
-    MlxBackendFactory,
+    create_realtime_backend, discover_hardware, expert_cache_telemetry, mtp_telemetry,
+    residency_telemetry, MlxBackendFactory,
 };
 pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
 pub use crate::composition::mlx::realtime::{

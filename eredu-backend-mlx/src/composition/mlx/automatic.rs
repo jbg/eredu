@@ -20,6 +20,7 @@ use super::{
     capability::available_memory,
     inspection::{inspect_model, MlxInspectionOptions},
     prepared_speculative::validate_external_drafter,
+    realtime::MlxRealtimeBackend,
     speculative::MlxDrafter,
     MlxBackend, ModelLoadOptions,
 };
@@ -53,6 +54,18 @@ impl MlxBackendFactory {
         self.sample_process_memory = sample_process_memory;
         self
     }
+}
+
+/// Creates a single-device realtime backend from a portable device plan.
+///
+/// Application facades use this factory boundary to keep native MLX streams
+/// out of their public API. Backend-author code that needs explicit streams or
+/// collective groups constructs [`MlxRealtimeBackend`] directly instead.
+pub fn create_realtime_backend(device: &DevicePlan) -> Result<MlxRealtimeBackend, Error> {
+    let device = mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
+    let stream = Stream::new_with_device(&device);
+    let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    Ok(MlxRealtimeBackend::new(&stream, &weights_stream))
 }
 
 /// Discovers hardware facts visible to the MLX adapter.

@@ -44,11 +44,15 @@ infrastructure. Cache workers, storage bindings, residency engines, parameter
 plans, and other infrastructure contracts are imported from their owning
 crates. The facade root retains only deliberately application-facing types.
 
-The selected adapter exposes distinct causal and realtime backend types because
-the neutral execution contracts have different model, input, output, session,
-and completion associated types. Both are available through `eredu::api`; an
-application does not depend directly on the concrete backend crate merely to
-select realtime loading and execution.
+The selected adapter exposes the causal backend type and a facade-owned
+realtime backend factory because the neutral execution contracts have
+different model, input, output, session, and completion associated types. The
+factory returns an opaque implementation of the neutral realtime loading and
+execution traits, preventing the concrete backend's native associated types
+and handle-oriented constructors from crossing `eredu::api`. An application
+does not depend directly on the concrete backend crate merely to select local
+realtime loading and execution. Explicit native streams and distributed
+collective groups remain backend-author concerns.
 
 Application-only targets and platform examples can depend solely on the
 `eredu` facade. Infrastructure-aware clients such as the CLI also depend on

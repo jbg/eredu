@@ -32,8 +32,6 @@ pub use eredu_backend_mlx::MlxBackendFactory as LocalBackendFactory;
 pub use eredu_backend_mlx::MlxError as LocalBackendError;
 /// Options for selected-local-backend model inspection.
 pub use eredu_backend_mlx::MlxInspectionOptions as LocalInspectionOptions;
-/// Backend selected for local realtime model loading and execution.
-pub use eredu_backend_mlx::MlxRealtimeBackend as LocalRealtimeBackend;
 /// Load policy accepted by the selected local backend.
 pub use eredu_backend_mlx::ModelLoadOptions as LocalLoadOptions;
 /// Scoped opt-in for selected-backend MTP component timing.
@@ -46,6 +44,54 @@ pub enum LocalDevice {
     Cpu,
     /// The selected native accelerator at this zero-based index.
     Accelerator(u32),
+}
+
+/// Factory for local realtime model loading and execution.
+///
+/// The created backend is intentionally opaque: applications operate it
+/// through the portable realtime traits, while native streams, tensors, and
+/// collective groups remain behind the selected-backend boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalRealtimeBackendFactory {
+    device: LocalDevice,
+}
+
+impl LocalRealtimeBackendFactory {
+    /// Selects the device used for realtime model execution.
+    pub const fn new(device: LocalDevice) -> Self {
+        Self { device }
+    }
+
+    /// Creates a single-device realtime backend with host-side weight loading.
+    ///
+    /// Native backend handles cannot be recovered from the returned value:
+    ///
+    /// ```compile_fail
+    /// let backend = eredu::api::LocalRealtimeBackendFactory::new(
+    ///     eredu::api::LocalDevice::Cpu,
+    /// )
+    /// .create()
+    /// .unwrap();
+    /// let _ = backend.stream();
+    /// ```
+    pub fn create(
+        &self,
+    ) -> Result<
+        impl crate::RealtimeModelLoadingBackend<
+            Preparation = crate::RealtimePreparationPlan,
+            LoadOptions = LocalLoadOptions,
+            Error = LocalBackendError,
+        >,
+        LocalBackendError,
+    > {
+        eredu_backend_mlx::create_realtime_backend(&local_device_plan(self.device))
+    }
+}
+
+impl Default for LocalRealtimeBackendFactory {
+    fn default() -> Self {
+        Self::new(LocalDevice::Cpu)
+    }
 }
 
 /// Process-global configuration for the selected local runtime.
