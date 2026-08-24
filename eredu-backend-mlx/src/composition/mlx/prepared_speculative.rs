@@ -1,18 +1,20 @@
 //! Whole-session MLX speculative generation capability.
 
 use eredu_core::{
-    generation::{GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent},
-    ModelRuntime, MtpCapability, SpeculativeDraft, SpeculativeGenerationBackend,
+    generation::{GenerationCancellationToken, MtpConfig, SemanticEvent},
+    GenerationSequence, ModelRuntime, MtpCapability, PreparedSpeculativeLane,
+    SpeculativeCallbackPublisher, SpeculativeDraft, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeSemanticState,
-    SpeculativeTokenFilterController,
+    SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
+    SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
 };
 use eredu_runtime::{ConstrainedSampler, GenerationSampler};
 use safemlx::{error::Exception, Array};
 
 use super::{
     speculative::{
-        scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
+        scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
+        MlxDrafter, MlxDrafterKind, MlxMtpCache, MlxSpeculativeSampling, MtpExecutionStreams,
     },
     MlxBackend, MlxModelInput, Model, ModelCache,
 };
@@ -25,27 +27,17 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         runtime.session().mtp_capability()
     }
 
-    fn execute_speculative<C, F>(
-        runtime: &mut ModelRuntime<Self>,
-        request: SpeculativeGenerationRequest<'_, Self, Self::Drafter, C, F>,
-    ) -> Result<SpeculativeGenerationOutput, Error>
-    where
-        C: SpeculativeTokenFilterController,
-        F: FnMut(SemanticEvent),
-    {
-        let tokenizer_fingerprint = request.tokenizer_fingerprint;
-        MlxSpeculativeSession::new(runtime, tokenizer_fingerprint).execute(request)
-    }
-
-    fn execute_speculative_batch<C>(
+    fn with_speculative_execution<C, V>(
         runtime: &mut ModelRuntime<Self>,
         request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
     where
         C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
         let tokenizer_fingerprint = request.tokenizer_fingerprint;
-        MlxSpeculativeSession::new(runtime, tokenizer_fingerprint).execute_batch(request)
+        MlxSpeculativeSession::new(runtime, tokenizer_fingerprint).with_execution(request, visitor)
     }
 }
 
@@ -111,13 +103,15 @@ fn run_speculative_batch<'a, B, C>(
     cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
     cache_kind: &str,
     streams: MtpExecutionStreams<'a>,
-    options: MtpSchedulerOptions,
+    visitor: impl SpeculativeGenerationVisitor,
 ) -> Result<SpeculativeGenerationBatchOutput, Exception>
 where
-    B: crate::composition::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
+    B: MlxSpeculativeRuntime<'a>,
     C: SpeculativeTokenFilterController + 'a,
 {
-    let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
+    let topology = streams.topology();
+    let component_timings_collected = component_timing_enabled() && backend.supports_telemetry();
+    let mut prepared = Vec::with_capacity(lanes.len());
     for (lane_index, lane) in lanes.into_iter().enumerate() {
         let MlxSpeculativeLaneRuntime {
             input,
@@ -134,42 +128,36 @@ where
                 "prepared-chat {cache_kind} MTP cache type mismatch at lane {lane_index}"
             ))
         })?;
-        input.with_borrowed(|input| {
-            scheduler.submit_with_semantics_cancellable(
-                cache,
-                input,
-                config,
-                prng_key,
-                sampler,
-                semantic,
+        let sampling = MlxSpeculativeSampling::new(sampler);
+        let randomness = <MlxSpeculativeSampling<MlxPreparedSampler<C>> as SpeculativeSampling>::initialize_randomness(
+            prng_key,
+            config.temperature,
+            streams,
+        )?;
+        prepared.push(PreparedSpeculativeLane {
+            cache,
+            input,
+            runtime: SpeculativeOutputRuntime::new(
+                sampling,
+                GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
+                SpeculativeSemanticConstraint::semantic(semantic),
+                SpeculativeCallbackPublisher::semantic(on_event),
                 cancellation,
-                on_event,
-            )
-        })?;
+            ),
+            config,
+            randomness,
+        });
     }
-    scheduler.run()?;
-    let output = scheduler.finish()?;
-    let requests = output
-        .requests
-        .into_iter()
-        .map(|request| {
-            let finish_reason = request.finish_reason.ok_or_else(|| {
-                Exception::custom(format!(
-                    "completed prepared-chat MTP request {} has no finish reason",
-                    request.id.index()
-                ))
-            })?;
-            Ok(SpeculativeGenerationOutput {
-                token_ids: request.token_ids,
-                finish_reason,
-                stats: request.stats,
-            })
-        })
-        .collect::<Result<Vec<_>, Exception>>()?;
-    Ok(SpeculativeGenerationBatchOutput {
-        requests,
-        scheduler: output.scheduler,
-    })
+    visitor
+        .run(
+            backend,
+            prepared,
+            topology,
+            streams.is_split(),
+            component_timings_collected,
+            streams,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
 }
 
 fn neutral_gemma_mtp_cache(
@@ -319,37 +307,39 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         Ok(prepared_lanes)
     }
 
-    fn execute_batch<C>(
+    fn with_execution<C, V>(
         &mut self,
         request: SpeculativeGenerationBatchRequest<'_, MlxBackend<'world>, MlxDrafter, C>,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
     where
         C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
         let SpeculativeGenerationBatchRequest {
             drafting,
             lanes,
-            scheduler,
             tokenizer_fingerprint: _,
         } = request;
         match drafting {
             SpeculativeDraft::External(drafter) => {
-                self.generate_speculative_batch_with_external_draft(drafter, lanes, scheduler)
+                self.generate_speculative_batch_with_external_draft(drafter, lanes, visitor)
             }
             SpeculativeDraft::Embedded => {
-                self.generate_speculative_batch_with_embedded_draft(lanes, scheduler)
+                self.generate_speculative_batch_with_embedded_draft(lanes, visitor)
             }
         }
     }
 
-    fn generate_speculative_batch_with_external_draft<C>(
+    fn generate_speculative_batch_with_external_draft<C, V>(
         &mut self,
         drafter: &mut MlxDrafter,
         lanes: Vec<SpeculativeGenerationLane<'_, MlxBackend<'world>, C>>,
-        scheduler: MtpSchedulerOptions,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
     where
         C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
         self.validate_drafter_compatibility(drafter)?;
         let target_stream = self.runtime.backend().stream().clone();
@@ -371,7 +361,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     neutral_gemma_mtp_cache,
                     "Gemma 4 external assistant",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -386,7 +376,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     neutral_muse_mtp_cache,
                     "Muse-Glimmer DFlash",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -398,13 +388,14 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         }
     }
 
-    fn generate_speculative_batch_with_embedded_draft<C>(
+    fn generate_speculative_batch_with_embedded_draft<C, V>(
         &mut self,
         lanes: Vec<SpeculativeGenerationLane<'_, MlxBackend<'world>, C>>,
-        scheduler: MtpSchedulerOptions,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
     where
         C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
         let stream = self.runtime.backend().stream().clone();
         let mut cache = self.new_mtp_cache(lanes.len());
@@ -422,7 +413,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     neutral_deepseek_mtp_cache,
                     "DeepSeek embedded",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -437,7 +428,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     nemotron_mtp_cache,
                     "Nemotron-H embedded",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -452,7 +443,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     neutral_inkling_mtp_cache,
                     "Inkling embedded",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -467,7 +458,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     qwen_next_mtp_cache,
                     "Qwen3-Next embedded",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -482,7 +473,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     qwen35_mtp_cache,
                     "Qwen3.5 embedded",
                     streams,
-                    scheduler,
+                    visitor,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
@@ -492,139 +483,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             model.mtp_capability()
         ))),
         }
-    }
-
-    fn execute<C, F>(
-        &mut self,
-        request: SpeculativeGenerationRequest<'_, MlxBackend<'world>, MlxDrafter, C, F>,
-    ) -> Result<SpeculativeGenerationOutput, Error>
-    where
-        C: SpeculativeTokenFilterController,
-        F: FnMut(SemanticEvent),
-    {
-        let SpeculativeGenerationRequest {
-            prompt,
-            drafting,
-            generation,
-            config,
-            constraint,
-            semantic,
-            scheduler,
-            cancellation,
-            tokenizer_fingerprint: _,
-            on_event,
-        } = request;
-        let (prng_key, sampler) = Self::prepare_mlx_speculative_sampling(generation, constraint)?;
-        match drafting {
-            SpeculativeDraft::External(drafter) => self.generate_speculative_with_external_draft(
-                prompt,
-                drafter,
-                config,
-                prng_key,
-                sampler,
-                semantic,
-                scheduler,
-                cancellation,
-                on_event,
-            ),
-            SpeculativeDraft::Embedded => self.generate_speculative_with_embedded_draft(
-                prompt,
-                config,
-                prng_key,
-                sampler,
-                semantic,
-                scheduler,
-                cancellation,
-                on_event,
-            ),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn generate_speculative_with_external_draft<C, F>(
-        &mut self,
-        input: MlxModelInput,
-        drafter: &mut MlxDrafter,
-        config: MtpConfig,
-        prng_key: Option<Array>,
-        mut sampler: MlxPreparedSampler<C>,
-        semantic: Box<dyn SpeculativeSemanticState>,
-        scheduler: MtpSchedulerOptions,
-        cancellation: GenerationCancellationToken,
-        on_event: F,
-    ) -> Result<SpeculativeGenerationOutput, Error>
-    where
-        C: SpeculativeTokenFilterController,
-        F: FnMut(SemanticEvent),
-    {
-        self.validate_drafter_compatibility(drafter)?;
-        let target_stream = self.runtime.backend().stream().clone();
-        let draft_stream = drafter.stream().clone();
-        let streams = MtpExecutionStreams::new(&target_stream, &draft_stream)?;
-        input.with_borrowed(|model_input| {
-            let (model, cache) = self.model_and_cache();
-            let (token_ids, stats, finish_reason) = model
-                .generate_mtp_input_with_semantics_and_options(
-                    drafter,
-                    cache,
-                    model_input,
-                    &config,
-                    prng_key,
-                    &mut sampler,
-                    semantic,
-                    cancellation,
-                    streams,
-                    scheduler,
-                    on_event,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))?;
-            Ok(SpeculativeGenerationOutput {
-                token_ids,
-                finish_reason,
-                stats,
-            })
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn generate_speculative_with_embedded_draft<C, F>(
-        &mut self,
-        input: MlxModelInput,
-        config: MtpConfig,
-        prng_key: Option<Array>,
-        mut sampler: MlxPreparedSampler<C>,
-        semantic: Box<dyn SpeculativeSemanticState>,
-        scheduler: MtpSchedulerOptions,
-        cancellation: GenerationCancellationToken,
-        on_event: F,
-    ) -> Result<SpeculativeGenerationOutput, Error>
-    where
-        C: SpeculativeTokenFilterController,
-        F: FnMut(SemanticEvent),
-    {
-        let stream = self.runtime.backend().stream().clone();
-        input.with_borrowed(|model_input| {
-            let (model, cache) = self.model_and_cache();
-            let (token_ids, stats, finish_reason) = model
-                .generate_embedded_mtp_input_with_semantics_and_options(
-                    cache,
-                    model_input,
-                    &config,
-                    prng_key,
-                    &mut sampler,
-                    semantic,
-                    cancellation,
-                    &stream,
-                    scheduler,
-                    on_event,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))?;
-            Ok(SpeculativeGenerationOutput {
-                token_ids,
-                finish_reason,
-                stats,
-            })
-        })
     }
 
     // Independent target caches are an implementation detail of prepared-chat MTP.

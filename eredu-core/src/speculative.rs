@@ -40,34 +40,6 @@ pub struct SpeculativeGenerationBatchOutput {
     pub scheduler: MtpSchedulerStats,
 }
 
-/// Execution-ready speculative request prepared above a selected backend.
-pub struct SpeculativeGenerationRequest<'a, B, D, C, F>
-where
-    B: TextGenerationBackend,
-    C: SpeculativeTokenFilterController,
-{
-    /// Backend-owned prompt prepared by the selected session backend.
-    pub prompt: B::Prompt,
-    /// Embedded or separately prepared draft-model selection.
-    pub drafting: SpeculativeDraft<'a, D>,
-    /// Fully resolved portable sampling configuration and random seed.
-    pub generation: TextGenerationConfig,
-    /// Resolved token budget, proposal width, temperature, and EOS ids.
-    pub config: MtpConfig,
-    /// Portable canonical grammar state.
-    pub constraint: C,
-    /// Transactional decoded semantic parser state.
-    pub semantic: Box<dyn SpeculativeSemanticState>,
-    /// Fair-scheduler and optimistic-lookahead controls.
-    pub scheduler: MtpSchedulerOptions,
-    /// Cooperative cancellation observed between exact submissions.
-    pub cancellation: GenerationCancellationToken,
-    /// Target tokenizer vocabulary identity used for drafter compatibility.
-    pub tokenizer_fingerprint: [u8; 32],
-    /// Called synchronously after each semantic event commits.
-    pub on_event: F,
-}
-
 /// One independently executable lane in a speculative batch.
 pub struct SpeculativeGenerationLane<'a, B, C>
 where
@@ -90,7 +62,7 @@ where
     pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
 
-/// Execution-ready fair-scheduler speculative batch.
+/// Backend-preparation input for one or more speculative lanes.
 pub struct SpeculativeGenerationBatchRequest<'a, B, D, C>
 where
     B: TextGenerationBackend,
@@ -102,15 +74,15 @@ where
     pub lanes: Vec<SpeculativeGenerationLane<'a, B, C>>,
     /// Target tokenizer vocabulary identity used for drafter compatibility.
     pub tokenizer_fingerprint: [u8; 32],
-    /// Bounded scheduler and optimistic-lookahead controls.
-    pub scheduler: MtpSchedulerOptions,
 }
 
-/// Optional whole-session speculative-generation capability.
+/// Optional speculative model-session capability.
 ///
-/// Implementations own draft models, target and draft placement, tensor
-/// caches, sampling execution, and exact completion. A backend is selected for
-/// the complete model session; requests cannot mix runtime implementations.
+/// Implementations prepare native executors, caches, sampling state, and
+/// execution placement, then expose them to the caller-provided neutral
+/// visitor. The backend must not drive request lifecycles or fair scheduling.
+/// A backend is selected for the complete model session; requests cannot mix
+/// runtime implementations.
 pub trait SpeculativeGenerationBackend: TextGenerationBackend {
     /// Backend-owned separately prepared draft model.
     type Drafter;
@@ -118,22 +90,15 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
     /// Reports fail-closed speculative support for the selected model session.
     fn mtp_capability(runtime: &ModelRuntime<Self>) -> MtpCapability;
 
-    /// Executes one prepared speculative request.
-    fn execute_speculative<C, F>(
-        runtime: &mut ModelRuntime<Self>,
-        request: SpeculativeGenerationRequest<'_, Self, Self::Drafter, C, F>,
-    ) -> Result<SpeculativeGenerationOutput, Self::Error>
-    where
-        C: SpeculativeTokenFilterController,
-        F: FnMut(SemanticEvent);
-
-    /// Executes independent lanes through one fair speculative scheduler.
-    fn execute_speculative_batch<C>(
+    /// Prepares native execution resources and lends them to neutral orchestration.
+    fn with_speculative_execution<C, V>(
         runtime: &mut ModelRuntime<Self>,
         request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
     where
-        C: SpeculativeTokenFilterController;
+        C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor;
 }
 
 /// Relationship between target and assistant execution placements.
@@ -482,6 +447,55 @@ pub struct SpeculativeRandomness<R, D> {
     pub target: Option<R>,
     /// Position-addressable assistant randomness.
     pub draft: Option<D>,
+}
+
+/// One backend-prepared lane lent to neutral speculative orchestration.
+///
+/// The lane contains opaque execution values but no scheduler or lifecycle
+/// policy. Its cache borrow remains valid only for the visitor invocation.
+pub struct PreparedSpeculativeLane<'a, E, S, C, P>
+where
+    E: SpeculativeExecutor,
+    S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
+{
+    /// Backend-owned request cache.
+    pub cache: &'a mut E::Cache,
+    /// Backend-owned prepared model input.
+    pub input: E::Input,
+    /// Validated speculative generation controls.
+    pub config: MtpConfig,
+    /// Canonical sampling, constraint, publication, and cancellation state.
+    pub runtime: SpeculativeOutputRuntime<S, C, P>,
+    /// Independent target and draft random streams.
+    pub randomness: SpeculativeRandomness<S::RandomState, S::DraftRandomness>,
+}
+
+/// Facade/runtime-owned driver for backend-prepared speculative execution.
+///
+/// The generic method lets a backend lend any concrete executor realization
+/// without erasing native tensor, cache, completion, or sampling types. The
+/// visitor owns request registration, fair action selection, completion
+/// driving, terminal validation, and public output construction.
+pub trait SpeculativeGenerationVisitor {
+    /// Drives one prepared set of lanes through the neutral lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    fn run<'a, E, S, C, P>(
+        self,
+        executor: &'a mut E,
+        lanes: Vec<PreparedSpeculativeLane<'a, E, S, C, P>>,
+        topology: SpeculativeExecutionTopology,
+        optimistic_execution_available: bool,
+        component_timings_collected: bool,
+        context: E::Context<'a>,
+    ) -> Result<SpeculativeGenerationBatchOutput, SpeculativeDriverError<E::Error>>
+    where
+        E: SpeculativeExecutor + 'a,
+        S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>>
+            + 'a,
+        C: SpeculativeConstraint,
+        P: SpeculativePublisher<C>;
 }
 
 /// High-level sampling contract used by speculative orchestration.

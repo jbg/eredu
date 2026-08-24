@@ -870,6 +870,12 @@ pub enum GenerationError {
     /// A speculative request table was consumed before reaching terminal state.
     #[error("cannot finish an MTP scheduler with active requests")]
     ActiveSpeculativeRequests,
+    /// A terminal speculative request did not retain its canonical finish reason.
+    #[error("completed MTP request {index} has no finish reason")]
+    MissingMtpFinishReason {
+        /// Stable request insertion index.
+        index: usize,
+    },
     /// No assistant proposal may be generated per round.
     #[error("MTP max_draft_tokens must be positive")]
     ZeroDraftTokens,

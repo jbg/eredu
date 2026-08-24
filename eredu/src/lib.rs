@@ -75,13 +75,12 @@ pub use eredu_core::{
     ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount,
     SpeculativeDraft, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
-    SpeculativeGenerationRequest, SpeculativeTokenFilterController, StateLayout,
-    StateMemoryAssumptions, StaticMemoryReport, SubgroupMembership, Submission, TextGeneration,
-    TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TimingTelemetry,
-    TokenFilter, TokenFilterController, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
-    TokenizedMultimodalSegment, TopologyPreflightReport, TransferTelemetry, ValueDescriptor, Video,
-    VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
-    EXECUTION_PLAN_SCHEMA_VERSION,
+    SpeculativeTokenFilterController, StateLayout, StateMemoryAssumptions, StaticMemoryReport,
+    SubgroupMembership, Submission, TextGeneration, TextGenerationBackend, TextGenerationConfig,
+    TextSamplingStrategy, TimingTelemetry, TokenFilter, TokenFilterController, TokenFilterError,
+    TokenOutput, TokenizedMultimodalRequest, TokenizedMultimodalSegment, TopologyPreflightReport,
+    TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 #[cfg(all(test, feature = "mlx-test-support"))]
 mod test_utils;

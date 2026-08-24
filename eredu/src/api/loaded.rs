@@ -6,7 +6,7 @@ use eredu_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
     DraftingPlan, ExternalDraftArtifact, MtpCapability, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeGenerationOutput, SpeculativeGenerationRequest,
+    SpeculativeGenerationOutput,
 };
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use eredu_text::{
@@ -263,22 +263,28 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             options.max_draft_tokens,
             caller_stop_sequences,
         )?;
-        B::execute_speculative(
+        let mut output = B::with_speculative_execution(
             &mut self.runtime,
-            SpeculativeGenerationRequest {
-                prompt,
+            SpeculativeGenerationBatchRequest {
                 drafting,
-                generation,
-                config,
-                constraint,
-                semantic,
-                scheduler: options.scheduler,
-                cancellation,
+                lanes: vec![SpeculativeGenerationLane {
+                    prompt,
+                    generation,
+                    config,
+                    constraint,
+                    semantic,
+                    cancellation,
+                    on_event: Box::new(on_event),
+                }],
                 tokenizer_fingerprint: self.tokenizer_fingerprint,
-                on_event,
             },
+            eredu_runtime::RunSpeculativeGeneration::new(options.scheduler),
         )
-        .map_err(PreparedChatMtpError::Backend)
+        .map_err(PreparedChatMtpError::Backend)?;
+        Ok(output
+            .requests
+            .pop()
+            .expect("one speculative lane produces one terminal output"))
     }
 
     /// Generates independent prepared chats through one fair speculative scheduler.
@@ -313,14 +319,14 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 on_event: lane.on_event,
             });
         }
-        B::execute_speculative_batch(
+        B::with_speculative_execution(
             &mut self.runtime,
             SpeculativeGenerationBatchRequest {
                 drafting,
                 lanes: prepared_lanes,
                 tokenizer_fingerprint: self.tokenizer_fingerprint,
-                scheduler,
             },
+            eredu_runtime::RunSpeculativeGeneration::new(scheduler),
         )
         .map_err(PreparedChatMtpError::Backend)
     }

@@ -39,6 +39,8 @@ pub mod prefetch;
 pub mod realtime;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
+/// Backend-neutral speculative request lifecycle and fair scheduling.
+pub mod speculative;
 /// Architecture-declared mutable state and concrete runtime realizations.
 pub mod state;
 mod weight_residency;
@@ -136,6 +138,7 @@ pub use residency::{
     ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup, ResidentLayerGroupReport,
     WeightBinding, WeightBindingPlan, WeightBindingSelectionError, WeightMaterializationReport,
 };
+pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use state::{
     DeviceState, LayerRuntimeState, ModelStateIdentity, PagedStatePlan,
     ResettableRuntimeLayerState, ResettableRuntimeState, RuntimeLayerState, RuntimeState,

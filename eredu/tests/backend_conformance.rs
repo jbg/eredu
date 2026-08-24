@@ -24,7 +24,10 @@ use eredu::{
     },
     core::{
         checkpoint::TensorDtype, BoundedResidencyRequirement, CandidateAdmission,
-        MtpSchedulerStats, MtpStats,
+        PreparedSpeculativeLane, ProposalDecision, SamplingPlacement, SpeculativeCallbackPublisher,
+        SpeculativeCommit, SpeculativeExecutor, SpeculativeGenerationVisitor,
+        SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
+        SpeculativeSemanticConstraint,
     },
     load_realtime_model_with_options, AdmissionRequest, AdmissionResult, ArtifactFormat,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
@@ -44,9 +47,9 @@ use eredu::{
     ResidencyPlan, ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
     SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
-    StateLayout, StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig,
-    TokenFilter, TokenOutput, ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
+    SpeculativeGenerationOutput, SpeculativeTokenFilterController, StateLayout, StaticMemoryReport,
+    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
+    ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::Completion;
 use tokenizers::{
@@ -94,6 +97,8 @@ struct MockToken(u32);
 enum MockError {
     #[error("synthetic token extraction failure for token {0}")]
     Token(u32),
+    #[error("synthetic speculative failure: {0}")]
+    Speculative(String),
 }
 
 impl TokenOutput for MockToken {
@@ -602,6 +607,200 @@ impl ExecutionPlanBackendFactory for MockBackend {
 
 struct MockDrafter;
 
+struct MockSpeculativeExecutor;
+
+impl SpeculativeExecutor for MockSpeculativeExecutor {
+    type Input = Vec<u32>;
+    type Cache = usize;
+    type TargetState = ();
+    type DraftState = ();
+    type CacheCheckpoint = usize;
+    type Verification = Vec<u32>;
+    type Logits = u32;
+    type Context<'a> = ();
+    type Completion = Done;
+    type Telemetry = ();
+    type Error = MockError;
+
+    fn max_proposals(&self) -> usize {
+        1
+    }
+
+    fn prefill<'a>(
+        &mut self,
+        input: Self::Input,
+        cache: &mut Self::Cache,
+        _: Self::Context<'a>,
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+    where
+        Self: 'a,
+    {
+        *cache = input.len();
+        Ok(SpeculativePrefill {
+            state: (),
+            logits: 7,
+            evaluated_tokens: input.len(),
+        })
+    }
+
+    fn begin_proposal<'a>(
+        &mut self,
+        _: &Self::TargetState,
+        _: u32,
+        _: usize,
+        _: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error> {
+        Ok(())
+    }
+
+    fn proposal_logits<'a>(
+        &mut self,
+        _: &mut Self::DraftState,
+        _: u32,
+        _: Self::Context<'a>,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(11)
+    }
+
+    fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
+        *cache
+    }
+
+    fn submit_verification<'a>(
+        &mut self,
+        input_tokens: &[u32],
+        cache: &mut Self::Cache,
+        _: Self::Context<'a>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
+        *cache += input_tokens.len();
+        Ok(Submission {
+            output: vec![11, 17],
+            completion: Done,
+        })
+    }
+
+    fn verification_logits<'a>(
+        output: &Self::Verification,
+        index: usize,
+        _: Self::Context<'a>,
+    ) -> Result<Self::Logits, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(output[index])
+    }
+
+    fn commit_verification<'a>(
+        &mut self,
+        _: Self::Verification,
+        _: Self::DraftState,
+        cache: &mut Self::Cache,
+        checkpoint: Self::CacheCheckpoint,
+        verified_inputs: usize,
+        _: Self::Context<'a>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
+        *cache = checkpoint + verified_inputs;
+        Ok(SpeculativeCommit {
+            state: (),
+            replayed_tokens: 0,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MockSpeculativeSampling;
+
+impl SpeculativeSampling for MockSpeculativeSampling {
+    type Logits = u32;
+    type Distribution = u32;
+    type Seed = ();
+    type RandomState = ();
+    type DraftRandomness = ();
+    type Context<'a> = ();
+    type Error = MockError;
+
+    fn initialize_randomness<'a>(
+        _: Option<Self::Seed>,
+        _: f32,
+        _: Self::Context<'a>,
+    ) -> Result<SpeculativeRandomness<Self::RandomState, Self::DraftRandomness>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(SpeculativeRandomness {
+            target: None,
+            draft: None,
+        })
+    }
+
+    fn draft_randomness_at<'a>(
+        _: &Self::DraftRandomness,
+        _: usize,
+        _: Self::Context<'a>,
+    ) -> Result<Self::RandomState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
+
+    fn process_logits<'a>(
+        &mut self,
+        logits: &Self::Logits,
+        _: f32,
+        _: &[u32],
+        _: SamplingPlacement,
+        _: Self::Context<'a>,
+    ) -> Result<Self::Distribution, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(*logits)
+    }
+
+    fn sample<'a>(
+        &self,
+        distribution: &Self::Distribution,
+        _: f32,
+        _: Option<&mut Self::RandomState>,
+        _: SamplingPlacement,
+        _: Self::Context<'a>,
+    ) -> Result<u32, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(*distribution)
+    }
+
+    fn decide_proposal<'a>(
+        &self,
+        _: &Self::Distribution,
+        _: &Self::Distribution,
+        _: u32,
+        _: f32,
+        _: Option<&mut Self::RandomState>,
+        _: Self::Context<'a>,
+    ) -> Result<ProposalDecision, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(ProposalDecision::Accept)
+    }
+
+    fn commit_token<'a>(
+        &mut self,
+        _: &Self::Distribution,
+        _: u32,
+        _: SamplingPlacement,
+        _: Self::Context<'a>,
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
+}
+
 impl SpeculativeGenerationBackend for MockBackend {
     type Drafter = MockDrafter;
 
@@ -611,62 +810,52 @@ impl SpeculativeGenerationBackend for MockBackend {
         }
     }
 
-    fn execute_speculative<C, F>(
-        _: &mut ModelRuntime<Self>,
-        request: SpeculativeGenerationRequest<'_, Self, Self::Drafter, C, F>,
-    ) -> Result<SpeculativeGenerationOutput, MockError>
-    where
-        C: SpeculativeTokenFilterController,
-        F: FnMut(SemanticEvent),
-    {
-        assert!(matches!(request.drafting, SpeculativeDraft::Embedded));
-        assert!(!request.prompt.is_empty());
-        assert_eq!(request.config.max_draft_tokens, 4);
-        assert_eq!(request.generation.seed(), 0);
-        request.constraint.filter_at(&[]).unwrap();
-        let mut on_event = request.on_event;
-        let mut semantic = request.semantic;
-        semantic.fork_box().unwrap();
-        semantic.finish(FinishReason::MaxTokens).unwrap();
-        for event in semantic.take_events() {
-            on_event(event);
-        }
-        Ok(SpeculativeGenerationOutput {
-            token_ids: vec![7, 11],
-            finish_reason: FinishReason::MaxTokens,
-            stats: MtpStats::default(),
-        })
-    }
-
-    fn execute_speculative_batch<C>(
+    fn with_speculative_execution<C, V>(
         _: &mut ModelRuntime<Self>,
         request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, MockError>
     where
         C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
         assert!(matches!(request.drafting, SpeculativeDraft::Embedded));
-        let requests = request
-            .lanes
-            .into_iter()
-            .map(|mut lane| {
-                assert!(!lane.prompt.is_empty());
-                assert_eq!(lane.config.max_draft_tokens, 2);
-                lane.semantic.finish(FinishReason::MaxTokens).unwrap();
-                for event in lane.semantic.take_events() {
-                    (lane.on_event)(event);
-                }
-                SpeculativeGenerationOutput {
-                    token_ids: vec![13],
-                    finish_reason: FinishReason::MaxTokens,
-                    stats: MtpStats::default(),
-                }
-            })
-            .collect();
-        Ok(SpeculativeGenerationBatchOutput {
-            requests,
-            scheduler: MtpSchedulerStats::default(),
-        })
+        let mut caches = vec![0; request.lanes.len()];
+        let mut prepared = Vec::with_capacity(request.lanes.len());
+        for (lane, cache) in request.lanes.into_iter().zip(caches.iter_mut()) {
+            assert!(!lane.prompt.is_empty());
+            assert_eq!(lane.generation.seed(), 0);
+            lane.constraint.filter_at(&[]).unwrap();
+            prepared.push(PreparedSpeculativeLane {
+                cache,
+                input: lane.prompt,
+                config: lane.config.clone(),
+                runtime: SpeculativeOutputRuntime::new(
+                    MockSpeculativeSampling,
+                    eredu::core::generation::GenerationSequence::new(
+                        lane.config.max_tokens,
+                        lane.config.eos_token_ids.iter().copied(),
+                    ),
+                    SpeculativeSemanticConstraint::semantic(lane.semantic),
+                    SpeculativeCallbackPublisher::semantic(lane.on_event),
+                    lane.cancellation,
+                ),
+                randomness: SpeculativeRandomness {
+                    target: None,
+                    draft: None,
+                },
+            });
+        }
+        visitor
+            .run(
+                &mut MockSpeculativeExecutor,
+                prepared,
+                eredu::core::SpeculativeExecutionTopology::Single,
+                false,
+                false,
+                (),
+            )
+            .map_err(|error| MockError::Speculative(error.to_string()))
     }
 }
 
@@ -828,7 +1017,13 @@ fn speculative_client_code<B: SpeculativeGenerationBackend>(
         .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
             input: PreparedChatInput::rendered_prompt(prepared),
             drafting: SpeculativeDraft::Embedded,
-            settings: PreparedChatGenerationSettings::default(),
+            settings: PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             options: PreparedChatMtpGenerationOptions::default(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -848,7 +1043,13 @@ fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
             drafting: SpeculativeDraft::Embedded,
             lanes: vec![PreparedChatMtpBatchLane {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                settings: PreparedChatGenerationSettings::default(),
+                settings: PreparedChatGenerationSettings {
+                    overrides: GenerationConfigOverrides {
+                        max_new_tokens: Some(2),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
                 max_draft_tokens: NonZeroUsize::new(2).unwrap(),
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
@@ -1268,19 +1469,27 @@ fn assert_prepared_generation_and_speculative_conformance() {
     assert_eq!(speculative.finish_reason, FinishReason::MaxTokens);
     assert_eq!(
         speculative_events,
-        vec![SemanticEvent::Finished {
-            reason: FinishReason::MaxTokens
-        }]
+        vec![
+            SemanticEvent::TextDelta("ordinary_6".into()),
+            SemanticEvent::TextDelta("ordinary_10".into()),
+            SemanticEvent::Finished {
+                reason: FinishReason::MaxTokens
+            },
+        ]
     );
 
     let (batch, batch_events) = speculative_batch_client_code(&mut model, &prepared);
     assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].token_ids, vec![13]);
+    assert_eq!(batch.requests[0].token_ids, vec![7, 11]);
     assert_eq!(
         batch_events,
-        vec![SemanticEvent::Finished {
-            reason: FinishReason::MaxTokens
-        }]
+        vec![
+            SemanticEvent::TextDelta("ordinary_6".into()),
+            SemanticEvent::TextDelta("ordinary_10".into()),
+            SemanticEvent::Finished {
+                reason: FinishReason::MaxTokens
+            },
+        ]
     );
 }
 

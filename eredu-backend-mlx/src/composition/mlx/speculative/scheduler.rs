@@ -1,4 +1,4 @@
-//! MLX speculative scheduling over the portable executor contract.
+//! MLX resource adaptation for neutral speculative scheduling.
 
 use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
@@ -9,11 +9,12 @@ use eredu_core::{
     resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
     SpeculativeOptimisticBranch, SpeculativeProposal,
 };
+#[cfg(test)]
+use eredu_core::{MtpSchedulerStats, SpeculativeRequestTable};
 use eredu_core::{
-    MtpSchedulerStats, MtpStats, SpeculativeCallbackPublisher, SpeculativeDriverError,
-    SpeculativeExecutor, SpeculativeOutputError, SpeculativeOutputRuntime, SpeculativeRequestTable,
-    SpeculativeSampling, SpeculativeSemanticConstraint, SpeculativeSemanticState,
-    SpeculativeTelemetry,
+    MtpStats, SpeculativeCallbackPublisher, SpeculativeDriverError, SpeculativeExecutor,
+    SpeculativeOutputError, SpeculativeOutputRuntime, SpeculativeSampling,
+    SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTelemetry,
 };
 use safemlx::{error::Exception, Array};
 #[cfg(test)]
@@ -27,9 +28,11 @@ use crate::{
         MlxModelInput,
     },
 };
+#[cfg(test)]
+use eredu_core::generation::MtpRequestId;
 use eredu_core::generation::{
-    FinishReason, GenerationCancellationToken, GenerationSequence, MtpConfig, MtpRequestId,
-    MtpSchedulerOptions, SemanticEvent,
+    FinishReason, GenerationCancellationToken, GenerationSequence, MtpConfig, MtpSchedulerOptions,
+    SemanticEvent,
 };
 
 /// Component timings accumulated by an architecture-specific MTP backend.
@@ -77,7 +80,7 @@ impl Drop for MtpComponentTimingGuard {
     }
 }
 
-fn component_timing_enabled() -> bool {
+pub(crate) fn component_timing_enabled() -> bool {
     COMPONENT_TIMING_ENABLED.get()
 }
 
@@ -170,6 +173,7 @@ where
     )
 }
 
+#[cfg(test)]
 type MlxRequestTable<'a, B, S> = SpeculativeRequestTable<
     'a,
     B,
@@ -178,6 +182,7 @@ type MlxRequestTable<'a, B, S> = SpeculativeRequestTable<
     SpeculativeCallbackPublisher<'a>,
 >;
 
+#[cfg(test)]
 pub struct MtpRequestOutput<S> {
     pub id: MtpRequestId,
     pub token_ids: Vec<u32>,
@@ -188,19 +193,21 @@ pub struct MtpRequestOutput<S> {
     pub cancelled: bool,
 }
 
+#[cfg(test)]
 pub struct MtpScheduleOutput<S> {
     pub requests: Vec<MtpRequestOutput<S>>,
     pub scheduler: MtpSchedulerStats,
 }
 
-/// Single-threaded fair MTP request scheduler.
+/// Test harness for exercising the neutral fair MTP request table with MLX values.
 ///
 /// MLX streams already provide asynchronous device queues. The scheduler stays
 /// deliberately single-threaded: it submits lazy target graphs, performs CPU
 /// draft work, and synchronizes only when a verification result is resolved.
 /// Model parameters are shared through the backend; every request owns its
 /// cache, target state, sampler, PRNG substreams, output, and statistics.
-pub struct MlxMtpScheduler<'a, B, S>
+#[cfg(test)]
+struct MlxMtpScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
@@ -211,6 +218,7 @@ where
     requests: MlxRequestTable<'a, B, S>,
 }
 
+#[cfg(test)]
 impl<'a, B, S> MlxMtpScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
@@ -465,28 +473,39 @@ where
     S: SpeculativeSampler + Clone + 'runtime,
     F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
-    let final_sampler;
-    let token_ids;
-    let stats;
-    {
-        let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
-        scheduler.submit(
+    validate_input(input)?;
+    let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
+        prng_key,
+        config.temperature,
+        streams,
+    )?;
+    let component_timings_collected = component_timing_enabled() && backend.supports_telemetry();
+    let mut scheduler = eredu_runtime::SpeculativeScheduler::new(
+        backend,
+        options,
+        streams.topology(),
+        streams.is_split(),
+        component_timings_collected,
+        streams,
+    )
+    .map_err(speculative_driver_error)?;
+    scheduler
+        .submit(eredu_core::PreparedSpeculativeLane {
             cache,
-            input,
-            config.clone(),
-            prng_key,
-            sampler.clone(),
-            on_token,
-        )?;
-        scheduler.run()?;
-        let mut output = scheduler.finish()?.requests;
-        let request = output.pop().expect("one request was submitted");
-        final_sampler = request.sampler;
-        token_ids = request.token_ids;
-        stats = request.stats;
-    }
-    *sampler = final_sampler;
-    Ok((token_ids, stats))
+            input: MlxModelInput::from(input),
+            config: config.clone(),
+            runtime: plain_runtime(sampler.clone(), config, on_token),
+            randomness,
+        })
+        .map_err(speculative_driver_error)?;
+    scheduler.run().map_err(speculative_driver_error)?;
+    let mut output = scheduler
+        .finish()
+        .map_err(speculative_driver_error)?
+        .requests;
+    let request = output.pop().expect("one request was submitted");
+    *sampler = request.sampler.into_inner();
+    Ok((request.token_ids, request.stats))
 }
 
 /// Runs one request with transactional semantic output.
@@ -509,34 +528,42 @@ where
     S: SpeculativeSampler + Clone + 'runtime,
     F: FnMut(SemanticEvent) + 'runtime,
 {
-    let final_sampler;
-    let token_ids;
-    let stats;
-    let finish_reason;
-    {
-        let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
-        scheduler.submit_with_semantics_cancellable(
+    validate_input(input)?;
+    let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
+        prng_key,
+        config.temperature,
+        streams,
+    )?;
+    let component_timings_collected = component_timing_enabled() && backend.supports_telemetry();
+    let mut scheduler = eredu_runtime::SpeculativeScheduler::new(
+        backend,
+        options,
+        streams.topology(),
+        streams.is_split(),
+        component_timings_collected,
+        streams,
+    )
+    .map_err(speculative_driver_error)?;
+    scheduler
+        .submit(eredu_core::PreparedSpeculativeLane {
             cache,
-            input,
-            config.clone(),
-            prng_key,
-            sampler.clone(),
-            semantic,
-            cancellation,
-            on_event,
-        )?;
-        scheduler.run()?;
-        let mut output = scheduler.finish()?.requests;
-        let request = output.pop().expect("one request was submitted");
-        final_sampler = request.sampler;
-        token_ids = request.token_ids;
-        stats = request.stats;
-        finish_reason = request.finish_reason.ok_or_else(|| {
-            Exception::custom("completed semantic MTP request has no finish reason")
-        })?;
-    }
-    *sampler = final_sampler;
-    Ok((token_ids, stats, finish_reason))
+            input: MlxModelInput::from(input),
+            config: config.clone(),
+            runtime: semantic_runtime(sampler.clone(), config, semantic, cancellation, on_event),
+            randomness,
+        })
+        .map_err(speculative_driver_error)?;
+    scheduler.run().map_err(speculative_driver_error)?;
+    let mut output = scheduler
+        .finish()
+        .map_err(speculative_driver_error)?
+        .requests;
+    let request = output.pop().expect("one request was submitted");
+    let finish_reason = request
+        .finish_reason
+        .ok_or_else(|| Exception::custom("completed semantic MTP request has no finish reason"))?;
+    *sampler = request.sampler.into_inner();
+    Ok((request.token_ids, request.stats, finish_reason))
 }
 
 fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {

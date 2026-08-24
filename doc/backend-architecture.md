@@ -521,6 +521,16 @@ probability arithmetic, random state, cache checkpoints, and concrete
 completion values. Embedded prediction heads and external assistant models use
 the same portable lifecycle.
 
+The prepared-generation capability does not expose whole-request execution
+methods. A backend implements `with_speculative_execution` only to validate the
+draft pairing, prepare typed lane resources, and lend them through
+`SpeculativeGenerationVisitor`. The facade supplies
+`RunSpeculativeGeneration`; `eredu-runtime::SpeculativeScheduler` registers
+lanes, selects fair actions, drives exact completions, validates terminal
+reasons, and constructs public outputs. Single requests use that same path as
+one-lane batches. Concrete backends must not substitute their own lifecycle or
+fair-batch loop.
+
 Architecture families also own external-assistant compatibility proofs. Those
 proofs match target-state publishers, hidden and rotary geometry, target-layer
 captures, and vocabulary requirements before a concrete backend composes the
@@ -529,8 +539,9 @@ restate family-specific compatibility rules.
 
 ## Scheduling and cancellation
 
-The core scheduler owns queued, prepared, submitted, committed, failed,
-cancelled, and abandoned states. Backend adapters supply submission and exact
+The core state machines own queued, prepared, submitted, committed, failed,
+cancelled, and abandoned states. Facade/runtime schedulers own action selection
+and progress; backend adapters supply typed resources, submission, and exact
 completion observation. A submitted request remains transactional until its
 completion is observed, even when its client has cancelled or disconnected.
 

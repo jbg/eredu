@@ -4,7 +4,7 @@
 pub mod embedded;
 /// External assistant adapters over neutral family equations and state.
 pub mod external;
-/// MLX scheduler and semantic-generation adapter over the portable core engine.
+/// MLX semantic-generation resource adapter over the portable runtime driver.
 pub mod scheduler;
 
 pub use scheduler::MtpComponentTimingGuard;
