@@ -78,7 +78,7 @@ impl MlxModel {
     }
 
     /// Wraps a directly constructed replicated model for backend integration tests.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub const fn complete_for_test(model: Model, runtime_state_dtype_bytes: NonZeroU8) -> Self {
         Self::complete(model, runtime_state_dtype_bytes)
     }
@@ -88,7 +88,7 @@ impl MlxModel {
     }
 
     /// Reports speculative-weight readiness to backend integration tests.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn mtp_capability_for_test(&self) -> eredu_core::MtpCapability {
         match &self.inner {
             MlxModelKind::Complete(model) => model.mtp_capability(),
@@ -111,7 +111,7 @@ impl MlxModel {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn into_complete(self) -> Result<Model, Error> {
         match self.inner {
             MlxModelKind::Complete(model) => Ok(model),
@@ -244,7 +244,7 @@ impl<'a> MlxBackend<'a> {
         self.stream.synchronize().map_err(Into::into)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn communication_for_topology(
         &self,
         topology: crate::backend::MlxParallelContext,

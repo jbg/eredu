@@ -31,35 +31,38 @@ fn no_default_features_test_graph_has_no_concrete_backend() {
 }
 
 #[test]
-fn production_mlx_feature_does_not_enable_backend_test_support() {
+fn published_crates_do_not_expose_test_support_features() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let output = Command::new(env!("CARGO"))
         .args([
-            "tree",
+            "metadata",
             "--manifest-path",
             manifest.to_str().unwrap(),
-            "--no-default-features",
-            "--features",
-            "mlx",
-            "--edges",
-            "normal,build,features",
-            "--prefix",
-            "none",
+            "--format-version",
+            "1",
+            "--no-deps",
         ])
         .output()
-        .expect("cargo tree must run");
+        .expect("cargo metadata must run");
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let tree = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        tree.contains("eredu-backend-mlx v"),
-        "missing backend in:\n{tree}"
-    );
-    assert!(
-        !tree.contains("eredu-backend-mlx feature \"test-support\""),
-        "production MLX graph enables backend test support:\n{tree}"
-    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for name in ["eredu", "eredu-backend-mlx"] {
+        let package = metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} package metadata"));
+        let features = package["features"].as_object().unwrap();
+        for forbidden in ["test-support", "mlx-test-support"] {
+            assert!(
+                !features.contains_key(forbidden),
+                "published package {name} exposes support-only feature {forbidden}"
+            );
+        }
+    }
 }

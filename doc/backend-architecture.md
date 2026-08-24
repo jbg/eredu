@@ -23,21 +23,21 @@ The `eredu` facade is also portable when built with
 `default-features = false`. Its default `mlx` feature selects the optional
 `eredu-backend-mlx` crate. The facade exposes a flat, application-facing local
 adapter under `eredu::api`; it does not reproduce the implementation crate's
-backend or composition module tree. Backend fixture APIs are activated only by
-the facade's development dependency; the production `mlx` feature does not
-enable backend `test-support`. The facade does not directly depend on
-`eredu-nn` in production; facade tests that exercise neutral neural contracts
-use it as a development dependency.
+backend or composition module tree. Backend-internal fixtures and composition
+tests are crate-private unit tests; published crates expose no test-support
+feature or fixture namespace. The facade does not directly depend on `eredu-nn`
+in production; facade tests that exercise neutral neural contracts use it as a
+development dependency.
 
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
 application-facing adapter as an explicit flat root API and deliberately makes
 its reusable `backend` module tree public for backend authors. Family
-composition and architecture-erased dispatch remain crate-private. The
-feature-gated `testing` namespace exists only for cross-crate integration
-fixtures and is not enabled by the production `mlx` feature. The backend crate
-does not alias neutral crates into its namespace; direct backend consumers
-import neutral contracts from their owning crates.
+composition and architecture-erased dispatch remain crate-private. Native
+facade integration tests use only the flat adapter, while tests that require
+composition internals live in `eredu-backend-mlx`. The backend crate does not
+alias neutral crates into its namespace; direct backend consumers import
+neutral contracts from their owning crates.
 
 Portable checkpoint quantization requests and storage diagnostics used by
 applications are re-exported by the facade; applications do not depend on
@@ -723,9 +723,9 @@ The repository mechanically verifies stable dependency and behavior boundaries:
 - the feature-disabled `portable_facade` and `backend_conformance` suites compile
   and exercise the public contracts through mock backends, with the facade's
   complete normal, build, and development dependency graph remaining free of
-  MLX; the separate `eredu-mlx-tests` package compiles the facade source as
-  its own library target and therefore owns and runs the facade's MLX unit
-  tests as well as the MLX integration targets; and
+  MLX; native facade integration tests compile the published facade target
+  normally and backend composition coverage remains in crate-private backend
+  unit tests; and
 - architecture, runtime, and backend conformance tests cover the relevant
   production contracts.
 

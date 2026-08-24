@@ -53,11 +53,6 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-#[cfg(test)]
-use std::collections::HashMap;
-
-#[cfg(test)]
-use crate::backend::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     backend::error::Error,
     backend::nn::{
@@ -1120,7 +1115,7 @@ impl PipelineStageCompletion {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl PipelineStageCompletion {
     pub fn into_logits(self) -> Result<Option<Array>, Error> {
         self.synchronize()?;
@@ -1270,12 +1265,8 @@ impl PipelineStateSlot {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl PipelineStateSlot {
-    pub const fn policy(&self) -> &StateTensorPolicy {
-        &self.policy
-    }
-
     pub const fn offset(&self) -> i32 {
         self.offset
     }
@@ -1415,7 +1406,7 @@ impl PipelineCache {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl PipelineCache {
     pub fn layers(&self) -> &[PipelineLayerCache] {
         &self.layers
@@ -11819,12 +11810,8 @@ impl PipelineModel {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl PipelineModel {
-    pub const fn placed_ingress_schedule_report(&self) -> &PlacedIngressScheduleReport {
-        &self.last_placed_ingress_schedule
-    }
-
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
@@ -11859,57 +11846,6 @@ impl PipelineModel {
 
     pub fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
         Ok(self.info.checkpoint_diagnostics.clone())
-    }
-
-    pub fn forward_stage(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut PipelineCache,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        self.topology.validate_execution_stream(stream)?;
-        validate_stage_input(
-            &self.info,
-            &input,
-            step,
-            &self.resolved_boundary_specs(step)?,
-        )?;
-        if cache.model_kind != self.info.model_kind {
-            return Err(Error::Parallel(format!(
-                "pipeline cache architecture {:?} does not match stage {:?}",
-                cache.model_kind, self.info.model_kind
-            )));
-        }
-        self.stage
-            .forward_with_execution(input, step, mask, &mut cache.layers, None, None, stream)
-    }
-
-    pub fn prefill_stage(
-        &mut self,
-        input: crate::backend::runtime::media::input::ModelInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut PipelineCache,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if !self.info.is_first {
-            return Err(Error::Parallel(format!(
-                "pipeline stage {} cannot accept typed ingress",
-                self.info.pipeline_stage
-            )));
-        }
-        crate::backend::runtime::media::input::validate(input)?;
-        self.topology.validate_execution_stream(stream)?;
-        if cache.model_kind != self.info.model_kind {
-            return Err(Error::Parallel(format!(
-                "pipeline cache architecture {:?} does not match stage {:?}",
-                cache.model_kind, self.info.model_kind
-            )));
-        }
-        self.stage
-            .prefill(input, step, mask, &mut cache.layers, None, None, stream)
     }
 }
 
@@ -12645,123 +12581,6 @@ fn validate_hidden_metadata(
         )));
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn checkpoint_name(parameter_name: &str) -> String {
-    crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
-}
-
-#[cfg(test)]
-pub fn assign_module(
-    module: &mut impl ModuleParameters,
-    prefix: &str,
-    tensors: &mut HashMap<String, Array>,
-    quantize_on_load: Option<WeightQuantization>,
-    stream: &Stream,
-) -> Result<(), Error> {
-    assign_module_excluding(module, prefix, tensors, quantize_on_load, stream, |_| false)
-}
-
-#[cfg(test)]
-pub fn assign_module_excluding<F>(
-    module: &mut impl ModuleParameters,
-    prefix: &str,
-    tensors: &mut HashMap<String, Array>,
-    quantize_on_load: Option<WeightQuantization>,
-    stream: &Stream,
-    excluded: F,
-) -> Result<(), Error>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut params = module.parameters_mut().flatten();
-    let destinations = params
-        .iter()
-        .map(|(name, value)| {
-            let name = if prefix.is_empty() {
-                name.to_string()
-            } else {
-                format!("{prefix}.{name}")
-            };
-            (name, value.shape().to_vec())
-        })
-        .filter(|(name, _)| !excluded(name))
-        .collect::<HashMap<_, _>>();
-    let mut loaded = HashMap::new();
-
-    for destination in destinations.keys() {
-        let source = checkpoint_name(destination);
-        if loaded.contains_key(destination) {
-            continue;
-        }
-        let tensor_key = if tensors.contains_key(destination) {
-            destination.as_str()
-        } else {
-            source.as_str()
-        };
-        let Some(value) = tensors.remove(tensor_key) else {
-            continue;
-        };
-        if destinations[destination] == value.shape() {
-            loaded.insert(destination.clone(), value);
-            continue;
-        }
-        let Some(quantization) = quantize_on_load.filter(|_| source.ends_with(".weight")) else {
-            return Err(Error::Parallel(format!(
-                "pipeline tensor {source} has shape {:?}, expected {:?}",
-                value.shape(),
-                destinations[destination]
-            )));
-        };
-        let quantized = quantize_tensor(&value, quantization, stream)?;
-        synchronize_outputs(
-            [&quantized.weight, &quantized.scales]
-                .into_iter()
-                .chain(quantized.biases.as_ref()),
-        )?;
-        loaded.insert(destination.clone(), quantized.weight);
-        let base = destination
-            .strip_suffix(".inner.weight")
-            .or_else(|| destination.strip_suffix(".weight"))
-            .expect("quantized destination weight");
-        loaded.insert(format!("{base}.scales"), quantized.scales);
-        if let Some(biases) = quantized.biases {
-            loaded.insert(format!("{base}.biases"), biases);
-        }
-    }
-
-    let mut missing = Vec::new();
-    for (local_name, parameter) in &mut params {
-        let destination = if prefix.is_empty() {
-            local_name.to_string()
-        } else {
-            format!("{prefix}.{local_name}")
-        };
-        if excluded(&destination) {
-            continue;
-        } else if let Some(value) = loaded.remove(&destination) {
-            if parameter.shape() != value.shape() {
-                return Err(Error::Parallel(format!(
-                    "pipeline tensor {destination} has shape {:?}, expected {:?}",
-                    value.shape(),
-                    parameter.shape()
-                )));
-            }
-            **parameter = value;
-        } else {
-            missing.push(destination);
-        }
-    }
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        missing.sort();
-        Err(Error::StrictLoadValidation {
-            missing,
-            unused: Vec::new(),
-        })
-    }
 }
 
 fn load_bound_module(

@@ -94,13 +94,13 @@ fn group_kind(architecture: &Architecture, group: usize) -> eredu_runtime::Archi
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub struct QwenVlCheckpointTemplate {
     pub static_modules: vl::StaticModules<MlxNeuralBackend>,
     pub units: Vec<Unit>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl QwenVlCheckpointTemplate {
     pub fn new(args: vl::ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = Architecture::new(args.clone(), stream)

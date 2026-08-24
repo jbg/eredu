@@ -93,13 +93,13 @@ type Block = Unit<MlxNeuralBackend>;
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub struct QwenHybridCheckpointTemplate {
     pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
     pub units: Vec<Block>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl QwenHybridCheckpointTemplate {
     pub fn new(config: HybridConfig, stream: &Stream) -> Result<Self, Error> {
         let architecture = Architecture::new(config.clone(), stream)
@@ -128,13 +128,13 @@ impl QwenHybridCheckpointTemplate {
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub struct QwenConditionalCheckpointTemplate {
     pub static_modules: hybrid::ConditionalStaticModules<MlxNeuralBackend>,
     pub units: Vec<hybrid::ConditionalUnit<MlxNeuralBackend>>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl QwenConditionalCheckpointTemplate {
     pub fn new(parsed: ParsedHybridConfig, stream: &Stream) -> Result<Self, Error> {
         let architecture = ConditionalArchitecture::new(parsed, stream)

@@ -1,8 +1,6 @@
 //! MLX architecture binding against portable checkpoint catalogs.
 
 use std::collections::HashMap;
-#[cfg(test)]
-use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
@@ -282,20 +280,6 @@ fn validate_neutral_moshi_safetensors(
         Ok(_) => StructuralValidation::Exact,
         Err(error) => invalid_geometry(error),
     }
-}
-
-#[cfg(test)]
-pub fn validate_safetensors_load_path(
-    kind: ModelKind,
-    model_dir: &Path,
-    options: ModelLoadOptions,
-) -> Result<(), Error> {
-    let config: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
-    let store =
-        SafetensorsWeightStore::open(model_dir).map_err(|error| Error::Other(Box::new(error)))?;
-    validate_safetensors(kind, &config, &store, options)
-        .into_loader_result()
-        .map_err(Error::from)
 }
 
 pub fn validate_gguf(

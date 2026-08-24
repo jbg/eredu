@@ -7,16 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::core::{CollectiveScope, DistributedSession};
-use eredu_backend_mlx::native::{
-    distributed::{self, Backend},
-    Array, Device, DeviceType, Stream,
-};
-use eredu_backend_mlx::testing::backend::{
+use crate::backend::{
     runtime::distributed::expert::{AllToAllVPlan, RoutedTransport},
     DeviceAssignment, MlxParallelContext,
 };
-use eredu_backend_mlx::MlxTensor;
+use crate::native::{
+    distributed::{self, Backend},
+    Array, Device, DeviceType, Stream,
+};
+use crate::MlxTensor;
+use eredu_core::{CollectiveScope, DistributedSession};
 
 const WORKER_ENV: &str = "EREDU_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "EREDU_CARTESIAN_TRIPLE_RING_WORKER";
@@ -99,12 +99,8 @@ fn cartesian_ring_worker() {
             exchange.statistics.payload_allocation_upper_bound_bytes
         );
     }
-    let empty = eredu_backend_mlx::native::ops::zeros_dtype(
-        &[0, 3],
-        eredu_backend_mlx::native::Dtype::Float32,
-        &stream,
-    )
-    .unwrap();
+    let empty =
+        crate::native::ops::zeros_dtype(&[0, 3], crate::native::Dtype::Float32, &stream).unwrap();
     let empty_counts = [0usize; 4];
     let empty =
         distributed::all_to_all_v(&empty, &empty_counts, &empty_counts, &world, &stream).unwrap();
@@ -117,13 +113,13 @@ fn cartesian_ring_worker() {
     // TP+PP: TP groups are [0, 1] and [2, 3]; pipeline lanes are [0, 2]
     // and [1, 3]. Both axes are logical subgroups under Ring.
     {
-        let execution = eredu_backend_mlx::native::backend(&stream, &stream)
+        let execution = crate::native::backend(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 2, 2, 1), &world)
             .unwrap();
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Tensor),
+            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Tensor),
             &input,
         )
         .unwrap()
@@ -142,7 +138,7 @@ fn cartesian_ring_worker() {
                 .unwrap();
         } else {
             let received = execution
-                .receive_pipeline(&[1], eredu::core::checkpoint::TensorDtype::I32)
+                .receive_pipeline(&[1], eredu_core::checkpoint::TensorDtype::I32)
                 .unwrap()
                 .into_value()
                 .unwrap();
@@ -152,13 +148,13 @@ fn cartesian_ring_worker() {
 
     // TP+EP: TP groups are [0, 2] and [1, 3]; EP groups are [0, 1] and [2, 3].
     {
-        let execution = eredu_backend_mlx::native::backend(&stream, &stream)
+        let execution = crate::native::backend(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 2, 1, 2), &world)
             .unwrap();
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Tensor),
+            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Tensor),
             &input,
         )
         .unwrap()
@@ -174,7 +170,7 @@ fn cartesian_ring_worker() {
         );
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Expert),
+            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert),
             &input,
         )
         .unwrap()
@@ -187,11 +183,11 @@ fn cartesian_ring_worker() {
 
         // Ring cannot split these EP pairs natively. Exercise the topology-
         // planned logical route with asymmetric counts in both directions.
-        let expert_scope = CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Expert);
+        let expert_scope = CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert);
         assert!(execution.scope_is_logical(expert_scope).unwrap());
         let expert_subgroup = execution
             .topology()
-            .subgroup(eredu::ParallelAxis::Expert)
+            .subgroup(eredu_core::ParallelAxis::Expert)
             .unwrap();
         let local_rank = expert_subgroup.rank;
         let logical_send = if local_rank == 0 { [0, 2] } else { [1, 0] };
@@ -221,13 +217,13 @@ fn cartesian_ring_worker() {
 
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.
     {
-        let execution = eredu_backend_mlx::native::backend(&stream, &stream)
+        let execution = crate::native::backend(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 1, 2, 2), &world)
             .unwrap();
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Expert),
+            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert),
             &input,
         )
         .unwrap()
@@ -246,7 +242,7 @@ fn cartesian_ring_worker() {
                 .unwrap();
         } else {
             let received = execution
-                .receive_pipeline(&[1], eredu::core::checkpoint::TensorDtype::I32)
+                .receive_pipeline(&[1], eredu_core::checkpoint::TensorDtype::I32)
                 .unwrap()
                 .into_value()
                 .unwrap();
@@ -277,21 +273,21 @@ fn cartesian_triple_ring_worker() {
     )
     .unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let execution = eredu_backend_mlx::native::backend(&stream, &stream)
+    let execution = crate::native::backend(&stream, &stream)
         .communication_for_topology(topology, &world)
         .unwrap();
     let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
 
     let tp = DistributedSession::all_reduce_sum(
         &execution,
-        CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Tensor),
+        CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Tensor),
         &input,
     )
     .unwrap()
     .wait()
     .unwrap();
     let expected_tp = topology
-        .subgroup(eredu::ParallelAxis::Tensor)
+        .subgroup(eredu_core::ParallelAxis::Tensor)
         .unwrap()
         .global_ranks
         .iter()
@@ -301,14 +297,14 @@ fn cartesian_triple_ring_worker() {
 
     let ep = DistributedSession::all_reduce_sum(
         &execution,
-        CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Expert),
+        CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert),
         &input,
     )
     .unwrap()
     .wait()
     .unwrap();
     let expected_ep = topology
-        .subgroup(eredu::ParallelAxis::Expert)
+        .subgroup(eredu_core::ParallelAxis::Expert)
         .unwrap()
         .global_ranks
         .iter()
@@ -325,7 +321,7 @@ fn cartesian_triple_ring_worker() {
             .unwrap();
     } else {
         let received = execution
-            .receive_pipeline(&[1], eredu::core::checkpoint::TensorDtype::I32)
+            .receive_pipeline(&[1], eredu_core::checkpoint::TensorDtype::I32)
             .unwrap()
             .into_value()
             .unwrap();

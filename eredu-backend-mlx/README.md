@@ -59,7 +59,6 @@ execution, distributed, and model-composition support.
 | `codec` | MLX Mimi integration and codec examples; implies `audio` |
 | `cuda` | SafeMLX CUDA execution |
 | `nccl` | NCCL collectives; implies `cuda` |
-| `test-support` | Cross-crate backend fixtures; not application API |
 
 The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
 `personaplex_quantization_eval` examples require `codec`.

@@ -46,20 +46,7 @@ mod tensor;
 #[cfg(test)]
 mod test_utils;
 
+#[cfg(test)]
+mod tests;
+
 pub use tensor::MlxTensor;
-
-/// Internal fixtures shared with Eredu's backend integration-test package.
-///
-/// This module is not part of the production adapter API. It is available only
-/// when the explicit `test-support` feature is enabled.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub mod testing {
-    pub mod backend {
-        pub use crate::backend::*;
-    }
-
-    pub mod composition {
-        pub use crate::composition::*;
-    }
-}

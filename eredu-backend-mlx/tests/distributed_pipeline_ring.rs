@@ -7,9 +7,9 @@ fn run_library_ring_selection(selection: &str) {
         .args([
             "test",
             "-p",
-            "eredu-mlx-tests",
+            "eredu-backend-mlx",
             "--lib",
-            selection,
+            &format!("tests::distributed_pipeline_ring::{selection}"),
             "--",
             "--ignored",
             "--test-threads=1",

@@ -13,7 +13,6 @@ members = [
     "eredu-nn",
     "eredu-nn-macros",
     "eredu-backend-mlx",
-    "eredu-mlx-tests",
     "eredu-runtime",
     "eredu-architectures",
     "eredu-codec",

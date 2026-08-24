@@ -83,13 +83,13 @@ type ParallelBoundedRuntime = LayerwiseRuntime<
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub struct KimiLinearCheckpointTemplate {
     pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
     pub layers: Vec<NeutralBlock>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl KimiLinearCheckpointTemplate {
     /// Builds one neutral full-parameter template for checkpoint tooling.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {

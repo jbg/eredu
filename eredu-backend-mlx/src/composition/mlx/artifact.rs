@@ -31,22 +31,6 @@ pub struct PreparedSafetensorsArtifact {
 }
 
 impl PreparedSafetensorsArtifact {
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn inspect(path: impl AsRef<Path>, max_mapped_shards: usize) -> Result<Self, Error> {
-        let inspection = eredu_architectures::configuration::inspect_artifact(path.as_ref())?;
-        if inspection.format() != eredu_core::ArtifactFormat::SafeTensors {
-            return Err(Error::UnsupportedArchitecture(
-                "SafeTensors composition received a non-SafeTensors artifact".into(),
-            ));
-        }
-        Self::open(
-            inspection.path().to_owned(),
-            inspection.configuration().clone(),
-            inspection.tensors().clone(),
-            max_mapped_shards,
-        )
-    }
-
     pub fn open(
         path: PathBuf,
         configuration: ModelConfiguration,

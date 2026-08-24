@@ -41,10 +41,33 @@ pub use eredu_core::artifact::{
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,
     PreparationPolicy, QuantizationRequest, ResidencyRequest,
 };
+pub use eredu_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
+pub use eredu_core::cache::{
+    CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
+    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, PromptCacheBlock,
+    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
+    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass,
+    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+    StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
+};
 pub use eredu_core::generation::{
     CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,
     GenerationConfigOverrides, MtpConfig, MtpRequestId, MtpRequestPhase, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
+};
+pub use eredu_core::residency::{
+    AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
+    MemoryTier, OffloadConfig, OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry,
+    OffloadUnitId, OffloadUnitSpec, PrefetchAdmission, PrefetchCompletion,
+    PrefetchDemandObservation, PrefetchDemandResolution, PrefetchExecutionState, PrefetchMetrics,
+    PrefetchOutcome, PrefetchStateError, PrefetchWork, ProcessMetrics, ResidencyBlocker,
+    ResidencyLedger, ResidencyLedgerError, ResidencyPolicy, TierByteTotals, TierUnitTotals,
+    TransferDirection, TransferMetrics, UnitResidencyReport, OFFLOAD_PLAN_SCHEMA_VERSION,
+};
+pub use eredu_core::scheduler::{
+    CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
+    SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
+    TransitionOutput, WorkDescriptor, WorkId, WorkLifecycle,
 };
 pub use eredu_core::{
     load_model, load_realtime_model, load_realtime_model_with_options, Admission,
@@ -82,46 +105,6 @@ pub use eredu_core::{
     TokenizerCompatibilityError, TokenizerCompatibilityProof, TopologyPreflightReport,
     TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
     AUTOMATIC_SCHEMA_VERSION, EXECUTION_PLAN_SCHEMA_VERSION,
-};
-#[cfg(all(test, feature = "mlx-test-support"))]
-mod test_utils;
-#[cfg(all(test, feature = "mlx-test-support"))]
-extern crate self as eredu;
-#[cfg(all(test, feature = "mlx-test-support"))]
-#[path = "../tests/distributed_cartesian_ring.rs"]
-mod distributed_cartesian_ring;
-#[cfg(all(test, feature = "mlx-test-support"))]
-#[path = "../tests/distributed_expert_exchange_ring.rs"]
-mod distributed_expert_exchange_ring;
-#[cfg(all(test, feature = "mlx-test-support"))]
-#[path = "../tests/distributed_partition_ring.rs"]
-mod distributed_partition_ring;
-#[cfg(all(test, feature = "mlx-test-support"))]
-#[path = "../tests/distributed_pipeline_ring.rs"]
-mod distributed_pipeline_ring;
-
-pub use eredu_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
-pub use eredu_core::cache::{
-    CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
-    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, PromptCacheBlock,
-    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass,
-    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-    StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
-};
-pub use eredu_core::residency::{
-    AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
-    MemoryTier, OffloadConfig, OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry,
-    OffloadUnitId, OffloadUnitSpec, PrefetchAdmission, PrefetchCompletion,
-    PrefetchDemandObservation, PrefetchDemandResolution, PrefetchExecutionState, PrefetchMetrics,
-    PrefetchOutcome, PrefetchStateError, PrefetchWork, ProcessMetrics, ResidencyBlocker,
-    ResidencyLedger, ResidencyLedgerError, ResidencyPolicy, TierByteTotals, TierUnitTotals,
-    TransferDirection, TransferMetrics, UnitResidencyReport, OFFLOAD_PLAN_SCHEMA_VERSION,
-};
-pub use eredu_core::scheduler::{
-    CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
-    SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
-    TransitionOutput, WorkDescriptor, WorkId, WorkLifecycle,
 };
 pub use eredu_runtime::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,

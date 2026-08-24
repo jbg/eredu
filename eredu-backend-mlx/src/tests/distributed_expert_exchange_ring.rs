@@ -8,18 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::core::residency::OffloadConfig;
-use eredu_backend_mlx::native::{
+use crate::native::{
     distributed::{self, Backend},
     module::Param,
     ops::concatenate_axis,
     transforms::{async_eval_with_event, eval},
     Array, Device, DeviceType, Stream,
 };
-use eredu_backend_mlx::{
-    testing::backend::error::Error,
-    testing::backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
-    testing::backend::runtime::{
+use crate::{
+    backend::error::Error,
+    backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
+    backend::runtime::{
         distributed::expert::{
             dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
             AllToAllVPlan, DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport,
@@ -29,6 +28,7 @@ use eredu_backend_mlx::{
     },
 };
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
+use eredu_core::residency::OffloadConfig;
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,
 };
@@ -176,11 +176,8 @@ fn execute_cached_qwen_routes(
             };
             cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
             let compact_routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
-            let unit_weights = eredu_backend_mlx::native::ops::ones_dtype(
-                &[hidden.dim(0), 1],
-                hidden.dtype(),
-                stream,
-            )?;
+            let unit_weights =
+                crate::native::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
             Ok(bank.forward(hidden, &compact_routes, &unit_weights, stream)?)
         },
     )?)

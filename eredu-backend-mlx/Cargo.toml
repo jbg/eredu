@@ -33,7 +33,6 @@ required-features = ["codec"]
 
 [features]
 default = []
-test-support = []
 cuda = ["safemlx/cuda"]
 nccl = ["cuda", "safemlx/nccl"]
 media = []

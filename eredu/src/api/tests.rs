@@ -29,9 +29,7 @@ use std::{
 };
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
-#[cfg(feature = "mlx-test-support")]
-mod mlx;
-#[cfg(feature = "mlx-test-support")]
+#[cfg(feature = "mlx")]
 mod mlx_sampler;
 
 static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);

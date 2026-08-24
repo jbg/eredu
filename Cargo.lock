@@ -979,32 +979,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eredu-mlx-tests"
-version = "0.1.1"
-dependencies = [
- "base64 0.22.1",
- "eredu-architectures",
- "eredu-backend-mlx",
- "eredu-checkpoint",
- "eredu-core",
- "eredu-gguf",
- "eredu-nn",
- "eredu-runtime",
- "eredu-text",
- "idna_adapter",
- "llguidance",
- "minijinja",
- "safetensors",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokenizers 0.23.1",
- "toktrie_hf_tokenizers",
-]
-
-[[package]]
 name = "eredu-nn"
 version = "0.1.0"
 dependencies = [

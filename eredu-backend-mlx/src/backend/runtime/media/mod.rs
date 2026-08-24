@@ -191,7 +191,7 @@ pub struct PreparedInputPart {
 }
 
 impl PreparedInputPart {
-    #[cfg(any(test, feature = "media", feature = "test-support"))]
+    #[cfg(any(test, feature = "media"))]
     pub fn text_token_ids(ids: &[u32]) -> Self {
         Self {
             modality: Modality::Text,
@@ -535,7 +535,7 @@ impl<E> From<Error> for ProcessorPreparationError<E> {
     }
 }
 
-#[cfg(any(test, feature = "media", feature = "test-support"))]
+#[cfg(any(test, feature = "media"))]
 pub fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedModelInput, Error> {
     if parts.is_empty() {
         return Err(Error::Processor(
@@ -545,7 +545,7 @@ pub fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedMod
     PreparedModelInput::new(parts)
 }
 
-#[cfg(any(test, feature = "media", feature = "test-support"))]
+#[cfg(any(test, feature = "media"))]
 pub fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
     if !token_ids.is_empty() {
         parts.push(PreparedInputPart::text_token_ids(token_ids));

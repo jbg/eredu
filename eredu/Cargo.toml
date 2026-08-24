@@ -54,6 +54,21 @@ path = "tests/dependency_boundary.rs"
 name = "portable_facade"
 path = "tests/portable_facade.rs"
 
+[[test]]
+name = "automatic_planner_api"
+path = "tests/automatic_planner_api.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "distributed_realtime_ring"
+path = "tests/distributed_realtime_ring.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "native_tool_checkpoints"
+path = "tests/native_tool_checkpoints.rs"
+required-features = ["mlx"]
+
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
 no-default-features = true
@@ -63,9 +78,6 @@ features = ["mlx-image", "mlx-audio"]
 default = ["mlx", "onig", "esaxx_fast"]
 
 mlx = ["dep:eredu-backend-mlx"]
-# Test packages use this explicitly to compile facade-owned MLX unit suites
-# against backend test helpers without adding a native facade dev-dependency.
-mlx-test-support = ["mlx", "eredu-backend-mlx/test-support"]
 cuda = ["mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]

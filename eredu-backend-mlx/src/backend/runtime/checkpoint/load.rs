@@ -65,7 +65,7 @@ impl GgufTensorNames for GgufCheckpoint {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl GgufTensorNames for HashMap<String, Array> {
     fn contains_gguf_tensor(&self, name: &str) -> bool {
         self.contains_key(name)
