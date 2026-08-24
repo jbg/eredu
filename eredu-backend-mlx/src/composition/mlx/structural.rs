@@ -296,8 +296,10 @@ pub(crate) fn validate_gguf_preparation(
     )
 }
 
-pub(crate) fn validate_inspected_preparation<P>(
-    inspection: &eredu_core::ArtifactInspection<P>,
+pub(crate) fn validate_inspected_preparation(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactProcessorPlan,
+    >,
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
     eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol, policy)?;
@@ -305,7 +307,10 @@ pub(crate) fn validate_inspected_preparation<P>(
         return Ok(());
     }
     let configuration = inspection.configuration();
-    let kind = ModelKind::resolve_family(&configuration.family)?;
+    let architecture_plan = inspection.architecture_plan();
+    let kind = architecture_plan.model_kind().ok_or_else(|| {
+        Error::ArchitectureModel("preparation omitted its architecture-owned model family".into())
+    })?;
     let capabilities = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => {
             eredu_architectures::preparation::safetensors_capabilities(
@@ -318,7 +323,11 @@ pub(crate) fn validate_inspected_preparation<P>(
             )
         }
         eredu_core::ArtifactFormat::Gguf => eredu_architectures::preparation::gguf_capabilities(
-            GgufArchitecture::resolve(&configuration.declared_model_type)?,
+            architecture_plan.gguf_architecture().ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "GGUF preparation omitted its architecture-owned GGUF identity".into(),
+                )
+            })?,
             inspection.gguf_checkpoint().ok_or_else(|| {
                 Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
                     "GGUF inspection omitted portable checkpoint metadata".into(),

@@ -1,10 +1,8 @@
 // Qwen image/video protocol preprocessing for neutral prepared inputs.
 
-use std::{fs, path::Path};
-
 use eredu_architectures::processor_plan::{
     ProcessorPlanError, QwenImagePlan, QwenPatchPlan, QwenProcessorPlan, QwenVideoPlan,
-    RgbResample, RgbTransformPlan, PROCESSOR_CONFIG_FILENAME, VIDEO_PROCESSOR_CONFIG_FILENAME,
+    RgbResample, RgbTransformPlan,
 };
 use safemlx::Array;
 
@@ -25,14 +23,6 @@ pub struct QwenProcessor {
 }
 
 impl QwenProcessor {
-    pub fn load(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
-        let image = read_optional(&model_dir.join(PROCESSOR_CONFIG_FILENAME))?;
-        let video = read_optional(&model_dir.join(VIDEO_PROCESSOR_CONFIG_FILENAME))?;
-        QwenProcessorPlan::from_hf_json(model, image.as_deref(), video.as_deref())
-            .map_err(processor_error)
-            .map(|plan| plan.map(|plan| Self { plan }))
-    }
-
     pub fn from_plan(plan: QwenProcessorPlan) -> Self {
         Self { plan }
     }
@@ -157,10 +147,6 @@ impl QwenProcessor {
         }
         Ok(parts)
     }
-}
-
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, Error> {
-    path.exists().then(|| fs::read(path)).transpose().map_err(Into::into)
 }
 
 fn processor_error(error: ProcessorPlanError) -> Error {

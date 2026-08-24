@@ -13894,7 +13894,7 @@ pub fn load_pipeline_model_with_options(
             Some(PipelineLayerLoadOptions::DenseDiskStream(options))
         }
     };
-    let (artifact, _architecture_plan, _policy, route) = plan.into_parts();
+    let (artifact, architecture_plan, _policy, route) = plan.into_parts();
     let (expert_cache, dense_stream) = match route {
         MaterializationRoute::Resident => (None, None),
         MaterializationRoute::Layerwise => {
@@ -13919,7 +13919,7 @@ pub fn load_pipeline_model_with_options(
     let artifact = match artifact {
         ModelArtifact::Gguf {
             path: _,
-            configuration,
+            configuration: _,
             checkpoint,
             mut companions,
             ..
@@ -13934,7 +13934,11 @@ pub fn load_pipeline_model_with_options(
             // validate the artifact geometry without reapplying the standalone
             // nonresident-loader restriction.
             structural_options.weight_residency = WeightResidency::fully_resident();
-            let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
+            let architecture = architecture_plan.gguf_architecture().ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "GGUF preparation omitted its architecture-owned GGUF identity".into(),
+                )
+            })?;
             let checkpoint = GgufCheckpoint::from_portable(checkpoint);
             let projector = companions
                 .remove(&eredu_core::GgufCompanionRole::MediaProjector)
@@ -14279,7 +14283,11 @@ pub fn load_pipeline_model_with_options(
 
     let configuration = artifact.configuration();
     let config = artifact.config()?;
-    let kind = ModelKind::resolve_family(&configuration.family)?;
+    let kind = architecture_plan.model_kind().ok_or_else(|| {
+        Error::ArchitectureModel(
+            "SafeTensors preparation omitted its architecture-owned model family".into(),
+        )
+    })?;
     if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
         return Err(Error::ArchitectureModel(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"

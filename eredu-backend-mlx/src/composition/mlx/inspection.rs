@@ -319,9 +319,10 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     let validated = portable
         .validated_gguf()
         .expect("GGUF inspection must expose its validated GGUF result");
-    let gguf_architecture =
-        GgufArchitecture::resolve(&portable.configuration().declared_model_type)
-            .expect("GGUF inspection must resolve through the architecture registry");
+    let gguf_architecture = portable
+        .architecture_plan()
+        .gguf_architecture()
+        .expect("GGUF inspection must retain its architecture-owned identity");
     let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
     report.container = InspectionReadiness::Ready;
     report.model_family = Some(gguf_architecture.model_kind().canonical_name().into());

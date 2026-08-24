@@ -9,7 +9,7 @@ use safemlx::ops::GgufCheckpoint;
 use safemlx::{ops::GgufMetadataValue, Stream};
 
 #[cfg(feature = "media")]
-use crate::composition::mlx::{load_processor, ModelProcessor};
+use crate::composition::mlx::ModelProcessor;
 
 use crate::{
     backend::error::Error,
@@ -211,25 +211,10 @@ pub fn materialize_model_plan(
         .parallel
         .filter(|topology| !topology.is_replicated())
     {
-        let kind = ModelKind::resolve_family(&plan.inspection().configuration().family)?;
+        let kind = prepared_model_kind(plan.inspection().architecture_plan())?;
         if structural::requires_distributed_stage_loader(kind, topology.topology()) {
             #[cfg(feature = "media")]
-            let processor = match plan.inspection().format() {
-                eredu_core::ArtifactFormat::SafeTensors => {
-                    let config = plan.inspection().configuration().json.as_ref().ok_or_else(
-                        || {
-                            Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
-                                "SafeTensors preparation plan omitted normalized JSON configuration"
-                                    .into(),
-                            ))
-                        },
-                    )?;
-                    load_processor(kind, plan.inspection().path(), config)?
-                }
-                eredu_core::ArtifactFormat::Gguf => {
-                    load_inspected_gguf_processor(plan.inspection())?
-                }
-            };
+            let processor = ModelProcessor::from_plan(plan.inspection().architecture_plan());
             let model =
                 crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
                     plan,
@@ -264,14 +249,14 @@ pub fn materialize_model_plan(
                     options.weight_residency.max_mapped_shards(),
                 )?;
                 let model = materialize_tensor_parallel(
-                    ModelKind::resolve_family(&prepared.configuration().family)?,
+                    prepared_model_kind(&architecture_plan)?,
                     &prepared,
                     options,
                     stream,
                     weights_stream,
                 )
                 .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
-                attach_safetensors_processor(model, &prepared)
+                attach_processor(model, &architecture_plan)
             }
         };
     }
@@ -286,7 +271,7 @@ pub fn materialize_model_plan(
             configuration,
             tensors,
         } => {
-            let kind = ModelKind::resolve_family(&configuration.family)?;
+            let kind = prepared_model_kind(&architecture_plan)?;
             let prepared = super::artifact::PreparedSafetensorsArtifact::open(
                 path,
                 configuration,
@@ -295,13 +280,13 @@ pub fn materialize_model_plan(
             )?;
             let model = materialize_safetensors(kind, &prepared, options, stream, weights_stream)
                 .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
-            attach_safetensors_processor(model, &prepared)
+            attach_processor(model, &architecture_plan)
         }
     }
 }
 
-fn inspected_runtime_state_dtype_bytes<P>(
-    inspection: &eredu_core::ArtifactInspection<P>,
+fn inspected_runtime_state_dtype_bytes(
+    inspection: &eredu_core::ArtifactInspection<ArtifactProcessorPlan>,
 ) -> Result<std::num::NonZeroU8, Error> {
     if inspection.format() == eredu_core::ArtifactFormat::Gguf {
         // MLX native GGUF embeddings dequantize to Float32. Their catalog dtype
@@ -315,7 +300,7 @@ fn inspected_runtime_state_dtype_bytes<P>(
         )
     })?;
     let source = eredu_architectures::preparation::safetensors_runtime_state_dtype_source(
-        ModelKind::resolve_family(&configuration.family)?,
+        prepared_model_kind(inspection.architecture_plan())?,
         config,
         inspection.tensors(),
     )
@@ -349,12 +334,8 @@ fn mlx_runtime_state_dtype_bytes(
 
 #[cfg(test)]
 mod runtime_state_dtype_tests {
-    #[cfg(feature = "image")]
-    use super::load_gguf_processor;
     use super::{mlx_runtime_state_dtype_bytes, reject_complete_tensor_parallel_quantization};
     use crate::backend::{DeviceAssignment, MlxParallelContext};
-    #[cfg(feature = "image")]
-    use eredu_architectures::GgufArchitecture;
     use eredu_architectures::ModelKind;
     use eredu_checkpoint::WeightQuantization;
     use eredu_core::checkpoint::TensorDtype;
@@ -423,63 +404,47 @@ mod runtime_state_dtype_tests {
 
     #[cfg(feature = "image")]
     #[test]
-    fn shared_gguf_processor_loader_consumes_retained_qwen_plan() {
-        use eredu_gguf::{MetadataArray, MetadataValue};
+    fn mlx_processor_consumes_retained_qwen_plan_after_sidecar_removal() {
+        use eredu_core::{
+            ArtifactFormat, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
+        };
 
-        let mut portable_model = std::collections::BTreeMap::new();
-        portable_model.insert(
-            "tokenizer.ggml.tokens".into(),
-            MetadataValue::Array(MetadataArray::String(vec![
-                "ordinary".into(),
-                "<|vision_start|>".into(),
-                "<|vision_end|>".into(),
-            ])),
-        );
-        let mut portable_projector = std::collections::BTreeMap::new();
-        portable_projector.insert("clip.vision.patch_size".into(), MetadataValue::Uint32(2));
-        portable_projector.insert(
-            "clip.vision.spatial_merge_size".into(),
-            MetadataValue::Uint32(2),
-        );
-        portable_projector.insert(
-            "clip.vision.image_mean".into(),
-            MetadataValue::Array(MetadataArray::Float32(vec![0.0; 3])),
-        );
-        portable_projector.insert(
-            "clip.vision.image_std".into(),
-            MetadataValue::Array(MetadataArray::Float32(vec![1.0; 3])),
-        );
-        let architecture_plan =
-            eredu_architectures::processor_plan::ArtifactProcessorPlan::from_qwen_gguf(
-                &portable_model,
-                Some(&portable_projector),
+        let root = tempfile::tempdir().unwrap();
+        let sidecar = root
+            .path()
+            .join(eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME);
+        std::fs::write(
+            &sidecar,
+            br#"{
+                "size":{"shortest_edge":16,"longest_edge":64},
+                "patch_size":2,"temporal_patch_size":2,"merge_size":2,
+                "image_mean":[0.0,0.0,0.0],"image_std":[1.0,1.0,1.0]
+            }"#,
+        )
+        .unwrap();
+        let configuration = ModelConfiguration {
+            declared_model_type: "qwen3_vl".into(),
+            effective_model_type: "qwen3_vl_text".into(),
+            family: ModelKind::Qwen3Vl.canonical_name().into(),
+            loading_protocol: LoadingProtocol::Model,
+            json: Some(serde_json::json!({
+                "model_type": "qwen3_vl",
+                "vision_start_token_id": 44,
+                "vision_end_token_id": 45
+            })),
+        };
+        let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+            .artifact_plan(
+                root.path(),
+                ArtifactFormat::SafeTensors,
+                &configuration,
+                None,
             )
             .unwrap();
-        let metadata = std::collections::HashMap::new();
+        std::fs::remove_file(sidecar).unwrap();
 
-        for architecture in [
-            GgufArchitecture::Qwen3Vl,
-            GgufArchitecture::Qwen3VlMoe,
-            GgufArchitecture::Qwen35,
-            GgufArchitecture::Qwen35Moe,
-        ] {
-            assert!(load_gguf_processor(
-                architecture,
-                &metadata,
-                Some(&metadata),
-                &architecture_plan,
-            )
-            .unwrap()
-            .is_some());
-        }
-        assert!(load_gguf_processor(
-            GgufArchitecture::Qwen35,
-            &metadata,
-            None,
-            &architecture_plan,
-        )
-        .unwrap()
-        .is_none());
+        assert_eq!(architecture_plan.model_kind(), Some(ModelKind::Qwen3Vl));
+        assert!(crate::composition::mlx::ModelProcessor::from_plan(&architecture_plan).is_some());
     }
 
     #[test]
@@ -519,18 +484,31 @@ mod runtime_state_dtype_tests {
     }
 }
 
-fn attach_safetensors_processor(
+fn prepared_model_kind(plan: &ArtifactProcessorPlan) -> Result<ModelKind, Error> {
+    plan.model_kind().ok_or_else(|| {
+        Error::ArchitectureModel("preparation omitted its architecture-owned model family".into())
+    })
+}
+
+fn prepared_gguf_architecture(plan: &ArtifactProcessorPlan) -> Result<GgufArchitecture, Error> {
+    plan.gguf_architecture().ok_or_else(|| {
+        Error::ArchitectureModel(
+            "GGUF preparation omitted its architecture-owned GGUF identity".into(),
+        )
+    })
+}
+
+fn attach_processor(
     model: MlxModel,
-    artifact: &super::artifact::PreparedSafetensorsArtifact,
+    architecture_plan: &ArtifactProcessorPlan,
 ) -> Result<MlxModel, Error> {
     #[cfg(feature = "media")]
     {
-        let kind = ModelKind::resolve_family(&artifact.configuration().family)?;
-        Ok(model.with_processor(load_processor(kind, artifact.path(), artifact.config()?)?))
+        Ok(model.with_processor(ModelProcessor::from_plan(architecture_plan)))
     }
     #[cfg(not(feature = "media"))]
     {
-        let _ = artifact;
+        let _ = architecture_plan;
         Ok(model)
     }
 }
@@ -543,73 +521,6 @@ fn complete_gguf_model(
     #[cfg(feature = "media")]
     let model = model.with_processor(materialized.processor);
     model
-}
-
-#[cfg(feature = "media")]
-fn load_gguf_processor(
-    architecture: GgufArchitecture,
-    model_metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    projector_metadata: Option<&std::collections::HashMap<String, GgufMetadataValue>>,
-    architecture_plan: &ArtifactProcessorPlan,
-) -> Result<Option<ModelProcessor>, Error> {
-    match architecture {
-        GgufArchitecture::Inkling if projector_metadata.is_some() => {
-            ModelProcessor::load_inkling_gguf(model_metadata).map(Some)
-        }
-        #[cfg(any(feature = "image", feature = "audio"))]
-        GgufArchitecture::Gemma4 => projector_metadata
-            .map(|metadata| ModelProcessor::load_gemma4_gguf(model_metadata, metadata))
-            .transpose(),
-        #[cfg(feature = "image")]
-        GgufArchitecture::MuseGlimmer => projector_metadata
-            .map(ModelProcessor::load_muse_glimmer_gguf)
-            .transpose(),
-        #[cfg(feature = "image")]
-        GgufArchitecture::Qwen3Vl
-        | GgufArchitecture::Qwen3VlMoe
-        | GgufArchitecture::Qwen35
-        | GgufArchitecture::Qwen35Moe
-            if projector_metadata.is_some() =>
-        {
-            architecture_plan
-                .qwen()
-                .cloned()
-                .map(ModelProcessor::load_qwen_plan)
-                .map(Some)
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "Qwen GGUF preparation omitted its architecture-owned processor plan"
-                            .into(),
-                    )
-                })
-        }
-        _ => Ok(None),
-    }
-}
-
-#[cfg(feature = "media")]
-fn load_inspected_gguf_processor(
-    inspection: &eredu_core::ArtifactInspection<ArtifactProcessorPlan>,
-) -> Result<Option<ModelProcessor>, Error> {
-    let validated = inspection.validated_gguf().ok_or_else(|| {
-        eredu_core::artifact::ArtifactError::InvalidArtifact(
-            "GGUF preparation plan omitted its validated checkpoint".into(),
-        )
-    })?;
-    let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
-    let model_metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    let projector_metadata = validated
-        .companion(&eredu_core::GgufCompanionRole::MediaProjector)
-        .map(|companion| {
-            let checkpoint = GgufCheckpoint::from_portable(companion.checkpoint().clone());
-            crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint)
-        });
-    load_gguf_processor(
-        GgufArchitecture::resolve(&inspection.configuration().declared_model_type)?,
-        &model_metadata,
-        projector_metadata.as_ref(),
-        inspection.architecture_plan(),
-    )
 }
 
 fn materialize_tensor_parallel(
@@ -766,14 +677,14 @@ pub(super) fn validate_plan_options(
 
 fn materialize_gguf_artifact(
     artifact: ModelArtifact,
-    _architecture_plan: ArtifactProcessorPlan,
+    architecture_plan: ArtifactProcessorPlan,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MaterializedGgufModel, Error> {
     let ModelArtifact::Gguf {
         path: _,
-        configuration,
+        configuration: _,
         checkpoint,
         mut companions,
         ..
@@ -788,23 +699,13 @@ fn materialize_gguf_artifact(
         .remove(&eredu_core::GgufCompanionRole::MediaProjector)
         .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
     let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
+    let architecture = prepared_gguf_architecture(&architecture_plan)?;
     let source = structural::admit_gguf(architecture, checkpoint, metadata, options)?;
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;
     #[cfg(feature = "media")]
-    let processor = {
-        let projector_metadata = projector
-            .as_ref()
-            .map(|checkpoint| crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint));
-        load_gguf_processor(
-            architecture,
-            metadata,
-            projector_metadata.as_ref(),
-            &_architecture_plan,
-        )?
-    };
+    let processor = ModelProcessor::from_plan(&architecture_plan);
     if options
         .parallel
         .is_some_and(|topology| !topology.is_replicated())

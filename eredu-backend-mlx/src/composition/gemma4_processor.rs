@@ -1,15 +1,10 @@
 //! Gemma 4 image, video, and audio host preprocessing.
 
-use std::{fs, path::Path};
-
 #[cfg(feature = "image")]
 use eredu_architectures::processor_plan::{
     Gemma4ImagePlan, Gemma4VideoPlan, RgbResample, RgbTransformPlan,
 };
 use eredu_architectures::processor_plan::{Gemma4ProcessorPlan, ProcessorPlanError};
-use eredu_architectures::processor_plan::{
-    PROCESSOR_CONFIG_FILENAME, VIDEO_PROCESSOR_CONFIG_FILENAME,
-};
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
@@ -40,29 +35,10 @@ pub struct Gemma4Processor {
 }
 
 impl Gemma4Processor {
-    pub fn load(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
-        let image = read_optional(&model_dir.join(PROCESSOR_CONFIG_FILENAME))?;
-        let video = read_optional(&model_dir.join(VIDEO_PROCESSOR_CONFIG_FILENAME))?;
-        let Some(plan) =
-            Gemma4ProcessorPlan::from_hf_json(model, image.as_deref(), video.as_deref())
-                .map_err(processor_error)?
-        else {
-            return Ok(None);
-        };
+    pub fn from_plan(plan: Gemma4ProcessorPlan) -> Option<Self> {
         let supported = cfg!(feature = "image") && plan.has_image()
             || cfg!(feature = "audio") && plan.has_audio();
-        Ok(supported.then_some(Self { plan }))
-    }
-
-    #[cfg(any(feature = "image", feature = "audio"))]
-    pub fn from_gguf(
-        model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-        projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            plan: Gemma4ProcessorPlan::from_gguf_metadata(model_metadata, projector_metadata)
-                .map_err(processor_error)?,
-        })
+        supported.then_some(Self { plan })
     }
 
     pub fn prepare_input<E>(
@@ -239,13 +215,6 @@ impl Gemma4Processor {
     }
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, Error> {
-    path.exists()
-        .then(|| fs::read(path))
-        .transpose()
-        .map_err(Into::into)
-}
-
 fn processor_error(error: ProcessorPlanError) -> Error {
     Error::Processor(error.to_string())
 }
@@ -316,7 +285,7 @@ mod tests {
 
     use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
     use eredu_core::VideoSampling;
-    use safemlx::ops::GgufMetadataValue;
+    use eredu_gguf::MetadataValue;
 
     use super::Gemma4Processor;
     use crate::{
@@ -344,24 +313,22 @@ mod tests {
     #[test]
     fn gguf_processor_uses_projector_geometry_and_language_boundaries() {
         let model = HashMap::from([
-            ("gemma4.boi_token_id".into(), GgufMetadataValue::Uint32(43)),
-            ("gemma4.eoi_token_id".into(), GgufMetadataValue::Uint32(44)),
+            ("gemma4.boi_token_id".into(), MetadataValue::Uint32(43)),
+            ("gemma4.eoi_token_id".into(), MetadataValue::Uint32(44)),
         ]);
         let projector = HashMap::from([
-            (
-                "clip.vision.patch_size".into(),
-                GgufMetadataValue::Uint32(2),
-            ),
+            ("clip.vision.patch_size".into(), MetadataValue::Uint32(2)),
             (
                 "clip.vision.pooling_kernel_size".into(),
-                GgufMetadataValue::Uint32(2),
+                MetadataValue::Uint32(2),
             ),
             (
                 "clip.vision.max_soft_tokens".into(),
-                GgufMetadataValue::Uint32(280),
+                MetadataValue::Uint32(280),
             ),
         ]);
-        let processor = Gemma4Processor::from_gguf(&model, &projector).unwrap();
+        let plan = Gemma4ProcessorPlan::from_gguf_metadata(&model, &projector).unwrap();
+        let processor = Gemma4Processor::from_plan(plan).unwrap();
         let plan = processor.plan.image(4, 4).unwrap();
         assert_eq!(plan.patch_size, 2);
         assert_eq!(plan.max_patches, 1120);

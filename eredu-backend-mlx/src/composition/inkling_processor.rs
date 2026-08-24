@@ -1,8 +1,5 @@
 //! Thinking Machines Lab Inkling image and dMel host preprocessing.
 
-#[cfg(feature = "media")]
-use std::collections::HashMap;
-
 #[cfg(feature = "image")]
 use eredu_architectures::processor_plan::InklingImagePlan;
 #[cfg(feature = "audio")]
@@ -31,19 +28,8 @@ pub struct InklingProcessor {
 }
 
 impl InklingProcessor {
-    pub fn load(model: &[u8]) -> Result<Option<Self>, Error> {
-        InklingProcessorPlan::from_hf_json(model)
-            .map_err(processor_error)
-            .map(|plan| plan.map(|plan| Self { plan }))
-    }
-
-    #[cfg(feature = "media")]
-    pub fn from_gguf(
-        metadata: &HashMap<String, safemlx::ops::GgufMetadataValue>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            plan: InklingProcessorPlan::from_gguf_metadata(metadata).map_err(processor_error)?,
-        })
+    pub fn from_plan(plan: InklingProcessorPlan) -> Self {
+        Self { plan }
     }
 
     pub fn prepare_input<E>(
@@ -293,16 +279,18 @@ mod tests {
     fn gguf_processor_resolves_media_markers_from_embedded_tokenizer() {
         use std::collections::HashMap;
 
-        use safemlx::ops::{GgufMetadataArray, GgufMetadataValue};
+        use eredu_architectures::processor_plan::InklingProcessorPlan;
+        use eredu_gguf::{MetadataArray, MetadataValue};
 
         let metadata = HashMap::from([(
             "tokenizer.ggml.tokens".into(),
-            GgufMetadataValue::Array(GgufMetadataArray::String(vec![
+            MetadataValue::Array(MetadataArray::String(vec![
                 "<|content_audio_input|>".into(),
                 "<|content_image|>".into(),
             ])),
         )]);
-        let processor = super::InklingProcessor::from_gguf(&metadata).unwrap();
+        let plan = InklingProcessorPlan::from_gguf_metadata(&metadata).unwrap();
+        let processor = super::InklingProcessor::from_plan(plan);
         #[cfg(feature = "image")]
         assert_eq!(processor.plan.image(40, 40).unwrap().start_token_id, 1);
         #[cfg(feature = "audio")]

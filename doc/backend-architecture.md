@@ -386,10 +386,13 @@ SafeTensors materialization retains the normalized configuration and validated
 tensor catalog from the preparation plan, opens one catalog-checked checkpoint
 store, and passes that composition object to every family loader. Family
 composition does not reopen `config.json`, rediscover checkpoint shards, or
-select a second catalog after admission. Inspection also retains typed
-architecture state in the preparation plan. Qwen GGUF processor construction,
-for example, consumes a `QwenProcessorPlan` derived from the admitted model and
-projector metadata rather than consulting adjacent Hugging Face JSON sidecars.
+select a second catalog after admission. Every admitted artifact plan retains
+the normalized `ModelKind`; GGUF plans additionally retain the exact
+`GgufArchitecture`. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
+also parses and retains the family processor plan from the admitted model,
+projector, and SafeTensors processor sidecars. Materialization consumes that
+snapshot directly and neither resolves family identity again nor rereads
+processor sidecars or GGUF metadata to reconstruct preprocessing policy.
 The catalog-bound store revalidates tensor metadata when leases are
 acquired so later header changes cannot silently replace the admitted catalog.
 For composite GGUF artifacts, the architecture additionally owns required

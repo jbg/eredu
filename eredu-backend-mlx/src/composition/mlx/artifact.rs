@@ -24,8 +24,6 @@ use eredu_core::{
 /// Family composition receives this object instead of an artifact path so it
 /// cannot rediscover configuration or checkpoint topology after admission.
 pub struct PreparedSafetensorsArtifact {
-    #[cfg(feature = "media")]
-    path: PathBuf,
     configuration: ModelConfiguration,
     store: SharedCheckpointSource,
 }
@@ -44,16 +42,9 @@ impl PreparedSafetensorsArtifact {
             source: Arc::new(store),
         };
         Ok(Self {
-            #[cfg(feature = "media")]
-            path,
             configuration,
             store: Arc::new(store),
         })
-    }
-
-    #[cfg(feature = "media")]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn configuration(&self) -> &ModelConfiguration {

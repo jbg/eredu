@@ -8,7 +8,7 @@ use eredu_core::{
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::{fs, path::Path};
 
 /// Stateless registry for every architecture family implemented by this crate.
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,37 +42,81 @@ impl ModelConfigurationResolver for ModelConfigurations {
 
     fn artifact_plan(
         &self,
-        _path: &Path,
+        path: &Path,
         format: ArtifactFormat,
         configuration: &ModelConfiguration,
         validated_gguf: Option<&ValidatedGguf>,
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
-        if format != ArtifactFormat::Gguf {
-            return Ok(Self::ArtifactPlan::default());
-        }
-        let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
-        if !matches!(
-            architecture,
-            GgufArchitecture::Qwen3Vl
-                | GgufArchitecture::Qwen3VlMoe
-                | GgufArchitecture::Qwen35
-                | GgufArchitecture::Qwen35Moe
-        ) {
-            return Ok(Self::ArtifactPlan::default());
-        }
-        let validated = validated_gguf.ok_or_else(|| {
-            ArtifactError::InvalidArtifact(
-                "GGUF inspection omitted its validated checkpoint".into(),
-            )
-        })?;
-        let projector = validated
-            .companion(&GgufCompanionRole::MediaProjector)
-            .map(|companion| companion.checkpoint().metadata());
-        crate::processor_plan::ArtifactProcessorPlan::from_qwen_gguf(
-            validated.checkpoint().metadata(),
-            projector,
-        )
-        .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))
+        let plan = match format {
+            ArtifactFormat::SafeTensors => {
+                let kind = ModelKind::resolve_family(&configuration.family)?;
+                let model = serde_json::to_vec(configuration.json.as_ref().ok_or_else(|| {
+                    ArtifactError::InvalidArtifact(
+                        "SafeTensors inspection omitted normalized JSON configuration".into(),
+                    )
+                })?)?;
+                let (image, video) = if matches!(
+                    kind,
+                    ModelKind::Gemma4
+                        | ModelKind::Qwen3Vl
+                        | ModelKind::Qwen3VlMoe
+                        | ModelKind::Qwen35
+                ) {
+                    (
+                        read_optional_sidecar(
+                            path,
+                            crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
+                        )?,
+                        read_optional_sidecar(
+                            path,
+                            crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
+                        )?,
+                    )
+                } else {
+                    (None, None)
+                };
+                let muse = if kind == ModelKind::MuseGlimmer {
+                    read_optional_sidecar(
+                        path,
+                        crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME,
+                    )?
+                } else {
+                    None
+                };
+                crate::processor_plan::ArtifactProcessorPlan::from_safetensors(
+                    kind,
+                    &model,
+                    image.as_deref(),
+                    video.as_deref(),
+                    muse.as_deref(),
+                )
+            }
+            ArtifactFormat::Gguf => {
+                let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
+                let validated = validated_gguf.ok_or_else(|| {
+                    ArtifactError::InvalidArtifact(
+                        "GGUF inspection omitted its validated checkpoint".into(),
+                    )
+                })?;
+                let projector = validated
+                    .companion(&GgufCompanionRole::MediaProjector)
+                    .map(|companion| companion.checkpoint().metadata());
+                crate::processor_plan::ArtifactProcessorPlan::from_gguf(
+                    architecture,
+                    validated.checkpoint().metadata(),
+                    projector,
+                )
+            }
+        };
+        plan.map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))
+    }
+}
+
+fn read_optional_sidecar(path: &Path, filename: &str) -> Result<Option<Vec<u8>>, ArtifactError> {
+    match fs::read(path.join(filename)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -556,6 +600,65 @@ mod tests {
     use super::*;
     use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
     use std::{collections::BTreeMap, fs::File};
+
+    #[test]
+    fn safetensors_processor_sidecars_are_snapshotted_during_inspection() {
+        let root = tempfile::tempdir().unwrap();
+        let processor_path = root
+            .path()
+            .join(crate::processor_plan::PROCESSOR_CONFIG_FILENAME);
+        let visual = |mean: f32| {
+            serde_json::to_vec(&serde_json::json!({
+                "size": {"shortest_edge": 16, "longest_edge": 64},
+                "patch_size": 2,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+                "image_mean": [mean, mean, mean],
+                "image_std": [1.0, 1.0, 1.0]
+            }))
+            .unwrap()
+        };
+        std::fs::write(&processor_path, visual(0.25)).unwrap();
+        let configuration = ModelConfiguration {
+            declared_model_type: "qwen3_vl".into(),
+            effective_model_type: "qwen3_vl_text".into(),
+            family: ModelKind::Qwen3Vl.canonical_name().into(),
+            loading_protocol: LoadingProtocol::Model,
+            json: Some(serde_json::json!({
+                "model_type": "qwen3_vl",
+                "vision_start_token_id": 44,
+                "vision_end_token_id": 45
+            })),
+        };
+        let plan = MODEL_CONFIGURATIONS
+            .artifact_plan(
+                root.path(),
+                ArtifactFormat::SafeTensors,
+                &configuration,
+                None,
+            )
+            .unwrap();
+
+        std::fs::write(&processor_path, visual(0.75)).unwrap();
+
+        assert_eq!(plan.model_kind(), Some(ModelKind::Qwen3Vl));
+        assert_eq!(
+            plan.qwen().unwrap().image(8, 8).unwrap().transform.mean,
+            [0.25; 3]
+        );
+        let next = MODEL_CONFIGURATIONS
+            .artifact_plan(
+                root.path(),
+                ArtifactFormat::SafeTensors,
+                &configuration,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            next.qwen().unwrap().image(8, 8).unwrap().transform.mean,
+            [0.75; 3]
+        );
+    }
 
     #[test]
     fn nested_wrappers_and_aliases_resolve_in_one_registry() {

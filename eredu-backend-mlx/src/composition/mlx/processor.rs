@@ -1,7 +1,5 @@
 //! Architecture selection for MLX media preprocessing.
 
-use std::path::Path;
-
 #[cfg(feature = "image")]
 use eredu_core::VideoSampling;
 use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment};
@@ -143,77 +141,39 @@ impl<'a> PortableMediaView<'a> {
 }
 
 impl ModelProcessor {
-    pub fn load_gemma4(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
-        gemma4::Gemma4Processor::load(model_dir, model).map(|processor| {
-            processor.map(|processor| Self {
+    /// Lowers the authoritative architecture-owned processor plan to MLX execution.
+    pub fn from_plan(
+        plan: &eredu_architectures::processor_plan::ArtifactProcessorPlan,
+    ) -> Option<Self> {
+        if let Some(processor) = plan
+            .gemma4()
+            .cloned()
+            .and_then(gemma4::Gemma4Processor::from_plan)
+        {
+            return Some(Self {
                 kind: ProcessorKind::Gemma4(processor),
-            })
-        })
-    }
-
-    #[cfg(any(feature = "image", feature = "audio"))]
-    pub fn load_gemma4_gguf(
-        model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-        projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            kind: ProcessorKind::Gemma4(gemma4::Gemma4Processor::from_gguf(
-                model_metadata,
-                projector_metadata,
-            )?),
-        })
-    }
-
-    pub fn load_inkling(model: &[u8]) -> Result<Option<Self>, Error> {
-        inkling::InklingProcessor::load(model).map(|processor| {
-            processor.map(|processor| Self {
-                kind: ProcessorKind::Inkling(processor),
-            })
-        })
-    }
-
-    pub fn load_inkling_gguf(
-        metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            kind: ProcessorKind::Inkling(inkling::InklingProcessor::from_gguf(metadata)?),
-        })
-    }
-
-    #[cfg(feature = "image")]
-    pub fn load_muse_glimmer(model_dir: &Path) -> Result<Option<Self>, Error> {
-        muse_glimmer::MuseGlimmerProcessor::load(model_dir).map(|processor| {
-            processor.map(|processor| Self {
-                kind: ProcessorKind::MuseGlimmer(processor),
-            })
-        })
-    }
-
-    #[cfg(feature = "image")]
-    pub fn load_muse_glimmer_gguf(
-        projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            kind: ProcessorKind::MuseGlimmer(muse_glimmer::MuseGlimmerProcessor::from_gguf(
-                projector_metadata,
-            )?),
-        })
-    }
-
-    #[cfg(feature = "image")]
-    pub fn load_qwen(model_dir: &Path, model: &[u8]) -> Result<Option<Self>, Error> {
-        qwen::QwenProcessor::load(model_dir, model).map(|processor| {
-            processor.map(|processor| Self {
-                kind: ProcessorKind::Qwen(processor),
-            })
-        })
-    }
-
-    #[cfg(feature = "image")]
-    pub fn load_qwen_plan(plan: eredu_architectures::processor_plan::QwenProcessorPlan) -> Self {
-        Self {
-            kind: ProcessorKind::Qwen(qwen::QwenProcessor::from_plan(plan)),
+            });
         }
+        if let Some(processor) = plan.inkling().cloned() {
+            return Some(Self {
+                kind: ProcessorKind::Inkling(inkling::InklingProcessor::from_plan(processor)),
+            });
+        }
+        #[cfg(feature = "image")]
+        if let Some(processor) = plan.muse().cloned() {
+            return Some(Self {
+                kind: ProcessorKind::MuseGlimmer(muse_glimmer::MuseGlimmerProcessor::from_plan(
+                    processor,
+                )),
+            });
+        }
+        #[cfg(feature = "image")]
+        if let Some(processor) = plan.qwen().cloned() {
+            return Some(Self {
+                kind: ProcessorKind::Qwen(qwen::QwenProcessor::from_plan(processor)),
+            });
+        }
+        None
     }
 
     fn prepare_input<E>(
@@ -266,74 +226,40 @@ impl ModelProcessor {
     }
 }
 
-/// Loads a supported media processor without loading model weights.
-pub fn load_processor(
-    kind: eredu_architectures::ModelKind,
-    model_dir: impl AsRef<Path>,
-    config: &serde_json::Value,
-) -> Result<Option<ModelProcessor>, Error> {
-    let model_dir = model_dir.as_ref();
-    let model = serde_json::to_vec(config)?;
-    match kind {
-        eredu_architectures::ModelKind::Inkling => ModelProcessor::load_inkling(&model),
-        eredu_architectures::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir, &model),
-        eredu_architectures::ModelKind::MuseGlimmer => {
-            #[cfg(feature = "image")]
-            {
-                ModelProcessor::load_muse_glimmer(model_dir)
-            }
-            #[cfg(not(feature = "image"))]
-            {
-                Ok(None)
-            }
-        }
-        eredu_architectures::ModelKind::Qwen3Vl
-        | eredu_architectures::ModelKind::Qwen3VlMoe
-        | eredu_architectures::ModelKind::Qwen35 => {
-            #[cfg(feature = "image")]
-            {
-                ModelProcessor::load_qwen(model_dir, &model)
-            }
-            #[cfg(not(feature = "image"))]
-            {
-                Ok(None)
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
 #[cfg(all(test, feature = "image"))]
 mod tests {
     use std::{collections::HashMap, convert::Infallible};
 
+    use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
     use eredu_core::{Media, MultimodalRequest, MultimodalSegment, RgbImage};
-    use safemlx::ops::GgufMetadataValue;
+    use eredu_gguf::MetadataValue;
 
-    use super::ModelProcessor;
+    use super::{ModelProcessor, ProcessorKind};
     use crate::backend::runtime::media::input::Modality;
 
     #[test]
     fn mlx_processor_materializes_the_portable_ordered_request() {
         let model = HashMap::from([
-            ("gemma4.boi_token_id".into(), GgufMetadataValue::Uint32(43)),
-            ("gemma4.eoi_token_id".into(), GgufMetadataValue::Uint32(44)),
+            ("gemma4.boi_token_id".into(), MetadataValue::Uint32(43)),
+            ("gemma4.eoi_token_id".into(), MetadataValue::Uint32(44)),
         ]);
         let projector = HashMap::from([
-            (
-                "clip.vision.patch_size".into(),
-                GgufMetadataValue::Uint32(2),
-            ),
+            ("clip.vision.patch_size".into(), MetadataValue::Uint32(2)),
             (
                 "clip.vision.pooling_kernel_size".into(),
-                GgufMetadataValue::Uint32(1),
+                MetadataValue::Uint32(1),
             ),
             (
                 "clip.vision.max_soft_tokens".into(),
-                GgufMetadataValue::Uint32(70),
+                MetadataValue::Uint32(70),
             ),
         ]);
-        let processor = ModelProcessor::load_gemma4_gguf(&model, &projector).unwrap();
+        let plan = Gemma4ProcessorPlan::from_gguf_metadata(&model, &projector).unwrap();
+        let processor = ModelProcessor {
+            kind: ProcessorKind::Gemma4(
+                crate::composition::gemma4_processor::Gemma4Processor::from_plan(plan).unwrap(),
+            ),
+        };
         let request = MultimodalRequest::new(vec![
             MultimodalSegment::TokenIds(vec![7]),
             MultimodalSegment::Media(Media::Image(

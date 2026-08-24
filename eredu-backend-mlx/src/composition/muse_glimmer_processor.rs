@@ -1,12 +1,10 @@
 //! Hugging Face-compatible Muse-Glimmer image and experimental video host processor.
 
-use std::{fs, path::Path};
-
 use eredu_architectures::processor_plan::{
     MuseImagePlan, MusePatchPlan, MuseProcessorPlan, ProcessorPlanError, RgbResample,
-    RgbTransformPlan, MUSE_PROCESSOR_CONFIG_FILENAME,
+    RgbTransformPlan,
 };
-use safemlx::{ops::GgufMetadataValue, Array};
+use safemlx::Array;
 
 use crate::{
     backend::error::Error,
@@ -27,22 +25,8 @@ pub struct MuseGlimmerProcessor {
 }
 
 impl MuseGlimmerProcessor {
-    pub fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
-        let path = model_dir.join(MUSE_PROCESSOR_CONFIG_FILENAME);
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            plan: MuseProcessorPlan::from_hf_json(&fs::read(path)?).map_err(processor_error)?,
-        }))
-    }
-
-    pub fn from_gguf(
-        metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            plan: MuseProcessorPlan::from_gguf_metadata(metadata).map_err(processor_error)?,
-        })
+    pub fn from_plan(plan: MuseProcessorPlan) -> Self {
+        Self { plan }
     }
 
     pub fn prepare_input<E>(
