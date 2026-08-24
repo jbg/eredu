@@ -2771,10 +2771,9 @@ type Lfm2PipelinePartition = PipelineRealization<
     MlxModule<eredu_architectures::lfm2::Block<MlxNeuralBackend>>,
 >;
 
-struct GroupedPredictionPipelineRealization<A, P, C, U> {
+struct GroupedPredictionPipelineRealization<A, P, U> {
     architecture: A,
     partition: P,
-    bindings: C,
     layers: Vec<U>,
     prediction_layers: Vec<Vec<U>>,
     dense_layers: Option<PipelineLayerStorage>,
@@ -2799,7 +2798,6 @@ type NemotronHPipelinePartition = GroupedPredictionPipelineRealization<
         Arc<eredu_architectures::nemotron_h::LocalGeometry>,
         eredu_architectures::nemotron_h::TargetBoundarySchema,
     >,
-    (),
     MlxModule<eredu_architectures::nemotron_h::Unit<MlxNeuralBackend>>,
 >;
 
@@ -2809,11 +2807,10 @@ type QwenHybridPipelinePartition = GroupedPredictionPipelineRealization<
         Option<Arc<eredu_architectures::qwen::hybrid::LocalGeometry>>,
         eredu_runtime::NoAuxiliaryBoundary,
     >,
-    QwenHybridPipelineBindings,
     MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxNeuralBackend>>,
 >;
 
-impl<A, P, C, U> GroupedPredictionPipelineRealization<A, P, C, U> {
+impl<A, P, U> GroupedPredictionPipelineRealization<A, P, U> {
     fn range(&self) -> Range<usize>
     where
         P: GroupedPartition,
@@ -4239,7 +4236,11 @@ where
                     range.len()
                 )));
             }
-            Ok((group, range.start))
+            let address = description
+                .unit_layout()
+                .address(range.start)
+                .expect("validated prediction range contains its unit");
+            Ok((group, address.index()))
         })
         .collect()
 }
@@ -9423,7 +9424,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
 
 impl PipelineEmbeddedMtp for QwenConditionalPipelinePartition {
     fn embedded_mtp_len(&self) -> usize {
-        self.args().text.mtp_num_hidden_layers.max(0) as usize
+        self.prediction_layers.len()
     }
 
     fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
@@ -18994,7 +18995,6 @@ impl NemotronHPipelinePartition {
         Ok(Self {
             architecture,
             partition,
-            bindings: (),
             layers: Vec::new(),
             prediction_layers: Vec::new(),
             dense_layers: None,
@@ -19334,15 +19334,9 @@ impl QwenHybridPipelinePartition {
         >,
         external_experts: bool,
     ) -> Result<Self, Error> {
-        let bindings = if external_experts {
-            QwenHybridPipelineBindings::new_external_experts()
-        } else {
-            QwenHybridPipelineBindings::new()
-        };
         Ok(Self {
             architecture,
             partition,
-            bindings,
             layers: Vec::new(),
             prediction_layers: Vec::new(),
             dense_layers: None,
@@ -19672,7 +19666,7 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
 
 impl PipelineEmbeddedMtp for QwenHybridPipelinePartition {
     fn embedded_mtp_len(&self) -> usize {
-        self.args().mtp_num_hidden_layers.max(0) as usize
+        self.prediction_layers.len()
     }
 
     fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
@@ -19809,10 +19803,6 @@ fn load_neutral_qwen_hybrid_pipeline(
     } else {
         QwenHybridPipelineBindings::new()
     };
-    topology.preflight(
-        Some(source_args.num_hidden_layers as usize),
-        external_experts.then_some(source_args.num_experts as usize),
-    )?;
     if requested_quantization.is_some() && source_args.fp8.is_some() {
         return Err(Error::Quantization(
             "Qwen hybrid pipeline cannot implicitly transcode checkpoint-native FP8 weights".into(),
@@ -19841,7 +19831,6 @@ fn load_neutral_qwen_hybrid_pipeline(
     } else {
         QwenHybridPipelineBindings::new()
     };
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let kind = if source_args.variant == eredu_architectures::qwen::hybrid::HybridVariant::Qwen3Next
     {
         ModelKind::Qwen3Next
@@ -19860,53 +19849,25 @@ fn load_neutral_qwen_hybrid_pipeline(
             stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut parameter_groups =
-        eredu_architectures::decoder::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &binding_architecture.static_modules().embeddings,
-            &binding_architecture.static_modules().norm,
-            binding_architecture.static_modules().lm_head.as_ref(),
-            "model",
-        )?;
+    let binding_parameter_description = binding_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
-    for layer in 0..target_args.num_hidden_layers as usize {
-        let unit =
-            <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::build_unit(&binding_architecture, decoder_group, layer, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
-                &unit,
-                &target_args,
-                0,
-                layer,
-            )?,
-        );
-    }
-    for depth in 0..target_args.mtp_num_hidden_layers as usize {
-        let prediction_group =
-            architecture_prediction_group::<_, MlxHybridState>(&binding_architecture, depth)?;
-        let unit =
-            <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::build_unit(&binding_architecture, prediction_group, 0, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
-                &unit,
-                &target_args,
-                depth + 1,
-                0,
-            )?,
-        );
-    }
+    let target_units = binding_parameter_description
+        .unit_layout()
+        .group_range(decoder_group)
+        .ok_or_else(|| Error::Parallel("Qwen hybrid parameter plan has no target group".into()))?
+        .len();
+    topology.preflight(
+        Some(target_units),
+        external_experts.then_some(source_args.num_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
+        for group in binding_parameter_description.groups() {
+            planner.register(group.group().clone())?;
         }
         let (_, layout) = planner.finish()?;
         let geometry = eredu_architectures::qwen::hybrid::local_geometry(&target_args, &layout)
@@ -19971,9 +19932,10 @@ fn load_neutral_qwen_hybrid_pipeline(
     let mut stage = QwenHybridPipelinePartition::new(architecture, partition, external_experts)?;
     stage.expert_assignment = expert_assignment;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
-    let prediction_groups = (0..stage.bindings.embedded_mtp_len(&stage.architecture))
-        .map(|depth| architecture_prediction_group::<_, MlxHybridState>(&stage.architecture, depth))
-        .collect::<Result<Vec<_>, _>>()?;
+    let prediction_units = architecture_single_prediction_units::<_, MlxHybridState>(
+        &stage.architecture,
+        &parameter_description,
+    )?;
     stage.layers = range
         .clone()
         .map(|global_layer| {
@@ -19984,19 +19946,15 @@ fn load_neutral_qwen_hybrid_pipeline(
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp = info.is_last && stage.bindings.embedded_mtp_len(&stage.architecture) > 0;
+    let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
     info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp {
-        stage.bindings.embedded_mtp_len(&stage.architecture)
-    } else {
-        0
-    };
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     if owns_mtp {
-        for &group in &prediction_groups {
+        for &(group, index) in &prediction_units {
             let unit = <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
                 MlxNeuralBackend,
                 MlxHybridState,
-            >>::build_unit(&stage.architecture, group, 0, stream)
+            >>::build_unit(&stage.architecture, group, index, stream)
             .map(MlxModule::new)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             stage.prediction_layers.push(vec![unit]);
@@ -20011,8 +19969,8 @@ fn load_neutral_qwen_hybrid_pipeline(
                 stage.range().clone(),
             );
             if owns_mtp {
-                for &group in &prediction_groups {
-                    selection = selection.with_layer_group(group, 0..1);
+                for &(group, index) in &prediction_units {
+                    selection = selection.with_layer_group(group, index..index + 1);
                 }
             }
             let source_quantization =
@@ -20111,17 +20069,18 @@ fn load_neutral_qwen_hybrid_pipeline(
     }
     if owns_mtp {
         let architecture = &stage.architecture;
-        for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
-            let prediction_group = prediction_groups[depth];
+        for (&(prediction_group, prediction_index), layers) in
+            prediction_units.iter().zip(&mut stage.prediction_layers)
+        {
             let layer = &mut layers[0];
             let binding_layer = binding_architecture
-                .construct_unit(prediction_group, 0, stream)
+                .construct_unit(prediction_group, prediction_index, stream)
                 .map(MlxModule::new)
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 prediction_group,
-                0,
+                prediction_index,
                 &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
@@ -20132,7 +20091,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                     architecture_parameter_unit_owner::<_, MlxHybridState>(
                         architecture,
                         prediction_group,
-                        0,
+                        prediction_index,
                     )?,
                     layer,
                     store.as_ref(),
@@ -20147,7 +20106,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                     architecture_parameter_unit_owner::<_, MlxHybridState>(
                         architecture,
                         prediction_group,
-                        0,
+                        prediction_index,
                     )?,
                     layer,
                     store.as_ref(),
@@ -20294,10 +20253,6 @@ fn load_neutral_qwen_conditional_pipeline(
     } else {
         QwenConditionalPipelineBindings::new()
     };
-    topology.preflight(
-        Some(source.text.num_hidden_layers as usize),
-        external_experts.then_some(source.text.num_experts as usize),
-    )?;
     if requested_quantization.is_some() && source.text.fp8.is_some() {
         return Err(Error::Quantization(
             "conditional Qwen3.5 pipeline cannot implicitly transcode checkpoint-native FP8 weights"
@@ -20330,95 +20285,36 @@ fn load_neutral_qwen_conditional_pipeline(
     } else {
         QwenConditionalPipelineBindings::new()
     };
-    let range = topology.layer_range(source.text.num_hidden_layers as usize)?;
     let binding_architecture =
         eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let static_modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
-        MlxNeuralBackend,
-    > as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
-        &binding_architecture,
-    );
-    let mut parameter_groups =
-        eredu_architectures::decoder::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &static_modules.text.embeddings,
-            &static_modules.text.norm,
-            static_modules.text.lm_head.as_ref(),
-            "model",
-        )?;
-    let vision = target
-        .vision
-        .as_ref()
-        .expect("validated conditional vision");
-    parameter_groups.extend(
-        eredu_architectures::qwen::vision::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &static_modules.vision,
-            vision,
-            "model.visual",
-        )?,
-    );
+    let binding_parameter_description = binding_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
         &binding_architecture,
         eredu_runtime::ArchitectureGroupKind::VisionEncoder,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
-    for index in 0..vision.layer_count() {
-        let unit = binding_architecture
-            .construct_unit(vision_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let eredu_architectures::qwen::hybrid::ConditionalUnit::Vision(block) = unit else {
-            unreachable!()
-        };
-        parameter_groups.extend(
-            eredu_architectures::qwen::vision::block_parallel_parameter_groups(
-                &block,
-                vision,
-                "model.visual",
-                index,
-            )?,
-        );
-    }
-    for index in 0..target.text.num_hidden_layers as usize {
-        let unit = binding_architecture
-            .construct_unit(decoder_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let eredu_architectures::qwen::hybrid::ConditionalUnit::Target(block) = unit else {
-            unreachable!()
-        };
-        parameter_groups.extend(
-            eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
-                &eredu_architectures::qwen::hybrid::Unit::Target(block),
-                &target.text,
-                0,
-                index,
-            )?,
-        );
-    }
-    for depth in 0..target.text.mtp_num_hidden_layers.max(0) as usize {
-        let prediction_group =
-            architecture_prediction_group::<_, MlxHybridState>(&binding_architecture, depth)?;
-        let unit = binding_architecture
-            .construct_unit(prediction_group, 0, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let eredu_architectures::qwen::hybrid::ConditionalUnit::Prediction(unit) = unit else {
-            unreachable!()
-        };
-        parameter_groups.extend(
-            eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
-                &eredu_architectures::qwen::hybrid::Unit::Prediction(unit),
-                &target.text,
-                depth + 1,
-                0,
-            )?,
-        );
-    }
+    let target_units = binding_parameter_description
+        .unit_layout()
+        .group_range(decoder_group)
+        .ok_or_else(|| {
+            Error::Parallel("conditional Qwen parameter plan has no target group".into())
+        })?
+        .len();
+    topology.preflight(
+        Some(target_units),
+        external_experts.then_some(source.text.num_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
+        for group in binding_parameter_description.groups() {
+            planner.register(group.group().clone())?;
         }
         let (_, layout) = planner.finish()?;
         let geometry =
@@ -20451,6 +20347,7 @@ fn load_neutral_qwen_conditional_pipeline(
     let complete_state = architecture
         .runtime_state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let boundary_schema = architecture.pipeline_boundary_schema();
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -20458,9 +20355,7 @@ fn load_neutral_qwen_conditional_pipeline(
             info.pipeline_stage,
             None,
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema::from_args(
-                &target,
-            ),
+            boundary_schema,
             std::iter::empty(),
         )?;
     let state_end = if ownership_probe.ownership().owns_output() {
@@ -20481,14 +20376,16 @@ fn load_neutral_qwen_conditional_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema::from_args(
-                &target,
-            ),
+            boundary_schema,
             local_parameter_groups,
         )?;
     let mut stage =
         QwenConditionalPipelinePartition::new(architecture, partition, external_experts)?;
     stage.expert_assignment = expert_assignment;
+    let prediction_units = architecture_single_prediction_units::<_, MlxHybridState>(
+        &stage.architecture,
+        &parameter_description,
+    )?;
     stage.vision_layers = stage
         .vision_range()
         .map(|index| {
@@ -20509,21 +20406,14 @@ fn load_neutral_qwen_conditional_pipeline(
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp =
-        stage.partition.ownership().owns_output() && target.text.mtp_num_hidden_layers > 0;
+    let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
     info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp {
-        target.text.mtp_num_hidden_layers as usize
-    } else {
-        0
-    };
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     if owns_mtp {
-        for depth in 0..target.text.mtp_num_hidden_layers as usize {
-            let prediction_group =
-                architecture_prediction_group::<_, MlxHybridState>(&stage.architecture, depth)?;
+        for &(prediction_group, prediction_index) in &prediction_units {
             let unit = stage
                 .architecture
-                .construct_unit(prediction_group, 0, stream)
+                .construct_unit(prediction_group, prediction_index, stream)
                 .map(MlxModule::new)
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             stage.prediction_layers.push(vec![unit]);
@@ -20539,12 +20429,9 @@ fn load_neutral_qwen_conditional_pipeline(
             )
             .with_layer_group(vision_group, stage.vision_range().clone());
             if owns_mtp {
-                for depth in 0..target.text.mtp_num_hidden_layers as usize {
-                    let prediction_group = architecture_prediction_group::<_, MlxHybridState>(
-                        &stage.architecture,
-                        depth,
-                    )?;
-                    selection = selection.with_layer_group(prediction_group, 0..1);
+                for &(prediction_group, prediction_index) in &prediction_units {
+                    selection = selection
+                        .with_layer_group(prediction_group, prediction_index..prediction_index + 1);
                 }
             }
             let source_quantization =
@@ -20669,18 +20556,18 @@ fn load_neutral_qwen_conditional_pipeline(
     }
     if owns_mtp {
         let architecture = &stage.architecture;
-        for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
-            let prediction_group =
-                architecture_prediction_group::<_, MlxHybridState>(architecture, depth)?;
+        for (&(prediction_group, prediction_index), layers) in
+            prediction_units.iter().zip(&mut stage.prediction_layers)
+        {
             let layer = &mut layers[0];
             let binding_layer = binding_architecture
-                .construct_unit(prediction_group, 0, stream)
+                .construct_unit(prediction_group, prediction_index, stream)
                 .map(MlxModule::new)
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 prediction_group,
-                0,
+                prediction_index,
                 &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
@@ -20690,7 +20577,7 @@ fn load_neutral_qwen_conditional_pipeline(
                     architecture_parameter_unit_owner::<_, MlxHybridState>(
                         architecture,
                         prediction_group,
-                        0,
+                        prediction_index,
                     )?,
                     layer,
                     store.as_ref(),
@@ -20705,7 +20592,7 @@ fn load_neutral_qwen_conditional_pipeline(
                     architecture_parameter_unit_owner::<_, MlxHybridState>(
                         architecture,
                         prediction_group,
-                        0,
+                        prediction_index,
                     )?,
                     layer,
                     store.as_ref(),
@@ -20721,11 +20608,28 @@ fn load_neutral_qwen_conditional_pipeline(
     let diagnostics_before_deferred = store.source_diagnostics()?;
     if let Some(options) = dense_stream {
         let layout = parallel_layout.clone();
-        let vision_start = stage.vision_range().start;
-        let vision_count = stage.vision_range().len();
-        let text_start = stage.range().start;
         let adapter = &stage.adapter;
         let streamed_architecture = &stage.architecture;
+        let streamed_units = stage
+            .partition
+            .units()
+            .filter(|address| {
+                <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
+                    MlxNeuralBackend,
+                > as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_transport(
+                    streamed_architecture,
+                    address.group(),
+                )
+                .placement
+                    == eredu_runtime::ArchitectureGroupPlacement::Pipeline
+            })
+            .collect::<Vec<_>>();
+        let execution_offset = streamed_units
+            .iter()
+            .position(|address| address.group() == decoder_group)
+            .ok_or_else(|| {
+                Error::Parallel("conditional Qwen partition traversal has no target unit".into())
+            })?;
         let dense = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -20734,56 +20638,44 @@ fn load_neutral_qwen_conditional_pipeline(
             } else {
                 &[]
             },
-            0..vision_count + stage.range().len(),
+            0..streamed_units.len(),
             options,
             static_bytes,
             info.materialization.clone(),
             stream,
             weights_stream,
             |ordinal, stream| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
+                let address = streamed_units[ordinal];
                 streamed_architecture
-                    .construct_unit(group, index, stream)
+                    .construct_unit(address.group(), address.index(), stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |ordinal, _layer, store| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
+                let address = streamed_units[ordinal];
                 let binding_layer = binding_architecture
-                    .construct_unit(group, index, stream)
+                    .construct_unit(address.group(), address.index(), stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 adapter.cartesian_layer_bindings(
                     &binding_architecture,
-                    group,
-                    index,
+                    address.group(),
+                    address.index(),
                     &binding_layer,
                     store,
                     layout.as_ref(),
                 )
             },
             |ordinal| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
+                let address = streamed_units[ordinal];
                 architecture_parameter_unit_owner::<_, MlxHybridState>(
                     streamed_architecture,
-                    group,
-                    index,
+                    address.group(),
+                    address.index(),
                 )
             },
         )?
-        .with_execution_offset(vision_count)?;
+        .with_execution_offset(execution_offset)?;
         stage.dense_layers = Some(dense);
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?)

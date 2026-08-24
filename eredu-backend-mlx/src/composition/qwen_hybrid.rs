@@ -16,8 +16,8 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
-    LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
+    CacheResidencyPolicy, CausalModel, ExecutionResidency, LayerWeightResidency,
+    LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
     PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
 };
 use safemlx::{
@@ -471,10 +471,6 @@ impl QwenHybridPipelineBindings {
         &architecture.config().model_type
     }
 
-    pub fn embedded_mtp_len(&self, architecture: &Architecture) -> usize {
-        architecture.config().mtp_num_hidden_layers.max(0) as usize
-    }
-
     pub fn static_units(
         &self,
         architecture: &Architecture,
@@ -502,7 +498,9 @@ impl QwenHybridPipelineBindings {
                 "Qwen hybrid has no unit {index} in group {group}"
             )));
         }
-        unit_layout(architecture)?
+        architecture
+            .unit_layout()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
             .ordinal(group, index)
             .ok_or_else(|| {
                 Error::Parallel(format!("Qwen hybrid has no unit {index} in group {group}"))
@@ -1819,51 +1817,14 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for QwenH
     }
 }
 
-fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error> {
-    let graph = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
-        architecture,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let counts = (0..graph.groups().len())
-        .map(|group| {
-            <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
-                architecture,
-                group,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
-
-fn conditional_unit_layout(
-    architecture: &ConditionalArchitecture,
-) -> Result<ExecutionUnitLayout, Error> {
-    let graph = <ConditionalArchitecture as LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxHybridState,
-    >>::execution_graph(architecture)
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let counts = (0..graph.groups().len())
-        .map(|group| {
-            <ConditionalArchitecture as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::group_unit_count(architecture, group)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
-
 fn conditional_unit_ordinal(
     architecture: &ConditionalArchitecture,
     group: usize,
     index: usize,
 ) -> Result<usize, Error> {
-    conditional_unit_layout(architecture)?
+    architecture
+        .unit_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .ordinal(group, index)
         .ok_or_else(|| {
             Error::Parallel(format!(
@@ -1908,17 +1869,18 @@ fn quantize_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let target_layers = usize::try_from(source.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Qwen hybrid layer count".into()))?;
-    let total = target_layers
-        .checked_add(usize::try_from(source.mtp_num_hidden_layers).map_err(|_| {
-            Error::ArchitectureModel("invalid Qwen hybrid MTP layer count".into())
-        })?)
-        .ok_or_else(|| {
-            Error::ArchitectureModel("Qwen hybrid layer count overflowed".into())
-        })?;
-    let source_layout = unit_layout(&source_architecture)?;
-    let target_layout = unit_layout(&target_architecture)?;
+    let source_layout = source_architecture
+        .unit_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let target_layout = target_architecture
+        .unit_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if source_layout != target_layout {
+        return Err(Error::ArchitectureModel(
+            "Qwen hybrid load-time quantization changed execution topology".into(),
+        ));
+    }
+    let total = source_layout.len();
     let source_static =
         <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &source_architecture,
@@ -1977,23 +1939,18 @@ fn quantize_conditional_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = ConditionalArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let vision_layers = source
-        .vision
-        .as_ref()
-        .expect("conditional configuration has vision")
-        .layer_count();
-    let target_layers = usize::try_from(source.text.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Qwen hybrid layer count".into()))?;
-    let prediction_layers = usize::try_from(source.text.mtp_num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Qwen hybrid MTP depth".into()))?;
-    let total = vision_layers
-        .checked_add(target_layers)
-        .and_then(|count| count.checked_add(prediction_layers))
-        .ok_or_else(|| {
-            Error::ArchitectureModel("conditional unit count overflowed".into())
-        })?;
-    let source_layout = conditional_unit_layout(&source_architecture)?;
-    let target_layout = conditional_unit_layout(&target_architecture)?;
+    let source_layout = source_architecture
+        .unit_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let target_layout = target_architecture
+        .unit_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if source_layout != target_layout {
+        return Err(Error::ArchitectureModel(
+            "conditional Qwen load-time quantization changed execution topology".into(),
+        ));
+    }
+    let total = source_layout.len();
     let source_static = <ConditionalArchitecture as LayeredArchitecture<
         MlxNeuralBackend,
         MlxHybridState,

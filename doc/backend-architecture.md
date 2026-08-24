@@ -357,6 +357,13 @@ execution-unit layout alongside owner-tagged parameter groups. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for
 target and prediction placement; it does not rebuild target/MTP counts from
 family configuration fields.
+Rank-local materialization traverses the canonical units exposed by its
+`ArchitecturePartition`, so composite vision, target, and prediction ordering
+is never restated by a backend loader. Qwen hybrid load-time conversion and MLX
+tensor-parallel planning likewise consume the architecture's unit layout and
+complete parameter description. Conditional Qwen pipeline boundaries come from
+the constructed architecture, including hidden width and DeepStack activation
+cardinality, rather than being re-derived from family arguments in MLX.
 
 The MLX backend materializes every active expert-parallel axis through its
 single distributed-stage loader. Pure EP, PP+EP, TP+EP, and TP+PP+EP therefore

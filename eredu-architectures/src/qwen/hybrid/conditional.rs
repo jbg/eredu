@@ -217,17 +217,6 @@ pub struct ConditionalPipelineBoundarySchema {
 }
 
 impl ConditionalPipelineBoundarySchema {
-    /// Derives the schema from the normalized conditional model.
-    pub fn from_args(args: &ParsedHybridConfig) -> Self {
-        Self {
-            hidden_size: args.text.hidden_size,
-            deepstack_count: args
-                .vision
-                .as_ref()
-                .map_or(0, |vision| vision.deepstack_layer_count()),
-        }
-    }
-
     /// Returns the expected number of transported DeepStack tensors.
     pub const fn deepstack_count(self) -> usize {
         self.deepstack_count
@@ -453,30 +442,70 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
         &self.parsed
     }
 
-    /// Describes vision, target, and prediction parameters with explicit
-    /// canonical graph ownership.
-    pub fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let mut graph_groups = vec![
+    fn canonical_execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        let mut groups = vec![
             ExecutionGroupSpec::root("vision"),
             ExecutionGroupSpec::with_dependencies("target", ["vision"]),
         ];
         let mut output = "target".to_owned();
         for depth in 0..self.prediction_steps {
             let id = format!("mtp.{depth}");
-            graph_groups.push(ExecutionGroupSpec::with_dependencies(
+            groups.push(ExecutionGroupSpec::with_dependencies(
                 id.clone(),
                 [output.clone()],
             ));
             output = id;
         }
-        let graph = ExecutionGraph::new(graph_groups, output).map_err(Error::backend)?;
+        ExecutionGraph::new(groups, output).map_err(Error::backend)
+    }
+
+    fn canonical_group_unit_count(&self, group: usize) -> Result<usize, Error> {
+        match group {
+            0 => Ok(self
+                .parsed
+                .vision
+                .as_ref()
+                .expect("validated vision")
+                .layer_count()),
+            1 => Ok(self.target_layers),
+            group if group < self.prediction_steps + 2 => Ok(1),
+            _ => Err(Error::backend(
+                "conditional Qwen3.5 execution group is invalid",
+            )),
+        }
+    }
+
+    /// Returns the architecture-owned vision, target, and prediction traversal.
+    pub fn unit_layout(&self) -> Result<ExecutionUnitLayout, Error> {
+        let graph = self.canonical_execution_graph()?;
+        let counts = (0..graph.groups().len())
+            .map(|group| self.canonical_group_unit_count(group))
+            .collect::<Result<Vec<_>, _>>()?;
+        ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)
+    }
+
+    /// Returns the family-owned activation schema transported between stages.
+    pub fn pipeline_boundary_schema(&self) -> ConditionalPipelineBoundarySchema {
+        ConditionalPipelineBoundarySchema {
+            hidden_size: self.parsed.text.hidden_size,
+            deepstack_count: self
+                .parsed
+                .vision
+                .as_ref()
+                .expect("validated vision")
+                .deepstack_layer_count(),
+        }
+    }
+
+    /// Describes vision, target, and prediction parameters with explicit
+    /// canonical graph ownership.
+    pub fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        let graph = self.canonical_execution_graph()?;
         let vision = self.parsed.vision.as_ref().expect("validated vision");
-        let mut counts = vec![vision.layer_count(), self.target_layers];
-        counts.extend(std::iter::repeat_n(1, self.prediction_steps));
-        let layout = ExecutionUnitLayout::new(&graph, counts.clone()).map_err(Error::backend)?;
+        let layout = self.unit_layout()?;
         let text_static = static_parallel_parameter_groups::<B>(
             &self.static_modules.text.embeddings,
             &self.static_modules.text.norm,
@@ -517,11 +546,15 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
                 OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("vision"), group)
             }))
             .collect::<Vec<_>>();
-        for (group_index, &count) in counts.iter().enumerate() {
+        for group_index in 0..layout.group_count() {
             let group_id = layout
                 .group_id(group_index)
                 .expect("conditional layout group")
                 .clone();
+            let count = layout
+                .group_range(group_index)
+                .expect("conditional layout range")
+                .len();
             for index in 0..count {
                 let unit = self.construct_unit(group_index, index, context)?;
                 let groups = match unit {
@@ -1345,36 +1378,11 @@ where
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        let mut groups = vec![
-            ExecutionGroupSpec::root("vision"),
-            ExecutionGroupSpec::with_dependencies("target", ["vision"]),
-        ];
-        let mut output = "target".to_owned();
-        for depth in 0..self.prediction_steps {
-            let id = format!("mtp.{depth}");
-            groups.push(ExecutionGroupSpec::with_dependencies(
-                id.clone(),
-                [output.clone()],
-            ));
-            output = id;
-        }
-        ExecutionGraph::new(groups, output).map_err(Error::backend)
+        self.canonical_execution_graph()
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .layer_count()),
-            1 => Ok(self.target_layers),
-            group if group < self.prediction_steps + 2 => Ok(1),
-            _ => Err(Error::backend(
-                "conditional Qwen3.5 execution group is invalid",
-            )),
-        }
+        self.canonical_group_unit_count(group)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {

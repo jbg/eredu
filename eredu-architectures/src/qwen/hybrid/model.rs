@@ -391,6 +391,15 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         &self.config
     }
 
+    /// Returns the architecture-owned target and prediction traversal.
+    pub fn unit_layout(&self) -> Result<ExecutionUnitLayout, Error> {
+        let graph = self.decoder.execution_graph()?;
+        let counts = (0..graph.groups().len())
+            .map(|group| self.decoder.group_unit_count(group))
+            .collect::<Result<Vec<_>, _>>()?;
+        ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)
+    }
+
     /// Describes target and embedded-prediction parameters without deriving
     /// ownership from checkpoint-name substrings.
     pub fn parameter_description(
@@ -398,10 +407,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
         let graph = self.decoder.execution_graph()?;
-        let counts = (0..graph.groups().len())
-            .map(|group| self.decoder.group_unit_count(group))
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
+        let layout = self.unit_layout()?;
         let static_groups = static_parallel_parameter_groups::<B>(
             &self.decoder.static_modules().embeddings,
             &self.decoder.static_modules().norm,

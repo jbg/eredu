@@ -963,6 +963,23 @@ impl<G, A> ArchitecturePartition<G, A> {
         &self.groups
     }
 
+    /// Traverses rank-owned execution units in canonical architecture order.
+    pub fn units(&self) -> impl Iterator<Item = crate::ExecutionUnitAddress> + '_ {
+        self.groups.iter().flat_map(move |owned| {
+            let group = owned.group_index;
+            let base = self
+                .unit_layout
+                .group_range(group)
+                .expect("partition group belongs to its canonical layout")
+                .start;
+            owned.global_units.clone().map(move |index| {
+                self.unit_layout
+                    .address(base + index)
+                    .expect("partition unit belongs to its canonical layout")
+            })
+        })
+    }
+
     /// Returns whether this rank owns one group-local global unit.
     pub fn owns_unit(&self, group: &str, global_unit: usize) -> bool {
         self.groups
@@ -1530,6 +1547,13 @@ mod tests {
         assert!(partition.ownership().owns_input());
         assert!(!partition.ownership().owns_output());
         assert!(partition.ownership().owns_static_role("embedding"));
+        assert_eq!(
+            partition
+                .units()
+                .map(|unit| (unit.group(), unit.index()))
+                .collect::<Vec<_>>(),
+            [(0, 1), (0, 2), (0, 3), (1, 0), (1, 1)]
+        );
         assert_eq!(partition.state().unwrap().global_layers(), 7..9);
         assert_eq!(partition.local_geometry(), &Geometry("local"));
         partition.auxiliary_boundary_mut().route = 5;
