@@ -13845,7 +13845,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 /// stage-local bounded packed overlay before parameter residency is selected;
 /// fully resident stages never fall back to eager complete-matrix conversion.
 pub fn load_pipeline_model_with_options(
-    plan: ModelPreparationPlan,
+    plan: ModelPreparationPlan<eredu_architectures::processor_plan::ArtifactProcessorPlan>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -13865,7 +13865,7 @@ pub fn load_pipeline_model_with_options(
             Some(PipelineLayerLoadOptions::DenseDiskStream(options))
         }
     };
-    let (artifact, _policy, route) = plan.into_parts();
+    let (artifact, _architecture_plan, _policy, route) = plan.into_parts();
     let (expert_cache, dense_stream) = match route {
         MaterializationRoute::Resident => (None, None),
         MaterializationRoute::Layerwise => {

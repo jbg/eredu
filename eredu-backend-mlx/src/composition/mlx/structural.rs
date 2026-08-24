@@ -296,8 +296,8 @@ pub(crate) fn validate_gguf_preparation(
     )
 }
 
-pub(crate) fn validate_inspected_preparation(
-    inspection: &eredu_core::ArtifactInspection,
+pub(crate) fn validate_inspected_preparation<P>(
+    inspection: &eredu_core::ArtifactInspection<P>,
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
     eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol, policy)?;

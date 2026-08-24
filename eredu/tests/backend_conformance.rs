@@ -472,7 +472,9 @@ impl ModelLoadingBackend for MockBackend {
 
     fn validate_preparation(
         &self,
-        _: &eredu_core::ArtifactInspection,
+        _: &eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        >,
         _: eredu_core::PreparationPolicy,
     ) -> Result<(), Self::Error> {
         Ok(())
@@ -480,7 +482,9 @@ impl ModelLoadingBackend for MockBackend {
 
     fn model_config(
         &self,
-        plan: eredu_core::ModelPreparationPlan,
+        plan: eredu_core::ModelPreparationPlan<
+            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        >,
         _: Self::LoadOptions,
     ) -> Result<Self::ModelConfig, Self::Error> {
         assert_eq!(plan.inspection().configuration().family, "llama");
@@ -1145,6 +1149,10 @@ where
         DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
     >,
     F::Backend: TextGenerationBackend,
+    <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
+        eredu_core::ModelConfigurationResolver<
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        >,
 {
     let request = AutomaticPlanRequest::new(
         model_path,

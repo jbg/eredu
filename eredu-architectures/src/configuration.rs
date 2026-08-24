@@ -1,8 +1,9 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_core::{
-    artifact::ArtifactError, GgufCompanionEncoding, GgufCompanionRequirement, GgufCompanionRole,
-    LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
+    artifact::ArtifactError, ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement,
+    GgufCompanionRole, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
+    ValidatedGguf,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ pub struct ModelConfigurations;
 pub static MODEL_CONFIGURATIONS: ModelConfigurations = ModelConfigurations;
 
 impl ModelConfigurationResolver for ModelConfigurations {
+    type ArtifactPlan = crate::processor_plan::ArtifactProcessorPlan;
+
     fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
         resolve_portable_model_configuration(json)
     }
@@ -35,6 +38,41 @@ impl ModelConfigurationResolver for ModelConfigurations {
         _checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
         gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
+    }
+
+    fn artifact_plan(
+        &self,
+        _path: &Path,
+        format: ArtifactFormat,
+        configuration: &ModelConfiguration,
+        validated_gguf: Option<&ValidatedGguf>,
+    ) -> Result<Self::ArtifactPlan, ArtifactError> {
+        if format != ArtifactFormat::Gguf {
+            return Ok(Self::ArtifactPlan::default());
+        }
+        let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
+        if !matches!(
+            architecture,
+            GgufArchitecture::Qwen3Vl
+                | GgufArchitecture::Qwen3VlMoe
+                | GgufArchitecture::Qwen35
+                | GgufArchitecture::Qwen35Moe
+        ) {
+            return Ok(Self::ArtifactPlan::default());
+        }
+        let validated = validated_gguf.ok_or_else(|| {
+            ArtifactError::InvalidArtifact(
+                "GGUF inspection omitted its validated checkpoint".into(),
+            )
+        })?;
+        let projector = validated
+            .companion(&GgufCompanionRole::MediaProjector)
+            .map(|companion| companion.checkpoint().metadata());
+        crate::processor_plan::ArtifactProcessorPlan::from_qwen_gguf(
+            validated.checkpoint().metadata(),
+            projector,
+        )
+        .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))
     }
 }
 
@@ -515,7 +553,10 @@ pub fn resolve_model_config(json: &Value) -> Result<ResolvedModelConfig, Artifac
 /// Inspects an artifact using this crate's authoritative family registry.
 pub fn inspect_artifact(
     path: impl AsRef<Path>,
-) -> Result<eredu_core::ArtifactInspection, ArtifactError> {
+) -> Result<
+    eredu_core::ArtifactInspection<crate::processor_plan::ArtifactProcessorPlan>,
+    ArtifactError,
+> {
     eredu_core::inspect_artifact(path, &MODEL_CONFIGURATIONS)
 }
 

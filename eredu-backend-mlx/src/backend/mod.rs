@@ -181,7 +181,9 @@ impl MlxModel {
 #[derive(Debug, Clone)]
 pub struct MlxModelConfig {
     /// Backend-neutral inspected artifact and materialization route.
-    pub plan: eredu_core::ModelPreparationPlan,
+    pub plan: eredu_core::ModelPreparationPlan<
+        eredu_architectures::processor_plan::ArtifactProcessorPlan,
+    >,
     /// MLX materialization details for the selected neutral route.
     pub options: ModelLoadOptions,
 }
@@ -353,7 +355,9 @@ impl ModelLoadingBackend for MlxBackend<'_> {
 
     fn validate_preparation(
         &self,
-        inspection: &eredu_core::ArtifactInspection,
+        inspection: &eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        >,
         policy: eredu_core::PreparationPolicy,
     ) -> Result<(), Self::Error> {
         crate::composition::mlx::structural::validate_inspected_preparation(inspection, policy)
@@ -361,7 +365,9 @@ impl ModelLoadingBackend for MlxBackend<'_> {
 
     fn model_config(
         &self,
-        plan: eredu_core::ModelPreparationPlan,
+        plan: eredu_core::ModelPreparationPlan<
+            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        >,
         options: Self::LoadOptions,
     ) -> Result<Self::ModelConfig, Self::Error> {
         Ok(MlxModelConfig { plan, options })

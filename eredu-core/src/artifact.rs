@@ -58,6 +58,9 @@ pub struct ModelConfiguration {
 /// Core owns the transport contract but deliberately does not recognize model
 /// family aliases, GGUF architecture spellings, or nested configuration wrappers.
 pub trait ModelConfigurationResolver {
+    /// Architecture-owned state retained from artifact inspection through materialization.
+    type ArtifactPlan: Clone + std::fmt::Debug + Default;
+
     /// Resolves one Hugging Face `config.json` value to its canonical family.
     fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError>;
 
@@ -74,6 +77,17 @@ pub trait ModelConfigurationResolver {
         architecture: &str,
         checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError>;
+
+    /// Derives typed architecture state from the exact artifact admitted by inspection.
+    fn artifact_plan(
+        &self,
+        _path: &Path,
+        _format: ArtifactFormat,
+        _configuration: &ModelConfiguration,
+        _validated_gguf: Option<&ValidatedGguf>,
+    ) -> Result<Self::ArtifactPlan, ArtifactError> {
+        Ok(Self::ArtifactPlan::default())
+    }
 }
 
 /// Semantic identity of a separately stored GGUF companion.
@@ -153,12 +167,13 @@ pub fn gguf_u32_metadata_values(
 
 /// Header-only artifact inspection result.
 #[derive(Debug, Clone)]
-pub struct ArtifactInspection {
+pub struct ArtifactInspection<P = ()> {
     path: PathBuf,
     format: ArtifactFormat,
     configuration: ModelConfiguration,
     tensors: TensorCatalog,
     validated_gguf: Option<ValidatedGguf>,
+    architecture_plan: P,
 }
 
 /// Portable GGUF facts admitted by core inspection.
@@ -209,7 +224,7 @@ impl ValidatedGguf {
     }
 }
 
-impl ArtifactInspection {
+impl<P> ArtifactInspection<P> {
     /// Submitted artifact path.
     pub fn path(&self) -> &Path {
         &self.path
@@ -233,6 +248,10 @@ impl ArtifactInspection {
     /// Portable GGUF checkpoint handle, when applicable.
     pub fn gguf_checkpoint(&self) -> Option<&GgufCheckpoint> {
         self.validated_gguf().map(ValidatedGguf::checkpoint)
+    }
+    /// Architecture-owned state derived from the exact inspected artifact.
+    pub fn architecture_plan(&self) -> &P {
+        &self.architecture_plan
     }
 }
 
@@ -291,15 +310,15 @@ pub enum MaterializationRoute {
 
 /// Fully inspected input supplied to one selected backend for materialization.
 #[derive(Debug, Clone)]
-pub struct ModelPreparationPlan {
-    inspection: ArtifactInspection,
+pub struct ModelPreparationPlan<P = ()> {
+    inspection: ArtifactInspection<P>,
     policy: PreparationPolicy,
     route: MaterializationRoute,
 }
 
-impl ModelPreparationPlan {
+impl<P> ModelPreparationPlan<P> {
     /// Header-only inspection owned by the plan.
-    pub fn inspection(&self) -> &ArtifactInspection {
+    pub fn inspection(&self) -> &ArtifactInspection<P> {
         &self.inspection
     }
     /// Validated caller policy.
@@ -310,8 +329,8 @@ impl ModelPreparationPlan {
     pub const fn route(&self) -> MaterializationRoute {
         self.route
     }
-    /// Consume the plan into its portable artifact and policy.
-    pub fn into_parts(self) -> (ModelArtifact, PreparationPolicy, MaterializationRoute) {
+    /// Consume the plan into its portable artifact, architecture state, and policy.
+    pub fn into_parts(self) -> (ModelArtifact, P, PreparationPolicy, MaterializationRoute) {
         let artifact = match self.inspection.validated_gguf {
             Some(validated) => ModelArtifact::Gguf {
                 path: self.inspection.path,
@@ -326,7 +345,12 @@ impl ModelPreparationPlan {
                 tensors: self.inspection.tensors,
             },
         };
-        (artifact, self.policy, self.route)
+        (
+            artifact,
+            self.inspection.architecture_plan,
+            self.policy,
+            self.route,
+        )
     }
 }
 
@@ -358,10 +382,10 @@ pub enum ModelArtifact {
 }
 
 /// Inspect a local artifact without loading tensor payloads.
-pub fn inspect_artifact(
+pub fn inspect_artifact<R: ModelConfigurationResolver>(
     path: impl AsRef<Path>,
-    resolver: &impl ModelConfigurationResolver,
-) -> Result<ArtifactInspection, ArtifactError> {
+    resolver: &R,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     let path = path.as_ref();
     if is_gguf(path) {
         inspect_gguf(path, resolver)
@@ -375,10 +399,10 @@ pub fn inspect_artifact(
 }
 
 /// Validate policy and select one backend-independent materialization route.
-pub fn plan_model_preparation(
-    inspection: ArtifactInspection,
+pub fn plan_model_preparation<P>(
+    inspection: ArtifactInspection<P>,
     policy: PreparationPolicy,
-) -> Result<ModelPreparationPlan, ArtifactError> {
+) -> Result<ModelPreparationPlan<P>, ArtifactError> {
     let route = validate_preparation_policy(inspection.configuration.loading_protocol, policy)?;
     Ok(ModelPreparationPlan {
         inspection,
@@ -405,10 +429,10 @@ pub fn validate_preparation_policy(
     Ok(route)
 }
 
-fn inspect_gguf(
+fn inspect_gguf<R: ModelConfigurationResolver>(
     path: &Path,
-    resolver: &impl ModelConfigurationResolver,
-) -> Result<ArtifactInspection, ArtifactError> {
+    resolver: &R,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     let checkpoint = GgufCheckpoint::open(path)?;
     let architecture_name = checkpoint
         .metadata()
@@ -444,15 +468,23 @@ fn inspect_gguf(
         })
         .collect::<Result<Vec<_>, ArtifactError>>()?;
     let tensors = TensorCatalog::new(tensors)?;
+    let validated_gguf = ValidatedGguf {
+        checkpoint,
+        companions,
+    };
+    let architecture_plan = resolver.artifact_plan(
+        path,
+        ArtifactFormat::Gguf,
+        &configuration,
+        Some(&validated_gguf),
+    )?;
     Ok(ArtifactInspection {
         path: path.to_path_buf(),
         format: ArtifactFormat::Gguf,
         configuration,
         tensors,
-        validated_gguf: Some(ValidatedGguf {
-            checkpoint,
-            companions,
-        }),
+        validated_gguf: Some(validated_gguf),
+        architecture_plan,
     })
 }
 
@@ -611,10 +643,10 @@ fn validate_gguf_container(checkpoint: &GgufCheckpoint) -> Result<(), ArtifactEr
     Ok(())
 }
 
-fn inspect_safetensors(
+fn inspect_safetensors<R: ModelConfigurationResolver>(
     path: &Path,
-    resolver: &impl ModelConfigurationResolver,
-) -> Result<ArtifactInspection, ArtifactError> {
+    resolver: &R,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
     let configuration = resolver.resolve_safetensors(&json)?;
@@ -635,12 +667,15 @@ fn inspect_safetensors(
             "SafeTensors checkpoint contains no tensors".into(),
         ));
     }
+    let architecture_plan =
+        resolver.artifact_plan(path, ArtifactFormat::SafeTensors, &configuration, None)?;
     Ok(ArtifactInspection {
         path: path.to_path_buf(),
         format: ArtifactFormat::SafeTensors,
         configuration,
         tensors,
         validated_gguf: None,
+        architecture_plan,
     })
 }
 
@@ -834,7 +869,14 @@ mod tests {
 
     struct FixtureResolver;
 
+    #[derive(Debug, Clone, Default, Eq, PartialEq)]
+    struct FixtureArtifactPlan {
+        format: Option<ArtifactFormat>,
+    }
+
     impl ModelConfigurationResolver for FixtureResolver {
+        type ArtifactPlan = FixtureArtifactPlan;
+
         fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
             let model_type = json
                 .get("model_type")
@@ -889,6 +931,18 @@ mod tests {
                 )?]);
             }
             Ok(Vec::new())
+        }
+
+        fn artifact_plan(
+            &self,
+            _path: &Path,
+            format: ArtifactFormat,
+            _configuration: &ModelConfiguration,
+            _validated_gguf: Option<&ValidatedGguf>,
+        ) -> Result<Self::ArtifactPlan, ArtifactError> {
+            Ok(FixtureArtifactPlan {
+                format: Some(format),
+            })
         }
     }
 
@@ -1030,10 +1084,9 @@ mod tests {
         assert_eq!(inspection.tensors().len(), 1);
         let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
         assert_eq!(plan.route(), MaterializationRoute::Resident);
-        assert!(matches!(
-            plan.into_parts().0,
-            ModelArtifact::SafeTensors { .. }
-        ));
+        let (artifact, architecture_plan, _, _) = plan.into_parts();
+        assert!(matches!(artifact, ModelArtifact::SafeTensors { .. }));
+        assert_eq!(architecture_plan.format, Some(ArtifactFormat::SafeTensors));
     }
 
     #[test]
@@ -1157,14 +1210,16 @@ mod tests {
         assert_eq!(inspection.configuration().declared_model_type, "llama");
 
         let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
+        let (artifact, architecture_plan, _, _) = plan.into_parts();
         let ModelArtifact::Gguf {
             configuration,
             checkpoint,
             ..
-        } = plan.into_parts().0
+        } = artifact
         else {
             panic!("expected GGUF artifact");
         };
+        assert_eq!(architecture_plan.format, Some(ArtifactFormat::Gguf));
         assert_eq!(configuration.family, "llama");
         assert_eq!(checkpoint.physical_tensor_count(), 1);
     }

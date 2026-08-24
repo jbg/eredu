@@ -4,7 +4,7 @@
 //! patch/audio feature policy live here. A concrete backend executes the
 //! declared pixel or signal transforms and constructs its native tensors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_core::VideoSampling;
 use eredu_gguf::{MetadataArray, MetadataValue};
@@ -225,6 +225,63 @@ impl QwenProcessorPlan {
         }))
     }
 
+    /// Derives Qwen preprocessing entirely from the admitted GGUF model and projector.
+    pub fn from_gguf_metadata(
+        model: &BTreeMap<String, MetadataValue>,
+        projector: &BTreeMap<String, MetadataValue>,
+    ) -> Result<Self, ProcessorPlanError> {
+        let patch_size = required_btree_usize(projector, "clip.vision.patch_size")?;
+        let merge_size =
+            optional_btree_usize(projector, "clip.vision.spatial_merge_size")?.unwrap_or(2);
+        let factor = patch_size
+            .checked_mul(merge_size)
+            .ok_or_else(|| invalid("Qwen GGUF resize factor overflow"))?;
+        let pixels_per_token = factor
+            .checked_mul(factor)
+            .ok_or_else(|| invalid("Qwen GGUF pixel geometry overflow"))?;
+        let min_pixels = optional_btree_usize(projector, "clip.vision.image_min_pixels")?
+            .unwrap_or(
+                8usize
+                    .checked_mul(pixels_per_token)
+                    .ok_or_else(|| invalid("Qwen GGUF minimum pixel geometry overflow"))?,
+            );
+        let max_pixels = optional_btree_usize(projector, "clip.vision.image_max_pixels")?
+            .unwrap_or(
+                4096usize
+                    .checked_mul(pixels_per_token)
+                    .ok_or_else(|| invalid("Qwen GGUF maximum pixel geometry overflow"))?,
+            );
+        let visual = QwenVisualSource {
+            size: QwenProcessorSize {
+                shortest_edge: min_pixels as u64,
+                longest_edge: max_pixels as u64,
+            },
+            patch_size,
+            temporal_patch_size: 2,
+            merge_size,
+            do_resize: true,
+            do_rescale: true,
+            rescale_factor: default_rescale_factor(),
+            do_normalize: true,
+            resample: default_bicubic_resample(),
+            image_mean: required_btree_rgb(projector, "clip.vision.image_mean")?,
+            image_std: required_btree_rgb(projector, "clip.vision.image_std")?,
+            fps: default_qwen_video_fps(),
+            min_frames: default_qwen_min_frames(),
+            max_frames: default_qwen_max_frames(),
+            do_sample_frames: true,
+        };
+        parse_qwen_visual_source(&visual)?;
+        Ok(Self {
+            image: Some(visual.clone()),
+            video: Some(visual),
+            framing: MediaFraming {
+                start_token_id: required_gguf_token_id(model, "<|vision_start|>")?,
+                end_token_id: required_gguf_token_id(model, "<|vision_end|>")?,
+            },
+        })
+    }
+
     /// Derives one still-image transform and patch plan.
     pub fn image(&self, height: usize, width: usize) -> Result<QwenImagePlan, ProcessorPlanError> {
         let source = self
@@ -327,6 +384,11 @@ impl QwenProcessorPlan {
 
 fn parse_qwen_visual(bytes: &[u8]) -> Result<QwenVisualSource, ProcessorPlanError> {
     let source: QwenVisualSource = serde_json::from_slice(bytes)?;
+    parse_qwen_visual_source(&source)?;
+    Ok(source)
+}
+
+fn parse_qwen_visual_source(source: &QwenVisualSource) -> Result<(), ProcessorPlanError> {
     if source.patch_size == 0 || source.temporal_patch_size == 0 || source.merge_size == 0 {
         return Err(invalid(
             "Qwen patch_size, temporal_patch_size, and merge_size must be positive",
@@ -357,7 +419,32 @@ fn parse_qwen_visual(bytes: &[u8]) -> Result<QwenVisualSource, ProcessorPlanErro
             source.fps, source.min_frames, source.max_frames
         )));
     }
-    Ok(source)
+    Ok(())
+}
+
+/// Architecture state retained by portable inspection for backend materialization.
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactProcessorPlan {
+    qwen: Option<QwenProcessorPlan>,
+}
+
+impl ArtifactProcessorPlan {
+    /// Retains a Qwen GGUF processor plan when the admitted artifact has a media projector.
+    pub fn from_qwen_gguf(
+        model: &BTreeMap<String, MetadataValue>,
+        projector: Option<&BTreeMap<String, MetadataValue>>,
+    ) -> Result<Self, ProcessorPlanError> {
+        Ok(Self {
+            qwen: projector
+                .map(|projector| QwenProcessorPlan::from_gguf_metadata(model, projector))
+                .transpose()?,
+        })
+    }
+
+    /// Returns the retained Qwen processor plan, when one was admitted.
+    pub const fn qwen(&self) -> Option<&QwenProcessorPlan> {
+        self.qwen.as_ref()
+    }
 }
 
 fn qwen_patches(source: &QwenVisualSource) -> QwenPatchPlan {
@@ -1020,6 +1107,79 @@ fn optional_metadata_u64(
         _ => return Err(invalid_metadata(key)),
     };
     Ok(Some(value))
+}
+
+fn optional_btree_usize(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &str,
+) -> Result<Option<usize>, ProcessorPlanError> {
+    let Some(value) = metadata.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_u32_vec()
+        .and_then(|values| {
+            values
+                .as_slice()
+                .first()
+                .copied()
+                .filter(|_| values.len() == 1)
+        })
+        .ok_or_else(|| invalid_metadata(key))?;
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| invalid(format!("processor GGUF metadata key {key:?} exceeds usize")))
+}
+
+fn required_btree_usize(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &str,
+) -> Result<usize, ProcessorPlanError> {
+    optional_btree_usize(metadata, key)?.ok_or_else(|| {
+        invalid(format!(
+            "Qwen projector is missing GGUF metadata key {key:?}"
+        ))
+    })
+}
+
+fn required_btree_rgb(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &str,
+) -> Result<[f32; 3], ProcessorPlanError> {
+    let values = metadata
+        .get(key)
+        .and_then(MetadataValue::as_array)
+        .and_then(MetadataArray::to_f32_vec)
+        .ok_or_else(|| {
+            invalid(format!(
+                "Qwen projector is missing float RGB metadata {key:?}"
+            ))
+        })?;
+    values.try_into().map_err(|values: Vec<f32>| {
+        invalid(format!(
+            "Qwen projector metadata {key:?} must contain 3 floats, got {}",
+            values.len()
+        ))
+    })
+}
+
+fn required_gguf_token_id(
+    metadata: &BTreeMap<String, MetadataValue>,
+    token: &str,
+) -> Result<u32, ProcessorPlanError> {
+    let tokens = metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(MetadataValue::as_strings)
+        .ok_or_else(|| invalid("Qwen GGUF is missing tokenizer.ggml.tokens"))?;
+    let index = tokens
+        .iter()
+        .position(|candidate| candidate == token)
+        .ok_or_else(|| {
+            invalid(format!(
+                "Qwen GGUF tokenizer is missing media marker {token:?}"
+            ))
+        })?;
+    u32::try_from(index).map_err(|_| invalid("Qwen media token id exceeds u32"))
 }
 
 fn invalid_metadata(key: &str) -> ProcessorPlanError {
@@ -1820,6 +1980,8 @@ mod tests {
         MelNormalization, MelScale, MuseProcessorPlan, QwenProcessorPlan, SpectrumValue,
     };
     use eredu_core::VideoSampling;
+    use eredu_gguf::{MetadataArray, MetadataValue};
+    use std::collections::BTreeMap;
 
     fn qwen_visual() -> Vec<u8> {
         br#"{
@@ -1845,6 +2007,50 @@ mod tests {
         assert_eq!(video.groups.len(), 2);
         assert_eq!(video.groups[0].timestamp_text, "<0.2 seconds>");
         assert_eq!(video.groups[1].timestamp_text, "<1.2 seconds>");
+    }
+
+    #[test]
+    fn qwen_gguf_plan_uses_embedded_tokenizer_and_projector_policy() {
+        let mut model = BTreeMap::new();
+        model.insert(
+            "tokenizer.ggml.tokens".into(),
+            MetadataValue::Array(MetadataArray::String(vec![
+                "ordinary".into(),
+                "<|vision_start|>".into(),
+                "<|vision_end|>".into(),
+            ])),
+        );
+        let mut projector = BTreeMap::new();
+        projector.insert("clip.vision.patch_size".into(), MetadataValue::Uint32(2));
+        projector.insert(
+            "clip.vision.spatial_merge_size".into(),
+            MetadataValue::Uint32(2),
+        );
+        projector.insert(
+            "clip.vision.image_min_pixels".into(),
+            MetadataValue::Uint32(16),
+        );
+        projector.insert(
+            "clip.vision.image_max_pixels".into(),
+            MetadataValue::Uint32(64),
+        );
+        projector.insert(
+            "clip.vision.image_mean".into(),
+            MetadataValue::Array(MetadataArray::Float32(vec![0.1, 0.2, 0.3])),
+        );
+        projector.insert(
+            "clip.vision.image_std".into(),
+            MetadataValue::Array(MetadataArray::Float32(vec![0.4, 0.5, 0.6])),
+        );
+
+        let plan = QwenProcessorPlan::from_gguf_metadata(&model, &projector).unwrap();
+        let image = plan.image(8, 8).unwrap();
+        assert_eq!(image.framing.start_token_id, 1);
+        assert_eq!(image.framing.end_token_id, 2);
+        assert_eq!((image.transform.height, image.transform.width), (8, 8));
+        assert_eq!(image.transform.mean, [0.1, 0.2, 0.3]);
+        assert_eq!(image.patches.patch_size, 2);
+        assert_eq!(image.patches.merge_size, 2);
     }
 
     #[test]

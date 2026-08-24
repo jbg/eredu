@@ -533,6 +533,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 impl<B> LoadedModel<B>
 where
     B: eredu_core::TextGenerationBackend + eredu_core::ModelLoadingBackend,
+    B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
+        ArtifactPlan = eredu_architectures::processor_plan::ArtifactProcessorPlan,
+    >,
 {
     /// Realizes a complete portable execution plan through the selected factory.
     ///
@@ -630,7 +633,9 @@ where
 
     fn from_inspected(
         backend: B,
-        inspection: eredu_core::ArtifactInspection,
+        inspection: eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        >,
         options: B::LoadOptions,
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
@@ -650,8 +655,8 @@ where
     }
 }
 
-fn loaded_text_artifact(
-    inspection: &eredu_core::ArtifactInspection,
+fn loaded_text_artifact<P>(
+    inspection: &eredu_core::ArtifactInspection<P>,
 ) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();

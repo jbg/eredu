@@ -210,12 +210,10 @@ impl ModelProcessor {
     }
 
     #[cfg(feature = "image")]
-    pub fn load_qwen_directory(model_dir: &Path) -> Result<Option<Self>, Error> {
-        qwen::QwenProcessor::load_directory(model_dir).map(|processor| {
-            processor.map(|processor| Self {
-                kind: ProcessorKind::Qwen(processor),
-            })
-        })
+    pub fn load_qwen_plan(plan: eredu_architectures::processor_plan::QwenProcessorPlan) -> Self {
+        Self {
+            kind: ProcessorKind::Qwen(qwen::QwenProcessor::from_plan(plan)),
+        }
     }
 
     fn prepare_input<E>(

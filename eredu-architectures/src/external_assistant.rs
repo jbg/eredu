@@ -175,6 +175,8 @@ impl gemma4::GgufTensorCatalog for GemmaCatalog<'_> {
 struct AssistantConfigurations;
 
 impl ModelConfigurationResolver for AssistantConfigurations {
+    type ArtifactPlan = ();
+
     fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
         let bytes = serde_json::to_vec(json)?;
         let model_type = json

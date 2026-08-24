@@ -307,14 +307,18 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// cannot realize.
     fn validate_preparation(
         &self,
-        inspection: &ArtifactInspection,
+        inspection: &ArtifactInspection<
+            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+        >,
         policy: PreparationPolicy,
     ) -> Result<(), Self::Error>;
 
     /// Binds a neutral preparation plan to backend-owned materialization input.
     fn model_config(
         &self,
-        plan: ModelPreparationPlan,
+        plan: ModelPreparationPlan<
+            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+        >,
         options: Self::LoadOptions,
     ) -> Result<Self::ModelConfig, Self::Error>;
 }
@@ -351,7 +355,9 @@ pub fn load_model<B: ModelLoadingBackend>(
 /// inspection before transferring ownership to the selected backend.
 pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     backend: &B,
-    inspection: ArtifactInspection,
+    inspection: ArtifactInspection<
+        <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+    >,
     options: B::LoadOptions,
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
     let policy = backend
@@ -1193,6 +1199,8 @@ mod tests {
     struct LoadingConfigurationResolver;
 
     impl ModelConfigurationResolver for LoadingConfigurationResolver {
+        type ArtifactPlan = ();
+
         fn resolve_safetensors(
             &self,
             json: &serde_json::Value,
