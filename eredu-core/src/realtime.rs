@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt::Debug, path::Path, time::Instant};
+use std::{collections::BTreeMap, fmt::Debug, time::Instant};
 
 /// Largest admitted text or audio delay in one portable realtime schedule.
 ///
@@ -1018,41 +1018,44 @@ pub trait RealtimeBackend {
     }
 }
 
-/// Model preparation contract for a complete realtime backend.
+/// Materialization contract for an architecture-prepared realtime model.
 ///
-/// Artifact interpretation and materialization belong to the selected backend;
-/// callers use the same loading function regardless of the concrete runtime.
+/// Architecture code inspects the artifact and produces [`Self::Preparation`]
+/// before this boundary. The selected backend consumes that neutral plan and
+/// owns only device-specific materialization.
 pub trait RealtimeModelLoadingBackend: RealtimeBackend + Sized {
+    /// Architecture-owned, backend-neutral artifact preparation.
+    type Preparation;
     /// Backend-specific materialization policy.
     type LoadOptions;
 
-    /// Prepares one backend-owned realtime model from an artifact directory.
-    fn prepare_realtime_model(
+    /// Materializes one architecture-prepared realtime model.
+    fn materialize_realtime_model(
         &self,
-        artifact: &Path,
+        preparation: Self::Preparation,
         options: Self::LoadOptions,
     ) -> Result<Self::Model, Self::Error>;
 }
 
-/// Loads a realtime model on the selected backend using default load policy.
+/// Materializes an architecture-prepared realtime model using default policy.
 pub fn load_realtime_model<B>(
     backend: B,
-    artifact: impl AsRef<Path>,
+    preparation: B::Preparation,
 ) -> Result<RealtimeModel<B>, B::Error>
 where
     B: RealtimeModelLoadingBackend,
     B::LoadOptions: Default,
 {
-    load_realtime_model_with_options(backend, artifact, B::LoadOptions::default())
+    load_realtime_model_with_options(backend, preparation, B::LoadOptions::default())
 }
 
-/// Loads a realtime model on the selected backend using explicit load policy.
+/// Materializes an architecture-prepared realtime model using explicit policy.
 pub fn load_realtime_model_with_options<B: RealtimeModelLoadingBackend>(
     backend: B,
-    artifact: impl AsRef<Path>,
+    preparation: B::Preparation,
     options: B::LoadOptions,
 ) -> Result<RealtimeModel<B>, B::Error> {
-    let model = backend.prepare_realtime_model(artifact.as_ref(), options)?;
+    let model = backend.materialize_realtime_model(preparation, options)?;
     Ok(RealtimeModel::new(backend, model))
 }
 
@@ -1630,20 +1633,21 @@ mod tests {
     }
 
     impl RealtimeModelLoadingBackend for MockBackend {
+        type Preparation = u64;
         type LoadOptions = u64;
 
-        fn prepare_realtime_model(
+        fn materialize_realtime_model(
             &self,
-            _: &Path,
-            identity: Self::LoadOptions,
+            preparation: Self::Preparation,
+            _: Self::LoadOptions,
         ) -> Result<Self::Model, Self::Error> {
-            Ok(identity)
+            Ok(preparation)
         }
     }
 
     #[test]
-    fn selected_backend_owns_realtime_model_preparation() {
-        let model = load_realtime_model_with_options(MockBackend, "unused", 37).unwrap();
+    fn selected_backend_materializes_architecture_preparation() {
+        let model = load_realtime_model_with_options(MockBackend, 37, 0).unwrap();
         assert_eq!(*model.model(), 37);
         assert_eq!(model.backend().name(), "mock-realtime");
     }

@@ -32,7 +32,9 @@ fn main() -> anyhow::Result<()> {
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = gpu.stream();
     let fixture = Array::load_safetensors(&fixture_path, cpu.stream())?;
-    let mut model = load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), &model_dir)?;
+    let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
+    let mut model =
+        load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), preparation)?;
     let generated =
         generate_encoded_greedy(&mut model, required(&fixture, "generation.input_audio")?)?;
     compare_tokens(

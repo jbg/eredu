@@ -57,8 +57,11 @@ fn main() -> EvalResult<()> {
     safemlx::transforms::eval([input_tokens.as_array()])?;
 
     let dense_load = Instant::now();
-    let mut dense =
-        load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), &dense_dir)?;
+    let dense_preparation = eredu_architectures::moshi::prepare_realtime_model(&dense_dir)?;
+    let mut dense = load_realtime_model(
+        MlxRealtimeBackend::new(stream, weights_stream),
+        dense_preparation,
+    )?;
     let dense_load_seconds = dense_load.elapsed().as_secs_f64();
     let dense_start = Instant::now();
     let dense_output = generate_encoded_greedy(&mut dense, input_tokens.as_array())?;
@@ -71,7 +74,7 @@ fn main() -> EvalResult<()> {
     let quantized_load = Instant::now();
     let mut quantized = load_realtime_model(
         MlxRealtimeBackend::new(stream, weights_stream),
-        &quantized_dir,
+        eredu_architectures::moshi::prepare_realtime_model(&quantized_dir)?,
     )?;
     let quantized_load_seconds = quantized_load.elapsed().as_secs_f64();
     let quantized_start = Instant::now();

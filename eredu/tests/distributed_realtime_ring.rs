@@ -220,7 +220,7 @@ fn moshi_ring_model_parity_worker() {
 
     let mut replicated = load_realtime_model(
         MlxRealtimeBackend::new(&stream, &weights_stream),
-        Path::new(&fixture),
+        eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
     )
     .unwrap();
     assert_eq!(replicated.model().model_type(), expected_profile);
@@ -233,7 +233,7 @@ fn moshi_ring_model_parity_worker() {
         .with_tensor_parallel_group(Arc::clone(&group));
     let mut parallel = load_realtime_model_with_options(
         backend,
-        Path::new(&fixture),
+        eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
         ModelLoadOptions::with_parallel(topology),
     )
     .unwrap();

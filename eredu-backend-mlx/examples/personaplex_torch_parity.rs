@@ -47,7 +47,9 @@ fn main() -> anyhow::Result<()> {
     let expected_output_audio = required(&fixture, "generation.expected_output_audio")?;
     let expected_emitted_steps = required(&fixture, "generation.expected_emitted_steps")?;
 
-    let mut model = load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), &model_dir)?;
+    let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
+    let mut model =
+        load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), preparation)?;
     let generated_audio_codebooks = model.speech_config().generated_audio_codebooks() as i32;
     let request = RequestId::new(1);
     let mut scheduler = RealtimeScheduler::new(&model, SchedulerLimits::new(1, 1)?)?;

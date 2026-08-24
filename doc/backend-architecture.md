@@ -326,6 +326,14 @@ architecture-owned: backend models return the Moshi architecture's
 `EffectiveModelType` directly, and backend adapters may re-export that type but
 must not wrap it in a backend-specific family enum.
 
+Realtime artifact loading also crosses the backend boundary as a neutral
+architecture preparation. Moshi inspection parses optional native defaults or
+released PersonaPlex configuration, resolves the confined `moshi_name` or
+indexed checkpoint source, validates the strict SafeTensors contract, and
+publishes canonical binding recipes in `RealtimePreparationPlan`. Concrete
+backends consume that plan and load tensor payloads; they do not receive a raw
+artifact path or reinterpret family configuration and filename policy.
+
 Prepared-media admission follows the same boundary after tensor construction.
 Architecture media plans validate family payload shapes,
 patch/window/pooling geometry, valid-position masks, and artifact-specific

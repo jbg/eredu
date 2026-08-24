@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let load_start = Instant::now();
         let mut model = load_realtime_model_with_options(
             MlxRealtimeBackend::new(stream, weights_stream),
-            &model_dir,
+            eredu_architectures::moshi::prepare_realtime_model(&model_dir)?,
             ModelLoadOptions::with_quantization(AffineQuantization::default()),
         )?;
         stream.synchronize()?;
@@ -56,8 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         eredu_backend_mlx::native::memory::reset_peak_memory()?;
         let load_start = Instant::now();
+        let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
         let mut model =
-            load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), &model_dir)?;
+            load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), preparation)?;
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
         report_memory()?;

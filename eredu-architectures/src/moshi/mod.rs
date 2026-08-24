@@ -1,5 +1,6 @@
 //! Backend-neutral Moshi-family architecture policy.
 
+mod artifact;
 mod block;
 mod checkpoint;
 mod config;
@@ -8,6 +9,7 @@ mod model;
 mod parallel;
 pub mod personaplex_prompt;
 
+pub use artifact::{prepare_realtime_model, RealtimePreparationError, RealtimePreparationPlan};
 pub use checkpoint::{canonical_recipes, safetensors_plan};
 pub use config::{
     ArtifactProfile, CheckpointLayout, EffectiveModelType, MoshiConfig, MoshiConfigError,

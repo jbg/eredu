@@ -1384,21 +1384,20 @@ impl RealtimeBackend for MockRealtimeBackend {
 }
 
 impl RealtimeModelLoadingBackend for MockRealtimeBackend {
+    type Preparation = u64;
     type LoadOptions = u64;
 
-    fn prepare_realtime_model(
+    fn materialize_realtime_model(
         &self,
-        _: &Path,
-        options: Self::LoadOptions,
+        preparation: Self::Preparation,
+        _: Self::LoadOptions,
     ) -> Result<Self::Model, Self::Error> {
-        Ok(options)
+        Ok(preparation)
     }
 }
 
 fn assert_realtime_conformance() {
-    let mut model =
-        load_realtime_model_with_options(MockRealtimeBackend, "mock-realtime-artifact", 23)
-            .unwrap();
+    let mut model = load_realtime_model_with_options(MockRealtimeBackend, 23, 0).unwrap();
     assert_eq!(model.backend().name(), "portable-mock-realtime");
     assert_eq!(*model.model(), 23);
     assert_eq!(model.speech_config().generated_audio_codebooks(), 1);

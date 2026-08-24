@@ -23,6 +23,9 @@ pub mod api;
 pub mod runtime;
 pub use api::{inspect_text_model, PlannedModelLoadError, TextInspectionOptions};
 pub use eredu_architectures::configuration::inspect_artifact;
+pub use eredu_architectures::moshi::{
+    prepare_realtime_model, RealtimePreparationError, RealtimePreparationPlan,
+};
 pub use eredu_architectures::{GgufArchitecture, ModelKind};
 pub use eredu_checkpoint::{
     store::{WeightStoreBackend, WeightStoreDiagnostics},

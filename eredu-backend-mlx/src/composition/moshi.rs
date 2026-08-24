@@ -1,12 +1,8 @@
 //! Production MLX composition for the backend-neutral Moshi-family model.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use eredu_architectures::moshi::{self, CheckpointLayout, LayeredModel, MoshiConfig, Unit};
+use eredu_architectures::moshi::{self, LayeredModel, MoshiConfig, RealtimePreparationPlan, Unit};
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     store::{CheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource},
@@ -287,23 +283,32 @@ impl MoshiModel {
 
 /// Loads either admitted Moshi-family SafeTensors layout into the neutral model.
 pub fn load(
-    model_dir: impl AsRef<Path>,
+    preparation: RealtimePreparationPlan,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let (source_config, config_value) = load_config(model_dir)?;
-    let source_path = source_checkpoint_path(model_dir, &source_config, config_value.as_ref())?;
-    let artifact_identity = artifact_identity(model_dir, &source_path, &source_config)?;
+    let (model_dir, source_path, source_config, checkpoint_plan, source_recipes) =
+        preparation.into_parts();
+    let artifact_identity = artifact_identity(&model_dir, &source_path, &source_config)?;
     let source_store = open_safetensors_weight_store(
         &source_path,
         options.weight_residency.layers().max_mapped_shards(),
     )?;
-    let source_store = resolve_source_store(source_store, &source_config)?;
-    let source_recipe_set = moshi::canonical_recipes(&source_config, source_store.as_ref())
-        .map_err(Error::UnsupportedArchitecture)?;
-    let (source_outputs, source_aliases) = source_recipe_set.into_parts();
+    let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
+        source_store.as_ref(),
+        &checkpoint_plan,
+    )
+    .map_err(|validation| {
+        Error::UnsupportedArchitecture(format!(
+            "prepared Moshi checkpoint contract no longer resolves: {validation:?}"
+        ))
+    })?;
+    let source_store: SharedCheckpointSource = Arc::new(ResolvedCheckpointSource::new(
+        source_store,
+        checkpoint_contract,
+    ));
+    let (source_outputs, source_aliases) = source_recipes.into_parts();
     let source_recipes = Arc::new(CanonicalBindingRecipes {
         outputs: source_outputs,
         aliases: source_aliases,
@@ -556,45 +561,6 @@ fn load_parallel(
     })
 }
 
-fn load_config(model_dir: &Path) -> Result<(MoshiConfig, Option<serde_json::Value>), Error> {
-    let path = model_dir.join("config.json");
-    if !path.exists() {
-        return MoshiConfig::native_v0_1()
-            .map(|config| (config, None))
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
-    }
-    let text = std::fs::read_to_string(path)?;
-    let value = serde_json::from_str(&text)?;
-    let config = MoshiConfig::from_config_value(Some(&value))
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    Ok((config, Some(value)))
-}
-
-fn source_checkpoint_path(
-    model_dir: &Path,
-    config: &MoshiConfig,
-    value: Option<&serde_json::Value>,
-) -> Result<PathBuf, Error> {
-    if model_dir.join("model.safetensors.index.json").exists()
-        || config.checkpoint_layout() == CheckpointLayout::PersonaPlexPytorch
-    {
-        return Ok(model_dir.to_owned());
-    }
-    let name = value
-        .and_then(serde_json::Value::as_object)
-        .and_then(|object| object.get("moshi_name"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("model.safetensors");
-    let name = Path::new(name);
-    if name.is_absolute() || name.components().count() != 1 {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Moshi artifact filename must be a single relative component, got {:?}",
-            name
-        )));
-    }
-    Ok(model_dir.join(name))
-}
-
 fn artifact_identity(
     model_dir: &Path,
     source: &Path,
@@ -614,21 +580,6 @@ fn artifact_identity(
         ArtifactFile::new(logical, path)
     });
     fingerprint_artifact(config.effective_model_type().as_str(), files)
-}
-
-fn resolve_source_store(
-    store: SharedCheckpointSource,
-    source_config: &MoshiConfig,
-) -> Result<SharedCheckpointSource, Error> {
-    let plan = moshi::safetensors_plan(source_config)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
-                "Moshi checkpoint contract did not resolve: {validation:?}"
-            ))
-        })?;
-    Ok(Arc::new(ResolvedCheckpointSource::new(store, resolved)))
 }
 
 fn bindings(
@@ -755,19 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_filename_is_resolution_only_and_confined_to_model_directory() {
-        let config = MoshiConfig::native_v0_1().unwrap();
-        let root = Path::new("fixture");
-        let value = serde_json::json!({"moshi_name":"weights.safetensors"});
-        assert_eq!(
-            source_checkpoint_path(root, &config, Some(&value)).unwrap(),
-            root.join("weights.safetensors")
-        );
-        let escape = serde_json::json!({"moshi_name":"../weights.safetensors"});
-        assert!(source_checkpoint_path(root, &config, Some(&escape)).is_err());
-    }
-
-    #[test]
     #[ignore = "requires EREDU_MOSHI_FIXTURE pointing at a complete released artifact"]
     fn moshi_native_fixture_loads_through_neutral_entrypoint() {
         let fixture = std::env::var_os("EREDU_MOSHI_FIXTURE").expect(
@@ -781,8 +719,9 @@ mod tests {
         let device = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);
         let stream = Stream::new_with_device(&device);
         let weights_stream = Stream::new_with_device(&device);
+        let preparation = eredu_architectures::moshi::prepare_realtime_model(&fixture).unwrap();
         let model = load(
-            fixture,
+            preparation,
             ModelLoadOptions::default(),
             &stream,
             &weights_stream,

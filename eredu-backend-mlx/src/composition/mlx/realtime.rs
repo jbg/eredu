@@ -3,9 +3,11 @@
 /// PersonaPlex prompt framing and forced-prompt enqueue protocol.
 pub mod personaplex_prompt;
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
-use eredu_architectures::moshi::{ArtifactProfile, EffectiveModelType, MoshiConfig};
+use eredu_architectures::moshi::{
+    ArtifactProfile, EffectiveModelType, MoshiConfig, RealtimePreparationPlan,
+};
 use eredu_core::{
     backend::{Completion, Submission},
     realtime::{
@@ -305,15 +307,16 @@ impl MlxRealtimeBackend {
 }
 
 impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
+    type Preparation = RealtimePreparationPlan;
     type LoadOptions = ModelLoadOptions;
 
-    fn prepare_realtime_model(
+    fn materialize_realtime_model(
         &self,
-        artifact: &Path,
+        preparation: Self::Preparation,
         options: Self::LoadOptions,
     ) -> Result<Self::Model, Self::Error> {
         let model =
-            materialize_realtime_model(artifact, options, &self.stream, &self.weights_stream)?;
+            materialize_realtime_model(preparation, options, &self.stream, &self.weights_stream)?;
         if let Some(topology) = model.model.topology() {
             let group = self.tensor_parallel_group.as_deref().ok_or_else(|| {
                 Error::Parallel(
@@ -337,7 +340,7 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
 }
 
 fn materialize_realtime_model(
-    model_dir: &Path,
+    preparation: RealtimePreparationPlan,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -347,7 +350,7 @@ fn materialize_realtime_model(
             "Moshi does not contain routed experts".into(),
         ));
     }
-    neutral_moshi::load(model_dir, options, stream, weights_stream)
+    neutral_moshi::load(preparation, options, stream, weights_stream)
         .map(|model| MlxRealtimeModel { model })
 }
 
@@ -1078,6 +1081,12 @@ mod tests {
         SequentialDecisionTraversal, WeightResidency,
     };
     use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
+    use std::path::Path;
+
+    fn prepare(path: &Path) -> RealtimePreparationPlan {
+        eredu_architectures::moshi::prepare_realtime_model(path)
+            .unwrap_or_else(|error| panic!("prepare realtime artifact {}: {error}", path.display()))
+    }
 
     const TINY_NATIVE_CONFIG: &str = r#"{
         "model_type": "moshi",
@@ -1409,7 +1418,7 @@ mod tests {
             let backend = MlxRealtimeBackend::new(&stream, &weights_stream);
             let mut model = load_realtime_model_with_options(
                 backend,
-                directory.path(),
+                prepare(directory.path()),
                 ModelLoadOptions::default().with_weight_residency(residency),
             )
             .unwrap_or_else(|error| panic!("load tiny {execution:?} model: {error}"));
@@ -1440,7 +1449,7 @@ mod tests {
             let backend = MlxRealtimeBackend::new(&stream, &weights_stream);
             let mut model = load_realtime_model_with_options(
                 backend,
-                directory.path(),
+                prepare(directory.path()),
                 ModelLoadOptions::with_quantization(quantization),
             )
             .unwrap_or_else(|error| panic!("load-time {quantization:?} tiny model: {error}"));
@@ -1471,7 +1480,7 @@ mod tests {
             let backend = MlxRealtimeBackend::new(&stream, &weights_stream);
             let mut model = load_realtime_model_with_options(
                 backend,
-                packed_directory.path(),
+                prepare(packed_directory.path()),
                 ModelLoadOptions::default(),
             )
             .unwrap_or_else(|error| panic!("load checkpoint-native {quantization:?}: {error}"));
@@ -1495,7 +1504,7 @@ mod tests {
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = load_realtime_model_with_options(
             backend,
-            directory.path(),
+            prepare(directory.path()),
             ModelLoadOptions::default(),
         )
         .expect("load tiny scheduler model");
@@ -1871,7 +1880,10 @@ mod tests {
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = backend
-            .prepare_realtime_model(Path::new(&model_path), ModelLoadOptions::default())
+            .materialize_realtime_model(
+                prepare(Path::new(&model_path)),
+                ModelLoadOptions::default(),
+            )
             .unwrap_or_else(|error| panic!("load {model_env}: {error}"));
         assert_eq!(model.effective_model_type(), expected_model_type);
         run_teacher_forced_fixture(&mut model, Path::new(&reference_path), execution.stream());
@@ -2115,7 +2127,7 @@ mod tests {
             let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
             let mut model = load_realtime_model_with_options(
                 backend,
-                Path::new(&model_path),
+                prepare(Path::new(&model_path)),
                 ModelLoadOptions::default().with_weight_residency(residency),
             )
             .expect("load PersonaPlex residency mode");
@@ -2142,7 +2154,7 @@ mod tests {
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = load_realtime_model_with_options(
             backend,
-            Path::new(&model_path),
+            prepare(Path::new(&model_path)),
             ModelLoadOptions::default(),
         )
         .expect("load native seeded fixture model");
@@ -2166,7 +2178,7 @@ mod tests {
         let stream = Stream::new_with_device(&device);
         let backend = MlxRealtimeBackend::new(&stream, &stream);
         let model = backend
-            .prepare_realtime_model(Path::new(&fixture), ModelLoadOptions::default())
+            .materialize_realtime_model(prepare(Path::new(&fixture)), ModelLoadOptions::default())
             .unwrap();
         let session = backend
             .create_session(&model, RealtimeSampling::greedy())
@@ -2189,7 +2201,7 @@ mod tests {
         let stream = Stream::new_with_device(&device);
         let backend = MlxRealtimeBackend::new(&stream, &stream);
         let model = backend
-            .prepare_realtime_model(Path::new(&fixture), ModelLoadOptions::default())
+            .materialize_realtime_model(prepare(Path::new(&fixture)), ModelLoadOptions::default())
             .unwrap();
         assert_eq!(
             model.effective_model_type(),

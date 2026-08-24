@@ -43,8 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights_stream = weights_ctx.stream();
 
     let load_start = Instant::now();
+    let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
     let mut model =
-        load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), &model_dir)?;
+        load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), preparation)?;
     let config = model.speech_config();
     let input_audio_codebooks = config.input_audio_codebooks() as i32;
     let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
