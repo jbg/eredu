@@ -38,7 +38,7 @@ use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendProvider as _, BackendSession as _, MtpCapability,
-    MtpCheckpointKind, MtpConfig,
+    MtpCheckpointKind, MtpConfig, TokenOutput as _,
 };
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
@@ -58,6 +58,7 @@ const CARTESIAN_AXES: &str = "EREDU_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "EREDU_PIPELINE_EXPERT_CACHE";
 const REQUANTIZE: &str = "EREDU_PIPELINE_REQUANTIZE";
 const OPAQUE_SESSION: &str = "EREDU_PIPELINE_OPAQUE_SESSION";
+const OPAQUE_TEXT_GENERATION: &str = "EREDU_PIPELINE_OPAQUE_TEXT_GENERATION";
 const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
@@ -509,6 +510,26 @@ fn pipeline_ring_worker() {
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
         let expected_mtp_capability = model.mtp_capability_for_test();
         let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
+        if std::env::var_os(OPAQUE_TEXT_GENERATION).is_some() {
+            let sampling = eredu_core::resolve_generation_config(
+                None,
+                eredu_core::GenerationConfigOverrides {
+                    max_new_tokens: Some(3),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let generated = eredu_core::TextGeneration::new(
+                &mut runtime,
+                vec![1, 2],
+                eredu_core::TextGenerationConfig::new(sampling),
+            )
+            .unwrap()
+            .map(|token| token.unwrap().token_id().unwrap())
+            .collect::<Vec<_>>();
+            assert_eq!(generated.len(), 3);
+            return;
+        }
         assert_eq!(runtime.session().model_family(), expected_model_family);
         assert_eq!(
             runtime.session().effective_model_type(),
@@ -4736,6 +4757,18 @@ fn ring_two_process_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Llama);
 }
 
+/// Runs backend-generic text generation across a pipeline whose non-output
+/// rank legitimately produces no local logits.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_pipeline_generic_text_generation() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueTextGeneration,
+    );
+}
+
 /// Compares the public Llama TP=2 session's prefill and decode logits with a
 /// fully resident single-rank reference built from the identical checkpoint.
 #[test]
@@ -6538,6 +6571,7 @@ enum WorkerMode {
     ExpertCacheRequantize,
     Requantize,
     OpaqueSession,
+    OpaqueTextGeneration,
     OpaqueSessionExpertCache,
     OpaqueMuseImage,
     OpaqueInklingMedia,
@@ -6726,6 +6760,10 @@ fn run_ring_pipeline_processes(
             }
             WorkerMode::OpaqueSession => {
                 command.env(OPAQUE_SESSION, "1");
+            }
+            WorkerMode::OpaqueTextGeneration => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_TEXT_GENERATION, "1");
             }
             WorkerMode::OpaqueSessionExpertCache => {
                 command.env(OPAQUE_SESSION, "1");

@@ -332,6 +332,28 @@ impl MlxTextSampler {
     }
 }
 
+struct FilteredTextSampler<'a> {
+    sampler: &'a mut MlxTextSampler,
+    filter: &'a TokenFilter,
+}
+
+impl Sampler for FilteredTextSampler<'_> {
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        random: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let logits = crate::backend::runtime::generation::sampler::apply_token_filter(
+            logits,
+            self.filter,
+            stream,
+        )?;
+        self.sampler.sample(&logits, temperature, random, stream)
+    }
+}
+
 enum MlxSessionCompletionKind {
     Model {
         completion: MlxCompletion,
@@ -1293,7 +1315,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
         let submission = runtime.prefill(prompt)?;
-        sample_text_submission(submission, filter, state, stream)
+        sample_text_submission(runtime.session(), submission, filter, state, stream)
     }
 
     fn submit_text_decode(
@@ -1305,27 +1327,42 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         let stream = runtime.backend().stream().clone();
         let input = token.value.try_index_device((.., NewAxis), &stream)?;
         let submission = runtime.decode(input)?;
-        sample_text_submission(submission, filter, state, stream)
+        sample_text_submission(runtime.session(), submission, filter, state, stream)
     }
 }
 
 fn sample_text_submission(
+    session: &MlxModelSession<'_>,
     submission: Submission<MlxModelOutput, MlxSessionCompletion>,
     filter: &TokenFilter,
     state: &mut MlxTextGenerationState,
     stream: Stream,
 ) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
-    let logits = submission.output.into_logits().ok_or_else(|| {
-        Error::Parallel("text generation requires logits on the local session rank".into())
-    })?;
-    let logits = crate::backend::runtime::generation::sampler::apply_token_filter(
-        logits.as_array(),
-        filter,
-        &stream,
-    )?;
-    let token = state
-        .sampler
-        .sample(&logits, state.temperature, state.prng.as_mut(), &stream)?;
+    let MlxTextGenerationState {
+        temperature,
+        prng,
+        sampler,
+    } = state;
+    let mut sampler = FilteredTextSampler { sampler, filter };
+    let token = if session.distributed().is_some() {
+        session
+            .sample_and_synchronize(
+                submission.output.logits(),
+                1,
+                &mut sampler,
+                *temperature,
+                prng.as_mut(),
+                false,
+            )?
+            .token
+            .try_index_device((.., 0), &stream)?
+    } else {
+        let logits = submission
+            .output
+            .logits()
+            .ok_or_else(|| Error::Parallel("local text generation requires model logits".into()))?;
+        sampler.sample(logits.as_array(), *temperature, prng.as_mut(), &stream)?
+    };
     let sampled = MlxCompletion::submission(token)?;
     Ok(Submission {
         output: MlxTextToken {
