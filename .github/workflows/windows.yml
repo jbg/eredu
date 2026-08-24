@@ -160,4 +160,4 @@ jobs:
       - name: Run CUDA device and numerical smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke --no-default-features
       - name: Run Eredu MLX integration tests on CUDA
-        run: cargo test -p eredu-mlx-tests --features cuda
+        run: cargo test -p eredu --no-default-features --features cuda

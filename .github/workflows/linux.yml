@@ -107,5 +107,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run CUDA device smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke
-      - name: Run tiny MLX runtime residency paths on CUDA
-        run: cargo test --release -p eredu-mlx-tests --features cuda api::tests::mlx::tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers --lib -- --exact
+      - name: Run Eredu facade tests on CUDA
+        run: cargo test --release -p eredu --no-default-features --features cuda
