@@ -165,7 +165,7 @@ fn ring_two_process_partition_load() {
             Command::new(&executable)
                 .args([
                     "--exact",
-                    "distributed_partition_ring::partition_ring_worker",
+                    "tests::distributed_partition_ring::partition_ring_worker",
                     "--nocapture",
                 ])
                 .env(WORKER_RANK, rank.to_string())

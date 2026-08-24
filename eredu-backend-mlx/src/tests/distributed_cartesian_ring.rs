@@ -397,7 +397,7 @@ fn run_cartesian_ring_workers(world_size: usize, worker: &str, worker_env: &str)
     drop(sockets);
 
     let executable = std::env::current_exe().unwrap();
-    let worker = format!("distributed_cartesian_ring::{worker}");
+    let worker = format!("tests::distributed_cartesian_ring::{worker}");
     let mut children = ChildGuard {
         children: Vec::with_capacity(world_size),
     };

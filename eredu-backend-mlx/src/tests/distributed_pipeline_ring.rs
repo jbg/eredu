@@ -6688,7 +6688,7 @@ fn run_ring_pipeline_processes(
         command
             .args([
                 "--exact",
-                "distributed_pipeline_ring::pipeline_ring_worker",
+                "tests::distributed_pipeline_ring::pipeline_ring_worker",
                 "--nocapture",
             ])
             .env(WORKER_RANK, rank.to_string())

@@ -535,7 +535,7 @@ fn ring_two_process_all_to_all_v_and_dispatch_sharded() {
             Command::new(&executable)
                 .args([
                     "--exact",
-                    "distributed_expert_exchange_ring::expert_exchange_ring_worker",
+                    "tests::distributed_expert_exchange_ring::expert_exchange_ring_worker",
                     "--nocapture",
                 ])
                 .env(WORKER_RANK, rank.to_string())
