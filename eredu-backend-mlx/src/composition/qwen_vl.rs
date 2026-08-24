@@ -1075,7 +1075,7 @@ pub fn load_gguf(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(QwenVlModel, Vec<u32>), Error> {
+) -> Result<QwenVlModel, Error> {
     let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut text = qwen::model_args_from_gguf_catalog_with_context(
@@ -1148,7 +1148,6 @@ pub fn load_gguf(
     } else {
         (store, None)
     };
-    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
     let mut model = load_store(
         store,
         args,
@@ -1161,7 +1160,7 @@ pub fn load_gguf(
     if let Some(options) = expert_options {
         attach_expert_cache(&mut model, options, stream, weights_stream)?;
     }
-    Ok((model, eos))
+    Ok(model)
 }
 
 /// Loads a Qwen3-VL SafeTensors artifact through the generic component engine.

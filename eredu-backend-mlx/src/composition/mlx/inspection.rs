@@ -418,16 +418,6 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             artifact_modalities(composite_plan.input_modalities(composition));
     }
 
-    if let Err(error) = gguf_eos_token_ids(&metadata) {
-        report.issue(
-            InspectionIssueCode::InvalidConfiguration,
-            InspectionSeverity::Error,
-            error.to_string(),
-            Some(path.to_path_buf()),
-        );
-        report.model_loadability = InspectionReadiness::Invalid;
-        report.requested_load = InspectionReadiness::Invalid;
-    }
     report
 }
 
@@ -975,7 +965,11 @@ fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn write_minimal_llama_gguf(path: &Path, include_embedding_length: bool) {
+    fn write_minimal_llama_gguf(
+        path: &Path,
+        include_embedding_length: bool,
+        tokenizer_eos: Option<eredu_gguf::MetadataValue>,
+    ) {
         let mut metadata = BTreeMap::from([
             (
                 "general.architecture".into(),
@@ -991,6 +985,9 @@ mod tests {
                 "llama.embedding_length".into(),
                 eredu_gguf::MetadataValue::Uint32(1),
             );
+        }
+        if let Some(tokenizer_eos) = tokenizer_eos {
+            metadata.insert("tokenizer.ggml.eos_token_id".into(), tokenizer_eos);
         }
         let data = 1.0_f32.to_le_bytes();
         eredu_gguf::Writer::default()
@@ -1072,7 +1069,7 @@ mod tests {
     fn gguf_inspection_enriches_the_portable_validated_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.gguf");
-        write_minimal_llama_gguf(&path, true);
+        write_minimal_llama_gguf(&path, true, None);
 
         let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
 
@@ -1083,10 +1080,36 @@ mod tests {
     }
 
     #[test]
+    fn gguf_inspection_ignores_facade_owned_tokenizer_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, true, None);
+        let baseline = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
+
+        write_minimal_llama_gguf(
+            &path,
+            true,
+            Some(eredu_gguf::MetadataValue::String("not a token id".into())),
+        );
+        let with_tokenizer_metadata =
+            inspect_model(&path, MlxInspectionOptions::default()).unwrap();
+
+        assert_eq!(
+            with_tokenizer_metadata.model_loadability,
+            baseline.model_loadability
+        );
+        assert_eq!(
+            with_tokenizer_metadata.requested_load,
+            baseline.requested_load
+        );
+        assert_eq!(with_tokenizer_metadata.issues, baseline.issues);
+    }
+
+    #[test]
     fn gguf_inspection_surfaces_the_portable_admission_floor() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.gguf");
-        write_minimal_llama_gguf(&path, false);
+        write_minimal_llama_gguf(&path, false, None);
 
         let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
 

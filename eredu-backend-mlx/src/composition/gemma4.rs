@@ -1878,18 +1878,14 @@ pub fn load_gguf_tensor_parallel(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(Gemma4Model, Vec<u32>), Error> {
+) -> Result<Gemma4Model, Error> {
     let (store, args) = open_pipeline_gguf_store(
         checkpoint,
         projector,
         metadata,
         residency.max_mapped_shards(),
     )?;
-    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
-    Ok((
-        load_parallel_store(store, args, residency, build, stream, weights_stream)?,
-        eos,
-    ))
+    load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
 fn attach_expert_cache(

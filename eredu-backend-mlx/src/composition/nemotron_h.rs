@@ -2040,7 +2040,6 @@ impl eredu_architectures::nemotron_h::GgufTensorCatalog for GgufCatalog<'_> {
 
 pub(crate) struct PreparedGguf {
     pub args: ModelArgs,
-    pub eos_token_ids: Vec<u32>,
 }
 
 pub(crate) fn prepare_gguf(
@@ -2074,10 +2073,7 @@ pub(crate) fn prepare_gguf(
     args.weight_quantization = None;
     args.validate()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    Ok(PreparedGguf {
-        args,
-        eos_token_ids: crate::composition::mlx::gguf_eos_token_ids(metadata)?,
-    })
+    Ok(PreparedGguf { args })
 }
 
 /// Loads a GGUF checkpoint through the same neutral Nemotron-H model object.
@@ -2087,7 +2083,7 @@ pub(crate) fn load_nemotron_h_gguf_model(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(NemotronHModel, Vec<u32>), Error> {
+) -> Result<NemotronHModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
@@ -2119,7 +2115,7 @@ pub(crate) fn load_nemotron_h_gguf_model(
     if let Some(expert_options) = expert_options {
         attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Loads GGUF Nemotron-H with tensor-parallel placement.
@@ -2129,7 +2125,7 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(NemotronHModel, Vec<u32>), Error> {
+) -> Result<NemotronHModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
@@ -2149,5 +2145,5 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
         weights_stream,
         false,
     )?;
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }

@@ -1718,7 +1718,6 @@ pub fn load_gpt_oss_tensor_parallel_model(
 /// Header-only results needed to open a portable GGUF GPT-OSS checkpoint.
 pub(crate) struct PreparedGptOssGguf {
     pub args: ModelArgs,
-    pub eos_token_ids: Vec<u32>,
 }
 
 /// Validates and normalizes portable GGUF metadata without reading payloads.
@@ -1758,10 +1757,7 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     args.quantization = None;
     args.validate()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    Ok(PreparedGptOssGguf {
-        args,
-        eos_token_ids: crate::composition::mlx::gguf_eos_token_ids(metadata)?,
-    })
+    Ok(PreparedGptOssGguf { args })
 }
 
 /// Loads a GGUF checkpoint through the same neutral model/runtime object.
@@ -1771,7 +1767,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(GptOssModel, Vec<u32>), Error> {
+) -> Result<GptOssModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
     let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
@@ -1804,7 +1800,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
     if let Some(options) = expert_options {
         attach_expert_cache(&mut model, options, stream, weights_stream)?;
     }
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Loads a validated GGUF checkpoint through the neutral tensor-parallel graph.
@@ -1814,7 +1810,7 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(GptOssModel, Vec<u32>), Error> {
+) -> Result<GptOssModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
     let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
@@ -1834,7 +1830,7 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
         weights_stream,
         false,
     )?;
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Loads portable GGUF weights with the requested unified residency policy.
@@ -1844,6 +1840,6 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(GptOssModel, Vec<u32>), Error> {
+) -> Result<GptOssModel, Error> {
     load_gpt_oss_gguf_model(source, residency, quantization, stream, weights_stream)
 }

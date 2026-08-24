@@ -10,15 +10,6 @@ use safemlx::{ops::GgufMetadataValue, Stream};
 #[cfg(feature = "media")]
 use crate::composition::mlx::{load_processor, ModelProcessor};
 
-pub fn gguf_eos_token_ids(
-    metadata: &std::collections::HashMap<String, eredu_gguf::MetadataValue>,
-) -> Result<Vec<u32>, Error> {
-    const KEY: &str = "tokenizer.ggml.eos_token_id";
-    Ok(eredu_core::gguf_u32_metadata_values(
-        KEY,
-        metadata.get(KEY),
-    )?)
-}
 use crate::{
     backend::error::Error,
     backend::{MlxModel, ModelLoadOptions},
@@ -42,17 +33,16 @@ fn materialize_gguf_model(
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     let kind = source.architecture().model_kind();
-    let (model, _architecture_eos_token_ids) = match source.architecture() {
+    let model = match source.architecture() {
         GgufArchitecture::KimiLinear => {
-            let (loaded, eos_token_ids) =
-                crate::composition::kimi_linear::load_kimi_linear_gguf_model(
-                    source,
-                    options.weight_residency,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-            (Model::KimiLinear(kind, loaded), eos_token_ids)
+            let loaded = crate::composition::kimi_linear::load_kimi_linear_gguf_model(
+                source,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            Model::KimiLinear(kind, loaded)
         }
         GgufArchitecture::DeepSeek2 => {
             if options.quantization.is_some() {
@@ -60,7 +50,7 @@ fn materialize_gguf_model(
                     "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
                 ));
             }
-            let (loaded, eos_token_ids) = crate::composition::deepseek::load_gguf(
+            let loaded = crate::composition::deepseek::load_gguf(
                 checkpoint,
                 metadata,
                 false,
@@ -68,7 +58,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            (Model::DeepSeek(kind, Box::new(loaded)), eos_token_ids)
+            Model::DeepSeek(kind, Box::new(loaded))
         }
         GgufArchitecture::DeepSeek4 => {
             if options.quantization.is_some() {
@@ -76,7 +66,7 @@ fn materialize_gguf_model(
                     "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
                 ));
             }
-            let (loaded, eos_token_ids) = crate::composition::deepseek::load_gguf(
+            let loaded = crate::composition::deepseek::load_gguf(
                 checkpoint,
                 metadata,
                 true,
@@ -84,18 +74,17 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            (Model::DeepSeek(kind, Box::new(loaded)), eos_token_ids)
+            Model::DeepSeek(kind, Box::new(loaded))
         }
         GgufArchitecture::GptOss => {
-            let (loaded, eos_token_ids) =
-                crate::composition::gpt_oss::load_gpt_oss_gguf_layerwise_model(
-                    source,
-                    options.weight_residency,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-            (Model::GptOss(kind, loaded), eos_token_ids)
+            let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_layerwise_model(
+                source,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            Model::GptOss(kind, loaded)
         }
         GgufArchitecture::Inkling => {
             if options.quantization.is_some() {
@@ -111,8 +100,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            let eos_token_ids = gguf_eos_token_ids(metadata)?;
-            (Model::Inkling(kind, loaded), eos_token_ids)
+            Model::Inkling(kind, loaded)
         }
         GgufArchitecture::Gemma4 => {
             if options.quantization.is_some() {
@@ -128,17 +116,17 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            (Model::Gemma4(kind, loaded), gguf_eos_token_ids(metadata)?)
+            Model::Gemma4(kind, loaded)
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-            let (loaded, eos_token_ids) = crate::composition::llama::load_llama_gguf_model(
+            let loaded = crate::composition::llama::load_llama_gguf_model(
                 source,
                 options.weight_residency,
                 options.quantization,
                 stream,
                 weights_stream,
             )?;
-            (Model::Llama(kind, loaded), eos_token_ids)
+            Model::Llama(kind, loaded)
         }
         GgufArchitecture::MuseGlimmer => {
             let projector = projector.ok_or_else(|| {
@@ -159,39 +147,37 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            let eos_token_ids = gguf_eos_token_ids(metadata)?;
-            (Model::MuseGlimmer(kind, loaded), eos_token_ids)
+            Model::MuseGlimmer(kind, loaded)
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-            let (loaded, eos_token_ids) = crate::composition::lfm2::load_lfm2_gguf_model(
+            let loaded = crate::composition::lfm2::load_lfm2_gguf_model(
                 source,
                 options.weight_residency,
                 options.quantization,
                 stream,
                 weights_stream,
             )?;
-            (Model::Lfm2(kind, loaded), eos_token_ids)
+            Model::Lfm2(kind, loaded)
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-            let (loaded, eos_token_ids) =
-                crate::composition::nemotron_h::load_nemotron_h_gguf_model(
-                    source,
-                    options.weight_residency,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-            (Model::NemotronH(kind, loaded), eos_token_ids)
-        }
-        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-            let (loaded, eos_token_ids) = crate::composition::qwen::load_qwen_gguf_model(
+            let loaded = crate::composition::nemotron_h::load_nemotron_h_gguf_model(
                 source,
                 options.weight_residency,
                 options.quantization,
                 stream,
                 weights_stream,
             )?;
-            (Model::Qwen(kind, loaded), eos_token_ids)
+            Model::NemotronH(kind, loaded)
+        }
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+            let loaded = crate::composition::qwen::load_qwen_gguf_model(
+                source,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            Model::Qwen(kind, loaded)
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let projector = projector.ok_or_else(|| {
@@ -199,7 +185,7 @@ fn materialize_gguf_model(
                     "Qwen3-VL preparation omitted its required media projector".into(),
                 )
             })?;
-            let (loaded, eos_token_ids) = crate::composition::qwen::vl::load_gguf(
+            let loaded = crate::composition::qwen::vl::load_gguf(
                 source.architecture(),
                 checkpoint,
                 projector,
@@ -214,10 +200,10 @@ fn materialize_gguf_model(
             } else {
                 Model::Qwen3Vl(kind, loaded)
             };
-            (variant, eos_token_ids)
+            variant
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            let (loaded, eos_token_ids) = crate::composition::qwen::hybrid::load_gguf(
+            let loaded = crate::composition::qwen::hybrid::load_gguf(
                 source,
                 projector,
                 options.weight_residency,
@@ -230,7 +216,7 @@ fn materialize_gguf_model(
             } else {
                 Model::Qwen35(kind, loaded)
             };
-            (model, eos_token_ids)
+            model
         }
     };
     Ok(model)
@@ -832,7 +818,7 @@ fn materialize_gguf_artifact(
         .parallel
         .is_some_and(|topology| !topology.is_replicated())
     {
-        let (model, _eos_token_ids) = materialize_gguf_tensor_parallel(
+        let model = materialize_gguf_tensor_parallel(
             &source,
             projector.as_ref(),
             options,
@@ -860,7 +846,7 @@ fn materialize_gguf_tensor_parallel(
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(Model, Vec<u32>), Error> {
+) -> Result<Model, Error> {
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     let architecture = source.architecture();
@@ -879,7 +865,7 @@ fn materialize_gguf_tensor_parallel(
     );
     match architecture {
         GgufArchitecture::KimiLinear => {
-            let (model, eos) =
+            let model =
                 crate::composition::kimi_linear::load_kimi_linear_gguf_tensor_parallel_model(
                     source,
                     residency,
@@ -887,55 +873,54 @@ fn materialize_gguf_tensor_parallel(
                     stream,
                     weights_stream,
                 )?;
-            Ok((Model::KimiLinear(kind, model), eos))
+            Ok(Model::KimiLinear(kind, model))
         }
         GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => Err(Error::Parallel(
             "DeepSeek GGUF tensor parallelism requires distributed-stage materialization".into(),
         )),
         GgufArchitecture::GptOss => {
-            let (model, eos) =
-                crate::composition::gpt_oss::load_gpt_oss_gguf_tensor_parallel_model(
-                    source,
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
-            Ok((Model::GptOss(kind, model), eos))
-        }
-        GgufArchitecture::Inkling => {
-            let (model, eos) = crate::composition::inkling::load_gguf_tensor_parallel(
-                checkpoint,
-                projector,
-                metadata,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Ok((Model::Inkling(kind, model), eos))
-        }
-        GgufArchitecture::Gemma4 => {
-            let (model, eos) = crate::composition::gemma4::load_gguf_tensor_parallel(
-                checkpoint,
-                projector,
-                metadata,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Ok((Model::Gemma4(kind, model), eos))
-        }
-        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-            let (model, eos) = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
+            let model = crate::composition::gpt_oss::load_gpt_oss_gguf_tensor_parallel_model(
                 source,
                 residency,
                 build,
                 stream,
                 weights_stream,
             )?;
-            Ok((Model::Llama(kind, model), eos))
+            Ok(Model::GptOss(kind, model))
+        }
+        GgufArchitecture::Inkling => {
+            let model = crate::composition::inkling::load_gguf_tensor_parallel(
+                checkpoint,
+                projector,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok(Model::Inkling(kind, model))
+        }
+        GgufArchitecture::Gemma4 => {
+            let model = crate::composition::gemma4::load_gguf_tensor_parallel(
+                checkpoint,
+                projector,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok(Model::Gemma4(kind, model))
+        }
+        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+            let model = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
+                source,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok(Model::Llama(kind, model))
         }
         GgufArchitecture::MuseGlimmer => {
             let projector = projector.ok_or_else(|| {
@@ -943,7 +928,7 @@ fn materialize_gguf_tensor_parallel(
                     "Muse-Glimmer preparation omitted its required media projector".into(),
                 )
             })?;
-            let (model, eos) = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
+            let model = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
                 checkpoint,
                 projector,
                 metadata,
@@ -952,38 +937,37 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok((Model::MuseGlimmer(kind, model), eos))
+            Ok(Model::MuseGlimmer(kind, model))
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-            let (model, eos) = crate::composition::lfm2::load_lfm2_gguf_tensor_parallel_model(
+            let model = crate::composition::lfm2::load_lfm2_gguf_tensor_parallel_model(
                 source,
                 residency,
                 build,
                 stream,
                 weights_stream,
             )?;
-            Ok((Model::Lfm2(kind, model), eos))
+            Ok(Model::Lfm2(kind, model))
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-            let (model, eos) =
-                crate::composition::nemotron_h::load_nemotron_h_gguf_tensor_parallel_model(
-                    source,
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
-            Ok((Model::NemotronH(kind, model), eos))
-        }
-        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-            let (model, eos) = crate::composition::qwen::load_qwen_gguf_tensor_parallel_model(
+            let model = crate::composition::nemotron_h::load_nemotron_h_gguf_tensor_parallel_model(
                 source,
                 residency,
                 build,
                 stream,
                 weights_stream,
             )?;
-            Ok((Model::Qwen(kind, model), eos))
+            Ok(Model::NemotronH(kind, model))
+        }
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+            let model = crate::composition::qwen::load_qwen_gguf_tensor_parallel_model(
+                source,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok(Model::Qwen(kind, model))
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             Err(Error::UnsupportedArchitecture(

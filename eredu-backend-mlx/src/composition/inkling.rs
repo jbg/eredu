@@ -1977,18 +1977,14 @@ pub fn load_gguf_tensor_parallel(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(InklingModel, Vec<u32>), Error> {
+) -> Result<InklingModel, Error> {
     let (store, args) = open_gguf_store(
         checkpoint,
         projector,
         metadata,
         layer_policy.max_mapped_shards(),
     )?;
-    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
-    Ok((
-        load_parallel_store(store, args, layer_policy, build, stream, weights_stream)?,
-        eos,
-    ))
+    load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
 }
 
 fn attach_expert_cache(

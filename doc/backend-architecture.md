@@ -79,6 +79,12 @@ Portable crates split tensor-independent ownership by responsibility:
 - distributed scopes, topology membership, placement, consensus messages, and
   operation capability descriptions.
 
+The facade owns text-tokenizer reconstruction, chat-template interpretation,
+and generation-termination policy, including EOS metadata from model sidecars
+and GGUF headers. Backend weight inspection and materialization do not parse
+tokenizer or EOS policy metadata: malformed or unsupported facade-owned policy
+cannot reject an otherwise valid weight artifact.
+
 `eredu-runtime` owns statically dispatched resident and bounded execution,
 parameter binding, residency, mutable state, exact completion, distributed-plan
 realization, and generation-facing causal-model contracts.
@@ -397,7 +403,8 @@ family-specific structural admission, and declares composite requirements.
 The handoff contains the primary plus the exact resolved companion checkpoint
 handles. Backends may wrap those portable handles and add architecture or
 device compatibility checks, but do not rescan directories, select companions,
-or repeat either portable admission layer.
+repeat either portable admission layer, or parse facade-owned tokenizer and EOS
+metadata.
 
 `ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
 including distributed stage loaders, consume its inspected configuration,

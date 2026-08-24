@@ -98,7 +98,6 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
 
 pub(crate) struct PreparedLlamaGguf {
     pub args: ModelArgs,
-    pub eos_token_ids: Vec<u32>,
 }
 
 pub(crate) fn prepare_llama_gguf_checkpoint(
@@ -137,11 +136,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         args.quantized_weight_configs = Some(quantized_weight_configs);
     }
 
-    let eos_token_ids = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
-    Ok(PreparedLlamaGguf {
-        args,
-        eos_token_ids,
-    })
+    Ok(PreparedLlamaGguf { args })
 }
 
 struct NeutralGgufCatalog<'a, T: ?Sized>(&'a T);

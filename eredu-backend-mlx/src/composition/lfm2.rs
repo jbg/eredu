@@ -1364,7 +1364,6 @@ impl eredu_architectures::lfm2::GgufTensorCatalog for GgufCatalog<'_> {
 
 pub(crate) struct PreparedGguf {
     pub args: ModelArgs,
-    pub eos_token_ids: Vec<u32>,
 }
 
 pub(crate) fn prepare_gguf(
@@ -1399,10 +1398,7 @@ pub(crate) fn prepare_gguf(
     args.weight_quantization = None;
     args.validate()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    Ok(PreparedGguf {
-        args,
-        eos_token_ids: crate::composition::mlx::gguf_eos_token_ids(metadata)?,
-    })
+    Ok(PreparedGguf { args })
 }
 
 /// Loads a GGUF checkpoint through the same neutral LFM2 model object.
@@ -1412,7 +1408,7 @@ pub(crate) fn load_lfm2_gguf_model(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(Lfm2Model, Vec<u32>), Error> {
+) -> Result<Lfm2Model, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
@@ -1445,7 +1441,7 @@ pub(crate) fn load_lfm2_gguf_model(
     if let Some(expert_options) = expert_options {
         attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Loads GGUF LFM2 with tensor-parallel placement.
@@ -1455,7 +1451,7 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(Lfm2Model, Vec<u32>), Error> {
+) -> Result<Lfm2Model, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let is_moe = prepared.args.has_sparse_moe_layers();
@@ -1476,5 +1472,5 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
         weights_stream,
         false,
     )?;
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }

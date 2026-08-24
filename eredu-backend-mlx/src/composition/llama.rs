@@ -819,7 +819,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(LlamaModel, Vec<u32>), Error> {
+) -> Result<LlamaModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
@@ -833,7 +833,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
         )?);
     let model =
         load_neutral_llama_parallel(store, prepared.args, options, build, stream, weights_stream)?;
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Loads a Llama/Mistral GGUF checkpoint using the selected residency policy.
@@ -843,7 +843,7 @@ pub(crate) fn load_llama_gguf_model(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(LlamaModel, Vec<u32>), Error> {
+) -> Result<LlamaModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
@@ -876,7 +876,7 @@ pub(crate) fn load_llama_gguf_model(
     } else {
         load_neutral_llama(store, args, execution_options, stream, weights_stream, None)?
     };
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Llama implementation of the generic layerwise model-family contract.

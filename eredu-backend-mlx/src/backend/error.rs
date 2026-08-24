@@ -127,10 +127,6 @@ pub enum Error {
     #[error("media processor error: {0}")]
     Processor(String),
 
-    /// Embedded GGUF tokenizer metadata is invalid or cannot be reconstructed.
-    #[error("GGUF tokenizer error: {0}")]
-    GgufTokenizer(String),
-
     /// Portable GGUF header or catalog parsing failed.
     #[error(transparent)]
     Gguf(#[from] eredu_gguf::Error),

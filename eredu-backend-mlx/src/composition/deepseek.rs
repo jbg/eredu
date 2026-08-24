@@ -2589,7 +2589,7 @@ pub fn load_gguf(
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(DeepSeekModel, Vec<u32>), Error> {
+) -> Result<DeepSeekModel, Error> {
     load_gguf_internal(
         checkpoint,
         _metadata,
@@ -2607,7 +2607,7 @@ fn load_gguf_internal(
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(DeepSeekModel, Vec<u32>), Error> {
+) -> Result<DeepSeekModel, Error> {
     let expert_options = residency.expert_cache();
     let portable_metadata = checkpoint
         .catalog()
@@ -2615,7 +2615,6 @@ fn load_gguf_internal(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<_, _>>();
-    let eos = crate::composition::mlx::loading::gguf_eos_token_ids(&portable_metadata)?;
     let options = residency.layers();
     let model = if family_v4 {
         let mut args = deepseek::parse_v4_gguf(&portable_metadata)
@@ -2673,7 +2672,7 @@ fn load_gguf_internal(
     if let Some(options) = expert_options {
         model.attach_expert_cache(options, stream, weights_stream)?;
     }
-    Ok((model, eos))
+    Ok(model)
 }
 
 struct PortableCatalog<'a>(&'a eredu_gguf::Checkpoint);

@@ -779,7 +779,7 @@ pub(crate) fn load_gguf(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(QwenHybridModel, Vec<u32>), Error> {
+) -> Result<QwenHybridModel, Error> {
     if !matches!(
         source.architecture(),
         eredu_architectures::GgufArchitecture::Qwen35
@@ -847,10 +847,7 @@ pub(crate) fn load_gguf(
     if let Some(expert_options) = expert_options {
         attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok((
-        model,
-        crate::composition::mlx::gguf_eos_token_ids(metadata)?,
-    ))
+    Ok(model)
 }
 
 impl MlxUnitPopulator<Block> for UnitPopulator {

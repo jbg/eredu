@@ -1401,7 +1401,6 @@ impl eredu_architectures::qwen::GgufTensorCatalog for QwenGgufCatalog<'_> {
 
 pub(crate) struct PreparedQwenGguf {
     pub args: ModelArgs,
-    pub eos_token_ids: Vec<u32>,
 }
 
 pub(crate) fn prepare_qwen_gguf_checkpoint(
@@ -1437,10 +1436,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    Ok(PreparedQwenGguf {
-        args,
-        eos_token_ids: crate::composition::mlx::gguf_eos_token_ids(metadata)?,
-    })
+    Ok(PreparedQwenGguf { args })
 }
 
 pub(crate) fn load_qwen_gguf_tensor_parallel_model(
@@ -1449,7 +1445,7 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(QwenModel, Vec<u32>), Error> {
+) -> Result<QwenModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_qwen_gguf_checkpoint(source)?;
     let gguf_plan = eredu_architectures::qwen::gguf_plan(&prepared.args)
@@ -1472,7 +1468,7 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
         weights_stream,
         false,
     )?;
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Loads a Qwen/Mistral GGUF checkpoint using the selected residency policy.
@@ -1482,7 +1478,7 @@ pub(crate) fn load_qwen_gguf_model(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(QwenModel, Vec<u32>), Error> {
+) -> Result<QwenModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_qwen_gguf_checkpoint(source)?;
     let gguf_plan = eredu_architectures::qwen::gguf_plan(&prepared.args)
@@ -1526,7 +1522,7 @@ pub(crate) fn load_qwen_gguf_model(
     if let Some(options) = expert_options {
         attach_qwen_expert_cache(&mut model, options, stream, weights_stream)?;
     }
-    Ok((model, prepared.eos_token_ids))
+    Ok(model)
 }
 
 /// Qwen binding and placement helper for pipeline-parallel stages.

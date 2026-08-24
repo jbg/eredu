@@ -16,7 +16,7 @@ pub mod speculative;
 pub mod structural;
 
 pub use inspection::{inspect_model, MlxInspectionOptions};
-pub use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
+pub use loading::validate_gguf_quantization_source;
 pub use model::{Model, ModelCache};
 #[cfg(feature = "media")]
 pub use processor::{load_processor, ModelProcessor};
