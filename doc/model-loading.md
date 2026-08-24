@@ -28,9 +28,10 @@ with an MLX parallel context.
 
 ### Fully resident
 
-`WeightResidency::fully_resident()` materializes the complete selected model or
-rank-local shard before execution. This is the simplest and usually fastest
-policy when it fits.
+`eredu_runtime::WeightResidency::fully_resident()` materializes the complete
+selected model or rank-local shard before execution. This is the simplest and
+usually fastest policy when it fits. Infrastructure clients configure this
+policy through the owning `eredu-runtime` crate.
 
 ### Host-layerwise
 

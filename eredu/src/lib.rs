@@ -34,8 +34,6 @@ pub use eredu_checkpoint::{
     store::{WeightStoreBackend, WeightStoreDiagnostics},
     AffineQuantization, WeightQuantization,
 };
-/// Canonical backend-neutral runtime types.
-pub use eredu_core as core;
 pub use eredu_core::artifact::{
     plan_model_preparation, ArtifactFormat, ArtifactInspection, LoadingProtocol,
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,
@@ -105,24 +103,4 @@ pub use eredu_core::{
     TokenizerCompatibilityError, TokenizerCompatibilityProof, TopologyPreflightReport,
     TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
     AUTOMATIC_SCHEMA_VERSION, EXECUTION_PLAN_SCHEMA_VERSION,
-};
-pub use eredu_runtime::{
-    finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
-    resolve_prompt_cache_root, safe_prompt_cache_shard_path, validate_prompt_cache_manifest,
-    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion,
-    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
-    CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
-    CacheIoPreparation, CacheIoStartDisposition, CacheIoSubmission, CacheIoSubmissionOutcome,
-    CacheIoTicket, CacheIoWorker, CacheIoWorkerError, CacheLayerResidencyReport,
-    CacheLayerResidencyStats, CacheLifecycleError, CachePoolError, CachePoolLimits,
-    CachePoolReport, CachePoolResource, CacheResidencyConfigurationError, CacheResidencyPolicy,
-    CacheResidencyPool, CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError,
-    CacheStoragePhase, DenseDiskStreamLoadOptions, DenseDiskStreamReport, ExecutionResidency,
-    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, ExpertWeightResidency,
-    LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, LiveCacheBlockPublication,
-    LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail, NonExpertWeightResidency,
-    PagedCacheOptions, ParallelModelInfo, PromptCachePersistenceError, PromptCachePublication,
-    StaticUnitBindings, WeightResidency, WeightResidencyPolicyError,
-    CACHE_RESIDENCY_LAYER_REPORT_LIMIT, DENSE_TRANSFER_WINDOW, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
-    PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };

@@ -134,7 +134,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
     ) -> Result<
         (eredu_core::TextGenerationConfig, NonZeroUsize),
-        crate::core::generation::GenerationError,
+        eredu_core::generation::GenerationError,
     > {
         let resolved = resolve_generation_config(
             self.checkpoint_generation_config.as_ref(),
@@ -346,7 +346,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         (
             B::Prompt,
             eredu_core::TextGenerationConfig,
-            crate::core::generation::MtpConfig,
+            eredu_core::generation::MtpConfig,
             PreparedChatSpeculativeConstraint,
             Box<dyn eredu_core::SpeculativeSemanticState>,
         ),
@@ -387,7 +387,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         Ok((
             prompt,
             generation,
-            crate::core::generation::MtpConfig {
+            eredu_core::generation::MtpConfig {
                 max_tokens: max_tokens.get(),
                 max_draft_tokens: max_draft_tokens.get(),
                 temperature,

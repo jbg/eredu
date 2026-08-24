@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::core::generation::{
+use eredu_core::generation::{
     FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
     TokenTerminalSignals,
 };
@@ -993,7 +993,7 @@ pub(crate) enum CommittedGenerationError<S, D> {
     /// Token decoding or semantic event construction failed.
     Pipeline(CommittedTokenPipelineError<D>),
     /// Portable generation lifecycle state was invalid.
-    Lifecycle(crate::core::generation::GenerationError),
+    Lifecycle(eredu_core::generation::GenerationError),
     /// The backend stopped without producing a terminal token.
     MissingTerminalToken,
 }

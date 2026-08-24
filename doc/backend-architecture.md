@@ -39,18 +39,21 @@ composition internals live in `eredu-backend-mlx`. The backend crate does not
 alias neutral crates into its namespace; direct backend consumers import
 neutral contracts from their owning crates.
 
+The facade likewise does not alias `eredu-core` or re-export `eredu-runtime`
+infrastructure. Cache workers, storage bindings, residency engines, parameter
+plans, and other infrastructure contracts are imported from their owning
+crates. The facade root retains only deliberately application-facing types.
+
 The selected adapter exposes distinct causal and realtime backend types because
 the neutral execution contracts have different model, input, output, session,
 and completion associated types. Both are available through `eredu::api`; an
 application does not depend directly on the concrete backend crate merely to
 select realtime loading and execution.
 
-Portable checkpoint quantization requests and storage diagnostics used by
-applications are re-exported by the facade; applications do not depend on
-`eredu-checkpoint` to name those contracts.
-
-Application targets, including the CLI and platform examples, depend only on
-the `eredu` facade. The selected-local-backend API owns device-plan creation,
+Application-only targets and platform examples can depend solely on the
+`eredu` facade. Infrastructure-aware clients such as the CLI also depend on
+the neutral owning crates for the low-level policies they configure. The
+selected-local-backend API owns device-plan creation,
 process runtime configuration, synchronization, allocator telemetry, and
 diagnostic benchmarks without exposing native tensors, streams, devices, or
 random state. Direct native access remains an explicit backend-author escape

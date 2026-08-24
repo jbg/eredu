@@ -22,13 +22,6 @@ use eredu::{
         PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpError,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, RgbImage,
     },
-    core::{
-        checkpoint::TensorDtype, BoundedResidencyRequirement, CandidateAdmission,
-        PreparedSpeculativeLane, ProposalDecision, SamplingPlacement, SpeculativeCallbackPublisher,
-        SpeculativeCommit, SpeculativeExecutor, SpeculativeGenerationVisitor,
-        SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
-        SpeculativeSemanticConstraint,
-    },
     load_realtime_model_with_options, AdmissionRequest, AdmissionResult, ArtifactFormat,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
     BackendCapabilities, BackendDescriptor, BackendId, BackendProvider, BackendSession,
@@ -51,7 +44,12 @@ use eredu::{
     Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
     ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
-use eredu_core::Completion;
+use eredu_core::{
+    checkpoint::TensorDtype, BoundedResidencyRequirement, CandidateAdmission, Completion,
+    PreparedSpeculativeLane, ProposalDecision, SamplingPlacement, SpeculativeCallbackPublisher,
+    SpeculativeCommit, SpeculativeExecutor, SpeculativeGenerationVisitor, SpeculativeOutputRuntime,
+    SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling, SpeculativeSemanticConstraint,
+};
 use tokenizers::{
     decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
     pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
@@ -423,7 +421,7 @@ impl ModelCapabilityBackend for MockBackend {
         max_output_tokens: u64,
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        eredu::core::estimate_runtime_state(
+        eredu_core::estimate_runtime_state(
             &StateLayout {
                 fixed_scalars_per_batch: 0,
                 growing: vec![GrowingState {
@@ -840,7 +838,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                 config: lane.config.clone(),
                 runtime: SpeculativeOutputRuntime::new(
                     MockSpeculativeSampling,
-                    eredu::core::generation::GenerationSequence::new(
+                    eredu_core::generation::GenerationSequence::new(
                         lane.config.max_tokens,
                         lane.config.eos_token_ids.iter().copied(),
                     ),
@@ -858,7 +856,7 @@ impl SpeculativeGenerationBackend for MockBackend {
             .run(
                 &mut MockSpeculativeExecutor,
                 prepared,
-                eredu::core::SpeculativeExecutionTopology::Single,
+                eredu_core::SpeculativeExecutionTopology::Single,
                 false,
                 false,
                 (),
@@ -1295,7 +1293,7 @@ fn assert_automatic_planning_conformance() {
     let mut wrong_backend = report.plan.clone();
     wrong_backend.device = DevicePlan::new("other", "gpu:0").unwrap();
     assert!(matches!(
-        eredu::core::realize_execution_plan_target(&backend, &wrong_backend),
+        eredu_core::realize_execution_plan_target(&backend, &wrong_backend),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("factory owns mock")
     ));
@@ -1303,7 +1301,7 @@ fn assert_automatic_planning_conformance() {
     let mut missing_device = report.plan.clone();
     missing_device.device = DevicePlan::new("mock", "gpu:1").unwrap();
     assert!(matches!(
-        eredu::core::realize_execution_plan_target(&backend, &missing_device),
+        eredu_core::realize_execution_plan_target(&backend, &missing_device),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("does not expose selected device gpu:1")
     ));

@@ -6,15 +6,15 @@ use crate::api::request::prepare_chat_from_parts;
 use crate::api::tokenizer::{load_chat_template, load_tokenizer_template_kwargs};
 use crate::api::{chat_template_kwargs, load_tokenizer, TextModelError};
 use crate::{
-    core::generation::{
-        resolve_generation_config, FinishReason, GenerationConfigOverrides, SemanticEvent,
-    },
     runtime::chat::constraints::ConstraintCompiler,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice,
         SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
     },
     GgufArchitecture,
+};
+use eredu_core::generation::{
+    resolve_generation_config, FinishReason, GenerationConfigOverrides, SemanticEvent,
 };
 use eredu_text::tokenizer::chat_template_kwargs as inspect_chat_template_kwargs;
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;

@@ -589,10 +589,8 @@ impl ProtocolParser for InklingMessageParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        core::generation::{FinishReason, SemanticEvent},
-        runtime::generation::streaming::ToolRuntimeParser,
-    };
+    use crate::runtime::generation::streaming::ToolRuntimeParser;
+    use eredu_core::generation::{FinishReason, SemanticEvent};
 
     fn new_parser() -> ToolRuntimeParser {
         ToolRuntimeParser::new_with_structural_stops(

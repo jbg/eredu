@@ -22,19 +22,22 @@ use eredu::{
         PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationRequest, ResidencyPlan, TextDecoder, TextModelError,
     },
-    core::residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
-    core::speculative::MtpStats,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AffineQuantization, AutomaticPlanRequest, AutomaticPlanner, DenseDiskStreamLoadOptions,
-    DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, FinishReason, GenerationCancellationToken,
-    GenerationConfigOverrides, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
-    MtpSchedulerOptions, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-    SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightQuantization,
-    WeightStoreDiagnostics, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    AffineQuantization, AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan,
+    DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
+    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
+    HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TextGenerationConfig,
+    TimingTelemetry, TokenOutput, WeightQuantization, WeightStoreDiagnostics,
+    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
+use eredu_core::{
+    residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
+    speculative::MtpStats,
+};
+use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use serde::{Deserialize, Serialize};
 
@@ -1234,7 +1237,7 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
 
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<eredu::api::LocalLoadOptions> {
     let realization =
-        eredu::core::realize_execution_plan_target(&LocalBackendFactory::default(), plan)?;
+        eredu_core::realize_execution_plan_target(&LocalBackendFactory::default(), plan)?;
     let (_, options) = realization.into_parts();
     Ok(options)
 }
@@ -2694,7 +2697,7 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
     ExecutionPlan {
         schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
         device: device_plan(args.device),
-        topology: eredu::core::topology::ParallelTopology::new(1, 1, 1, 1)
+        topology: eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
             .expect("the singleton topology is valid"),
         residency,
         weight_transformation: match (args.quantize, args.quantization_mode) {

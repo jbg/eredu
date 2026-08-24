@@ -129,7 +129,7 @@ pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
     Constraint(#[from] ConstraintError),
     /// Portable generation lifecycle state was invalid.
     #[error(transparent)]
-    Generation(#[from] crate::core::generation::GenerationError),
+    Generation(#[from] eredu_core::generation::GenerationError),
     /// Prompt or incremental token decoding failed.
     #[error(transparent)]
     Tokenizer(#[from] TextDecoderError),
@@ -175,7 +175,7 @@ pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
     Backend(#[source] E),
     /// Portable generation configuration was invalid.
     #[error(transparent)]
-    Generation(#[from] crate::core::generation::GenerationError),
+    Generation(#[from] eredu_core::generation::GenerationError),
     /// Portable tokenizer preparation failed.
     #[error(transparent)]
     Text(#[from] TextModelError),

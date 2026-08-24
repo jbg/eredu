@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use eredu_core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use llguidance::{
     toktrie::{SimpleVob, TokEnv, TokenId},
@@ -18,7 +19,6 @@ use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
 use crate::{
-    core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController},
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
     runtime::chat::{
         GenerationConstraint, GenerationRuntimePlan, GenerationRuntimePlanParts,

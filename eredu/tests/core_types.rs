@@ -1,219 +1,29 @@
 use std::any::TypeId;
 
 #[test]
-fn facade_exports_are_the_canonical_core_types() {
+fn facade_exports_are_curated_application_types() {
     assert_eq!(
         TypeId::of::<eredu::ModelKind>(),
         TypeId::of::<eredu_architectures::ModelKind>(),
     );
     assert_eq!(
         TypeId::of::<eredu::PreparationPolicy>(),
-        TypeId::of::<eredu::core::artifact::PreparationPolicy>(),
+        TypeId::of::<eredu_core::artifact::PreparationPolicy>(),
     );
     assert_eq!(
-        TypeId::of::<eredu::ModelPreparationPlan>(),
-        TypeId::of::<eredu::core::artifact::ModelPreparationPlan>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::AttentionPolicy>(),
-        TypeId::of::<eredu::core::attention::AttentionPolicy>(),
-    );
-    let schedule = eredu::LayerSchedule::all_full(2).unwrap();
-    assert_eq!(schedule.len(), 2);
-    assert_eq!(
-        TypeId::of::<eredu::RequestId>(),
-        TypeId::of::<eredu::core::scheduler::RequestId>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::SchedulerLimits>(),
-        TypeId::of::<eredu::core::scheduler::SchedulerLimits>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::SchedulerReport>(),
-        TypeId::of::<eredu::core::scheduler::SchedulerReport>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::SchedulerError>(),
-        TypeId::of::<eredu::core::scheduler::SchedulerError>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::FinishReason>(),
-        TypeId::of::<eredu::core::generation::FinishReason>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::SemanticEvent>(),
-        TypeId::of::<eredu::core::generation::SemanticEvent>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::GenerationConfigOverrides>(),
-        TypeId::of::<eredu::core::generation::GenerationConfigOverrides>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::MtpConfig>(),
-        TypeId::of::<eredu::core::generation::MtpConfig>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::MtpSchedulerOptions>(),
-        TypeId::of::<eredu::core::generation::MtpSchedulerOptions>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::core::speculative::MtpStats>(),
-        TypeId::of::<eredu::core::speculative::MtpStats>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::core::speculative::MtpSchedulerStats>(),
-        TypeId::of::<eredu::core::speculative::MtpSchedulerStats>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::core::speculative::MtpBatchOutput>(),
-        TypeId::of::<eredu::core::speculative::MtpBatchOutput>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::SpeculativeGenerationOutput>(),
-        TypeId::of::<eredu::core::speculative::SpeculativeGenerationOutput>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::api::SpeculativeGenerationBatchOutput>(),
-        TypeId::of::<eredu::core::speculative::SpeculativeGenerationBatchOutput>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::OffloadConfig>(),
-        TypeId::of::<eredu::core::residency::OffloadConfig>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::MemoryTier>(),
-        TypeId::of::<eredu::core::residency::MemoryTier>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::OffloadReport>(),
-        TypeId::of::<eredu::core::residency::OffloadReport>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::ResidencyLedger>(),
-        TypeId::of::<eredu::core::residency::ResidencyLedger>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::ResidencyLedgerError>(),
-        TypeId::of::<eredu::core::residency::ResidencyLedgerError>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::UnitResidencyReport>(),
-        TypeId::of::<eredu::core::residency::UnitResidencyReport>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::BackgroundPrefetchReport>(),
-        TypeId::of::<eredu::core::residency::BackgroundPrefetchReport>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheIoExecutionState>(),
-        TypeId::of::<eredu_runtime::CacheIoExecutionState>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CachePoolLimits>(),
-        TypeId::of::<eredu_runtime::CachePoolLimits>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheResidencyPool>(),
-        TypeId::of::<eredu_runtime::CacheResidencyPool>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CachePoolReport>(),
-        TypeId::of::<eredu_runtime::CachePoolReport>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheResidencyPolicy>(),
-        TypeId::of::<eredu_runtime::CacheResidencyPolicy>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::PagedCacheOptions>(),
-        TypeId::of::<eredu_runtime::PagedCacheOptions>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheBlockId>(),
-        TypeId::of::<eredu::core::cache::CacheBlockId>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::LayerCachePolicy>(),
-        TypeId::of::<eredu::core::cache::LayerCachePolicy>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::StateTensorPolicy>(),
-        TypeId::of::<eredu::core::cache::StateTensorPolicy>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::PromptCacheDescriptor>(),
-        TypeId::of::<eredu::core::cache::PromptCacheDescriptor>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::PromptCacheManifest>(),
-        TypeId::of::<eredu::core::cache::PromptCacheManifest>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::PromptCacheTopology>(),
-        TypeId::of::<eredu::core::cache::PromptCacheTopology>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheBlockLifecycle>(),
-        TypeId::of::<eredu_runtime::CacheBlockLifecycle>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::MutableCacheTail>(),
-        TypeId::of::<eredu_runtime::MutableCacheTail>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheLifecycleError>(),
-        TypeId::of::<eredu_runtime::CacheLifecycleError>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheStoragePhase>(),
-        TypeId::of::<eredu_runtime::CacheStoragePhase>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheIoOperationKey>(),
-        TypeId::of::<eredu_runtime::CacheIoOperationKey>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CacheStorageError>(),
-        TypeId::of::<eredu_runtime::CacheStorageError>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::DistributedCapabilities>(),
-        TypeId::of::<eredu::core::backend::DistributedCapabilities>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::CollectiveScope>(),
-        TypeId::of::<eredu::core::backend::CollectiveScope>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::DistributedSessionDescriptor>(),
-        TypeId::of::<eredu::core::backend::DistributedSessionDescriptor>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::ValueDescriptor>(),
-        TypeId::of::<eredu::core::backend::ValueDescriptor>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::ModelCapabilities>(),
-        TypeId::of::<eredu::core::capability::ModelCapabilities>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::RuntimeStateEstimate>(),
-        TypeId::of::<eredu::core::capability::RuntimeStateEstimate>(),
-    );
-    assert_eq!(
-        TypeId::of::<eredu::AdmissionResult>(),
-        TypeId::of::<eredu::core::capability::AdmissionResult>(),
+        TypeId::of::<eredu::ExecutionPlan>(),
+        TypeId::of::<eredu_core::ExecutionPlan>(),
     );
     assert_eq!(
         TypeId::of::<eredu::ModelInspectionReport>(),
-        TypeId::of::<eredu::core::inspection::ModelInspectionReport>(),
+        TypeId::of::<eredu_core::ModelInspectionReport>(),
     );
     assert_eq!(
         TypeId::of::<eredu::MultimodalRequest>(),
-        TypeId::of::<eredu::core::media::MultimodalRequest>(),
+        TypeId::of::<eredu_core::MultimodalRequest>(),
     );
     assert_eq!(
-        TypeId::of::<eredu::MediaBinding>(),
-        TypeId::of::<eredu::core::media::MediaBinding>(),
+        TypeId::of::<eredu::WeightQuantization>(),
+        TypeId::of::<eredu_checkpoint::WeightQuantization>(),
     );
 }

@@ -3063,11 +3063,11 @@ mod tests {
         ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
     };
     use crate::{
-        core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
         runtime::chat::{ParallelToolCallPolicy, ToolChoice},
         runtime::generation::streaming::{ProtocolParser, SemanticEventSink},
     };
+    use eredu_core::generation::{FinishReason, SemanticEvent};
 
     const FUNCTION_INPUT_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
         envelope: ExactEnvelope {

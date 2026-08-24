@@ -567,11 +567,11 @@ mod tests {
 
     use super::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT, STRUCTURAL_TOKENS};
     use crate::{
-        core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
         runtime::chat::dialect::DialectParameters,
         runtime::chat::{ParallelToolCallPolicy, ToolChoice},
     };
+    use eredu_core::generation::{FinishReason, SemanticEvent};
 
     const REASONING_CALL_FIXTURE: &str =
         include_str!("../../../tests/fixtures/harmony/reasoning-function-call-abd677f7.txt");

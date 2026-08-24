@@ -927,6 +927,8 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu",
+ "eredu-core",
+ "eredu-runtime",
  "hf-hub",
  "serde",
  "serde_json",

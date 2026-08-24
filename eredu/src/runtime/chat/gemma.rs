@@ -426,13 +426,11 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use crate::{
-        core::generation::{FinishReason, SemanticEvent},
-        runtime::generation::streaming::{
-            CommittedTokenPipeline, RawTokenDecoder, SemanticEventSink, TokenDecoderBackend,
-            ToolRuntimeParser,
-        },
+    use crate::runtime::generation::streaming::{
+        CommittedTokenPipeline, RawTokenDecoder, SemanticEventSink, TokenDecoderBackend,
+        ToolRuntimeParser,
     };
+    use eredu_core::generation::{FinishReason, SemanticEvent};
 
     #[test]
     fn structural_channel_identity_controls_reasoning_state() {
