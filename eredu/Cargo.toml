@@ -55,6 +55,11 @@ name = "portable_facade"
 path = "tests/portable_facade.rs"
 
 [[test]]
+name = "selected_backend_api"
+path = "tests/selected_backend_api.rs"
+required-features = ["mlx"]
+
+[[test]]
 name = "automatic_planner_api"
 path = "tests/automatic_planner_api.rs"
 required-features = ["mlx"]

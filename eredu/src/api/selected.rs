@@ -32,6 +32,8 @@ pub use eredu_backend_mlx::MlxBackendFactory as LocalBackendFactory;
 pub use eredu_backend_mlx::MlxError as LocalBackendError;
 /// Options for selected-local-backend model inspection.
 pub use eredu_backend_mlx::MlxInspectionOptions as LocalInspectionOptions;
+/// Backend selected for local realtime model loading and execution.
+pub use eredu_backend_mlx::MlxRealtimeBackend as LocalRealtimeBackend;
 /// Load policy accepted by the selected local backend.
 pub use eredu_backend_mlx::ModelLoadOptions as LocalLoadOptions;
 /// Scoped opt-in for selected-backend MTP component timing.

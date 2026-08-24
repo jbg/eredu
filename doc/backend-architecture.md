@@ -39,6 +39,12 @@ composition internals live in `eredu-backend-mlx`. The backend crate does not
 alias neutral crates into its namespace; direct backend consumers import
 neutral contracts from their owning crates.
 
+The selected adapter exposes distinct causal and realtime backend types because
+the neutral execution contracts have different model, input, output, session,
+and completion associated types. Both are available through `eredu::api`; an
+application does not depend directly on the concrete backend crate merely to
+select realtime loading and execution.
+
 Portable checkpoint quantization requests and storage diagnostics used by
 applications are re-exported by the facade; applications do not depend on
 `eredu-checkpoint` to name those contracts.
