@@ -2,11 +2,8 @@
 
 use eredu_checkpoint::WeightQuantization;
 
-use std::path::Path;
-
 use eredu_architectures::{GgufArchitecture, ModelKind};
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
-#[cfg(feature = "media")]
 use safemlx::ops::GgufCheckpoint;
 use safemlx::{ops::GgufMetadataValue, Stream};
 
@@ -36,8 +33,8 @@ struct MaterializedGgufModel {
 }
 
 fn materialize_gguf_model(
-    gguf_file: &Path,
     source: &structural::AdmittedGguf,
+    projector: Option<&GgufCheckpoint>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -105,9 +102,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Inkling => {
             #[cfg(feature = "media")]
-            if crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "inkling")?
-                .is_some()
-            {
+            if projector.is_some() {
                 processor = Some(ModelProcessor::load_inkling_gguf(metadata)?);
             }
             if options.quantization.is_some() {
@@ -116,8 +111,8 @@ fn materialize_gguf_model(
                 ));
             }
             let loaded = crate::composition::inkling::load_gguf(
-                gguf_file,
                 checkpoint,
+                projector,
                 metadata,
                 options.weight_residency,
                 stream,
@@ -128,13 +123,10 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Gemma4 => {
             #[cfg(any(feature = "image", feature = "audio"))]
-            if let Some(mmproj_path) =
-                crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "gemma4")?
-            {
-                let mmproj = GgufCheckpoint::open(mmproj_path)?;
+            if let Some(mmproj) = projector {
                 processor = Some(ModelProcessor::load_gemma4_gguf(
                     metadata,
-                    &crate::backend::runtime::checkpoint::load::gguf_metadata(&mmproj),
+                    &crate::backend::runtime::checkpoint::load::gguf_metadata(mmproj),
                 )?);
             }
             if options.quantization.is_some() {
@@ -143,8 +135,8 @@ fn materialize_gguf_model(
                 ));
             }
             let loaded = crate::composition::gemma4::load_gguf(
-                gguf_file,
                 checkpoint,
+                projector,
                 metadata,
                 options.weight_residency,
                 stream,
@@ -163,13 +155,15 @@ fn materialize_gguf_model(
             (Model::Llama(kind, loaded), eos_token_ids)
         }
         GgufArchitecture::MuseGlimmer => {
+            let projector = projector.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Muse-Glimmer preparation omitted its required media projector".into(),
+                )
+            })?;
             #[cfg(feature = "image")]
-            if let Some(mmproj) =
-                crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "muse-glimmer")?
             {
-                let checkpoint = GgufCheckpoint::open(mmproj)?;
                 processor = Some(ModelProcessor::load_muse_glimmer_gguf(
-                    &crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+                    &crate::backend::runtime::checkpoint::load::gguf_metadata(projector),
                 )?);
             }
             if options.quantization.is_some() {
@@ -178,8 +172,8 @@ fn materialize_gguf_model(
                 ));
             }
             let loaded = crate::composition::muse_glimmer::load_gguf(
-                gguf_file,
                 checkpoint,
+                projector,
                 metadata,
                 options.weight_residency,
                 stream,
@@ -220,10 +214,15 @@ fn materialize_gguf_model(
             (Model::Qwen(kind, loaded), eos_token_ids)
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            let projector = projector.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Qwen3-VL preparation omitted its required media projector".into(),
+                )
+            })?;
             let (loaded, eos_token_ids) = crate::composition::qwen::vl::load_gguf(
                 source.architecture(),
-                gguf_file,
                 checkpoint,
+                projector,
                 metadata,
                 options.weight_residency,
                 options.quantization,
@@ -239,8 +238,8 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
             let (loaded, eos_token_ids) = crate::composition::qwen::hybrid::load_gguf(
-                gguf_file,
                 source,
+                projector,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -689,9 +688,10 @@ fn materialize_gguf_artifact(
     weights_stream: &Stream,
 ) -> Result<MaterializedGgufModel, Error> {
     let ModelArtifact::Gguf {
-        path,
+        path: _model_path,
         configuration,
         checkpoint,
+        mut companions,
         ..
     } = artifact
     else {
@@ -700,6 +700,9 @@ fn materialize_gguf_artifact(
         ));
     };
     let checkpoint = safemlx::ops::GgufCheckpoint::from_portable(checkpoint);
+    let projector = companions
+        .remove(&eredu_core::GgufCompanionRole::MediaProjector)
+        .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
     let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
     let source = structural::admit_gguf(architecture, checkpoint, metadata, options)?;
@@ -710,50 +713,43 @@ fn materialize_gguf_artifact(
         .parallel
         .is_some_and(|topology| !topology.is_replicated())
     {
-        let (model, _eos_token_ids) =
-            materialize_gguf_tensor_parallel(&path, &source, options, stream, weights_stream)?;
+        let (model, _eos_token_ids) = materialize_gguf_tensor_parallel(
+            &source,
+            projector.as_ref(),
+            options,
+            stream,
+            weights_stream,
+        )?;
         #[cfg(feature = "media")]
         let processor = match architecture {
-            GgufArchitecture::Inkling
-                if crate::composition::mlx::artifact::find_sibling_mmproj(&path, "inkling")?
-                    .is_some() =>
-            {
+            GgufArchitecture::Inkling if projector.is_some() => {
                 Some(ModelProcessor::load_inkling_gguf(&metadata)?)
             }
             #[cfg(any(feature = "image", feature = "audio"))]
-            GgufArchitecture::Gemma4 => {
-                crate::composition::mlx::artifact::find_sibling_mmproj(&path, "gemma4")?
-                    .map(GgufCheckpoint::open)
-                    .transpose()?
-                    .as_ref()
-                    .map(|checkpoint| {
-                        ModelProcessor::load_gemma4_gguf(
-                            &metadata,
-                            &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
-                        )
-                    })
-                    .transpose()?
-            }
+            GgufArchitecture::Gemma4 => projector
+                .as_ref()
+                .map(|checkpoint| {
+                    ModelProcessor::load_gemma4_gguf(
+                        &metadata,
+                        &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
+                    )
+                })
+                .transpose()?,
             #[cfg(feature = "image")]
-            GgufArchitecture::MuseGlimmer => {
-                crate::composition::mlx::artifact::find_sibling_mmproj(&path, "muse-glimmer")?
-                    .map(GgufCheckpoint::open)
-                    .transpose()?
-                    .as_ref()
-                    .map(|checkpoint| {
-                        ModelProcessor::load_muse_glimmer_gguf(
-                            &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
-                        )
-                    })
-                    .transpose()?
-            }
+            GgufArchitecture::MuseGlimmer => projector
+                .as_ref()
+                .map(|checkpoint| {
+                    ModelProcessor::load_muse_glimmer_gguf(
+                        &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
+                    )
+                })
+                .transpose()?,
             #[cfg(feature = "image")]
-            GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe
-                if crate::composition::mlx::artifact::find_sibling_mmproj(&path, "qwen35")?
-                    .is_some() =>
-            {
+            GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe if projector.is_some() => {
                 ModelProcessor::load_qwen_directory(
-                    path.parent().unwrap_or_else(|| Path::new(".")),
+                    _model_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new(".")),
                 )?
             }
             _ => None,
@@ -764,12 +760,12 @@ fn materialize_gguf_artifact(
             processor,
         });
     }
-    materialize_gguf_model(&path, &source, options, stream, weights_stream)
+    materialize_gguf_model(&source, projector.as_ref(), options, stream, weights_stream)
 }
 
 fn materialize_gguf_tensor_parallel(
-    gguf_path: &Path,
     source: &structural::AdmittedGguf,
+    projector: Option<&GgufCheckpoint>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -828,8 +824,8 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Inkling => {
             let (model, eos) = crate::composition::inkling::load_gguf_tensor_parallel(
-                gguf_path,
                 checkpoint,
+                projector,
                 metadata,
                 residency,
                 build,
@@ -840,8 +836,8 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Gemma4 => {
             let (model, eos) = crate::composition::gemma4::load_gguf_tensor_parallel(
-                gguf_path,
                 checkpoint,
+                projector,
                 metadata,
                 residency,
                 build,
@@ -861,9 +857,14 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::Llama(kind, model), eos))
         }
         GgufArchitecture::MuseGlimmer => {
+            let projector = projector.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Muse-Glimmer preparation omitted its required media projector".into(),
+                )
+            })?;
             let (model, eos) = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
-                gguf_path,
                 checkpoint,
+                projector,
                 metadata,
                 residency,
                 build,

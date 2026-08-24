@@ -230,6 +230,14 @@ impl ModelConfigurationResolver for AssistantConfigurations {
             json: None,
         })
     }
+
+    fn gguf_companion_requirements(
+        &self,
+        _architecture: &str,
+        _checkpoint: &Checkpoint,
+    ) -> Result<Vec<eredu_core::GgufCompanionRequirement>, ArtifactError> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

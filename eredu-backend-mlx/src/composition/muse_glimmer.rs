@@ -51,7 +51,6 @@ use crate::backend::{
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
     },
 };
-use crate::composition::mlx::artifact::find_sibling_mmproj;
 
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
@@ -1625,8 +1624,8 @@ pub fn load_safetensors_tensor_parallel(
 }
 
 pub fn load_gguf_tensor_parallel(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
@@ -1634,8 +1633,8 @@ pub fn load_gguf_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<(MuseGlimmerModel, Vec<u32>), Error> {
     let (store, args) = open_gguf_store(
-        gguf_file,
         checkpoint,
+        projector,
         metadata,
         residency.max_mapped_shards(),
     )?;
@@ -1710,8 +1709,8 @@ pub fn load_safetensors(
 
 /// Loads split text/projector GGUF through the same neutral family object.
 pub fn load_gguf(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
     stream: &Stream,
@@ -1719,8 +1718,8 @@ pub fn load_gguf(
 ) -> Result<MuseGlimmerModel, Error> {
     let expert_options = residency.expert_cache();
     let (store, args) = open_gguf_store(
-        gguf_file,
         checkpoint,
+        projector,
         metadata,
         residency.max_mapped_shards(),
     )?;
@@ -1740,20 +1739,14 @@ pub fn load_gguf(
 }
 
 fn open_gguf_store(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, DecoderConfig), Error> {
-    let projector_path = find_sibling_mmproj(gguf_file, "muse-glimmer")?.ok_or_else(|| {
-        Error::UnsupportedArchitecture(
-            "Muse-Glimmer GGUF requires its validated sibling vision projector".into(),
-        )
-    })?;
-    let projector = GgufCheckpoint::open(projector_path)?;
-    let projector_metadata = gguf_metadata(&projector);
+    let projector_metadata = gguf_metadata(projector);
     let projector_quantization = gguf_quantization_configs(
-        &projector,
+        projector,
         eredu_architectures::muse_glimmer::translate_projector_gguf_name,
     )?;
     let output_head_present = checkpoint.contains_gguf_tensor("output.weight");
@@ -1782,15 +1775,10 @@ fn open_gguf_store(
 
 pub fn prepare_gguf_pipeline_source(
     checkpoint: &GgufCheckpoint,
+    projector: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(DecoderConfig, SharedCheckpointSource), Error> {
-    let path = checkpoint
-        .catalog()
-        .shards()
-        .first()
-        .map(|shard| shard.path())
-        .ok_or_else(|| Error::UnsupportedArchitecture("Muse-Glimmer GGUF has no shards".into()))?;
-    let (store, args) = open_gguf_store(path, checkpoint, metadata, max_cached_readers)?;
+    let (store, args) = open_gguf_store(checkpoint, projector, metadata, max_cached_readers)?;
     Ok((args, store))
 }

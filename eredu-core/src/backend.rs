@@ -1224,6 +1224,14 @@ mod tests {
                 json: None,
             })
         }
+
+        fn gguf_companion_requirements(
+            &self,
+            _architecture: &str,
+            _checkpoint: &eredu_gguf::Checkpoint,
+        ) -> Result<Vec<crate::GgufCompanionRequirement>, ArtifactError> {
+            Ok(Vec::new())
+        }
     }
 
     static LOADING_CONFIGURATION_RESOLVER: LoadingConfigurationResolver =

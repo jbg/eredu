@@ -701,8 +701,8 @@ impl vision::VisionGgufCatalog for HybridVisionGgufCatalog<'_> {
 }
 
 fn prepare_hybrid_gguf_store(
-    model_path: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
@@ -727,16 +727,13 @@ fn prepare_hybrid_gguf_store(
     if parsed.text.variant == hybrid::HybridVariant::Qwen3Next {
         return Ok((parsed, text));
     }
-    let Some(projector_path) =
-        crate::composition::mlx::artifact::find_sibling_mmproj(model_path, "qwen35")?
-    else {
+    let Some(projector) = projector else {
         return Ok((parsed, text));
     };
-    let projector = GgufCheckpoint::open(projector_path)?;
     let projector_metadata =
-        crate::backend::runtime::checkpoint::load::gguf_metadata(&projector);
+        crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
-        vision::config_from_gguf_catalog(&HybridVisionGgufCatalog(&projector), &projector_metadata)
+        vision::config_from_gguf_catalog(&HybridVisionGgufCatalog(projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate = |name: &str| hybrid::translate_vision_gguf_weight_name(name, &deepstack);
@@ -751,7 +748,7 @@ fn prepare_hybrid_gguf_store(
     let vision_plan = vision::gguf_plan(&vision, parsed.text.hidden_size)
         .map_err(Error::UnsupportedArchitecture)?;
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        projector,
+        projector.clone(),
         &vision_plan,
         translate,
         max_mapped_shards,
@@ -765,19 +762,19 @@ fn prepare_hybrid_gguf_store(
 }
 
 pub fn prepare_gguf_pipeline(
-    model_path: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
-    prepare_hybrid_gguf_store(model_path, checkpoint, metadata, max_mapped_shards)
+    prepare_hybrid_gguf_store(checkpoint, projector, metadata, max_mapped_shards)
 }
 
 /// Loads a llama.cpp Qwen3-Next/Qwen3.5 text artifact through the same
 /// neutral resident/bounded execution graph as SafeTensors.
 pub(crate) fn load_gguf(
-    model_path: &Path,
     source: &crate::composition::mlx::structural::AdmittedGguf,
+    projector: Option<&GgufCheckpoint>,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -799,8 +796,8 @@ pub(crate) fn load_gguf(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let (mut parsed, store) = prepare_hybrid_gguf_store(
-        model_path,
         checkpoint,
+        projector,
         metadata,
         options.max_mapped_shards(),
     )?;

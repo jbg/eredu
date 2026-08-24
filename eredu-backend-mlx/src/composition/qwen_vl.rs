@@ -999,8 +999,8 @@ fn quantize_store(
 
 pub fn prepare_gguf_pipeline(
     architecture: GgufArchitecture,
-    model_path: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(vl::ModelArgs, Arc<dyn CheckpointSource>), Error> {
@@ -1023,20 +1023,10 @@ pub fn prepare_gguf_pipeline(
     text.quantized_weights = Some(text_formats.keys().cloned().collect());
     text.quantized_weight_configs = Some(text_formats);
     text.quantization = None;
-    let projector_path = crate::composition::mlx::artifact::find_sibling_mmproj(
-        model_path, "qwen3vl",
-    )?
-    .ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
-            "Qwen3-VL GGUF requires a sibling mmproj relative to {}",
-            model_path.display()
-        ))
-    })?;
-    let projector = GgufCheckpoint::open(projector_path)?;
     let projector_metadata =
-        crate::backend::runtime::checkpoint::load::gguf_metadata(&projector);
+        crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
-        vision::config_from_gguf_catalog(&VisionGgufCatalog(&projector), &projector_metadata)
+        vision::config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
@@ -1060,7 +1050,7 @@ pub fn prepare_gguf_pipeline(
         max_mapped_shards,
     )?);
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        projector,
+        projector.clone(),
         &vision_plan,
         translate_vision,
         max_mapped_shards,
@@ -1078,8 +1068,8 @@ pub fn prepare_gguf_pipeline(
 /// composite neutral checkpoint source.
 pub fn load_gguf(
     architecture: GgufArchitecture,
-    model_path: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
@@ -1106,20 +1096,10 @@ pub fn load_gguf(
     text.quantized_weight_configs = Some(text_formats);
     text.quantization = None;
 
-    let projector_path = crate::composition::mlx::artifact::find_sibling_mmproj(
-        model_path, "qwen3vl",
-    )?
-    .ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
-            "Qwen3-VL GGUF requires a sibling mmproj relative to {}",
-            model_path.display()
-        ))
-    })?;
-    let projector = GgufCheckpoint::open(projector_path)?;
     let projector_metadata =
-        crate::backend::runtime::checkpoint::load::gguf_metadata(&projector);
+        crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
-        vision::config_from_gguf_catalog(&VisionGgufCatalog(&projector), &projector_metadata)
+        vision::config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
@@ -1145,7 +1125,7 @@ pub fn load_gguf(
         options.max_mapped_shards(),
     )?);
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        projector,
+        projector.clone(),
         &vision_plan,
         translate_vision,
         options.max_mapped_shards(),

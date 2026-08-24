@@ -14078,9 +14078,10 @@ pub fn load_pipeline_model_with_options(
 
     let artifact = match artifact {
         ModelArtifact::Gguf {
-            path: model_dir,
+            path: _,
             configuration,
             checkpoint,
+            mut companions,
             ..
         } => {
             let mut structural_options = options;
@@ -14095,6 +14096,9 @@ pub fn load_pipeline_model_with_options(
             structural_options.weight_residency = WeightResidency::fully_resident();
             let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
             let checkpoint = GgufCheckpoint::from_portable(checkpoint);
+            let projector = companions
+                .remove(&eredu_core::GgufCompanionRole::MediaProjector)
+                .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
             let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             let admitted = crate::composition::mlx::structural::admit_gguf(
                 architecture,
@@ -14166,6 +14170,12 @@ pub fn load_pipeline_model_with_options(
                     let (args, store) =
                         crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
                             &checkpoint,
+                            projector.as_ref().ok_or_else(|| {
+                                Error::UnsupportedArchitecture(
+                                    "Muse-Glimmer preparation omitted its required media projector"
+                                        .into(),
+                                )
+                            })?,
                             &metadata,
                             max_mapped_shards,
                         )?;
@@ -14207,8 +14217,8 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::Gemma4 => {
                     let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
-                        &model_dir,
                         &checkpoint,
+                        projector.as_ref(),
                         &metadata,
                         max_mapped_shards,
                     )?;
@@ -14254,8 +14264,12 @@ pub fn load_pipeline_model_with_options(
                 architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
                     let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
                         architecture,
-                        &model_dir,
                         &checkpoint,
+                        projector.as_ref().ok_or_else(|| {
+                            Error::UnsupportedArchitecture(
+                                "Qwen3-VL preparation omitted its required media projector".into(),
+                            )
+                        })?,
                         &metadata,
                         max_mapped_shards,
                     )?;
@@ -14341,8 +14355,8 @@ pub fn load_pipeline_model_with_options(
                 | GgufArchitecture::Qwen35Moe
                 | GgufArchitecture::Qwen3Next => {
                     let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
-                        &model_dir,
                         &checkpoint,
+                        projector.as_ref(),
                         &metadata,
                         max_mapped_shards,
                     )?;
@@ -14393,8 +14407,8 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::Inkling => {
                     let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
-                        &model_dir,
                         &checkpoint,
+                        projector.as_ref(),
                         &metadata,
                         max_mapped_shards,
                     )?;

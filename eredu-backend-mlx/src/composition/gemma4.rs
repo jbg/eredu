@@ -64,7 +64,6 @@ use crate::backend::{
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
     },
 };
-use crate::composition::mlx::artifact::find_sibling_mmproj;
 
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
@@ -1872,8 +1871,8 @@ pub fn load_safetensors_tensor_parallel(
 }
 
 pub fn load_gguf_tensor_parallel(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
@@ -1881,8 +1880,8 @@ pub fn load_gguf_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<(Gemma4Model, Vec<u32>), Error> {
     let (store, args) = open_pipeline_gguf_store(
-        gguf_file,
         checkpoint,
+        projector,
         metadata,
         residency.max_mapped_shards(),
     )?;
@@ -1957,8 +1956,8 @@ pub fn load_safetensors(
 /// Loads a Gemma 4 decoder and optional sibling media projector through the
 /// same neutral family object.
 pub fn load_gguf(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
     stream: &Stream,
@@ -1966,8 +1965,8 @@ pub fn load_gguf(
 ) -> Result<Gemma4Model, Error> {
     let expert_options = residency.expert_cache();
     let (store, args) = open_pipeline_gguf_store(
-        gguf_file,
         checkpoint,
+        projector,
         metadata,
         residency.max_mapped_shards(),
     )?;
@@ -1987,17 +1986,13 @@ pub fn load_gguf(
 }
 
 pub fn open_pipeline_gguf_store(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, FamilyConfig), Error> {
-    let projector = find_sibling_mmproj(gguf_file, "gemma4")?
-        .map(GgufCheckpoint::open)
-        .transpose()?;
-    let projector_metadata = projector
-        .as_ref()
-        .map(crate::backend::runtime::checkpoint::load::gguf_metadata);
+    let projector_metadata =
+        projector.map(crate::backend::runtime::checkpoint::load::gguf_metadata);
     if let Some(metadata) = projector_metadata.as_ref() {
         eredu_architectures::gemma4::validate_projector_identity(metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -2020,7 +2015,7 @@ pub fn open_pipeline_gguf_store(
         projector_metadata.as_ref(),
     )
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    if let Some(projector) = projector.as_ref() {
+    if let Some(projector) = projector {
         let quantized = gguf_quantization_configs(
             projector,
             eredu_architectures::gemma4::translate_mmproj_weight_name,

@@ -67,6 +67,73 @@ pub trait ModelConfigurationResolver {
         architecture: &str,
         checkpoint: &GgufCheckpoint,
     ) -> Result<ModelConfiguration, ArtifactError>;
+
+    /// Declares the sibling artifacts required by one admitted GGUF architecture.
+    fn gguf_companion_requirements(
+        &self,
+        architecture: &str,
+        checkpoint: &GgufCheckpoint,
+    ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError>;
+}
+
+/// Semantic identity of a separately stored GGUF companion.
+#[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GgufCompanionRole {
+    /// Media encoder and projection weights consumed with the decoder.
+    MediaProjector,
+    /// Architecture-declared role not covered by a common semantic variant.
+    Named(String),
+}
+
+/// Encoding policy used to select among matching GGUF companions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GgufCompanionEncoding {
+    /// Require a checkpoint whose tensor catalog contains no quantized weights.
+    DenseRequired,
+    /// Prefer a dense checkpoint, but admit one unambiguous quantized checkpoint.
+    DensePreferred,
+}
+
+/// Architecture-declared filename and encoding policy for one GGUF companion.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct GgufCompanionRequirement {
+    role: GgufCompanionRole,
+    required: bool,
+    filename_prefix: String,
+    parent_search_depth: usize,
+    encoding: GgufCompanionEncoding,
+}
+
+impl GgufCompanionRequirement {
+    /// Creates one validated companion requirement.
+    pub fn new(
+        role: GgufCompanionRole,
+        required: bool,
+        filename_prefix: impl Into<String>,
+        parent_search_depth: usize,
+        encoding: GgufCompanionEncoding,
+    ) -> Result<Self, ArtifactError> {
+        let filename_prefix = filename_prefix.into();
+        if filename_prefix.trim().is_empty()
+            || matches!(&role, GgufCompanionRole::Named(name) if name.trim().is_empty())
+        {
+            return Err(ArtifactError::InvalidArtifact(
+                "GGUF companion roles and filename prefixes must be non-empty".into(),
+            ));
+        }
+        Ok(Self {
+            role,
+            required,
+            filename_prefix,
+            parent_search_depth,
+            encoding,
+        })
+    }
+
+    /// Semantic role of the resolved artifact.
+    pub fn role(&self) -> &GgufCompanionRole {
+        &self.role
+    }
 }
 
 /// Parses an optional GGUF integer metadata value as lossless `u32` values.
@@ -101,12 +168,44 @@ pub struct ArtifactInspection {
 #[derive(Debug, Clone)]
 pub struct ValidatedGguf {
     checkpoint: GgufCheckpoint,
+    companions: BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>,
+}
+
+/// One exact sibling GGUF admitted during portable inspection.
+#[derive(Debug, Clone)]
+pub struct ValidatedGgufCompanion {
+    path: PathBuf,
+    checkpoint: GgufCheckpoint,
+}
+
+impl ValidatedGgufCompanion {
+    /// Resolved companion path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Header-only checkpoint admitted by portable inspection.
+    pub fn checkpoint(&self) -> &GgufCheckpoint {
+        &self.checkpoint
+    }
 }
 
 impl ValidatedGguf {
     /// Header-only checkpoint admitted by portable inspection.
     pub fn checkpoint(&self) -> &GgufCheckpoint {
         &self.checkpoint
+    }
+
+    /// Returns the resolved companion for one semantic role.
+    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&ValidatedGgufCompanion> {
+        self.companions.get(role)
+    }
+
+    /// Returns every resolved companion in stable role order.
+    pub fn companions(
+        &self,
+    ) -> impl Iterator<Item = (&GgufCompanionRole, &ValidatedGgufCompanion)> {
+        self.companions.iter()
     }
 }
 
@@ -219,6 +318,7 @@ impl ModelPreparationPlan {
                 configuration: self.inspection.configuration,
                 tensors: self.inspection.tensors,
                 checkpoint: validated.checkpoint,
+                companions: validated.companions,
             },
             None => ModelArtifact::SafeTensors {
                 path: self.inspection.path,
@@ -252,6 +352,8 @@ pub enum ModelArtifact {
         tensors: TensorCatalog,
         /// Pure-Rust checkpoint handle used by backend materialization.
         checkpoint: GgufCheckpoint,
+        /// Exact sibling checkpoints selected during portable inspection.
+        companions: BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>,
     },
 }
 
@@ -314,6 +416,8 @@ fn inspect_gguf(
         .and_then(MetadataValue::as_str)
         .ok_or(ArtifactError::MissingGgufArchitecture)?;
     let configuration = resolver.resolve_gguf(architecture_name, &checkpoint)?;
+    let requirements = resolver.gguf_companion_requirements(architecture_name, &checkpoint)?;
+    let companions = resolve_gguf_companions(path, &requirements)?;
     validate_gguf_container(&checkpoint)?;
     let tensors = checkpoint
         .tensors()
@@ -345,8 +449,157 @@ fn inspect_gguf(
         format: ArtifactFormat::Gguf,
         configuration,
         tensors,
-        validated_gguf: Some(ValidatedGguf { checkpoint }),
+        validated_gguf: Some(ValidatedGguf {
+            checkpoint,
+            companions,
+        }),
     })
+}
+
+/// Resolves architecture-declared GGUF companions without materializing payloads.
+pub fn resolve_gguf_companions(
+    primary: &Path,
+    requirements: &[GgufCompanionRequirement],
+) -> Result<BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>, ArtifactError> {
+    let mut resolved = BTreeMap::new();
+    let mut declared_roles = BTreeSet::new();
+    for requirement in requirements {
+        if !declared_roles.insert(requirement.role.clone()) {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "GGUF companion role {:?} was declared more than once",
+                requirement.role
+            )));
+        }
+        let mut directories = Vec::new();
+        let mut directory = primary.parent().unwrap_or_else(|| Path::new("."));
+        directories.push(directory.to_path_buf());
+        for _ in 0..requirement.parent_search_depth {
+            let Some(parent) = directory.parent() else {
+                break;
+            };
+            if parent == directory {
+                break;
+            }
+            directories.push(parent.to_path_buf());
+            directory = parent;
+        }
+        let mut candidates = Vec::new();
+        for directory in &directories {
+            let candidate_start = candidates.len();
+            for entry in std::fs::read_dir(directory)? {
+                let path = entry?.path();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if path != primary
+                    && path.is_file()
+                    && name
+                        .get(..requirement.filename_prefix.len())
+                        .is_some_and(|prefix| {
+                            prefix.eq_ignore_ascii_case(&requirement.filename_prefix)
+                        })
+                    && is_gguf(&path)
+                {
+                    let checkpoint = GgufCheckpoint::open(&path)?;
+                    if checkpoint.physical_tensor_count() == 0 {
+                        return Err(ArtifactError::InvalidArtifact(format!(
+                            "GGUF companion {} contains no tensors",
+                            path.display()
+                        )));
+                    }
+                    let dense = checkpoint.tensors().all(|tensor| {
+                        matches!(
+                            tensor.descriptor().ggml_type,
+                            eredu_gguf::GgmlType::F32
+                                | eredu_gguf::GgmlType::F16
+                                | eredu_gguf::GgmlType::Bf16
+                        )
+                    });
+                    candidates.push((path, checkpoint, dense));
+                }
+            }
+            if candidates.len() != candidate_start {
+                break;
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by(|left, right| left.0 == right.0);
+        let dense = candidates
+            .iter()
+            .filter(|candidate| candidate.2)
+            .collect::<Vec<_>>();
+        let selected = match requirement.encoding {
+            GgufCompanionEncoding::DenseRequired => match dense.as_slice() {
+                [candidate] => Some(*candidate),
+                [] if candidates.is_empty() => None,
+                [] => {
+                    return Err(ArtifactError::InvalidArtifact(format!(
+                        "GGUF companion {:?} requires dense F32, F16, or BF16 tensors, but all {} matching candidates are quantized",
+                        requirement.role,
+                        candidates.len()
+                    )))
+                }
+                _ => return Err(ambiguous_companion(requirement, &directories, dense.len())),
+            },
+            GgufCompanionEncoding::DensePreferred => match dense.as_slice() {
+                [candidate] => Some(*candidate),
+                [] => match candidates.as_slice() {
+                    [candidate] => Some(candidate),
+                    [] => None,
+                    _ => {
+                        return Err(ambiguous_companion(
+                            requirement,
+                            &directories,
+                            candidates.len(),
+                        ))
+                    }
+                },
+                _ => return Err(ambiguous_companion(requirement, &directories, dense.len())),
+            },
+        };
+        match selected {
+            Some((path, checkpoint, _)) => {
+                resolved.insert(
+                    requirement.role.clone(),
+                    ValidatedGgufCompanion {
+                        path: path.clone(),
+                        checkpoint: checkpoint.clone(),
+                    },
+                );
+            }
+            None if requirement.required => {
+                return Err(ArtifactError::InvalidArtifact(format!(
+                    "required GGUF companion {:?} matching {:?} was not found in {}",
+                    requirement.role,
+                    requirement.filename_prefix,
+                    display_directories(&directories)
+                )))
+            }
+            None => {}
+        }
+    }
+    Ok(resolved)
+}
+
+fn ambiguous_companion(
+    requirement: &GgufCompanionRequirement,
+    directories: &[PathBuf],
+    candidates: usize,
+) -> ArtifactError {
+    ArtifactError::InvalidArtifact(format!(
+        "GGUF companion {:?} is ambiguous: found {candidates} preferred candidates in {}",
+        requirement.role,
+        display_directories(directories)
+    ))
+}
+
+fn display_directories(directories: &[PathBuf]) -> String {
+    directories
+        .iter()
+        .map(|directory| directory.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn validate_gguf_container(checkpoint: &GgufCheckpoint) -> Result<(), ArtifactError> {
@@ -620,6 +873,23 @@ mod tests {
                 json: None,
             })
         }
+
+        fn gguf_companion_requirements(
+            &self,
+            architecture: &str,
+            _checkpoint: &GgufCheckpoint,
+        ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
+            if architecture == "future" {
+                return Ok(vec![GgufCompanionRequirement::new(
+                    GgufCompanionRole::MediaProjector,
+                    false,
+                    "mmproj",
+                    0,
+                    GgufCompanionEncoding::DensePreferred,
+                )?]);
+            }
+            Ok(Vec::new())
+        }
     }
 
     fn write_safetensors_fixture(root: &Path, model_type: &str) {
@@ -635,6 +905,85 @@ mod tests {
             .unwrap();
         file.write_all(header).unwrap();
         file.write_all(&[0_u8; 16]).unwrap();
+    }
+
+    fn write_gguf_fixture(path: &Path, ggml_type: GgmlType) {
+        let metadata = BTreeMap::from([(
+            "general.architecture".into(),
+            MetadataValue::String("clip".into()),
+        )]);
+        let (dimensions, data) = match ggml_type {
+            GgmlType::F32 => (vec![1], 1.0_f32.to_le_bytes().to_vec()),
+            GgmlType::Q8_0 => (vec![32], vec![0_u8; 34]),
+            other => panic!("unsupported fixture encoding {other:?}"),
+        };
+        Writer::default()
+            .write(
+                File::create(path).unwrap(),
+                &metadata,
+                &[TensorInput {
+                    name: "projector.weight",
+                    dimensions: &dimensions,
+                    ggml_type,
+                    data: &data,
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn companion_planning_selects_by_catalog_encoding_not_filename() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("model.gguf");
+        write_gguf_fixture(&primary, GgmlType::F32);
+        let quantized_name = root.path().join("mmproj-f16.gguf");
+        let dense_name = root.path().join("mmproj-q4_k.gguf");
+        write_gguf_fixture(&quantized_name, GgmlType::Q8_0);
+        write_gguf_fixture(&dense_name, GgmlType::F32);
+        let requirement = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            true,
+            "mmproj",
+            1,
+            GgufCompanionEncoding::DensePreferred,
+        )
+        .unwrap();
+
+        let companions = resolve_gguf_companions(&primary, &[requirement]).unwrap();
+
+        assert_eq!(
+            companions
+                .get(&GgufCompanionRole::MediaProjector)
+                .unwrap()
+                .path(),
+            dense_name
+        );
+    }
+
+    #[test]
+    fn dense_only_and_required_companion_policies_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("model.gguf");
+        write_gguf_fixture(&primary, GgmlType::F32);
+        write_gguf_fixture(&root.path().join("mmproj.gguf"), GgmlType::Q8_0);
+        let optional = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            false,
+            "mmproj",
+            0,
+            GgufCompanionEncoding::DenseRequired,
+        )
+        .unwrap();
+        assert!(resolve_gguf_companions(&primary, &[optional]).is_err());
+        let required = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            true,
+            "mmproj",
+            0,
+            GgufCompanionEncoding::DenseRequired,
+        )
+        .unwrap();
+        assert!(resolve_gguf_companions(&primary, &[required]).is_err());
     }
 
     #[test]
@@ -847,5 +1196,55 @@ mod tests {
 
         assert_eq!(inspection.configuration().family, "future_family");
         assert!(inspection.tensors().get("state.in_proj").is_some());
+    }
+
+    #[test]
+    fn preparation_plan_carries_the_exact_inspected_companion() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("model.gguf");
+        let scalar = 1.0_f32.to_le_bytes();
+        Writer::default()
+            .write(
+                File::create(&primary).unwrap(),
+                &BTreeMap::from([(
+                    "general.architecture".into(),
+                    MetadataValue::String("future".into()),
+                )]),
+                &[TensorInput {
+                    name: "state.in_proj",
+                    dimensions: &[1],
+                    ggml_type: GgmlType::F32,
+                    data: &scalar,
+                }],
+            )
+            .unwrap();
+        let projector = root.path().join("mmproj.gguf");
+        write_gguf_fixture(&projector, GgmlType::F32);
+
+        let inspection = inspect_artifact(&primary, &FixtureResolver).unwrap();
+        assert_eq!(
+            inspection
+                .validated_gguf()
+                .unwrap()
+                .companion(&GgufCompanionRole::MediaProjector)
+                .unwrap()
+                .path(),
+            projector
+        );
+        let ModelArtifact::Gguf { companions, .. } =
+            plan_model_preparation(inspection, PreparationPolicy::default())
+                .unwrap()
+                .into_parts()
+                .0
+        else {
+            panic!("expected GGUF preparation artifact");
+        };
+        assert_eq!(
+            companions
+                .get(&GgufCompanionRole::MediaProjector)
+                .unwrap()
+                .path(),
+            projector
+        );
     }
 }

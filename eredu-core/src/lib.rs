@@ -47,10 +47,12 @@ pub mod speculative;
 pub mod topology;
 
 pub use artifact::{
-    gguf_u32_metadata_values, inspect_artifact, plan_model_preparation,
-    validate_preparation_policy, ArtifactFormat, ArtifactInspection, LoadingProtocol,
-    MaterializationRoute, ModelArtifact, ModelConfiguration, ModelConfigurationResolver,
-    ModelPreparationPlan, PreparationPolicy, QuantizationRequest, ResidencyRequest, ValidatedGguf,
+    gguf_u32_metadata_values, inspect_artifact, plan_model_preparation, resolve_gguf_companions,
+    validate_preparation_policy, ArtifactFormat, ArtifactInspection, GgufCompanionEncoding,
+    GgufCompanionRequirement, GgufCompanionRole, LoadingProtocol, MaterializationRoute,
+    ModelArtifact, ModelConfiguration, ModelConfigurationResolver, ModelPreparationPlan,
+    PreparationPolicy, QuantizationRequest, ResidencyRequest, ValidatedGguf,
+    ValidatedGgufCompanion,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{

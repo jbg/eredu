@@ -1,7 +1,8 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_core::{
-    artifact::ArtifactError, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
+    artifact::ArtifactError, GgufCompanionEncoding, GgufCompanionRequirement, GgufCompanionRole,
+    LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,43 @@ impl ModelConfigurationResolver for ModelConfigurations {
     ) -> Result<ModelConfiguration, ArtifactError> {
         resolve_gguf_configuration(architecture, checkpoint)
     }
+
+    fn gguf_companion_requirements(
+        &self,
+        architecture: &str,
+        _checkpoint: &GgufCheckpoint,
+    ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
+        gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
+    }
+}
+
+/// Declares the portable sibling-artifact requirements for one GGUF architecture.
+pub fn gguf_companion_requirements(
+    architecture: GgufArchitecture,
+) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
+    let policy = match architecture {
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            Some((true, GgufCompanionEncoding::DensePreferred))
+        }
+        GgufArchitecture::MuseGlimmer => Some((true, GgufCompanionEncoding::DensePreferred)),
+        GgufArchitecture::Gemma4 => Some((false, GgufCompanionEncoding::DenseRequired)),
+        GgufArchitecture::Inkling | GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
+            Some((false, GgufCompanionEncoding::DensePreferred))
+        }
+        _ => None,
+    };
+    policy
+        .map(|(required, encoding)| {
+            GgufCompanionRequirement::new(
+                GgufCompanionRole::MediaProjector,
+                required,
+                "mmproj",
+                1,
+                encoding,
+            )
+            .map(|requirement| vec![requirement])
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 /// Architecture family identity owned by the architecture registry.
@@ -549,6 +587,37 @@ mod tests {
                 Err(ArtifactError::UnsupportedGgufArchitecture(name)) if name == nearby
             ));
         }
+    }
+
+    #[test]
+    fn gguf_families_declare_companion_presence_and_encoding_policy() {
+        let required_quantized = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            true,
+            "mmproj",
+            1,
+            GgufCompanionEncoding::DensePreferred,
+        )
+        .unwrap();
+        assert_eq!(
+            gguf_companion_requirements(GgufArchitecture::Qwen3Vl).unwrap(),
+            vec![required_quantized]
+        );
+        let optional_dense = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            false,
+            "mmproj",
+            1,
+            GgufCompanionEncoding::DenseRequired,
+        )
+        .unwrap();
+        assert_eq!(
+            gguf_companion_requirements(GgufArchitecture::Gemma4).unwrap(),
+            vec![optional_dense]
+        );
+        assert!(gguf_companion_requirements(GgufArchitecture::Llama)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

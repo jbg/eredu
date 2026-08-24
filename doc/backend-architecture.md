@@ -94,9 +94,10 @@ assistant resolvers likewise own both SafeTensors `model_type` and GGUF
 `general.architecture` identities and aliases. `eredu-core` accepts that
 registry through `ModelConfigurationResolver` while inspecting both
 SafeTensors and GGUF artifacts. The resolver returns an open canonical family
-string and the neutral `LoadingProtocol` required to prepare the artifact. Core
-routes that protocol; it neither recognizes family strings nor exposes an
-exhaustive family type.
+string, the neutral `LoadingProtocol`, and any GGUF companion requirements
+needed to prepare the artifact. Core routes that protocol and resolves
+companion paths; it neither recognizes family strings nor exposes an exhaustive
+family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
 in `eredu-architectures`. Once that resolver admits a GGUF artifact,
@@ -299,11 +300,15 @@ select a second catalog after admission; media processor construction also
 uses the retained model configuration while reading only its processor
 sidecars. The catalog-bound store revalidates tensor metadata when leases are
 acquired so later header changes cannot silently replace the admitted catalog.
-For composite GGUF artifacts, the architecture additionally owns the plan that
-maps a validated sibling media projector to the resulting input modalities.
-Inspection applies that plan after projector discovery and structural
-validation, so expected modalities and multimodal readiness describe the same
-validated artifact composition.
+For composite GGUF artifacts, the architecture additionally owns required
+versus optional companion roles, filename matching scope, search depth, and
+dense-only versus dense-preferred admission. Portable inspection resolves
+those declarations once, classifies dense and quantized candidates from their
+GGUF tensor catalogs rather than filename substrings, and retains the exact
+path and checkpoint handle in `ValidatedGguf`. The architecture also owns the
+plan that maps a structurally validated sibling media projector to resulting
+input modalities. Inspection applies that plan to the same resolved artifact,
+so expected modalities and multimodal readiness describe one composition.
 
 Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released
@@ -372,9 +377,9 @@ per-layer and per-token paths.
 
 Artifact loading has four stages:
 
-1. Portable inspection validates checkpoint metadata and tensor catalogs and
-   asks the architecture registry for a canonical family and neutral loading
-   protocol.
+1. Portable inspection validates checkpoint metadata and tensor catalogs,
+   asks the architecture registry for a canonical family, neutral loading
+   protocol, and companion requirements, then resolves any sibling artifacts.
 2. The selected backend validates the requested policy against normalized
    architecture facts and its own capabilities.
 3. Portable planning combines the artifact description with topology,
@@ -385,17 +390,20 @@ Artifact loading has four stages:
 For GGUF artifacts, `ArtifactInspection::validated_gguf` is the authoritative
 handoff from stage 1. Core validates format-generic tensor-count, required
 metadata, and embedding floors using the submitted metadata prefix. The
-selected architecture registry resolves the family spelling and applies
-family-specific structural admission. Backends may wrap the resulting portable
-checkpoint handle and add architecture or device compatibility checks, but do
-not repeat either portable admission layer.
+selected architecture registry resolves the family spelling, applies
+family-specific structural admission, and declares composite requirements.
+The handoff contains the primary plus the exact resolved companion checkpoint
+handles. Backends may wrap those portable handles and add architecture or
+device compatibility checks, but do not rescan directories, select companions,
+or repeat either portable admission layer.
 
 `ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
 including distributed stage loaders, consume its inspected configuration,
-checkpoint handle, and selected route directly. They must not reopen an
-artifact to rediscover configuration or checkpoint metadata after planning;
-payload stores may still map weight members during materialization, but those
-reads do not replace the plan's configuration, checkpoint metadata, or route.
+primary and companion checkpoint handles, and selected route directly. They
+must not reopen an artifact to rediscover configuration, checkpoint metadata,
+or sibling filename policy after planning; payload stores may still map weight
+members during materialization, but those reads do not replace the plan's
+configuration, checkpoint metadata, companion selection, or route.
 
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.

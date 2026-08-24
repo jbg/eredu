@@ -56,7 +56,6 @@ use crate::backend::{
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
     },
 };
-use crate::composition::mlx::artifact::find_sibling_mmproj;
 
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
@@ -1581,12 +1580,12 @@ pub fn resolve_pipeline_store(
 }
 
 pub fn prepare_gguf_pipeline_source(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
-    open_gguf_store(gguf_file, checkpoint, metadata, max_cached_readers)
+    open_gguf_store(checkpoint, projector, metadata, max_cached_readers)
 }
 
 fn quantize_store(
@@ -1971,8 +1970,8 @@ pub fn load_safetensors_tensor_parallel(
 
 /// Loads an Inkling GGUF checkpoint through the same neutral TP binder.
 pub fn load_gguf_tensor_parallel(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     layer_policy: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
@@ -1980,8 +1979,8 @@ pub fn load_gguf_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<(InklingModel, Vec<u32>), Error> {
     let (store, args) = open_gguf_store(
-        gguf_file,
         checkpoint,
+        projector,
         metadata,
         layer_policy.max_mapped_shards(),
     )?;
@@ -2054,8 +2053,8 @@ pub fn load_safetensors(
 
 /// Loads the text GGUF and optional sibling media artifact into one neutral model.
 pub fn load_gguf(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
     stream: &Stream,
@@ -2063,8 +2062,8 @@ pub fn load_gguf(
 ) -> Result<InklingModel, Error> {
     let expert_options = residency.expert_cache();
     let (store, args) = open_gguf_store(
-        gguf_file,
         checkpoint,
+        projector,
         metadata,
         residency.max_mapped_shards(),
     )?;
@@ -2085,8 +2084,8 @@ pub fn load_gguf(
 }
 
 fn open_gguf_store(
-    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
+    projector: Option<&GgufCheckpoint>,
     metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
@@ -2099,11 +2098,8 @@ fn open_gguf_store(
     eredu_architectures::inkling::normalize_gguf_weight_formats(&args, &mut text_formats)
         .map_err(Error::Quantization)?;
     args.text_config.quantized_weight_configs = (!text_formats.is_empty()).then_some(text_formats);
-    let projector = find_sibling_mmproj(gguf_file, "inkling")?
-        .map(GgufCheckpoint::open)
-        .transpose()?;
-    let projector_metadata = projector.as_ref().map(gguf_metadata);
-    if let (Some(projector), Some(projector_metadata)) = (&projector, &projector_metadata) {
+    let projector_metadata = projector.map(gguf_metadata);
+    if let (Some(projector), Some(projector_metadata)) = (projector, &projector_metadata) {
         let formats = gguf_quantization_configs(
             projector,
             eredu_architectures::inkling::translate_mmproj_weight_name,
