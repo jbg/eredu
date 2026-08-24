@@ -47,8 +47,8 @@ name = "core_types"
 path = "tests/core_types.rs"
 
 [[test]]
-name = "dependency_boundary"
-path = "tests/dependency_boundary.rs"
+name = "published_surface"
+path = "tests/published_surface.rs"
 
 [[test]]
 name = "portable_facade"

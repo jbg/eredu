@@ -788,23 +788,19 @@ associated implementation types.
 
 ## Guarantees and verification
 
-The repository mechanically verifies stable dependency and behavior boundaries:
+The repository mechanically verifies portable behavior and feature-gated
+builds:
 
-- `eredu-core`, `eredu-nn`, `eredu-runtime`, `eredu-architectures`, and
-  `eredu-codec` dependency-graph tests reject upward or accelerator-runtime
-  dependencies;
-- `eredu-backend-mlx` dependency-graph tests reject a dependency on `eredu`;
 - the feature-disabled `portable_facade` and `backend_conformance` suites compile
-  and exercise the public contracts through mock backends, with the facade's
-  complete normal, build, and development dependency graph remaining free of
-  MLX; native facade integration tests compile the published facade target
-  normally and backend composition coverage remains in crate-private backend
-  unit tests; and
+  and exercise the public contracts through mock backends;
+- native facade integration tests compile the published facade target normally,
+  while backend composition coverage remains in crate-private backend unit
+  tests; and
 - architecture, runtime, and backend conformance tests cover the relevant
   production contracts.
 
-The following ownership constraints are review rules rather than claims made by
-source-layout tests:
+Dependency direction and semantic ownership are review rules recorded in
+`AGENTS.md` and expressed by the crate manifests and public type boundaries:
 
 - `eredu-architectures` contains model-family policy but no concrete backend
   imports;
@@ -821,7 +817,8 @@ source-layout tests:
 
 These rules are recorded in the repository-root
 [architecture rules](../AGENTS.md). We intentionally do not enforce them by
-scanning Rust source for substrings or by asserting a particular file layout:
-those checks couple architecture to names and migration artifacts instead of
-semantic ownership. Repeated violations should be made unrepresentable with a
-crate boundary, visibility change, or manifest-level dependency check.
+inspecting the Cargo dependency graph, scanning Rust source for substrings, or
+asserting a particular file layout: those checks couple architecture to
+repository shape and migration artifacts instead of semantic ownership.
+Repeated violations should be made unrepresentable with a crate boundary or
+visibility change.

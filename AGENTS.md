@@ -73,20 +73,23 @@ Prefer semantic enforcement that survives refactors:
 - backend-neutral conformance tests for public behavior; and
 - focused tests for architecture/runtime contracts.
 
-Do not add tests that recursively inspect repository source text, forbid family
-names by substring, or assert a particular file/directory layout. Those tests
-confuse spelling and placement with dependency ownership and become stale during
-valid reorganizations. If a boundary needs stronger mechanical enforcement,
-prefer introducing a crate boundary, narrowing visibility, or adding a
-manifest/dependency check.
+Do not add tests that inspect the Cargo dependency graph, recursively inspect
+repository source text, forbid family names by substring, or assert a particular
+file/directory layout. Those tests confuse repository shape with dependency
+ownership and become stale during valid reorganizations. Keep dependency rules
+explicit in this file and manifests. If a boundary needs stronger mechanical
+enforcement, prefer introducing a crate boundary or narrowing visibility.
 
 When changing any boundary above, update `doc/backend-architecture.md` in the
 same change. Useful verification commands are:
 
 ```sh
-cargo test -p eredu-core --test dependency_boundary
-cargo test -p eredu-runtime --test dependency_boundary
+cargo check -p eredu-core
+cargo check -p eredu-checkpoint
+cargo check -p eredu-runtime
+cargo check -p eredu-nn --all-features
+cargo check -p eredu-codec --all-features
+cargo check -p eredu-architectures
 cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance
-cargo check -p eredu-architectures
 ```
