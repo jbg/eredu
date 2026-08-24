@@ -35,6 +35,8 @@ pub mod inspection;
 pub mod media;
 /// Stable model and artifact identities.
 pub mod model;
+/// Portable, explicitly requested execution observations.
+pub mod observation;
 /// Backend-generic realtime token-session execution and scheduling.
 pub mod realtime;
 /// Weight-residency ownership, capacity, and resource planning.
@@ -71,8 +73,8 @@ pub use backend::{
     BackendProvider, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
     ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DistributedBackend,
     DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend, ModelRuntime,
-    MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
+    InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
+    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
     SpeculativeTokenFilterController, Submission, TextGeneration, TextGenerationBackend,
     TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenFilterController,
     TokenFilterError, TokenOutput, ValueDescriptor,
@@ -108,6 +110,10 @@ pub use inspection::{
 pub use media::{
     Audio, Media, MediaBinding, MediaRequestError, MultimodalRequest, MultimodalSegment, RgbImage,
     TokenizedMultimodalRequest, TokenizedMultimodalSegment, Video, VideoSampling,
+};
+pub use observation::{
+    InspectedOutput, ObservationError, ObservationRequest, ObservationSelector, ObservationSet,
+    ObservationValue, TensorObservation, TensorObservationData,
 };
 pub use realtime::{
     load_realtime_model, load_realtime_model_with_options, RealtimeBackend, RealtimeCompletedStep,

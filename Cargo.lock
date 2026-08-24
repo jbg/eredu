@@ -960,14 +960,17 @@ dependencies = [
 name = "eredu-evaluation"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "eredu-architectures",
  "eredu-codec",
  "eredu-core",
  "eredu-nn",
+ "safetensors",
  "sentencepiece-rs",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

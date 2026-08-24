@@ -13,9 +13,12 @@ eredu-architectures.workspace = true
 eredu-codec.workspace = true
 eredu-core.workspace = true
 eredu-nn.workspace = true
+clap = { version = "4", features = ["derive"] }
+safetensors = "0.8"
 sentencepiece-rs = "0.2.2"
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

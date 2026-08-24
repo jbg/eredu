@@ -15,6 +15,7 @@ use crate::{
     checkpoint::TensorDtype,
     generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
+    observation::{InspectedOutput, ObservationRequest, ObservationSet},
     topology::{ParallelAxis, ParallelTopology},
 };
 
@@ -51,6 +52,10 @@ pub struct BackendCapabilities {
     pub collectives: bool,
     /// Supports backend-managed persistent decode caches.
     pub persistent_cache: bool,
+    /// Supports explicit host observation of completed session outputs.
+    pub output_observation: bool,
+    /// Supports named activation inspection for instrumented session passes.
+    pub activation_inspection: bool,
 }
 
 /// Fail-closed distributed operations exposed by one selected session.
@@ -403,6 +408,40 @@ pub trait BackendSession<B: BackendProvider> {
         backend: &B,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
+
+    /// Materializes an already completed opaque output into portable records.
+    ///
+    /// Calling this method is an explicit synchronization and host-transfer
+    /// boundary. Ordinary inference does not invoke it.
+    fn observe_output(
+        &self,
+        backend: &B,
+        output: &Self::Output,
+    ) -> Result<ObservationSet, B::Error>;
+}
+
+/// Optional named-activation inspection for a selected backend session.
+///
+/// This is a general diagnostics and observability capability. Implementations
+/// execute the requested operation to completion and materialize only selected
+/// observation points. It is intentionally separate from ordinary asynchronous
+/// submission so production inference pays no instrumentation cost.
+pub trait InspectableBackendSession<B: BackendProvider>: BackendSession<B> {
+    /// Executes and inspects one prompt prefill operation.
+    fn inspect_prefill(
+        &mut self,
+        backend: &B,
+        input: Self::PrefillInput,
+        request: &ObservationRequest,
+    ) -> Result<InspectedOutput<Self::Output>, B::Error>;
+
+    /// Executes and inspects one cached decode operation.
+    fn inspect_decode(
+        &mut self,
+        backend: &B,
+        input: Self::DecodeInput,
+        request: &ObservationRequest,
+    ) -> Result<InspectedOutput<Self::Output>, B::Error>;
 }
 
 /// One submission produced by the selected backend session.
@@ -470,6 +509,38 @@ impl<B: BackendProvider> ModelRuntime<B> {
         input: <B::Session as BackendSession<B>>::DecodeInput,
     ) -> Result<SessionSubmission<B>, B::Error> {
         self.session.decode(&self.backend, input)
+    }
+
+    /// Materializes portable observations from an already completed output.
+    pub fn observe_output(
+        &self,
+        output: &<B::Session as BackendSession<B>>::Output,
+    ) -> Result<ObservationSet, B::Error> {
+        self.session.observe_output(&self.backend, output)
+    }
+}
+
+impl<B> ModelRuntime<B>
+where
+    B: BackendProvider,
+    B::Session: InspectableBackendSession<B>,
+{
+    /// Executes a completed, explicitly instrumented prefill operation.
+    pub fn inspect_prefill(
+        &mut self,
+        input: <B::Session as BackendSession<B>>::PrefillInput,
+        request: &ObservationRequest,
+    ) -> Result<InspectedOutput<<B::Session as BackendSession<B>>::Output>, B::Error> {
+        self.session.inspect_prefill(&self.backend, input, request)
+    }
+
+    /// Executes a completed, explicitly instrumented decode operation.
+    pub fn inspect_decode(
+        &mut self,
+        input: <B::Session as BackendSession<B>>::DecodeInput,
+        request: &ObservationRequest,
+    ) -> Result<InspectedOutput<<B::Session as BackendSession<B>>::Output>, B::Error> {
+        self.session.inspect_decode(&self.backend, input, request)
     }
 }
 
@@ -1305,6 +1376,14 @@ mod tests {
                 completion: LoadingDone,
             })
         }
+
+        fn observe_output(
+            &self,
+            _: &LoadingMock,
+            _: &(),
+        ) -> Result<ObservationSet, std::convert::Infallible> {
+            Ok(ObservationSet::new())
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1390,6 +1469,17 @@ mod tests {
                 output: self.tokens.len() as u32 + self.model,
                 completion: Done,
             })
+        }
+
+        fn observe_output(&self, _: &Mock, output: &u32) -> Result<ObservationSet, Infallible> {
+            let mut observations = ObservationSet::new();
+            observations
+                .insert(
+                    "mock.output",
+                    crate::ObservationValue::Unsigned(u64::from(*output)),
+                )
+                .unwrap();
+            Ok(observations)
         }
     }
 

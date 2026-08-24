@@ -6,8 +6,8 @@ use eredu::api::{
 use eredu::{
     ArtifactFormat, BackendCapabilities, BackendDescriptor, BackendProvider, BackendSession,
     Completion, DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness,
-    ModelInspectionReport, ModelRuntime, PreparedModel, Submission, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenOutput,
+    ModelInspectionReport, ModelRuntime, ObservationSet, ObservationValue, PreparedModel,
+    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
@@ -98,6 +98,21 @@ impl BackendSession<MockBackend> for MockSession {
             output: input + 1,
             completion: Complete,
         })
+    }
+
+    fn observe_output(
+        &self,
+        _: &MockBackend,
+        output: &Self::Output,
+    ) -> Result<ObservationSet, MockError> {
+        let mut observations = ObservationSet::new();
+        observations
+            .insert(
+                "mock.output",
+                ObservationValue::Unsigned(u64::from(*output)),
+            )
+            .unwrap();
+        Ok(observations)
     }
 }
 

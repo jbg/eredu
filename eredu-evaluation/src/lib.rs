@@ -3,6 +3,29 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod checkpoint;
+mod distribution;
+mod evidence;
+mod parity;
+mod realtime;
+
+pub use checkpoint::{
+    compare_checkpoint_artifacts, CheckpointParityError, CheckpointParityOptions,
+    CheckpointParityReport,
+};
+pub use distribution::{compare_distributions, DistributionError, DistributionMetrics};
+
+pub use evidence::{
+    observe_f32_tensor, observe_i32_tensor, observe_realtime_frame, summarize_latencies,
+    EvaluationEvidence, EvidenceError, LatencySummary,
+};
+pub use parity::{
+    compare_observations, LogitRowMetrics, LogitTolerance, NumericMetrics, NumericTolerance,
+    ObservationParity, ParityComparison, ParityError, ParityMetrics, ParityPolicy, ParityReport,
+    ParityRule,
+};
+pub use realtime::{encoded_audio_frames, run_realtime_trace, RealtimeTrace, RealtimeTraceError};
+
 use std::{
     error::Error,
     fs,
@@ -583,49 +606,21 @@ impl DistributionAccumulator {
         candidate: &[f32],
         target: usize,
     ) -> Result<(), Box<dyn Error>> {
-        if dense.len() != candidate.len() || dense.is_empty() {
-            return Err(invalid("dense and candidate diagnostic shapes differ"));
-        }
-        let dense_lse = logsumexp(dense);
-        let candidate_lse = logsumexp(candidate);
-        let mut kl = 0.0;
-        let mut entropy = 0.0;
-        for (&dense_logit, &candidate_logit) in dense.iter().zip(candidate) {
-            let log_p = dense_logit as f64 - dense_lse;
-            let log_q = candidate_logit as f64 - candidate_lse;
-            let probability = log_p.exp();
-            kl += probability * (log_p - log_q);
-            entropy -= probability * log_p;
-        }
-        let dense_mean = dense.iter().map(|value| *value as f64).sum::<f64>() / dense.len() as f64;
-        let candidate_mean =
-            candidate.iter().map(|value| *value as f64).sum::<f64>() / candidate.len() as f64;
-        let rmse = (dense
-            .iter()
-            .zip(candidate)
-            .map(|(&left, &right)| {
-                let delta = (left as f64 - dense_mean) - (right as f64 - candidate_mean);
-                delta * delta
-            })
-            .sum::<f64>()
-            / dense.len() as f64)
-            .sqrt();
-        let dense_top = top_indices(dense, 5);
-        let candidate_top = top_indices(candidate, 5);
+        let metrics = compare_distributions(
+            dense,
+            candidate,
+            (target < dense.len()).then_some(target),
+            5,
+        )?;
         self.count += 1;
-        self.kl_sum += kl.max(0.0);
-        self.entropy_sum += entropy;
-        self.centered_rmse_sum += rmse;
-        self.top1_matches += usize::from(dense_top[0] == candidate_top[0]);
-        self.top5_overlap_sum += dense_top
-            .iter()
-            .filter(|index| candidate_top.contains(index))
-            .count() as f64
-            / dense_top.len() as f64;
-        if target < dense.len() {
+        self.kl_sum += metrics.kl_nats;
+        self.entropy_sum += metrics.reference_entropy_nats;
+        self.centered_rmse_sum += metrics.centered_logit_rmse;
+        self.top1_matches += usize::from(metrics.top1_agreement);
+        self.top5_overlap_sum += metrics.top_k_overlap;
+        if let Some(delta) = metrics.target_nll_delta_nats {
             self.target_count += 1;
-            self.target_nll_delta_sum +=
-                (candidate_lse - candidate[target] as f64) - (dense_lse - dense[target] as f64);
+            self.target_nll_delta_sum += delta;
         }
         Ok(())
     }
@@ -749,22 +744,15 @@ struct PerformanceSummary {
 }
 
 fn performance_summary(latencies: &[f64]) -> PerformanceSummary {
-    let mut sorted = latencies.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let percentile = |fraction: f64| {
-        let index = ((sorted.len().saturating_sub(1)) as f64 * fraction).round() as usize;
-        sorted.get(index).copied().unwrap_or(0.0)
-    };
+    let summary = summarize_latencies(latencies, Some(DEADLINE_MS))
+        .expect("every model run records at least one finite nonnegative latency");
     PerformanceSummary {
-        frames: latencies.len(),
-        mean_ms: latencies.iter().sum::<f64>() / latencies.len().max(1) as f64,
-        p50_ms: percentile(0.50),
-        p95_ms: percentile(0.95),
-        max_ms: sorted.last().copied().unwrap_or(0.0),
-        deadline_misses: latencies
-            .iter()
-            .filter(|value| **value > DEADLINE_MS)
-            .count(),
+        frames: summary.samples,
+        mean_ms: summary.mean_ms,
+        p50_ms: summary.p50_ms,
+        p95_ms: summary.p95_ms,
+        max_ms: summary.max_ms,
+        deadline_misses: summary.deadline_misses,
     }
 }
 
@@ -795,23 +783,6 @@ fn reference_tokens(frames: &[ReferenceFrame]) -> Vec<serde_json::Value> {
         .iter()
         .map(|frame| json!({ "text": frame.text_token, "sampled_audio": frame.sampled_audio }))
         .collect()
-}
-
-fn logsumexp(values: &[f32]) -> f64 {
-    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-    maximum
-        + values
-            .iter()
-            .map(|value| (*value as f64 - maximum).exp())
-            .sum::<f64>()
-            .ln()
-}
-
-fn top_indices(values: &[f32], count: usize) -> Vec<usize> {
-    let mut indices = (0..values.len()).collect::<Vec<_>>();
-    indices.sort_unstable_by(|left, right| values[*right].total_cmp(&values[*left]));
-    indices.truncate(count.min(indices.len()));
-    indices
 }
 
 fn token_frame_agreement(left: &[Vec<i32>], right: &[Vec<i32>]) -> f64 {

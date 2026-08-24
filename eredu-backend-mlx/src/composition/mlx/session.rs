@@ -1,9 +1,12 @@
 //! Architecture-erased MLX model-session execution.
 
 use eredu_core::{
-    BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
-    TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenOutput,
+    BackendSession, Completion, InspectableBackendSession, InspectedOutput, ModelRuntime,
+    ObservationRequest, ObservationSet, ObservationValue, Submission, TensorObservation,
+    TensorObservationData, TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy,
+    TokenFilter, TokenOutput,
 };
+use eredu_nn::Tensor as _;
 use eredu_runtime::{
     ActivationObserver as RuntimeActivationObserver, CausalModel, GenerationSampler,
     MirostatV2Sampler,
@@ -13,7 +16,7 @@ use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
     random::RandomState,
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 use std::path::Path;
 
@@ -37,6 +40,167 @@ use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, Model, M
 
 struct ArrayObserverAdapter<'a, O: ?Sized> {
     inner: &'a mut O,
+}
+
+struct InspectionCollector<'a> {
+    request: &'a ObservationRequest,
+    values: Vec<(String, MlxTensor)>,
+}
+
+impl<'a> InspectionCollector<'a> {
+    fn new(request: &'a ObservationRequest) -> Self {
+        Self {
+            request,
+            values: Vec::new(),
+        }
+    }
+
+    fn capture(&mut self, path: &str, value: &MlxTensor) {
+        if self.request.matches(path) {
+            self.values.push((path.into(), value.clone()));
+        }
+    }
+
+    fn materialize(self, stream: &Stream) -> Result<ObservationSet, Error> {
+        let mut observations = ObservationSet::new();
+        for (path, value) in self.values {
+            observations
+                .insert(
+                    path,
+                    ObservationValue::Tensor(observe_tensor(&value, stream)?),
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        }
+        Ok(observations)
+    }
+}
+
+impl RuntimeActivationObserver<MlxTensor, Exception> for InspectionCollector<'_> {
+    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Exception> {
+        self.capture(path, value);
+        Ok(())
+    }
+
+    fn observe_routing(
+        &mut self,
+        routing: eredu_runtime::RoutingObservation<'_, MlxTensor>,
+    ) -> Result<(), Exception> {
+        let root = format!("{}.routing", routing.path);
+        self.capture(
+            &format!("{root}.selected_experts"),
+            routing.selected_experts,
+        );
+        self.capture(&format!("{root}.selected_scores"), routing.selected_scores);
+        self.capture(&format!("{root}.route_weights"), routing.route_weights);
+        self.capture(&format!("{root}.routed_output"), routing.routed_output);
+        if let Some(value) = routing.local_routed_output {
+            self.capture(&format!("{root}.local_routed_output"), value);
+        }
+        if let Some(value) = routing.reduced_routed_output {
+            self.capture(&format!("{root}.reduced_routed_output"), value);
+        }
+        if let Some(value) = routing.shared_output {
+            self.capture(&format!("{root}.shared_output"), value);
+        }
+        if let Some(value) = routing.combined_output {
+            self.capture(&format!("{root}.combined_output"), value);
+        }
+        Ok(())
+    }
+}
+
+fn observe_tensor(value: &MlxTensor, stream: &Stream) -> Result<TensorObservation, Error> {
+    let shape = value
+        .shape()
+        .iter()
+        .map(|dimension| {
+            usize::try_from(*dimension).map_err(|_| {
+                Error::ArchitectureModel(format!(
+                    "observed tensor has negative dimension {dimension}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let data = match value.as_array().dtype() {
+        Dtype::Bool => {
+            TensorObservationData::Bool(value.as_array().evaluated()?.as_slice::<bool>().to_vec())
+        }
+        Dtype::Uint8 => TensorObservationData::U64(
+            value
+                .as_array()
+                .evaluated()?
+                .as_slice::<u8>()
+                .iter()
+                .copied()
+                .map(u64::from)
+                .collect(),
+        ),
+        Dtype::Uint16 => TensorObservationData::U64(
+            value
+                .as_array()
+                .evaluated()?
+                .as_slice::<u16>()
+                .iter()
+                .copied()
+                .map(u64::from)
+                .collect(),
+        ),
+        Dtype::Uint32 => TensorObservationData::U64(
+            value
+                .as_array()
+                .evaluated()?
+                .as_slice::<u32>()
+                .iter()
+                .copied()
+                .map(u64::from)
+                .collect(),
+        ),
+        Dtype::Uint64 => {
+            TensorObservationData::U64(value.as_array().evaluated()?.as_slice::<u64>().to_vec())
+        }
+        Dtype::Int8 => TensorObservationData::I64(
+            value
+                .as_array()
+                .evaluated()?
+                .as_slice::<i8>()
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect(),
+        ),
+        Dtype::Int16 => TensorObservationData::I64(
+            value
+                .as_array()
+                .evaluated()?
+                .as_slice::<i16>()
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect(),
+        ),
+        Dtype::Int32 => TensorObservationData::I64(
+            value
+                .as_array()
+                .evaluated()?
+                .as_slice::<i32>()
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect(),
+        ),
+        Dtype::Int64 => {
+            TensorObservationData::I64(value.as_array().evaluated()?.as_slice::<i64>().to_vec())
+        }
+        Dtype::Float16 | Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 => {
+            TensorObservationData::F32(value.to_f32_vec(stream)?)
+        }
+        Dtype::Complex64 => {
+            return Err(Error::ArchitectureModel(
+                "complex activation observation is unsupported".into(),
+            ))
+        }
+    };
+    TensorObservation::new(shape, data).map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 impl<O> RuntimeActivationObserver<Array, Exception> for ArrayObserverAdapter<'_, O>
@@ -873,6 +1037,31 @@ impl<'a> MlxModelSession<'a> {
         })?;
         MlxCompletion::submission(output)
     }
+
+    fn submit_decode_with_observer(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        input: Array,
+        observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
+    ) -> Result<Submission<Array, MlxCompletion>, Error> {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => {
+                let output = Self::forward_with_observer(
+                    model,
+                    &input,
+                    None,
+                    cache,
+                    backend.stream(),
+                    observer,
+                )?
+                .try_index_device((.., -1, ..), backend.stream())?;
+                MlxCompletion::submission(output)
+            }
+            MlxSessionKind::Pipeline(_, _) => Err(Error::ArchitectureModel(
+                "activation observation is unavailable for distributed MLX sessions".into(),
+            )),
+        }
+    }
 }
 
 impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
@@ -972,6 +1161,57 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 pipeline_submission(completion)
             }
         }
+    }
+
+    fn observe_output(
+        &self,
+        backend: &MlxBackend<'a>,
+        output: &Self::Output,
+    ) -> Result<ObservationSet, Error> {
+        let mut observations = ObservationSet::new();
+        if let Some(logits) = output.logits() {
+            observations
+                .insert(
+                    "model.logits",
+                    ObservationValue::Tensor(observe_tensor(logits, backend.stream())?),
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        }
+        Ok(observations)
+    }
+}
+
+impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
+    fn inspect_prefill(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        input: Self::PrefillInput,
+        request: &ObservationRequest,
+    ) -> Result<InspectedOutput<Self::Output>, Error> {
+        let mut collector = InspectionCollector::new(request);
+        let submission = self.submit_prefill_with_observer(backend, input, &mut collector)?;
+        let logits = submission.wait()?;
+        let observations = collector.materialize(backend.stream())?;
+        Ok(InspectedOutput {
+            output: MlxModelOutput::new(Some(MlxTensor::from_array(logits))),
+            observations,
+        })
+    }
+
+    fn inspect_decode(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        input: Self::DecodeInput,
+        request: &ObservationRequest,
+    ) -> Result<InspectedOutput<Self::Output>, Error> {
+        let mut collector = InspectionCollector::new(request);
+        let submission = self.submit_decode_with_observer(backend, input, &mut collector)?;
+        let logits = submission.wait()?;
+        let observations = collector.materialize(backend.stream())?;
+        Ok(InspectedOutput {
+            output: MlxModelOutput::new(Some(MlxTensor::from_array(logits))),
+            observations,
+        })
     }
 }
 
@@ -1386,7 +1626,7 @@ fn forward_model_tensor_parallel(
 
 #[cfg(test)]
 mod tests {
-    use safemlx::Array;
+    use safemlx::{Array, Device, DeviceType, ExecutionContext};
 
     use super::*;
 
@@ -1419,6 +1659,34 @@ mod tests {
     #[test]
     fn model_session_is_the_backend_session_implementation() {
         fn assert_session<T: BackendSession<MlxBackend<'static>>>() {}
+        fn assert_inspectable<T: InspectableBackendSession<MlxBackend<'static>>>() {}
         assert_session::<MlxModelSession>();
+        assert_inspectable::<MlxModelSession>();
+    }
+
+    #[test]
+    fn inspection_collector_filters_and_materializes_portable_values() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let requested = ObservationRequest::selected([eredu_core::ObservationSelector::Exact(
+            "model.layers.1.output".into(),
+        )]);
+        let mut collector = InspectionCollector::new(&requested);
+        collector.capture(
+            "model.layers.0.output",
+            &MlxTensor::from_array(Array::from_slice(&[1.0f32], &[1])),
+        );
+        collector.capture(
+            "model.layers.1.output",
+            &MlxTensor::from_array(Array::from_slice(&[2.0f32, 3.0], &[1, 2])),
+        );
+        let observations = collector.materialize(stream).unwrap();
+        assert_eq!(observations.len(), 1);
+        let Some(ObservationValue::Tensor(tensor)) = observations.get("model.layers.1.output")
+        else {
+            panic!("selected activation must be a tensor");
+        };
+        assert_eq!(tensor.shape(), [1, 2]);
+        assert_eq!(tensor.data(), &TensorObservationData::F32(vec![2.0, 3.0]));
     }
 }

@@ -67,12 +67,21 @@ Facade examples follow the same rule and construct selected local sessions
 through `eredu::api`. Backend-author probes that intentionally manipulate MLX
 tensors, streams, distributed groups, caches, or checkpoint packing live as
 `eredu-backend-mlx` examples and depend downward on neutral contracts.
-Realtime applications exchange portable host token frames and observations
-through `RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
-Backends retain native tensors internally, while explicit observations may
-materialize completed tokens and requested decision logits for diagnostics.
-Backend-neutral evaluation drivers live in `eredu-evaluation`; concrete backend
-examples only select execution contexts and materialize model and codec artifacts.
+All selected sessions expose completed outputs through
+`BackendSession::observe_output`; backends retain native tensors internally and
+materialize portable `ObservationSet` records only when explicitly requested.
+Backends may additionally implement `InspectableBackendSession` by binding the
+named activation and routed-expert points already emitted by
+`eredu-runtime::ActivationObserver`. These are general diagnostics contracts
+used by telemetry, inspection, observability, and evaluation rather than an
+evaluation-specific backend surface. Realtime applications likewise exchange
+portable host token frames and observations through
+`RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
+
+Backend-neutral parity, distribution metrics, timing summaries, evidence, and
+evaluation drivers live in `eredu-evaluation`. Concrete backend examples only
+select execution contexts and materialize model and codec artifacts; they do
+not own comparison thresholds or reference policy.
 
 ## Ownership boundary
 

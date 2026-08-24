@@ -82,7 +82,7 @@ portable components or implementation layers for specialized use.
 | [`safemlx-sys`](safemlx-sys/) | MLX C bindings and native build integration |
 | [`eredu-nn`](eredu-nn/) | Backend-neutral tensor and neural-operation contracts for shared architectures |
 | [`eredu-codec`](eredu-codec/) | Backend-neutral neural audio codec architectures used by realtime speech models |
-| [`eredu-evaluation`](eredu-evaluation/) | Backend-neutral model evaluation drivers and suite tooling |
+| [`eredu-evaluation`](eredu-evaluation/) | Backend-neutral evidence, parity, quality metrics, performance summaries, and evaluation drivers |
 
 The workspace also contains procedural macros, integration tests, and an iOS
 example application.

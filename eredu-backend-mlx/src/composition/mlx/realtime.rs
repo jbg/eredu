@@ -1176,11 +1176,12 @@ impl RealtimeBackend for MlxRealtimeBackend {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(RealtimeDecisionDiagnostics::new(
+                RealtimeDecisionDiagnostics::new(
                     prediction,
                     shape,
                     array_f32_host(logits, &self.stream)?,
-                ))
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .collect::<Result<Vec<_>, Error>>()?;
         Ok(RealtimeOutputFrame::new(

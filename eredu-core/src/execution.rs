@@ -266,6 +266,16 @@ impl ExecutionPlan {
                 available.persistent_cache,
                 "persistent_cache",
             ),
+            (
+                self.required_capabilities.output_observation,
+                available.output_observation,
+                "output_observation",
+            ),
+            (
+                self.required_capabilities.activation_inspection,
+                available.activation_inspection,
+                "activation_inspection",
+            ),
         ] {
             if required && !supported {
                 return Err(ExecutionPlanError::Capability(name));

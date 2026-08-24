@@ -7,8 +7,10 @@ The text-checkpoint path uses three artifacts:
    backend completion; tensor readback and artifact serialization are excluded.
 2. `reference_runner.py` runs Transformers with the probe's exact prompt and
    cache-feed token IDs.
-3. `compare_checkpoints.py` checks input identity, finiteness, relative L2,
-   cosine similarity, top-k overlap, and unambiguous argmax agreement.
+3. `eredu-parity`, built from `eredu-evaluation`, checks input identity,
+   finiteness, relative L2, cosine similarity, top-k overlap, and unambiguous
+   argmax agreement through the same general parity engine used by other
+   backends and modalities.
 
 Install the reference dependencies in a CUDA-enabled Python environment:
 
@@ -19,10 +21,11 @@ python -m pip install -r validation/requirements.txt
 ## Pinned CUDA image
 
 The published `linux/amd64` image contains the CUDA-enabled
-`checkpoint_probe`, an MXFP4 JIT smoke binary, PyTorch, Transformers, and the
-validation scripts. Its build compiles the installed CUDA, CuTe, and CUTLASS
-headers with NVRTC. At runtime, `MLX_CUDA_JIT_INCLUDE_DIRS` gives MLX explicit
-header roots instead of relying on the executable's installed location.
+`checkpoint_probe`, the backend-neutral `eredu-parity` comparator, an MXFP4 JIT
+smoke binary, PyTorch, Transformers, and the validation scripts. Its build
+compiles the installed CUDA, CuTe, and CUTLASS headers with NVRTC. At runtime,
+`MLX_CUDA_JIT_INCLUDE_DIRS` gives MLX explicit header roots instead of relying
+on the executable's installed location.
 
 ```text
 ghcr.io/jbg/eredu-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1
@@ -77,11 +80,12 @@ python validation/reference_runner.py \
 Compare using the case's tolerance profile from the manifest:
 
 ```bash
-python validation/compare_checkpoints.py \
+eredu-parity \
   --actual validation/results/tinyllama_eredu.json \
   --reference validation/results/tinyllama_transformers.json \
-  --manifest validation/models.yaml \
-  --case llama_dense_untied \
+  --relative-l2-max 0.02 \
+  --cosine-similarity-min 0.999 \
+  --top-k 5 --top-k-overlap-min 4 \
   --output validation/results/tinyllama_comparison.json
 ```
 

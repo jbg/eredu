@@ -65,6 +65,12 @@ The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
 The quantization example is a thin MLX composition entry point over the
 backend-neutral driver in `eredu-evaluation`.
 
+Completed text-session outputs are materialized through the neutral
+`BackendSession::observe_output` contract. Explicit instrumented passes bind
+the architecture's named activation points to `InspectableBackendSession`.
+Parity policy and numerical comparison remain in `eredu-evaluation`; the
+backend owns only execution and host observation.
+
 ## Migration notes
 
 This crate is new in the backend extraction release. The concrete tensor type

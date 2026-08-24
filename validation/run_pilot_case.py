@@ -309,20 +309,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_json(summary_path, summary)
 
         comparison_json = output_dir / "correctness-comparison.json"
+        parity_profile = manifest["correctness_profiles"][case["correctness_profile"]]
         comparison_status = run_command(
             [
-                "python",
-                str(SCRIPT_DIR / "compare_checkpoints.py"),
+                "eredu-parity",
                 "--actual",
                 str(actual_json),
                 "--reference",
                 str(reference_json),
-                "--manifest",
-                str(args.manifest),
-                "--case",
-                args.case,
                 "--output",
                 str(comparison_json),
+                "--relative-l2-max",
+                str(parity_profile["relative_l2_max"]),
+                "--cosine-similarity-min",
+                str(parity_profile["cosine_similarity_min"]),
+                "--top-k",
+                str(parity_profile["top_k"]),
+                "--top-k-overlap-min",
+                str(parity_profile["top_k_overlap_min"]),
+                "--require-unambiguous-argmax-match",
+                str(parity_profile["require_unambiguous_argmax_match"]).lower(),
+                "--argmax-margin-min",
+                str(parity_profile["argmax_margin_min"]),
                 "--overwrite",
             ],
             summary["phases"].setdefault("comparison", {}),

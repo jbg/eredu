@@ -20,7 +20,9 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use eredu_backend_mlx::{MlxBackend, MlxModelInput, MlxModelSession, ModelLoadOptions};
-use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
+use eredu_core::{
+    load_model, BackendProvider as _, BackendSession as _, ObservationValue, TensorObservationData,
+};
 use eredu_text::tokenizer::Tokenizer;
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use serde::Serialize;
@@ -373,11 +375,9 @@ fn run_probe(
     let prefill_started = Instant::now();
     let prefill = session
         .prefill(backend, MlxModelInput::from(ModelInput::new(&prompt_parts)))?
-        .wait()?
-        .into_logits()
-        .context("selected MLX rank does not own prefill logits")?;
+        .wait()?;
     let prefill_wall = prefill_started.elapsed();
-    let (prefill_logits, vocab_size) = copy_logits(prefill.as_array(), stream)?;
+    let (prefill_logits, vocab_size) = copy_logits(session, backend, &prefill)?;
     let mut greedy_token_ids = vec![argmax(&prefill_logits)?];
     let mut fed_token_ids = Vec::with_capacity(decode_steps);
     let mut decode_logits = Vec::with_capacity(decode_steps.saturating_mul(vocab_size));
@@ -391,13 +391,9 @@ fn run_probe(
         let token = Array::from(&[token_id][..]).try_index_device(NewAxis, stream)?;
 
         let wall_started = Instant::now();
-        let logits = session
-            .decode(backend, token)?
-            .wait()?
-            .into_logits()
-            .context("selected MLX rank does not own decode logits")?;
+        let logits = session.decode(backend, token)?.wait()?;
         let wall_elapsed = wall_started.elapsed();
-        let (values, step_vocab_size) = copy_logits(logits.as_array(), stream)?;
+        let (values, step_vocab_size) = copy_logits(session, backend, &logits)?;
         ensure!(
             step_vocab_size == vocab_size,
             "vocabulary changed from {vocab_size} to {step_vocab_size} at decode step {step}"
@@ -418,16 +414,27 @@ fn run_probe(
     })
 }
 
-fn copy_logits(logits: &Array, stream: &Stream) -> Result<(Vec<f32>, usize)> {
-    let shape = logits.shape();
+fn copy_logits(
+    session: &MlxModelSession<'static>,
+    backend: &MlxBackend<'static>,
+    output: &eredu_backend_mlx::MlxModelOutput,
+) -> Result<(Vec<f32>, usize)> {
+    let observations = session.observe_output(backend, output)?;
+    let tensor = match observations.get("model.logits") {
+        Some(ObservationValue::Tensor(tensor)) => tensor,
+        Some(_) => anyhow::bail!("model.logits observation is not a tensor"),
+        None => anyhow::bail!("selected backend rank did not observe model.logits"),
+    };
+    let shape = tensor.shape();
     ensure!(
         shape.len() == 2 && shape[0] == 1 && shape[1] > 0,
         "expected logits shaped [1, vocab], got {shape:?}"
     );
-    let vocab_size = usize::try_from(shape[1])?;
-    let logits = logits.as_type::<f32>(stream)?;
-    let evaluated = logits.evaluated()?;
-    Ok((evaluated.as_slice::<f32>().to_vec(), vocab_size))
+    let values = match tensor.data() {
+        TensorObservationData::F32(values) => values.clone(),
+        _ => anyhow::bail!("model.logits observation is not F32"),
+    };
+    Ok((values, shape[1]))
 }
 
 fn argmax(values: &[f32]) -> Result<u32> {

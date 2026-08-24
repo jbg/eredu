@@ -33,16 +33,17 @@ use eredu::{
     HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, MemoryTier,
     ModelCapabilities, ModelCapabilityBackend, ModelKind, ModelLoadingBackend,
     ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
-    MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan, OffloadUnitId,
-    OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PreparedModel,
-    RealizedDrafting, RealtimeBackend, RealtimeFrameConvention, RealtimeModelLoadingBackend,
-    RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, RequestId, ResidencyLedger,
-    ResidencyPlan, ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
-    SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationOutput, SpeculativeTokenFilterController, StateLayout, StaticMemoryReport,
-    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
-    ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
+    MultimodalPreparationBackend, ObservationSet, ObservationValue, Observed, OffloadConfig,
+    OffloadPlan, OffloadUnitId, OffloadUnitSpec, ParallelAxis, ParallelTopology,
+    PhysicalMemorySemantics, PreparedModel, RealizedDrafting, RealtimeBackend,
+    RealtimeFrameConvention, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
+    RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan, ResidencyPolicy,
+    RuntimeStateEstimate, SchedulerLimits, SemanticEvent, SemanticStateTransaction,
+    SpeculativeDraft, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput,
+    SpeculativeTokenFilterController, StateLayout, StaticMemoryReport, Submission,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
+    WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::{
     checkpoint::TensorDtype, BoundedResidencyRequirement, CandidateAdmission, Completion,
@@ -151,6 +152,8 @@ impl BackendProvider for MockBackend {
                 transfers: true,
                 collectives: true,
                 persistent_cache: true,
+                output_observation: true,
+                activation_inspection: false,
             },
         )])
     }
@@ -201,6 +204,21 @@ impl BackendSession<MockBackend> for MockSession {
             output: input + 1,
             completion: Done,
         })
+    }
+
+    fn observe_output(
+        &self,
+        _: &MockBackend,
+        output: &Self::Output,
+    ) -> Result<ObservationSet, MockError> {
+        let mut observations = ObservationSet::new();
+        observations
+            .insert(
+                "mock.output",
+                ObservationValue::Unsigned(u64::from(*output)),
+            )
+            .unwrap();
+        Ok(observations)
     }
 }
 
@@ -1459,6 +1477,16 @@ fn assert_distributed_conformance() {
     assert_eq!(distributed.scheduler_words, vec![7, 9, 7, 9]);
 }
 
+fn assert_session_observation_conformance() {
+    let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let output = runtime.prefill(vec![1, 2, 3]).unwrap().wait().unwrap();
+    let observations = runtime.observe_output(&output).unwrap();
+    assert_eq!(
+        observations.get("mock.output"),
+        Some(&ObservationValue::Unsigned(3))
+    );
+}
+
 fn assert_prepared_generation_and_speculative_conformance() {
     let vocabulary = std::iter::once(("[UNK]".to_owned(), 0))
         .chain((0..64).map(|index| (format!("ordinary_{index}"), index + 1)))
@@ -1778,6 +1806,7 @@ fn non_mlx_backend_conforms_to_the_complete_generic_facade() {
     assert_loading_generation_capability_and_multimodal_conformance();
     assert_prepared_generation_and_speculative_conformance();
     assert_realtime_conformance();
+    assert_session_observation_conformance();
 }
 
 #[test]

@@ -14,8 +14,12 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
-use eredu_backend_mlx::{generate_encoded_greedy, MlxRealtimeBackend};
-use eredu_core::load_realtime_model;
+use eredu_backend_mlx::{MlxRealtimeBackend, MlxTensor};
+use eredu_core::{load_realtime_model, ObservationSet, ObservationValue, RealtimeSampling};
+use eredu_evaluation::{
+    compare_observations, encoded_audio_frames, observe_i32_tensor, run_realtime_trace,
+    ParityPolicy,
+};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -35,44 +39,63 @@ fn main() -> anyhow::Result<()> {
     let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
     let mut model =
         load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), preparation)?;
-    let generated =
-        generate_encoded_greedy(&mut model, required(&fixture, "generation.input_audio")?)?;
-    compare_tokens(
-        &generated.text_tokens,
+    let input = required(&fixture, "generation.input_audio")?;
+    let trace = run_realtime_trace(
+        &mut model,
+        encoded_audio_frames(&MlxTensor::from_array(input.clone()), stream)?,
+        RealtimeSampling::greedy(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let trace_observations = trace.observations()?;
+    let mut actual = ObservationSet::new();
+    for path in ["trace.text_tokens", "trace.output_audio_tokens"] {
+        actual.insert(
+            path,
+            trace_observations
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("trace omitted {path}"))?,
+        )?;
+    }
+    let mut reference = ObservationSet::new();
+    insert_tokens(
+        &mut reference,
+        "trace.text_tokens",
         required(&fixture, "generation.expected_text")?,
         stream,
-        "generated text",
     )?;
-    compare_tokens(
-        &generated.audio_tokens,
+    insert_tokens(
+        &mut reference,
+        "trace.output_audio_tokens",
         required(&fixture, "generation.expected_audio")?,
         stream,
-        "generated encoded audio",
     )?;
+    let report = compare_observations(&actual, &reference, &ParityPolicy::exact())?;
+    anyhow::ensure!(report.passed, "token parity failed: {:?}", report.failures);
 
     println!(
         "Realtime token parity passed: {} input frames, {} emitted audio frames",
-        required(&fixture, "generation.input_audio")?.dim(2),
-        generated.audio_tokens.dim(2),
+        input.dim(2),
+        trace
+            .frames()
+            .iter()
+            .filter(|frame| frame.output_audio_tokens().is_some())
+            .count(),
     );
     Ok(())
 }
 
-fn compare_tokens(
-    actual: &Array,
-    expected: &Array,
+fn insert_tokens(
+    observations: &mut ObservationSet,
+    path: &str,
+    value: &Array,
     stream: &eredu_backend_mlx::native::Stream,
-    label: &str,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        actual.shape() == expected.shape(),
-        "{label}: shape mismatch: Rust {:?}, reference {:?}",
-        actual.shape(),
-        expected.shape()
-    );
-    let expected = expected.copy(stream)?;
-    let equal = actual.eq(&expected, stream)?.all(None, stream)?;
-    anyhow::ensure!(equal.item::<bool>(stream), "{label}: token mismatch");
+    let value = MlxTensor::from_array(value.clone());
+    observations.insert(
+        path,
+        ObservationValue::Tensor(observe_i32_tensor(&value, stream)?),
+    )?;
     Ok(())
 }
 

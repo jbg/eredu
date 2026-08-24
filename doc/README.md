@@ -20,6 +20,9 @@ relevant model, execution, or platform guide here.
   the boundary between cooperative cancellation and submitted backend work.
 - [PersonaPlex quantization evaluation](personaplex-evaluation.md): the audio
   comparison and blinded-listening tools in `eredu-evaluation`.
+- [Evaluation and observation architecture](evaluation.md): portable evidence,
+  backend parity, activation inspection, distribution metrics, and performance
+  reporting.
 
 ## Runtime and backends
 

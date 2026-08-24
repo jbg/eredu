@@ -17,13 +17,13 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu_backend_mlx::native::{
-    ops::{indexing::TryIndexOp, stack_axis},
-    Array, Device, DeviceType, ExecutionContext, Stream,
+use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext, Stream};
+use eredu_backend_mlx::{MlxRealtimeBackend, MlxTensor};
+use eredu_core::{load_realtime_model, ObservationSet, ObservationValue, RealtimeSampling};
+use eredu_evaluation::{
+    compare_observations, encoded_audio_frames, observe_i32_tensor, run_realtime_trace,
+    ParityPolicy,
 };
-use eredu_backend_mlx::{MlxRealtimeBackend, MlxRealtimeInput};
-use eredu_core::scheduler::{RequestId, SchedulerLimits};
-use eredu_core::{load_realtime_model, RealtimeSampling, RealtimeScheduler};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -50,79 +50,66 @@ fn main() -> anyhow::Result<()> {
     let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
     let mut model =
         load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), preparation)?;
-    let generated_audio_codebooks = model.speech_config().generated_audio_codebooks() as i32;
-    let request = RequestId::new(1);
-    let mut scheduler = RealtimeScheduler::new(&model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(&model, request, RealtimeSampling::greedy())?;
-    let mut sampled = Vec::new();
-    let mut emitted = Vec::new();
-    let mut emitted_steps = Vec::new();
-    for step in 0..input_audio.dim(2) {
-        let input = input_audio.try_index_device((.., .., step), stream)?;
-        scheduler.enqueue(&model, request, MlxRealtimeInput::encoded_audio(&input))?;
-        let output = loop {
-            if let Some(output) = scheduler.run_queued(&mut model)?.pop() {
-                break output.into_parts().1;
-            }
-            std::thread::yield_now();
-        };
-        if step > 0 {
-            let text = output.text_token.squeeze_axes(&[-1], stream)?;
-            let text = text.expand_dims(1, stream)?;
-            let frame = eredu_backend_mlx::native::ops::concatenate_axis(
-                &[text, output.sampled_audio_tokens],
-                1,
-                stream,
-            )?;
-            sampled.push(frame);
-        }
-        if let Some(tokens) = output.output_audio_tokens {
-            emitted.push(tokens);
-            emitted_steps.push(step);
-        }
-    }
-
-    let actual_sampled = if sampled.is_empty() {
-        Array::zeros::<i32>(&[input_audio.dim(0), 17, 0], stream)?
-    } else {
-        stack_axis(&sampled, 2, stream)?
-    };
-    let actual_output_audio = if emitted.is_empty() {
-        Array::zeros::<i32>(&[input_audio.dim(0), generated_audio_codebooks, 0], stream)?
-    } else {
-        stack_axis(&emitted, 2, stream)?
-    };
-    let actual_emitted_steps =
-        Array::from_slice(&emitted_steps, &[i32::try_from(emitted_steps.len())?]);
+    let generated_audio_codebooks = model.speech_config().generated_audio_codebooks();
+    let trace = run_realtime_trace(
+        &mut model,
+        encoded_audio_frames(&MlxTensor::from_array(input_audio.clone()), stream)?,
+        RealtimeSampling::greedy(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     anyhow::ensure!(
-        expected_sampled.dim(1) == generated_audio_codebooks + 1,
+        expected_sampled.dim(1) == i32::try_from(generated_audio_codebooks + 1)?,
         "released fixture sampled width must be text plus {generated_audio_codebooks} generated audio codebooks, got {}",
         expected_sampled.dim(1)
     );
-    compare_tokens(
-        &actual_sampled,
+    let trace_observations = trace.observations()?;
+    let mut actual = ObservationSet::new();
+    actual.insert(
+        "generation.sampled",
+        ObservationValue::Tensor(trace.combined_sampled_tokens(1)?),
+    )?;
+    actual.insert(
+        "generation.output_audio",
+        trace_observations
+            .get("trace.output_audio_tokens")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("trace omitted output audio"))?,
+    )?;
+    actual.insert(
+        "generation.emitted_steps",
+        ObservationValue::Tensor(trace.emitted_frame_indices()?),
+    )?;
+    let mut reference = ObservationSet::new();
+    insert_tokens(
+        &mut reference,
+        "generation.sampled",
         expected_sampled,
         stream,
-        "sampled model tokens",
     )?;
-    compare_tokens(
-        &actual_output_audio,
+    insert_tokens(
+        &mut reference,
+        "generation.output_audio",
         expected_output_audio,
         stream,
-        "delay-aligned output audio",
     )?;
-    compare_tokens(
-        &actual_emitted_steps,
+    insert_tokens(
+        &mut reference,
+        "generation.emitted_steps",
         expected_emitted_steps,
         stream,
-        "emitted frame positions",
     )?;
+    let report = compare_observations(&actual, &reference, &ParityPolicy::exact())?;
+    anyhow::ensure!(report.passed, "token parity failed: {:?}", report.failures);
 
     println!(
         "PersonaPlex PyTorch parity passed: {} input frames, {} sampled frames, {} emitted frames",
         input_audio.dim(2),
-        actual_sampled.dim(2),
-        actual_output_audio.dim(2)
+        trace.frames().len().saturating_sub(1),
+        trace
+            .frames()
+            .iter()
+            .filter(|frame| frame.output_audio_tokens().is_some())
+            .count()
     );
     Ok(())
 }
@@ -133,20 +120,16 @@ fn required<'a>(fixture: &'a HashMap<String, Array>, key: &str) -> anyhow::Resul
         .ok_or_else(|| anyhow::anyhow!("fixture is missing tensor {key}"))
 }
 
-fn compare_tokens(
-    actual: &Array,
-    expected: &Array,
+fn insert_tokens(
+    observations: &mut ObservationSet,
+    path: &str,
+    value: &Array,
     stream: &Stream,
-    label: &str,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        actual.shape() == expected.shape(),
-        "{label}: shape mismatch: Rust {:?}, upstream {:?}",
-        actual.shape(),
-        expected.shape()
-    );
-    let expected = expected.copy(stream)?;
-    let equal = actual.eq(&expected, stream)?.all(None, stream)?;
-    anyhow::ensure!(equal.item::<bool>(stream), "{label}: token mismatch");
+    let value = MlxTensor::from_array(value.clone());
+    observations.insert(
+        path,
+        ObservationValue::Tensor(observe_i32_tensor(&value, stream)?),
+    )?;
     Ok(())
 }

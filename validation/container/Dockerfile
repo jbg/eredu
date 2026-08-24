@@ -49,6 +49,9 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
         --features cuda \
         --example checkpoint_probe; \
     cargo build --locked --release \
+        -p eredu-evaluation \
+        --bin eredu-parity; \
+    cargo build --locked --release \
         -p safemlx \
         --no-default-features \
         --features cuda \
@@ -56,6 +59,9 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
     install -m 0755 \
         /tmp/eredu-target/release/examples/checkpoint_probe \
         /usr/local/bin/checkpoint_probe; \
+    install -m 0755 \
+        /tmp/eredu-target/release/eredu-parity \
+        /usr/local/bin/eredu-parity; \
     install -m 0755 \
         /tmp/eredu-target/release/examples/cuda_mxfp4_smoke \
         /usr/local/bin/cuda_mxfp4_smoke; \
@@ -134,6 +140,7 @@ ENV SAFEMLX_CUDA_ARCHITECTURES="80;89;90" \
 COPY --from=checkpoint-probe-builder /usr/local/cuda/include /usr/local/cuda/include
 COPY --from=checkpoint-probe-builder /usr/local/include /usr/local/include
 COPY --from=checkpoint-probe-builder /usr/local/bin/checkpoint_probe /usr/local/bin/checkpoint_probe
+COPY --from=checkpoint-probe-builder /usr/local/bin/eredu-parity /usr/local/bin/eredu-parity
 COPY --from=checkpoint-probe-builder /usr/local/bin/cuda_mxfp4_smoke /usr/local/bin/cuda_mxfp4_smoke
 
 COPY validation /opt/eredu/validation

@@ -2,6 +2,7 @@
 
 use crate::{
     backend::{Completion, Submission},
+    observation::{ObservationError, TensorObservation, TensorObservationData},
     scheduler::{
         RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
         SchedulerLimits, SchedulerReport, SemanticStateTransaction, TransitionOutput,
@@ -1076,18 +1077,20 @@ impl RealtimeInputFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeDecisionDiagnostics {
     prediction: usize,
-    shape: Vec<usize>,
-    logits: Vec<f32>,
+    tensor: TensorObservation,
 }
 
 impl RealtimeDecisionDiagnostics {
     /// Creates one portable diagnostic observation.
-    pub fn new(prediction: usize, shape: Vec<usize>, logits: Vec<f32>) -> Self {
-        Self {
+    pub fn new(
+        prediction: usize,
+        shape: Vec<usize>,
+        logits: Vec<f32>,
+    ) -> Result<Self, ObservationError> {
+        Ok(Self {
             prediction,
-            shape,
-            logits,
-        }
+            tensor: TensorObservation::new(shape, TensorObservationData::F32(logits))?,
+        })
     }
     /// Decision ordinal in text-then-depth order.
     pub const fn prediction(&self) -> usize {
@@ -1095,11 +1098,19 @@ impl RealtimeDecisionDiagnostics {
     }
     /// Complete materialized logits shape.
     pub fn shape(&self) -> &[usize] {
-        &self.shape
+        self.tensor.shape()
     }
     /// Complete row-major logits values.
     pub fn logits(&self) -> &[f32] {
-        &self.logits
+        let TensorObservationData::F32(values) = self.tensor.data() else {
+            unreachable!("realtime diagnostics are constructed from F32 values")
+        };
+        values
+    }
+
+    /// General portable tensor observation for this decision.
+    pub const fn tensor(&self) -> &TensorObservation {
+        &self.tensor
     }
 }
 

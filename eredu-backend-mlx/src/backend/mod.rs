@@ -298,6 +298,8 @@ impl<'a> BackendProvider for MlxBackend<'a> {
                 transfers: true,
                 collectives: true,
                 persistent_cache: true,
+                output_observation: true,
+                activation_inspection: true,
             },
         )])
     }
