@@ -18894,11 +18894,10 @@ fn load_nemotron_h_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if external_experts {
-        let target_layers = source_args.num_hidden_layers as usize;
         let entries = crate::composition::nemotron_h::expert_catalog_selected(
             &source_args,
             store.as_ref(),
-            |layer| stage.range().contains(&layer) || (owns_mtp && layer >= target_layers),
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
         )?
         .into_iter()
         .filter(|entry| {

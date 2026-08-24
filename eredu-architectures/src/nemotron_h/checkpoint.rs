@@ -1596,5 +1596,14 @@ mod tests {
             prediction.distribution(),
             crate::ExpertResidencyDistribution::ExpertParallel
         );
+        let selected = catalog
+            .into_units_selected_by_owner(|group, unit| group.as_str() == "mtp.0" && unit == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 4);
+        assert!(selected.iter().all(|unit| {
+            unit.identity().layer == 5
+                && unit.owner_group().as_str() == "mtp.0"
+                && unit.owner_unit() == 1
+        }));
     }
 }

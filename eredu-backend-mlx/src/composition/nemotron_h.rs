@@ -378,20 +378,18 @@ pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    expert_catalog_selected(args, store, |_| true)
+    expert_catalog_selected(args, store, |_, _| true)
 }
 
+/// Canonical independent-expert catalog for selected architecture-owned units.
 pub fn expert_catalog_selected(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
-    mut include_layer: impl FnMut(usize) -> bool,
+    owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::nemotron_h::expert_residency_catalog(store, args)
         .map_err(Error::ArchitectureModel)?;
-    let units = catalog
-        .into_units()
-        .into_iter()
-        .filter(|unit| include_layer(unit.identity().layer));
+    let units = catalog.into_units_selected_by_owner(owns_unit);
     crate::composition::architecture_expert_units(units, store, None)
 }
 
