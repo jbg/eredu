@@ -2072,7 +2072,7 @@ impl eredu_runtime::RuntimeStateComponents<MlxNeuralBackend> for PipelineHybridL
                 slots.first().map_or(0, |slot| slot.offset)
             }
             PipelineLayerCache::CompressedLatent { cache, .. } => cache.offset(),
-            _ => 0,
+            PipelineLayerCache::PoolingAttention { cache, .. } => cache.offset(),
         }
     }
 
@@ -2115,6 +2115,34 @@ impl eredu_runtime::RuntimeStateComponents<MlxNeuralBackend> for PipelineHybridL
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn pooling_attention_pipeline_state_preserves_nonzero_position() {
+    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy};
+
+    let policy = LayerCachePolicy::key_only(AttentionPolicy::sliding(32).unwrap(), 1, 8).unwrap();
+    let mut cache = MlxPoolingAttentionCache::resident_from_policy(0, &policy).unwrap();
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    eredu_nn::PoolingAttentionCache::append_local(
+        &mut cache,
+        crate::MlxTensor::from_array(Array::from_slice(&[0.0_f32; 19 * 8], &[1, 19, 8])),
+        &stream,
+    )
+    .unwrap();
+    assert_eq!(cache.offset(), 19);
+
+    let mut cache = PipelineLayerCache::PoolingAttention {
+        global_layer: 0,
+        cache,
+    };
+    let state = PipelineHybridLayerState(&mut cache);
+
+    assert_eq!(
+        eredu_runtime::RuntimeStateComponents::<MlxNeuralBackend>::position(&state),
+        19
+    );
 }
 
 impl eredu_nn::AttentionCache<crate::MlxTensor> for PipelineHybridLayerState<'_> {
