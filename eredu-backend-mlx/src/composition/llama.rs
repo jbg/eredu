@@ -163,7 +163,6 @@ pub fn quantize_neutral_llama_store(
 > {
     let mut target_args = source_args.clone();
     target_args.quantization = Some(quantization);
-    target_args.quantization_config = None;
     target_args.quantized_weights = None;
     target_args.quantized_weight_configs = None;
     let source = NeutralArchitecture::new(source_args.clone(), stream)

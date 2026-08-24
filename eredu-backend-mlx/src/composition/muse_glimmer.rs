@@ -1267,7 +1267,6 @@ fn quantize_store(
 > {
     let mut target = source.clone();
     target.quantization = Some(quantization);
-    target.quantization_config = None;
     target.quantized_weights = None;
     target.quantized_weight_configs = None;
     target.vision_config.weight_quantization = Some(quantization);
@@ -1378,7 +1377,7 @@ fn load_store(
         },
     )?;
     metadata.set_model_type(args.model_type.clone());
-    metadata.set_quantization(args.quantization.or(args.quantization_config));
+    metadata.set_quantization(args.quantization);
     metadata.set_materialization(materialization);
     let execution = if residency.is_fully_resident() {
         Execution::Resident(LayerwiseRuntime::new_policy_first(
@@ -1549,7 +1548,7 @@ fn load_parallel_store(
         },
     )?;
     metadata.set_model_type(args.model_type.clone());
-    metadata.set_quantization(args.quantization.or(args.quantization_config));
+    metadata.set_quantization(args.quantization);
     let local_parameter_bytes = metadata
         .static_device_bytes()
         .checked_add(metadata.layer_parameter_bytes())
@@ -1660,7 +1659,7 @@ pub fn load_safetensors(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
-    let current = args.quantization.or(args.quantization_config);
+    let current = args.quantization;
     let requested = quantization
         .map(|requested| {
             should_quantize_on_load("Muse-Glimmer", current, requested)

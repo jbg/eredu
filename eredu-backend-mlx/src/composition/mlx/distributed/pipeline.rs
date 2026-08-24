@@ -14525,7 +14525,7 @@ fn load_llama_pipeline(
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Llama pipeline",
-                source_args.quantization.or(source_args.quantization_config),
+                source_args.quantization,
                 requested,
             )
             .map(|required| required.then_some(requested))
@@ -14819,7 +14819,7 @@ fn load_qwen_pipeline(
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen pipeline",
-                source_args.quantization.or(source_args.quantization_config),
+                source_args.quantization,
                 requested,
             )
             .map(|required| required.then_some(requested))
@@ -15191,12 +15191,8 @@ fn load_muse_glimmer_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            should_quantize_on_load(
-                "Muse-Glimmer pipeline",
-                source_args.quantization.or(source_args.quantization_config),
-                requested,
-            )
-            .map(|required| required.then_some(requested))
+            should_quantize_on_load("Muse-Glimmer pipeline", source_args.quantization, requested)
+                .map(|required| required.then_some(requested))
         })
         .transpose()?
         .flatten();
@@ -15204,7 +15200,6 @@ fn load_muse_glimmer_pipeline(
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
-        target_args.quantization_config = None;
         target_args.quantized_weight_configs = None;
         target_args.vision_config.weight_quantization = Some(quantization);
         target_args.vision_config.quantized_weight_configs.clear();

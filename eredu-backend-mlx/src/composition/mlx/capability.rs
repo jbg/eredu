@@ -974,7 +974,6 @@ mod tests {
                 None => eredu_core::attention::LayerSchedule::all_full(2).unwrap(),
             },
             quantization: None,
-            quantization_config: None,
             quantized_weights: None,
             quantized_weight_configs: None,
         }

@@ -243,7 +243,6 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
             rope_scaling: args.rope_scaling.clone(),
             attention_schedule: args.attention_schedule.clone(),
             quantization: None,
-            quantization_config: None,
             quantized_weights: None,
             quantized_weight_configs: None,
         },

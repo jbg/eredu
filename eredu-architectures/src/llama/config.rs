@@ -60,10 +60,8 @@ pub struct ModelArgs {
     pub rope_scaling: Option<HashMap<String, RopeValue>>,
     /// Exact ordered attention policy for every decoder layer.
     pub attention_schedule: LayerSchedule<AttentionPolicy>,
-    /// Preferred model-wide stored weight encoding.
+    /// Canonical model-wide stored weight encoding.
     pub quantization: Option<WeightQuantization>,
-    /// Hugging Face-compatible alias for `quantization`.
-    pub quantization_config: Option<WeightQuantization>,
     /// Exact canonical names using the model-wide encoding.
     pub quantized_weights: Option<HashSet<String>>,
     /// Exact per-parameter encodings for mixed checkpoints.
@@ -112,7 +110,7 @@ impl ModelArgs {
 
     /// Returns the model-wide checkpoint encoding, if packed.
     pub fn weight_quantization(&self) -> Option<WeightQuantization> {
-        self.quantization.or(self.quantization_config)
+        self.quantization
     }
 
     /// Returns the physical encoding for one canonical parameter name.
@@ -311,7 +309,6 @@ pub fn model_args_from_gguf_catalog(
         rope_scaling,
         attention_schedule,
         quantization: None,
-        quantization_config: None,
         quantized_weights: None,
         quantized_weight_configs: None,
     };
@@ -434,6 +431,15 @@ fn normalize_model_args(mut source: ModelArgsSource) -> Result<ModelArgs, Config
         Some(window) => LayerSchedule::all_sliding(layer_count, window),
     }
     .map_err(|error| invalid(error.to_string()))?;
+    let quantization = match (source.quantization, source.quantization_config) {
+        (Some(first), Some(second)) if first != second => {
+            return Err(invalid(
+                "Llama quantization and quantization_config disagree",
+            ));
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    };
     let args = ModelArgs {
         model_type: source.model_type,
         hidden_size: source.hidden_size,
@@ -452,8 +458,7 @@ fn normalize_model_args(mut source: ModelArgsSource) -> Result<ModelArgs, Config
         mlp_bias: source.mlp_bias,
         rope_scaling: source.rope_scaling,
         attention_schedule,
-        quantization: source.quantization,
-        quantization_config: source.quantization_config,
+        quantization,
         quantized_weights: None,
         quantized_weight_configs: None,
     };
@@ -660,6 +665,34 @@ mod tests {
         assert_eq!(
             args.weight_quantization_for("model.layers.0.mlp.up_proj.weight"),
             None
+        );
+    }
+
+    #[test]
+    fn canonicalizes_quantization_alias_and_rejects_conflicts() {
+        let mut value = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64,
+            "quantization_config": {"group_size": 32, "bits": 4}
+        });
+        let args = model_args_from_config_value(&value).unwrap();
+        assert_eq!(
+            args.quantization,
+            Some(WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()
+            ))
+        );
+
+        value["quantization"] = serde_json::json!({"group_size": 64, "bits": 4});
+        let error = model_args_from_config_value(&value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Llama quantization and quantization_config disagree"
         );
     }
 

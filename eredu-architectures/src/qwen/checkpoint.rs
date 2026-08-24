@@ -29,7 +29,6 @@ pub fn load_time_quantization(
     quantization.validate().map_err(|error| error.to_string())?;
     let mut target = args.clone();
     target.quantization = Some(quantization);
-    target.quantization_config = None;
     target.quantized_weights = None;
     target.quantized_weight_configs = None;
     target.validate().map_err(|error| error.to_string())?;
@@ -923,7 +922,7 @@ mod tests {
     #[test]
     fn load_time_quantization_replaces_checkpoint_format_policy() {
         let mut source = args("qwen3", false);
-        source.quantization_config = Some(WeightQuantization::MxFp4);
+        source.quantization = Some(WeightQuantization::MxFp4);
         source.quantized_weights = Some(["model.layers.0.self_attn.q_proj.weight".into()].into());
         source.quantized_weight_configs = Some(HashMap::from([(
             "model.layers.0.self_attn.q_proj.weight".into(),
@@ -935,11 +934,10 @@ mod tests {
         let target = load_time_quantization(&source, quantization).unwrap();
 
         assert_eq!(target.quantization, Some(quantization));
-        assert_eq!(target.quantization_config, None);
         assert_eq!(target.quantized_weights, None);
         assert_eq!(target.quantized_weight_configs, None);
         target.validate().unwrap();
-        assert_eq!(source.quantization_config, Some(WeightQuantization::MxFp4));
+        assert_eq!(source.quantization, Some(WeightQuantization::MxFp4));
         assert!(source.quantized_weights.is_some());
         assert!(source.quantized_weight_configs.is_some());
     }

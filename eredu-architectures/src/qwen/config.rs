@@ -106,10 +106,8 @@ pub struct ModelArgs {
     pub num_experts_per_tok: i32,
     /// Whether selected expert scores are renormalized.
     pub norm_topk_prob: bool,
-    /// Preferred model-wide checkpoint encoding.
+    /// Canonical model-wide checkpoint encoding.
     pub quantization: Option<WeightQuantization>,
-    /// Hugging Face-compatible alias for `quantization`.
-    pub quantization_config: Option<WeightQuantization>,
     /// Exact canonical names using model-wide quantization.
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-parameter encodings for mixed checkpoints.
@@ -175,7 +173,7 @@ impl ModelArgs {
 
     /// Returns the model-wide physical encoding, if any.
     pub fn weight_quantization(&self) -> Option<WeightQuantization> {
-        self.quantization.or(self.quantization_config)
+        self.quantization
     }
 
     /// Returns the physical encoding for one canonical parameter identity.
@@ -316,6 +314,15 @@ pub fn model_args_from_text_config_value(
         })?,
     )?;
     validate_source_policy(variant, &source)?;
+    let quantization = match (source.quantization, source.quantization_config) {
+        (Some(first), Some(second)) if first != second => {
+            return Err(invalid(
+                "Qwen quantization and quantization_config disagree",
+            ));
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    };
     let args = ModelArgs {
         variant,
         model_type: canonical_model_type.into(),
@@ -341,8 +348,7 @@ pub fn model_args_from_text_config_value(
         num_experts: source.num_experts,
         num_experts_per_tok: source.num_experts_per_tok,
         norm_topk_prob: source.norm_topk_prob,
-        quantization: source.quantization,
-        quantization_config: source.quantization_config,
+        quantization,
         quantized_weights: None,
         quantized_weight_configs: None,
     };
@@ -534,7 +540,6 @@ pub fn model_args_from_gguf_catalog_with_context(
         },
         norm_topk_prob: is_moe,
         quantization: None,
-        quantization_config: None,
         quantized_weights: None,
         quantized_weight_configs: None,
     };
@@ -1031,6 +1036,26 @@ mod tests {
         assert!(!qwen2.attention_bias(AttentionProjection::Output));
         assert_eq!(qwen2.query_key_norm_epsilon(), None);
         assert_eq!(qwen3.query_key_norm_epsilon(), Some(0.000001));
+    }
+
+    #[test]
+    fn canonicalizes_quantization_alias_and_rejects_conflicts() {
+        let mut value = base("qwen3");
+        value["quantization_config"] = serde_json::json!({"group_size": 32, "bits": 4});
+        let args = model_args_from_config_value(&value).unwrap();
+        assert_eq!(
+            args.quantization,
+            Some(WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()
+            ))
+        );
+
+        value["quantization"] = serde_json::json!({"group_size": 64, "bits": 4});
+        let error = model_args_from_config_value(&value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Qwen quantization and quantization_config disagree"
+        );
     }
 
     #[test]

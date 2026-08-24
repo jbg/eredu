@@ -972,7 +972,6 @@ fn tiny_args() -> ModelArgs {
         rope_scaling: None,
         attention_schedule: LayerSchedule::new(2, vec![AttentionPolicy::Full; 2]).unwrap(),
         quantization: None,
-        quantization_config: None,
         quantized_weights: None,
         quantized_weight_configs: None,
     }

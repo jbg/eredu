@@ -190,10 +190,8 @@ pub struct DecoderConfig {
     pub final_logit_softcapping: f32,
     /// Source-specific parameter convention.
     pub weight_convention: WeightConvention,
-    /// Preferred uniform quantization.
+    /// Canonical uniform quantization.
     pub quantization: Option<WeightQuantization>,
-    /// Converter-compatible uniform quantization alias.
-    pub quantization_config: Option<WeightQuantization>,
     /// Exact names quantized under a mixed artifact.
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight mixed encodings.
@@ -348,6 +346,15 @@ impl DecoderConfig {
             source.hidden_size,
             projector_hidden_size,
         )?;
+        let quantization = match (source.quantization, source.quantization_config) {
+            (Some(first), Some(second)) if first != second => {
+                return Err(invalid(
+                    "Muse-Glimmer quantization and quantization_config disagree",
+                ));
+            }
+            (Some(value), _) | (_, Some(value)) => Some(value),
+            (None, None) => None,
+        };
         let config = Self {
             model_type: source.model_type,
             hidden_size: source.hidden_size,
@@ -381,8 +388,7 @@ impl DecoderConfig {
             output_multiplier: source.output_multiplier,
             final_logit_softcapping: source.final_logit_softcapping,
             weight_convention: WeightConvention::HuggingFace,
-            quantization: source.quantization,
-            quantization_config: source.quantization_config,
+            quantization,
             quantized_weights: None,
             quantized_weight_configs: None,
             image_token_id: required_u32(value, "image_token_id")?,
@@ -496,7 +502,6 @@ impl DecoderConfig {
             final_logit_softcapping: gguf_f32(metadata, &key("final_logit_softcapping"))?,
             weight_convention: WeightConvention::Gguf,
             quantization: None,
-            quantization_config: None,
             quantized_weights: None,
             quantized_weight_configs: None,
             vision_config: vision,
@@ -578,7 +583,7 @@ impl DecoderConfig {
         {
             return Some(*format);
         }
-        let format = self.quantization.or(self.quantization_config)?;
+        let format = self.quantization?;
         match &self.quantized_weights {
             Some(names) if !names.contains(name) => None,
             _ => Some(format),
@@ -1124,6 +1129,27 @@ mod tests {
         );
         assert_eq!(config.layer_uses_rope, [true, false]);
         assert_eq!(config.vision_config.schedule, [VisionAttentionPolicy::Full]);
+    }
+
+    #[test]
+    fn canonicalizes_quantization_alias_and_rejects_conflicts() {
+        let mut value = config();
+        value["text_config"]["quantization_config"] =
+            serde_json::json!({"group_size": 32, "bits": 4});
+        let args = DecoderConfig::from_hf_value(&value).unwrap();
+        assert_eq!(
+            args.quantization,
+            Some(WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()
+            ))
+        );
+
+        value["text_config"]["quantization"] = serde_json::json!({"group_size": 64, "bits": 4});
+        let error = DecoderConfig::from_hf_value(&value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Muse-Glimmer quantization and quantization_config disagree"
+        );
     }
 
     #[test]
