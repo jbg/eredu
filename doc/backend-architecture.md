@@ -40,7 +40,8 @@ alias neutral crates into its namespace; direct backend consumers import
 neutral contracts from their owning crates.
 
 The facade likewise does not alias `eredu-core` or re-export `eredu-runtime`
-infrastructure. Cache workers, storage bindings, residency engines, parameter
+infrastructure. Cache workers, checkpoint storage bindings, residency and
+prefetch engines, generic schedulers and work-lifecycle contracts, parameter
 plans, and other infrastructure contracts are imported from their owning
 crates. The facade root retains only deliberately application-facing types.
 

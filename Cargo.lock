@@ -928,6 +928,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu",
+ "eredu-checkpoint",
  "eredu-core",
  "eredu-runtime",
  "hf-hub",

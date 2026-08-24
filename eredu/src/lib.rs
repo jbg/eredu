@@ -30,10 +30,7 @@ pub use eredu_architectures::{
     prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
 };
 pub use eredu_architectures::{GgufArchitecture, ModelKind};
-pub use eredu_checkpoint::{
-    store::{WeightStoreBackend, WeightStoreDiagnostics},
-    AffineQuantization, WeightQuantization,
-};
+pub use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 pub use eredu_core::artifact::{
     plan_model_preparation, ArtifactFormat, ArtifactInspection, LoadingProtocol,
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,
@@ -52,20 +49,6 @@ pub use eredu_core::generation::{
     CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,
     GenerationConfigOverrides, MtpConfig, MtpRequestId, MtpRequestPhase, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
-};
-pub use eredu_core::residency::{
-    AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
-    MemoryTier, OffloadConfig, OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry,
-    OffloadUnitId, OffloadUnitSpec, PrefetchAdmission, PrefetchCompletion,
-    PrefetchDemandObservation, PrefetchDemandResolution, PrefetchExecutionState, PrefetchMetrics,
-    PrefetchOutcome, PrefetchStateError, PrefetchWork, ProcessMetrics, ResidencyBlocker,
-    ResidencyLedger, ResidencyLedgerError, ResidencyPolicy, TierByteTotals, TierUnitTotals,
-    TransferDirection, TransferMetrics, UnitResidencyReport, OFFLOAD_PLAN_SCHEMA_VERSION,
-};
-pub use eredu_core::scheduler::{
-    CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
-    SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
-    TransitionOutput, WorkDescriptor, WorkId, WorkLifecycle,
 };
 pub use eredu_core::{
     load_model, load_realtime_model, load_realtime_model_with_options, Admission,

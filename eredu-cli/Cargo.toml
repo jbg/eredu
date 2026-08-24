@@ -24,6 +24,7 @@ anyhow.workspace = true
 clap.workspace = true
 hf-hub = { version = "=1.0.0", features = ["blocking"] }
 eredu.workspace = true
+eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-runtime.workspace = true
 serde.workspace = true

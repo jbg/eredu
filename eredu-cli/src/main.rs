@@ -30,9 +30,10 @@ use eredu::{
     FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
     HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
     PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TextGenerationConfig,
-    TimingTelemetry, TokenOutput, WeightQuantization, WeightStoreDiagnostics,
-    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    TimingTelemetry, TokenOutput, WeightQuantization, WeightTransformationPlan,
+    EXECUTION_PLAN_SCHEMA_VERSION,
 };
+use eredu_checkpoint::store::WeightStoreDiagnostics;
 use eredu_core::{
     residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     speculative::MtpStats,
@@ -4624,8 +4625,8 @@ mod tests {
 
     #[test]
     fn concise_weight_store_diagnostics_omit_shard_paths() {
-        let diagnostics = eredu::WeightStoreDiagnostics {
-            backend: eredu::WeightStoreBackend::Safetensors,
+        let diagnostics = eredu_checkpoint::store::WeightStoreDiagnostics {
+            backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
             mapping_hits: 17,
             mapping_misses: 2,
             evictions: 1,
