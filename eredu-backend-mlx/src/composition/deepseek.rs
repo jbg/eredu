@@ -1,10 +1,6 @@
 //! Unified neutral DeepSeek-V3/V4 loading across layer-residency policies.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use eredu_architectures::deepseek::{self, V3Args, V4Args};
 use eredu_checkpoint::WeightQuantization;
@@ -13,12 +9,7 @@ use eredu_runtime::{
     LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeLayerState,
     RuntimeState, StateSegmentId, WeightResidency,
 };
-use safemlx::{
-    distributed::Group,
-    error::Exception,
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
-};
+use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::backend::runtime::{
     distributed::parallel::ParallelBuildContext, execution::layerwise::shard_layer_bindings,
@@ -2494,15 +2485,10 @@ pub fn load_safetensors(
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
     let expert_options = residency.expert_cache();
-    let value = artifact.config()?;
     let store = artifact.store();
-    let configuration = eredu_architectures::configuration::resolve_model_identity(value)?;
-    match configuration.kind {
-        eredu_architectures::ModelKind::DeepSeekV3 => {
-            let args =
-                deepseek::parse_v3_config(value).map_err(|error| unsupported(error.to_string()))?;
-            let plan = deepseek::v3_safetensors_plan(&args, true).map_err(unsupported)?;
-            let store = resolve_safetensors_store(store, &plan, &args.model_type)?;
+    match artifact.model() {
+        eredu_architectures::configuration::SafetensorsModelConfig::DeepSeekV3(args) => {
+            let args = args.clone();
             let (store, args, materialization) = match quantization {
                 Some(quantization) => {
                     let (store, args, report) =
@@ -2527,11 +2513,8 @@ pub fn load_safetensors(
             }
             Ok(model)
         }
-        eredu_architectures::ModelKind::DeepSeekV4 => {
-            let args =
-                deepseek::parse_v4_config(value).map_err(|error| unsupported(error.to_string()))?;
-            let plan = deepseek::v4_safetensors_plan(&args).map_err(unsupported)?;
-            let store = resolve_safetensors_store(store, &plan, &args.model_type)?;
+        eredu_architectures::configuration::SafetensorsModelConfig::DeepSeekV4(args) => {
+            let args = args.clone();
             let (store, args, materialization) = match quantization {
                 Some(quantization) => {
                     let (store, args, report) =
@@ -2556,131 +2539,82 @@ pub fn load_safetensors(
             }
             Ok(model)
         }
-        kind => Err(unsupported(format!(
-            "neutral DeepSeek loader received {}",
-            kind.canonical_name()
-        ))),
+        _ => Err(unsupported(
+            "DeepSeek loader received a different prepared architecture",
+        )),
     }
 }
 
 /// Loads a GGUF DeepSeek family through the neutral architecture.
 pub fn load_gguf(
-    checkpoint: &GgufCheckpoint,
-    _metadata: &HashMap<String, GgufMetadataValue>,
-    family_v4: bool,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
-    load_gguf_internal(
-        checkpoint,
-        _metadata,
-        family_v4,
-        residency,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_gguf_internal(
-    checkpoint: &GgufCheckpoint,
-    _metadata: &HashMap<String, GgufMetadataValue>,
-    family_v4: bool,
-    residency: WeightResidency,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekModel, Error> {
+    let checkpoint = source.checkpoint();
     let expert_options = residency.expert_cache();
-    let portable_metadata = checkpoint
-        .catalog()
-        .metadata()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<HashMap<_, _>>();
     let options = residency.layers();
-    let model = if family_v4 {
-        let mut args = deepseek::parse_v4_gguf(&portable_metadata)
-            .map_err(|error| unsupported(error.to_string()))?;
-        let mut linear_formats =
-            gguf_quantization_configs(checkpoint, deepseek::translate_v4_gguf_weight_name)?
-                .into_iter()
-                .map(|(name, format)| (name, format.into()))
-                .collect();
-        deepseek::normalize_v4_weight_formats(&args, &mut linear_formats);
-        args.linear_formats = linear_formats;
-        let plan = deepseek::v4_gguf_plan(&args).map_err(unsupported)?;
-        let store = Arc::new(open_gguf_checkpoint_source(
-            checkpoint.clone(),
-            &plan,
-            deepseek::translate_v4_gguf_weight_name,
-            residency.max_mapped_shards(),
-        )?);
-        DeepSeekModel::load_v4(
-            store,
-            args,
-            options,
-            stream,
-            weights_stream,
-            expert_options.is_some(),
-        )?
-    } else {
-        let catalog = PortableCatalog(checkpoint.catalog());
-        let mut args = deepseek::parse_v3_gguf(&catalog, &portable_metadata)
-            .map_err(|error| unsupported(error.to_string()))?;
-        let mut linear_formats =
-            gguf_quantization_configs(checkpoint, deepseek::translate_v3_gguf_weight_name)?
-                .into_iter()
-                .map(|(name, format)| (name, format.into()))
-                .collect();
-        deepseek::normalize_v3_weight_formats(&args, &mut linear_formats);
-        args.linear_formats = linear_formats;
-        let plan = deepseek::v3_gguf_plan(&args).map_err(unsupported)?;
-        let store = Arc::new(open_gguf_checkpoint_source(
-            checkpoint.clone(),
-            &plan,
-            deepseek::translate_v3_gguf_weight_name,
-            residency.max_mapped_shards(),
-        )?);
-        DeepSeekModel::load_v3(
-            store,
-            args,
-            options,
-            stream,
-            weights_stream,
-            expert_options.is_some(),
-        )?
+    let model = match source.model() {
+        eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) => {
+            let mut args = args.clone();
+            let mut linear_formats =
+                gguf_quantization_configs(checkpoint, deepseek::translate_v4_gguf_weight_name)?
+                    .into_iter()
+                    .map(|(name, format)| (name, format.into()))
+                    .collect();
+            deepseek::normalize_v4_weight_formats(&args, &mut linear_formats);
+            args.linear_formats = linear_formats;
+            let store = Arc::new(open_gguf_checkpoint_source(
+                checkpoint.clone(),
+                source.plan().checkpoint(),
+                deepseek::translate_v4_gguf_weight_name,
+                residency.max_mapped_shards(),
+            )?);
+            DeepSeekModel::load_v4(
+                store,
+                args,
+                options,
+                stream,
+                weights_stream,
+                expert_options.is_some(),
+            )?
+        }
+        eredu_architectures::configuration::GgufModelConfig::DeepSeekV3(args) => {
+            let mut args = args.clone();
+            let mut linear_formats =
+                gguf_quantization_configs(checkpoint, deepseek::translate_v3_gguf_weight_name)?
+                    .into_iter()
+                    .map(|(name, format)| (name, format.into()))
+                    .collect();
+            deepseek::normalize_v3_weight_formats(&args, &mut linear_formats);
+            args.linear_formats = linear_formats;
+            let store = Arc::new(open_gguf_checkpoint_source(
+                checkpoint.clone(),
+                source.plan().checkpoint(),
+                deepseek::translate_v3_gguf_weight_name,
+                residency.max_mapped_shards(),
+            )?);
+            DeepSeekModel::load_v3(
+                store,
+                args,
+                options,
+                stream,
+                weights_stream,
+                expert_options.is_some(),
+            )?
+        }
+        _ => {
+            return Err(unsupported(
+                "DeepSeek GGUF loader received a different prepared model",
+            ))
+        }
     };
     let mut model = model;
     if let Some(options) = expert_options {
         model.attach_expert_cache(options, stream, weights_stream)?;
     }
     Ok(model)
-}
-
-struct PortableCatalog<'a>(&'a eredu_gguf::Checkpoint);
-
-impl deepseek::GgufTensorCatalog for PortableCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-}
-
-fn resolve_safetensors_store(
-    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    plan: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
-    identity: &str,
-) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
-        .map_err(|validation| {
-            unsupported(format!(
-                "{identity} checkpoint contract did not resolve: {validation:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
 }
 
 fn execution_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>

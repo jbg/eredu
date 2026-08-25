@@ -1,7 +1,7 @@
 //! Neutral Gemma 4 binding to MLX storage, state, and residency policy.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
 };
@@ -26,7 +26,7 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{NewAxis, TryIndexOp},
-        maximum, pad, GgufCheckpoint, GgufMetadataValue, PadWidth,
+        maximum, pad, GgufCheckpoint, PadWidth,
     },
     Array, Stream,
 };
@@ -1471,23 +1471,6 @@ fn execution_ordinal(
         .ok_or_else(|| Error::Parallel(format!("Gemma 4 has no unit {index} in group {group}")))
 }
 
-pub fn resolve_pipeline_store(
-    store: SharedCheckpointSource,
-    args: &FamilyConfig,
-) -> Result<SharedCheckpointSource, Error> {
-    let plan =
-        eredu_architectures::gemma4::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|error| {
-            Error::ArchitectureModel(format!(
-                "Gemma 4 checkpoint contract did not resolve: {error:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
 fn quantize_store(
     store: SharedCheckpointSource,
     source: &FamilyConfig,
@@ -1845,28 +1828,26 @@ pub fn load_safetensors_tensor_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
-    let args = FamilyConfig::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Gemma4(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Gemma 4 loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_pipeline_store(store, &args)?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
 pub fn load_gguf_tensor_parallel(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
-    let (store, args) = open_pipeline_gguf_store(
-        checkpoint,
-        projector,
-        metadata,
-        residency.max_mapped_shards(),
-    )?;
+    let (store, args) = open_pipeline_gguf_store(source, projector, residency.max_mapped_shards())?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
@@ -1898,10 +1879,14 @@ pub fn load_safetensors(
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
     let expert_options = residency.expert_cache();
-    let args = FamilyConfig::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Gemma4(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Gemma 4 loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_pipeline_store(store, &args)?;
     let requested = quantization
         .map(|requested| {
             should_quantize_on_load("Gemma 4", args.text.weight_quantization, requested)
@@ -1934,20 +1919,14 @@ pub fn load_safetensors(
 /// Loads a Gemma 4 decoder and optional sibling media projector through the
 /// same neutral family object.
 pub fn load_gguf(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
     let expert_options = residency.expert_cache();
-    let (store, args) = open_pipeline_gguf_store(
-        checkpoint,
-        projector,
-        metadata,
-        residency.max_mapped_shards(),
-    )?;
+    let (store, args) = open_pipeline_gguf_store(source, projector, residency.max_mapped_shards())?;
     let mut model = load_store(
         store,
         args,
@@ -1964,25 +1943,24 @@ pub fn load_gguf(
 }
 
 pub fn open_pipeline_gguf_store(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, FamilyConfig), Error> {
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     let projector_metadata =
         projector.map(crate::backend::runtime::checkpoint::load::gguf_metadata);
     if let Some(metadata) = projector_metadata.as_ref() {
         eredu_architectures::gemma4::validate_projector_identity(metadata)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
-    let names = checkpoint
-        .catalog()
-        .tensors()
-        .flat_map(|tensor| tensor.outputs())
-        .map(|output| output.name.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut text = eredu_architectures::gemma4::ModelArgs::from_gguf_metadata(&names, metadata)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::GgufModelConfig::Gemma4(family) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "Gemma 4 GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut text = family.text.clone();
     text.quantized_weight_configs = Some(gguf_quantization_configs(
         checkpoint,
         eredu_architectures::gemma4::translate_gguf_weight_name,
@@ -2029,13 +2007,13 @@ pub fn open_pipeline_gguf_store(
         .validate()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
-    let plan =
-        eredu_architectures::gemma4::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
     let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
-        .add_checkpoint(checkpoint.catalog().clone(), &plan, |name| {
-            eredu_architectures::gemma4::translate_gguf_weight_name(name)
-        })?;
+        .add_checkpoint(
+            checkpoint.catalog().clone(),
+            source.plan().checkpoint(),
+            |name| eredu_architectures::gemma4::translate_gguf_weight_name(name),
+        )?;
     let builder = if let Some(projector) = projector.as_ref() {
         let plan = eredu_architectures::gemma4::mmproj_gguf_plan(&args)
             .map_err(Error::ArchitectureModel)?;

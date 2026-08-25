@@ -1,6 +1,6 @@
 //! Neutral Muse-Glimmer binding to MLX storage and execution policy.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use eredu_architectures::{
     media_plan,
@@ -21,7 +21,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint},
     Stream,
 };
 
@@ -37,7 +37,7 @@ use crate::backend::{
                 materialize_module_bindings, parameter_name_in_targets,
                 populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
             },
-            load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
+            load::{gguf_metadata, gguf_quantization_configs},
             quantization::should_quantize_on_load,
         },
         execution::{
@@ -1235,23 +1235,6 @@ impl CausalModel<MlxKeyValueState> for MuseGlimmerModel {
     }
 }
 
-fn resolve_store(
-    store: SharedCheckpointSource,
-    args: &DecoderConfig,
-) -> Result<SharedCheckpointSource, Error> {
-    let plan = eredu_architectures::muse_glimmer::safetensors_plan(args)
-        .map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|error| {
-            Error::ArchitectureModel(format!(
-                "Muse-Glimmer checkpoint contract did not resolve: {error:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
 fn quantize_store(
     store: SharedCheckpointSource,
     source: &DecoderConfig,
@@ -1602,28 +1585,27 @@ pub fn load_safetensors_tensor_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let args = DecoderConfig::from_hf_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::MuseGlimmer(args) =
+        artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Muse-Glimmer loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
 pub fn load_gguf_tensor_parallel(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let (store, args) = open_gguf_store(
-        checkpoint,
-        projector,
-        metadata,
-        residency.max_mapped_shards(),
-    )?;
+    let (store, args) = open_gguf_store(source, projector, residency.max_mapped_shards())?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
@@ -1655,10 +1637,15 @@ pub fn load_safetensors(
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
     let expert_options = residency.expert_cache();
-    let args = DecoderConfig::from_hf_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::MuseGlimmer(args) =
+        artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Muse-Glimmer loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     let current = args.quantization;
     let requested = quantization
         .map(|requested| {
@@ -1691,20 +1678,14 @@ pub fn load_safetensors(
 
 /// Loads split text/projector GGUF through the same neutral family object.
 pub fn load_gguf(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
     let expert_options = residency.expert_cache();
-    let (store, args) = open_gguf_store(
-        checkpoint,
-        projector,
-        metadata,
-        residency.max_mapped_shards(),
-    )?;
+    let (store, args) = open_gguf_store(source, projector, residency.max_mapped_shards())?;
     let mut model = load_store(
         store,
         args,
@@ -1721,31 +1702,36 @@ pub fn load_gguf(
 }
 
 fn open_gguf_store(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, DecoderConfig), Error> {
+    let checkpoint = source.checkpoint();
     let projector_metadata = gguf_metadata(projector);
     let projector_quantization = gguf_quantization_configs(
         projector,
         eredu_architectures::muse_glimmer::translate_projector_gguf_name,
     )?;
-    let args = DecoderConfig::from_gguf_catalog(&GgufCatalog(checkpoint), metadata)
-        .and_then(|args| {
-            args.with_gguf_projector_metadata(&projector_metadata, projector_quantization)
-        })
+    let eredu_architectures::configuration::GgufModelConfig::MuseGlimmer(args) = source.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Muse-Glimmer GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let args = args
+        .clone()
+        .with_gguf_projector_metadata(&projector_metadata, projector_quantization)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let text_plan =
-        eredu_architectures::muse_glimmer::gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let projector_plan = eredu_architectures::muse_glimmer::projector_gguf_plan(&args)
         .map_err(Error::ArchitectureModel)?;
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(max_cached_readers)?
-            .add_checkpoint(checkpoint.catalog().clone(), &text_plan, |name| {
-                eredu_architectures::muse_glimmer::translate_text_gguf_name(name)
-            })?
+            .add_checkpoint(
+                checkpoint.catalog().clone(),
+                source.plan().checkpoint(),
+                |name| eredu_architectures::muse_glimmer::translate_text_gguf_name(name),
+            )?
             .add_checkpoint(projector.catalog().clone(), &projector_plan, |name| {
                 eredu_architectures::muse_glimmer::translate_projector_gguf_name(name)
             })?
@@ -1754,20 +1740,11 @@ fn open_gguf_store(
     Ok((store, args))
 }
 
-struct GgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl eredu_architectures::muse_glimmer::GgufTensorCatalog for GgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0.contains_gguf_tensor(name)
-    }
-}
-
 pub fn prepare_gguf_pipeline_source(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(DecoderConfig, SharedCheckpointSource), Error> {
-    let (store, args) = open_gguf_store(checkpoint, projector, metadata, max_cached_readers)?;
+    let (store, args) = open_gguf_store(source, projector, max_cached_readers)?;
     Ok((args, store))
 }

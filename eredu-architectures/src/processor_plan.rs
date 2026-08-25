@@ -427,7 +427,7 @@ fn parse_qwen_visual_source(source: &QwenVisualSource) -> Result<(), ProcessorPl
 #[derive(Debug, Clone)]
 enum ArtifactFamilyPlan {
     Safetensors(SafetensorsArchitecturePlan),
-    Gguf(GgufArchitecture),
+    Gguf(crate::configuration::GgufArchitecturePlan),
 }
 
 #[derive(Debug, Clone)]
@@ -458,7 +458,9 @@ impl ArtifactArchitecturePlan {
     }
 
     /// Retains the exact GGUF architecture from resolution.
-    pub(crate) fn from_gguf_architecture(architecture: GgufArchitecture) -> Self {
+    pub(crate) fn from_gguf_architecture(
+        architecture: crate::configuration::GgufArchitecturePlan,
+    ) -> Self {
         Self {
             family: ArtifactFamilyPlan::Gguf(architecture),
             processor: None,
@@ -548,14 +550,14 @@ impl ArtifactArchitecturePlan {
     pub const fn model_kind(&self) -> ModelKind {
         match &self.family {
             ArtifactFamilyPlan::Safetensors(plan) => plan.model_kind(),
-            ArtifactFamilyPlan::Gguf(architecture) => architecture.model_kind(),
+            ArtifactFamilyPlan::Gguf(plan) => plan.model_kind(),
         }
     }
 
     /// Returns the exact normalized GGUF architecture, when applicable.
     pub const fn gguf_architecture(&self) -> Option<GgufArchitecture> {
         match &self.family {
-            ArtifactFamilyPlan::Gguf(architecture) => Some(*architecture),
+            ArtifactFamilyPlan::Gguf(plan) => Some(plan.architecture()),
             ArtifactFamilyPlan::Safetensors(_) => None,
         }
     }
@@ -565,6 +567,14 @@ impl ArtifactArchitecturePlan {
         match &self.family {
             ArtifactFamilyPlan::Safetensors(plan) => Some(plan),
             ArtifactFamilyPlan::Gguf(_) => None,
+        }
+    }
+
+    /// Returns the validated GGUF architecture geometry and checkpoint plan.
+    pub const fn gguf_plan(&self) -> Option<&crate::configuration::GgufArchitecturePlan> {
+        match &self.family {
+            ArtifactFamilyPlan::Gguf(plan) => Some(plan),
+            ArtifactFamilyPlan::Safetensors(_) => None,
         }
     }
 
@@ -2144,6 +2154,27 @@ mod tests {
     use eredu_gguf::{MetadataArray, MetadataValue};
     use std::collections::BTreeMap;
 
+    fn gguf_artifact_plan(architecture: GgufArchitecture) -> ArtifactArchitecturePlan {
+        let args = crate::llama::model_args_from_config_value(&serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64
+        }))
+        .unwrap();
+        let checkpoint = crate::llama::gguf_plan(&args).unwrap();
+        ArtifactArchitecturePlan::from_gguf_architecture(
+            crate::configuration::GgufArchitecturePlan::new(
+                architecture,
+                crate::configuration::GgufModelConfig::Llama(args),
+                checkpoint,
+            ),
+        )
+    }
+
     fn qwen_visual() -> Vec<u8> {
         br#"{
             "size":{"shortest_edge":16,"longest_edge":16},
@@ -2180,7 +2211,7 @@ mod tests {
             GgufArchitecture::MuseGlimmer,
             GgufArchitecture::Qwen35Moe,
         ] {
-            let plan = ArtifactArchitecturePlan::from_gguf_architecture(architecture)
+            let plan = gguf_artifact_plan(architecture)
                 .with_gguf_processors(&BTreeMap::new(), None)
                 .unwrap();
             assert_eq!(plan.model_kind(), architecture.model_kind());
@@ -2224,20 +2255,16 @@ mod tests {
         ]);
         let gemma_projector =
             BTreeMap::from([("clip.vision.patch_size".into(), MetadataValue::Uint32(2))]);
-        assert!(
-            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::Gemma4)
-                .with_gguf_processors(&gemma_model, Some(&gemma_projector))
-                .unwrap()
-                .gemma4()
-                .is_some()
-        );
-        assert!(
-            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::Inkling)
-                .with_gguf_processors(&BTreeMap::new(), Some(&BTreeMap::new()))
-                .unwrap()
-                .inkling()
-                .is_some()
-        );
+        assert!(gguf_artifact_plan(GgufArchitecture::Gemma4)
+            .with_gguf_processors(&gemma_model, Some(&gemma_projector))
+            .unwrap()
+            .gemma4()
+            .is_some());
+        assert!(gguf_artifact_plan(GgufArchitecture::Inkling)
+            .with_gguf_processors(&BTreeMap::new(), Some(&BTreeMap::new()))
+            .unwrap()
+            .inkling()
+            .is_some());
 
         let muse_projector = BTreeMap::from([
             ("clip.vision.patch_size".into(), MetadataValue::Uint32(2)),
@@ -2254,13 +2281,11 @@ mod tests {
                 MetadataValue::Array(MetadataArray::Float32(vec![1.0; 3])),
             ),
         ]);
-        assert!(
-            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::MuseGlimmer)
-                .with_gguf_processors(&BTreeMap::new(), Some(&muse_projector))
-                .unwrap()
-                .muse()
-                .is_some()
-        );
+        assert!(gguf_artifact_plan(GgufArchitecture::MuseGlimmer)
+            .with_gguf_processors(&BTreeMap::new(), Some(&muse_projector))
+            .unwrap()
+            .muse()
+            .is_some());
 
         let qwen_model = BTreeMap::from([(
             "tokenizer.ggml.tokens".into(),
@@ -2269,13 +2294,11 @@ mod tests {
                 "<|vision_end|>".into(),
             ])),
         )]);
-        assert!(
-            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::Qwen3Vl)
-                .with_gguf_processors(&qwen_model, Some(&muse_projector))
-                .unwrap()
-                .qwen()
-                .is_some()
-        );
+        assert!(gguf_artifact_plan(GgufArchitecture::Qwen3Vl)
+            .with_gguf_processors(&qwen_model, Some(&muse_projector))
+            .unwrap()
+            .qwen()
+            .is_some());
     }
 
     #[test]

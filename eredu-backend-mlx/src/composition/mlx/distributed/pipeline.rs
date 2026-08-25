@@ -13386,11 +13386,14 @@ pub fn load_pipeline_model_with_options(
             validated,
             ..
         } => {
-            let architecture = architecture_plan.gguf_architecture().ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "GGUF preparation omitted its architecture-owned GGUF identity".into(),
-                )
-            })?;
+            let architecture = architecture_plan
+                .gguf_plan()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "GGUF preparation omitted its validated architecture plan".into(),
+                    )
+                })?
+                .clone();
             let (admitted, mut companions) =
                 crate::composition::mlx::structural::AdmittedGguf::from_admission(
                     architecture,
@@ -13401,10 +13404,8 @@ pub fn load_pipeline_model_with_options(
                 .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
             let architecture = admitted.architecture();
             let checkpoint = admitted.checkpoint().clone();
-            let metadata = admitted.metadata().clone();
             let capabilities =
-                eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                eredu_architectures::preparation::prepared_gguf_capabilities(admitted.plan());
             validate_distributed_stage_capabilities(
                 capabilities,
                 topology,
@@ -13414,18 +13415,21 @@ pub fn load_pipeline_model_with_options(
             )?;
             return match architecture {
                 GgufArchitecture::DeepSeek4 => {
-                    let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    let gguf_plan = eredu_architectures::deepseek::v4_gguf_plan(&args)
-                        .map_err(Error::ArchitectureModel)?;
+                    let eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) =
+                        admitted.model()
+                    else {
+                        return Err(Error::ArchitectureModel(
+                            "DeepSeek-V4 GGUF plan has mismatched geometry".into(),
+                        ));
+                    };
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         eredu_architectures::deepseek::translate_v4_gguf_weight_name,
                         max_mapped_shards,
                     )?);
                     load_neutral_deepseek_v4_pipeline(
-                        args,
+                        args.clone(),
                         store,
                         topology,
                         options.quantization,
@@ -13441,11 +13445,9 @@ pub fn load_pipeline_model_with_options(
                         None,
                         weights_stream,
                     )?;
-                    let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
-                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         eredu_architectures::llama::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -13462,14 +13464,13 @@ pub fn load_pipeline_model_with_options(
                 GgufArchitecture::MuseGlimmer => {
                     let (args, store) =
                         crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
-                            &checkpoint,
+                            &admitted,
                             projector.as_ref().ok_or_else(|| {
                                 Error::ArchitectureModel(
                                     "Muse-Glimmer preparation omitted its required media projector"
                                         .into(),
                                 )
                             })?,
-                            &metadata,
                             max_mapped_shards,
                         )?;
                     load_muse_glimmer_pipeline(
@@ -13484,21 +13485,21 @@ pub fn load_pipeline_model_with_options(
                     )
                 }
                 GgufArchitecture::DeepSeek2 => {
-                    let args = eredu_architectures::deepseek::parse_v3_gguf(
-                        &PipelineDeepSeekGgufCatalog(&checkpoint),
-                        &metadata,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    let gguf_plan = eredu_architectures::deepseek::v3_gguf_plan(&args)
-                        .map_err(Error::ArchitectureModel)?;
+                    let eredu_architectures::configuration::GgufModelConfig::DeepSeekV3(args) =
+                        admitted.model()
+                    else {
+                        return Err(Error::ArchitectureModel(
+                            "DeepSeek-V3 GGUF plan has mismatched geometry".into(),
+                        ));
+                    };
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         eredu_architectures::deepseek::translate_v3_gguf_weight_name,
                         max_mapped_shards,
                     )?);
                     load_neutral_deepseek_v3_pipeline(
-                        args,
+                        args.clone(),
                         store,
                         topology,
                         options.quantization,
@@ -13510,9 +13511,8 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::Gemma4 => {
                     let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
-                        &checkpoint,
+                        &admitted,
                         projector.as_ref(),
-                        &metadata,
                         max_mapped_shards,
                     )?;
                     load_neutral_gemma4_pipeline(
@@ -13533,11 +13533,9 @@ pub fn load_pipeline_model_with_options(
                     let prepared =
                         crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
                     let args = prepared.args;
-                    let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
-                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         move |name| {
                             eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe)
                         },
@@ -13554,16 +13552,14 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
+                GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
                     let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
-                        architecture,
-                        &checkpoint,
+                        &admitted,
                         projector.as_ref().ok_or_else(|| {
                             Error::ArchitectureModel(
                                 "Qwen3-VL preparation omitted its required media projector".into(),
                             )
                         })?,
-                        &metadata,
                         max_mapped_shards,
                     )?;
                     load_neutral_qwen_vl_pipeline(
@@ -13579,11 +13575,9 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::GptOss => {
                     let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
-                    let gguf_plan =
-                        gpt_oss::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         gpt_oss::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -13601,11 +13595,9 @@ pub fn load_pipeline_model_with_options(
                 architecture @ (GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe) => {
                     let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
                     let is_moe = architecture == GgufArchitecture::Lfm2Moe;
-                    let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
-                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         move |name| {
                             eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe)
                         },
@@ -13624,11 +13616,9 @@ pub fn load_pipeline_model_with_options(
                 }
                 architecture @ (GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe) => {
                     let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
-                    let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
-                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         eredu_architectures::nemotron_h::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -13648,9 +13638,8 @@ pub fn load_pipeline_model_with_options(
                 | GgufArchitecture::Qwen35Moe
                 | GgufArchitecture::Qwen3Next => {
                     let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
-                        &checkpoint,
+                        &admitted,
                         projector.as_ref(),
-                        &metadata,
                         max_mapped_shards,
                     )?;
                     if parsed.vision.is_some() {
@@ -13679,11 +13668,9 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::KimiLinear => {
                     let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
-                    let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
-                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
-                        &gguf_plan,
+                        admitted.plan().checkpoint(),
                         eredu_architectures::kimi_linear::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -13700,9 +13687,8 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::Inkling => {
                     let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
-                        &checkpoint,
+                        &admitted,
                         projector.as_ref(),
-                        &metadata,
                         max_mapped_shards,
                     )?;
                     load_neutral_inkling_pipeline(
@@ -13734,31 +13720,28 @@ pub fn load_pipeline_model_with_options(
         )?,
     };
 
-    let configuration = artifact.configuration();
-    let config = artifact.config()?;
-    let kind = architecture_plan.model_kind();
-    if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
+    if artifact.loading_protocol() == eredu_core::LoadingProtocol::Realtime {
         return Err(Error::ArchitectureModel(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
                 .into(),
         ));
     }
-    let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let capabilities = eredu_architectures::preparation::prepared_safetensors_capabilities(
+        artifact.architecture(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_distributed_stage_capabilities(
         capabilities,
         topology,
         expert_cache.is_some(),
         "SafeTensors",
-        &configuration.effective_model_type,
+        artifact.effective_model_type(),
     )?;
     let store = artifact.store();
-    match kind {
-        ModelKind::Llama => {
-            let args = eredu_architectures::llama::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    match artifact.model() {
+        eredu_architectures::configuration::SafetensorsModelConfig::Llama(args) => {
             load_llama_pipeline(
-                args,
+                args.clone(),
                 store,
                 topology,
                 options.quantization,
@@ -13767,12 +13750,8 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::DeepSeekV3 => {
-            let args = eredu_architectures::deepseek::parse_v3_config(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            let plan = eredu_architectures::deepseek::v3_safetensors_plan(&args, true)
-                .map_err(Error::ArchitectureModel)?;
-            let store = resolve_pipeline_safetensors_store(store, &plan, &args.model_type)?;
+        eredu_architectures::configuration::SafetensorsModelConfig::DeepSeekV3(args) => {
+            let args = args.clone();
             load_neutral_deepseek_v3_pipeline(
                 args,
                 store,
@@ -13784,12 +13763,8 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::DeepSeekV4 => {
-            let args = eredu_architectures::deepseek::parse_v4_config(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args)
-                .map_err(Error::ArchitectureModel)?;
-            let store = resolve_pipeline_safetensors_store(store, &plan, &args.model_type)?;
+        eredu_architectures::configuration::SafetensorsModelConfig::DeepSeekV4(args) => {
+            let args = args.clone();
             load_neutral_deepseek_v4_pipeline(
                 args,
                 store,
@@ -13801,12 +13776,8 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::Gemma4 => {
-            let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
-                &serde_json::to_vec(config)?,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            let store = crate::composition::gemma4::resolve_pipeline_store(store, &args)?;
+        eredu_architectures::configuration::SafetensorsModelConfig::Gemma4(args) => {
+            let args = args.clone();
             load_neutral_gemma4_pipeline(
                 args,
                 store,
@@ -13818,11 +13789,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::Qwen2 | ModelKind::Qwen3 => {
-            let args = eredu_architectures::qwen::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args) => {
             load_qwen_pipeline(
-                args,
+                args.clone(),
                 store,
                 topology,
                 options.quantization,
@@ -13832,13 +13801,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::MuseGlimmer => {
-            let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
-                &serde_json::to_vec(config)?,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        eredu_architectures::configuration::SafetensorsModelConfig::MuseGlimmer(args) => {
             load_muse_glimmer_pipeline(
-                args,
+                args.clone(),
                 store,
                 topology,
                 options.quantization,
@@ -13848,11 +13813,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            let args = eredu_architectures::qwen::vl::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        eredu_architectures::configuration::SafetensorsModelConfig::QwenVl(args) => {
             load_neutral_qwen_vl_pipeline(
-                args,
+                args.clone(),
                 store,
                 topology,
                 options.quantization,
@@ -13862,42 +13825,46 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::GptOss => load_gpt_oss_pipeline(
-            eredu_architectures::gpt_oss::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-            store,
-            topology,
-            options.quantization,
-            dense_stream,
-            expert_cache,
-            stream,
-            weights_stream,
-        ),
-        ModelKind::Lfm2 => load_lfm2_pipeline(
-            eredu_architectures::lfm2::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-            store,
-            topology,
-            options.quantization,
-            dense_stream,
-            expert_cache,
-            stream,
-            weights_stream,
-        ),
-        ModelKind::NemotronH => load_nemotron_h_pipeline(
-            eredu_architectures::nemotron_h::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-            store,
-            topology,
-            options.quantization,
-            dense_stream,
-            expert_cache,
-            stream,
-            weights_stream,
-        ),
-        ModelKind::Qwen3Next => {
-            let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        eredu_architectures::configuration::SafetensorsModelConfig::GptOss(args) => {
+            load_gpt_oss_pipeline(
+                args.clone(),
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                expert_cache,
+                stream,
+                weights_stream,
+            )
+        }
+        eredu_architectures::configuration::SafetensorsModelConfig::Lfm2(args) => {
+            load_lfm2_pipeline(
+                args.clone(),
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                expert_cache,
+                stream,
+                weights_stream,
+            )
+        }
+        eredu_architectures::configuration::SafetensorsModelConfig::NemotronH(args) => {
+            load_nemotron_h_pipeline(
+                args.clone(),
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                expert_cache,
+                stream,
+                weights_stream,
+            )
+        }
+        eredu_architectures::configuration::SafetensorsModelConfig::QwenHybrid(parsed)
+            if architecture_plan.model_kind() == ModelKind::Qwen3Next =>
+        {
+            let parsed = parsed.clone();
             load_neutral_qwen_hybrid_pipeline(
                 parsed.text,
                 store,
@@ -13909,9 +13876,8 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::Qwen35 => {
-            let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        eredu_architectures::configuration::SafetensorsModelConfig::QwenHybrid(parsed) => {
+            let parsed = parsed.clone();
             if parsed.vision.is_none() {
                 load_neutral_qwen_hybrid_pipeline(
                     parsed.text,
@@ -13936,22 +13902,20 @@ pub fn load_pipeline_model_with_options(
                 )
             }
         }
-        ModelKind::KimiLinear => load_kimi_linear_pipeline(
-            eredu_architectures::kimi_linear::model_args_from_config_value(config)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-            store,
-            topology,
-            options.quantization,
-            dense_stream,
-            expert_cache,
-            stream,
-            weights_stream,
-        ),
-        ModelKind::Inkling => {
-            let args =
-                eredu_architectures::inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config)?)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            let store = crate::composition::inkling::resolve_pipeline_store(store, &args)?;
+        eredu_architectures::configuration::SafetensorsModelConfig::KimiLinear(args) => {
+            load_kimi_linear_pipeline(
+                args.clone(),
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                expert_cache,
+                stream,
+                weights_stream,
+            )
+        }
+        eredu_architectures::configuration::SafetensorsModelConfig::Inkling(args) => {
+            let args = args.clone();
             load_neutral_inkling_pipeline(
                 args,
                 store,
@@ -13963,9 +13927,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::Moshi => Err(Error::ArchitectureModel(
-            "Moshi-family models do not use the decoder pipeline".into(),
-        )),
+        eredu_architectures::configuration::SafetensorsModelConfig::Moshi(_) => Err(
+            Error::ArchitectureModel("Moshi-family models do not use the decoder pipeline".into()),
+        ),
     }
 }
 
@@ -21579,32 +21543,6 @@ fn load_neutral_gemma4_pipeline(
     info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
     PipelineModel::from_adapter(topology, info, stage)
-}
-
-struct PipelineDeepSeekGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl eredu_architectures::deepseek::GgufTensorCatalog for PipelineDeepSeekGgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        crate::backend::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
-            self.0, name,
-        )
-    }
-}
-
-fn resolve_pipeline_safetensors_store(
-    store: SharedCheckpointSource,
-    plan: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
-    identity: &str,
-) -> Result<SharedCheckpointSource, Error> {
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "{identity} pipeline checkpoint contract did not resolve: {validation:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
 }
 
 fn deepseek_parallel_layout(

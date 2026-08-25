@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use eredu_checkpoint::validation::{
-    validate_gguf_plan, CheckpointIssue, CheckpointIssueKind, CheckpointValidation,
-};
+use eredu_checkpoint::validation::{validate_gguf_plan, CheckpointValidation};
 use eredu_gguf::{Checkpoint, MetadataValue};
 
-use crate::GgufArchitecture;
+use crate::{
+    configuration::{GgufArchitecturePlan, GgufModelConfig},
+    GgufArchitecture,
+};
 
 struct ExactCatalog<'a>(&'a Checkpoint);
 
@@ -89,20 +90,29 @@ impl crate::qwen::GgufTensorCatalog for ExactCatalog<'_> {
     }
 }
 
-pub(crate) fn validate(
+pub(crate) fn resolve(
     architecture: GgufArchitecture,
     checkpoint: &Checkpoint,
-) -> CheckpointValidation {
-    match validate_family(architecture, checkpoint) {
-        Ok(validation) => validation,
-        Err(detail) => invalid_geometry(detail),
-    }
+) -> Result<(GgufArchitecturePlan, CheckpointValidation), String> {
+    let (model, plan, validation) = resolve_family(architecture, checkpoint)?;
+    let validation = validation.unwrap_or_else(|| validate_gguf_plan(checkpoint, &plan));
+    Ok((
+        GgufArchitecturePlan::new(architecture, model, plan),
+        validation,
+    ))
 }
 
-fn validate_family(
+fn resolve_family(
     architecture: GgufArchitecture,
     checkpoint: &Checkpoint,
-) -> Result<CheckpointValidation, String> {
+) -> Result<
+    (
+        GgufModelConfig,
+        eredu_checkpoint::schema::GgufCheckpointPlan,
+        Option<CheckpointValidation>,
+    ),
+    String,
+> {
     let metadata = checkpoint
         .metadata()
         .iter()
@@ -114,13 +124,15 @@ fn validate_family(
             let args = crate::deepseek::parse_v3_gguf(&catalog, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::deepseek::translate_v3_gguf_weight_name)?;
-            plan(checkpoint, crate::deepseek::v3_gguf_plan(&args))
+            let plan = crate::deepseek::v3_gguf_plan(&args)?;
+            Ok((GgufModelConfig::DeepSeekV3(args), plan, None))
         }
         GgufArchitecture::DeepSeek4 => {
             let args =
                 crate::deepseek::parse_v4_gguf(&metadata).map_err(|error| error.to_string())?;
             translated(checkpoint, crate::deepseek::translate_v4_gguf_weight_name)?;
-            plan(checkpoint, crate::deepseek::v4_gguf_plan(&args))
+            let plan = crate::deepseek::v4_gguf_plan(&args)?;
+            Ok((GgufModelConfig::DeepSeekV4(args), plan, None))
         }
         GgufArchitecture::Gemma4 => {
             let names = checkpoint
@@ -131,24 +143,29 @@ fn validate_family(
                 .map_err(|error| error.to_string())?;
             let family = crate::gemma4::family_from_gguf_metadata(text, &metadata, None)
                 .map_err(|error| error.to_string())?;
-            plan(checkpoint, crate::gemma4::gguf_plan(&family.text))
+            let plan = crate::gemma4::gguf_plan(&family.text)?;
+            Ok((GgufModelConfig::Gemma4(family), plan, None))
         }
         GgufArchitecture::GptOss => {
             translated(checkpoint, crate::gpt_oss::translate_gguf_weight_name)?;
             let args = crate::gpt_oss::model_args_from_gguf_catalog(&metadata)
                 .map_err(|error| error.to_string())?;
-            Ok(crate::gpt_oss::validate_gguf(checkpoint, &args))
+            let plan = crate::gpt_oss::gguf_plan(&args)?;
+            let validation = crate::gpt_oss::validate_gguf(checkpoint, &args);
+            Ok((GgufModelConfig::GptOss(args), plan, Some(validation)))
         }
         GgufArchitecture::Inkling => {
             let args = crate::inkling::ModelArgs::from_gguf_metadata(&metadata)
                 .map_err(|error| error.to_string())?;
-            plan(checkpoint, crate::inkling::gguf_plan(&args))
+            let plan = crate::inkling::gguf_plan(&args)?;
+            Ok((GgufModelConfig::Inkling(args), plan, None))
         }
         GgufArchitecture::KimiLinear => {
             let args = crate::kimi_linear::model_args_from_gguf_catalog(&catalog, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::kimi_linear::translate_gguf_weight_name)?;
-            plan(checkpoint, crate::kimi_linear::gguf_plan(&args))
+            let plan = crate::kimi_linear::gguf_plan(&args)?;
+            Ok((GgufModelConfig::KimiLinear(args), plan, None))
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let args = crate::lfm2::model_args_from_gguf_catalog(&catalog, &metadata)
@@ -157,7 +174,8 @@ fn validate_family(
             translated(checkpoint, |name| {
                 crate::lfm2::translate_gguf_weight_name(name, is_moe)
             })?;
-            plan(checkpoint, crate::lfm2::gguf_plan(&args))
+            let plan = crate::lfm2::gguf_plan(&args)?;
+            Ok((GgufModelConfig::Lfm2(args), plan, None))
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let args = crate::llama::model_args_from_gguf_catalog(&catalog, &metadata)
@@ -170,21 +188,21 @@ fn validate_family(
                 ));
             }
             translated(checkpoint, crate::llama::translate_gguf_weight_name)?;
-            plan(
-                checkpoint,
-                crate::llama::gguf_plan(&args).map_err(|error| error.to_string()),
-            )
+            let plan = crate::llama::gguf_plan(&args)?;
+            Ok((GgufModelConfig::Llama(args), plan, None))
         }
         GgufArchitecture::MuseGlimmer => {
             let args = crate::muse_glimmer::DecoderConfig::from_gguf_catalog(&catalog, &metadata)
                 .map_err(|error| error.to_string())?;
-            plan(checkpoint, crate::muse_glimmer::gguf_plan(&args))
+            let plan = crate::muse_glimmer::gguf_plan(&args)?;
+            Ok((GgufModelConfig::MuseGlimmer(args), plan, None))
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let args = crate::nemotron_h::model_args_from_gguf_catalog(&catalog, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::nemotron_h::translate_gguf_weight_name)?;
-            plan(checkpoint, crate::nemotron_h::gguf_plan(&args))
+            let plan = crate::nemotron_h::gguf_plan(&args)?;
+            Ok((GgufModelConfig::NemotronH(args), plan, None))
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let args = crate::qwen::model_args_from_gguf_catalog(&catalog, &metadata)
@@ -192,7 +210,8 @@ fn validate_family(
             translated(checkpoint, |name| {
                 crate::qwen::translate_gguf_weight_name(name, args.is_moe())
             })?;
-            plan(checkpoint, crate::qwen::gguf_plan(&args))
+            let plan = crate::qwen::gguf_plan(&args)?;
+            Ok((GgufModelConfig::Qwen(args), plan, None))
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let is_moe = architecture == GgufArchitecture::Qwen3VlMoe;
@@ -211,13 +230,15 @@ fn validate_family(
             translated(checkpoint, |name| {
                 crate::qwen::translate_gguf_weight_name(name, is_moe)
             })?;
-            plan(checkpoint, crate::qwen::gguf_plan(&args))
+            let plan = crate::qwen::gguf_plan(&args)?;
+            Ok((GgufModelConfig::Qwen(args), plan, None))
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
             let parsed = crate::qwen::hybrid::model_args_from_gguf_catalog(&catalog, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::qwen::hybrid::translate_gguf_weight_name)?;
-            plan(checkpoint, crate::qwen::hybrid::gguf_plan(&parsed.text))
+            let plan = crate::qwen::hybrid::gguf_plan(&parsed.text)?;
+            Ok((GgufModelConfig::QwenHybrid(parsed), plan, None))
         }
     }
 }
@@ -230,21 +251,4 @@ fn translated(
         .translated_outputs(translate)
         .map(|_| ())
         .map_err(|error| error.to_string())
-}
-
-fn plan(
-    checkpoint: &Checkpoint,
-    plan: Result<eredu_checkpoint::schema::GgufCheckpointPlan, String>,
-) -> Result<CheckpointValidation, String> {
-    Ok(validate_gguf_plan(checkpoint, &plan?))
-}
-
-fn invalid_geometry(detail: String) -> CheckpointValidation {
-    CheckpointValidation::Invalid(vec![CheckpointIssue {
-        kind: CheckpointIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
 }

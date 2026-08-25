@@ -27,14 +27,14 @@ impl<T> StructuralSafetensorsCatalog for T where T: SafetensorsCatalog + RecipeC
 /// Family composition consumes this type instead of repeating architecture
 /// admission or reaching upward from reusable backend runtime code.
 pub(crate) struct AdmittedGguf {
-    architecture: GgufArchitecture,
+    plan: eredu_architectures::configuration::GgufArchitecturePlan,
     checkpoint: GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
 }
 
 impl AdmittedGguf {
     pub(crate) fn from_admission(
-        architecture: GgufArchitecture,
+        plan: eredu_architectures::configuration::GgufArchitecturePlan,
         validated: eredu_core::ValidatedGguf,
     ) -> (
         Self,
@@ -48,7 +48,7 @@ impl AdmittedGguf {
         let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         (
             Self {
-                architecture,
+                plan,
                 checkpoint,
                 metadata,
             },
@@ -57,7 +57,15 @@ impl AdmittedGguf {
     }
 
     pub(crate) const fn architecture(&self) -> GgufArchitecture {
-        self.architecture
+        self.plan.architecture()
+    }
+
+    pub(crate) const fn plan(&self) -> &eredu_architectures::configuration::GgufArchitecturePlan {
+        &self.plan
+    }
+
+    pub(crate) const fn model(&self) -> &eredu_architectures::configuration::GgufModelConfig {
+        self.plan.model()
     }
 
     pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
@@ -320,31 +328,29 @@ pub(crate) fn validate_inspected_preparation(
     if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
-    let configuration = inspection.configuration();
     let architecture_plan = inspection.architecture_plan();
     let kind = architecture_plan.model_kind();
     let capabilities = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => {
-            eredu_architectures::preparation::safetensors_capabilities(
-                kind,
-                configuration.json.as_ref().ok_or_else(|| {
-                    Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
-                        "SafeTensors inspection omitted normalized JSON configuration".into(),
-                    ))
-                })?,
+            eredu_architectures::preparation::prepared_safetensors_capabilities(
+                architecture_plan
+                    .safetensors_architecture()
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "SafeTensors preparation omitted its validated architecture plan"
+                                .into(),
+                        )
+                    })?,
             )
         }
-        eredu_core::ArtifactFormat::Gguf => eredu_architectures::preparation::gguf_capabilities(
-            architecture_plan.gguf_architecture().ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "GGUF preparation omitted its architecture-owned GGUF identity".into(),
-                )
-            })?,
-            inspection.gguf_checkpoint().ok_or_else(|| {
-                Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
-                    "GGUF inspection omitted portable checkpoint metadata".into(),
-                ))
-            })?,
+        eredu_core::ArtifactFormat::Gguf => Ok(
+            eredu_architectures::preparation::prepared_gguf_capabilities(
+                architecture_plan.gguf_plan().ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "GGUF preparation omitted its validated architecture plan".into(),
+                    )
+                })?,
+            ),
         ),
     }
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;

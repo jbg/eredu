@@ -279,29 +279,6 @@ impl Parameterized<crate::MlxTensor> for DenseUnit {
     }
 }
 
-fn resolve_safetensors_store(
-    store: Arc<dyn CheckpointSource>,
-    args: &ModelArgs,
-) -> Result<Arc<dyn CheckpointSource>, Error> {
-    if store.is_checkpoint_contract_resolved()
-        || store.source_diagnostics()?.backend
-            != eredu_checkpoint::store::WeightStoreBackend::Safetensors
-    {
-        return Ok(store);
-    }
-    let plan =
-        eredu_architectures::gpt_oss::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "GPT-OSS SafeTensors contract did not resolve: {validation:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
 fn unit_recipes(
     store: &dyn CheckpointSource,
     args: &ModelArgs,
@@ -1471,8 +1448,13 @@ pub fn load_gpt_oss_safetensors_mlx(
 ) -> Result<GptOssModel, Error> {
     let expert_options = weight_residency.expert_cache();
     let execution_options = weight_residency.layers();
-    let args = eredu_architectures::gpt_oss::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::GptOss(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "GPT-OSS loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("GPT-OSS", args.quantization, requested)
@@ -1481,7 +1463,6 @@ pub fn load_gpt_oss_safetensors_mlx(
         .transpose()?
         .flatten();
     let store = artifact.store();
-    let store = resolve_safetensors_store(store, &args)?;
     let (store, args, materialization) = match quantize_on_load {
         Some(quantization) => {
             let (store, args, report) = quantize_neutral_store(store, &args, quantization, stream)?;
@@ -1548,10 +1529,14 @@ pub fn load_gpt_oss_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
     let options = options.into();
-    let args = eredu_architectures::gpt_oss::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::GptOss(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "GPT-OSS loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_safetensors_store(store, &args)?;
     load_neutral_parallel_with_store(store, args, options, build, stream, weights_stream, false)
 }
 
@@ -1571,14 +1556,13 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
         )));
     }
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let mut args = eredu_architectures::gpt_oss::model_args_from_gguf_catalog(metadata)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::GgufModelConfig::GptOss(args) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "GPT-OSS GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut args = args.clone();
     let translate = eredu_architectures::gpt_oss::translate_gguf_weight_name;
-    checkpoint
-        .catalog()
-        .translated_outputs(translate)
-        .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     let expert_targets = eredu_architectures::gpt_oss::gguf_expert_quantization_targets(&args)
         .map_err(Error::ArchitectureModel)?
@@ -1587,8 +1571,6 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     configs.retain(|name, _| !expert_targets.contains(name));
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    args.validate()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(PreparedGptOssGguf { args })
 }
 
@@ -1602,11 +1584,9 @@ pub(crate) fn load_gpt_oss_gguf_model(
 ) -> Result<GptOssModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
-    let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
-        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &plan,
+        source.plan().checkpoint(),
         eredu_architectures::gpt_oss::translate_gguf_weight_name,
         residency.max_mapped_shards(),
     )?);
@@ -1645,11 +1625,9 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
 ) -> Result<GptOssModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
-    let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
-        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &plan,
+        source.plan().checkpoint(),
         eredu_architectures::gpt_oss::translate_gguf_weight_name,
         options.max_mapped_shards(),
     )?);

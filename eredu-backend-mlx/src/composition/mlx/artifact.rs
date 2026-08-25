@@ -39,10 +39,20 @@ impl PreparedSafetensorsArtifact {
     ) -> Result<Self, Error> {
         let store = SafetensorsWeightStore::open_with_max_mapped_shards(&path, max_mapped_shards)?;
         validate_prepared_catalog(&catalog, &store)?;
-        let store = PreparedCatalogSource {
+        let store: SharedCheckpointSource = Arc::new(PreparedCatalogSource {
             catalog,
             source: Arc::new(store),
-        };
+        });
+        let resolution = eredu_checkpoint::validation::resolve_safetensors_plan(
+            store.as_ref(),
+            architecture.checkpoint(),
+        )
+        .map_err(|failure| {
+            Error::ArchitectureModel(format!(
+                "prepared SafeTensors checkpoint contract did not resolve: {failure:?}"
+            ))
+        })?;
+        let store = eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolution);
         Ok(Self {
             configuration,
             architecture,
@@ -50,20 +60,20 @@ impl PreparedSafetensorsArtifact {
         })
     }
 
-    pub fn configuration(&self) -> &ModelConfiguration {
-        &self.configuration
+    pub fn loading_protocol(&self) -> eredu_core::LoadingProtocol {
+        self.configuration.loading_protocol
+    }
+
+    pub fn effective_model_type(&self) -> &str {
+        &self.configuration.effective_model_type
     }
 
     pub fn architecture(&self) -> &eredu_architectures::configuration::SafetensorsArchitecturePlan {
         &self.architecture
     }
 
-    pub fn config(&self) -> Result<&serde_json::Value, Error> {
-        self.configuration.json.as_ref().ok_or_else(|| {
-            Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
-                "SafeTensors preparation plan omitted normalized JSON configuration".into(),
-            ))
-        })
+    pub fn model(&self) -> &eredu_architectures::configuration::SafetensorsModelConfig {
+        self.architecture.model()
     }
 
     pub fn store(&self) -> SharedCheckpointSource {
@@ -218,7 +228,7 @@ fn encoded_dtype_name(dtype: &StoredDtype) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::PreparedSafetensorsArtifact;
+    use super::{PreparedCatalogSource, PreparedSafetensorsArtifact};
     use eredu_core::{
         checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage},
         LoadingProtocol, ModelConfiguration,
@@ -288,16 +298,26 @@ mod tests {
         )
         .unwrap();
 
-        let artifact = PreparedSafetensorsArtifact::open(
-            directory.path().to_owned(),
-            configuration(prepared.clone()),
-            architecture(),
-            catalog_for(directory.path(), vec![1], 4),
+        let source = eredu_checkpoint::store::SafetensorsWeightStore::open_with_max_mapped_shards(
+            directory.path(),
             1,
         )
         .unwrap();
+        let artifact = PreparedSafetensorsArtifact {
+            configuration: configuration(prepared),
+            architecture: architecture(),
+            store: std::sync::Arc::new(PreparedCatalogSource {
+                catalog: catalog_for(directory.path(), vec![1], 4),
+                source: std::sync::Arc::new(source),
+            }),
+        };
 
-        assert_eq!(artifact.config().unwrap(), &prepared);
+        let eredu_architectures::configuration::SafetensorsModelConfig::Llama(args) =
+            artifact.model()
+        else {
+            panic!("expected prepared Llama geometry");
+        };
+        assert_eq!(args.hidden_size, 16);
     }
 
     #[test]

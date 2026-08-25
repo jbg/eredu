@@ -23,7 +23,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, GgufCheckpoint},
     Array, Stream,
 };
 
@@ -74,7 +74,7 @@ use crate::backend::{
             parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::{
-            load::{gguf_quantization_configs, GgufTensorNames},
+            load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
             store::open_gguf_checkpoint_source,
         },
@@ -599,14 +599,6 @@ const fn cached_provider<'a>(
     CachedGatedProductExpertProvider::new(cache)
 }
 
-struct HybridGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl eredu_architectures::qwen::GgufTensorCatalog for HybridGgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        GgufTensorNames::contains_gguf_tensor(self.0, name)
-    }
-}
-
 struct HybridVisionGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl vision::VisionGgufCatalog for HybridVisionGgufCatalog<'_> {
@@ -627,26 +619,27 @@ impl vision::VisionGgufCatalog for HybridVisionGgufCatalog<'_> {
 }
 
 fn prepare_hybrid_gguf_store(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
-    let mut parsed = hybrid::model_args_from_gguf_catalog(&HybridGgufCatalog(checkpoint), metadata)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    checkpoint
-        .catalog()
-        .translated_outputs(hybrid::translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    let eredu_architectures::configuration::GgufModelConfig::QwenHybrid(parsed) = source.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Qwen hybrid GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut parsed = parsed.clone();
     parsed.text.linear_formats =
         gguf_quantization_configs(checkpoint, hybrid::translate_gguf_weight_name)?
             .into_iter()
             .map(|(name, config)| (name, config.into()))
             .collect();
-    let text_plan = hybrid::gguf_plan(&parsed.text).map_err(Error::ArchitectureModel)?;
     let text: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &text_plan,
+        source.plan().checkpoint(),
         hybrid::translate_gguf_weight_name,
         max_mapped_shards,
     )?);
@@ -690,12 +683,11 @@ fn prepare_hybrid_gguf_store(
 }
 
 pub fn prepare_gguf_pipeline(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
-    prepare_hybrid_gguf_store(checkpoint, projector, metadata, max_mapped_shards)
+    prepare_hybrid_gguf_store(source, projector, max_mapped_shards)
 }
 
 /// Loads a llama.cpp Qwen3-Next/Qwen3.5 text artifact through the same
@@ -719,14 +711,11 @@ pub(crate) fn load_gguf(
             source.architecture()
         )));
     }
-    let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let (mut parsed, store) = prepare_hybrid_gguf_store(
-        checkpoint,
+        source,
         projector,
-        metadata,
         options.max_mapped_shards(),
     )?;
     let quantize_on_load = quantization
@@ -1814,23 +1803,6 @@ fn conditional_unit_ordinal(
         })
 }
 
-fn resolve_store(
-    store: Arc<dyn CheckpointSource>,
-    config: &HybridConfig,
-) -> Result<Arc<dyn CheckpointSource>, Error> {
-    let plan = hybrid::safetensors_plan(config).map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "{} checkpoint contract did not resolve: {validation:?}",
-                config.model_type
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
 fn quantize_store(
     store: Arc<dyn CheckpointSource>,
     source: &HybridConfig,
@@ -1995,8 +1967,14 @@ pub fn load_safetensors_with_residency(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridModel, Error> {
-    let mut parsed = hybrid::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::QwenHybrid(parsed) =
+        artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Qwen hybrid loader received a different prepared architecture".into(),
+        ));
+    };
+    let mut parsed = parsed.clone();
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen hybrid", parsed.text.quantization, requested)
@@ -2030,7 +2008,6 @@ pub fn load_safetensors_with_residency(
         }
         return Ok(model);
     }
-    let store = resolve_store(store, &parsed.text)?;
     let (store, materialization) = if let Some(quantization) = quantize_on_load {
         let (store, target, report) = quantize_store(store, &parsed.text, quantization, stream)?;
         parsed.text = target;

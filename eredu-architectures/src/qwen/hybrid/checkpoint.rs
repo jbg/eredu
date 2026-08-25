@@ -745,6 +745,36 @@ pub fn safetensors_plan(config: &HybridConfig) -> Result<SafetensorsCheckpointPl
     .map_err(|error| error.to_string())
 }
 
+/// Builds the complete SafeTensors catalog for a text-only or conditional hybrid model.
+pub fn composite_safetensors_plan(
+    config: &ParsedHybridConfig,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    let mut text = safetensors_plan(&config.text)?;
+    let Some(vision) = config.vision.as_ref() else {
+        return Ok(text);
+    };
+    vision
+        .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+        .map_err(|error| error.to_string())?;
+    if vision.out_hidden_size != config.text.hidden_size {
+        return Err(format!(
+            "conditional Qwen projector output {} does not match text hidden size {}",
+            vision.out_hidden_size, config.text.hidden_size
+        ));
+    }
+    let vision = crate::qwen::vision::safetensors_plan(vision, "model.visual")?;
+    text.common_tensors.extend(vision.common_tensors);
+    text.layout_groups.extend(vision.layout_groups);
+    let policy = text.catalog_policy;
+    SafetensorsCheckpointPlan::new(
+        format!("{} composite SafeTensors", config.text.model_type),
+        text.common_tensors,
+        text.layout_groups,
+        policy,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Builds the canonical llama.cpp Qwen3-Next/Qwen3.5 tensor catalog.
 pub fn gguf_plan(config: &HybridConfig) -> Result<GgufCheckpointPlan, String> {
     config.validate().map_err(|error| error.to_string())?;
@@ -1536,7 +1566,7 @@ fn add(left: usize, right: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use eredu_checkpoint::{
         recipe::RecipeCatalog,
@@ -1669,6 +1699,20 @@ mod tests {
         assert_eq!(target.text.quantization, Some(quantization));
         assert!(!target.vision.unwrap().linear_formats.is_empty());
         assert!(source.vision.unwrap().linear_formats.is_empty());
+    }
+
+    #[test]
+    fn conditional_safetensors_plan_covers_text_and_vision_once() {
+        let plan = composite_safetensors_plan(&conditional_config()).unwrap();
+        let keys = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(keys.contains("model.embed_tokens.weight"));
+        assert!(keys.contains("model.visual.patch_embed.proj.weight"));
+        assert!(keys.contains("model.visual.merger.linear_fc2.weight"));
+        assert_eq!(keys.len(), plan.common_tensors.len());
     }
 
     #[test]

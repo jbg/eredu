@@ -406,6 +406,43 @@ pub fn safetensors_runtime_state_dtype_source(
     resolve_runtime_state_dtype_source(&plan, &parameter, tensors)
 }
 
+/// Resolves runtime-state dtype from the exact SafeTensors plan retained at admission.
+pub fn prepared_safetensors_runtime_state_dtype_source(
+    architecture: &crate::configuration::SafetensorsArchitecturePlan,
+    tensors: &TensorCatalog,
+) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+    use crate::configuration::SafetensorsModelConfig;
+
+    let parameter = match architecture.model() {
+        SafetensorsModelConfig::Gemma4(_) | SafetensorsModelConfig::MuseGlimmer(_) => {
+            "model.language_model.embed_tokens.weight".into()
+        }
+        SafetensorsModelConfig::GptOss(args) => {
+            format!("{}.embed_tokens.weight", args.parameter_root)
+        }
+        SafetensorsModelConfig::Inkling(_) => "model.llm.embed.weight".into(),
+        SafetensorsModelConfig::NemotronH(_) => "backbone.embeddings.weight".into(),
+        SafetensorsModelConfig::Qwen(args) => {
+            format!("{}.embed_tokens.weight", args.parameter_root)
+        }
+        SafetensorsModelConfig::QwenVl(args) => {
+            format!("{}.embed_tokens.weight", args.text.parameter_root)
+        }
+        SafetensorsModelConfig::Moshi(_) => {
+            return Err(invalid(
+                "Moshi runtime-state dtype belongs to the realtime loader contract",
+            ));
+        }
+        SafetensorsModelConfig::DeepSeekV3(_)
+        | SafetensorsModelConfig::DeepSeekV4(_)
+        | SafetensorsModelConfig::KimiLinear(_)
+        | SafetensorsModelConfig::Llama(_)
+        | SafetensorsModelConfig::Lfm2(_)
+        | SafetensorsModelConfig::QwenHybrid(_) => "model.embed_tokens.weight".into(),
+    };
+    resolve_runtime_state_dtype_source(architecture.checkpoint(), &parameter, tensors)
+}
+
 /// Derives preparation capabilities from a normalized SafeTensors family
 /// configuration.
 pub fn safetensors_capabilities(
@@ -646,6 +683,157 @@ pub fn safetensors_capabilities(
     ))
 }
 
+/// Derives preparation capabilities from the exact SafeTensors plan retained at admission.
+pub fn prepared_safetensors_capabilities(
+    architecture: &crate::configuration::SafetensorsArchitecturePlan,
+) -> Result<ArchitectureCapabilities, PreparationCapabilityError> {
+    use crate::configuration::SafetensorsModelConfig;
+
+    let (parallel, independently_addressable_experts, input_modalities, embedded_draft_layers) =
+        match architecture.model() {
+            SafetensorsModelConfig::DeepSeekV3(args) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
+                true,
+                InputModalities::TEXT,
+                usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
+            ),
+            SafetensorsModelConfig::DeepSeekV4(args) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
+                true,
+                InputModalities::TEXT,
+                usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
+            ),
+            SafetensorsModelConfig::Gemma4(family) => {
+                let routed = family.text.num_experts.is_some();
+                (
+                    if routed {
+                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
+                    } else {
+                        ParallelCapabilityPlan::TENSOR_PIPELINE
+                    },
+                    routed,
+                    family.input_modalities(),
+                    0,
+                )
+            }
+            SafetensorsModelConfig::GptOss(_) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
+                true,
+                InputModalities::TEXT,
+                0,
+            ),
+            SafetensorsModelConfig::Inkling(args) => {
+                let routed = args.text_config.layer_schedule.iter().any(|policy| {
+                    policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe
+                });
+                let embedded = args
+                    .mtp_config
+                    .as_ref()
+                    .map_or(0, |mtp| mtp.num_nextn_predict_layers);
+                (
+                    if routed {
+                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
+                    } else {
+                        ParallelCapabilityPlan::TENSOR_PIPELINE
+                    },
+                    routed,
+                    args.input_modalities(),
+                    usize::try_from(embedded).map_err(invalid)?,
+                )
+            }
+            SafetensorsModelConfig::KimiLinear(args) => routed_text(args.has_sparse_moe_layers()),
+            SafetensorsModelConfig::Lfm2(args) => routed_text(args.has_sparse_moe_layers()),
+            SafetensorsModelConfig::Llama(_) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE,
+                false,
+                InputModalities::TEXT,
+                0,
+            ),
+            SafetensorsModelConfig::MuseGlimmer(args) => {
+                let routed = args.is_moe();
+                (
+                    routed_parallel(routed),
+                    routed,
+                    InputModalities {
+                        text: true,
+                        image: true,
+                        audio: false,
+                        video: args.weight_convention
+                            == crate::muse_glimmer::WeightConvention::HuggingFace,
+                    },
+                    0,
+                )
+            }
+            SafetensorsModelConfig::NemotronH(args) => {
+                let mut capabilities = routed_text(args.has_sparse_moe_layers());
+                capabilities.3 = usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?;
+                capabilities
+            }
+            SafetensorsModelConfig::Qwen(args) => routed_text(args.is_moe()),
+            SafetensorsModelConfig::QwenHybrid(args) => {
+                let routed = args.text.is_moe();
+                let multimodal = args.vision.is_some();
+                (
+                    routed_parallel(routed),
+                    routed,
+                    InputModalities {
+                        text: true,
+                        image: multimodal,
+                        audio: false,
+                        video: multimodal,
+                    },
+                    usize::try_from(args.text.mtp_num_hidden_layers).map_err(invalid)?,
+                )
+            }
+            SafetensorsModelConfig::QwenVl(args) => {
+                let routed = args.text.is_moe();
+                (
+                    routed_parallel(routed),
+                    routed,
+                    InputModalities {
+                        text: true,
+                        image: true,
+                        audio: false,
+                        video: true,
+                    },
+                    0,
+                )
+            }
+            SafetensorsModelConfig::Moshi(_) => (
+                ParallelCapabilityPlan::TENSOR_ONLY,
+                false,
+                InputModalities {
+                    text: true,
+                    image: false,
+                    audio: true,
+                    video: false,
+                },
+                0,
+            ),
+        };
+    let nonresident_safetensors_quantization =
+        !matches!(architecture.model(), SafetensorsModelConfig::Moshi(_));
+    Ok(ArchitectureCapabilities::new(
+        parallel,
+        independently_addressable_experts,
+        nonresident_safetensors_quantization,
+        input_modalities,
+        Some(embedded_draft_layers),
+    ))
+}
+
+fn routed_parallel(routed: bool) -> ParallelCapabilityPlan {
+    if routed {
+        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
+    } else {
+        ParallelCapabilityPlan::TENSOR_PIPELINE
+    }
+}
+
+fn routed_text(routed: bool) -> (ParallelCapabilityPlan, bool, InputModalities, usize) {
+    (routed_parallel(routed), routed, InputModalities::TEXT, 0)
+}
+
 struct ExactGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl crate::gemma4::GgufTensorCatalog for ExactGgufCatalog<'_> {
@@ -737,6 +925,37 @@ pub fn gguf_capabilities(
         input_modalities,
         None,
     ))
+}
+
+/// Derives preparation capabilities from the exact GGUF plan retained at admission.
+pub fn prepared_gguf_capabilities(
+    plan: &crate::configuration::GgufArchitecturePlan,
+) -> ArchitectureCapabilities {
+    use crate::configuration::GgufModelConfig;
+
+    let architecture = plan.architecture();
+    let routed = match plan.model() {
+        GgufModelConfig::Gemma4(family) => family.text.num_experts.is_some(),
+        GgufModelConfig::MuseGlimmer(args) => args.is_moe(),
+        GgufModelConfig::DeepSeekV3(_)
+        | GgufModelConfig::DeepSeekV4(_)
+        | GgufModelConfig::GptOss(_)
+        | GgufModelConfig::Inkling(_)
+        | GgufModelConfig::KimiLinear(_) => true,
+        GgufModelConfig::Lfm2(args) => args.has_sparse_moe_layers(),
+        GgufModelConfig::NemotronH(args) => args.has_sparse_moe_layers(),
+        GgufModelConfig::Qwen(args) => args.is_moe(),
+        GgufModelConfig::QwenHybrid(args) => args.text.is_moe(),
+        GgufModelConfig::Llama(_) => false,
+    };
+    ArchitectureCapabilities::new(
+        routed_parallel(routed),
+        routed,
+        false,
+        gguf_composite_artifact_plan(architecture)
+            .input_modalities(GgufArtifactComposition::ModelOnly),
+        None,
+    )
 }
 
 #[cfg(test)]

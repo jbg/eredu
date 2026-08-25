@@ -173,11 +173,6 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     };
     let configuration = portable.configuration();
     let architecture_plan = portable.architecture_plan();
-    let kind = architecture_plan.model_kind();
-    let config = configuration
-        .json
-        .as_ref()
-        .expect("SafeTensors inspection must retain normalized JSON configuration");
     let catalog = portable.tensors();
     let inspected_catalog = InspectedSafetensorsCatalog(catalog);
 
@@ -226,7 +221,11 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
         }
     }
 
-    match eredu_architectures::preparation::safetensors_capabilities(kind, config) {
+    match eredu_architectures::preparation::prepared_safetensors_capabilities(
+        architecture_plan
+            .safetensors_architecture()
+            .expect("SafeTensors inspection must retain its validated architecture plan"),
+    ) {
         Ok(capabilities) => {
             record_embedded_drafting(&mut report, capabilities);
             report.expected_modalities = artifact_modalities(capabilities.input_modalities());
@@ -415,23 +414,13 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let composite_plan =
         eredu_architectures::preparation::gguf_composite_artifact_plan(gguf_architecture);
-    let mut capabilities_valid = false;
-    match eredu_architectures::preparation::gguf_capabilities(gguf_architecture, &checkpoint) {
-        Ok(capabilities) => {
-            capabilities_valid = true;
-            record_embedded_drafting(&mut report, capabilities);
-        }
-        Err(error) => {
-            report.structural_binding = InspectionReadiness::Invalid;
-            report.model_loadability = InspectionReadiness::Invalid;
-            report.issue(
-                InspectionIssueCode::InvalidConfiguration,
-                InspectionSeverity::Error,
-                error.to_string(),
-                Some(path.to_path_buf()),
-            );
-        }
-    }
+    let capabilities = eredu_architectures::preparation::prepared_gguf_capabilities(
+        portable
+            .architecture_plan()
+            .gguf_plan()
+            .expect("GGUF inspection must retain its validated architecture plan"),
+    );
+    record_embedded_drafting(&mut report, capabilities);
     match structural::validate_gguf_preparation(gguf_architecture, &checkpoint, options.load) {
         Ok(()) => match validate_gguf_quantization_source(
             &checkpoint,
@@ -451,10 +440,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         &checkpoint,
         &metadata,
     );
-    if capabilities_valid {
-        report.expected_modalities =
-            artifact_modalities(composite_plan.input_modalities(composition));
-    }
+    report.expected_modalities = artifact_modalities(composite_plan.input_modalities(composition));
 
     report
 }

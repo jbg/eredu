@@ -13,11 +13,7 @@ use eredu_runtime::{
     LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
     ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
 };
-use safemlx::{
-    error::Exception,
-    ops::{indexing::TryIndexOp, GgufCheckpoint},
-    Array, Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::backend::{
     error::Error,
@@ -35,7 +31,7 @@ use crate::backend::{
                 parameter_name_in_targets, parameter_role_targets,
                 populate_module_from_lease_excluding,
             },
-            load::{gguf_quantization_configs, GgufTensorNames},
+            load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
             store::open_gguf_checkpoint_source,
         },
@@ -345,29 +341,6 @@ enum Lfm2Execution {
     Layerwise(Box<BoundedRuntime>),
     TensorParallelResident(Box<ParallelResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
-}
-
-fn resolve_store(
-    store: Arc<dyn CheckpointSource>,
-    args: &ModelArgs,
-) -> Result<Arc<dyn CheckpointSource>, Error> {
-    if store.is_checkpoint_contract_resolved()
-        || store.source_diagnostics()?.backend
-            != eredu_checkpoint::store::WeightStoreBackend::Safetensors
-    {
-        return Ok(store);
-    }
-    let plan = eredu_architectures::lfm2::safetensors_plan(args, true)
-        .map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "LFM2 checkpoint contract did not resolve: {validation:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
 }
 
 pub fn expert_catalog(
@@ -1261,8 +1234,13 @@ pub fn load_lfm2_model(
 ) -> Result<Lfm2Model, Error> {
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    let args = eredu_architectures::lfm2::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Lfm2(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "LFM2 loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let quantize = quantization
         .map(|requested| {
             should_quantize_on_load("LFM2", args.weight_quantization, requested)
@@ -1271,7 +1249,6 @@ pub fn load_lfm2_model(
         .transpose()?
         .flatten();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     if let Some(quantization) = quantize {
         let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
         let mut model = load_neutral(
@@ -1330,23 +1307,15 @@ pub fn load_lfm2_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<Lfm2Model, Error> {
     let options = options.into();
-    let args = eredu_architectures::lfm2::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Lfm2(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "LFM2 loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
-}
-
-struct GgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl eredu_architectures::lfm2::GgufTensorCatalog for GgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0.contains_gguf_tensor(name)
-    }
-
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
-        self.0.any_gguf_tensor(predicate)
-    }
 }
 
 pub(crate) struct PreparedGguf {
@@ -1368,23 +1337,19 @@ pub(crate) fn prepare_gguf(
         )));
     }
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let mut args =
-        eredu_architectures::lfm2::model_args_from_gguf_catalog(&GgufCatalog(checkpoint), metadata)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::GgufModelConfig::Lfm2(args) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "LFM2 GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut args = args.clone();
     let translate =
         |name: &str| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe);
-    checkpoint
-        .catalog()
-        .translated_outputs(translate)
-        .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     eredu_architectures::lfm2::normalize_weight_formats(&args, &mut configs);
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.weight_quantization = None;
-    args.validate()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(PreparedGguf { args })
 }
 
@@ -1400,11 +1365,9 @@ pub(crate) fn load_lfm2_gguf_model(
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
     let is_moe = prepared.args.has_sparse_moe_layers();
-    let plan =
-        eredu_architectures::lfm2::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &plan,
+        source.plan().checkpoint(),
         move |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe),
         residency.max_mapped_shards(),
     )?);
@@ -1442,11 +1405,9 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let is_moe = prepared.args.has_sparse_moe_layers();
-    let plan =
-        eredu_architectures::lfm2::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &plan,
+        source.plan().checkpoint(),
         move |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe),
         options.max_mapped_shards(),
     )?);

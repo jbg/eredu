@@ -441,10 +441,15 @@ Family composition does not reopen `config.json`, rediscover checkpoint shards,
 or select a second catalog after admission. Every admitted artifact plan
 retains the normalized `ModelKind`; SafeTensors plans additionally retain typed
 family geometry and the checkpoint schema, while GGUF plans retain the exact
-`GgufArchitecture`. Core keeps the corresponding `ValidatedGguf` proof intact
+`GgufArchitecture`, typed family geometry, and architecture-derived main
+checkpoint schema. Core keeps the corresponding `ValidatedGguf` proof intact
 inside `ModelArtifact` until the selected backend consumes it; materializers do
 not downgrade that proof to an unvalidated checkpoint handle and rerun the
-architecture schema. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
+architecture parser or regenerate the main checkpoint schema. Backend
+composition may enrich a clone of retained geometry with native encoding
+descriptors, and composite families may derive a separate companion schema from
+admitted companion geometry; neither operation replaces the retained main
+artifact plan. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
 also parses and retains the family processor plan from the admitted model,
 projector, and SafeTensors processor sidecars. Materialization consumes that
 snapshot directly and neither resolves family identity again nor rereads

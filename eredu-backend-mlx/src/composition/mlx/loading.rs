@@ -31,8 +31,6 @@ fn materialize_gguf_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
     let kind = source.architecture().model_kind();
     structural::validate_complete_gguf_quantization(kind, options.quantization.is_some())?;
     let model = match source.architecture() {
@@ -48,9 +46,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::DeepSeek2 => {
             let loaded = crate::composition::deepseek::load_gguf(
-                checkpoint,
-                metadata,
-                false,
+                source,
                 options.weight_residency,
                 stream,
                 weights_stream,
@@ -59,9 +55,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::DeepSeek4 => {
             let loaded = crate::composition::deepseek::load_gguf(
-                checkpoint,
-                metadata,
-                true,
+                source,
                 options.weight_residency,
                 stream,
                 weights_stream,
@@ -80,9 +74,8 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Inkling => {
             let loaded = crate::composition::inkling::load_gguf(
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 options.weight_residency,
                 stream,
                 weights_stream,
@@ -91,9 +84,8 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Gemma4 => {
             let loaded = crate::composition::gemma4::load_gguf(
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 options.weight_residency,
                 stream,
                 weights_stream,
@@ -117,9 +109,8 @@ fn materialize_gguf_model(
                 )
             })?;
             let loaded = crate::composition::muse_glimmer::load_gguf(
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 options.weight_residency,
                 stream,
                 weights_stream,
@@ -163,10 +154,8 @@ fn materialize_gguf_model(
                 )
             })?;
             let loaded = crate::composition::qwen::vl::load_gguf(
-                source.architecture(),
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -288,15 +277,8 @@ fn inspected_runtime_state_dtype_bytes(
         // describes packed storage rather than the resulting activation.
         return Ok(std::num::NonZeroU8::new(4).expect("Float32 width is nonzero"));
     }
-    let configuration = inspection.configuration();
-    let config = configuration.json.as_ref().ok_or_else(|| {
-        eredu_core::artifact::ArtifactError::InvalidArtifact(
-            "SafeTensors inspection omitted normalized JSON configuration".into(),
-        )
-    })?;
-    let source = eredu_architectures::preparation::safetensors_runtime_state_dtype_source(
-        prepared_model_kind(inspection.architecture_plan()),
-        config,
+    let source = eredu_architectures::preparation::prepared_safetensors_runtime_state_dtype_source(
+        prepared_safetensors_architecture(inspection.architecture_plan())?,
         inspection.tensors(),
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -505,11 +487,11 @@ pub(super) fn prepared_safetensors_architecture(
     })
 }
 
-fn prepared_gguf_architecture(plan: &ArtifactArchitecturePlan) -> Result<GgufArchitecture, Error> {
-    plan.gguf_architecture().ok_or_else(|| {
-        Error::ArchitectureModel(
-            "GGUF preparation omitted its architecture-owned GGUF identity".into(),
-        )
+fn prepared_gguf_plan(
+    plan: &ArtifactArchitecturePlan,
+) -> Result<&eredu_architectures::configuration::GgufArchitecturePlan, Error> {
+    plan.gguf_plan().ok_or_else(|| {
+        Error::ArchitectureModel("GGUF preparation omitted its validated architecture plan".into())
     })
 }
 
@@ -708,7 +690,7 @@ fn materialize_gguf_artifact(
             "MLX GGUF materializer received a SafeTensors plan".into(),
         ));
     };
-    let architecture = prepared_gguf_architecture(&architecture_plan)?;
+    let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
     let (source, mut companions) =
         structural::AdmittedGguf::from_admission(architecture, validated);
     let projector = companions
@@ -752,8 +734,6 @@ fn materialize_gguf_tensor_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
     let architecture = source.architecture();
     let kind = architecture.model_kind();
     let topology = options.parallel.ok_or_else(|| {
@@ -795,9 +775,8 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Inkling => {
             let model = crate::composition::inkling::load_gguf_tensor_parallel(
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 residency,
                 build,
                 stream,
@@ -807,9 +786,8 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Gemma4 => {
             let model = crate::composition::gemma4::load_gguf_tensor_parallel(
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 residency,
                 build,
                 stream,
@@ -834,9 +812,8 @@ fn materialize_gguf_tensor_parallel(
                 )
             })?;
             let model = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
-                checkpoint,
+                source,
                 projector,
-                metadata,
                 residency,
                 build,
                 stream,

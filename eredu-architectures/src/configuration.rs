@@ -1,8 +1,8 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_checkpoint::{
-    schema::SafetensorsCheckpointPlan,
-    validation::{CheckpointValidation, StrictLoadFailure},
+    schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan},
+    validation::StrictLoadFailure,
 };
 use eredu_core::{
     artifact::ArtifactError, ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement,
@@ -428,9 +428,9 @@ impl GgufArchitecture {
 fn resolve_gguf_configuration(
     name: &str,
     checkpoint: &GgufCheckpoint,
-) -> Result<(ModelConfiguration, GgufArchitecture), ArtifactError> {
+) -> Result<(ModelConfiguration, GgufArchitecturePlan), ArtifactError> {
     let architecture = GgufArchitecture::resolve(name)?;
-    validate_gguf_structure(architecture, checkpoint)?;
+    let plan = resolve_gguf_architecture(architecture, checkpoint)?;
     Ok((
         ModelConfiguration {
             declared_model_type: name.into(),
@@ -439,26 +439,20 @@ fn resolve_gguf_configuration(
             loading_protocol: architecture.model_kind().loading_protocol(),
             json: None,
         },
-        architecture,
+        plan,
     ))
 }
 
-fn validate_gguf_structure(
+fn resolve_gguf_architecture(
     architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
-) -> Result<(), ArtifactError> {
-    validate_gguf_checkpoint(architecture, checkpoint)
+) -> Result<GgufArchitecturePlan, ArtifactError> {
+    let (plan, validation) = crate::gguf_admission::resolve(architecture, checkpoint)
+        .map_err(ArtifactError::InvalidArtifact)?;
+    validation
         .into_loader_result()
-        .map_err(gguf_validation_error)
-}
-
-/// Parses and validates the complete architecture-owned GGUF checkpoint schema
-/// at the portable configuration-resolution boundary.
-fn validate_gguf_checkpoint(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-) -> CheckpointValidation {
-    crate::gguf_admission::validate(architecture, checkpoint)
+        .map_err(gguf_validation_error)?;
+    Ok(plan)
 }
 
 fn gguf_validation_error(failure: StrictLoadFailure) -> ArtifactError {
@@ -583,6 +577,77 @@ pub struct SafetensorsArchitecturePlan {
     checkpoint: SafetensorsCheckpointPlan,
 }
 
+/// Typed, normalized family configuration retained from GGUF admission.
+#[derive(Debug, Clone)]
+pub enum GgufModelConfig {
+    /// DeepSeek-V3/R1 family geometry.
+    DeepSeekV3(crate::deepseek::V3Args),
+    /// DeepSeek-V4 family geometry.
+    DeepSeekV4(crate::deepseek::V4Args),
+    /// Gemma 4 family geometry.
+    Gemma4(crate::gemma4::FamilyConfig),
+    /// GPT-OSS family geometry.
+    GptOss(crate::gpt_oss::ModelArgs),
+    /// Inkling family geometry.
+    Inkling(crate::inkling::ModelArgs),
+    /// Kimi Linear family geometry.
+    KimiLinear(crate::kimi_linear::ModelArgs),
+    /// LFM2 family geometry.
+    Lfm2(crate::lfm2::ModelArgs),
+    /// Llama-compatible family geometry.
+    Llama(crate::llama::ModelArgs),
+    /// Muse-Glimmer family geometry.
+    MuseGlimmer(crate::muse_glimmer::DecoderConfig),
+    /// Nemotron-H family geometry.
+    NemotronH(crate::nemotron_h::ModelArgs),
+    /// Qwen2/Qwen3 family geometry, including Qwen3-VL text checkpoints.
+    Qwen(crate::qwen::ModelArgs),
+    /// Qwen hybrid-family geometry.
+    QwenHybrid(crate::qwen::hybrid::ParsedHybridConfig),
+}
+
+/// GGUF architecture geometry and checkpoint schema proven valid at admission.
+#[derive(Debug, Clone)]
+pub struct GgufArchitecturePlan {
+    architecture: GgufArchitecture,
+    model: GgufModelConfig,
+    checkpoint: GgufCheckpointPlan,
+}
+
+impl GgufArchitecturePlan {
+    pub(crate) fn new(
+        architecture: GgufArchitecture,
+        model: GgufModelConfig,
+        checkpoint: GgufCheckpointPlan,
+    ) -> Self {
+        Self {
+            architecture,
+            model,
+            checkpoint,
+        }
+    }
+
+    /// Exact GGUF architecture selected for this checkpoint.
+    pub const fn architecture(&self) -> GgufArchitecture {
+        self.architecture
+    }
+
+    /// Canonical family selected for this exact checkpoint.
+    pub const fn model_kind(&self) -> ModelKind {
+        self.architecture.model_kind()
+    }
+
+    /// Typed normalized family configuration.
+    pub const fn model(&self) -> &GgufModelConfig {
+        &self.model
+    }
+
+    /// Complete expected GGUF catalog derived from the normalized geometry.
+    pub const fn checkpoint(&self) -> &GgufCheckpointPlan {
+        &self.checkpoint
+    }
+}
+
 impl SafetensorsArchitecturePlan {
     /// Canonical family selected for this exact configuration.
     pub const fn model_kind(&self) -> ModelKind {
@@ -692,7 +757,7 @@ fn resolve_safetensors_architecture(
         SafetensorsModelConfig::Qwen(args) => crate::qwen::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::QwenHybrid(args) => {
-            crate::qwen::hybrid::safetensors_plan(&args.text)
+            crate::qwen::hybrid::composite_safetensors_plan(args)
                 .map_err(|error| invalid_configuration(kind, error))?
         }
         SafetensorsModelConfig::QwenVl(args) => {

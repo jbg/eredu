@@ -1,10 +1,6 @@
 //! Neutral Inkling binding to MLX storage and heterogeneous state.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use eredu_architectures::{
     inkling::{
@@ -24,7 +20,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint},
     Array, Stream,
 };
 
@@ -1560,37 +1556,12 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
     }
 }
 
-fn resolve_store(
-    store: SharedCheckpointSource,
-    args: &ModelArgs,
-) -> Result<SharedCheckpointSource, Error> {
-    let plan =
-        eredu_architectures::inkling::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|error| {
-            Error::ArchitectureModel(format!(
-                "Inkling checkpoint contract did not resolve: {error:?}"
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
-pub fn resolve_pipeline_store(
-    store: SharedCheckpointSource,
-    args: &ModelArgs,
-) -> Result<SharedCheckpointSource, Error> {
-    resolve_store(store, args)
-}
-
 pub fn prepare_gguf_pipeline_source(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
-    open_gguf_store(checkpoint, projector, metadata, max_cached_readers)
+    open_gguf_store(source, projector, max_cached_readers)
 }
 
 fn quantize_store(
@@ -1966,29 +1937,28 @@ pub fn load_safetensors_tensor_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let args = ModelArgs::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Inkling(args) =
+        artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Inkling loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
 }
 
 /// Loads an Inkling GGUF checkpoint through the same neutral TP binder.
 pub fn load_gguf_tensor_parallel(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     layer_policy: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let (store, args) = open_gguf_store(
-        checkpoint,
-        projector,
-        metadata,
-        layer_policy.max_mapped_shards(),
-    )?;
+    let (store, args) = open_gguf_store(source, projector, layer_policy.max_mapped_shards())?;
     load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
 }
 
@@ -2019,10 +1989,15 @@ pub fn load_safetensors(
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
     let expert_options = residency.expert_cache();
-    let args = ModelArgs::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Inkling(args) =
+        artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Inkling loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     let requested = quantization
         .map(|requested| {
             should_quantize_on_load("Inkling", args.text_config.weight_quantization, requested)
@@ -2054,20 +2029,14 @@ pub fn load_safetensors(
 
 /// Loads the text GGUF and optional sibling media artifact into one neutral model.
 pub fn load_gguf(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
     let expert_options = residency.expert_cache();
-    let (store, args) = open_gguf_store(
-        checkpoint,
-        projector,
-        metadata,
-        residency.max_mapped_shards(),
-    )?;
+    let (store, args) = open_gguf_store(source, projector, residency.max_mapped_shards())?;
     let layer_policy = residency.layers();
     let mut model = load_store(
         store,
@@ -2085,13 +2054,18 @@ pub fn load_gguf(
 }
 
 fn open_gguf_store(
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&GgufCheckpoint>,
-    metadata: &HashMap<String, GgufMetadataValue>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
-    let mut args = ModelArgs::from_gguf_metadata(metadata)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    let eredu_architectures::configuration::GgufModelConfig::Inkling(args) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "Inkling GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut args = args.clone();
     let translation_args = args.clone();
     let mut text_formats = gguf_quantization_configs(checkpoint, |name| {
         eredu_architectures::inkling::translate_gguf_weight_name_for_model(name, &translation_args)
@@ -2109,17 +2083,19 @@ fn open_gguf_store(
             .with_gguf_projector_metadata(metadata, projector_metadata, formats)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
-    let text_plan =
-        eredu_architectures::inkling::gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let translation_args = args.clone();
     let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
-        .add_checkpoint(checkpoint.catalog().clone(), &text_plan, move |name| {
-            eredu_architectures::inkling::translate_gguf_weight_name_for_model(
-                name,
-                &translation_args,
-            )
-        })?;
+        .add_checkpoint(
+            checkpoint.catalog().clone(),
+            source.plan().checkpoint(),
+            move |name| {
+                eredu_architectures::inkling::translate_gguf_weight_name_for_model(
+                    name,
+                    &translation_args,
+                )
+            },
+        )?;
     if let Some(projector) = projector {
         let plan = eredu_architectures::inkling::mmproj_gguf_plan(&args)
             .map_err(Error::ArchitectureModel)?;

@@ -78,30 +78,6 @@ enum LlamaExecution {
     TensorParallelLayerwise(Box<NeutralParallelLayerwiseRuntime>),
 }
 
-fn resolve_llama_safetensors_store(
-    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    args: &ModelArgs,
-) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
-    if store.is_checkpoint_contract_resolved()
-        || store.source_diagnostics()?.backend
-            != eredu_checkpoint::store::WeightStoreBackend::Safetensors
-    {
-        return Ok(store);
-    }
-    let plan = eredu_architectures::llama::safetensors_plan(args)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "{} checkpoint contract did not resolve: {validation:?}",
-                args.model_type
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
 fn load_neutral_llama(
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
@@ -629,8 +605,13 @@ pub fn load_llama_safetensors_mlx(
         ));
     }
     let execution_options = weight_residency.layers();
-    let args = eredu_architectures::llama::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Llama(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Llama loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Llama", args.weight_quantization(), requested)
@@ -639,7 +620,6 @@ pub fn load_llama_safetensors_mlx(
         .transpose()?
         .flatten();
     let store = artifact.store();
-    let store = resolve_llama_safetensors_store(store, &args)?;
     if let Some(quantization) = quantize_on_load {
         let (store, args, report) =
             quantize_neutral_llama_store(store, &args, quantization, stream)?;
@@ -805,10 +785,14 @@ pub fn load_llama_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     let options = options.into();
-    let args = eredu_architectures::llama::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Llama(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Llama loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_llama_safetensors_store(store, &args)?;
     load_neutral_llama_parallel(store, args, options, build, stream, weights_stream)
 }
 
@@ -821,12 +805,10 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
 ) -> Result<LlamaModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
-    let gguf_plan =
-        eredu_architectures::llama::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
-            &gguf_plan,
+            source.plan().checkpoint(),
             eredu_architectures::llama::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -845,12 +827,10 @@ pub(crate) fn load_llama_gguf_model(
 ) -> Result<LlamaModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
-    let gguf_plan =
-        eredu_architectures::llama::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
-            &gguf_plan,
+            source.plan().checkpoint(),
             eredu_architectures::llama::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);

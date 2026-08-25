@@ -14,7 +14,7 @@ use std::{
 
 use eredu_architectures::{media_plan::QwenVisionIngressPlan, qwen::ModelArgs};
 use eredu_nn::RoutedNeuralBackend;
-use safemlx::{error::Exception, ops::indexing::TryIndexOp, ops::GgufCheckpoint, Array, Stream};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
@@ -216,30 +216,6 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
             .observe_routing(routing)
             .map_err(|error| eredu_nn::Error::backend(error.to_string()))
     }
-}
-
-fn resolve_qwen_safetensors_store(
-    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    args: &ModelArgs,
-) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
-    if store.is_checkpoint_contract_resolved()
-        || store.source_diagnostics()?.backend
-            != eredu_checkpoint::store::WeightStoreBackend::Safetensors
-    {
-        return Ok(store);
-    }
-    let plan = eredu_architectures::qwen::safetensors_plan(args)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "{} checkpoint contract did not resolve: {validation:?}",
-                args.model_type
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
 }
 
 fn qwen_unit_recipes(
@@ -1069,8 +1045,13 @@ pub fn load_qwen_safetensors_mlx(
 ) -> Result<QwenModel, Error> {
     let expert_options = weight_residency.expert_cache();
     let execution_options = weight_residency.layers();
-    let args = eredu_architectures::qwen::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Qwen loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen", args.weight_quantization(), requested)
@@ -1079,7 +1060,6 @@ pub fn load_qwen_safetensors_mlx(
         .transpose()?
         .flatten();
     let store = artifact.store();
-    let store = resolve_qwen_safetensors_store(store, &args)?;
     if let Some(quantization) = quantize_on_load {
         let (store, args, report) =
             quantize_neutral_qwen_store(store, &args, quantization, stream)?;
@@ -1320,21 +1300,15 @@ pub fn load_qwen_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
     let options = options.into();
-    let args = eredu_architectures::qwen::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Qwen loader received a different prepared architecture".into(),
+        ));
+    };
+    let args = args.clone();
     let store = artifact.store();
-    let store = resolve_qwen_safetensors_store(store, &args)?;
     load_neutral_qwen_parallel(store, args, options, build, stream, weights_stream, false)
-}
-
-struct QwenGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl eredu_architectures::qwen::GgufTensorCatalog for QwenGgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        crate::backend::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
-            self.0, name,
-        )
-    }
 }
 
 pub(crate) struct PreparedQwenGguf {
@@ -1356,19 +1330,15 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
         )));
     }
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let mut args = eredu_architectures::qwen::model_args_from_gguf_catalog(
-        &QwenGgufCatalog(checkpoint),
-        metadata,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::GgufModelConfig::Qwen(args) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "Qwen GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut args = args.clone();
     let is_moe = args.is_moe();
     let translate =
         |name: &str| eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe);
-    checkpoint
-        .catalog()
-        .translated_outputs(translate)
-        .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     eredu_architectures::qwen::normalize_weight_formats(&args, &mut configs);
     args.quantized_weights = Some(configs.keys().cloned().collect());
@@ -1386,12 +1356,10 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
 ) -> Result<QwenModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_qwen_gguf_checkpoint(source)?;
-    let gguf_plan =
-        eredu_architectures::qwen::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
-            &gguf_plan,
+            source.plan().checkpoint(),
             |name| {
                 eredu_architectures::qwen::translate_gguf_weight_name(name, prepared.args.is_moe())
             },
@@ -1419,12 +1387,10 @@ pub(crate) fn load_qwen_gguf_model(
 ) -> Result<QwenModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_qwen_gguf_checkpoint(source)?;
-    let gguf_plan =
-        eredu_architectures::qwen::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
-            &gguf_plan,
+            source.plan().checkpoint(),
             |name| {
                 eredu_architectures::qwen::translate_gguf_weight_name(name, prepared.args.is_moe())
             },

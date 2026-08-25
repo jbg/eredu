@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::{qwen::{self, vision, vl}, GgufArchitecture};
+use eredu_architectures::qwen::{self, vision, vl};
 use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource, TensorSelection},
     WeightQuantization,
@@ -19,7 +19,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint},
     Array, Stream,
 };
 
@@ -73,7 +73,7 @@ use crate::backend::{
             populate_module_from_lease_excluding,
         },
         checkpoint::{
-            load::{gguf_quantization_configs, GgufTensorNames},
+            load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
             store::open_gguf_checkpoint_source,
         },
@@ -135,14 +135,6 @@ impl QwenVlCheckpointTemplate {
             static_modules,
             units,
         })
-    }
-}
-
-struct TextGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl qwen::GgufTensorCatalog for TextGgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        GgufTensorNames::contains_gguf_tensor(self.0, name)
     }
 }
 
@@ -913,23 +905,6 @@ fn unit_ordinal(architecture: &Architecture, group: usize, index: usize) -> Resu
         .ok_or_else(|| Error::Parallel(format!("Qwen3-VL has no unit {index} in group {group}")))
 }
 
-fn resolve_store(
-    store: Arc<dyn CheckpointSource>,
-    args: &vl::ModelArgs,
-) -> Result<Arc<dyn CheckpointSource>, Error> {
-    let plan = vl::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
-        .map_err(|validation| {
-            Error::ArchitectureModel(format!(
-                "{} checkpoint contract did not resolve: {validation:?}",
-                args.model_type
-            ))
-        })?;
-    Ok(Arc::new(
-        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
-    ))
-}
-
 fn quantize_store(
     store: Arc<dyn CheckpointSource>,
     source: &vl::ModelArgs,
@@ -997,26 +972,20 @@ fn quantize_store(
 }
 
 pub fn prepare_gguf_pipeline(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(vl::ModelArgs, Arc<dyn CheckpointSource>), Error> {
-    let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut text = qwen::model_args_from_gguf_catalog_with_context(
-        &TextGgufCatalog(checkpoint),
-        metadata,
-        context,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    let eredu_architectures::configuration::GgufModelConfig::Qwen(text) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "Qwen3-VL GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut text = text.clone();
     let is_moe = text.is_moe();
     let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_text)
-        .map_err(safemlx::error::IoError::from)?;
     let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
     vl::normalize_text_weight_formats(&text, &mut text_formats);
     text.quantized_weights = Some(text_formats.keys().cloned().collect());
@@ -1039,11 +1008,10 @@ pub fn prepare_gguf_pipeline(
         .collect();
     let args = vl::model_args_from_gguf_parts(text, metadata, vision)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let text_plan = qwen::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
     let vision_plan = vl::projector_gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &text_plan,
+        source.plan().checkpoint(),
         translate_text,
         max_mapped_shards,
     )?);
@@ -1065,29 +1033,23 @@ pub fn prepare_gguf_pipeline(
 /// Loads split Qwen3-VL text plus projector GGUF artifacts through one
 /// composite neutral checkpoint source.
 pub fn load_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
-    let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut text = qwen::model_args_from_gguf_catalog_with_context(
-        &TextGgufCatalog(checkpoint),
-        metadata,
-        context,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    let eredu_architectures::configuration::GgufModelConfig::Qwen(text) = source.model() else {
+        return Err(Error::ArchitectureModel(
+            "Qwen3-VL GGUF loader received a different prepared model".into(),
+        ));
+    };
+    let mut text = text.clone();
     let is_moe = text.is_moe();
     let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_text)
-        .map_err(safemlx::error::IoError::from)?;
     let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
     vl::normalize_text_weight_formats(&text, &mut text_formats);
     text.quantized_weights = Some(text_formats.keys().cloned().collect());
@@ -1113,11 +1075,10 @@ pub fn load_gguf(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    let text_plan = qwen::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
     let vision_plan = vl::projector_gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
-        &text_plan,
+        source.plan().checkpoint(),
         translate_text,
         options.max_mapped_shards(),
     )?);
@@ -1184,8 +1145,13 @@ pub fn load_safetensors_with_residency(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
-    let mut args = vl::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let eredu_architectures::configuration::SafetensorsModelConfig::QwenVl(args) = artifact.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Qwen3-VL loader received a different prepared architecture".into(),
+        ));
+    };
+    let mut args = args.clone();
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen3-VL", args.text.weight_quantization(), requested)
@@ -1196,7 +1162,6 @@ pub fn load_safetensors_with_residency(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let store = artifact.store();
-    let store = resolve_store(store, &args)?;
     let (store, materialization) = if let Some(quantization) = quantize_on_load {
         let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
         args = target;
