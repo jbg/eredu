@@ -183,6 +183,8 @@ impl Parameterized<FakeTensor> for FakeModule {
                 trainable: true,
                 alias_of: None,
                 group: None,
+                linear_companion: None,
+                linear_companion_of: None,
             },
             &self.weight,
         );
@@ -198,6 +200,8 @@ impl Parameterized<FakeTensor> for FakeModule {
                 trainable: true,
                 alias_of: None,
                 group: None,
+                linear_companion: None,
+                linear_companion_of: None,
             },
             &mut self.weight,
         );
