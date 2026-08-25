@@ -1,12 +1,11 @@
 //! Normalized architecture capabilities used during materialization planning.
 
-use std::{collections::HashMap, fmt::Display};
+use std::fmt::Display;
 
 use crate::ModelKind;
 use eredu_checkpoint::schema::SafetensorsCheckpointPlan;
 use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
 use eredu_core::InputModalities;
-use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
 use serde_json::Value;
 
 use crate::GgufArchitecture;
@@ -832,99 +831,6 @@ fn routed_parallel(routed: bool) -> ParallelCapabilityPlan {
 
 fn routed_text(routed: bool) -> (ParallelCapabilityPlan, bool, InputModalities, usize) {
     (routed_parallel(routed), routed, InputModalities::TEXT, 0)
-}
-
-struct ExactGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl crate::gemma4::GgufTensorCatalog for ExactGgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-}
-
-impl crate::muse_glimmer::GgufTensorCatalog for ExactGgufCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-}
-
-/// Derives preparation capabilities from normalized GGUF architecture policy.
-pub fn gguf_capabilities(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-) -> Result<ArchitectureCapabilities, PreparationCapabilityError> {
-    let metadata: HashMap<String, MetadataValue> = checkpoint
-        .metadata()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let (parallel, independently_addressable_experts) = match architecture {
-        GgufArchitecture::Gemma4 => {
-            let routed = crate::gemma4::ModelArgs::from_gguf_metadata(
-                &ExactGgufCatalog(checkpoint),
-                &metadata,
-            )
-            .map_err(invalid)?
-            .num_experts
-            .is_some();
-            (
-                if routed {
-                    ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                } else {
-                    ParallelCapabilityPlan::TENSOR_PIPELINE
-                },
-                routed,
-            )
-        }
-        GgufArchitecture::MuseGlimmer => {
-            let routed = crate::muse_glimmer::DecoderConfig::from_gguf_catalog(
-                &ExactGgufCatalog(checkpoint),
-                &metadata,
-            )
-            .map_err(invalid)?
-            .is_moe();
-            (
-                if routed {
-                    ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                } else {
-                    ParallelCapabilityPlan::TENSOR_PIPELINE
-                },
-                routed,
-            )
-        }
-        GgufArchitecture::KimiLinear
-        | GgufArchitecture::DeepSeek2
-        | GgufArchitecture::DeepSeek4
-        | GgufArchitecture::GptOss
-        | GgufArchitecture::Inkling
-        | GgufArchitecture::Lfm2Moe
-        | GgufArchitecture::NemotronHMoe
-        | GgufArchitecture::Qwen3Moe
-        | GgufArchitecture::Qwen3VlMoe
-        | GgufArchitecture::Qwen35Moe
-        | GgufArchitecture::Qwen3Next => (ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT, true),
-        GgufArchitecture::Llama
-        | GgufArchitecture::Mistral
-        | GgufArchitecture::Lfm2
-        | GgufArchitecture::NemotronH
-        | GgufArchitecture::Qwen2
-        | GgufArchitecture::Qwen3
-        | GgufArchitecture::Qwen3Vl
-        | GgufArchitecture::Qwen35 => (ParallelCapabilityPlan::TENSOR_PIPELINE, false),
-    };
-    let input_modalities = gguf_composite_artifact_plan(architecture)
-        .input_modalities(GgufArtifactComposition::ModelOnly);
-    Ok(ArchitectureCapabilities::new(
-        parallel,
-        independently_addressable_experts,
-        false,
-        input_modalities,
-        None,
-    ))
 }
 
 /// Derives preparation capabilities from the exact GGUF plan retained at admission.

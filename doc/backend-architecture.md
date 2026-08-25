@@ -411,7 +411,10 @@ addressability or a broad family identity. Independent expert residency
 remains a separate artifact capability because it does not imply an
 expert-parallel execution plan. Distributed backend preflight consumes these
 facts from that exact normalized report instead of reconstructing support from
-raw or wrapper `model_type` values.
+raw or wrapper `model_type` values. GGUF inspection, planning, and
+materialization all validate requested preparation against the architecture
+plan retained by portable admission. A backend must not reparse the raw GGUF
+checkpoint to derive a second capability report.
 Validated architecture parameter descriptions retain their canonical
 execution-unit layout alongside owner-tagged parameter groups. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for

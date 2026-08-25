@@ -415,7 +415,11 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             .expect("GGUF inspection must retain its validated architecture plan"),
     );
     record_embedded_drafting(&mut report, capabilities);
-    match structural::validate_gguf_preparation(gguf_architecture, &checkpoint, options.load) {
+    match options
+        .load
+        .preparation_policy()
+        .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
+    {
         Ok(()) => match validate_gguf_quantization_source(
             &checkpoint,
             &metadata,

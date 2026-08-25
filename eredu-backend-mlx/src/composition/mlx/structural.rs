@@ -338,27 +338,6 @@ fn validate_safetensors_preparation_for_test(
     )
 }
 
-pub(crate) fn validate_gguf_preparation(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-    options: ModelLoadOptions,
-) -> Result<(), Error> {
-    let policy = options.preparation_policy()?;
-    eredu_core::validate_preparation_policy(architecture.model_kind().loading_protocol(), policy)?;
-    if !requires_architecture_capabilities(policy) {
-        return Ok(());
-    }
-    let capabilities =
-        eredu_architectures::preparation::gguf_capabilities(architecture, checkpoint)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    validate_preparation_capability_intersection(
-        architecture.model_kind(),
-        eredu_core::ArtifactFormat::Gguf,
-        policy,
-        capabilities,
-    )
-}
-
 pub(crate) fn validate_inspected_preparation(
     inspection: &eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
