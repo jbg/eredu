@@ -16,5 +16,6 @@ pub use prompt::{
     derive_prompt_cache_architecture_fingerprint, prompt_cache_token_fingerprint,
     validate_prompt_cache_model_identity, PromptCacheBlock, PromptCacheDescriptor,
     PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheStateTensor, PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
+    PromptCacheStateSegment, PromptCacheStateTensor, PromptCacheTopology,
+    PROMPT_CACHE_SCHEMA_VERSION,
 };

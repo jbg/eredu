@@ -558,7 +558,7 @@ impl LlamaModel {
         Ok(true)
     }
 
-    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let layout = self.state_layout.clone();
         let topology = self
             .parallel_info

@@ -1,6 +1,9 @@
 //! Portable reusable prompt-cache identity, catalog, and validation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,7 +16,42 @@ use super::{
 };
 
 /// Current reusable prompt-cache schema version.
-pub const PROMPT_CACHE_SCHEMA_VERSION: u32 = 7;
+pub const PROMPT_CACHE_SCHEMA_VERSION: u32 = 8;
+
+/// One named contiguous state range in a portable prompt-cache identity.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PromptCacheStateSegment {
+    id: String,
+    layers: Range<usize>,
+}
+
+impl PromptCacheStateSegment {
+    /// Creates a named non-empty local state range.
+    pub fn new(id: impl Into<String>, layers: Range<usize>) -> Result<Self, PromptCacheError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(PromptCacheError::Malformed(
+                "prompt-cache state segment identity must not be empty".into(),
+            ));
+        }
+        if layers.is_empty() {
+            return Err(PromptCacheError::Malformed(format!(
+                "prompt-cache state segment {id:?} has an empty range"
+            )));
+        }
+        Ok(Self { id, layers })
+    }
+
+    /// Returns the architecture-declared stable segment identity.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the segment's local range in the identity's ordered layout.
+    pub fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+}
 
 /// Caller-supplied identity and geometry for a reusable prefix cache.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -40,6 +78,8 @@ pub struct PromptCacheDescriptor {
     pub layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Per-layer processed-token delta relative to the persisted prefix.
     pub layer_prefix_offsets: Vec<i32>,
+    /// Architecture-declared named ranges in the ordered state layout.
+    pub state_segments: Vec<PromptCacheStateSegment>,
     /// Attention sink or pinned-prefix token count.
     pub sink_tokens: usize,
     /// Distributed rank-local layout.
@@ -56,6 +96,7 @@ impl PromptCacheDescriptor {
             batch_size: self.batch_size,
             layer_layout: &self.layer_layout,
             layer_prefix_offsets: &self.layer_prefix_offsets,
+            state_segments: &self.state_segments,
             topology: &self.topology,
         }
         .validate("prompt-cache descriptor")
@@ -85,6 +126,8 @@ pub struct PromptCacheModelIdentity {
     pub layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Per-layer processed-token delta relative to the persisted prefix.
     pub layer_prefix_offsets: Vec<i32>,
+    /// Architecture-declared named ranges in the ordered state layout.
+    pub state_segments: Vec<PromptCacheStateSegment>,
 }
 
 impl PromptCacheModelIdentity {
@@ -136,9 +179,66 @@ impl PromptCacheModelIdentity {
             batch_size: 1,
             layer_layout: &self.layer_layout,
             layer_prefix_offsets: &self.layer_prefix_offsets,
+            state_segments: &self.state_segments,
             topology: &self.topology,
         }
         .validate("loaded model")
+    }
+
+    /// Returns one architecture-declared state segment by stable identity.
+    pub fn state_segment(&self, id: &str) -> Result<&PromptCacheStateSegment, PromptCacheError> {
+        self.validate()?;
+        self.state_segments
+            .iter()
+            .find(|segment| segment.id() == id)
+            .ok_or_else(|| {
+                PromptCacheError::Incompatible(format!(
+                    "loaded model has no prompt-cache state segment {id:?}"
+                ))
+            })
+    }
+
+    /// Selects one named state segment as a validated standalone identity.
+    pub fn select_state_segment(&self, id: &str) -> Result<Self, PromptCacheError> {
+        let layers = self.state_segment(id)?.layers();
+        let length = layers.len();
+        let global_layer_start = self
+            .global_layer_start
+            .checked_add(layers.start)
+            .ok_or_else(|| PromptCacheError::Malformed("state segment range overflowed".into()))?;
+        let global_layer_end = global_layer_start
+            .checked_add(length)
+            .ok_or_else(|| PromptCacheError::Malformed("state segment range overflowed".into()))?;
+        let layer_layout = LayerSchedule::new(
+            length,
+            self.layer_layout
+                .iter()
+                .skip(layers.start)
+                .take(length)
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| PromptCacheError::Malformed(error.to_string()))?;
+        let layer_prefix_offsets = self
+            .layer_prefix_offsets
+            .get(layers.clone())
+            .ok_or_else(|| PromptCacheError::Malformed("state segment range is invalid".into()))?
+            .to_vec();
+        let selected = Self {
+            model_family: self.model_family.clone(),
+            effective_model_type: self.effective_model_type.clone(),
+            architecture_fingerprint: self.architecture_fingerprint.clone(),
+            layer_count: self.layer_count,
+            global_layer_start,
+            global_layer_end,
+            sink_tokens: self.sink_tokens,
+            topology: self.topology.clone(),
+            layer_layout,
+            layer_prefix_offsets,
+            state_segments: vec![PromptCacheStateSegment::new(id, 0..length)?],
+        };
+        selected.validate()?;
+        Ok(selected)
     }
 }
 
@@ -149,6 +249,7 @@ struct IdentityLayout<'a> {
     batch_size: usize,
     layer_layout: &'a LayerSchedule<LayerCachePolicy>,
     layer_prefix_offsets: &'a [i32],
+    state_segments: &'a [PromptCacheStateSegment],
     topology: &'a PromptCacheTopology,
 }
 
@@ -176,6 +277,8 @@ impl IdentityLayout<'_> {
             )));
         }
         self.topology.validate()?;
+        validate_state_segments(self.state_segments, owned)
+            .map_err(|error| PromptCacheError::Incompatible(format!("{subject} {error}")))?;
         for policy in self.layer_layout.iter() {
             policy.validate()?;
         }
@@ -210,6 +313,45 @@ pub fn validate_prompt_cache_model_identity(
     require_equal!(topology);
     require_equal!(layer_layout);
     require_equal!(layer_prefix_offsets);
+    require_equal!(state_segments);
+    Ok(())
+}
+
+fn validate_state_segments(
+    segments: &[PromptCacheStateSegment],
+    owned: usize,
+) -> Result<(), String> {
+    if segments.is_empty() {
+        return Err("has no named state segments".into());
+    }
+    let mut ids = BTreeSet::new();
+    let mut next = 0;
+    for segment in segments {
+        if segment.id.trim().is_empty() {
+            return Err("has an empty state segment identity".into());
+        }
+        if !ids.insert(segment.id.as_str()) {
+            return Err(format!(
+                "has duplicate state segment identity {:?}",
+                segment.id
+            ));
+        }
+        if segment.layers.start != next
+            || segment.layers.end <= segment.layers.start
+            || segment.layers.end > owned
+        {
+            return Err(format!(
+                "state segment {:?} range {}..{} does not continue an exact partition of {owned} owned layers",
+                segment.id, segment.layers.start, segment.layers.end
+            ));
+        }
+        next = segment.layers.end;
+    }
+    if next != owned {
+        return Err(format!(
+            "state segments cover {next} of {owned} owned layers"
+        ));
+    }
     Ok(())
 }
 
@@ -309,6 +451,8 @@ pub struct PromptCacheManifest {
     pub layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Per-layer processed-token delta relative to the prefix.
     pub layer_prefix_offsets: Vec<i32>,
+    /// Architecture-declared named ranges in the ordered state layout.
+    pub state_segments: Vec<PromptCacheStateSegment>,
     /// Pinned prefix or sink token count.
     pub sink_tokens: usize,
     /// Distributed rank-local representation.
@@ -399,6 +543,8 @@ impl PromptCacheManifest {
             ));
         }
         self.topology.validate()?;
+        validate_state_segments(&self.state_segments, self.layer_layout.len())
+            .map_err(PromptCacheError::Malformed)?;
         for (index, offset) in self.layer_prefix_offsets.iter().enumerate() {
             layer_prefix_tokens(self.total_prefix_tokens, *offset).map_err(|error| {
                 PromptCacheError::Malformed(format!(
@@ -449,6 +595,7 @@ impl PromptCacheManifest {
         require_equal!(batch_size);
         require_equal!(layer_layout);
         require_equal!(layer_prefix_offsets);
+        require_equal!(state_segments);
         require_equal!(sink_tokens);
         require_equal!(topology);
         if self.total_prefix_tokens != prefix_token_ids.len()
@@ -845,6 +992,7 @@ mod tests {
             prefix_sha256: prompt_cache_token_fingerprint(&[7, 8]),
             layer_layout: layout,
             layer_prefix_offsets: vec![0],
+            state_segments: vec![PromptCacheStateSegment::new("state", 0..1).unwrap()],
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
             application_namespace: None,
@@ -941,6 +1089,7 @@ mod tests {
             batch_size: 1,
             layer_layout: manifest.layer_layout.clone(),
             layer_prefix_offsets: vec![0],
+            state_segments: manifest.state_segments.clone(),
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
         };
@@ -950,11 +1099,24 @@ mod tests {
         assert!(manifest
             .validate_compatibility(&descriptor, &[8, 7])
             .is_err());
+        let mut renamed = descriptor.clone();
+        renamed.state_segments = vec![PromptCacheStateSegment::new("renamed", 0..1).unwrap()];
+        assert!(matches!(
+            manifest.validate_compatibility(&renamed, &[7, 8]),
+            Err(PromptCacheError::Incompatible(_))
+        ));
         let mut invalid = descriptor;
         invalid.layer_prefix_offsets[0] = 1;
         assert!(matches!(
             invalid.validate(),
             Err(PromptCacheError::Incompatible(_))
+        ));
+
+        let mut malformed = manifest.clone();
+        malformed.state_segments = vec![PromptCacheStateSegment::new("state", 0..2).unwrap()];
+        assert!(matches!(
+            malformed.validate(),
+            Err(PromptCacheError::Malformed(_))
         ));
     }
 }

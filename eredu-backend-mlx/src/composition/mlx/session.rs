@@ -695,6 +695,20 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    /// Returns the architecture-declared named rank-local state ranges.
+    pub fn prompt_cache_state_segments(
+        &self,
+    ) -> Result<Vec<eredu_core::cache::PromptCacheStateSegment>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => {
+                model.prompt_cache_state_segments().map_err(Into::into)
+            }
+            MlxSessionKind::Pipeline(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.state_segments)
+            }
+        }
+    }
+
     pub(super) fn validate_external_drafter(&self, drafter: &MlxDrafter) -> Result<(), Error> {
         match &self.inner {
             MlxSessionKind::Complete(Model::Gemma4(_, target), _)

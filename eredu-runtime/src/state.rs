@@ -8,8 +8,8 @@ use std::{marker::PhantomData, ops::Range};
 
 use eredu_core::{
     cache::{
-        LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheTopology,
-        StateComponentPolicy, StateTensorRole,
+        LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheStateSegment,
+        PromptCacheTopology, StateComponentPolicy, StateTensorRole,
     },
     LayerSchedule,
 };
@@ -597,6 +597,13 @@ impl ModelStateIdentity {
             topology: self.topology.clone(),
             layer_layout: layout.layers().clone(),
             layer_prefix_offsets: layout.layer_prefix_offsets(),
+            state_segments: layout
+                .segments()
+                .iter()
+                .map(|segment| {
+                    PromptCacheStateSegment::new(segment.id().as_str(), segment.layers())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         };
         identity.validate()?;
         Ok(identity)
@@ -787,6 +794,18 @@ mod tests {
         .prompt_cache_identity(&layout)
         .unwrap();
         assert_eq!(identity.layer_prefix_offsets, [0, -1]);
+        assert_eq!(identity.state_segments.len(), 2);
+        assert_eq!(identity.state_segments[0].id(), "target");
+        assert_eq!(identity.state_segments[0].layers(), 0..1);
+        assert_eq!(identity.state_segments[1].id(), "prediction");
+        assert_eq!(identity.state_segments[1].layers(), 1..2);
+
+        let prediction = identity.select_state_segment("prediction").unwrap();
+        assert_eq!(prediction.global_layer_start, 1);
+        assert_eq!(prediction.global_layer_end, 2);
+        assert_eq!(prediction.layer_prefix_offsets, [-1]);
+        assert_eq!(prediction.state_segments[0].id(), "prediction");
+        assert_eq!(prediction.state_segments[0].layers(), 0..1);
     }
 
     #[test]

@@ -243,6 +243,31 @@ impl Model {
         }
     }
 
+    /// Returns the complete architecture-derived prompt-cache model identity.
+    pub fn prompt_cache_model_identity(
+        &self,
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Exception> {
+        match self {
+            Self::DeepSeek(_, model) => model.prompt_cache_identity(),
+            Self::Gemma4(_, model) => model.prompt_cache_model_identity(),
+            Self::GptOss(_, model) => model.prompt_cache_model_identity(),
+            Self::Inkling(_, model) => model.prompt_identity(),
+            Self::KimiLinear(_, model) => model.prompt_cache_model_identity(),
+            Self::Llama(_, model) => model.prompt_cache_model_identity(),
+            Self::Lfm2(_, model) => model.prompt_cache_model_identity(),
+            Self::NemotronH(_, model) => model.prompt_cache_model_identity(),
+            Self::Qwen(_, model) => model.prompt_cache_model_identity(),
+            Self::MuseGlimmer(_, model) => model.prompt_cache_model_identity(),
+            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => {
+                model.prompt_cache_model_identity()
+            }
+            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
+                model.prompt_cache_model_identity()
+            }
+        }
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
     /// Returns the exact ordered prompt-cache state and attention layout.
     pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
         match self {
@@ -300,6 +325,13 @@ impl Model {
                 .map_err(|error| Exception::custom(error.to_string())),
             _ => Ok(vec![0; self.prompt_cache_layer_layout()?.len()]),
         }
+    }
+
+    /// Returns the architecture-declared named prompt-cache state ranges.
+    pub fn prompt_cache_state_segments(
+        &self,
+    ) -> Result<Vec<eredu_core::cache::PromptCacheStateSegment>, Exception> {
+        Ok(self.prompt_cache_model_identity()?.state_segments)
     }
 
     /// Runs an instrumented pass through the canonical generalized executor.

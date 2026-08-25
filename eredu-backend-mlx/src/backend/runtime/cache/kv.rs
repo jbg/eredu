@@ -4284,6 +4284,9 @@ mod tests {
             global_layer_end: 1,
             batch_size: 1,
             layer_prefix_offsets: vec![0],
+            state_segments: vec![
+                eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap(),
+            ],
             layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
             sink_tokens: 0,
             topology: PromptCacheTopology {
@@ -4338,6 +4341,7 @@ mod tests {
             global_layer_end: 1,
             sink_tokens: 0,
             layer_prefix_offsets: vec![0],
+            state_segments: descriptor.state_segments.clone(),
             topology: descriptor.topology.clone(),
             layer_layout: descriptor.layer_layout.clone(),
         };
@@ -4428,6 +4432,11 @@ mod tests {
             global_layer_end: windows.len(),
             batch_size: 1,
             layer_prefix_offsets: vec![0; windows.len()],
+            state_segments: vec![eredu_core::cache::PromptCacheStateSegment::new(
+                "state",
+                0..windows.len(),
+            )
+            .unwrap()],
             layer_layout: layer_layout.clone(),
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
@@ -4482,6 +4491,7 @@ mod tests {
             global_layer_end: windows.len(),
             sink_tokens: 0,
             layer_prefix_offsets: vec![0; windows.len()],
+            state_segments: descriptor.state_segments.clone(),
             topology: PromptCacheTopology::default(),
             layer_layout,
         };

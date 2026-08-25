@@ -818,6 +818,7 @@ fn pipeline_ring_worker() {
         };
         let layer_layout = session.prompt_cache_layer_layout().unwrap();
         let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
+        let state_segments = session.prompt_cache_state_segments().unwrap();
         let layer_count = session.prompt_cache_layer_count().unwrap();
         let global_layer_range = session.prompt_cache_global_layer_range().unwrap();
         let descriptor = PromptCacheDescriptor {
@@ -831,6 +832,7 @@ fn pipeline_ring_worker() {
             global_layer_end: global_layer_range.end,
             batch_size: 1,
             layer_prefix_offsets,
+            state_segments,
             layer_layout,
             sink_tokens: 0,
             topology: PromptCacheTopology {
@@ -1238,6 +1240,7 @@ fn pipeline_ring_worker() {
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let (model_family, effective_model_type) = family.descriptor_names();
     let layer_layout = model.prompt_cache_layer_layout().unwrap();
+    let state_segments = model.prompt_cache_state_segments().unwrap();
     let target_layer_count = family.stage_range(pipeline_rank).len();
     let mut layer_prefix_offsets = vec![0; layer_layout.len()];
     layer_prefix_offsets[target_layer_count..].fill(-1);
@@ -1252,6 +1255,7 @@ fn pipeline_ring_worker() {
         global_layer_end: family.stage_range(pipeline_rank).start + layer_layout.len(),
         batch_size: 1,
         layer_prefix_offsets,
+        state_segments,
         layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology {

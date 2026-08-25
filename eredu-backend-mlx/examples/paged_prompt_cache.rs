@@ -160,6 +160,7 @@ fn main() -> anyhow::Result<()> {
         global_layer_end: layer_count,
         batch_size: 1,
         layer_prefix_offsets: session.prompt_cache_layer_prefix_offsets()?,
+        state_segments: session.prompt_cache_state_segments()?,
         layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology::default(),

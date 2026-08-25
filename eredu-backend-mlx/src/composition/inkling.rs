@@ -475,7 +475,9 @@ impl InklingModel {
         Ok(self.prompt_state_layout.layers().clone())
     }
 
-    fn prompt_identity(&self) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
+    pub(crate) fn prompt_identity(
+        &self,
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
         let topology = self
             .parallel_info
             .as_ref()

@@ -7254,28 +7254,9 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         // Predictor state is appended to the final stage's persistence
         // identity, but it is materialized in the transactional MTP cache.
-        let target_owned = self.range().len();
-        let mut target_identity = identity.clone();
-        target_identity.global_layer_end = target_identity
-            .global_layer_start
-            .checked_add(target_owned)
-            .ok_or_else(|| Error::Parallel("pipeline target cache range overflowed".into()))?;
-        target_identity.layer_layout = eredu_core::LayerSchedule::new(
-            target_owned,
-            identity
-                .layer_layout
-                .iter()
-                .take(target_owned)
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        target_identity.layer_prefix_offsets = identity
-            .layer_prefix_offsets
-            .iter()
-            .take(target_owned)
-            .copied()
-            .collect();
+        let target_identity = identity
+            .select_state_segment(eredu_architectures::inkling::TARGET_STATE_SEGMENT)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         materialize_pipeline_cache_layers(&target_identity, paged)
     }
 
@@ -8743,25 +8724,9 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
-        let target_owned = self.range().len();
-        let mut target_identity = identity.clone();
-        target_identity.global_layer_end = target_identity.global_layer_start + target_owned;
-        target_identity.layer_layout = eredu_core::LayerSchedule::new(
-            target_owned,
-            identity
-                .layer_layout
-                .iter()
-                .take(target_owned)
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        target_identity.layer_prefix_offsets = identity
-            .layer_prefix_offsets
-            .iter()
-            .take(target_owned)
-            .copied()
-            .collect();
+        let target_identity = identity
+            .select_state_segment(eredu_architectures::qwen::hybrid::TARGET_STATE_SEGMENT)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         materialize_pipeline_cache_layers(&target_identity, paged)
     }
 
@@ -9389,28 +9354,9 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
         // The final rank owns appended prediction state in its persisted
         // identity, but ordinary pipeline execution addresses target units
         // only; prediction groups use the transactional hybrid cache below.
-        let target_owned = self.range().len();
-        let mut target_identity = identity.clone();
-        target_identity.global_layer_end = target_identity
-            .global_layer_start
-            .checked_add(target_owned)
-            .ok_or_else(|| Error::Parallel("pipeline target cache range overflowed".into()))?;
-        target_identity.layer_layout = eredu_core::LayerSchedule::new(
-            target_owned,
-            identity
-                .layer_layout
-                .iter()
-                .take(target_owned)
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        target_identity.layer_prefix_offsets = identity
-            .layer_prefix_offsets
-            .iter()
-            .take(target_owned)
-            .copied()
-            .collect();
+        let target_identity = identity
+            .select_state_segment(eredu_architectures::nemotron_h::TARGET_STATE_SEGMENT)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         materialize_pipeline_cache_layers(&target_identity, paged)
     }
 
@@ -10196,10 +10142,12 @@ impl PipelineModel {
                 .embedded_mtp()
                 .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
         ) {
-            let target_owned = cache.layers.len();
+            let prediction = identity
+                .state_segment(segment)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
             let offsets = identity
                 .layer_prefix_offsets
-                .get(target_owned..)
+                .get(prediction.layers())
                 .ok_or_else(|| Error::Parallel("pipeline MTP prompt offsets are missing".into()))?;
             let range = mtp
                 .segment_range(segment)
@@ -10322,10 +10270,12 @@ impl PipelineModel {
                     .embedded_mtp()
                     .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
             ) {
-                let target_owned = cache.layers.len();
+                let prediction = identity
+                    .state_segment(segment)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
                 let offsets = identity
                     .layer_prefix_offsets
-                    .get(target_owned..)
+                    .get(prediction.layers())
                     .ok_or_else(|| {
                         Error::Parallel("pipeline MTP prompt offsets are missing".into())
                     })?;
@@ -11324,6 +11274,12 @@ impl PipelineModel {
         &self,
     ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
         Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
+    pub fn prompt_cache_state_segments(
+        &self,
+    ) -> Result<Vec<eredu_core::cache::PromptCacheStateSegment>, Error> {
+        Ok(self.prompt_cache_model_identity()?.state_segments)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -19113,25 +19069,9 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
-        let target_owned = self.range().len();
-        let mut target_identity = identity.clone();
-        target_identity.global_layer_end = target_identity.global_layer_start + target_owned;
-        target_identity.layer_layout = eredu_core::LayerSchedule::new(
-            target_owned,
-            identity
-                .layer_layout
-                .iter()
-                .take(target_owned)
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        target_identity.layer_prefix_offsets = identity
-            .layer_prefix_offsets
-            .iter()
-            .take(target_owned)
-            .copied()
-            .collect();
+        let target_identity = identity
+            .select_state_segment(eredu_architectures::qwen::hybrid::TARGET_STATE_SEGMENT)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         materialize_pipeline_cache_layers(&target_identity, paged)
     }
 

@@ -370,8 +370,11 @@ model-family arguments are not a second source of state geometry. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
 assembled by the architecture before a backend consumes them. Architecture
 state segments also declare their processed-token frontier offsets. Runtime
-expands those segment offsets into prompt-cache identity, and contiguous
-partition slices preserve and rebase the intersecting segment metadata.
+preserves the named segment ranges in prompt-cache model identity, descriptor,
+and manifest data while expanding their frontier offsets per layer. Segment
+selection validates the architecture-declared ID and rebases its exact range;
+contiguous partition slices preserve and rebase the intersecting segment
+metadata.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.

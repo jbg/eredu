@@ -56,7 +56,7 @@ pub use eredu_core::artifact::{
 };
 pub use eredu_core::cache::{
     CachePolicyError, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
-    PromptCacheOptions, PROMPT_CACHE_SCHEMA_VERSION,
+    PromptCacheOptions, PromptCacheStateSegment, PROMPT_CACHE_SCHEMA_VERSION,
 };
 pub use eredu_core::generation::{
     CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,

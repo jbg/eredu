@@ -873,7 +873,8 @@ fn hex(digest: impl AsRef<[u8]>) -> String {
 mod tests {
     use super::*;
     use eredu_core::cache::{
-        CacheRepresentation, LayerCachePolicy, PromptCacheDescriptor, PromptCacheTopology,
+        CacheRepresentation, LayerCachePolicy, PromptCacheDescriptor, PromptCacheStateSegment,
+        PromptCacheTopology,
     };
     use eredu_core::{AttentionPolicy, LayerSchedule};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -905,6 +906,7 @@ mod tests {
             )
             .unwrap(),
             layer_prefix_offsets: vec![0],
+            state_segments: vec![PromptCacheStateSegment::new("state", 0..1).unwrap()],
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
         };
@@ -924,6 +926,7 @@ mod tests {
             prefix_sha256: "00".repeat(32),
             layer_layout: descriptor.layer_layout,
             layer_prefix_offsets: vec![0],
+            state_segments: descriptor.state_segments,
             sink_tokens: 0,
             topology: descriptor.topology,
             application_namespace: None,
