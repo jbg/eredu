@@ -52,10 +52,13 @@ fn neutral_input_parts<'a>(
 
 fn qwen_hybrid_input_plan(
     args: &ParsedHybridConfig,
-    part: input::InputPart<'_>,
+    part: &input::InputPart,
 ) -> Result<QwenHybridInputPartPlan, safemlx::error::Exception> {
-    let prepared = input::prepared_input_part(part)?;
-    eredu_architectures::media_plan::qwen_hybrid_input_part(args, &prepared)
+    eredu_architectures::media_plan::qwen_hybrid_input_part(
+        args,
+        part,
+        &input::MlxInputInspector,
+    )
         .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
 }
 
@@ -289,17 +292,17 @@ impl QwenConditionalPipelineBindings {
             Video(usize, usize),
         }
         let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().copied().enumerate() {
+        for (original, part) in typed.parts.iter().enumerate() {
             match qwen_hybrid_input_plan(&parsed, part)? {
                 QwenHybridInputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(tokens.clone());
                     kinds.push(Kind::Text(token_storage.len() - 1));
                 }
                 QwenHybridInputPartPlan::Projected { .. } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(input::token_ids_array(
@@ -309,7 +312,7 @@ impl QwenConditionalPipelineBindings {
                     kinds.push(Kind::Projected(token_storage.len() - 1, original));
                 }
                 QwenHybridInputPartPlan::Media { ingress, .. } => {
-                    let input::InputPayload::Tensor(tensor) = part.payload else {
+                    let input::InputPayload::Tensor(tensor) = part.payload() else {
                         unreachable!()
                     };
                     let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
@@ -318,7 +321,7 @@ impl QwenConditionalPipelineBindings {
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if part.modality == input::Modality::Image {
+                    kinds.push(if part.modality() == input::Modality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
@@ -331,7 +334,7 @@ impl QwenConditionalPipelineBindings {
             parts.push(match kind {
                 Kind::Text(token) => InputPart::Text(&token_storage[token]),
                 Kind::Projected(token, original) => {
-                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload
+                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload()
                     else {
                         unreachable!()
                     };
@@ -1209,17 +1212,17 @@ impl QwenHybridModel {
             Video(usize, usize),
         }
         let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().copied().enumerate() {
+        for (original, part) in typed.parts.iter().enumerate() {
             match qwen_hybrid_input_plan(&self.parsed, part)? {
                 QwenHybridInputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(tokens.clone());
                     kinds.push(Kind::Text(token_storage.len() - 1));
                 }
                 QwenHybridInputPartPlan::Projected { .. } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(input::token_ids_array(
@@ -1229,7 +1232,7 @@ impl QwenHybridModel {
                     kinds.push(Kind::Projected(token_storage.len() - 1, original));
                 }
                 QwenHybridInputPartPlan::Media { ingress, .. } => {
-                    let input::InputPayload::Tensor(tensor) = part.payload else {
+                    let input::InputPayload::Tensor(tensor) = part.payload() else {
                         unreachable!()
                     };
                     let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
@@ -1238,7 +1241,7 @@ impl QwenHybridModel {
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if part.modality == input::Modality::Image {
+                    kinds.push(if part.modality() == input::Modality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
@@ -1251,7 +1254,7 @@ impl QwenHybridModel {
             parts.push(match kind {
                 Kind::Text(token) => InputPart::Text(&token_storage[token]),
                 Kind::Projected(token, original) => {
-                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload
+                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload()
                     else {
                         unreachable!()
                     };

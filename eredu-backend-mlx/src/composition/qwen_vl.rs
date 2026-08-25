@@ -51,10 +51,9 @@ fn neutral_input_parts<'a>(
 
 fn qwen_vl_input_plan(
     args: &vl::ModelArgs,
-    part: input::InputPart<'_>,
+    part: &input::InputPart,
 ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, safemlx::error::Exception> {
-    let prepared = input::prepared_input_part(part)?;
-    eredu_architectures::media_plan::qwen_vl_input_part(args, &prepared)
+    eredu_architectures::media_plan::qwen_vl_input_part(args, part, &input::MlxInputInspector)
         .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
 }
 
@@ -204,17 +203,17 @@ impl QwenVlPipelineBindings {
             Video(usize, usize),
         }
         let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().copied().enumerate() {
+        for (original, part) in typed.parts.iter().enumerate() {
             match qwen_vl_input_plan(&args, part)? {
                 eredu_architectures::media_plan::QwenVlInputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(tokens.clone());
                     kinds.push(Kind::Text(token_storage.len() - 1));
                 }
                 eredu_architectures::media_plan::QwenVlInputPartPlan::ProjectedText { .. } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(input::token_ids_array(
@@ -226,7 +225,7 @@ impl QwenVlPipelineBindings {
                 eredu_architectures::media_plan::QwenVlInputPartPlan::Media {
                     ingress, ..
                 } => {
-                    let input::InputPayload::Tensor(tensor) = part.payload else {
+                    let input::InputPayload::Tensor(tensor) = part.payload() else {
                         unreachable!()
                     };
                     let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
@@ -235,7 +234,7 @@ impl QwenVlPipelineBindings {
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if part.modality == input::Modality::Image {
+                    kinds.push(if part.modality() == input::Modality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
@@ -248,7 +247,7 @@ impl QwenVlPipelineBindings {
             parts.push(match kind {
                 Kind::Text(token) => vl::InputPart::Text(&token_storage[token]),
                 Kind::Projected(token, original) => {
-                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload
+                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload()
                     else {
                         unreachable!()
                     };
@@ -694,17 +693,17 @@ impl QwenVlModel {
             Video(usize, usize),
         }
         let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().copied().enumerate() {
+        for (original, part) in typed.parts.iter().enumerate() {
             match qwen_vl_input_plan(&self.args, part)? {
                 eredu_architectures::media_plan::QwenVlInputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
                         unreachable!()
                     };
                     token_storage.push(tokens.clone());
                     kinds.push(Kind::Text(token_storage.len() - 1));
                 }
                 eredu_architectures::media_plan::QwenVlInputPartPlan::ProjectedText { .. } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
                         unreachable!()
                     };
                     let token = input::token_ids_array(
@@ -717,7 +716,7 @@ impl QwenVlModel {
                 eredu_architectures::media_plan::QwenVlInputPartPlan::Media {
                     ingress, ..
                 } => {
-                    let input::InputPayload::Tensor(tensor) = part.payload else {
+                    let input::InputPayload::Tensor(tensor) = part.payload() else {
                         unreachable!()
                     };
                     let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
@@ -726,7 +725,7 @@ impl QwenVlModel {
                     pixels.push(tensor.clone());
                     let token_index = token_storage.len() - 1;
                     let grid_index = grids.len() - 1;
-                    kinds.push(if part.modality == input::Modality::Image {
+                    kinds.push(if part.modality() == input::Modality::Image {
                         Kind::Image(token_index, grid_index)
                     } else {
                         Kind::Video(token_index, grid_index)
@@ -739,7 +738,7 @@ impl QwenVlModel {
             parts.push(match kind {
                 Kind::Text(token) => vl::InputPart::Text(&token_storage[token]),
                 Kind::Projected(token, original) => {
-                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload
+                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload()
                     else {
                         unreachable!()
                     };

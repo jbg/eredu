@@ -5,23 +5,18 @@ pub mod input;
 
 #[cfg(feature = "image")]
 use eredu_core::VideoSampling;
-use eredu_core::{
-    checkpoint::TensorDtype, InputExtent, InputMetadataKey, InputModality, InputTensorIdentity,
-    PreparedInputIdentity,
-};
-use eredu_runtime::{
-    PreparedInputPart as RuntimePreparedInputPart,
-    PreparedInputPayload as RuntimePreparedInputPayload,
-    PreparedModelInput as RuntimePreparedModelInput,
-};
+use eredu_core::{checkpoint::TensorDtype, InputTensorIdentity, PreparedInputIdentity};
+#[cfg(any(feature = "image", feature = "audio"))]
+use eredu_core::{InputExtent, InputMetadataKey};
+use eredu_runtime::PreparedModelInput as RuntimePreparedModelInput;
 use safemlx::{Array, Dtype};
 
-use crate::{
-    backend::error::Error,
-    backend::runtime::media::input::{
-        InputMetadata, InputPart, InputPayload, Modality, ModelInput,
-    },
-};
+#[cfg(any(test, feature = "media"))]
+use crate::backend::runtime::media::input::{InputPayload, Modality};
+use crate::{backend::error::Error, backend::runtime::media::input::ModelInput};
+
+/// Backend-neutral runtime input part specialized to MLX arrays.
+pub use crate::backend::runtime::media::input::InputPart;
 
 /// Shared PCM waveform validation and spectral operations.
 #[cfg(feature = "audio")]
@@ -126,108 +121,27 @@ pub enum MediaPayload<'a> {
     _Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
-#[derive(Debug, Clone)]
-enum OwnedInputPayload {
-    TokenIds(Array),
-    Tensor(Array),
-    Embeddings(Array),
+#[cfg(any(test, feature = "media"))]
+fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
+    let width = i32::try_from(ids.len())
+        .map_err(|_| Error::Processor("text input exceeds MLX dimension capacity".into()))?;
+    input::input_part(
+        Modality::Text,
+        InputPayload::TokenIds(Array::from_slice(ids, &[1, width])),
+        [],
+        [],
+    )
+    .map_err(Into::into)
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct OwnedInputMetadata {
-    patch_grid: Option<Array>,
-    patch_positions: Option<Array>,
-    audio_mask: Option<Array>,
-    patch_extent: Option<[i32; 3]>,
-    audio_valid_frames: Option<i32>,
-}
-
-impl OwnedInputMetadata {
-    #[cfg(feature = "image")]
-    pub fn patch_grid(value: Array) -> Self {
-        Self {
-            patch_grid: Some(value),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(feature = "image")]
-    pub fn patch_layout(grid: Array, positions: Array, extent: [i32; 3]) -> Self {
-        Self {
-            patch_grid: Some(grid),
-            patch_positions: Some(positions),
-            audio_mask: None,
-            patch_extent: Some(extent),
-            audio_valid_frames: None,
-        }
-    }
-
-    #[cfg(feature = "audio")]
-    pub fn audio_mask(value: Array, valid_frames: i32) -> Self {
-        Self {
-            audio_mask: Some(value),
-            audio_valid_frames: Some(valid_frames),
-            ..Self::default()
-        }
-    }
-
-    fn from_input_metadata(metadata: InputMetadata<'_>) -> Self {
-        Self {
-            patch_grid: metadata.patch_grid.cloned(),
-            patch_positions: metadata.patch_positions.cloned(),
-            audio_mask: metadata.audio_mask.cloned(),
-            patch_extent: metadata.patch_extent,
-            audio_valid_frames: metadata.audio_valid_frames,
-        }
-    }
-}
-
-/// One owned part of a prepared model input.
-#[derive(Debug, Clone)]
-pub struct PreparedInputPart {
+#[cfg(any(feature = "image", feature = "audio"))]
+pub fn media_input_part(
     modality: Modality,
-    payload: OwnedInputPayload,
-    metadata: OwnedInputMetadata,
-}
-
-impl PreparedInputPart {
-    #[cfg(any(test, feature = "media"))]
-    pub fn text_token_ids(ids: &[u32]) -> Self {
-        Self {
-            modality: Modality::Text,
-            payload: OwnedInputPayload::TokenIds(Array::from_slice(ids, &[1, ids.len() as i32])),
-            metadata: OwnedInputMetadata::default(),
-        }
-    }
-
-    #[cfg(any(feature = "image", feature = "audio"))]
-    pub fn media_tensor(modality: Modality, tensor: Array, metadata: OwnedInputMetadata) -> Self {
-        Self {
-            modality,
-            payload: OwnedInputPayload::Tensor(tensor),
-            metadata,
-        }
-    }
-
-    /// Borrows this owned part as a runtime input part.
-    pub fn as_input_part(&self) -> InputPart<'_> {
-        let payload = match &self.payload {
-            OwnedInputPayload::TokenIds(value) => InputPayload::TokenIds(value),
-            OwnedInputPayload::Tensor(value) => InputPayload::Tensor(value),
-            OwnedInputPayload::Embeddings(value) => InputPayload::Embeddings(value),
-        };
-        InputPart {
-            modality: self.modality,
-            payload,
-            metadata: InputMetadata {
-                patch_grid: self.metadata.patch_grid.as_ref(),
-                patch_positions: self.metadata.patch_positions.as_ref(),
-                audio_mask: self.metadata.audio_mask.as_ref(),
-                patch_extent: self.metadata.patch_extent,
-                audio_valid_frames: self.metadata.audio_valid_frames,
-            },
-        }
-    }
+    tensor: Array,
+    metadata: impl IntoIterator<Item = (InputMetadataKey, Array)>,
+    extents: impl IntoIterator<Item = InputExtent>,
+) -> Result<InputPart, Error> {
+    input::input_part(modality, InputPayload::Tensor(tensor), metadata, extents).map_err(Into::into)
 }
 
 /// Owned runtime input produced by a media processor.
@@ -237,11 +151,7 @@ pub struct PreparedModelInput {
 }
 
 impl PreparedModelInput {
-    fn new(parts: Vec<PreparedInputPart>) -> Result<Self, Error> {
-        let parts = parts
-            .into_iter()
-            .map(runtime_prepared_part)
-            .collect::<Result<Vec<_>, _>>()?;
+    fn new(parts: Vec<InputPart>) -> Result<Self, Error> {
         let inner = RuntimePreparedModelInput::new(parts, |array| {
             portable_tensor_identity(array).map_err(|error| {
                 eredu_core::PreparedInputError::BackendTensorIdentity(error.to_string())
@@ -254,20 +164,7 @@ impl PreparedModelInput {
     /// Copies borrowed typed input into scheduler-safe owned storage.
     pub fn from_model_input(input: ModelInput<'_>) -> Result<Self, Error> {
         input::validate(input)?;
-        let parts = input
-            .parts
-            .iter()
-            .map(|part| PreparedInputPart {
-                modality: part.modality,
-                payload: match part.payload {
-                    InputPayload::TokenIds(array) => OwnedInputPayload::TokenIds(array.clone()),
-                    InputPayload::Tensor(array) => OwnedInputPayload::Tensor(array.clone()),
-                    InputPayload::Embeddings(array) => OwnedInputPayload::Embeddings(array.clone()),
-                },
-                metadata: OwnedInputMetadata::from_input_metadata(part.metadata),
-            })
-            .collect();
-        Self::new(parts)
+        Self::new(input.parts.to_vec())
     }
 
     /// Returns the payload-free collective identity of this prepared input.
@@ -287,16 +184,14 @@ impl PreparedModelInput {
 
     /// Borrows the prepared data as ordinary typed runtime input parts.
     ///
-    /// Keep the returned vector alive for as long as the resulting
-    /// [`ModelInput`] is used.
-    pub fn input_parts(&self) -> Vec<InputPart<'_>> {
-        self.inner.parts().iter().map(runtime_input_part).collect()
+    /// The returned slice borrows this prepared input.
+    pub fn input_parts(&self) -> &[InputPart] {
+        self.inner.parts()
     }
 
     /// Calls `function` with a borrowed typed runtime input.
     pub fn with_model_input<T>(&self, function: impl FnOnce(ModelInput<'_>) -> T) -> T {
-        let parts = self.input_parts();
-        function(ModelInput::new(&parts))
+        function(ModelInput::new(self.input_parts()))
     }
 
     /// Clones payload and metadata arrays in the identity's deterministic wire order.
@@ -336,104 +231,8 @@ impl PreparedModelInput {
     }
 }
 
-fn runtime_prepared_part(
-    part: PreparedInputPart,
-) -> Result<RuntimePreparedInputPart<Array>, Error> {
-    let payload = match part.payload {
-        OwnedInputPayload::TokenIds(value) => RuntimePreparedInputPayload::TokenIds(value),
-        OwnedInputPayload::Tensor(value) => RuntimePreparedInputPayload::Tensor(value),
-        OwnedInputPayload::Embeddings(value) => RuntimePreparedInputPayload::Embeddings(value),
-    };
-    let metadata = [
-        (InputMetadataKey::PatchGrid, part.metadata.patch_grid),
-        (
-            InputMetadataKey::PatchPositions,
-            part.metadata.patch_positions,
-        ),
-        (InputMetadataKey::AudioMask, part.metadata.audio_mask),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| value.map(|value| (key, value)));
-    let extents = part
-        .metadata
-        .patch_extent
-        .map(|[time, height, width]| {
-            let [time, height, width] = [time, height, width].map(|value| {
-                usize::try_from(value).map_err(|_| {
-                    Error::Processor("prepared patch extent must be non-negative".into())
-                })
-            });
-            Ok(InputExtent::PatchGrid {
-                time: time?,
-                height: height?,
-                width: width?,
-            })
-        })
-        .into_iter()
-        .chain(part.metadata.audio_valid_frames.map(|frames| {
-            usize::try_from(frames)
-                .map(InputExtent::AudioValidFrames)
-                .map_err(|_| Error::Processor("valid audio frames must be non-negative".into()))
-        }))
-        .collect::<Result<Vec<_>, Error>>()?;
-    RuntimePreparedInputPart::new_with_extents(
-        portable_modality(part.modality),
-        payload,
-        metadata,
-        extents,
-    )
-    .map_err(prepared_input_error)
-}
-
-fn runtime_input_part(part: &RuntimePreparedInputPart<Array>) -> InputPart<'_> {
-    let payload = match part.payload() {
-        RuntimePreparedInputPayload::TokenIds(value) => InputPayload::TokenIds(value),
-        RuntimePreparedInputPayload::Tensor(value) => InputPayload::Tensor(value),
-        RuntimePreparedInputPayload::Embeddings(value) => InputPayload::Embeddings(value),
-    };
-    InputPart {
-        modality: mlx_modality(part.modality()),
-        payload,
-        metadata: InputMetadata {
-            patch_grid: part.metadata_value(InputMetadataKey::PatchGrid),
-            patch_positions: part.metadata_value(InputMetadataKey::PatchPositions),
-            audio_mask: part.metadata_value(InputMetadataKey::AudioMask),
-            patch_extent: part.extents().iter().find_map(|extent| match extent {
-                InputExtent::PatchGrid {
-                    time,
-                    height,
-                    width,
-                } => Some([*time as i32, *height as i32, *width as i32]),
-                InputExtent::AudioValidFrames(_) => None,
-            }),
-            audio_valid_frames: part.extents().iter().find_map(|extent| match extent {
-                InputExtent::AudioValidFrames(frames) => Some(*frames as i32),
-                InputExtent::PatchGrid { .. } => None,
-            }),
-        },
-    }
-}
-
 fn prepared_input_error(error: eredu_core::PreparedInputError) -> Error {
     Error::Parallel(error.to_string())
-}
-
-fn portable_modality(modality: Modality) -> InputModality {
-    match modality {
-        Modality::Text => InputModality::Text,
-        Modality::Image => InputModality::Image,
-        Modality::Video => InputModality::Video,
-        Modality::Audio => InputModality::Audio,
-    }
-}
-
-fn mlx_modality(modality: InputModality) -> Modality {
-    match modality {
-        InputModality::Text => Modality::Text,
-        InputModality::Image => Modality::Image,
-        InputModality::Video => Modality::Video,
-        InputModality::Audio => Modality::Audio,
-    }
 }
 
 fn portable_tensor_identity(array: &Array) -> Result<InputTensorIdentity, Error> {
@@ -536,7 +335,7 @@ impl<E> From<Error> for ProcessorPreparationError<E> {
 }
 
 #[cfg(any(test, feature = "media"))]
-pub fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedModelInput, Error> {
+pub fn prepared_model_input(parts: Vec<InputPart>) -> Result<PreparedModelInput, Error> {
     if parts.is_empty() {
         return Err(Error::Processor(
             "prepared model input must not be empty".to_string(),
@@ -546,18 +345,20 @@ pub fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedMod
 }
 
 #[cfg(any(test, feature = "media"))]
-pub fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
+pub fn push_text_token_ids(parts: &mut Vec<InputPart>, token_ids: &[u32]) -> Result<(), Error> {
     if !token_ids.is_empty() {
-        parts.push(PreparedInputPart::text_token_ids(token_ids));
+        parts.push(text_input_part(token_ids)?);
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod prepared_input_identity_tests {
     use super::{
-        input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
+        input::{input_part, InputPayload, Modality, ModelInput},
         PreparedModelInput,
     };
+    use eredu_core::InputMetadataKey;
     use safemlx::Array;
 
     fn descriptor(input: ModelInput<'_>) -> Vec<u32> {
@@ -575,22 +376,34 @@ mod prepared_input_identity_tests {
         let grid = Array::from_slice(&[1_i32, 1, 2], &[1, 3]);
         let other_grid = Array::from_slice(&[1_i32, 1, 2], &[3, 1]);
 
-        let image_part = [InputPart::image_tensor(
-            &image,
-            InputMetadata::patch_grid(&grid),
-        )];
-        let video_part = [InputPart::video_tensor(
-            &image,
-            InputMetadata::patch_grid(&grid),
-        )];
-        let shaped_part = [InputPart::image_tensor(
-            &differently_shaped,
-            InputMetadata::patch_grid(&grid),
-        )];
-        let metadata_part = [InputPart::image_tensor(
-            &image,
-            InputMetadata::patch_grid(&other_grid),
-        )];
+        let image_part = [input_part(
+            Modality::Image,
+            InputPayload::Tensor(image.clone()),
+            [(InputMetadataKey::PatchGrid, grid.clone())],
+            [],
+        )
+        .unwrap()];
+        let video_part = [input_part(
+            Modality::Video,
+            InputPayload::Tensor(image.clone()),
+            [(InputMetadataKey::PatchGrid, grid.clone())],
+            [],
+        )
+        .unwrap()];
+        let shaped_part = [input_part(
+            Modality::Image,
+            InputPayload::Tensor(differently_shaped),
+            [(InputMetadataKey::PatchGrid, grid)],
+            [],
+        )
+        .unwrap()];
+        let metadata_part = [input_part(
+            Modality::Image,
+            InputPayload::Tensor(image),
+            [(InputMetadataKey::PatchGrid, other_grid)],
+            [],
+        )
+        .unwrap()];
 
         let baseline = descriptor(ModelInput::new(&image_part));
         assert_ne!(baseline, descriptor(ModelInput::new(&video_part)));
@@ -604,12 +417,14 @@ mod prepared_input_identity_tests {
         let embeddings = Array::from_slice(&[0.0_f32; 12], &[1, 2, 6]);
         let positions = Array::from_slice(&[0_i32, 1, 2, 3], &[1, 2, 2]);
         let parts = [
-            InputPart::text_token_ids(&tokens),
-            InputPart {
-                modality: Modality::Image,
-                payload: InputPayload::Embeddings(&embeddings),
-                metadata: InputMetadata::patch_positions(&positions),
-            },
+            input_part(Modality::Text, InputPayload::TokenIds(tokens), [], []).unwrap(),
+            input_part(
+                Modality::Image,
+                InputPayload::Embeddings(embeddings),
+                [(InputMetadataKey::PatchPositions, positions)],
+                [],
+            )
+            .unwrap(),
         ];
         let borrowed = ModelInput::new(&parts);
         let expected = PreparedModelInput::from_model_input(borrowed)
@@ -622,10 +437,12 @@ mod prepared_input_identity_tests {
         assert_eq!(prepared.identity(), &expected);
         prepared.with_model_input(|round_tripped| {
             assert!(matches!(
-                round_tripped.parts[1].payload,
+                round_tripped.parts[1].payload(),
                 InputPayload::Embeddings(_)
             ));
-            assert!(round_tripped.parts[1].metadata.patch_positions.is_some());
+            assert!(round_tripped.parts[1]
+                .metadata_value(InputMetadataKey::PatchPositions)
+                .is_some());
         });
     }
 }

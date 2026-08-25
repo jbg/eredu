@@ -595,15 +595,20 @@ Prepared-media admission follows the same boundary after tensor construction.
 Architecture media plans validate family payload shapes,
 patch/window/pooling geometry, valid-position masks, and artifact-specific
 modality policy, then report decoder positions and conservative scalar
-workspace. Concrete backends only extract shapes and small metadata values
-from native arrays, apply physical scalar widths, and account for the arrays'
-actual byte sizes. Architecture input-part plans additionally classify payload
-representations for every family, including explicit rejection plans for
-text-only models. The same plan must drive prefill materialization and
-capability accounting, and both paths must consume the same backend extraction
-of native input facts, so they cannot disagree about an accepted
-modality/payload pair or its metadata; backend admission has no rank-only
-fallback.
+workspace. Admission consumes `eredu-core` input descriptors and
+`eredu-runtime` prepared-input tensor containers directly; architectures and
+concrete backends must not redeclare modality or payload vocabularies. A narrow
+backend inspector describes native tensors and evaluates only the small signed
+integer or Boolean metadata arrays required by family equations. Core extents
+remain host-sized through neutral planning and are narrowed with checked
+conversions only where a concrete tensor API requires it. Concrete backends
+apply physical scalar widths and account for the arrays' actual byte sizes.
+Architecture input-part plans additionally classify payload representations
+for every family, including explicit rejection plans for text-only models. The
+same plan must drive prefill materialization and capability accounting, and
+both paths must consume the same runtime container and inspector, so they
+cannot disagree about an accepted modality/payload pair or its metadata;
+backend admission has no rank-only fallback.
 
 Backend types also declare the optional neural and tensor operations they
 support. This includes every `Tensor` method whose default implementation fails

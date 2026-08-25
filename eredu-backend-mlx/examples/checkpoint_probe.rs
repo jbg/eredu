@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
+use eredu_backend_mlx::backend::runtime::media::input::ModelInput;
 use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
@@ -370,7 +370,8 @@ fn run_probe(
 ) -> Result<RunOutput> {
     session.reset()?;
     let prompt_tokens = Array::from(input_ids).try_index_device(NewAxis, stream)?;
-    let prompt_parts = [InputPart::text_token_ids(&prompt_tokens)];
+    let prompt_parts =
+        [eredu_backend_mlx::backend::runtime::media::input::token_ids_part(&prompt_tokens)?];
 
     let prefill_started = Instant::now();
     let prefill = session

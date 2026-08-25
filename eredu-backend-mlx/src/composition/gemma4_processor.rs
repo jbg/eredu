@@ -6,6 +6,8 @@ use eredu_architectures::processor_plan::{
 };
 use eredu_architectures::processor_plan::{Gemma4ProcessorPlan, ProcessorPlanError};
 #[cfg(any(feature = "image", feature = "audio"))]
+use eredu_core::{InputExtent, InputMetadataKey};
+#[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
 use crate::backend::error::Error;
@@ -20,14 +22,14 @@ use crate::backend::runtime::media::image::{
 use crate::backend::runtime::media::input::Modality;
 #[cfg(feature = "image")]
 use crate::backend::runtime::media::video::validate_rgb_frames;
+#[cfg(any(feature = "image", feature = "audio"))]
+use crate::backend::runtime::media::MediaPayload;
 #[cfg(feature = "image")]
 use crate::backend::runtime::media::VideoFrames;
 use crate::backend::runtime::media::{
-    prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
-    ProcessorInput, ProcessorPreparationError,
+    media_input_part, prepared_model_input, push_text_token_ids, InputPart, MediaInput,
+    PreparedModelInput, ProcessorInput, ProcessorPreparationError,
 };
-#[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub struct Gemma4Processor {
@@ -50,7 +52,7 @@ impl Gemma4Processor {
         for item in input {
             match *item {
                 ProcessorInput::TokenIds(token_ids) => {
-                    push_text_token_ids(&mut parts, token_ids);
+                    push_text_token_ids(&mut parts, token_ids)?;
                 }
                 ProcessorInput::Media(media) => {
                     self.push_media_parts(&mut parts, media, encode_text)?;
@@ -62,7 +64,7 @@ impl Gemma4Processor {
 
     fn push_media_parts<E>(
         &self,
-        parts: &mut Vec<PreparedInputPart>,
+        parts: &mut Vec<InputPart>,
         item: MediaInput<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
@@ -77,9 +79,9 @@ impl Gemma4Processor {
                     .plan
                     .image(image.height() as usize, image.width() as usize)
                     .map_err(processor_error)?;
-                push_text_token_ids(parts, &[plan.framing.start_token_id]);
+                push_text_token_ids(parts, &[plan.framing.start_token_id])?;
                 parts.push(self.process_image(image, &plan)?);
-                push_text_token_ids(parts, &[plan.framing.end_token_id]);
+                push_text_token_ids(parts, &[plan.framing.end_token_id])?;
                 Ok(())
             }
             #[cfg(feature = "image")]
@@ -90,9 +92,9 @@ impl Gemma4Processor {
             #[cfg(feature = "audio")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
                 let plan = self.plan.audio().map_err(processor_error)?;
-                push_text_token_ids(parts, &[plan.framing.start_token_id]);
+                push_text_token_ids(parts, &[plan.framing.start_token_id])?;
                 parts.push(self.process_audio(waveform, &plan)?);
-                push_text_token_ids(parts, &[plan.framing.end_token_id]);
+                push_text_token_ids(parts, &[plan.framing.end_token_id])?;
                 Ok(())
             }
             _ => Err(Error::Processor(format!(
@@ -108,7 +110,7 @@ impl Gemma4Processor {
         &self,
         image: RgbImageView<'_>,
         plan: &Gemma4ImagePlan,
-    ) -> Result<PreparedInputPart, Error> {
+    ) -> Result<InputPart, Error> {
         let resized = resize_rgb8(image, plan.transform)?;
         let normalized = rescale_and_normalize_rgb8(
             resized.as_view(),
@@ -118,11 +120,19 @@ impl Gemma4Processor {
         )?;
         let (patches, positions, grid, extent) =
             pack_patches(&normalized, plan.patch_size, plan.max_patches)?;
-        Ok(PreparedInputPart::media_tensor(
+        media_input_part(
             Modality::Image,
             patches,
-            OwnedInputMetadata::patch_layout(grid, positions, extent),
-        ))
+            [
+                (InputMetadataKey::PatchGrid, grid),
+                (InputMetadataKey::PatchPositions, positions),
+            ],
+            [InputExtent::PatchGrid {
+                time: extent[0],
+                height: extent[1],
+                width: extent[2],
+            }],
+        )
     }
 
     #[cfg(feature = "image")]
@@ -130,7 +140,7 @@ impl Gemma4Processor {
         &self,
         video: VideoFrames<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
+    ) -> Result<Vec<InputPart>, ProcessorPreparationError<E>> {
         let (width, height) = validate_rgb_frames(video.frames)?;
         let plan = self
             .plan
@@ -151,13 +161,13 @@ impl Gemma4Processor {
         video: VideoFrames<'_>,
         plan: &Gemma4VideoPlan,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
+    ) -> Result<Vec<InputPart>, ProcessorPreparationError<E>> {
         let mut replacement = Vec::with_capacity(plan.frames.len() * 3);
         for frame in &plan.frames {
             let mut prefix =
                 encode_text(&frame.timestamp_text).map_err(ProcessorPreparationError::Text)?;
             prefix.push(plan.framing.start_token_id);
-            replacement.push(PreparedInputPart::text_token_ids(&prefix));
+            push_text_token_ids(&mut replacement, &prefix)?;
 
             let resized = resize_rgb8(video.frames[frame.source_index], plan.transform)?;
             let normalized = rescale_and_normalize_rgb8(
@@ -168,14 +178,20 @@ impl Gemma4Processor {
             )?;
             let (patches, positions, grid, extent) =
                 pack_patches(&normalized, plan.patch_size, plan.max_patches)?;
-            replacement.push(PreparedInputPart::media_tensor(
+            replacement.push(media_input_part(
                 Modality::Video,
                 patches,
-                OwnedInputMetadata::patch_layout(grid, positions, extent),
-            ));
-            replacement.push(PreparedInputPart::text_token_ids(&[plan
-                .framing
-                .end_token_id]));
+                [
+                    (InputMetadataKey::PatchGrid, grid),
+                    (InputMetadataKey::PatchPositions, positions),
+                ],
+                [InputExtent::PatchGrid {
+                    time: extent[0],
+                    height: extent[1],
+                    width: extent[2],
+                }],
+            )?);
+            push_text_token_ids(&mut replacement, &[plan.framing.end_token_id])?;
         }
         Ok(replacement)
     }
@@ -185,7 +201,7 @@ impl Gemma4Processor {
         &self,
         waveform: crate::backend::runtime::media::audio::AudioWaveform<'_>,
         plan: &eredu_architectures::processor_plan::Gemma4AudioPlan,
-    ) -> Result<PreparedInputPart, Error> {
+    ) -> Result<InputPart, Error> {
         let features = extract_log_mel(
             waveform,
             &LogMelConfig {
@@ -205,13 +221,14 @@ impl Gemma4Processor {
             &features.values,
             &[1, features.frames as i32, features.mel_bins as i32],
         );
-        let valid_frames = features.mask.iter().filter(|valid| **valid).count() as i32;
+        let valid_frames = features.mask.iter().filter(|valid| **valid).count();
         let mask = Array::from_slice(&features.mask, &[1, features.frames as i32]);
-        Ok(PreparedInputPart::media_tensor(
+        media_input_part(
             Modality::Audio,
             tensor,
-            OwnedInputMetadata::audio_mask(mask, valid_frames),
-        ))
+            [(InputMetadataKey::AudioMask, mask)],
+            [InputExtent::AudioValidFrames(valid_frames)],
+        )
     }
 }
 
@@ -232,7 +249,7 @@ fn pack_patches(
     image: &NormalizedImage,
     patch_size: usize,
     max_patches: usize,
-) -> Result<(Array, Array, Array, [i32; 3]), Error> {
+) -> Result<(Array, Array, Array, [usize; 3]), Error> {
     if !image.height().is_multiple_of(patch_size) || !image.width().is_multiple_of(patch_size) {
         return Err(Error::Processor(format!(
             "Gemma 4 image dimensions {}x{} are not divisible by patch size {patch_size}",
@@ -275,7 +292,7 @@ fn pack_patches(
         Array::from_slice(&patches, &[1, max_patches as i32, patch_dims as i32]),
         Array::from_slice(&positions, &[1, max_patches as i32, 2]),
         Array::from_slice(&[1, patch_height as i32, patch_width as i32], &[1, 3]),
-        [1, patch_height as i32, patch_width as i32],
+        [1, patch_height, patch_width],
     ))
 }
 
@@ -284,7 +301,7 @@ mod tests {
     use std::collections::HashMap;
 
     use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
-    use eredu_core::VideoSampling;
+    use eredu_core::{InputMetadataKey, VideoSampling};
     use eredu_gguf::MetadataValue;
 
     use super::Gemma4Processor;
@@ -353,9 +370,11 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2].modality, Modality::Image);
-        assert!(matches!(parts[2].payload, InputPayload::Tensor(_)));
-        assert!(parts[2].metadata.patch_positions.is_some());
+        assert_eq!(parts[2].modality(), Modality::Image);
+        assert!(matches!(parts[2].payload(), InputPayload::Tensor(_)));
+        assert!(parts[2]
+            .metadata_value(InputMetadataKey::PatchPositions)
+            .is_some());
     }
 
     #[test]
@@ -387,12 +406,12 @@ mod tests {
         let parts = prepared.input_parts();
         let video_parts = parts
             .iter()
-            .filter(|part| part.modality == Modality::Video)
+            .filter(|part| part.modality() == Modality::Video)
             .collect::<Vec<_>>();
         assert_eq!(video_parts.len(), 2);
-        assert!(video_parts
-            .iter()
-            .all(|part| part.metadata.patch_positions.is_some()));
+        assert!(video_parts.iter().all(|part| part
+            .metadata_value(InputMetadataKey::PatchPositions)
+            .is_some()));
         assert_eq!(encoded, vec!["00:00 ", " 00:01 "]);
     }
 }
@@ -400,6 +419,7 @@ mod tests {
 #[cfg(all(test, feature = "audio"))]
 mod audio_tests {
     use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
+    use eredu_core::InputMetadataKey;
 
     use super::Gemma4Processor;
     use crate::{
@@ -431,8 +451,10 @@ mod audio_tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2].modality, Modality::Audio);
-        assert!(matches!(parts[2].payload, InputPayload::Tensor(_)));
-        assert!(parts[2].metadata.audio_mask.is_some());
+        assert_eq!(parts[2].modality(), Modality::Audio);
+        assert!(matches!(parts[2].payload(), InputPayload::Tensor(_)));
+        assert!(parts[2]
+            .metadata_value(InputMetadataKey::AudioMask)
+            .is_some());
     }
 }

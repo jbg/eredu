@@ -394,60 +394,13 @@ impl Completion for MlxSessionCompletion {
 /// makes submission independent of the caller's temporary `ModelInput` view.
 #[derive(Debug, Clone)]
 pub struct MlxModelInput {
-    parts: Vec<MlxInputPart>,
-}
-
-#[derive(Debug, Clone)]
-struct MlxInputPart {
-    modality: input::Modality,
-    payload: MlxInputPayload,
-    metadata: MlxInputMetadata,
-}
-
-#[derive(Debug, Clone)]
-enum MlxInputPayload {
-    TokenIds(Array),
-    Tensor(Array),
-    Embeddings(Array),
-}
-
-#[derive(Debug, Clone, Default)]
-struct MlxInputMetadata {
-    patch_grid: Option<Array>,
-    patch_positions: Option<Array>,
-    audio_mask: Option<Array>,
-    patch_extent: Option<[i32; 3]>,
-    audio_valid_frames: Option<i32>,
+    parts: Vec<input::InputPart>,
 }
 
 impl From<input::ModelInput<'_>> for MlxModelInput {
     fn from(input: input::ModelInput<'_>) -> Self {
         Self {
-            parts: input
-                .parts
-                .iter()
-                .map(|part| MlxInputPart {
-                    modality: part.modality,
-                    payload: match part.payload {
-                        input::InputPayload::TokenIds(value) => {
-                            MlxInputPayload::TokenIds(value.clone())
-                        }
-                        input::InputPayload::Tensor(value) => {
-                            MlxInputPayload::Tensor(value.clone())
-                        }
-                        input::InputPayload::Embeddings(value) => {
-                            MlxInputPayload::Embeddings(value.clone())
-                        }
-                    },
-                    metadata: MlxInputMetadata {
-                        patch_grid: part.metadata.patch_grid.cloned(),
-                        patch_positions: part.metadata.patch_positions.cloned(),
-                        audio_mask: part.metadata.audio_mask.cloned(),
-                        patch_extent: part.metadata.patch_extent,
-                        audio_valid_frames: part.metadata.audio_valid_frames,
-                    },
-                })
-                .collect(),
+            parts: input.parts.to_vec(),
         }
     }
 }
@@ -460,26 +413,7 @@ impl MlxModelInput {
     }
 
     pub fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
-        let parts = self
-            .parts
-            .iter()
-            .map(|part| input::InputPart {
-                modality: part.modality,
-                payload: match &part.payload {
-                    MlxInputPayload::TokenIds(value) => input::InputPayload::TokenIds(value),
-                    MlxInputPayload::Tensor(value) => input::InputPayload::Tensor(value),
-                    MlxInputPayload::Embeddings(value) => input::InputPayload::Embeddings(value),
-                },
-                metadata: input::InputMetadata {
-                    patch_grid: part.metadata.patch_grid.as_ref(),
-                    patch_positions: part.metadata.patch_positions.as_ref(),
-                    audio_mask: part.metadata.audio_mask.as_ref(),
-                    patch_extent: part.metadata.patch_extent,
-                    audio_valid_frames: part.metadata.audio_valid_frames,
-                },
-            })
-            .collect::<Vec<_>>();
-        execute(input::ModelInput::new(&parts))
+        execute(input::ModelInput::new(&self.parts))
     }
 }
 
@@ -758,7 +692,7 @@ impl<'a> MlxModelSession<'a> {
 
     pub(super) fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
         match &self.inner {
@@ -1142,7 +1076,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     let multimodal = borrowed
                         .parts
                         .iter()
-                        .any(|part| part.modality != input::Modality::Text);
+                        .any(|part| part.modality() != input::Modality::Text);
                     if multimodal {
                         model.prefill_distributed(
                             model.stage_info().is_first.then_some(borrowed),
@@ -1309,7 +1243,12 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         }
         let tokens =
             Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, backend.stream())?;
-        let parts = [input::InputPart::text_token_ids(&tokens)];
+        let parts = [input::input_part(
+            input::Modality::Text,
+            input::InputPayload::TokenIds(tokens),
+            [],
+            [],
+        )?];
         Ok(MlxModelInput::from(input::ModelInput::new(&parts)))
     }
 
@@ -1678,19 +1617,30 @@ mod tests {
         let image = Array::from_slice(&[0.0_f32; 8], &[1, 2, 4]);
         let grid = Array::from_slice(&[1_i32, 2, 2], &[1, 3]);
         let parts = [
-            input::InputPart::text_token_ids(&tokens),
-            input::InputPart::image_tensor(&image, input::InputMetadata::patch_grid(&grid)),
+            input::input_part(
+                input::Modality::Text,
+                input::InputPayload::TokenIds(tokens),
+                [],
+                [],
+            )
+            .unwrap(),
+            input::input_part(
+                input::Modality::Image,
+                input::InputPayload::Tensor(image),
+                [(eredu_core::InputMetadataKey::PatchGrid, grid)],
+                [],
+            )
+            .unwrap(),
         ];
 
         let owned = MlxModelInput::from(input::ModelInput::new(&parts));
         owned.with_borrowed(|borrowed| {
             assert_eq!(borrowed.parts.len(), 2);
-            assert_eq!(borrowed.parts[0].modality, input::Modality::Text);
-            assert_eq!(borrowed.parts[1].modality, input::Modality::Image);
+            assert_eq!(borrowed.parts[0].modality(), input::Modality::Text);
+            assert_eq!(borrowed.parts[1].modality(), input::Modality::Image);
             assert_eq!(
                 borrowed.parts[1]
-                    .metadata
-                    .patch_grid
+                    .metadata_value(eredu_core::InputMetadataKey::PatchGrid)
                     .expect("grid metadata")
                     .shape(),
                 &[1, 3]

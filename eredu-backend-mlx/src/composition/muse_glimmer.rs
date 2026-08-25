@@ -551,10 +551,9 @@ pub fn prepare_muse_input(
     let mut pixels = Vec::new();
     let mut grid = Vec::new();
     for part in typed.parts {
-        let architecture_input = input::prepared_input_part(*part)?;
-        let plan = media_plan::muse_glimmer_input_part(args, &architecture_input)
+        let plan = media_plan::muse_glimmer_input_part(args, part, &input::MlxInputInspector)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        match (plan, part.payload) {
+        match (plan, part.payload()) {
             (
                 media_plan::MuseGlimmerInputPartPlan::TextTokens { .. },
                 input::InputPayload::TokenIds(value),
@@ -582,7 +581,7 @@ pub fn prepare_muse_input(
             _ => {
                 return Err(Error::ArchitectureModel(format!(
                     "Muse-Glimmer input plan disagrees with the prepared {} payload",
-                    part.modality.as_str()
+                    part.modality().as_str()
                 )))
             }
         }

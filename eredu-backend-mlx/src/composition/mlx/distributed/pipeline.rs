@@ -2838,7 +2838,7 @@ trait PipelinePartitionMetadata {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>;
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -5280,10 +5280,14 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("llama", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "llama",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -5479,10 +5483,14 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("deepseek_v3", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "deepseek_v3",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -5885,10 +5893,14 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("deepseek_v4", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "deepseek_v4",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6412,10 +6424,15 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::gemma4_input_part(self.args(), input).map(Into::into)
+        eredu_architectures::media_plan::gemma4_input_part(
+            self.args(),
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
+        .map(Into::into)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6608,10 +6625,14 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("qwen", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "qwen",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -6754,11 +6775,15 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::muse_glimmer_input_part(self.architecture.args(), input)
-            .map(Into::into)
+        eredu_architectures::media_plan::muse_glimmer_input_part(
+            self.architecture.args(),
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
+        .map(Into::into)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7011,10 +7036,15 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::inkling_input_part(self.args(), input).map(Into::into)
+        eredu_architectures::media_plan::inkling_input_part(
+            self.args(),
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
+        .map(Into::into)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7610,10 +7640,15 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::qwen_vl_input_part(self.args(), input).map(Into::into)
+        eredu_architectures::media_plan::qwen_vl_input_part(
+            self.args(),
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
+        .map(Into::into)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -8232,10 +8267,15 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::qwen_hybrid_input_part(self.args(), input).map(Into::into)
+        eredu_architectures::media_plan::qwen_hybrid_input_part(
+            self.args(),
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
+        .map(Into::into)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -8579,10 +8619,14 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("gpt_oss", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "gpt_oss",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8725,10 +8769,14 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("lfm2", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "lfm2",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8871,10 +8919,14 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("nemotron_h", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "nemotron_h",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -9103,10 +9155,14 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part("kimi_linear", input)
+        eredu_architectures::media_plan::text_only_input_part(
+            "kimi_linear",
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9291,7 +9347,7 @@ fn pipeline_mtp_token_identity(
     let tokens = input
         .parts
         .iter()
-        .filter_map(|part| match (part.modality, part.payload) {
+        .filter_map(|part| match (part.modality(), part.payload()) {
             (
                 crate::backend::runtime::media::input::Modality::Text,
                 crate::backend::runtime::media::input::InputPayload::TokenIds(tokens),
@@ -9465,7 +9521,7 @@ impl PipelineModel {
 
     pub(in crate::composition::mlx) fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
         self.stage.prepared_input_part_plan(input)
@@ -10587,9 +10643,9 @@ impl PipelineModel {
         if let Some(PipelineIngress::ModelInput(input)) = ingress {
             if self.info.placement.groups().len() > 1 {
                 let has_media_tensor = input.parts.iter().any(|part| {
-                    part.modality != crate::backend::runtime::media::input::Modality::Text
+                    part.modality() != crate::backend::runtime::media::input::Modality::Text
                         && matches!(
-                            part.payload,
+                            part.payload(),
                             crate::backend::runtime::media::input::InputPayload::Tensor(_)
                         )
                 });
@@ -10863,7 +10919,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         let multimodal = input
             .parts
             .iter()
-            .any(|part| part.modality != crate::backend::runtime::media::input::Modality::Text);
+            .any(|part| part.modality() != crate::backend::runtime::media::input::Modality::Text);
         cache
             .reset()
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -18131,11 +18187,15 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
 
     fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
+        input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::qwen_hybrid_text_input_part(self.args(), input)
-            .map(Into::into)
+        eredu_architectures::media_plan::qwen_hybrid_text_input_part(
+            self.args(),
+            input,
+            &crate::backend::runtime::media::input::MlxInputInspector,
+        )
+        .map(Into::into)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {

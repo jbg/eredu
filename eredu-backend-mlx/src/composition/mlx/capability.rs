@@ -2,13 +2,11 @@
 
 use std::num::NonZeroU8;
 
-use eredu_architectures::media_plan::{
-    self, MediaShapePlan, PreparedInputModality, PreparedInputPart, PreparedInputPartPlan,
-};
+use eredu_architectures::media_plan::{self, MediaShapePlan, PreparedInputPartPlan};
 use eredu_core::{
-    estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
-    ModelCapabilityBackend, ModelRuntime, ObservationKind, Observed, PhysicalMemorySemantics,
-    RuntimeStateEstimate, StateLayout, StaticMemoryReport,
+    estimate_runtime_state, AvailableMemory, CapabilityError, InputMetadataKey, InputModality,
+    InputTokenCount, ModelCapabilities, ModelCapabilityBackend, ModelRuntime, ObservationKind,
+    Observed, PhysicalMemorySemantics, RuntimeStateEstimate, StateLayout, StaticMemoryReport,
 };
 use safemlx::{Array, Stream};
 
@@ -61,26 +59,40 @@ fn estimate_mlx_runtime_state(
 impl Model {
     pub(super) fn prepared_input_part_plan(
         &self,
-        input: &PreparedInputPart,
+        input: &input::InputPart,
     ) -> Result<PreparedInputPartPlan, CapabilityError> {
         match self {
             Self::Gemma4(_, model) => {
-                media_plan::gemma4_input_part(model.args(), input).map(Into::into)
+                media_plan::gemma4_input_part(model.args(), input, &input::MlxInputInspector)
+                    .map(Into::into)
             }
             Self::Inkling(_, model) => {
-                media_plan::inkling_input_part(model.args(), input).map(Into::into)
+                media_plan::inkling_input_part(model.args(), input, &input::MlxInputInspector)
+                    .map(Into::into)
             }
             Self::MuseGlimmer(_, model) => {
-                media_plan::muse_glimmer_input_part(model.args(), input).map(Into::into)
+                media_plan::muse_glimmer_input_part(model.args(), input, &input::MlxInputInspector)
+                    .map(Into::into)
             }
             Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
-                media_plan::qwen_vl_input_part(model.args(), input).map(Into::into)
+                media_plan::qwen_vl_input_part(model.args(), input, &input::MlxInputInspector)
+                    .map(Into::into)
             }
             Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => {
                 if model.vision_config().is_some() {
-                    media_plan::qwen_hybrid_input_part(model.parsed_args(), input).map(Into::into)
+                    media_plan::qwen_hybrid_input_part(
+                        model.parsed_args(),
+                        input,
+                        &input::MlxInputInspector,
+                    )
+                    .map(Into::into)
                 } else {
-                    media_plan::qwen_hybrid_text_input_part(model.args(), input).map(Into::into)
+                    media_plan::qwen_hybrid_text_input_part(
+                        model.args(),
+                        input,
+                        &input::MlxInputInspector,
+                    )
+                    .map(Into::into)
                 }
             }
             Self::DeepSeek(_, _)
@@ -89,9 +101,11 @@ impl Model {
             | Self::Llama(_, _)
             | Self::Lfm2(_, _)
             | Self::NemotronH(_, _)
-            | Self::Qwen(_, _) => {
-                media_plan::text_only_input_part(self.effective_model_type(), input)
-            }
+            | Self::Qwen(_, _) => media_plan::text_only_input_part(
+                self.effective_model_type(),
+                input,
+                &input::MlxInputInspector,
+            ),
         }
     }
 
@@ -161,14 +175,14 @@ fn four_byte_scalars(scalars: u64, operation: &'static str) -> Result<u64, Capab
 
 fn prepared_media_accounting_with_plan(
     payload: &Array,
-    metadata: input::InputMetadata<'_>,
+    part: &input::InputPart,
     plan: &MediaShapePlan,
 ) -> Result<(u64, u64), CapabilityError> {
     let mut input_bytes = array_bytes(payload, "prepared media payload bytes")?;
     for array in [
-        metadata.patch_grid,
-        metadata.patch_positions,
-        metadata.audio_mask,
+        part.metadata_value(InputMetadataKey::PatchGrid),
+        part.metadata_value(InputMetadataKey::PatchPositions),
+        part.metadata_value(InputMetadataKey::AudioMask),
     ]
     .into_iter()
     .flatten()
@@ -209,10 +223,8 @@ pub fn count_prepared_input(
     let mut media_positions = 0u64;
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
-    for &part in prepared.parts {
-        let prepared_part = input::prepared_input_part(part)
-            .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-        match session.prepared_input_part_plan(&prepared_part)? {
+    for part in prepared.parts {
+        match session.prepared_input_part_plan(part)? {
             PreparedInputPartPlan::Text { positions } => {
                 text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
             }
@@ -220,7 +232,7 @@ pub fn count_prepared_input(
                 modality,
                 positions,
             } => {
-                if modality == PreparedInputModality::Text {
+                if modality == InputModality::Text {
                     text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
                 } else {
                     media_positions =
@@ -228,14 +240,14 @@ pub fn count_prepared_input(
                 }
             }
             PreparedInputPartPlan::Media { shape } => {
-                let InputPayload::Tensor(tensor) = part.payload else {
+                let InputPayload::Tensor(tensor) = part.payload() else {
                     return Err(CapabilityError::UnsupportedInput {
                         architecture: session.effective_model_type().into(),
                         reason: "architecture media plan requires a tensor payload".into(),
                     });
                 };
                 let (positions, workspace_bytes) =
-                    prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
+                    prepared_media_accounting_with_plan(tensor, part, &shape)?;
                 media_positions =
                     checked_add(media_positions, positions, "prepared media-position total")?;
                 media_execution_workspace_bytes = checked_add(

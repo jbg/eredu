@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
+use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
 use eredu_backend_mlx::native::{
     transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext, MlxModelInput,
     MlxModelSession,
@@ -63,7 +63,7 @@ fn prefill_tokens(
     backend: &MlxBackend<'static>,
     session: &mut MlxModelSession<'static>,
 ) -> anyhow::Result<Array> {
-    let parts = [InputPart::text_token_ids(tokens)];
+    let parts = [token_ids_part(tokens)?];
     let input = MlxModelInput::from(ModelInput::new(&parts));
     session
         .prefill(backend, input)?

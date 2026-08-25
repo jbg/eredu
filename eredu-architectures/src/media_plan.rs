@@ -4,7 +4,11 @@
 //! native arrays. Architecture policy validates those values and returns the
 //! decoder positions and scalar workspace implied by the family equations.
 
-use eredu_core::CapabilityError;
+use eredu_core::{
+    CapabilityError, InputExtent, InputMetadataKey, InputModality, InputPartDescriptor,
+    InputPayloadKind, InputTensorIdentity, PreparedInputError,
+};
+use eredu_runtime::PreparedInputPart;
 
 use crate::qwen::{
     hybrid::{HybridConfig, ParsedHybridConfig},
@@ -12,112 +16,132 @@ use crate::qwen::{
     vl::ModelArgs as QwenVlModelArgs,
 };
 
-/// A non-text input modality presented to an architecture media tower.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MediaModality {
-    /// Still-image input.
-    Image,
-    /// Audio input.
-    Audio,
-    /// Video input.
-    Video,
+/// Backend adapter used only to describe native tensors and read the small
+/// metadata arrays required by architecture admission.
+///
+/// Modality, payload role, tensor identity, and host-known extents remain
+/// owned by `eredu-core` and `eredu-runtime`.
+pub trait PreparedInputInspector<Tensor> {
+    /// Returns the portable identity of a native tensor.
+    fn identity(&self, tensor: &Tensor) -> Result<InputTensorIdentity, PreparedInputError>;
+
+    /// Reads an evaluated signed-integer metadata tensor in row-major order.
+    fn i32_values(&self, tensor: &Tensor) -> Result<Vec<i32>, CapabilityError>;
+
+    /// Reads an evaluated Boolean metadata tensor in row-major order.
+    fn bool_values(&self, tensor: &Tensor) -> Result<Vec<bool>, CapabilityError>;
 }
 
-impl MediaModality {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Image => "image",
-            Self::Audio => "audio",
-            Self::Video => "video",
-        }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataValues<T> {
+    shape: Vec<u64>,
+    values: Vec<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediaAdmissionInput {
+    descriptor: InputPartDescriptor,
+    payload_shape: Vec<u64>,
+    patch_grid: Option<MetadataValues<i32>>,
+    patch_positions: Option<MetadataValues<i32>>,
+    audio_mask: Option<MetadataValues<bool>>,
+}
+
+impl MediaAdmissionInput {
+    fn modality(&self) -> InputModality {
+        self.descriptor.modality()
+    }
+
+    fn patch_extent(&self) -> Option<[usize; 3]> {
+        self.descriptor.extents().find_map(|extent| match extent {
+            InputExtent::PatchGrid {
+                time,
+                height,
+                width,
+            } => Some([time, height, width]),
+            InputExtent::AudioValidFrames(_) => None,
+        })
+    }
+
+    fn audio_valid_frames(&self) -> Option<usize> {
+        self.descriptor.extents().find_map(|extent| match extent {
+            InputExtent::AudioValidFrames(frames) => Some(frames),
+            InputExtent::PatchGrid { .. } => None,
+        })
     }
 }
 
-/// Typed values and shape extracted from a small native metadata array.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaMetadata<T> {
-    /// Logical array shape.
-    pub shape: Vec<u64>,
-    /// Row-major scalar values.
-    pub values: Vec<T>,
-}
-
-/// Backend-neutral description of one prepared media tensor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedMediaInput {
-    /// Input modality.
-    pub modality: MediaModality,
-    /// Logical payload-array shape.
-    pub payload_shape: Vec<u64>,
-    /// Optional `(time, height, width)` rows.
-    pub patch_grid: Option<MediaMetadata<i32>>,
-    /// Optional two-axis patch positions, with negative padding entries.
-    pub patch_positions: Option<MediaMetadata<i32>>,
-    /// Optional valid-frame mask.
-    pub audio_mask: Option<MediaMetadata<bool>>,
-    /// Host-known `(time, height, width)` extent for one vision part.
-    pub patch_extent: Option<[i32; 3]>,
-    /// Host-known valid prefix of an audio feature sequence.
-    pub audio_valid_frames: Option<i32>,
-}
-
-/// Modality of one prepared model-input part.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreparedInputModality {
-    /// Token or projected text input.
-    Text,
-    /// Still-image input.
-    Image,
-    /// Audio input.
-    Audio,
-    /// Video input.
-    Video,
-}
-
-impl PreparedInputModality {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Image => "image",
-            Self::Audio => "audio",
-            Self::Video => "video",
-        }
+fn payload_name(kind: InputPayloadKind) -> &'static str {
+    match kind {
+        InputPayloadKind::TokenIds => "token-ID",
+        InputPayloadKind::Tensor => "tensor",
+        InputPayloadKind::Embeddings => "embedding",
     }
 }
 
-/// Backend-neutral payload facts for one prepared model-input part.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparedInputPayload {
-    /// Token IDs with their logical shape.
-    TokenIds(Vec<u64>),
-    /// Already-projected embeddings with their logical shape.
-    Embeddings(Vec<u64>),
-    /// A model-native tensor and any available media metadata.
-    Tensor {
-        /// Logical tensor shape.
-        shape: Vec<u64>,
-        /// Media geometry for a non-text modality.
-        media: Option<PreparedMediaInput>,
-    },
+fn u64_shape(identity: &InputTensorIdentity) -> Result<Vec<u64>, CapabilityError> {
+    identity
+        .shape()
+        .iter()
+        .map(|dimension| {
+            u64::try_from(*dimension).map_err(|_| CapabilityError::ArithmeticOverflow {
+                operation: "prepared-input tensor dimension",
+            })
+        })
+        .collect()
 }
 
-impl PreparedInputPayload {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::TokenIds(_) => "token-ID",
-            Self::Embeddings(_) => "embedding",
-            Self::Tensor { .. } => "tensor",
+fn inspect_part<Tensor>(
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+) -> Result<MediaAdmissionInput, CapabilityError> {
+    let descriptor = input
+        .descriptor(&|tensor| inspector.identity(tensor))
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let inspect_metadata = descriptor.payload_kind() == InputPayloadKind::Tensor
+        && descriptor.modality() != InputModality::Text;
+
+    let metadata_shape = |key| descriptor.metadata_value(key).map(u64_shape).transpose();
+    let i32_metadata = |key| -> Result<Option<MetadataValues<i32>>, CapabilityError> {
+        if !inspect_metadata {
+            return Ok(None);
         }
-    }
-}
-
-/// Backend-neutral description of one prepared model-input part.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedInputPart {
-    /// Semantic modality attached to the part.
-    pub modality: PreparedInputModality,
-    /// Payload representation and logical shape or metadata.
-    pub payload: PreparedInputPayload,
+        input
+            .metadata_value(key)
+            .map(|tensor| {
+                Ok(MetadataValues {
+                    shape: metadata_shape(key)?.expect("runtime metadata has a descriptor"),
+                    values: inspector.i32_values(tensor)?,
+                })
+            })
+            .transpose()
+    };
+    let bool_metadata = |key| -> Result<Option<MetadataValues<bool>>, CapabilityError> {
+        if !inspect_metadata {
+            return Ok(None);
+        }
+        input
+            .metadata_value(key)
+            .map(|tensor| {
+                Ok(MetadataValues {
+                    shape: metadata_shape(key)?.expect("runtime metadata has a descriptor"),
+                    values: inspector.bool_values(tensor)?,
+                })
+            })
+            .transpose()
+    };
+    let payload_shape = u64_shape(descriptor.payload())?;
+    let patch_grid = i32_metadata(InputMetadataKey::PatchGrid)?;
+    let patch_positions = i32_metadata(InputMetadataKey::PatchPositions)?;
+    let audio_mask = bool_metadata(InputMetadataKey::AudioMask)?;
+    let media = MediaAdmissionInput {
+        descriptor,
+        payload_shape,
+        patch_grid,
+        patch_positions,
+        audio_mask,
+    };
+    Ok(media)
 }
 
 /// Architecture-owned admission and accounting plan for one prepared input part.
@@ -131,7 +155,7 @@ pub enum PreparedInputPartPlan {
     /// Decoder-width embeddings supplied directly by the caller.
     Projected {
         /// Semantic modality retained by decoder input assembly.
-        modality: PreparedInputModality,
+        modality: InputModality,
         /// Decoder positions occupied by the part.
         positions: u64,
     },
@@ -195,7 +219,7 @@ pub enum QwenHybridInputPartPlan {
     /// Decoder-width embeddings supplied directly by the caller.
     Projected {
         /// Semantic modality retained for capability accounting.
-        modality: PreparedInputModality,
+        modality: InputModality,
         /// Decoder positions occupied by the part.
         positions: u64,
     },
@@ -219,7 +243,7 @@ pub enum Gemma4InputPartPlan {
     /// Decoder-width embeddings supplied directly by the caller.
     Projected {
         /// Semantic modality retained by the decoder input.
-        modality: PreparedInputModality,
+        modality: InputModality,
         /// Architecture-selected placeholder token repeated under the embeddings.
         placeholder_token_id: u32,
         /// Decoder positions occupied by the part.
@@ -300,7 +324,7 @@ pub enum InklingInputPartPlan {
     /// Decoder-width image or audio embeddings supplied by the caller.
     Projected {
         /// Semantic modality retained by decoder input assembly.
-        modality: PreparedInputModality,
+        modality: InputModality,
         /// Architecture-selected placeholder token repeated under the embeddings.
         placeholder_token_id: u32,
         /// Decoder positions occupied by the part.
@@ -309,7 +333,7 @@ pub enum InklingInputPartPlan {
     /// Model-native image or audio input.
     Media {
         /// Semantic modality consumed by the tower.
-        modality: PreparedInputModality,
+        modality: InputModality,
         /// Architecture-selected placeholder and span.
         ingress: InklingIngressPlan,
         /// Decoder and workspace accounting for tower execution.
@@ -345,7 +369,7 @@ pub enum MuseGlimmerInputPartPlan {
     /// Model-native image or video input.
     Vision {
         /// Semantic modality consumed by the vision tower.
-        modality: PreparedInputModality,
+        modality: InputModality,
         /// Architecture-selected placeholder span and patch grid.
         ingress: MuseGlimmerIngressPlan,
         /// Decoder and workspace accounting for tower execution.
@@ -520,15 +544,21 @@ fn qwen_attention_chunk_squares(
 }
 
 /// Derives prepared Qwen image/video geometry from normalized vision policy.
-pub fn qwen_vision(
+fn qwen_vision(
     config: &VisionConfig,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    if !matches!(input.modality, MediaModality::Image | MediaModality::Video) {
+    if !matches!(
+        input.modality(),
+        InputModality::Image | InputModality::Video
+    ) {
         return Err(unsupported(
             architecture,
-            format!("{} is not a Qwen vision modality", input.modality.as_str()),
+            format!(
+                "{} is not a Qwen vision modality",
+                input.modality().as_str()
+            ),
         ));
     }
     if input.payload_shape.len() != 2 {
@@ -712,9 +742,9 @@ pub fn qwen_vision(
 
 /// Derives Qwen media geometry when the normalized hybrid policy may omit its
 /// vision tower.
-pub fn qwen_hybrid_vision(
+fn qwen_hybrid_vision(
     config: Option<&VisionConfig>,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<MediaShapePlan, CapabilityError> {
     config
@@ -726,14 +756,14 @@ fn qwen_vision_ingress_with_shape(
     config: Option<&VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<(QwenVisionIngressPlan, MediaShapePlan), CapabilityError> {
     let shape = qwen_hybrid_vision(config, input, architecture)?;
-    let token_id = match input.modality {
-        MediaModality::Image => image_token_id,
-        MediaModality::Video => video_token_id,
-        MediaModality::Audio => None,
+    let token_id = match input.modality() {
+        InputModality::Image => image_token_id,
+        InputModality::Video => video_token_id,
+        InputModality::Audio | InputModality::Text => None,
     }
     .ok_or_else(|| unsupported(architecture, "prepared media placeholder token is absent"))?;
     let placeholder_token_id =
@@ -760,29 +790,16 @@ fn qwen_vision_ingress_with_shape(
     ))
 }
 
+#[cfg(test)]
 fn qwen_vision_ingress(
     config: Option<&VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<QwenVisionIngressPlan, CapabilityError> {
     qwen_vision_ingress_with_shape(config, image_token_id, video_token_id, input, architecture)
         .map(|(ingress, _)| ingress)
-}
-
-/// Validates prepared Qwen3-VL media and derives its execution ingress policy.
-pub fn qwen_vl_ingress(
-    args: &QwenVlModelArgs,
-    input: &PreparedMediaInput,
-) -> Result<QwenVisionIngressPlan, CapabilityError> {
-    qwen_vision_ingress(
-        Some(&args.vision),
-        Some(args.image_token_id),
-        Some(args.video_token_id),
-        input,
-        &args.model_type,
-    )
 }
 
 fn batch_one_sequence(
@@ -802,18 +819,22 @@ fn batch_one_sequence(
 
 /// Validates one prepared Qwen3-VL part and derives the exact prefill and
 /// capability-accounting plan consumed by a concrete backend.
-pub fn qwen_vl_input_part(
+pub fn qwen_vl_input_part<Tensor>(
     args: &QwenVlModelArgs,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenVlInputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
-            Ok(QwenVlInputPartPlan::TextTokens {
-                positions: batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
-            })
-        }
-        (PreparedInputModality::Text, PreparedInputPayload::Embeddings(shape)) => {
-            let positions = batch_one_sequence(shape, 3, "text embeddings", &args.model_type)?;
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(QwenVlInputPartPlan::TextTokens {
+            positions: batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
+        }),
+        (InputModality::Text, InputPayloadKind::Embeddings) => {
+            let positions = batch_one_sequence(&shape, 3, "text embeddings", &args.model_type)?;
             let hidden = positive(args.text.hidden_size, "Qwen3-VL hidden size")?;
             if shape[2] != hidden {
                 return Err(unsupported(
@@ -826,28 +847,12 @@ pub fn qwen_vl_input_part(
             }
             Ok(QwenVlInputPartPlan::ProjectedText { positions })
         }
-        (
-            PreparedInputModality::Image | PreparedInputModality::Video,
-            PreparedInputPayload::Tensor {
-                media: Some(media), ..
-            },
-        ) => {
-            let expected = if input.modality == PreparedInputModality::Image {
-                MediaModality::Image
-            } else {
-                MediaModality::Video
-            };
-            if media.modality != expected {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared input modality disagrees with its media metadata",
-                ));
-            }
+        (InputModality::Image | InputModality::Video, InputPayloadKind::Tensor) => {
             let (ingress, shape) = qwen_vision_ingress_with_shape(
                 Some(&args.vision),
                 Some(args.image_token_id),
                 Some(args.video_token_id),
-                media,
+                &inspected,
                 &args.model_type,
             )?;
             Ok(QwenVlInputPartPlan::Media { ingress, shape })
@@ -857,33 +862,37 @@ pub fn qwen_vl_input_part(
             format!(
                 "Qwen3-VL does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
 }
 
-fn qwen_hybrid_input_part_with_policy(
+fn qwen_hybrid_input_part_with_policy<Tensor>(
     text: &HybridConfig,
     vision: Option<&VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenHybridInputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => {
             Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: batch_one_sequence(shape, 2, "text token IDs", &text.model_type)?,
+                positions: batch_one_sequence(&shape, 2, "text token IDs", &text.model_type)?,
             })
         }
         (
-            modality @ (PreparedInputModality::Text
-            | PreparedInputModality::Image
-            | PreparedInputModality::Video),
-            PreparedInputPayload::Embeddings(shape),
+            modality @ (InputModality::Text | InputModality::Image | InputModality::Video),
+            InputPayloadKind::Embeddings,
         ) => {
             let positions = batch_one_sequence(
-                shape,
+                &shape,
                 3,
                 &format!("{} embeddings", modality.as_str()),
                 &text.model_type,
@@ -899,32 +908,16 @@ fn qwen_hybrid_input_part_with_policy(
                 ));
             }
             Ok(QwenHybridInputPartPlan::Projected {
-                modality: *modality,
+                modality,
                 positions,
             })
         }
-        (
-            PreparedInputModality::Image | PreparedInputModality::Video,
-            PreparedInputPayload::Tensor {
-                media: Some(media), ..
-            },
-        ) => {
-            let expected = if input.modality == PreparedInputModality::Image {
-                MediaModality::Image
-            } else {
-                MediaModality::Video
-            };
-            if media.modality != expected {
-                return Err(unsupported(
-                    &text.model_type,
-                    "prepared input modality disagrees with its media metadata",
-                ));
-            }
+        (InputModality::Image | InputModality::Video, InputPayloadKind::Tensor) => {
             let (ingress, shape) = qwen_vision_ingress_with_shape(
                 vision,
                 image_token_id,
                 video_token_id,
-                media,
+                &inspected,
                 &text.model_type,
             )?;
             Ok(QwenHybridInputPartPlan::Media { ingress, shape })
@@ -934,7 +927,7 @@ fn qwen_hybrid_input_part_with_policy(
             format!(
                 "Qwen hybrid does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
@@ -942,9 +935,10 @@ fn qwen_hybrid_input_part_with_policy(
 
 /// Validates one prepared conditional Qwen3.5 input part and derives the exact
 /// prefill and capability-accounting plan consumed by a concrete backend.
-pub fn qwen_hybrid_input_part(
+pub fn qwen_hybrid_input_part<Tensor>(
     args: &ParsedHybridConfig,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenHybridInputPartPlan, CapabilityError> {
     qwen_hybrid_input_part_with_policy(
         &args.text,
@@ -952,18 +946,25 @@ pub fn qwen_hybrid_input_part(
         args.image_token_id,
         args.video_token_id,
         input,
+        inspector,
     )
 }
 
 /// Validates one prepared text-only Qwen3.5/Qwen3-Next input part.
-pub fn qwen_hybrid_text_input_part(
+pub fn qwen_hybrid_text_input_part<Tensor>(
     args: &HybridConfig,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenHybridInputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => {
             Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
+                positions: batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
             })
         }
         (modality, payload) => Err(unsupported(
@@ -971,7 +972,7 @@ pub fn qwen_hybrid_text_input_part(
             format!(
                 "text-only Qwen hybrid does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
@@ -994,13 +995,13 @@ fn gemma_batch_one_sequence(
 
 fn gemma_placeholder_token(
     args: &crate::gemma4::FamilyConfig,
-    modality: PreparedInputModality,
+    modality: InputModality,
 ) -> Result<u32, CapabilityError> {
     let token = match modality {
-        PreparedInputModality::Text => Some(args.text.pad_token_id),
-        PreparedInputModality::Image => args.image_token_id,
-        PreparedInputModality::Video => args.video_token_id,
-        PreparedInputModality::Audio => args.audio_token_id,
+        InputModality::Text => Some(args.text.pad_token_id),
+        InputModality::Image => args.image_token_id,
+        InputModality::Video => args.video_token_id,
+        InputModality::Audio => args.audio_token_id,
     };
     token
         .and_then(|token| u32::try_from(token).ok())
@@ -1014,19 +1015,23 @@ fn gemma_placeholder_token(
 
 /// Validates one prepared Gemma 4 part and derives the exact placeholder,
 /// ingress geometry, and capability-accounting plan consumed by a backend.
-pub fn gemma4_input_part(
+pub fn gemma4_input_part<Tensor>(
     args: &crate::gemma4::FamilyConfig,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<Gemma4InputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
-            Ok(Gemma4InputPartPlan::TextTokens {
-                positions: gemma_batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
-            })
-        }
-        (modality, PreparedInputPayload::Embeddings(shape)) => {
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(Gemma4InputPartPlan::TextTokens {
+            positions: gemma_batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
+        }),
+        (modality, InputPayloadKind::Embeddings) => {
             let positions = gemma_batch_one_sequence(
-                shape,
+                &shape,
                 3,
                 &format!("{} embeddings", modality.as_str()),
                 &args.model_type,
@@ -1042,30 +1047,13 @@ pub fn gemma4_input_part(
                 ));
             }
             Ok(Gemma4InputPartPlan::Projected {
-                modality: *modality,
-                placeholder_token_id: gemma_placeholder_token(args, *modality)?,
+                modality,
+                placeholder_token_id: gemma_placeholder_token(args, modality)?,
                 positions,
             })
         }
-        (
-            modality @ (PreparedInputModality::Image | PreparedInputModality::Video),
-            PreparedInputPayload::Tensor {
-                shape,
-                media: Some(media),
-            },
-        ) => {
-            let expected = if *modality == PreparedInputModality::Image {
-                MediaModality::Image
-            } else {
-                MediaModality::Video
-            };
-            if media.modality != expected || media.payload_shape != *shape {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared Gemma input modality or shape disagrees with its media metadata",
-                ));
-            }
-            if media.patch_grid.is_none() {
+        (modality @ (InputModality::Image | InputModality::Video), InputPayloadKind::Tensor) => {
+            if inspected.patch_grid.is_none() {
                 return Err(unsupported(
                     &args.model_type,
                     format!(
@@ -1074,7 +1062,7 @@ pub fn gemma4_input_part(
                     ),
                 ));
             }
-            let extent = media.patch_extent.ok_or_else(|| {
+            let extent = inspected.patch_extent().ok_or_else(|| {
                 unsupported(
                     &args.model_type,
                     format!(
@@ -1083,8 +1071,18 @@ pub fn gemma4_input_part(
                     ),
                 )
             })?;
-            let grid = media.patch_grid.as_ref().expect("checked above");
-            if grid.shape != [1, 3] || grid.values.as_slice() != extent || grid.values.len() != 3 {
+            let grid = inspected.patch_grid.as_ref().expect("checked above");
+            let extent_i32 = extent.map(|value| {
+                i32::try_from(value).map_err(|_| CapabilityError::ArithmeticOverflow {
+                    operation: "Gemma patch extent",
+                })
+            });
+            let [time, height, width] = extent_i32;
+            let extent_i32 = [time?, height?, width?];
+            if grid.shape != [1, 3]
+                || grid.values.as_slice() != extent_i32
+                || grid.values.len() != 3
+            {
                 return Err(unsupported(
                     &args.model_type,
                     format!(
@@ -1100,11 +1098,12 @@ pub fn gemma4_input_part(
                 i32::try_from(shape[1]).map_err(|_| CapabilityError::ArithmeticOverflow {
                     operation: "Gemma padded vision patch count",
                 })?;
-            let ingress = crate::gemma4::VisionIngressPartPlan::new(vision, extent, padded_patches)
-                .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
-            let media_shape = gemma4(args, media)?;
+            let ingress =
+                crate::gemma4::VisionIngressPartPlan::new(vision, extent_i32, padded_patches)
+                    .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
+            let media_shape = gemma4(args, &inspected)?;
             let valid_patches = gemma_valid_patch_count(
-                media
+                inspected
                     .patch_positions
                     .as_ref()
                     .expect("Gemma media shape validation requires patch positions"),
@@ -1119,25 +1118,13 @@ pub fn gemma4_input_part(
                 ));
             }
             Ok(Gemma4InputPartPlan::Vision {
-                placeholder_token_id: gemma_placeholder_token(args, *modality)?,
+                placeholder_token_id: gemma_placeholder_token(args, modality)?,
                 ingress,
                 shape: media_shape,
             })
         }
-        (
-            PreparedInputModality::Audio,
-            PreparedInputPayload::Tensor {
-                shape,
-                media: Some(media),
-            },
-        ) => {
-            if media.modality != MediaModality::Audio || media.payload_shape != *shape {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared Gemma audio shape disagrees with its media metadata",
-                ));
-            }
-            let valid_frames = media.audio_valid_frames.ok_or_else(|| {
+        (InputModality::Audio, InputPayloadKind::Tensor) => {
+            let valid_frames = inspected.audio_valid_frames().ok_or_else(|| {
                 unsupported(
                     &args.model_type,
                     "prepared Gemma audio has no host-known valid-frame extent",
@@ -1147,10 +1134,14 @@ pub fn gemma4_input_part(
                 i32::try_from(shape[1]).map_err(|_| CapabilityError::ArithmeticOverflow {
                     operation: "Gemma padded audio frame count",
                 })?;
-            let ingress = crate::gemma4::AudioIngressPartPlan::new(valid_frames, padded_frames)
+            let valid_frames_i32 =
+                i32::try_from(valid_frames).map_err(|_| CapabilityError::ArithmeticOverflow {
+                    operation: "Gemma valid audio frame count",
+                })?;
+            let ingress = crate::gemma4::AudioIngressPartPlan::new(valid_frames_i32, padded_frames)
                 .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
-            let media_shape = gemma4(args, media)?;
-            let valid_mask_frames = media
+            let media_shape = gemma4(args, &inspected)?;
+            let valid_mask_frames = inspected
                 .audio_mask
                 .as_ref()
                 .expect("Gemma media shape validation requires an audio mask")
@@ -1158,7 +1149,7 @@ pub fn gemma4_input_part(
                 .iter()
                 .filter(|value| **value)
                 .count();
-            if valid_mask_frames != usize::try_from(valid_frames).unwrap_or_default()
+            if valid_mask_frames != valid_frames
                 || media_shape.decoder_positions != ingress.decoder_positions as u64
             {
                 return Err(unsupported(
@@ -1167,7 +1158,7 @@ pub fn gemma4_input_part(
                 ));
             }
             Ok(Gemma4InputPartPlan::Audio {
-                placeholder_token_id: gemma_placeholder_token(args, PreparedInputModality::Audio)?,
+                placeholder_token_id: gemma_placeholder_token(args, InputModality::Audio)?,
                 ingress,
                 shape: media_shape,
             })
@@ -1177,14 +1168,14 @@ pub fn gemma4_input_part(
             format!(
                 "Gemma 4 does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
 }
 
 fn gemma_valid_patch_count(
-    positions: &MediaMetadata<i32>,
+    positions: &MetadataValues<i32>,
     architecture: &str,
 ) -> Result<u64, CapabilityError> {
     if positions.shape.len() != 3 || positions.shape[0] != 1 || positions.shape[2] != 2 {
@@ -1218,7 +1209,7 @@ fn gemma_valid_patch_count(
 fn gemma_vision(
     config: &crate::gemma4::VisionConfig,
     text_hidden: u64,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<MediaShapePlan, CapabilityError> {
     if input.payload_shape.len() != 3 || input.payload_shape[0] != 1 {
@@ -1313,7 +1304,7 @@ fn gemma_vision(
 fn gemma_audio(
     config: &crate::gemma4::AudioConfig,
     text_hidden: u64,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<MediaShapePlan, CapabilityError> {
     if input.payload_shape.len() != 3
@@ -1456,32 +1447,36 @@ fn gemma_audio(
 }
 
 /// Derives prepared Gemma 4 media geometry from normalized family policy.
-pub fn gemma4(
+fn gemma4(
     args: &crate::gemma4::FamilyConfig,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
     let text_hidden = positive(args.text.hidden_size, "Gemma text hidden size")?;
-    match input.modality {
-        MediaModality::Image | MediaModality::Video => args
+    match input.modality() {
+        InputModality::Image | InputModality::Video => args
             .vision
             .as_ref()
             .ok_or_else(|| unsupported(&args.model_type, "loaded model has no vision tower"))
             .and_then(|config| gemma_vision(config, text_hidden, input, &args.model_type)),
-        MediaModality::Audio => args
+        InputModality::Audio => args
             .audio
             .as_ref()
             .ok_or_else(|| unsupported(&args.model_type, "loaded model has no audio tower"))
             .and_then(|config| gemma_audio(config, text_hidden, input, &args.model_type)),
+        InputModality::Text => Err(unsupported(
+            &args.model_type,
+            "text is not a Gemma media modality",
+        )),
     }
 }
 
 /// Derives prepared Inkling media geometry from normalized family policy.
-pub fn inkling(
+fn inkling(
     args: &crate::inkling::ModelArgs,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    match input.modality {
-        MediaModality::Image => {
+    match input.modality() {
+        InputModality::Image => {
             let config = args.vision_config.as_ref().ok_or_else(|| {
                 unsupported(
                     &args.model_type,
@@ -1537,7 +1532,7 @@ pub fn inkling(
                 execution_workspace_scalars: graph_scalars,
             })
         }
-        MediaModality::Audio => {
+        InputModality::Audio => {
             let config = args.audio_config.as_ref().ok_or_else(|| {
                 unsupported(
                     &args.model_type,
@@ -1605,36 +1600,39 @@ pub fn inkling(
                 execution_workspace_scalars: graph_scalars,
             })
         }
-        MediaModality::Video => Err(unsupported(
+        InputModality::Video => Err(unsupported(
             &args.model_type,
             "video is not a supported Inkling modality",
+        )),
+        InputModality::Text => Err(unsupported(
+            &args.model_type,
+            "text is not an Inkling media modality",
         )),
     }
 }
 
 /// Validates one prepared Inkling part and derives the exact placeholder,
 /// ingress geometry, and capability-accounting plan consumed by a backend.
-pub fn inkling_input_part(
+pub fn inkling_input_part<Tensor>(
     args: &crate::inkling::ModelArgs,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<InklingInputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
-            Ok(InklingInputPartPlan::TextTokens {
-                positions: batch_one_sequence(
-                    shape,
-                    2,
-                    "Inkling text token IDs",
-                    &args.model_type,
-                )?,
-            })
-        }
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(InklingInputPartPlan::TextTokens {
+            positions: batch_one_sequence(&shape, 2, "Inkling text token IDs", &args.model_type)?,
+        }),
         (
-            modality @ (PreparedInputModality::Image | PreparedInputModality::Audio),
-            PreparedInputPayload::Embeddings(shape),
+            modality @ (InputModality::Image | InputModality::Audio),
+            InputPayloadKind::Embeddings,
         ) => {
             let positions = batch_one_sequence(
-                shape,
+                &shape,
                 3,
                 &format!("Inkling {} embeddings", modality.as_str()),
                 &args.model_type,
@@ -1650,37 +1648,20 @@ pub fn inkling_input_part(
                 ));
             }
             let placeholder_token_id = match modality {
-                PreparedInputModality::Image => args.image_token_id,
-                PreparedInputModality::Audio => args.audio_token_id,
-                PreparedInputModality::Text | PreparedInputModality::Video => unreachable!(),
+                InputModality::Image => args.image_token_id,
+                InputModality::Audio => args.audio_token_id,
+                InputModality::Text | InputModality::Video => unreachable!(),
             };
             Ok(InklingInputPartPlan::Projected {
-                modality: *modality,
+                modality,
                 placeholder_token_id,
                 positions,
             })
         }
-        (
-            modality @ (PreparedInputModality::Image | PreparedInputModality::Audio),
-            PreparedInputPayload::Tensor {
-                shape,
-                media: Some(media),
-            },
-        ) => {
-            let expected = if *modality == PreparedInputModality::Image {
-                MediaModality::Image
-            } else {
-                MediaModality::Audio
-            };
-            if media.modality != expected || media.payload_shape != *shape {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared Inkling input modality or shape disagrees with its media metadata",
-                ));
-            }
-            let shape = inkling(args, media)?;
+        (modality @ (InputModality::Image | InputModality::Audio), InputPayloadKind::Tensor) => {
+            let shape = inkling(args, &inspected)?;
             let ingress = InklingIngressPlan {
-                placeholder_token_id: if *modality == PreparedInputModality::Image {
+                placeholder_token_id: if modality == InputModality::Image {
                     args.image_token_id
                 } else {
                     args.audio_token_id
@@ -1688,7 +1669,7 @@ pub fn inkling_input_part(
                 placeholder_count: shape.decoder_positions,
             };
             Ok(InklingInputPartPlan::Media {
-                modality: *modality,
+                modality,
                 ingress,
                 shape,
             })
@@ -1698,26 +1679,26 @@ pub fn inkling_input_part(
             format!(
                 "Inkling does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
 }
 
 /// Derives prepared Muse-Glimmer media geometry and artifact modality policy.
-pub fn muse_glimmer(
+fn muse_glimmer(
     args: &crate::muse_glimmer::DecoderConfig,
-    input: &PreparedMediaInput,
+    input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    if input.modality == MediaModality::Audio
-        || (input.modality == MediaModality::Video
+    if input.modality() == InputModality::Audio
+        || (input.modality() == InputModality::Video
             && args.weight_convention == crate::muse_glimmer::WeightConvention::Gguf)
     {
         return Err(unsupported(
             &args.model_type,
             format!(
                 "loaded Muse-Glimmer artifact does not support {}",
-                input.modality.as_str()
+                input.modality().as_str()
             ),
         ));
     }
@@ -1800,46 +1781,35 @@ pub fn muse_glimmer(
 
 /// Validates one prepared Muse-Glimmer part and derives the exact placeholder,
 /// ingress geometry, and capability-accounting plan consumed by a backend.
-pub fn muse_glimmer_input_part(
+pub fn muse_glimmer_input_part<Tensor>(
     args: &crate::muse_glimmer::DecoderConfig,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<MuseGlimmerInputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => {
             Ok(MuseGlimmerInputPartPlan::TextTokens {
                 positions: batch_one_sequence(
-                    shape,
+                    &shape,
                     2,
                     "Muse-Glimmer text token IDs",
                     &args.model_type,
                 )?,
             })
         }
-        (
-            modality @ (PreparedInputModality::Image | PreparedInputModality::Video),
-            PreparedInputPayload::Tensor {
-                shape,
-                media: Some(media),
-            },
-        ) => {
-            let expected = if *modality == PreparedInputModality::Image {
-                MediaModality::Image
-            } else {
-                MediaModality::Video
-            };
-            if media.modality != expected || media.payload_shape != *shape {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared Muse-Glimmer input modality or shape disagrees with its media metadata",
-                ));
-            }
-            let shape = muse_glimmer(args, media)?;
-            let placeholder_token_id = if *modality == PreparedInputModality::Image {
+        (modality @ (InputModality::Image | InputModality::Video), InputPayloadKind::Tensor) => {
+            let shape = muse_glimmer(args, &inspected)?;
+            let placeholder_token_id = if modality == InputModality::Image {
                 args.image_token_id
             } else {
                 args.video_token_id
             };
-            let patch_grid = media
+            let patch_grid = inspected
                 .patch_grid
                 .as_ref()
                 .expect("Muse-Glimmer shape validation requires a patch grid")
@@ -1848,7 +1818,7 @@ pub fn muse_glimmer_input_part(
                 .map(|entry| (entry[0], entry[1], entry[2]))
                 .collect();
             Ok(MuseGlimmerInputPartPlan::Vision {
-                modality: *modality,
+                modality,
                 ingress: MuseGlimmerIngressPlan {
                     placeholder_token_id,
                     placeholder_count: shape.decoder_positions,
@@ -1862,29 +1832,33 @@ pub fn muse_glimmer_input_part(
             format!(
                 "Muse-Glimmer does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
 }
 
 /// Validates one prepared input part for a text-only architecture.
-pub fn text_only_input_part(
+pub fn text_only_input_part<Tensor>(
     architecture: &str,
-    input: &PreparedInputPart,
+    input: &PreparedInputPart<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<PreparedInputPartPlan, CapabilityError> {
-    match (&input.modality, &input.payload) {
-        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
-            Ok(PreparedInputPartPlan::Text {
-                positions: batch_one_sequence(shape, 2, "text token IDs", architecture)?,
-            })
-        }
+    let inspected = inspect_part(input, inspector)?;
+    let descriptor = &inspected.descriptor;
+    let modality = descriptor.modality();
+    let payload = descriptor.payload_kind();
+    let shape = u64_shape(descriptor.payload())?;
+    match (modality, payload) {
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(PreparedInputPartPlan::Text {
+            positions: batch_one_sequence(&shape, 2, "text token IDs", architecture)?,
+        }),
         (modality, payload) => Err(unsupported(
             architecture,
             format!(
                 "text-only architecture does not support a {} {} payload",
                 modality.as_str(),
-                payload.as_str()
+                payload_name(payload)
             ),
         )),
     }
@@ -1893,18 +1867,236 @@ pub fn text_only_input_part(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::checkpoint::TensorDtype;
+    use eredu_runtime::PreparedInputPayload as RuntimePayload;
     use serde_json::json;
 
-    fn input(modality: MediaModality, payload_shape: &[u64]) -> PreparedMediaInput {
-        PreparedMediaInput {
-            modality,
+    type MediaMetadata<T> = MetadataValues<T>;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestPayload {
+        TokenIds(Vec<u64>),
+        Embeddings(Vec<u64>),
+        Tensor {
+            shape: Vec<u64>,
+            media: Option<MediaAdmissionInput>,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestInputPart {
+        modality: InputModality,
+        payload: TestPayload,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestTensorValues {
+        None,
+        I32(Vec<i32>),
+        Bool(Vec<bool>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestTensor {
+        shape: Vec<usize>,
+        dtype: TensorDtype,
+        values: TestTensorValues,
+    }
+
+    struct TestInspector;
+
+    impl PreparedInputInspector<TestTensor> for TestInspector {
+        fn identity(&self, tensor: &TestTensor) -> Result<InputTensorIdentity, PreparedInputError> {
+            InputTensorIdentity::new(tensor.dtype.clone(), tensor.shape.clone())
+        }
+
+        fn i32_values(&self, tensor: &TestTensor) -> Result<Vec<i32>, CapabilityError> {
+            match &tensor.values {
+                TestTensorValues::I32(values) => Ok(values.clone()),
+                _ => Err(CapabilityError::Observation(
+                    "test tensor does not contain i32 values".into(),
+                )),
+            }
+        }
+
+        fn bool_values(&self, tensor: &TestTensor) -> Result<Vec<bool>, CapabilityError> {
+            match &tensor.values {
+                TestTensorValues::Bool(values) => Ok(values.clone()),
+                _ => Err(CapabilityError::Observation(
+                    "test tensor does not contain bool values".into(),
+                )),
+            }
+        }
+    }
+
+    fn usize_shape(shape: &[u64]) -> Vec<usize> {
+        shape
+            .iter()
+            .map(|value| usize::try_from(*value).unwrap())
+            .collect()
+    }
+
+    fn tensor(shape: &[u64], dtype: TensorDtype, values: TestTensorValues) -> TestTensor {
+        TestTensor {
+            shape: usize_shape(shape),
+            dtype,
+            values,
+        }
+    }
+
+    fn runtime_part(input: &TestInputPart) -> eredu_runtime::PreparedInputPart<TestTensor> {
+        let (payload, media) = match &input.payload {
+            TestPayload::TokenIds(shape) => (
+                RuntimePayload::TokenIds(tensor(shape, TensorDtype::U32, TestTensorValues::None)),
+                None,
+            ),
+            TestPayload::Embeddings(shape) => (
+                RuntimePayload::Embeddings(tensor(shape, TensorDtype::F32, TestTensorValues::None)),
+                None,
+            ),
+            TestPayload::Tensor { shape, media } => (
+                RuntimePayload::Tensor(tensor(shape, TensorDtype::F32, TestTensorValues::None)),
+                media.as_ref(),
+            ),
+        };
+        let metadata = media
+            .into_iter()
+            .flat_map(|media| {
+                [
+                    media.patch_grid.as_ref().map(|metadata| {
+                        (
+                            InputMetadataKey::PatchGrid,
+                            tensor(
+                                &metadata.shape,
+                                TensorDtype::I32,
+                                TestTensorValues::I32(metadata.values.clone()),
+                            ),
+                        )
+                    }),
+                    media.patch_positions.as_ref().map(|metadata| {
+                        (
+                            InputMetadataKey::PatchPositions,
+                            tensor(
+                                &metadata.shape,
+                                TensorDtype::I32,
+                                TestTensorValues::I32(metadata.values.clone()),
+                            ),
+                        )
+                    }),
+                    media.audio_mask.as_ref().map(|metadata| {
+                        (
+                            InputMetadataKey::AudioMask,
+                            tensor(
+                                &metadata.shape,
+                                TensorDtype::Bool,
+                                TestTensorValues::Bool(metadata.values.clone()),
+                            ),
+                        )
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        let extents = media
+            .into_iter()
+            .flat_map(|media| media.descriptor.extents())
+            .collect::<Vec<_>>();
+        eredu_runtime::PreparedInputPart::new_with_extents(
+            input.modality,
+            payload,
+            metadata,
+            extents,
+        )
+        .unwrap()
+    }
+
+    macro_rules! input_part_adapter {
+        ($name:ident, $args:ty, $result:ty) => {
+            fn $name(args: &$args, input: &TestInputPart) -> Result<$result, CapabilityError> {
+                super::$name(args, &runtime_part(input), &TestInspector)
+            }
+        };
+    }
+
+    input_part_adapter!(qwen_vl_input_part, QwenVlModelArgs, QwenVlInputPartPlan);
+    input_part_adapter!(
+        qwen_hybrid_input_part,
+        ParsedHybridConfig,
+        QwenHybridInputPartPlan
+    );
+    input_part_adapter!(
+        qwen_hybrid_text_input_part,
+        HybridConfig,
+        QwenHybridInputPartPlan
+    );
+    input_part_adapter!(
+        gemma4_input_part,
+        crate::gemma4::FamilyConfig,
+        Gemma4InputPartPlan
+    );
+    input_part_adapter!(
+        inkling_input_part,
+        crate::inkling::ModelArgs,
+        InklingInputPartPlan
+    );
+    input_part_adapter!(
+        muse_glimmer_input_part,
+        crate::muse_glimmer::DecoderConfig,
+        MuseGlimmerInputPartPlan
+    );
+
+    fn text_only_input_part(
+        architecture: &str,
+        input: &TestInputPart,
+    ) -> Result<PreparedInputPartPlan, CapabilityError> {
+        super::text_only_input_part(architecture, &runtime_part(input), &TestInspector)
+    }
+
+    fn input(modality: InputModality, payload_shape: &[u64]) -> MediaAdmissionInput {
+        let payload =
+            InputTensorIdentity::new(TensorDtype::F32, usize_shape(payload_shape)).unwrap();
+        MediaAdmissionInput {
+            descriptor: InputPartDescriptor::new(modality, InputPayloadKind::Tensor, payload, [])
+                .unwrap(),
             payload_shape: payload_shape.to_vec(),
             patch_grid: None,
             patch_positions: None,
             audio_mask: None,
-            patch_extent: None,
-            audio_valid_frames: None,
         }
+    }
+
+    fn set_extents(
+        input: &mut MediaAdmissionInput,
+        extents: impl IntoIterator<Item = InputExtent>,
+    ) {
+        input.descriptor = InputPartDescriptor::new_with_extents(
+            input.descriptor.modality(),
+            input.descriptor.payload_kind(),
+            input.descriptor.payload().clone(),
+            input
+                .descriptor
+                .metadata()
+                .iter()
+                .map(|(key, identity)| (*key, identity.clone())),
+            extents,
+        )
+        .unwrap();
+    }
+
+    fn set_modality(input: &mut MediaAdmissionInput, modality: InputModality) {
+        input.descriptor = InputPartDescriptor::new_with_extents(
+            modality,
+            input.descriptor.payload_kind(),
+            input.descriptor.payload().clone(),
+            input
+                .descriptor
+                .metadata()
+                .iter()
+                .map(|(key, identity)| (*key, identity.clone())),
+            input.descriptor.extents(),
+        )
+        .unwrap();
     }
 
     fn qwen_vl_args() -> QwenVlModelArgs {
@@ -1981,18 +2173,18 @@ mod tests {
     #[test]
     fn qwen_vl_admission_accepts_only_text_projected_embeddings() {
         let args = qwen_vl_args();
-        let projected = PreparedInputPart {
-            modality: PreparedInputModality::Text,
-            payload: PreparedInputPayload::Embeddings(vec![1, 4, 32]),
+        let projected = TestInputPart {
+            modality: InputModality::Text,
+            payload: TestPayload::Embeddings(vec![1, 4, 32]),
         };
         assert_eq!(
             qwen_vl_input_part(&args, &projected).unwrap(),
             QwenVlInputPartPlan::ProjectedText { positions: 4 }
         );
 
-        let non_text = PreparedInputPart {
-            modality: PreparedInputModality::Image,
-            payload: PreparedInputPayload::Embeddings(vec![1, 4, 32]),
+        let non_text = TestInputPart {
+            modality: InputModality::Image,
+            payload: TestPayload::Embeddings(vec![1, 4, 32]),
         };
         assert!(matches!(
             qwen_vl_input_part(&args, &non_text),
@@ -2004,13 +2196,13 @@ mod tests {
     fn qwen_hybrid_admission_accepts_projected_text_image_and_video() {
         let args = qwen_hybrid_args();
         for modality in [
-            PreparedInputModality::Text,
-            PreparedInputModality::Image,
-            PreparedInputModality::Video,
+            InputModality::Text,
+            InputModality::Image,
+            InputModality::Video,
         ] {
-            let projected = PreparedInputPart {
+            let projected = TestInputPart {
                 modality,
-                payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+                payload: TestPayload::Embeddings(vec![1, 4, 16]),
             };
             assert_eq!(
                 qwen_hybrid_input_part(&args, &projected).unwrap(),
@@ -2021,27 +2213,27 @@ mod tests {
             );
         }
 
-        let wrong_width = PreparedInputPart {
-            modality: PreparedInputModality::Image,
-            payload: PreparedInputPayload::Embeddings(vec![1, 4, 8]),
+        let wrong_width = TestInputPart {
+            modality: InputModality::Image,
+            payload: TestPayload::Embeddings(vec![1, 4, 8]),
         };
         assert!(matches!(
             qwen_hybrid_input_part(&args, &wrong_width),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
 
-        let audio = PreparedInputPart {
-            modality: PreparedInputModality::Audio,
-            payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+        let audio = TestInputPart {
+            modality: InputModality::Audio,
+            payload: TestPayload::Embeddings(vec![1, 4, 16]),
         };
         assert!(matches!(
             qwen_hybrid_input_part(&args, &audio),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
 
-        let projected_text = PreparedInputPart {
-            modality: PreparedInputModality::Text,
-            payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+        let projected_text = TestInputPart {
+            modality: InputModality::Text,
+            payload: TestPayload::Embeddings(vec![1, 4, 16]),
         };
         assert!(matches!(
             qwen_hybrid_text_input_part(&args.text, &projected_text),
@@ -2051,9 +2243,9 @@ mod tests {
 
     #[test]
     fn text_only_input_plan_rejects_every_non_token_payload() {
-        let tokens = PreparedInputPart {
-            modality: PreparedInputModality::Text,
-            payload: PreparedInputPayload::TokenIds(vec![1, 4]),
+        let tokens = TestInputPart {
+            modality: InputModality::Text,
+            payload: TestPayload::TokenIds(vec![1, 4]),
         };
         assert_eq!(
             text_only_input_part("llama", &tokens).unwrap(),
@@ -2061,13 +2253,13 @@ mod tests {
         );
 
         for input in [
-            PreparedInputPart {
-                modality: PreparedInputModality::Text,
-                payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+            TestInputPart {
+                modality: InputModality::Text,
+                payload: TestPayload::Embeddings(vec![1, 4, 16]),
             },
-            PreparedInputPart {
-                modality: PreparedInputModality::Image,
-                payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+            TestInputPart {
+                modality: InputModality::Image,
+                payload: TestPayload::Embeddings(vec![1, 4, 16]),
             },
         ] {
             assert!(matches!(
@@ -2096,20 +2288,20 @@ mod tests {
             Some(eredu_core::MtpCheckpointKind::Separate)
         );
 
-        let projected = PreparedInputPart {
-            modality: PreparedInputModality::Image,
-            payload: PreparedInputPayload::Embeddings(vec![1, 3, 16]),
+        let projected = TestInputPart {
+            modality: InputModality::Image,
+            payload: TestPayload::Embeddings(vec![1, 3, 16]),
         };
         assert_eq!(
             gemma4_input_part(&args, &projected).unwrap(),
             Gemma4InputPartPlan::Projected {
-                modality: PreparedInputModality::Image,
+                modality: InputModality::Image,
                 placeholder_token_id: 60,
                 positions: 3,
             }
         );
 
-        let mut vision = input(MediaModality::Image, &[1, 4, 48]);
+        let mut vision = input(InputModality::Image, &[1, 4, 48]);
         vision.patch_grid = Some(MediaMetadata {
             shape: vec![1, 3],
             values: vec![1, 2, 2],
@@ -2118,10 +2310,17 @@ mod tests {
             shape: vec![1, 4, 2],
             values: vec![0, 0, 1, 0, 0, 1, 1, 1],
         });
-        vision.patch_extent = Some([1, 2, 2]);
-        let vision = PreparedInputPart {
-            modality: PreparedInputModality::Image,
-            payload: PreparedInputPayload::Tensor {
+        set_extents(
+            &mut vision,
+            [InputExtent::PatchGrid {
+                time: 1,
+                height: 2,
+                width: 2,
+            }],
+        );
+        let vision = TestInputPart {
+            modality: InputModality::Image,
+            payload: TestPayload::Tensor {
                 shape: vision.payload_shape.clone(),
                 media: Some(vision),
             },
@@ -2138,27 +2337,34 @@ mod tests {
             }
         ));
         let mut inconsistent_vision = vision.clone();
-        let PreparedInputPayload::Tensor {
+        let TestPayload::Tensor {
             media: Some(media), ..
         } = &mut inconsistent_vision.payload
         else {
             unreachable!()
         };
-        media.patch_extent = Some([1, 4, 1]);
+        set_extents(
+            media,
+            [InputExtent::PatchGrid {
+                time: 1,
+                height: 4,
+                width: 1,
+            }],
+        );
         assert!(matches!(
             gemma4_input_part(&args, &inconsistent_vision),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
 
-        let mut audio = input(MediaModality::Audio, &[1, 8, 128]);
+        let mut audio = input(InputModality::Audio, &[1, 8, 128]);
         audio.audio_mask = Some(MediaMetadata {
             shape: vec![1, 8],
             values: vec![true, true, true, true, true, true, false, false],
         });
-        audio.audio_valid_frames = Some(6);
-        let audio = PreparedInputPart {
-            modality: PreparedInputModality::Audio,
-            payload: PreparedInputPayload::Tensor {
+        set_extents(&mut audio, [InputExtent::AudioValidFrames(6)]);
+        let audio = TestInputPart {
+            modality: InputModality::Audio,
+            payload: TestPayload::Tensor {
                 shape: audio.payload_shape.clone(),
                 media: Some(audio),
             },
@@ -2175,21 +2381,21 @@ mod tests {
             }
         ));
         let mut inconsistent_audio = audio.clone();
-        let PreparedInputPayload::Tensor {
+        let TestPayload::Tensor {
             media: Some(media), ..
         } = &mut inconsistent_audio.payload
         else {
             unreachable!()
         };
-        media.audio_valid_frames = Some(5);
+        set_extents(media, [InputExtent::AudioValidFrames(5)]);
         assert!(matches!(
             gemma4_input_part(&args, &inconsistent_audio),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
 
-        let video = PreparedInputPart {
-            modality: PreparedInputModality::Video,
-            payload: PreparedInputPayload::Embeddings(vec![1, 1, 16]),
+        let video = TestInputPart {
+            modality: InputModality::Video,
+            payload: TestPayload::Embeddings(vec![1, 1, 16]),
         };
         assert!(matches!(
             gemma4_input_part(&args, &video),
@@ -2246,7 +2452,7 @@ mod tests {
             out_hidden_size: 8,
             linear_formats: Default::default(),
         };
-        let mut prepared = input(MediaModality::Image, &[4, 3]);
+        let mut prepared = input(InputModality::Image, &[4, 3]);
         prepared.patch_grid = Some(MediaMetadata {
             shape: vec![1, 3],
             values: vec![1, 2, 2],
@@ -2261,7 +2467,7 @@ mod tests {
         assert_eq!(ingress.placeholder_count, 1);
         assert_eq!(ingress.patch_grid, vec![(1, 2, 2)]);
 
-        prepared.modality = MediaModality::Video;
+        set_modality(&mut prepared, InputModality::Video);
         assert_eq!(
             qwen_vision_ingress(Some(&config), Some(22), Some(23), &prepared, "qwen3_vl",)
                 .unwrap()
@@ -2302,7 +2508,7 @@ mod tests {
             quantized_weights: None,
             quantized_weight_configs: None,
         };
-        let mut vision = input(MediaModality::Image, &[1, 5, 3]);
+        let mut vision = input(InputModality::Image, &[1, 5, 3]);
         vision.patch_positions = Some(MediaMetadata {
             shape: vec![1, 5, 2],
             values: vec![0, 0, 1, 0, 0, 1, 1, 1, -1, -1],
@@ -2328,7 +2534,7 @@ mod tests {
             quantized_weights: None,
             quantized_weight_configs: None,
         };
-        let mut audio = input(MediaModality::Audio, &[1, 8, 128]);
+        let mut audio = input(InputModality::Audio, &[1, 8, 128]);
         audio.audio_mask = Some(MediaMetadata {
             shape: vec![1, 8],
             values: vec![true, true, true, true, true, true, false, false],
@@ -2365,12 +2571,12 @@ mod tests {
     #[test]
     fn inkling_plan_owns_hmlp_and_dmel_shapes() {
         let args = tiny_inkling();
-        let image = input(MediaModality::Image, &[1, 2, 40, 40, 3]);
+        let image = input(InputModality::Image, &[1, 2, 40, 40, 3]);
         let image_plan = inkling(&args, &image).unwrap();
         assert_eq!(image_plan.decoder_positions, 1);
-        let image_part = PreparedInputPart {
-            modality: PreparedInputModality::Image,
-            payload: PreparedInputPayload::Tensor {
+        let image_part = TestInputPart {
+            modality: InputModality::Image,
+            payload: TestPayload::Tensor {
                 shape: image.payload_shape.clone(),
                 media: Some(image),
             },
@@ -2386,16 +2592,16 @@ mod tests {
             } if placeholder_token_id == args.image_token_id
         ));
 
-        let mut audio = input(MediaModality::Audio, &[1, 3, 80]);
+        let mut audio = input(InputModality::Audio, &[1, 3, 80]);
         audio.audio_mask = Some(MediaMetadata {
             shape: vec![1, 3],
             values: vec![true, true, false],
         });
         let audio_plan = inkling(&args, &audio).unwrap();
         assert_eq!(audio_plan.decoder_positions, 2);
-        let audio_part = |media: PreparedMediaInput| PreparedInputPart {
-            modality: PreparedInputModality::Audio,
-            payload: PreparedInputPayload::Tensor {
+        let audio_part = |media: MediaAdmissionInput| TestInputPart {
+            modality: InputModality::Audio,
+            payload: TestPayload::Tensor {
                 shape: media.payload_shape.clone(),
                 media: Some(media),
             },
@@ -2417,11 +2623,11 @@ mod tests {
             Err(CapabilityError::UnsupportedInput { .. })
         ));
         assert!(matches!(
-            inkling(&args, &input(MediaModality::Audio, &[3, 80])),
+            inkling(&args, &input(InputModality::Audio, &[3, 80])),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
         assert!(matches!(
-            inkling(&args, &input(MediaModality::Video, &[1, 2])),
+            inkling(&args, &input(InputModality::Video, &[1, 2])),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
     }
@@ -2429,23 +2635,23 @@ mod tests {
     #[test]
     fn inkling_input_plan_matches_projected_execution_policy() {
         let args = tiny_inkling();
-        let projected = PreparedInputPart {
-            modality: PreparedInputModality::Image,
-            payload: PreparedInputPayload::Embeddings(vec![1, 3, 32]),
+        let projected = TestInputPart {
+            modality: InputModality::Image,
+            payload: TestPayload::Embeddings(vec![1, 3, 32]),
         };
         assert_eq!(
             inkling_input_part(&args, &projected).unwrap(),
             InklingInputPartPlan::Projected {
-                modality: PreparedInputModality::Image,
+                modality: InputModality::Image,
                 placeholder_token_id: args.image_token_id,
                 positions: 3,
             }
         );
 
-        for modality in [PreparedInputModality::Text, PreparedInputModality::Video] {
-            let rejected = PreparedInputPart {
+        for modality in [InputModality::Text, InputModality::Video] {
+            let rejected = TestInputPart {
                 modality,
-                payload: PreparedInputPayload::Embeddings(vec![1, 3, 32]),
+                payload: TestPayload::Embeddings(vec![1, 3, 32]),
             };
             assert!(matches!(
                 inkling_input_part(&args, &rejected),
@@ -2477,7 +2683,7 @@ mod tests {
 
     #[test]
     fn muse_plan_owns_grid_geometry_and_artifact_video_policy() {
-        let mut prepared = input(MediaModality::Video, &[4, 12]);
+        let mut prepared = input(InputModality::Video, &[4, 12]);
         prepared.patch_grid = Some(MediaMetadata {
             shape: vec![1, 3],
             values: vec![1, 2, 2],
@@ -2485,9 +2691,9 @@ mod tests {
         let mut args = tiny_muse();
         let plan = muse_glimmer(&args, &prepared).unwrap();
         assert_eq!(plan.decoder_positions, 1);
-        let prepared_part = |media: PreparedMediaInput| PreparedInputPart {
-            modality: PreparedInputModality::Video,
-            payload: PreparedInputPayload::Tensor {
+        let prepared_part = |media: MediaAdmissionInput| TestInputPart {
+            modality: InputModality::Video,
+            payload: TestPayload::Tensor {
                 shape: media.payload_shape.clone(),
                 media: Some(media),
             },
@@ -2515,15 +2721,15 @@ mod tests {
     fn muse_input_plan_rejects_projected_and_audio_payloads() {
         let args = tiny_muse();
         for input in [
-            PreparedInputPart {
-                modality: PreparedInputModality::Image,
-                payload: PreparedInputPayload::Embeddings(vec![1, 1, 16]),
+            TestInputPart {
+                modality: InputModality::Image,
+                payload: TestPayload::Embeddings(vec![1, 1, 16]),
             },
-            PreparedInputPart {
-                modality: PreparedInputModality::Audio,
-                payload: PreparedInputPayload::Tensor {
+            TestInputPart {
+                modality: InputModality::Audio,
+                payload: TestPayload::Tensor {
                     shape: vec![1, 2, 3],
-                    media: Some(input(MediaModality::Audio, &[1, 2, 3])),
+                    media: Some(input(InputModality::Audio, &[1, 2, 3])),
                 },
             },
         ] {

@@ -313,6 +313,6 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2].modality, Modality::Image);
+        assert_eq!(parts[2].modality(), Modality::Image);
     }
 }

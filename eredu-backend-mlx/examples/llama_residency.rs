@@ -3,7 +3,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
+use eredu_backend_mlx::backend::runtime::media::input::ModelInput;
 use eredu_backend_mlx::native::{sample, Array, Device, DeviceType, ExecutionContext};
 use eredu_backend_mlx::ModelLoadOptions;
 use eredu_core::{
@@ -136,7 +136,8 @@ fn main() -> anyhow::Result<()> {
 
     stream.synchronize()?;
     let prompt_array = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
-    let prompt_parts = [InputPart::text_token_ids(&prompt_array)];
+    let prompt_parts =
+        [eredu_backend_mlx::backend::runtime::media::input::token_ids_part(&prompt_array)?];
     let prefill_started = Instant::now();
     let _ = session
         .prefill(&backend, ModelInput::new(&prompt_parts).into())?

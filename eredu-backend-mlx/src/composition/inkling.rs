@@ -1183,10 +1183,9 @@ impl PreparedInklingInput {
         let mut images = Vec::new();
         let mut audio = Vec::new();
         for part in typed.parts {
-            let architecture_input = input::prepared_input_part(*part)?;
-            let plan = media_plan::inkling_input_part(args, &architecture_input)
+            let plan = media_plan::inkling_input_part(args, part, &input::MlxInputInspector)
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            match (plan, part.payload) {
+            match (plan, part.payload()) {
                 (
                     media_plan::InklingInputPartPlan::TextTokens { .. },
                     input::InputPayload::TokenIds(value),
@@ -1197,7 +1196,7 @@ impl PreparedInklingInput {
                 }
                 (
                     media_plan::InklingInputPartPlan::Media {
-                        modality: media_plan::PreparedInputModality::Image,
+                        modality: input::Modality::Image,
                         ingress,
                         ..
                     },
@@ -1218,7 +1217,7 @@ impl PreparedInklingInput {
                 }
                 (
                     media_plan::InklingInputPartPlan::Media {
-                        modality: media_plan::PreparedInputModality::Audio,
+                        modality: input::Modality::Audio,
                         ingress,
                         ..
                     },
@@ -1261,17 +1260,16 @@ impl PreparedInklingInput {
                         stream,
                     )?));
                     kinds.push(match modality {
-                        media_plan::PreparedInputModality::Image => input::Modality::Image,
-                        media_plan::PreparedInputModality::Audio => input::Modality::Audio,
-                        media_plan::PreparedInputModality::Text
-                        | media_plan::PreparedInputModality::Video => unreachable!(),
+                        input::Modality::Image => input::Modality::Image,
+                        input::Modality::Audio => input::Modality::Audio,
+                        input::Modality::Text | input::Modality::Video => unreachable!(),
                     });
                     projected.push(Some(crate::MlxTensor::from_array(value.clone())));
                 }
                 _ => {
                     return Err(Error::ArchitectureModel(format!(
                         "Inkling input plan disagrees with the prepared {} payload",
-                        part.modality.as_str()
+                        part.modality().as_str()
                     )))
                 }
             }

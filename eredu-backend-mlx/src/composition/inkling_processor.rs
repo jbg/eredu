@@ -10,6 +10,8 @@ use eredu_architectures::processor_plan::{
     AudioFrameCount, AudioWindow, InklingAudioPlan, Logarithm, MelNormalization, MelScale,
     SpectrumValue,
 };
+#[cfg(feature = "audio")]
+use eredu_core::{InputExtent, InputMetadataKey};
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
@@ -17,12 +19,12 @@ use crate::backend::error::Error;
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::backend::runtime::media::input::Modality;
 
-use crate::backend::runtime::media::{
-    prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
-    ProcessorInput, ProcessorPreparationError,
-};
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::runtime::media::{MediaPayload, OwnedInputMetadata};
+use crate::backend::runtime::media::MediaPayload;
+use crate::backend::runtime::media::{
+    media_input_part, prepared_model_input, push_text_token_ids, InputPart, MediaInput,
+    PreparedModelInput, ProcessorInput, ProcessorPreparationError,
+};
 
 #[derive(Debug, Clone)]
 pub struct InklingProcessor {
@@ -42,18 +44,14 @@ impl InklingProcessor {
         let mut parts = Vec::new();
         for item in input {
             match *item {
-                ProcessorInput::TokenIds(ids) => push_text_token_ids(&mut parts, ids),
+                ProcessorInput::TokenIds(ids) => push_text_token_ids(&mut parts, ids)?,
                 ProcessorInput::Media(media) => self.push_media(&mut parts, media)?,
             }
         }
         Ok(prepared_model_input(parts)?)
     }
 
-    fn push_media(
-        &self,
-        _parts: &mut Vec<PreparedInputPart>,
-        media: MediaInput<'_>,
-    ) -> Result<(), Error> {
+    fn push_media(&self, _parts: &mut Vec<InputPart>, media: MediaInput<'_>) -> Result<(), Error> {
         match (media.modality, media.payload) {
             #[cfg(feature = "image")]
             (Modality::Image, MediaPayload::Rgb8(image)) => {
@@ -61,14 +59,14 @@ impl InklingProcessor {
                     .plan
                     .image(image.height() as usize, image.width() as usize)
                     .map_err(processor_error)?;
-                push_text_token_ids(_parts, &[plan.start_token_id]);
+                push_text_token_ids(_parts, &[plan.start_token_id])?;
                 _parts.push(process_image(image, plan)?);
                 Ok(())
             }
             #[cfg(feature = "audio")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
                 let plan = self.plan.audio();
-                push_text_token_ids(_parts, &[plan.start_token_id]);
+                push_text_token_ids(_parts, &[plan.start_token_id])?;
                 _parts.push(self.process_audio(waveform, plan)?);
                 Ok(())
             }
@@ -84,7 +82,7 @@ impl InklingProcessor {
         &self,
         waveform: crate::backend::runtime::media::audio::AudioWaveform<'_>,
         plan: InklingAudioPlan,
-    ) -> Result<PreparedInputPart, Error> {
+    ) -> Result<InputPart, Error> {
         let features = inkling_log_mel(waveform, plan)?;
         let span = (plan.dmel_max - plan.dmel_min) as f64;
         let centers = (0..plan.dmel_bins)
@@ -107,11 +105,12 @@ impl InklingProcessor {
         let frames = ids.len() / plan.mel_bins;
         let tensor = Array::from_slice(&ids, &[1, frames as i32, plan.mel_bins as i32]);
         let mask = Array::from_slice(&vec![true; frames], &[1, frames as i32]);
-        Ok(PreparedInputPart::media_tensor(
+        media_input_part(
             Modality::Audio,
             tensor,
-            OwnedInputMetadata::audio_mask(mask, frames as i32),
-        ))
+            [(InputMetadataKey::AudioMask, mask)],
+            [InputExtent::AudioValidFrames(frames)],
+        )
     }
 }
 
@@ -124,7 +123,7 @@ fn processor_error(error: ProcessorPlanError) -> Error {
 fn process_image(
     image: crate::backend::runtime::media::image::RgbImageView<'_>,
     plan: InklingImagePlan,
-) -> Result<PreparedInputPart, Error> {
+) -> Result<InputPart, Error> {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let pixels = image.packed_pixels();
@@ -156,7 +155,7 @@ fn process_image(
             output.extend(values);
         }
     }
-    Ok(PreparedInputPart::media_tensor(
+    media_input_part(
         Modality::Image,
         Array::from_slice(
             &output,
@@ -168,8 +167,9 @@ fn process_image(
                 3,
             ],
         ),
-        OwnedInputMetadata::default(),
-    ))
+        [],
+        [],
+    )
 }
 
 #[cfg(feature = "audio")]

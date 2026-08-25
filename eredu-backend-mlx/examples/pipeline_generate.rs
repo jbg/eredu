@@ -1,6 +1,6 @@
 //! Minimal MLX two-or-more-process microbatched pipeline generation probe.
 
-use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
+use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut session = backend.create_session(model)?;
     let prompt = eredu_backend_mlx::native::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let parts = [InputPart::text_token_ids(&prompt)];
+    let parts = [token_ids_part(&prompt)?];
     let mut logits = session
         .prefill(&backend, ModelInput::new(&parts).into())?
         .wait()?

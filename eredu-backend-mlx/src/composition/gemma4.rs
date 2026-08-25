@@ -16,6 +16,7 @@ use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
 };
+use eredu_core::InputMetadataKey;
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, ExecutionUnitLayout,
@@ -1094,12 +1095,15 @@ impl PreparedParts {
             audio: None,
         };
         for part in typed.parts {
-            let neutral = input::prepared_input_part(*part)?;
-            let plan = eredu_architectures::media_plan::gemma4_input_part(args, &neutral)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            let plan = eredu_architectures::media_plan::gemma4_input_part(
+                args,
+                part,
+                &input::MlxInputInspector,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             match plan {
                 Gemma4InputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
                         unreachable!("architecture-admitted Gemma text payload")
                     };
                     prepared
@@ -1113,7 +1117,7 @@ impl PreparedParts {
                     positions,
                     ..
                 } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
                         unreachable!("architecture-admitted Gemma projected payload")
                     };
                     let positions = usize::try_from(positions).map_err(|_| {
@@ -1127,7 +1131,7 @@ impl PreparedParts {
                             &vec![placeholder_token_id; positions],
                             &[1, embeddings.dim(1)],
                         )));
-                    prepared.modalities.push(part.modality);
+                    prepared.modalities.push(part.modality());
                     prepared
                         .projected
                         .push(Some(crate::MlxTensor::from_array(embeddings.clone())));
@@ -1137,15 +1141,14 @@ impl PreparedParts {
                     ingress,
                     ..
                 } => {
-                    let input::InputPayload::Tensor(patches) = part.payload else {
+                    let input::InputPayload::Tensor(patches) = part.payload() else {
                         unreachable!("architecture-admitted Gemma vision payload")
                     };
                     let positions = part
-                        .metadata
-                        .patch_positions
+                        .metadata_value(InputMetadataKey::PatchPositions)
                         .expect("architecture-admitted Gemma patch positions");
                     prepared.push_vision(
-                        part.modality,
+                        part.modality(),
                         patches,
                         positions,
                         ingress,
@@ -1157,12 +1160,11 @@ impl PreparedParts {
                     ingress,
                     ..
                 } => {
-                    let input::InputPayload::Tensor(features) = part.payload else {
+                    let input::InputPayload::Tensor(features) = part.payload() else {
                         unreachable!("architecture-admitted Gemma audio payload")
                     };
                     let mask = part
-                        .metadata
-                        .audio_mask
+                        .metadata_value(InputMetadataKey::AudioMask)
                         .expect("architecture-admitted Gemma audio mask");
                     prepared.push_audio(features, mask, ingress, placeholder_token_id)?;
                 }

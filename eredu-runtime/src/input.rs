@@ -113,7 +113,8 @@ impl<Tensor> PreparedInputPart<Tensor> {
         &self.extents
     }
 
-    fn descriptor(
+    /// Builds and validates the core descriptor for this exact tensor part.
+    pub fn descriptor(
         &self,
         describe: &impl Fn(&Tensor) -> Result<InputTensorIdentity, PreparedInputError>,
     ) -> Result<InputPartDescriptor, PreparedInputError> {

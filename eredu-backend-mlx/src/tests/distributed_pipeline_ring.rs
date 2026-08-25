@@ -38,11 +38,12 @@ use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, FinishReason,
-    GenerationCancellationToken, ModelRuntime, MtpCapability, MtpCheckpointKind, MtpConfig,
-    ObservationRequest, SemanticEvent, SpeculativeDraft, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeOutputError,
-    SpeculativeSemanticState, SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter,
-    TokenFilterController, TokenOutput as _,
+    GenerationCancellationToken, InputExtent, InputMetadataKey, InputModality, ModelRuntime,
+    MtpCapability, MtpCheckpointKind, MtpConfig, ObservationRequest, SemanticEvent,
+    SpeculativeDraft, SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest,
+    SpeculativeGenerationLane, SpeculativeOutputError, SpeculativeSemanticState,
+    SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter, TokenFilterController,
+    TokenOutput as _,
 };
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
@@ -67,6 +68,24 @@ const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
 const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
+
+fn input_part(
+    modality: InputModality,
+    payload: InputPayload,
+    metadata: impl IntoIterator<Item = (InputMetadataKey, Array)>,
+    extents: impl IntoIterator<Item = InputExtent>,
+) -> crate::backend::runtime::media::input::InputPart {
+    crate::backend::runtime::media::input::input_part(modality, payload, metadata, extents).unwrap()
+}
+
+fn text_input_part(tokens: &Array) -> crate::backend::runtime::media::input::InputPart {
+    input_part(
+        InputModality::Text,
+        InputPayload::TokenIds(tokens.clone()),
+        [],
+        [],
+    )
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct AllowAllTokens;
@@ -651,11 +670,9 @@ fn pipeline_ring_worker() {
             <MlxBackend<'_> as eredu_core::SpeculativeGenerationBackend>::mtp_capability(&runtime),
             expected_mtp_capability
         );
-        use crate::backend::runtime::media::input::{
-            InputMetadata, InputPart, InputPayload, Modality, ModelInput,
-        };
+        use crate::backend::runtime::media::input::{InputPayload, Modality, ModelInput};
         let capability_tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let capability_parts = [InputPart::text_token_ids(&capability_tokens)];
+        let capability_parts = [text_input_part(&capability_tokens)];
         let capability_input = ModelInput::new(&capability_parts).into();
         let capabilities =
             <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::model_capabilities(&runtime)
@@ -716,34 +733,56 @@ fn pipeline_ring_worker() {
         let gemma4_audio_mask = Array::from_slice(&[true, true, true, true], &[1, 4]);
         let parts = if image_mode {
             vec![
-                InputPart::text_token_ids(&text_before),
-                InputPart::image_tensor(&image_pixels, InputMetadata::patch_grid(&image_grid)),
-                InputPart::text_token_ids(&text_after),
+                text_input_part(&text_before),
+                input_part(
+                    Modality::Image,
+                    InputPayload::Tensor(image_pixels.clone()),
+                    [(InputMetadataKey::PatchGrid, image_grid.clone())],
+                    [],
+                ),
+                text_input_part(&text_after),
             ]
         } else if inkling_media_mode {
             vec![
-                InputPart::text_token_ids(&prompt),
-                InputPart {
-                    modality: Modality::Image,
-                    payload: InputPayload::Embeddings(&inkling_image),
-                    metadata: InputMetadata::empty(),
-                },
-                InputPart::audio_tensor(&inkling_audio, InputMetadata::empty()),
+                text_input_part(&prompt),
+                input_part(
+                    Modality::Image,
+                    InputPayload::Embeddings(inkling_image.clone()),
+                    [],
+                    [],
+                ),
+                input_part(
+                    Modality::Audio,
+                    InputPayload::Tensor(inkling_audio.clone()),
+                    [],
+                    [],
+                ),
             ]
         } else if gemma4_media_mode {
             vec![
-                InputPart::text_token_ids(&prompt),
-                InputPart::image_tensor(
-                    &gemma4_patches,
-                    InputMetadata::patch_layout(&gemma4_grid, &gemma4_positions, [1, 2, 2]),
+                text_input_part(&prompt),
+                input_part(
+                    Modality::Image,
+                    InputPayload::Tensor(gemma4_patches.clone()),
+                    [
+                        (InputMetadataKey::PatchGrid, gemma4_grid.clone()),
+                        (InputMetadataKey::PatchPositions, gemma4_positions.clone()),
+                    ],
+                    [InputExtent::PatchGrid {
+                        time: 1,
+                        height: 2,
+                        width: 2,
+                    }],
                 ),
-                InputPart::audio_tensor(
-                    &gemma4_audio,
-                    InputMetadata::audio_layout(&gemma4_audio_mask, 4),
+                input_part(
+                    Modality::Audio,
+                    InputPayload::Tensor(gemma4_audio.clone()),
+                    [(InputMetadataKey::AudioMask, gemma4_audio_mask.clone())],
+                    [InputExtent::AudioValidFrames(4)],
                 ),
             ]
         } else {
-            vec![InputPart::text_token_ids(&prompt)]
+            vec![text_input_part(&prompt)]
         };
         let prefix_tokens = if image_mode {
             vec![1, 22, 2]
@@ -1447,7 +1486,7 @@ fn resident_reference_quantized(
         .unwrap();
     let mut cache = model.new_cache();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [crate::backend::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let parts = [text_input_part(&prompt)];
     let prefill = model
         .submit_prefill(
             crate::backend::runtime::media::input::ModelInput::new(&parts),
@@ -1514,46 +1553,57 @@ fn resident_reference_for_prepared(
 }
 
 fn inkling_multimodal_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::{InputMetadata, InputPart, Modality, ModelInput};
+    use crate::backend::runtime::media::input::{Modality, ModelInput};
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
     let audio = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[1, 3, 2]);
     let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
     let parts = [
-        InputPart::text_token_ids(&text),
-        InputPart {
-            modality: Modality::Image,
-            payload: InputPayload::Embeddings(&image),
-            metadata: InputMetadata::empty(),
-        },
-        InputPart::audio_tensor(&audio, InputMetadata::audio_layout(&audio_mask, 2)),
+        text_input_part(&text),
+        input_part(Modality::Image, InputPayload::Embeddings(image), [], []),
+        input_part(
+            Modality::Audio,
+            InputPayload::Tensor(audio),
+            [(InputMetadataKey::AudioMask, audio_mask)],
+            [InputExtent::AudioValidFrames(2)],
+        ),
     ];
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
 
 fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use crate::backend::runtime::media::input::{Modality, ModelInput};
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
     let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
     let parts = [
-        InputPart::text_token_ids(&text),
-        InputPart::image_tensor(&pixels, InputMetadata::patch_grid(&grid)),
+        text_input_part(&text),
+        input_part(
+            Modality::Image,
+            InputPayload::Tensor(pixels),
+            [(InputMetadataKey::PatchGrid, grid)],
+            [],
+        ),
     ];
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
 
 fn qwen3_vl_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use crate::backend::runtime::media::input::{Modality, ModelInput};
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
     let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
     let parts = [
-        InputPart::text_token_ids(&text),
-        InputPart::image_tensor(&pixels, InputMetadata::patch_grid(&grid)),
+        text_input_part(&text),
+        input_part(
+            Modality::Image,
+            InputPayload::Tensor(pixels),
+            [(InputMetadataKey::PatchGrid, grid)],
+            [],
+        ),
     ];
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
@@ -2515,7 +2565,7 @@ fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
         let model = load_model(&backend, artifact, options).unwrap();
         let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::backend::runtime::media::input::InputPart::text_token_ids(&tokens)];
+        let parts = [text_input_part(&tokens)];
         let input = crate::composition::mlx::MlxModelInput::from(
             crate::backend::runtime::media::input::ModelInput::new(&parts),
         );

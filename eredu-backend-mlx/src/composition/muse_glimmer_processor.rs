@@ -4,6 +4,7 @@ use eredu_architectures::processor_plan::{
     MuseImagePlan, MusePatchPlan, MuseProcessorPlan, ProcessorPlanError, RgbResample,
     RgbTransformPlan,
 };
+use eredu_core::InputMetadataKey;
 use safemlx::Array;
 
 use crate::{
@@ -11,10 +12,10 @@ use crate::{
     backend::runtime::media::{
         image::{rescale_and_normalize_rgb8, resize_rgb8_lanczos3, NormalizedImage, RgbImageView},
         input::Modality,
-        prepared_model_input, push_text_token_ids,
+        media_input_part, prepared_model_input, push_text_token_ids,
         video::validate_rgb_frames,
-        MediaInput, MediaPayload, OwnedInputMetadata, PreparedInputPart, PreparedModelInput,
-        ProcessorInput, ProcessorPreparationError, VideoFrames,
+        InputPart, MediaInput, MediaPayload, PreparedModelInput, ProcessorInput,
+        ProcessorPreparationError, VideoFrames,
     },
 };
 
@@ -37,7 +38,7 @@ impl MuseGlimmerProcessor {
         let mut parts = Vec::new();
         for item in input {
             match *item {
-                ProcessorInput::TokenIds(ids) => push_text_token_ids(&mut parts, ids),
+                ProcessorInput::TokenIds(ids) => push_text_token_ids(&mut parts, ids)?,
                 ProcessorInput::Media(media) => self.push_media(&mut parts, media, encode_text)?,
             }
         }
@@ -46,7 +47,7 @@ impl MuseGlimmerProcessor {
 
     fn push_media<E>(
         &self,
-        parts: &mut Vec<PreparedInputPart>,
+        parts: &mut Vec<InputPart>,
         media: MediaInput<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
@@ -59,12 +60,12 @@ impl MuseGlimmerProcessor {
                 push_text_token_ids(
                     parts,
                     &encode_text(plan.start_text).map_err(ProcessorPreparationError::Text)?,
-                );
+                )?;
                 parts.push(process_image(image, plan)?);
                 push_text_token_ids(
                     parts,
                     &encode_text(plan.end_text).map_err(ProcessorPreparationError::Text)?,
-                );
+                )?;
                 Ok(())
             }
             (Modality::Video, MediaPayload::VideoFrames(video)) => {
@@ -80,7 +81,7 @@ impl MuseGlimmerProcessor {
 
     fn push_video<E>(
         &self,
-        parts: &mut Vec<PreparedInputPart>,
+        parts: &mut Vec<InputPart>,
         video: VideoFrames<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
@@ -98,12 +99,12 @@ impl MuseGlimmerProcessor {
         push_text_token_ids(
             parts,
             &encode_text(plan.start_text).map_err(ProcessorPreparationError::Text)?,
-        );
+        )?;
         for group in &plan.groups {
             push_text_token_ids(
                 parts,
                 &encode_text(&group.timestamp_text).map_err(ProcessorPreparationError::Text)?,
-            );
+            )?;
             let frames = group
                 .source_indices
                 .iter()
@@ -113,7 +114,7 @@ impl MuseGlimmerProcessor {
             push_text_token_ids(
                 parts,
                 &encode_text(group.boundary_text).map_err(ProcessorPreparationError::Text)?,
-            );
+            )?;
         }
         Ok(())
     }
@@ -137,26 +138,28 @@ fn normalize(image: RgbImageView<'_>, plan: RgbTransformPlan) -> Result<Normaliz
     rescale_and_normalize_rgb8(resized.as_view(), plan.rescale_factor, plan.mean, plan.std)
 }
 
-fn process_image(image: RgbImageView<'_>, plan: MuseImagePlan) -> Result<PreparedInputPart, Error> {
+fn process_image(image: RgbImageView<'_>, plan: MuseImagePlan) -> Result<InputPart, Error> {
     let image = normalize(image, plan.transform)?;
     let (patches, grid) = pack_patches(std::slice::from_ref(&image), plan.patches, true)?;
-    Ok(PreparedInputPart::media_tensor(
+    media_input_part(
         Modality::Image,
         patches,
-        OwnedInputMetadata::patch_grid(grid),
-    ))
+        [(InputMetadataKey::PatchGrid, grid)],
+        [],
+    )
 }
 
 fn process_video_group(
     frames: &[NormalizedImage],
     plan: MusePatchPlan,
-) -> Result<PreparedInputPart, Error> {
+) -> Result<InputPart, Error> {
     let (patches, grid) = pack_patches(frames, plan, false)?;
-    Ok(PreparedInputPart::media_tensor(
+    media_input_part(
         Modality::Video,
         patches,
-        OwnedInputMetadata::patch_grid(grid),
-    ))
+        [(InputMetadataKey::PatchGrid, grid)],
+        [],
+    )
 }
 
 fn pack_patches(

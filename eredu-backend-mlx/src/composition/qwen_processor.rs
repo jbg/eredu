@@ -4,6 +4,7 @@ use eredu_architectures::processor_plan::{
     ProcessorPlanError, QwenImagePlan, QwenPatchPlan, QwenProcessorPlan, QwenVideoPlan,
     RgbResample, RgbTransformPlan,
 };
+use eredu_core::InputMetadataKey;
 use safemlx::Array;
 
 use crate::backend::runtime::media::video::validate_rgb_frames;
@@ -12,8 +13,8 @@ use crate::backend::runtime::media::{
         rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, NormalizedImage,
         RgbImage, RgbImageView,
     },
-    prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
-    PreparedInputPart, PreparedModelInput, ProcessorInput, ProcessorPreparationError, VideoFrames,
+    media_input_part, prepared_model_input, push_text_token_ids, MediaInput, MediaPayload,
+    InputPart, PreparedModelInput, ProcessorInput, ProcessorPreparationError, VideoFrames,
 };
 use crate::{backend::error::Error, backend::runtime::media::input::Modality};
 
@@ -36,7 +37,7 @@ impl QwenProcessor {
         for item in input {
             match *item {
                 ProcessorInput::TokenIds(token_ids) => {
-                    push_text_token_ids(&mut parts, token_ids);
+                    push_text_token_ids(&mut parts, token_ids)?;
                 }
                 ProcessorInput::Media(media) => {
                     self.push_media_parts(&mut parts, media, encode_text)?;
@@ -48,7 +49,7 @@ impl QwenProcessor {
 
     fn push_media_parts<E>(
         &self,
-        parts: &mut Vec<PreparedInputPart>,
+        parts: &mut Vec<InputPart>,
         item: MediaInput<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
@@ -58,9 +59,9 @@ impl QwenProcessor {
                     .plan
                     .image(image.height() as usize, image.width() as usize)
                     .map_err(processor_error)?;
-                push_text_token_ids(parts, &[plan.framing.start_token_id]);
+                push_text_token_ids(parts, &[plan.framing.start_token_id])?;
                 parts.push(self.process_image(image, &plan)?);
-                push_text_token_ids(parts, &[plan.framing.end_token_id]);
+                push_text_token_ids(parts, &[plan.framing.end_token_id])?;
             }
             (Modality::Video, MediaPayload::VideoFrames(video)) => {
                 parts.extend(self.process_video(video, encode_text)?);
@@ -80,7 +81,7 @@ impl QwenProcessor {
         &self,
         image: RgbImageView<'_>,
         plan: &QwenImagePlan,
-    ) -> Result<PreparedInputPart, Error> {
+    ) -> Result<InputPart, Error> {
         let resized = resize_rgb8(image, plan.transform)?;
         let normalized = rescale_and_normalize_rgb8(
             resized.as_view(),
@@ -89,18 +90,19 @@ impl QwenProcessor {
             plan.transform.std,
         )?;
         let (patches, grid_thw) = pack_image_patches(&normalized, plan.patches)?;
-        Ok(PreparedInputPart::media_tensor(
+        media_input_part(
             Modality::Image,
             patches,
-            OwnedInputMetadata::patch_grid(grid_thw),
-        ))
+            [(InputMetadataKey::PatchGrid, grid_thw)],
+            [],
+        )
     }
 
     fn process_video<E>(
         &self,
         video: VideoFrames<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
+    ) -> Result<Vec<InputPart>, ProcessorPreparationError<E>> {
         let (width, height) = validate_rgb_frames(video.frames)?;
         let plan = self
             .plan
@@ -120,13 +122,13 @@ impl QwenProcessor {
         video: VideoFrames<'_>,
         plan: &QwenVideoPlan,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
+    ) -> Result<Vec<InputPart>, ProcessorPreparationError<E>> {
         let mut parts = Vec::with_capacity(plan.groups.len() * 3);
         for group in &plan.groups {
             let mut prefix = encode_text(&group.timestamp_text)
                 .map_err(ProcessorPreparationError::Text)?;
             prefix.push(plan.framing.start_token_id);
-            push_text_token_ids(&mut parts, &prefix);
+            push_text_token_ids(&mut parts, &prefix)?;
             let mut frames = Vec::with_capacity(group.source_indices.len());
             for &index in &group.source_indices {
                 let resized = resize_rgb8(video.frames[index], plan.transform)?;
@@ -138,12 +140,13 @@ impl QwenProcessor {
                 )?);
             }
             let (patches, grid_thw) = pack_video_patches(&frames, plan.patches)?;
-            parts.push(PreparedInputPart::media_tensor(
+            parts.push(media_input_part(
                 Modality::Video,
                 patches,
-                OwnedInputMetadata::patch_grid(grid_thw),
-            ));
-            push_text_token_ids(&mut parts, &[plan.framing.end_token_id]);
+                [(InputMetadataKey::PatchGrid, grid_thw)],
+                [],
+            )?);
+            push_text_token_ids(&mut parts, &[plan.framing.end_token_id])?;
         }
         Ok(parts)
     }
@@ -291,7 +294,7 @@ fn pack_video_patches(
 #[cfg(test)]
 mod tests {
     use eredu_architectures::processor_plan::{QwenPatchPlan, QwenProcessorPlan};
-    use eredu_core::VideoSampling;
+    use eredu_core::{InputMetadataKey, VideoSampling};
 
     use super::{pack_image_patches, QwenProcessor};
     use crate::{
@@ -361,25 +364,24 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[0].modality, Modality::Text);
-        assert_eq!(parts[2].modality, Modality::Image);
-        assert_eq!(parts[4].modality, Modality::Text);
-        let InputPayload::TokenIds(start) = parts[1].payload else {
+        assert_eq!(parts[0].modality(), Modality::Text);
+        assert_eq!(parts[2].modality(), Modality::Image);
+        assert_eq!(parts[4].modality(), Modality::Text);
+        let InputPayload::TokenIds(start) = parts[1].payload() else {
             panic!("expected vision-start token");
         };
         assert_eq!(start.evaluated().unwrap().as_slice::<u32>(), &[44]);
-        let InputPayload::TokenIds(end) = parts[3].payload else {
+        let InputPayload::TokenIds(end) = parts[3].payload() else {
             panic!("expected vision-end token");
         };
         assert_eq!(end.evaluated().unwrap().as_slice::<u32>(), &[45]);
-        let InputPayload::Tensor(patches) = parts[2].payload else {
+        let InputPayload::Tensor(patches) = parts[2].payload() else {
             panic!("expected processed image tensor");
         };
         assert_eq!(patches.shape(), &[4, 24]);
         assert_eq!(
             parts[2]
-                .metadata
-                .patch_grid
+                .metadata_value(InputMetadataKey::PatchGrid)
                 .unwrap()
                 .evaluated()
                 .unwrap()
@@ -419,41 +421,40 @@ mod tests {
         let parts = prepared.input_parts();
         assert_eq!(timestamp_text, vec!["<0.2 seconds>", "<1.2 seconds>"]);
         assert_eq!(parts.len(), 8);
-        assert_eq!(parts[2].modality, Modality::Video);
-        assert_eq!(parts[5].modality, Modality::Video);
-        let InputPayload::TokenIds(replacement) = parts[1].payload else {
+        assert_eq!(parts[2].modality(), Modality::Video);
+        assert_eq!(parts[5].modality(), Modality::Video);
+        let InputPayload::TokenIds(replacement) = parts[1].payload() else {
             panic!("expected timestamp replacement tokens");
         };
         assert_eq!(
             replacement.evaluated().unwrap().as_slice::<u32>(),
             &[91, 44]
         );
-        let InputPayload::Tensor(first_patches) = parts[2].payload else {
+        let InputPayload::Tensor(first_patches) = parts[2].payload() else {
             panic!("expected first processed video tensor");
         };
         assert_eq!(first_patches.shape(), &[4, 24]);
         assert_eq!(
             parts[2]
-                .metadata
-                .patch_grid
+                .metadata_value(InputMetadataKey::PatchGrid)
                 .unwrap()
                 .evaluated()
                 .unwrap()
                 .as_slice::<i32>(),
             &[1, 2, 2]
         );
-        let InputPayload::TokenIds(first_end) = parts[3].payload else {
+        let InputPayload::TokenIds(first_end) = parts[3].payload() else {
             panic!("expected first vision-end token");
         };
         assert_eq!(first_end.evaluated().unwrap().as_slice::<u32>(), &[45]);
-        let InputPayload::TokenIds(second_prefix) = parts[4].payload else {
+        let InputPayload::TokenIds(second_prefix) = parts[4].payload() else {
             panic!("expected second timestamp prefix tokens");
         };
         assert_eq!(
             second_prefix.evaluated().unwrap().as_slice::<u32>(),
             &[92, 44]
         );
-        let InputPayload::Tensor(second_patches) = parts[5].payload else {
+        let InputPayload::Tensor(second_patches) = parts[5].payload() else {
             panic!("expected second processed video tensor");
         };
         assert_eq!(second_patches.shape(), &[4, 24]);

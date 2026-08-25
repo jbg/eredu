@@ -526,11 +526,11 @@ fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
     if input
         .parts
         .iter()
-        .all(|part| part.modality == Modality::Text)
+        .all(|part| part.modality() == Modality::Text)
     {
         let mut tokens = 0i32;
         for part in input.parts {
-            let InputPayload::TokenIds(ids) = part.payload else {
+            let InputPayload::TokenIds(ids) = part.payload() else {
                 return Err(Exception::custom(
                     "MTP text input must contain token-id payloads",
                 ));
@@ -560,6 +560,22 @@ mod tests {
     use super::*;
     use crate::backend::runtime::media::input::InputPart;
     use eredu_runtime::{DefaultSampler, GenerationSampler, MirostatV2Sampler};
+
+    trait TestInputPart {
+        fn text_token_ids(tokens: &Array) -> Self;
+    }
+
+    impl TestInputPart for InputPart {
+        fn text_token_ids(tokens: &Array) -> Self {
+            crate::backend::runtime::media::input::input_part(
+                crate::backend::runtime::media::input::Modality::Text,
+                crate::backend::runtime::media::input::InputPayload::TokenIds(tokens.clone()),
+                [],
+                [],
+            )
+            .unwrap()
+        }
+    }
 
     #[derive(Clone, Default)]
     struct CountingSampler {
