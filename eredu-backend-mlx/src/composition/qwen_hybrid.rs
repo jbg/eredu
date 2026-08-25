@@ -1331,27 +1331,6 @@ impl QwenHybridModel {
         })
     }
 
-    pub fn forward_tensor_parallel(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        _group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.forward(tokens, cache, stream)
-    }
-
-    pub fn prefill_tensor_parallel(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut MlxHybridState,
-        _group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let tokens = input::text_token_ids(input, stream)?;
-        self.forward(&tokens, cache, stream)
-    }
-
     fn forward_mtp(
         &mut self,
         input: EmbeddedInput<'_, crate::MlxTensor>,

@@ -1596,16 +1596,6 @@ fn prefill_model_tensor_parallel(
         (Model::Inkling(_, model), ModelCache::Inkling(cache)) => model
             .prefill_tensor_parallel(input, cache, group, stream)?
             .into_array(),
-        (Model::Qwen3Vl(_, model), ModelCache::Qwen3Vl(cache)) => {
-            model.prefill_tensor_parallel(input, cache, group, stream)?
-        }
-        (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
-            model.prefill_tensor_parallel(input, cache, group, stream)?
-        }
-        (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
-        | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
-            model.prefill_tensor_parallel(input, cache, group, stream)?
-        }
         (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => model
             .prefill_tensor_parallel(input, cache, group, stream)?
             .into_array(),
@@ -1667,16 +1657,6 @@ fn forward_model_tensor_parallel(
         (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => model
             .forward_tensor_parallel(&tensor_input, cache, group, stream)
             .map(MlxTensor::into_array),
-        (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
-        | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
-            model.forward_tensor_parallel(input, cache, group, stream)
-        }
-        (Model::Qwen3Vl(_, model), ModelCache::Qwen3Vl(cache)) => {
-            model.decode_tensor_parallel(input, cache, group, stream)
-        }
-        (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
-            model.decode_tensor_parallel(input, cache, group, stream)
-        }
         (model, _) => Err(Error::ArchitectureModel(format!(
             "tensor-parallel MLX cache does not match model type {}",
             model.effective_model_type()

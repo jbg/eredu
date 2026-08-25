@@ -788,35 +788,6 @@ impl QwenVlModel {
         self.prepared_forward(input, cache, stream)
     }
 
-    pub fn prefill_tensor_parallel(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut MlxHybridState,
-        _group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.prepared_forward(input, cache, stream)
-            .map_err(Error::Exception)
-    }
-
-    pub fn decode_tensor_parallel(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        _group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let parts = [vl::InputPart::Text(tokens)];
-        self.forward(
-            vl::ModelInput {
-                parts: &parts,
-                pixels: None,
-                mask: None,
-            },
-            cache,
-            stream,
-        )
-    }
 }
 
 impl CausalModel<MlxHybridState> for QwenVlModel {
