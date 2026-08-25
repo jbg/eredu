@@ -11,6 +11,7 @@ use eredu_architectures::gemma4::{
     LayeredModel as Architecture, ModelInput, Unit, VisionIngressBatchPlan, VisionIngressPartPlan,
     VisionInput,
 };
+use eredu_architectures::media_plan::Gemma4InputPartPlan;
 use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
@@ -1105,44 +1106,77 @@ impl PreparedParts {
             audio: None,
         };
         for part in typed.parts {
-            match (part.modality, part.payload) {
-                (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+            let neutral = input::prepared_input_part(*part)?;
+            let plan = eredu_architectures::media_plan::gemma4_input_part(args, &neutral)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            match plan {
+                Gemma4InputPartPlan::TextTokens { .. } => {
+                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                        unreachable!("architecture-admitted Gemma text payload")
+                    };
                     prepared
                         .tokens
                         .push(crate::MlxTensor::from_array(tokens.clone()));
                     prepared.modalities.push(input::Modality::Text);
                     prepared.projected.push(None);
                 }
-                (
-                    modality @ (input::Modality::Image | input::Modality::Video),
-                    input::InputPayload::Tensor(patches),
-                ) => prepared.push_vision(args, modality, patches, part.metadata)?,
-                (input::Modality::Audio, input::InputPayload::Tensor(features)) => {
-                    prepared.push_audio(args, features, part.metadata)?
-                }
-                (modality, input::InputPayload::Embeddings(embeddings)) => {
-                    input::ensure_hidden_size(
-                        embeddings,
-                        args.text.hidden_size,
-                        "Gemma 4 projected embeddings",
-                    )?;
-                    let token = modality_token(args, modality)?;
+                Gemma4InputPartPlan::Projected {
+                    placeholder_token_id,
+                    positions,
+                    ..
+                } => {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                        unreachable!("architecture-admitted Gemma projected payload")
+                    };
+                    let positions = usize::try_from(positions).map_err(|_| {
+                        Error::ArchitectureModel(
+                            "Gemma projected sequence exceeds host capacity".into(),
+                        )
+                    })?;
                     prepared
                         .tokens
                         .push(crate::MlxTensor::from_array(Array::from_slice(
-                            &vec![token; embeddings.dim(1) as usize],
+                            &vec![placeholder_token_id; positions],
                             &[1, embeddings.dim(1)],
                         )));
-                    prepared.modalities.push(modality);
+                    prepared.modalities.push(part.modality);
                     prepared
                         .projected
                         .push(Some(crate::MlxTensor::from_array(embeddings.clone())));
                 }
-                (modality, _) => {
-                    return Err(Error::ArchitectureModel(format!(
-                        "Gemma 4 does not accept this {} payload",
-                        modality.as_str()
-                    )))
+                Gemma4InputPartPlan::Vision {
+                    placeholder_token_id,
+                    ingress,
+                    ..
+                } => {
+                    let input::InputPayload::Tensor(patches) = part.payload else {
+                        unreachable!("architecture-admitted Gemma vision payload")
+                    };
+                    let positions = part
+                        .metadata
+                        .patch_positions
+                        .expect("architecture-admitted Gemma patch positions");
+                    prepared.push_vision(
+                        part.modality,
+                        patches,
+                        positions,
+                        ingress,
+                        placeholder_token_id,
+                    )?;
+                }
+                Gemma4InputPartPlan::Audio {
+                    placeholder_token_id,
+                    ingress,
+                    ..
+                } => {
+                    let input::InputPayload::Tensor(features) = part.payload else {
+                        unreachable!("architecture-admitted Gemma audio payload")
+                    };
+                    let mask = part
+                        .metadata
+                        .audio_mask
+                        .expect("architecture-admitted Gemma audio mask");
+                    prepared.push_audio(features, mask, ingress, placeholder_token_id)?;
                 }
             }
         }
@@ -1153,39 +1187,15 @@ impl PreparedParts {
 
     fn push_vision(
         &mut self,
-        args: &FamilyConfig,
         modality: input::Modality,
         patches: &Array,
-        metadata: input::InputMetadata<'_>,
+        positions: &Array,
+        plan: VisionIngressPartPlan,
+        placeholder_token_id: u32,
     ) -> Result<(), Error> {
-        let positions = metadata.patch_positions.ok_or_else(|| {
-            Error::ArchitectureModel(format!(
-                "Gemma 4 {} input requires patch positions",
-                modality.as_str()
-            ))
-        })?;
-        metadata.patch_grid.ok_or_else(|| {
-            Error::ArchitectureModel(format!(
-                "Gemma 4 {} input requires a prepared patch grid",
-                modality.as_str()
-            ))
-        })?;
-        let [time, height, width] = metadata.patch_extent.ok_or_else(|| {
-            Error::ArchitectureModel(format!(
-                "Gemma 4 {} input requires a host-known patch extent",
-                modality.as_str()
-            ))
-        })?;
-        let vision = args
-            .vision
-            .as_ref()
-            .ok_or_else(|| Error::ArchitectureModel("Gemma 4 has no vision tower".into()))?;
-        let plan = VisionIngressPartPlan::new(vision, [time, height, width], patches.dim(1))
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let token = modality_token(args, modality)?;
         self.tokens
             .push(crate::MlxTensor::from_array(Array::from_slice(
-                &vec![token; plan.decoder_positions as usize],
+                &vec![placeholder_token_id; plan.decoder_positions as usize],
                 &[1, plan.decoder_positions],
             )));
         self.modalities.push(modality);
@@ -1245,24 +1255,14 @@ impl PreparedParts {
 
     fn push_audio(
         &mut self,
-        args: &FamilyConfig,
         features: &Array,
-        metadata: input::InputMetadata<'_>,
+        mask: &Array,
+        plan: AudioIngressPartPlan,
+        placeholder_token_id: u32,
     ) -> Result<(), Error> {
-        let mask = metadata.audio_mask.ok_or_else(|| {
-            Error::ArchitectureModel("Gemma 4 audio input requires an audio mask".into())
-        })?;
-        let valid_frames = metadata.audio_valid_frames.ok_or_else(|| {
-            Error::ArchitectureModel(
-                "Gemma 4 audio input requires a host-known valid-frame extent".into(),
-            )
-        })?;
-        let plan = AudioIngressPartPlan::new(valid_frames, features.dim(1))
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let token = modality_token(args, input::Modality::Audio)?;
         self.tokens
             .push(crate::MlxTensor::from_array(Array::from_slice(
-                &vec![token; plan.decoder_positions as usize],
+                &vec![placeholder_token_id; plan.decoder_positions as usize],
                 &[1, plan.decoder_positions],
             )));
         self.modalities.push(input::Modality::Audio);
@@ -1388,22 +1388,6 @@ fn pad_sequence(value: &Array, sequence: i32, fill: i32, stream: &Stream) -> Res
         None,
         stream,
     )?)
-}
-
-fn modality_token(args: &FamilyConfig, modality: input::Modality) -> Result<u32, Error> {
-    match modality {
-        input::Modality::Text => Some(args.text.pad_token_id),
-        input::Modality::Image => args.image_token_id,
-        input::Modality::Video => args.video_token_id,
-        input::Modality::Audio => args.audio_token_id,
-    }
-    .and_then(|token| u32::try_from(token).ok())
-    .ok_or_else(|| {
-        Error::ArchitectureModel(format!(
-            "Gemma 4 has no valid {} placeholder",
-            modality.as_str()
-        ))
-    })
 }
 
 impl CausalModel<MlxHybridState> for Gemma4Model {

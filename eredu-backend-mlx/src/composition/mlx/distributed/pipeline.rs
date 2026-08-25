@@ -2888,6 +2888,17 @@ trait PipelinePartitionMetadata {
         })
     }
 
+    fn gemma4_input_part_plan(
+        &self,
+        _input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
+    {
+        Err(eredu_core::CapabilityError::UnsupportedInput {
+            architecture: self.model_kind().canonical_name().into(),
+            reason: "Gemma 4 input admission requested for another architecture".into(),
+        })
+    }
+
     fn qwen_hybrid_input_part_plan(
         &self,
         _input: &eredu_architectures::media_plan::PreparedInputPart,
@@ -6680,6 +6691,14 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
         eredu_architectures::media_plan::gemma4(self.args(), input)
     }
 
+    fn gemma4_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::gemma4_input_part(self.args(), input)
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
             .auxiliary_boundary()
@@ -9982,6 +10001,14 @@ impl PipelineModel {
     ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
     {
         self.stage.qwen_vl_input_part_plan(input)
+    }
+
+    pub(in crate::composition::mlx) fn gemma4_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
+    {
+        self.stage.gemma4_input_part_plan(input)
     }
 
     pub(in crate::composition::mlx) fn qwen_hybrid_input_part_plan(

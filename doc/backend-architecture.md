@@ -357,6 +357,10 @@ recurrent-state geometry, and backend-neutral scalar state layouts. Concrete
 backends select the loaded architecture estimate, apply their physical state
 scalar width, and add live allocator, residency, and system-memory
 observations; they do not reconstruct family state geometry.
+The same exact estimate declares whether speculative draft weights use a
+separate checkpoint, use configured embedded prediction layers, or are absent.
+A backend maps that declaration to executable or unsupported status according
+to its implementation; it does not maintain a family-name MTP table.
 
 For SafeTensors materialization, architecture preparation also identifies the
 checkpoint parameter that establishes runtime-state dtype and resolves its
@@ -654,8 +658,12 @@ inputs. They derive family-specific placeholder spans, pooling geometry,
 padding logits, and subsampling masks from portable extents. Concrete backends
 materialize those declared values and may perform generic padding or dtype
 conversion, but must not independently reconstruct family mask or geometry
-policy. Gemma 4 exposes this contract through its vision and audio ingress
-part/batch plans. Qwen vision ingress validates the prepared payload against
+policy. Gemma 4 exposes one input-part admission plan shared by resident
+prefill, pipeline prefill, and capability accounting. That plan admits the
+exact modality/payload pair, validates decoder-width projected embeddings,
+selects the placeholder token, and returns its vision or audio ingress geometry
+plus workspace shape; its part/batch plans continue to own padding and mask
+values. Qwen vision ingress validates the prepared payload against
 its patch grid with checked geometry, selects the image or video placeholder
 token, and returns the exact placeholder span and validated grid; an accelerator
 adapter only reads the small metadata tensor and materializes the returned token

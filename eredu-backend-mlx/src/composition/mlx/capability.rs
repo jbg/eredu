@@ -3,8 +3,9 @@
 use std::num::NonZeroU8;
 
 use eredu_architectures::media_plan::{
-    self, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality, PreparedInputPart,
-    PreparedInputPayload, PreparedMediaInput, QwenHybridInputPartPlan, QwenVlInputPartPlan,
+    self, Gemma4InputPartPlan, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality,
+    PreparedInputPart, PreparedInputPayload, PreparedMediaInput, QwenHybridInputPartPlan,
+    QwenVlInputPartPlan,
 };
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
@@ -186,6 +187,8 @@ fn prepared_media_input(
         patch_grid: i32_metadata(metadata.patch_grid)?,
         patch_positions: i32_metadata(metadata.patch_positions)?,
         audio_mask: bool_metadata(metadata.audio_mask)?,
+        patch_extent: metadata.patch_extent,
+        audio_valid_frames: metadata.audio_valid_frames,
     })
 }
 
@@ -259,6 +262,19 @@ impl Model {
             _ => Err(CapabilityError::UnsupportedInput {
                 architecture: self.effective_model_type().into(),
                 reason: "Qwen3-VL input admission requested for another architecture".into(),
+            }),
+        }
+    }
+
+    pub(super) fn gemma4_input_part_plan(
+        &self,
+        input: &PreparedInputPart,
+    ) -> Result<Gemma4InputPartPlan, CapabilityError> {
+        match self {
+            Self::Gemma4(_, model) => media_plan::gemma4_input_part(model.args(), input),
+            _ => Err(CapabilityError::UnsupportedInput {
+                architecture: self.effective_model_type().into(),
+                reason: "Gemma 4 input admission requested for another architecture".into(),
             }),
         }
     }
@@ -345,6 +361,46 @@ pub fn count_prepared_input(
     let mut media_execution_workspace_kind = ObservationKind::Exact;
     let model_family = session.model_family();
     for &part in prepared.parts {
+        if model_family == eredu_architectures::ModelKind::Gemma4 {
+            match session.gemma4_input_part_plan(&prepared_input_part(part)?)? {
+                Gemma4InputPartPlan::TextTokens { positions } => {
+                    text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
+                }
+                Gemma4InputPartPlan::Projected {
+                    modality,
+                    positions,
+                    ..
+                } => {
+                    if modality == PreparedInputModality::Text {
+                        text_tokens =
+                            checked_add(text_tokens, positions, "prepared text-token total")?;
+                    } else {
+                        media_positions = checked_add(
+                            media_positions,
+                            positions,
+                            "prepared media-position total",
+                        )?;
+                    }
+                }
+                Gemma4InputPartPlan::Vision { shape, .. }
+                | Gemma4InputPartPlan::Audio { shape, .. } => {
+                    let InputPayload::Tensor(tensor) = part.payload else {
+                        unreachable!()
+                    };
+                    let (positions, workspace_bytes) =
+                        prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
+                    media_positions =
+                        checked_add(media_positions, positions, "prepared media-position total")?;
+                    media_execution_workspace_bytes = checked_add(
+                        media_execution_workspace_bytes,
+                        workspace_bytes,
+                        "prepared media-workspace total",
+                    )?;
+                    media_execution_workspace_kind = ObservationKind::Conservative;
+                }
+            }
+            continue;
+        }
         if matches!(
             model_family,
             eredu_architectures::ModelKind::Qwen3Vl | eredu_architectures::ModelKind::Qwen3VlMoe

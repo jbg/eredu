@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use crate::rotary::RopeValue;
 use eredu_core::{
     CacheStateStrategy, CapabilityError, EstimationCompleteness, GrowingState, InputModalities,
-    ModelCapabilities, ObservationKind, Observed, SlidingWindowLayerCount, StateLayout,
+    ModelCapabilities, MtpCheckpointKind, ObservationKind, Observed, SlidingWindowLayerCount,
+    StateLayout,
 };
 
 use crate::{
@@ -1002,6 +1003,7 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
 pub struct CapabilityEstimate {
     capabilities: ModelCapabilities,
     state_layout: StateLayout,
+    mtp_checkpoint: Option<MtpCheckpointKind>,
 }
 
 impl CapabilityEstimate {
@@ -1013,6 +1015,15 @@ impl CapabilityEstimate {
     /// Returns backend-neutral scalar state geometry.
     pub const fn state_layout(&self) -> &StateLayout {
         &self.state_layout
+    }
+
+    /// Architecture-declared checkpoint form for executable draft weights.
+    ///
+    /// `None` means that this exact normalized configuration exposes no MTP
+    /// graph. Concrete backends decide whether they implement the declared
+    /// graph; they do not infer family policy themselves.
+    pub const fn mtp_checkpoint_kind(&self) -> Option<MtpCheckpointKind> {
+        self.mtp_checkpoint
     }
 
     /// Splits the estimate into its portable capability and state values.
@@ -1039,7 +1050,20 @@ fn finish(model_type: String, spec: Spec) -> CapabilityEstimate {
             estimation,
         },
         state_layout,
+        mtp_checkpoint: None,
     }
+}
+
+fn with_mtp_checkpoint(
+    mut estimate: CapabilityEstimate,
+    checkpoint: Option<MtpCheckpointKind>,
+) -> CapabilityEstimate {
+    estimate.mtp_checkpoint = checkpoint;
+    estimate
+}
+
+fn embedded_mtp_checkpoint(layers: i32) -> Option<MtpCheckpointKind> {
+    (layers > 0).then_some(MtpCheckpointKind::Embedded)
 }
 
 /// Derives Llama/Mistral capabilities from normalized architecture policy.
@@ -1064,22 +1088,25 @@ pub fn qwen_vl(args: &crate::qwen::vl::ModelArgs) -> Result<CapabilityEstimate, 
 pub fn muse_glimmer(
     args: &crate::muse_glimmer::DecoderConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), muse_glimmer_spec(args)?))
+    Ok(with_mtp_checkpoint(
+        finish(args.model_type.clone(), muse_glimmer_spec(args)?),
+        Some(MtpCheckpointKind::Separate),
+    ))
 }
 
 /// Derives DeepSeek-V3 capabilities from normalized architecture policy.
 pub fn deepseek_v3(args: &crate::deepseek::V3Args) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        args.model_type.clone(),
-        neutral_deepseek_v3_spec(args)?,
+    Ok(with_mtp_checkpoint(
+        finish(args.model_type.clone(), neutral_deepseek_v3_spec(args)?),
+        embedded_mtp_checkpoint(args.num_nextn_predict_layers),
     ))
 }
 
 /// Derives DeepSeek-V4 capabilities from normalized architecture policy.
 pub fn deepseek_v4(args: &crate::deepseek::V4Args) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        args.model_type.clone(),
-        neutral_deepseek_v4_spec(args)?,
+    Ok(with_mtp_checkpoint(
+        finish(args.model_type.clone(), neutral_deepseek_v4_spec(args)?),
+        embedded_mtp_checkpoint(args.num_nextn_predict_layers),
     ))
 }
 
@@ -1097,15 +1124,25 @@ pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, C
 
 /// Derives Gemma 4 capabilities from its complete normalized family policy.
 pub fn gemma4(args: &crate::gemma4::FamilyConfig) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        args.model_type.clone(),
-        gemma4_spec(&args.text, args.input_modalities())?,
+    Ok(with_mtp_checkpoint(
+        finish(
+            args.model_type.clone(),
+            gemma4_spec(&args.text, args.input_modalities())?,
+        ),
+        Some(MtpCheckpointKind::Separate),
     ))
 }
 
 /// Derives Inkling capabilities from normalized architecture policy.
 pub fn inkling(args: &crate::inkling::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), inkling_spec(args)?))
+    let layers = args
+        .mtp_config
+        .as_ref()
+        .map_or(0, |mtp| mtp.num_nextn_predict_layers);
+    Ok(with_mtp_checkpoint(
+        finish(args.model_type.clone(), inkling_spec(args)?),
+        embedded_mtp_checkpoint(layers),
+    ))
 }
 
 /// Derives LFM2 capabilities from normalized architecture policy.
@@ -1117,16 +1154,22 @@ pub fn lfm2(args: &crate::lfm2::ModelArgs) -> Result<CapabilityEstimate, Capabil
 pub fn nemotron_h(
     args: &crate::nemotron_h::ModelArgs,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), nemotron_spec(args)?))
+    Ok(with_mtp_checkpoint(
+        finish(args.model_type.clone(), nemotron_spec(args)?),
+        embedded_mtp_checkpoint(args.num_nextn_predict_layers),
+    ))
 }
 
 /// Derives Qwen hybrid text/vision capabilities from complete normalized policy.
 pub fn qwen_hybrid(
     args: &crate::qwen::hybrid::ParsedHybridConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        args.text.model_type.clone(),
-        qwen_hybrid_spec(&args.text, args.vision.is_some())?,
+    Ok(with_mtp_checkpoint(
+        finish(
+            args.text.model_type.clone(),
+            qwen_hybrid_spec(&args.text, args.vision.is_some())?,
+        ),
+        embedded_mtp_checkpoint(args.text.mtp_num_hidden_layers),
     ))
 }
 
@@ -1134,9 +1177,9 @@ pub fn qwen_hybrid(
 pub fn qwen_hybrid_text(
     args: &crate::qwen::hybrid::HybridConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        args.model_type.clone(),
-        qwen_hybrid_spec(args, false)?,
+    Ok(with_mtp_checkpoint(
+        finish(args.model_type.clone(), qwen_hybrid_spec(args, false)?),
+        embedded_mtp_checkpoint(args.mtp_num_hidden_layers),
     ))
 }
 

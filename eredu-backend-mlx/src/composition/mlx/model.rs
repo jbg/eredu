@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
-use eredu_core::{MtpCapability, MtpCheckpointKind};
+use eredu_core::MtpCapability;
 use safemlx::{error::Exception, Array, Stream};
 
 use crate::backend::error::Error;
@@ -78,27 +78,12 @@ impl Model {
 
     /// Reports how this model architecture exposes MTP weights.
     pub fn mtp_capability(&self) -> MtpCapability {
-        match self {
-            Self::Gemma4(_, _) | Self::MuseGlimmer(_, _) => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Separate,
-            },
-            Self::DeepSeek(_, model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::Qwen3Next(_, model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::Qwen35(_, model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::NemotronH(_, model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::Inkling(_, model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            _ => MtpCapability::Unavailable,
-        }
+        self.architecture_capability_estimate()
+            .ok()
+            .and_then(|estimate| estimate.mtp_checkpoint_kind())
+            .map_or(MtpCapability::Unavailable, |checkpoint| {
+                MtpCapability::Ready { checkpoint }
+            })
     }
 
     /// Returns residency telemetry when this model uses bounded layer execution.

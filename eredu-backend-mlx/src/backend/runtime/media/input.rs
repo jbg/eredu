@@ -322,6 +322,8 @@ pub fn prepared_media_input(
         patch_grid: i32_metadata(metadata.patch_grid)?,
         patch_positions: i32_metadata(metadata.patch_positions)?,
         audio_mask: bool_metadata(metadata.audio_mask)?,
+        patch_extent: metadata.patch_extent,
+        audio_valid_frames: metadata.audio_valid_frames,
     })
 }
 

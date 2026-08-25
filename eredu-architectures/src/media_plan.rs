@@ -55,6 +55,10 @@ pub struct PreparedMediaInput {
     pub patch_positions: Option<MediaMetadata<i32>>,
     /// Optional valid-frame mask.
     pub audio_mask: Option<MediaMetadata<bool>>,
+    /// Host-known `(time, height, width)` extent for one vision part.
+    pub patch_extent: Option<[i32; 3]>,
+    /// Host-known valid prefix of an audio feature sequence.
+    pub audio_valid_frames: Option<i32>,
 }
 
 /// Modality of one prepared model-input part.
@@ -177,6 +181,43 @@ pub enum QwenHybridInputPartPlan {
     Media {
         /// Validated placeholder and patch-grid ingress.
         ingress: QwenVisionIngressPlan,
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+}
+
+/// Gemma 4 admission and execution plan for one prepared input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gemma4InputPartPlan {
+    /// Ordinary text token IDs.
+    TextTokens {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Decoder-width embeddings supplied directly by the caller.
+    Projected {
+        /// Semantic modality retained by the decoder input.
+        modality: PreparedInputModality,
+        /// Architecture-selected placeholder token repeated under the embeddings.
+        placeholder_token_id: u32,
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Model-native image or video input.
+    Vision {
+        /// Architecture-selected placeholder token.
+        placeholder_token_id: u32,
+        /// Validated execution ingress geometry.
+        ingress: crate::gemma4::VisionIngressPartPlan,
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+    /// Model-native audio input.
+    Audio {
+        /// Architecture-selected placeholder token.
+        placeholder_token_id: u32,
+        /// Validated execution ingress geometry.
+        ingress: crate::gemma4::AudioIngressPartPlan,
         /// Decoder and workspace accounting for tower execution.
         shape: MediaShapePlan,
     },
@@ -797,6 +838,212 @@ pub fn qwen_hybrid_text_input_part(
     }
 }
 
+fn gemma_batch_one_sequence(
+    shape: &[u64],
+    rank: usize,
+    name: &str,
+    architecture: &str,
+) -> Result<u64, CapabilityError> {
+    if shape.len() != rank || shape.first() != Some(&1) || shape.get(1).copied().unwrap_or(0) == 0 {
+        return Err(unsupported(
+            architecture,
+            format!("prepared Gemma {name} must be batch-one with rank {rank}, got {shape:?}"),
+        ));
+    }
+    Ok(shape[1])
+}
+
+fn gemma_placeholder_token(
+    args: &crate::gemma4::FamilyConfig,
+    modality: PreparedInputModality,
+) -> Result<u32, CapabilityError> {
+    let token = match modality {
+        PreparedInputModality::Text => Some(args.text.pad_token_id),
+        PreparedInputModality::Image => args.image_token_id,
+        PreparedInputModality::Video => args.video_token_id,
+        PreparedInputModality::Audio => args.audio_token_id,
+    };
+    token
+        .and_then(|token| u32::try_from(token).ok())
+        .ok_or_else(|| {
+            unsupported(
+                &args.model_type,
+                format!("Gemma 4 has no valid {} placeholder", modality.as_str()),
+            )
+        })
+}
+
+/// Validates one prepared Gemma 4 part and derives the exact placeholder,
+/// ingress geometry, and capability-accounting plan consumed by a backend.
+pub fn gemma4_input_part(
+    args: &crate::gemma4::FamilyConfig,
+    input: &PreparedInputPart,
+) -> Result<Gemma4InputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(Gemma4InputPartPlan::TextTokens {
+                positions: gemma_batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
+            })
+        }
+        (modality, PreparedInputPayload::Embeddings(shape)) => {
+            let positions = gemma_batch_one_sequence(
+                shape,
+                3,
+                &format!("{} embeddings", modality.as_str()),
+                &args.model_type,
+            )?;
+            let hidden = positive(args.text.hidden_size, "Gemma text hidden size")?;
+            if shape[2] != hidden {
+                return Err(unsupported(
+                    &args.model_type,
+                    format!(
+                        "prepared Gemma {} embeddings must have hidden width {hidden}, got {shape:?}",
+                        modality.as_str()
+                    ),
+                ));
+            }
+            Ok(Gemma4InputPartPlan::Projected {
+                modality: *modality,
+                placeholder_token_id: gemma_placeholder_token(args, *modality)?,
+                positions,
+            })
+        }
+        (
+            modality @ (PreparedInputModality::Image | PreparedInputModality::Video),
+            PreparedInputPayload::Tensor {
+                shape,
+                media: Some(media),
+            },
+        ) => {
+            let expected = if *modality == PreparedInputModality::Image {
+                MediaModality::Image
+            } else {
+                MediaModality::Video
+            };
+            if media.modality != expected || media.payload_shape != *shape {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared Gemma input modality or shape disagrees with its media metadata",
+                ));
+            }
+            if media.patch_grid.is_none() {
+                return Err(unsupported(
+                    &args.model_type,
+                    format!(
+                        "prepared Gemma {} input has no patch grid",
+                        modality.as_str()
+                    ),
+                ));
+            }
+            let extent = media.patch_extent.ok_or_else(|| {
+                unsupported(
+                    &args.model_type,
+                    format!(
+                        "prepared Gemma {} input has no host-known patch extent",
+                        modality.as_str()
+                    ),
+                )
+            })?;
+            let grid = media.patch_grid.as_ref().expect("checked above");
+            if grid.shape != [1, 3] || grid.values.as_slice() != extent || grid.values.len() != 3 {
+                return Err(unsupported(
+                    &args.model_type,
+                    format!(
+                        "prepared Gemma {} patch grid must be one row matching extent {extent:?}",
+                        modality.as_str()
+                    ),
+                ));
+            }
+            let vision = args.vision.as_ref().ok_or_else(|| {
+                unsupported(&args.model_type, "loaded Gemma model has no vision tower")
+            })?;
+            let padded_patches =
+                i32::try_from(shape[1]).map_err(|_| CapabilityError::ArithmeticOverflow {
+                    operation: "Gemma padded vision patch count",
+                })?;
+            let ingress = crate::gemma4::VisionIngressPartPlan::new(vision, extent, padded_patches)
+                .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
+            let media_shape = gemma4(args, media)?;
+            let valid_patches = gemma_valid_patch_count(
+                media
+                    .patch_positions
+                    .as_ref()
+                    .expect("Gemma media shape validation requires patch positions"),
+                &args.model_type,
+            )?;
+            if valid_patches != ingress.valid_patches as u64
+                || media_shape.decoder_positions != ingress.decoder_positions as u64
+            {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared Gemma patch extent and position metadata disagree",
+                ));
+            }
+            Ok(Gemma4InputPartPlan::Vision {
+                placeholder_token_id: gemma_placeholder_token(args, *modality)?,
+                ingress,
+                shape: media_shape,
+            })
+        }
+        (
+            PreparedInputModality::Audio,
+            PreparedInputPayload::Tensor {
+                shape,
+                media: Some(media),
+            },
+        ) => {
+            if media.modality != MediaModality::Audio || media.payload_shape != *shape {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared Gemma audio shape disagrees with its media metadata",
+                ));
+            }
+            let valid_frames = media.audio_valid_frames.ok_or_else(|| {
+                unsupported(
+                    &args.model_type,
+                    "prepared Gemma audio has no host-known valid-frame extent",
+                )
+            })?;
+            let padded_frames =
+                i32::try_from(shape[1]).map_err(|_| CapabilityError::ArithmeticOverflow {
+                    operation: "Gemma padded audio frame count",
+                })?;
+            let ingress = crate::gemma4::AudioIngressPartPlan::new(valid_frames, padded_frames)
+                .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
+            let media_shape = gemma4(args, media)?;
+            let valid_mask_frames = media
+                .audio_mask
+                .as_ref()
+                .expect("Gemma media shape validation requires an audio mask")
+                .values
+                .iter()
+                .filter(|value| **value)
+                .count();
+            if valid_mask_frames != usize::try_from(valid_frames).unwrap_or_default()
+                || media_shape.decoder_positions != ingress.decoder_positions as u64
+            {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared Gemma audio valid-frame extent and mask disagree",
+                ));
+            }
+            Ok(Gemma4InputPartPlan::Audio {
+                placeholder_token_id: gemma_placeholder_token(args, PreparedInputModality::Audio)?,
+                ingress,
+                shape: media_shape,
+            })
+        }
+        (modality, payload) => Err(unsupported(
+            &args.model_type,
+            format!(
+                "Gemma 4 does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
+}
+
 fn gemma_valid_patch_count(
     positions: &MediaMetadata<i32>,
     architecture: &str,
@@ -1401,6 +1648,8 @@ mod tests {
             patch_grid: None,
             patch_positions: None,
             audio_mask: None,
+            patch_extent: None,
+            audio_valid_frames: None,
         }
     }
 
@@ -1439,6 +1688,39 @@ mod tests {
                 "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":16
             }
         }))
+        .unwrap()
+    }
+
+    fn gemma_family() -> crate::gemma4::FamilyConfig {
+        crate::gemma4::FamilyConfig::from_hf_json(
+            &serde_json::to_vec(&json!({
+                "model_type":"gemma4_unified",
+                "tie_word_embeddings":false,
+                "image_token_id":60,
+                "audio_token_id":61,
+                "text_config":{
+                    "model_type":"gemma4_text","hidden_size":16,"num_hidden_layers":2,
+                    "intermediate_size":32,"num_attention_heads":2,"num_key_value_heads":1,
+                    "head_dim":8,"rms_norm_eps":0.000001,"vocab_size":64,
+                    "max_position_embeddings":128,"layer_types":["full_attention","full_attention"]
+                },
+                "vision_config":{
+                    "hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,
+                    "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,
+                    "patch_size":4,"pooling_kernel_size":2,"position_embedding_size":16,
+                    "rms_norm_eps":0.000001
+                },
+                "audio_config":{
+                    "hidden_size":16,"num_hidden_layers":1,"num_attention_heads":2,
+                    "output_proj_dims":8,"conv_kernel_size":3,"attention_chunk_size":4,
+                    "attention_context_left":5,"attention_context_right":0,
+                    "attention_invalid_logits_value":-1000000000.0,"attention_logit_cap":50.0,
+                    "residual_weight":0.5,"rms_norm_eps":0.000001,
+                    "subsampling_conv_channels":[4,8]
+                }
+            }))
+            .unwrap(),
+        )
         .unwrap()
     }
 
@@ -1520,6 +1802,135 @@ mod tests {
             values: vec![0, 0, 1, 0, 0, 1, 1, 1, -1, -1],
         };
         assert_eq!(gemma_valid_patch_count(&positions, "gemma4").unwrap(), 4);
+    }
+
+    #[test]
+    fn gemma_input_plan_owns_payload_placeholder_and_ingress_policy() {
+        let args = gemma_family();
+        assert_eq!(
+            crate::capability::gemma4(&args)
+                .unwrap()
+                .mtp_checkpoint_kind(),
+            Some(eredu_core::MtpCheckpointKind::Separate)
+        );
+
+        let projected = PreparedInputPart {
+            modality: PreparedInputModality::Image,
+            payload: PreparedInputPayload::Embeddings(vec![1, 3, 16]),
+        };
+        assert_eq!(
+            gemma4_input_part(&args, &projected).unwrap(),
+            Gemma4InputPartPlan::Projected {
+                modality: PreparedInputModality::Image,
+                placeholder_token_id: 60,
+                positions: 3,
+            }
+        );
+
+        let mut vision = input(MediaModality::Image, &[1, 4, 48]);
+        vision.patch_grid = Some(MediaMetadata {
+            shape: vec![1, 3],
+            values: vec![1, 2, 2],
+        });
+        vision.patch_positions = Some(MediaMetadata {
+            shape: vec![1, 4, 2],
+            values: vec![0, 0, 1, 0, 0, 1, 1, 1],
+        });
+        vision.patch_extent = Some([1, 2, 2]);
+        let vision = PreparedInputPart {
+            modality: PreparedInputModality::Image,
+            payload: PreparedInputPayload::Tensor {
+                shape: vision.payload_shape.clone(),
+                media: Some(vision),
+            },
+        };
+        assert!(matches!(
+            gemma4_input_part(&args, &vision).unwrap(),
+            Gemma4InputPartPlan::Vision {
+                placeholder_token_id: 60,
+                ingress: crate::gemma4::VisionIngressPartPlan {
+                    decoder_positions: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+        let mut inconsistent_vision = vision.clone();
+        let PreparedInputPayload::Tensor {
+            media: Some(media), ..
+        } = &mut inconsistent_vision.payload
+        else {
+            unreachable!()
+        };
+        media.patch_extent = Some([1, 4, 1]);
+        assert!(matches!(
+            gemma4_input_part(&args, &inconsistent_vision),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+
+        let mut audio = input(MediaModality::Audio, &[1, 8, 128]);
+        audio.audio_mask = Some(MediaMetadata {
+            shape: vec![1, 8],
+            values: vec![true, true, true, true, true, true, false, false],
+        });
+        audio.audio_valid_frames = Some(6);
+        let audio = PreparedInputPart {
+            modality: PreparedInputModality::Audio,
+            payload: PreparedInputPayload::Tensor {
+                shape: audio.payload_shape.clone(),
+                media: Some(audio),
+            },
+        };
+        assert!(matches!(
+            gemma4_input_part(&args, &audio).unwrap(),
+            Gemma4InputPartPlan::Audio {
+                placeholder_token_id: 61,
+                ingress: crate::gemma4::AudioIngressPartPlan {
+                    decoder_positions: 2,
+                    ..
+                },
+                ..
+            }
+        ));
+        let mut inconsistent_audio = audio.clone();
+        let PreparedInputPayload::Tensor {
+            media: Some(media), ..
+        } = &mut inconsistent_audio.payload
+        else {
+            unreachable!()
+        };
+        media.audio_valid_frames = Some(5);
+        assert!(matches!(
+            gemma4_input_part(&args, &inconsistent_audio),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+
+        let video = PreparedInputPart {
+            modality: PreparedInputModality::Video,
+            payload: PreparedInputPayload::Embeddings(vec![1, 1, 16]),
+        };
+        assert!(matches!(
+            gemma4_input_part(&args, &video),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+    }
+
+    #[test]
+    fn capability_estimate_derives_embedded_mtp_from_exact_configuration() {
+        let mut args = qwen_hybrid_args();
+        assert_eq!(
+            crate::capability::qwen_hybrid(&args)
+                .unwrap()
+                .mtp_checkpoint_kind(),
+            None
+        );
+        args.text.mtp_num_hidden_layers = 2;
+        assert_eq!(
+            crate::capability::qwen_hybrid(&args)
+                .unwrap()
+                .mtp_checkpoint_kind(),
+            Some(eredu_core::MtpCheckpointKind::Embedded)
+        );
     }
 
     #[test]
