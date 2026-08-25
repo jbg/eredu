@@ -14410,32 +14410,11 @@ fn load_qwen_pipeline(
         .architecture
         .take()
         .expect("Qwen partition constructor owns a neutral architecture");
-    let mut parameter_groups =
-        eredu_architectures::qwen::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &seed_architecture.static_modules().embeddings,
-            &seed_architecture.static_modules().norm,
-            seed_architecture.static_modules().lm_head.as_ref(),
-            &target_args.parameter_root,
-        )?;
-    for layer in 0..target_args.num_hidden_layers as usize {
-        let block =
-            eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&target_args, layer, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
-                &block,
-                &target_args,
-                layer,
-            )?,
-        );
-    }
+    let binding_parameter_description =
+        eredu_architectures::qwen::parameter_description(&seed_architecture, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         stage.architecture = Some(
@@ -17140,28 +17119,10 @@ fn load_gpt_oss_pipeline(
         .architecture
         .take()
         .expect("GPT-OSS neutral architecture");
-    let mut parameter_groups = gpt_oss::static_parameter_groups::<MlxNeuralBackend>(
-        seed_architecture.static_modules(),
-        &target_args,
-    )?;
-    for layer in 0..target_args.num_hidden_layers as usize {
-        let block = gpt_oss::new_block::<MlxNeuralBackend>(&target_args, layer, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            gpt_oss::layer_parallel_parameter_groups::<MlxNeuralBackend>(
-                &block,
-                &target_args,
-                layer,
-            )?,
-        );
-    }
+    let binding_parameter_description = gpt_oss::parameter_description(&seed_architecture, stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = gpt_oss::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         stage.architecture = Some(
@@ -21661,7 +21622,7 @@ fn load_neutral_gemma4_pipeline(
     PipelineModel::from_adapter(topology, info, stage)
 }
 
-fn deepseek_parallel_layout(
+fn architecture_parallel_layout(
     description: &eredu_runtime::ArchitectureParameterDescription,
     topology: MlxParallelContext,
 ) -> Result<eredu_runtime::LocalModelLayout, Error> {
@@ -21772,7 +21733,7 @@ fn load_neutral_deepseek_v3_pipeline(
         && !prediction_units.is_empty();
     let tensor_parallel = topology.tensor_parallel_size > 1;
     let parallel_layout = tensor_parallel
-        .then(|| deepseek_parallel_layout(&parameter_description, topology))
+        .then(|| architecture_parallel_layout(&parameter_description, topology))
         .transpose()?;
     let seed_static_module = MlxModule::new(seed_architecture.static_modules().clone());
     let all_static_bindings = build_module_bindings(&seed_static_module, "", store.as_ref())?;
@@ -22180,7 +22141,7 @@ fn load_neutral_deepseek_v4_pipeline(
         && !prediction_units.is_empty();
     let tensor_parallel = topology.tensor_parallel_size > 1;
     let parallel_layout = tensor_parallel
-        .then(|| deepseek_parallel_layout(&parameter_description, topology))
+        .then(|| architecture_parallel_layout(&parameter_description, topology))
         .transpose()?;
     let seed_static_module = MlxModule::new(seed_architecture.static_modules().clone());
     let all_static_bindings = build_module_bindings(&seed_static_module, "", store.as_ref())?;
