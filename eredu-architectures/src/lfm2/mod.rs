@@ -809,7 +809,7 @@ where
     }
 }
 
-/// Declares cache identity independently of its MLX realization.
+/// Declares cache identity independently of its backend realization.
 pub fn state_identity(
     args: &ModelArgs,
     layout: &StateLayout,

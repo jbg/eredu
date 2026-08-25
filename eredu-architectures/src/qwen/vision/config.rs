@@ -436,7 +436,7 @@ fn checked_layer_index(layer: i32, depth: usize, label: &str) -> Result<usize, V
 
 /// Header-only tensor geometry needed to normalize a Qwen projector GGUF.
 pub trait VisionGgufCatalog {
-    /// Returns the logical MLX-order shape of a physical tensor.
+    /// Returns the logical row-major shape of a physical tensor.
     fn shape(&self, name: &str) -> Option<Vec<usize>>;
 }
 

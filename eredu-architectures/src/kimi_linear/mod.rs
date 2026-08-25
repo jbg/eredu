@@ -856,7 +856,7 @@ where
     }
 }
 
-/// Declares prompt-cache identity independently of the MLX realization.
+/// Declares prompt-cache identity independently of the backend realization.
 pub fn state_identity(
     args: &ModelArgs,
     layout: &StateLayout,

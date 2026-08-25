@@ -2,12 +2,14 @@
 
 #[cfg(feature = "image")]
 use eredu_architectures::processor_plan::InklingImagePlan;
+use eredu_architectures::processor_plan::InklingProcessorPlan;
+#[cfg(feature = "image")]
+use eredu_architectures::processor_plan::ProcessorPlanError;
 #[cfg(feature = "audio")]
 use eredu_architectures::processor_plan::{
     AudioFrameCount, AudioWindow, InklingAudioPlan, Logarithm, MelNormalization, MelScale,
     SpectrumValue,
 };
-use eredu_architectures::processor_plan::{InklingProcessorPlan, ProcessorPlanError};
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
@@ -113,6 +115,7 @@ impl InklingProcessor {
     }
 }
 
+#[cfg(feature = "image")]
 fn processor_error(error: ProcessorPlanError) -> Error {
     Error::Processor(error.to_string())
 }
