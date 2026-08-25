@@ -5,9 +5,9 @@ use eredu_backend_mlx::backend::{
     MlxBackend,
 };
 use eredu_backend_mlx::native::{
-    error::Exception, random::RandomState, sample, Array, Sampler, Stream,
+    error::Exception, random::RandomState, sample, Array, MlxRealtimeModel, Sampler, Stream,
 };
-use eredu_backend_mlx::{MlxModelOutput, MlxRealtimeModel, MlxTensor};
+use eredu_backend_mlx::{MlxModelOutput, MlxTensor};
 
 fn assert_public_type<T: ?Sized>() {}
 
@@ -27,7 +27,7 @@ fn raw_sampling_api_is_rooted_under_native() {
 }
 
 #[test]
-fn realtime_adapter_exposes_architecture_owned_identity() {
+fn native_realtime_adapter_exposes_architecture_owned_identity() {
     let _: fn(&MlxRealtimeModel) -> eredu_architectures::moshi::EffectiveModelType =
         MlxRealtimeModel::effective_model_type;
 }

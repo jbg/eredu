@@ -11,8 +11,8 @@ use eredu_core::{
     ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
     HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, MtpCapability,
     MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, RealizedDrafting,
-    ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend, TransferTelemetry,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    RealtimeModelLoadingBackend, ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend,
+    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -59,8 +59,17 @@ impl MlxBackendFactory {
 ///
 /// Application facades use this factory boundary to keep native MLX streams
 /// out of their public API. Backend-author code that needs explicit streams or
-/// collective groups constructs [`MlxRealtimeBackend`] directly instead.
-pub fn create_realtime_backend(device: &DevicePlan) -> Result<MlxRealtimeBackend, Error> {
+/// collective groups constructs [`crate::native::MlxRealtimeBackend`] directly instead.
+pub fn create_realtime_backend(
+    device: &DevicePlan,
+) -> Result<
+    impl RealtimeModelLoadingBackend<
+        Preparation = eredu_architectures::moshi::RealtimePreparationPlan,
+        LoadOptions = ModelLoadOptions,
+        Error = Error,
+    >,
+    Error,
+> {
     let device = mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
     let stream = Stream::new_with_device(&device);
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));

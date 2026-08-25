@@ -570,7 +570,7 @@ impl<'a> MlxModelSession<'a> {
     }
 
     #[cfg(feature = "media")]
-    pub fn processor(&self) -> Option<&ModelProcessor> {
+    pub(crate) fn processor(&self) -> Option<&ModelProcessor> {
         self.processor.as_ref()
     }
 

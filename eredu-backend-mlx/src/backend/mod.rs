@@ -116,7 +116,7 @@ impl MlxModel {
     }
 
     #[cfg(feature = "media")]
-    pub fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
+    pub(crate) fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
         self.processor = processor;
         self
     }

@@ -21,9 +21,21 @@ pub use adapter::*;
 
 /// Deliberate access to native MLX handles for backend-author tools that
 /// configure devices, streams, memory, or low-level tensor inputs.
+///
+/// Native realtime types are not part of the flat curated adapter:
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxRealtimeInput;
+/// ```
 pub mod native {
     pub use crate::backend::nn::generation::sample;
     pub use crate::backend::runtime::generation::sampler::Sampler;
+    pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
+    pub use crate::composition::mlx::realtime::{
+        MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
+        MlxRealtimeModelIdentity, MlxRealtimeModelState, MlxRealtimeModelStateBranch,
+        MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
+    };
     pub use safemlx::*;
 
     /// Constructs an MLX backend from explicitly selected native streams.

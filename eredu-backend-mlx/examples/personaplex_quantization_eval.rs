@@ -1,6 +1,6 @@
 use std::{error::Error, path::Path, path::PathBuf};
 
-use eredu_backend_mlx::{codec::mimi::load, MlxRealtimeBackend};
+use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeBackend};
 use eredu_core::load_realtime_model;
 use eredu_evaluation::{
     run_personaplex_quantization, PersonaPlexEvaluationOptions, PersonaPlexEvaluationPaths,

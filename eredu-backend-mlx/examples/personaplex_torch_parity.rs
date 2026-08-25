@@ -18,7 +18,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext, Stream};
-use eredu_backend_mlx::{MlxRealtimeBackend, MlxTensor};
+use eredu_backend_mlx::{native::MlxRealtimeBackend, MlxTensor};
 use eredu_core::{load_realtime_model, ObservationSet, ObservationValue, RealtimeSampling};
 use eredu_evaluation::{
     compare_observations, encoded_audio_frames, observe_i32_tensor, run_realtime_trace,

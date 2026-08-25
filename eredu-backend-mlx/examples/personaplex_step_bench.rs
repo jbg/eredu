@@ -3,11 +3,10 @@
 use std::{path::PathBuf, time::Instant};
 
 use eredu_backend_mlx::native::{
-    transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
+    personaplex_sine_frame, transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext,
+    MlxRealtimeBackend, MlxRealtimeInput, Stream,
 };
-use eredu_backend_mlx::{
-    personaplex_sine_frame, MlxRealtimeBackend, MlxRealtimeInput, ModelLoadOptions,
-};
+use eredu_backend_mlx::ModelLoadOptions;
 use eredu_checkpoint::AffineQuantization;
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
 use eredu_core::{

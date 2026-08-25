@@ -14,7 +14,8 @@ use crate::native::{
     Array, Device, DeviceType, Stream,
 };
 use crate::{
-    DeviceAssignment, MlxParallelContext, MlxRealtimeBackend, MlxRealtimeInput, ModelLoadOptions,
+    native::{MlxRealtimeBackend, MlxRealtimeInput},
+    DeviceAssignment, MlxParallelContext, ModelLoadOptions,
 };
 use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
 use eredu_core::scheduler::{RequestId, SchedulerLimits};

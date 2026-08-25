@@ -1,6 +1,10 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu_backend_mlx::{codec::mimi::load, MlxRealtimeBackend, MlxRealtimeInput, MlxTensor};
+use eredu_backend_mlx::{
+    codec::mimi::load,
+    native::{MlxRealtimeBackend, MlxRealtimeInput},
+    MlxTensor,
+};
 use eredu_codec::mimi::Mimi;
 use eredu_core::{
     load_realtime_model,

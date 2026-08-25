@@ -21,7 +21,7 @@ use crate::{
 
 /// Architecture-erased media processor selected during model composition.
 #[derive(Debug, Clone)]
-pub struct ModelProcessor {
+pub(crate) struct ModelProcessor {
     kind: ProcessorKind,
 }
 

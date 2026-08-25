@@ -74,7 +74,10 @@ random state. Direct native access remains an explicit backend-author escape
 hatch under `eredu-backend-mlx::native`; it is not an application dependency.
 Sampling functions and sampler traits whose signatures expose raw MLX arrays,
 streams, or random state are exported only through that native namespace, not
-through the flat application-facing adapter. The flat adapter likewise keeps
+through the flat application-facing adapter. Concrete realtime backend types,
+inputs, outputs, sessions, completions, and prompt helpers follow the same
+rule; the flat realtime factory returns an opaque neutral-trait implementation.
+The flat adapter likewise keeps
 the native borrowed model-input views private and returns model logits through
 the backend-owned `MlxTensor` handle.
 Facade examples follow the same rule and construct selected local sessions
