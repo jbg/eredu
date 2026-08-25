@@ -4240,6 +4240,8 @@ mod tests {
         let mut manifest = write_prompt_fixture(directory.path(), "speculative-frontier");
         manifest.layer_count = 2;
         manifest.global_layer_end = 2;
+        manifest.state_segments =
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..2).unwrap()];
         manifest.total_prefix_tokens = 2;
         manifest.prefix_sha256 = prompt_cache_token_fingerprint(&[7, 8]);
         manifest.layer_layout = key_value_layout([None, None]);
@@ -4463,6 +4465,8 @@ mod tests {
         let mut two_layers = base.clone();
         two_layers.layer_count = 2;
         two_layers.global_layer_end = 2;
+        two_layers.state_segments =
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..2).unwrap()];
         two_layers.layer_layout = key_value_layout([None, Some(7)]);
         two_layers.layer_prefix_offsets = vec![0, 0];
         let mut second = two_layers.blocks[0].clone();
