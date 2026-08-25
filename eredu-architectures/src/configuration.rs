@@ -1,5 +1,6 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
+use eredu_checkpoint::validation::{CheckpointValidation, StrictLoadFailure};
 use eredu_core::{
     artifact::ArtifactError, ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement,
     GgufCompanionRole, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
@@ -431,18 +432,30 @@ fn validate_gguf_structure(
     architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
 ) -> Result<(), ArtifactError> {
-    if matches!(
-        architecture,
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next
-    ) && checkpoint.tensors().any(|tensor| {
-        let name = tensor.descriptor().name.as_str();
-        name.starts_with("v.") || name.starts_with("mm.")
-    }) {
-        return Err(ArtifactError::InvalidArtifact(
-            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
-        ));
-    }
-    Ok(())
+    validate_gguf_checkpoint(architecture, checkpoint)
+        .into_loader_result()
+        .map_err(gguf_validation_error)
+}
+
+/// Parses and validates the complete architecture-owned GGUF checkpoint schema.
+///
+/// This is the portable admission boundary used by the configuration resolver
+/// and by concrete backends that need to validate an already inspected GGUF.
+pub fn validate_gguf_checkpoint(
+    architecture: GgufArchitecture,
+    checkpoint: &GgufCheckpoint,
+) -> CheckpointValidation {
+    crate::gguf_admission::validate(architecture, checkpoint)
+}
+
+fn gguf_validation_error(failure: StrictLoadFailure) -> ArtifactError {
+    let mut details = failure
+        .missing
+        .into_iter()
+        .map(|name| format!("missing {name:?}"))
+        .collect::<Vec<_>>();
+    details.extend(failure.unused);
+    ArtifactError::InvalidArtifact(details.join("; "))
 }
 
 #[derive(Deserialize)]
@@ -759,36 +772,24 @@ mod tests {
     }
 
     #[test]
-    fn gguf_inspection_applies_architecture_owned_qwen_structure_policy() {
+    fn gguf_inspection_runs_complete_family_parsing_before_backend_selection() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("model.gguf");
         let scalar = 1.0_f32.to_le_bytes();
-        let metadata = BTreeMap::from([
-            (
-                "general.architecture".into(),
-                MetadataValue::String("qwen35".into()),
-            ),
-            ("qwen35.block_count".into(), MetadataValue::Uint32(1)),
-            ("qwen35.embedding_length".into(), MetadataValue::Uint32(1)),
-        ]);
+        let metadata = BTreeMap::from([(
+            "general.architecture".into(),
+            MetadataValue::String("llama".into()),
+        )]);
         Writer::default()
             .write(
                 File::create(&path).unwrap(),
                 &metadata,
-                &[
-                    TensorInput {
-                        name: "token_embd.weight",
-                        dimensions: &[1],
-                        ggml_type: GgmlType::F32,
-                        data: &scalar,
-                    },
-                    TensorInput {
-                        name: "v.patch_embd.weight",
-                        dimensions: &[1],
-                        ggml_type: GgmlType::F32,
-                        data: &scalar,
-                    },
-                ],
+                &[TensorInput {
+                    name: "token_embd.weight",
+                    dimensions: &[1],
+                    ggml_type: GgmlType::F32,
+                    data: &scalar,
+                }],
             )
             .unwrap();
 
@@ -796,7 +797,52 @@ mod tests {
         assert!(matches!(
             error,
             ArtifactError::InvalidArtifact(detail)
-                if detail.contains("multimodal Qwen3-Next/Qwen3.5")
+                if detail.contains("llama.embedding_length")
+        ));
+    }
+
+    #[test]
+    fn gguf_inspection_runs_complete_schema_validation_before_backend_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("model.gguf");
+        let scalar = 1.0_f32.to_le_bytes();
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("llama".into()),
+            ),
+            ("llama.embedding_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.attention.head_count".into(),
+                MetadataValue::Uint32(1),
+            ),
+            ("llama.block_count".into(), MetadataValue::Uint32(1)),
+            ("llama.feed_forward_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::Float32(1e-5),
+            ),
+            ("llama.vocab_size".into(), MetadataValue::Uint32(1)),
+            ("llama.context_length".into(), MetadataValue::Uint32(1)),
+        ]);
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &metadata,
+                &[TensorInput {
+                    name: "token_embd.weight",
+                    dimensions: &[1, 1],
+                    ggml_type: GgmlType::F32,
+                    data: &scalar,
+                }],
+            )
+            .unwrap();
+
+        let error = inspect_artifact(&path).unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidArtifact(detail)
+                if detail.contains("output_norm.weight")
         ));
     }
 }

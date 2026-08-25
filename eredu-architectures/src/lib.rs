@@ -26,6 +26,7 @@ pub use external_assistant::{
     prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
     Gemma4AssistantPreparationPlan, MuseGlimmerAssistantPreparationPlan,
 };
+mod gguf_admission;
 mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;

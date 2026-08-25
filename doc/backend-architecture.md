@@ -145,8 +145,12 @@ or decide which model-family scaling names are supported.
 
 The architecture configuration registry is the sole owner of Hugging Face
 family aliases, GGUF `general.architecture` spellings, nested-wrapper
-normalization, and the exhaustive dispatch to family parsers. Its external
-assistant resolvers likewise own both SafeTensors `model_type` and GGUF
+normalization, and the exhaustive dispatch to family parsers. During GGUF
+inspection, core passes the complete portable header catalog to that registry;
+the registry performs full family parsing, canonical-name collision checks,
+and architecture checkpoint-schema validation before admission. Concrete
+backends consume that result and do not repeat a family admission match. Its
+external assistant resolvers likewise own both SafeTensors `model_type` and GGUF
 `general.architecture` identities and aliases. `eredu-core` accepts that
 registry through `ModelConfigurationResolver` while inspecting both
 SafeTensors and GGUF artifacts. The resolver returns an open canonical family
@@ -162,10 +166,10 @@ registry; an unknown outer `model_type` is rejected even when its nested text
 identity is known. External assistant admission remains separate: its closed
 resolver explicitly selects the ordinary family tokenizer contract carried by
 the admitted assistant plan, without admitting assistant identities as ordinary
-models. Once that resolver admits a GGUF artifact,
-`eredu-core` applies only container-generic catalog checks; it does not require
-family metadata keys or tensor names. Facades and concrete backend adapters
-select that shared registry. Backend composition converts the resolved
+models. Before invoking that resolver, `eredu-core` applies only
+container-generic catalog checks; it does not recognize family metadata keys or
+tensor names. Facades and concrete backend adapters select that shared
+registry. Backend composition converts the resolved
 canonical family through the architecture registry and consumes architecture
 parser outputs, never a second raw `model_type` or `general.architecture`
 dispatch table. Unsupported family identities therefore remain architecture

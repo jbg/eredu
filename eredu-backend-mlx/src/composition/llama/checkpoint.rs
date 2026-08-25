@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use eredu_architectures::llama::ModelArgs;
 use eredu_checkpoint::WeightQuantization;
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
+use safemlx::ops::GgufMetadataValue;
 use safemlx::Stream;
 use serde_json::Value;
 
@@ -48,40 +48,6 @@ pub fn validate_safetensors(
         }
     };
     validation::validate_safetensors_plan(store, &plan)
-}
-
-pub fn validate_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> CheckpointValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(eredu_architectures::llama::translate_gguf_weight_name)
-    {
-        return CheckpointValidation::Invalid(vec![CheckpointIssue {
-            kind: CheckpointIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match model_args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let plan = match eredu_architectures::llama::gguf_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 fn invalid_geometry(detail: String) -> CheckpointValidation {

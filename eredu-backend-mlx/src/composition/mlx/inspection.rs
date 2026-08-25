@@ -418,7 +418,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             record_embedded_drafting(&mut report, capabilities);
             apply_structural_validation(
                 &mut report,
-                structural::validate_gguf(gguf_architecture, &checkpoint, &metadata, options.load),
+                structural::validate_gguf(gguf_architecture, &checkpoint, options.load),
                 path,
             );
         }
@@ -1049,26 +1049,62 @@ mod tests {
             ),
         ]);
         if include_embedding_length {
-            metadata.insert(
-                "llama.embedding_length".into(),
-                eredu_gguf::MetadataValue::Uint32(1),
-            );
+            metadata.extend([
+                (
+                    "llama.embedding_length".into(),
+                    eredu_gguf::MetadataValue::Uint32(1),
+                ),
+                (
+                    "llama.attention.head_count".into(),
+                    eredu_gguf::MetadataValue::Uint32(1),
+                ),
+                (
+                    "llama.feed_forward_length".into(),
+                    eredu_gguf::MetadataValue::Uint32(1),
+                ),
+                (
+                    "llama.attention.layer_norm_rms_epsilon".into(),
+                    eredu_gguf::MetadataValue::Float32(1e-5),
+                ),
+                (
+                    "llama.vocab_size".into(),
+                    eredu_gguf::MetadataValue::Uint32(1),
+                ),
+                (
+                    "llama.context_length".into(),
+                    eredu_gguf::MetadataValue::Uint32(1),
+                ),
+            ]);
         }
         if let Some(tokenizer_eos) = tokenizer_eos {
             metadata.insert("tokenizer.ggml.eos_token_id".into(), tokenizer_eos);
         }
         let data = 1.0_f32.to_le_bytes();
+        let tensor = |name, dimensions| eredu_gguf::TensorInput {
+            name,
+            dimensions,
+            ggml_type: eredu_gguf::GgmlType::F32,
+            data: &data,
+        };
+        let tensors = if include_embedding_length {
+            vec![
+                tensor("token_embd.weight", &[1, 1]),
+                tensor("output_norm.weight", &[1]),
+                tensor("blk.0.attn_norm.weight", &[1]),
+                tensor("blk.0.ffn_norm.weight", &[1]),
+                tensor("blk.0.attn_q.weight", &[1, 1]),
+                tensor("blk.0.attn_k.weight", &[1, 1]),
+                tensor("blk.0.attn_v.weight", &[1, 1]),
+                tensor("blk.0.attn_output.weight", &[1, 1]),
+                tensor("blk.0.ffn_gate.weight", &[1, 1]),
+                tensor("blk.0.ffn_up.weight", &[1, 1]),
+                tensor("blk.0.ffn_down.weight", &[1, 1]),
+            ]
+        } else {
+            vec![tensor("token_embd.weight", &[1])]
+        };
         eredu_gguf::Writer::default()
-            .write(
-                std::fs::File::create(path).unwrap(),
-                &metadata,
-                &[eredu_gguf::TensorInput {
-                    name: "token_embd.weight",
-                    dimensions: &[1],
-                    ggml_type: eredu_gguf::GgmlType::F32,
-                    data: &data,
-                }],
-            )
+            .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
             .unwrap();
     }
 
@@ -1195,7 +1231,7 @@ mod tests {
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.architecture.as_deref(), Some("llama"));
-        assert_eq!(report.tensor_count, Some(1));
+        assert_eq!(report.tensor_count, Some(11));
     }
 
     #[test]
