@@ -28,7 +28,7 @@ pub use graph::{
 };
 pub use model::{
     state_identity, DecoderInputPart, ForwardContext, LayeredModel, ModelInput, PartitionMtpOutput,
-    StaticModules, TextPartitionInput, Unit,
+    StaticModules, TextPartitionInput, Unit, MTP_STATIC_ROLE,
 };
 pub use mtp::{MtpDepth, MtpModel, MtpOutput};
 pub use parallel::{

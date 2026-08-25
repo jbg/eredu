@@ -565,6 +565,28 @@ impl PipelineStep {
     }
 }
 
+fn inkling_partition_owns_prediction_state(ownership: &eredu_runtime::PartitionOwnership) -> bool {
+    ownership.owns_static_role(eredu_architectures::inkling::MTP_STATIC_ROLE)
+}
+
+#[cfg(test)]
+#[test]
+fn inkling_prediction_state_follows_realized_mtp_role_not_output_position() {
+    let output_without_mtp =
+        eredu_runtime::PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+    assert!(!inkling_partition_owns_prediction_state(
+        &output_without_mtp
+    ));
+
+    let relocated_mtp = eredu_runtime::PartitionOwnership::new(
+        false,
+        false,
+        [eredu_architectures::inkling::MTP_STATIC_ROLE],
+    )
+    .unwrap();
+    assert!(inkling_partition_owns_prediction_state(&relocated_mtp));
+}
+
 const fn mlx_boundary_dtype(kind: eredu_runtime::BoundaryTensorDtype, activation: Dtype) -> Dtype {
     match kind {
         eredu_runtime::BoundaryTensorDtype::Activation => activation,
@@ -7332,7 +7354,7 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))?;
-        let prediction = if self.range().end == self.args().text_config.num_hidden_layers as usize {
+        let prediction = if inkling_partition_owns_prediction_state(self.partition.ownership()) {
             eredu_architectures::inkling::mtp_state_layout(self.args())
                 .map_err(|error| Error::Parallel(error.to_string()))?
         } else {
@@ -16202,7 +16224,7 @@ impl Gemma4PipelinePartition {
                 stream,
             )?
         });
-        if self.range().end == self.args().text.num_hidden_layers() {
+        if self.partition.ownership().owns_output() {
             let logits = match execution.and_then(ParallelExecutionContext::group) {
                 Some(parallel) => {
                     let mut state =
@@ -16446,7 +16468,7 @@ impl InklingPipelinePartition {
                 stream,
             )?
         };
-        if self.range().end == self.args().text_config.num_hidden_layers as usize {
+        if self.partition.ownership().owns_output() {
             Ok(PipelineStageOutput::EmbeddedMtpLogits {
                 logits: match tensor_group {
                     Some(parallel) => self.architecture.project_target_logits_parallel(

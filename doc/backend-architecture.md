@@ -259,6 +259,9 @@ MTP unit, checkpoint root, and cache identity of every sparse unit in this
 catalog; backend adapters filter catalog units against the realized partition
 using that canonical group-local owner address, without recovering placement
 from flattened cache identities, target-layer counts, or inferred MTP ownership.
+Pipeline logits and persistent prediction-state attachment likewise follow the
+realized partition's output flag and architecture-declared static roles; a
+stage's raw layer-range endpoint is not an ownership signal.
 Concrete backends lower catalog entries into native storage and may apply the
 declared unit path to a rank-local placement; they do not rebuild the schedule,
 instantiate a family block to discover expert parameters, or match parameter

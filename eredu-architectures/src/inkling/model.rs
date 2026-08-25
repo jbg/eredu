@@ -22,6 +22,10 @@ use super::{
     LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
 
+/// Canonical static-role identity for the embedded prediction modules and
+/// their persistent state owner.
+pub const MTP_STATIC_ROLE: &str = "mtp";
+
 /// Pinned text, audio, and image modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -334,7 +338,7 @@ impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel
             visitor.visit("vision", module)?;
         }
         if let Some(module) = &self.static_modules.mtp {
-            visitor.visit("mtp", module)?;
+            visitor.visit(MTP_STATIC_ROLE, module)?;
         }
         Ok(())
     }
@@ -354,7 +358,7 @@ impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel
             visitor.visit_mut("vision", module)?;
         }
         if let Some(module) = &mut self.static_modules.mtp {
-            visitor.visit_mut("mtp", module)?;
+            visitor.visit_mut(MTP_STATIC_ROLE, module)?;
         }
         Ok(())
     }
@@ -472,14 +476,17 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .zip(static_roles)
             .map(|(group, role)| {
                 let owner = if role == "embedding" {
-                    ParameterGroupOwner::static_any_of(["embedding", "mtp"])
+                    ParameterGroupOwner::static_any_of(["embedding", MTP_STATIC_ROLE])
                 } else {
                     ParameterGroupOwner::static_role(role)
                 };
                 OwnedParameterGroupSpec::new(owner, group)
             })
             .chain(mtp_groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("mtp"), group)
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_role(MTP_STATIC_ROLE),
+                    group,
+                )
             }))
             .collect::<Vec<_>>();
         for (group_index, &count) in counts.iter().enumerate() {
@@ -1151,7 +1158,11 @@ where
                     "embedding_norm".into(),
                     "audio".into(),
                 ],
-                last_owner_static_roles: vec!["norm".into(), "output".into(), "mtp".into()],
+                last_owner_static_roles: vec![
+                    "norm".into(),
+                    "output".into(),
+                    MTP_STATIC_ROLE.into(),
+                ],
                 merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
                 parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
                 request_optional: false,
