@@ -57,6 +57,11 @@ use crate::backend::{
 };
 use crate::MlxTensor;
 
+fn bind_linear_companion(weight: &ParameterSpec, mut companion: ParameterSpec) -> ParameterSpec {
+    companion.linear_companion_of = Some(weight.id.clone());
+    companion
+}
+
 fn compute<T>(result: Result<T, safemlx::error::Exception>) -> Result<T, ComputeError> {
     result.map_err(ComputeError::backend)
 }
@@ -130,16 +135,22 @@ fn parameter_topology(
                         "backend operator exposed unexpected bias parameter {local:?}"
                     ))
                 })?,
-                "scales" | "weight_scale_inv" => format.scale().cloned().ok_or_else(|| {
-                    ComputeError::backend(format!(
-                        "backend operator exposed scale slot {local:?} but the architecture declared none"
-                    ))
-                })?,
-                "biases" => format.affine_bias().cloned().ok_or_else(|| {
-                    ComputeError::backend(
-                        "backend operator exposed affine-bias slot but the architecture declared none",
-                    )
-                })?,
+                "scales" | "weight_scale_inv" => bind_linear_companion(
+                    &weight,
+                    format.scale().cloned().ok_or_else(|| {
+                        ComputeError::backend(format!(
+                            "backend operator exposed scale slot {local:?} but the architecture declared none"
+                        ))
+                    })?,
+                ),
+                "biases" => bind_linear_companion(
+                    &weight,
+                    format.affine_bias().cloned().ok_or_else(|| {
+                        ComputeError::backend(
+                            "backend operator exposed affine-bias slot but the architecture declared none",
+                        )
+                    })?,
+                ),
                 "e_score_correction_bias" => bias.clone().ok_or_else(|| {
                     ComputeError::backend(format!(
                         "backend operator exposed unexpected correction-bias parameter {local:?}"
@@ -378,6 +389,26 @@ impl<M: Parameterized<MlxTensor>> ModuleParameters for MlxModule<M> {
     fn any_frozen(&self) -> Option<bool> {
         let states = neutral_parameter_states(&self.inner);
         (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
+    }
+}
+
+impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxModule<M> {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, MlxTensor>,
+    {
+        self.inner.visit_parameters(visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, MlxTensor>,
+    {
+        self.inner.visit_parameters_mut(visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        self.inner.set_trainable(trainable);
     }
 }
 
@@ -2592,10 +2623,10 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             topology.push(("bias", bias));
         }
         if let Some(scale) = spec.format.scale() {
-            topology.push(("scales", scale.clone()));
+            topology.push(("scales", bind_linear_companion(&weight, scale.clone())));
         }
         if let Some(bias) = spec.format.affine_bias() {
-            topology.push(("biases", bias.clone()));
+            topology.push(("biases", bind_linear_companion(&weight, bias.clone())));
         }
         if let Some(correction_bias) = spec.correction_bias {
             topology.push(("e_score_correction_bias", correction_bias));
@@ -2670,16 +2701,28 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             topology.push(("down_proj_bias", bias.clone()));
         }
         if let Some(scale) = gate_up.format.scale() {
-            topology.push(("gate_up_proj_scales", scale.clone()));
+            topology.push((
+                "gate_up_proj_scales",
+                bind_linear_companion(&gate_up.weight, scale.clone()),
+            ));
         }
         if let Some(bias) = gate_up.format.affine_bias() {
-            topology.push(("gate_up_proj_biases", bias.clone()));
+            topology.push((
+                "gate_up_proj_biases",
+                bind_linear_companion(&gate_up.weight, bias.clone()),
+            ));
         }
         if let Some(scale) = down.format.scale() {
-            topology.push(("down_proj_scales", scale.clone()));
+            topology.push((
+                "down_proj_scales",
+                bind_linear_companion(&down.weight, scale.clone()),
+            ));
         }
         if let Some(bias) = down.format.affine_bias() {
-            topology.push(("down_proj_biases", bias.clone()));
+            topology.push((
+                "down_proj_biases",
+                bind_linear_companion(&down.weight, bias.clone()),
+            ));
         }
         Ok(MlxGatedProductExpertBank {
             spec,
@@ -2712,16 +2755,28 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             ("down_proj", spec.down.weight.clone()),
         ];
         if let Some(scale) = spec.up.format.scale() {
-            topology.push(("up_proj_scales", scale.clone()));
+            topology.push((
+                "up_proj_scales",
+                bind_linear_companion(&spec.up.weight, scale.clone()),
+            ));
         }
         if let Some(bias) = spec.up.format.affine_bias() {
-            topology.push(("up_proj_biases", bias.clone()));
+            topology.push((
+                "up_proj_biases",
+                bind_linear_companion(&spec.up.weight, bias.clone()),
+            ));
         }
         if let Some(scale) = spec.down.format.scale() {
-            topology.push(("down_proj_scales", scale.clone()));
+            topology.push((
+                "down_proj_scales",
+                bind_linear_companion(&spec.down.weight, scale.clone()),
+            ));
         }
         if let Some(bias) = spec.down.format.affine_bias() {
-            topology.push(("down_proj_biases", bias.clone()));
+            topology.push((
+                "down_proj_biases",
+                bind_linear_companion(&spec.down.weight, bias.clone()),
+            ));
         }
         Ok(MlxRelu2ExpertBank {
             module: MlxNamedModule::with_exact_topology(module, topology)?,

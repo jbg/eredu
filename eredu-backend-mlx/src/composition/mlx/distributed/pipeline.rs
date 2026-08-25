@@ -12,7 +12,7 @@
 
 use eredu_architectures::{
     llama::ModelArgs as LlamaModelArgs, muse_glimmer, BindableStaticParameters, GgufArchitecture,
-    StaticParameterVisitorMut,
+    StaticParameterVisitor, StaticParameterVisitorMut,
 };
 use eredu_checkpoint::{store::WeightStoreDiagnostics, WeightQuantization};
 use eredu_core::{
@@ -81,8 +81,9 @@ use crate::{
     },
     backend::runtime::distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
     backend::runtime::execution::layerwise::{
-        quantize_pipeline_stage_store_with, shard_layer_bindings, DenseStreamController,
-        DenseTransferWindow, PipelineStageQuantizationSelection,
+        packed_weight_companions, quantize_pipeline_stage_store_with, shard_layer_bindings,
+        DenseStreamController, DenseTransferWindow, PackedWeightCompanions,
+        PipelineStageQuantizationSelection,
     },
     backend::runtime::media::{prepared_identity_wire_arrays, PreparedModelInput},
     backend::runtime::residency::expert_cache::{
@@ -149,7 +150,7 @@ fn qwen_model_kind(args: &eredu_architectures::qwen::ModelArgs) -> ModelKind {
 /// This deliberately excludes forward execution, cache semantics, and residency
 /// policy: those remain architecture-owned or backend-neutral runtime concerns.
 trait PipelineQuantizationAdapter {
-    type Layer: ModuleParameters;
+    type Layer: ModuleParameters + Parameterized<crate::MlxTensor>;
 
     fn model_type(&self) -> &str;
     fn static_units(
@@ -157,6 +158,10 @@ trait PipelineQuantizationAdapter {
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error>;
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool;
+    fn static_quantization_companions(
+        &self,
+        quantization: WeightQuantization,
+    ) -> Result<BTreeMap<String, PackedWeightCompanions>, Error>;
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
     fn layer_bindings(
         &self,
@@ -169,7 +174,7 @@ trait PipelineQuantizationAdapter {
 
 trait PipelineArchitectureBindings {
     type Architecture;
-    type Layer: ModuleParameters;
+    type Layer: ModuleParameters + Parameterized<crate::MlxTensor>;
 
     fn model_type<'a>(&self, architecture: &'a Self::Architecture) -> &'a str;
     fn static_units(
@@ -178,6 +183,11 @@ trait PipelineArchitectureBindings {
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error>;
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool;
+    fn static_quantization_companions(
+        &self,
+        architecture: &Self::Architecture,
+        quantization: WeightQuantization,
+    ) -> Result<BTreeMap<String, PackedWeightCompanions>, Error>;
     fn build_unit(
         &self,
         architecture: &Self::Architecture,
@@ -227,6 +237,14 @@ impl<B: PipelineArchitectureBindings> PipelineQuantizationAdapter for BoundPipel
         self.bindings.quantizes_static_binding(binding)
     }
 
+    fn static_quantization_companions(
+        &self,
+        quantization: WeightQuantization,
+    ) -> Result<BTreeMap<String, PackedWeightCompanions>, Error> {
+        self.bindings
+            .static_quantization_companions(self.architecture, quantization)
+    }
+
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
         self.bindings
             .build_unit(self.architecture, group, index, stream)
@@ -242,6 +260,44 @@ impl<B: PipelineArchitectureBindings> PipelineQuantizationAdapter for BoundPipel
         self.bindings
             .layer_bindings(self.architecture, group, index, layer, store)
     }
+}
+
+fn architecture_static_quantization_companions<A>(
+    architecture: &A,
+    quantization: WeightQuantization,
+) -> Result<BTreeMap<String, PackedWeightCompanions>, Error>
+where
+    A: BindableStaticParameters<MlxNeuralBackend>,
+{
+    struct Visitor {
+        quantization: WeightQuantization,
+        companions: BTreeMap<String, PackedWeightCompanions>,
+    }
+
+    impl StaticParameterVisitor<MlxNeuralBackend> for Visitor {
+        type Error = Error;
+
+        fn visit<M>(&mut self, _role: &str, module: &M) -> Result<(), Self::Error>
+        where
+            M: Parameterized<crate::MlxTensor>,
+        {
+            for (weight, companions) in packed_weight_companions(module, self.quantization)? {
+                if self.companions.insert(weight.clone(), companions).is_some() {
+                    return Err(Error::Quantization(format!(
+                        "static quantization target {weight:?} is declared more than once"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut visitor = Visitor {
+        quantization,
+        companions: BTreeMap::new(),
+    };
+    architecture.visit_static_parameters(&mut visitor)?;
+    Ok(visitor.companions)
 }
 
 macro_rules! impl_pipeline_architecture_bindings {
@@ -264,6 +320,14 @@ macro_rules! impl_pipeline_architecture_bindings {
 
             fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
                 <$adapter>::quantizes_static_binding(self, binding)
+            }
+
+            fn static_quantization_companions(
+                &self,
+                architecture: &Self::Architecture,
+                quantization: WeightQuantization,
+            ) -> Result<BTreeMap<String, PackedWeightCompanions>, Error> {
+                architecture_static_quantization_companions(architecture, quantization)
             }
 
             fn build_unit(
@@ -374,12 +438,14 @@ fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
     stream: &Stream,
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error> {
     let static_roles = selection.static_roles().to_vec();
+    let static_companions = target.static_quantization_companions(quantization)?;
     quantize_pipeline_stage_store_with(
         store,
         selection,
         quantization,
         stream,
         source.model_type(),
+        static_companions,
         |store| {
             select_static_binding_units_by_owner(
                 binding_authority,

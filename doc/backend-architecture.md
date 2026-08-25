@@ -348,6 +348,11 @@ the declaration, but runtime and reusable backends never decide that a
 parameter is quantizable or construct companion identities from weight,
 projection, scale, or bias name suffixes. Native backend slot names are local
 implementation details mapped to the literal neutral identities.
+Neutral parameter traversal preserves each companion's scale or affine-bias
+role together with its primary weight identity. Load-time quantization uses
+that semantic link to build bounded targets whose weight and companion output
+names are all explicit; bounded materializers reject missing or colliding
+identities and never manufacture them from the weight name.
 
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution

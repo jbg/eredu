@@ -153,7 +153,15 @@ pub fn quantize_expert_catalog(
                 identity.global_expert,
                 binding.name()
             );
-            let target = BoundedQuantizationTarget::from_recipe(target_name, recipe)?;
+            let target_prefix = target_name
+                .strip_suffix(".weight")
+                .expect("synthetic expert target has a weight suffix");
+            let target = BoundedQuantizationTarget::from_recipe(
+                target_name.clone(),
+                format!("{target_prefix}.scales"),
+                Some(format!("{target_prefix}.biases")),
+                recipe,
+            )?;
             packed_catalog_bytes = packed_catalog_bytes
                 .checked_add(packed_projection_bytes(metadata.shape(), quantization)?)
                 .ok_or_else(|| {
@@ -205,13 +213,15 @@ pub fn quantize_expert_catalog(
             )?);
             bindings.push(packed_binding(
                 scales_name,
-                &target.scales_name(),
+                target.scales_name(),
                 store.as_ref(),
             )?);
             if quantization.has_biases() {
                 bindings.push(packed_binding(
                     biases_name,
-                    &target.biases_name(),
+                    target
+                        .biases_name()
+                        .expect("affine expert target declared a bias identity"),
                     store.as_ref(),
                 )?);
             }

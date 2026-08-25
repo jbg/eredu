@@ -47,42 +47,42 @@ const BOUNDED_QUANTIZATION_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_QUANTIZATION_SUBMISSION_ELEMENTS: usize = i32::MAX as usize;
 
 /// One dense semantic weight that will be replaced by its packed representation.
-///
-/// Scale and affine-bias names are derived from the required `.weight` suffix,
-/// so a target cannot describe mismatched companion tensors.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BoundedQuantizationTarget {
     weight_name: String,
     scales_name: String,
-    biases_name: String,
+    biases_name: Option<String>,
     source: DerivedWeightRecipe,
     affine_companion_dtype: RecipeDtype,
 }
 
 impl BoundedQuantizationTarget {
-    /// Quantizes a checkpoint tensor in place under the same logical name.
-    pub fn direct(weight_name: impl Into<String>) -> Result<Self, Error> {
+    /// Quantizes a checkpoint tensor in place under exact output identities.
+    pub fn direct(
+        weight_name: impl Into<String>,
+        scales_name: impl Into<String>,
+        biases_name: Option<impl Into<String>>,
+    ) -> Result<Self, Error> {
         let weight_name = weight_name.into();
         Self::from_recipe(
             weight_name.clone(),
+            scales_name,
+            biases_name,
             DerivedWeightRecipe::source(weight_name, TensorSelection::Full),
         )
     }
 
-    /// Quantizes a semantic recipe under its packed runtime weight name.
-    ///
-    /// Distributed planners can use a bounded selection recipe here to encode
-    /// rank-local TP or EP ownership before the conversion runs. Conventional
-    /// module weights use `.weight`, `.scales`, and `.biases`; packed matrix
-    /// banks use the same runtime weight name plus `_scales` and `_biases`.
-    /// Deriving the complete output triplet here prevents a target from
-    /// describing an incoherent mixture of the two layouts.
+    /// Quantizes a semantic recipe under exact packed runtime identities.
     pub fn from_recipe(
         weight_name: impl Into<String>,
+        scales_name: impl Into<String>,
+        biases_name: Option<impl Into<String>>,
         source: DerivedWeightRecipe,
     ) -> Result<Self, Error> {
         let weight_name = weight_name.into();
-        let (scales_name, biases_name) = companion_names(&weight_name)?;
+        let scales_name = scales_name.into();
+        let biases_name = biases_name.map(Into::into);
+        validate_output_names(&weight_name, &scales_name, biases_name.as_deref())?;
         Ok(Self {
             weight_name,
             scales_name,
@@ -125,14 +125,14 @@ impl BoundedQuantizationTarget {
         }
     }
 
-    /// Returns the packed scale tensor name derived from this target.
-    pub fn scales_name(&self) -> String {
-        self.scales_name.clone()
+    /// Returns the exact packed scale tensor name.
+    pub fn scales_name(&self) -> &str {
+        &self.scales_name
     }
 
-    /// Returns the packed affine-bias tensor name derived from this target.
-    pub fn biases_name(&self) -> String {
-        self.biases_name.clone()
+    /// Returns the exact packed affine-bias tensor name, when declared.
+    pub fn biases_name(&self) -> Option<&str> {
+        self.biases_name.as_deref()
     }
 }
 
@@ -172,6 +172,12 @@ impl BoundedQuantizationPlan {
         targets.sort_by(|left, right| left.weight_name.cmp(&right.weight_name));
         let mut output_names = BTreeSet::new();
         for target in &targets {
+            if quantization.has_biases() && target.biases_name.is_none() {
+                return Err(quantization_error(format!(
+                    "bounded affine quantization target {:?} has no affine-bias identity",
+                    target.weight_name
+                )));
+            }
             for name in output_names_for(target, quantization)? {
                 if !output_names.insert(name.clone()) {
                     return Err(quantization_error(format!(
@@ -1034,7 +1040,7 @@ fn output_layouts(
     )?);
     if quantization.has_biases() {
         layouts.push(layout(
-            biases_name,
+            biases_name.expect("bounded plan validated affine-bias identity"),
             affine_dtype,
             prefix,
             scale_columns,
@@ -1228,7 +1234,12 @@ fn preflight_source_collisions(
 ) -> Result<(), Error> {
     let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
     for target in &plan.targets {
-        if source_keys.contains(&target.scales_name) || source_keys.contains(&target.biases_name) {
+        if source_keys.contains(&target.scales_name)
+            || target
+                .biases_name
+                .as_ref()
+                .is_some_and(|name| source_keys.contains(name))
+        {
             return Err(quantization_error(format!(
                 "bounded quantization target {:?} already has checkpoint quantization companions; implicit transcoding is unsupported",
                 target.weight_name
@@ -1244,31 +1255,37 @@ fn output_names_for(
 ) -> Result<Vec<String>, Error> {
     let mut names = vec![target.weight_name.clone(), target.scales_name.clone()];
     if quantization.has_biases() {
-        names.push(target.biases_name.clone());
+        names.push(
+            target
+                .biases_name
+                .clone()
+                .expect("bounded plan validated affine-bias identity"),
+        );
     }
     Ok(names)
 }
 
-fn companion_names(weight_name: &str) -> Result<(String, String), Error> {
-    if weight_name.trim().is_empty() {
+fn validate_output_names(
+    weight_name: &str,
+    scales_name: &str,
+    biases_name: Option<&str>,
+) -> Result<(), Error> {
+    if weight_name.trim().is_empty()
+        || scales_name.trim().is_empty()
+        || biases_name.is_some_and(|name| name.trim().is_empty())
+    {
         return Err(quantization_error(
-            "bounded quantization target name must not be empty",
+            "bounded quantization output identities must not be empty",
         ));
     }
-    if weight_name == ".weight" {
+    if weight_name == scales_name
+        || biases_name.is_some_and(|name| name == weight_name || name == scales_name)
+    {
         return Err(quantization_error(
-            "bounded quantization target prefix must not be empty",
+            "bounded quantization output identities must be distinct",
         ));
     }
-    Ok(weight_name.strip_suffix(".weight").map_or_else(
-        || {
-            (
-                format!("{weight_name}_scales"),
-                format!("{weight_name}_biases"),
-            )
-        },
-        |prefix| (format!("{prefix}.scales"), format!("{prefix}.biases")),
-    ))
+    Ok(())
 }
 
 fn checked_product(dimensions: &[usize], context: &'static str) -> Result<usize, Error> {
@@ -1314,6 +1331,26 @@ mod tests {
 
     fn cpu_context() -> ExecutionContext {
         ExecutionContext::new(Device::new(DeviceType::Cpu, 0))
+    }
+
+    fn test_target(weight_name: &str, source: DerivedWeightRecipe) -> BoundedQuantizationTarget {
+        let (scales, biases) = weight_name.strip_suffix(".weight").map_or_else(
+            || {
+                (
+                    format!("{weight_name}_scales"),
+                    format!("{weight_name}_biases"),
+                )
+            },
+            |prefix| (format!("{prefix}.scales"), format!("{prefix}.biases")),
+        );
+        BoundedQuantizationTarget::from_recipe(weight_name, scales, Some(biases), source).unwrap()
+    }
+
+    fn direct_test_target(weight_name: &str) -> BoundedQuantizationTarget {
+        test_target(
+            weight_name,
+            DerivedWeightRecipe::source(weight_name, TensorSelection::Full),
+        )
     }
 
     fn float_bytes(values: &[f32]) -> Vec<u8> {
@@ -1452,7 +1489,7 @@ mod tests {
         let (_directory, source, values) = direct_fixture();
         let context = cpu_context();
         let quantization = AffineQuantization::default();
-        let target = BoundedQuantizationTarget::direct("model.proj.weight").unwrap();
+        let target = direct_test_target("model.proj.weight");
         // One f32 source row (256 bytes) plus one packed affine output row
         // (32-byte weight, 4-byte scale, and 4-byte bias). The complete
         // quantized matrix is 320 bytes, so that runtime-sized budget is also
@@ -1512,7 +1549,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             quantization,
             640,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let transformed =
@@ -1539,8 +1576,8 @@ mod tests {
             quantization,
             4_640,
             [
-                BoundedQuantizationTarget::direct("model.first.weight").unwrap(),
-                BoundedQuantizationTarget::direct("model.second.weight").unwrap(),
+                direct_test_target("model.first.weight"),
+                direct_test_target("model.second.weight"),
             ],
         )
         .unwrap();
@@ -1583,7 +1620,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             quantization,
             640,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let transformed =
@@ -1599,7 +1636,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             AffineQuantization::default(),
             295,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let error = BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream())
@@ -1631,7 +1668,7 @@ mod tests {
         let context = cpu_context();
         let recipe =
             DerivedWeightRecipe::source("checkpoint.expert_1.weight", TensorSelection::Full);
-        let target = BoundedQuantizationTarget::from_recipe("local.expert.weight", recipe).unwrap();
+        let target = test_target("local.expert.weight", recipe);
         let plan =
             BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
         let transformed =
@@ -1680,7 +1717,7 @@ mod tests {
                 end: 3,
             },
         };
-        let target = BoundedQuantizationTarget::from_recipe("rank.expert.weight", recipe).unwrap();
+        let target = test_target("rank.expert.weight", recipe);
         let plan =
             BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
         let transformed =
@@ -1722,7 +1759,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             AffineQuantization::default(),
             296,
-            [BoundedQuantizationTarget::direct("model.experts.weight").unwrap()],
+            [direct_test_target("model.experts.weight")],
         )
         .unwrap();
         let transformed =
@@ -1771,7 +1808,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             AffineQuantization::default(),
             5_000,
-            [BoundedQuantizationTarget::direct("model.experts.weight").unwrap()],
+            [direct_test_target("model.experts.weight")],
         )
         .unwrap();
         let transformed =
@@ -1794,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_rank_three_bank_uses_atomic_runtime_companion_names() {
+    fn complete_rank_three_bank_preserves_exact_runtime_companion_names() {
         let values = matrix_values(2, 4, 64);
         let dense = Array::from_slice(&values, &[2, 4, 64]);
         let fixture = SyntheticGguf::dense(
@@ -1811,11 +1848,13 @@ mod tests {
         let context = cpu_context();
         let target = BoundedQuantizationTarget::from_recipe(
             "model.experts.down_proj",
+            "architecture.scale-table",
+            Some("architecture.zero-points"),
             DerivedWeightRecipe::source("checkpoint.experts.weight", TensorSelection::Full),
         )
         .unwrap();
-        assert_eq!(target.scales_name(), "model.experts.down_proj_scales");
-        assert_eq!(target.biases_name(), "model.experts.down_proj_biases");
+        assert_eq!(target.scales_name(), "architecture.scale-table");
+        assert_eq!(target.biases_name(), Some("architecture.zero-points"));
         let plan =
             BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
         let transformed =
@@ -1830,14 +1869,14 @@ mod tests {
         );
         assert_eq!(
             transformed
-                .source_metadata("model.experts.down_proj_scales")
+                .source_metadata("architecture.scale-table")
                 .unwrap()
                 .logical_shape,
             vec![2, 4, 1]
         );
         assert_eq!(
             transformed
-                .source_metadata("model.experts.down_proj_biases")
+                .source_metadata("architecture.zero-points")
                 .unwrap()
                 .logical_shape,
             vec![2, 4, 1]
@@ -1878,7 +1917,7 @@ mod tests {
                 end: 3,
             },
         };
-        let target = BoundedQuantizationTarget::from_recipe("rank.expert.weight", recipe).unwrap();
+        let target = test_target("rank.expert.weight", recipe);
         let plan =
             BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
         let transformed =
@@ -1926,7 +1965,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             AffineQuantization::default(),
             296,
-            [BoundedQuantizationTarget::direct("model.experts.weight").unwrap()],
+            [direct_test_target("model.experts.weight")],
         )
         .unwrap();
         let transformed =
@@ -1961,7 +2000,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             WeightQuantization::MxFp4,
             290,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let transformed =
@@ -1990,7 +2029,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             WeightQuantization::MxFp4,
             580,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let transformed =
@@ -2018,7 +2057,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             AffineQuantization::default(),
             320,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let transformed =
@@ -2049,7 +2088,7 @@ mod tests {
         let plan = BoundedQuantizationPlan::new(
             AffineQuantization::default(),
             296,
-            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+            [direct_test_target("model.proj.weight")],
         )
         .unwrap();
         let transformed = Arc::new(

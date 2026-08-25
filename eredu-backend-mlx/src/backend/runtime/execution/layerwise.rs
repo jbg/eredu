@@ -3,7 +3,6 @@
 //! Reusable MLX materialization, residency-transfer, sharding, and pipeline
 //! quantization capabilities used by the backend-neutral layered runtime.
 
-#[cfg(test)]
 use eredu_checkpoint::recipe::DerivedWeightRecipe;
 use eredu_checkpoint::{
     recipe::RecipeDtype,
@@ -24,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-use safemlx::{module::ModuleParameters, Stream};
+use safemlx::{module::ModuleParameters, Dtype, Stream};
 
 #[cfg(test)]
 use crate::backend::runtime::checkpoint::binding::{
@@ -45,6 +44,7 @@ use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyL
 #[cfg(test)]
 use eredu_core::residency::{OffloadUnitSpec, ResidencyPolicy};
 
+use eredu_nn::{LinearCompanionRole, ParameterMetadata, ParameterVisitor, Parameterized};
 use eredu_runtime::WeightMaterializationReport;
 
 fn is_temporary_residency_contention(error: &Error) -> bool {
@@ -395,20 +395,277 @@ impl Drop for DenseStreamGroupGuard {
 /// Group windows, lease lifetime, retained-state evaluation, stream
 /// synchronization, and telemetry stay centralized here. Adapter code owns only
 /// architecture math, cache validation, and runtime-unit construction.
-fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<String, RecipeDtype> {
-    let parameters = module.parameters().flatten();
-    parameters
-        .iter()
-        .filter(|(_, parameter)| parameter.dtype() == safemlx::Dtype::Uint32)
-        .map(|(name, _)| {
-            let canonical =
-                crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(name);
-            // Affine packed constructors publish F32 companions by contract.
-            // The physical companion names come from the typed quantization
-            // target; do not rediscover them by parsing flattened names here.
-            (canonical, RecipeDtype::F32)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PackedWeightCompanions {
+    weight_name: String,
+    scales_name: String,
+    biases_name: Option<String>,
+    affine_companion_dtype: RecipeDtype,
+}
+
+pub(crate) fn packed_weight_companions<M>(
+    module: &M,
+    quantization: WeightQuantization,
+) -> Result<BTreeMap<String, PackedWeightCompanions>, Error>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    struct Collector {
+        parameters: BTreeMap<String, Dtype>,
+        companions: BTreeMap<(String, LinearCompanionRole), (String, Dtype)>,
+        error: Option<Error>,
+    }
+
+    impl<'a> ParameterVisitor<'a, crate::MlxTensor> for Collector {
+        fn visit(&mut self, metadata: ParameterMetadata, value: &'a crate::MlxTensor) {
+            if self.error.is_some() {
+                return;
+            }
+            let name = metadata.id.as_str().to_owned();
+            self.parameters
+                .insert(name.clone(), value.as_array().dtype());
+            if let Some(role) = metadata.linear_companion {
+                let Some(weight) = metadata.linear_companion_of else {
+                    self.error = Some(Error::Quantization(format!(
+                        "linear quantization companion {name:?} has no primary weight identity"
+                    )));
+                    return;
+                };
+                if self
+                    .companions
+                    .insert(
+                        (weight.as_str().to_owned(), role),
+                        (name.clone(), value.as_array().dtype()),
+                    )
+                    .is_some()
+                {
+                    self.error = Some(Error::Quantization(format!(
+                        "linear weight {:?} declares more than one {role:?} companion",
+                        weight.as_str()
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut collector = Collector {
+        parameters: BTreeMap::new(),
+        companions: BTreeMap::new(),
+        error: None,
+    };
+    module.visit_parameters(&mut collector);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    let weights = collector
+        .companions
+        .keys()
+        .map(|(weight, _)| weight.clone())
+        .collect::<BTreeSet<_>>();
+    weights
+        .into_iter()
+        .map(|weight_name| {
+            let dtype = collector.parameters.get(&weight_name).ok_or_else(|| {
+                Error::Quantization(format!(
+                    "linear quantization companions reference missing weight {weight_name:?}"
+                ))
+            })?;
+            if *dtype != Dtype::Uint32 {
+                return Ok(None);
+            }
+            let (scales_name, scales_dtype) = collector
+                .companions
+                .remove(&(weight_name.clone(), LinearCompanionRole::Scale))
+                .ok_or_else(|| {
+                    Error::Quantization(format!(
+                        "packed linear weight {weight_name:?} has no declared scale companion"
+                    ))
+                })?;
+            let biases = collector
+                .companions
+                .remove(&(weight_name.clone(), LinearCompanionRole::AffineBias));
+            if quantization.has_biases() && biases.is_none() {
+                return Err(Error::Quantization(format!(
+                    "affine packed linear weight {weight_name:?} has no declared bias companion"
+                )));
+            }
+            let affine_companion_dtype = match scales_dtype {
+                Dtype::Float16 => RecipeDtype::F16,
+                Dtype::Bfloat16 => RecipeDtype::BF16,
+                Dtype::Float32 => RecipeDtype::F32,
+                Dtype::Uint8 if !quantization.has_biases() => RecipeDtype::F32,
+                dtype => {
+                    return Err(Error::Quantization(format!(
+                        "packed linear weight {weight_name:?} has unsupported scale dtype {dtype:?}"
+                    )))
+                }
+            };
+            if let Some((_, biases_dtype)) = &biases {
+                let expected = match affine_companion_dtype {
+                    RecipeDtype::F16 => Dtype::Float16,
+                    RecipeDtype::BF16 => Dtype::Bfloat16,
+                    RecipeDtype::F32 => Dtype::Float32,
+                    _ => unreachable!("selected affine companion dtype"),
+                };
+                if *biases_dtype != expected {
+                    return Err(Error::Quantization(format!(
+                        "packed linear weight {weight_name:?} has mismatched scale and bias dtypes"
+                    )));
+                }
+            }
+            let canonical = crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
+                &weight_name,
+            );
+            Ok(Some((
+                canonical,
+                PackedWeightCompanions {
+                    weight_name,
+                    scales_name,
+                    biases_name: biases.map(|(name, _)| name),
+                    affine_companion_dtype,
+                },
+            )))
         })
-        .collect()
+        .collect::<Result<Vec<_>, Error>>()
+        .map(|targets| targets.into_iter().flatten().collect())
+}
+
+type QuantizationRecipes = BTreeMap<String, (DerivedWeightRecipe, PackedWeightCompanions)>;
+
+fn collect_quantization_recipes(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    bindings: &[WeightBinding],
+    selected: &BTreeMap<String, PackedWeightCompanions>,
+    recipes: &mut QuantizationRecipes,
+    context: &str,
+) -> Result<(), Error> {
+    for binding in bindings {
+        if binding.is_alias() {
+            continue;
+        }
+        let recipe = binding.source_recipe();
+        let metadata = recipe.infer(store)?;
+        if !matches!(
+            metadata.dtype(),
+            RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+        ) || metadata.shape().len() < 2
+        {
+            continue;
+        }
+        let canonical =
+            crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+        let Some(companions) = selected.get(&canonical).cloned() else {
+            continue;
+        };
+        let target = companions.weight_name.clone();
+        match recipes.entry(target.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((recipe, companions));
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get() != &(recipe, companions) =>
+            {
+                return Err(Error::Quantization(format!(
+                    "{context} target {target:?} has conflicting semantic recipes"
+                )));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod packed_weight_companion_tests {
+    use super::*;
+    use crate::backend::nn::shared::MlxNeuralBackend;
+    use eredu_checkpoint::store::MemoryWeightStore;
+    use eredu_checkpoint::AffineQuantization;
+    use eredu_nn::{LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    fn parameter(name: &str) -> ParameterSpec {
+        ParameterSpec::trainable(name).unwrap()
+    }
+
+    #[test]
+    fn quantized_store_preserves_nonconventional_architecture_companion_names() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weight_name = "encoder.blocks.3.projection.kernel";
+        let source = MlxNeuralBackend::linear(
+            LinearSpec {
+                input: 64,
+                output: 8,
+                weight: parameter(weight_name),
+                bias: None,
+                format: LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap(),
+            },
+            context.stream(),
+        )
+        .unwrap();
+        let format = LinearFormatSpec::affine(
+            WeightQuantization::Affine(AffineQuantization::default()).into(),
+            parameter("encoder.blocks.3.quantization.scale-table"),
+            parameter("encoder.blocks.3.quantization.zero-points"),
+        )
+        .unwrap();
+        let linear = MlxNeuralBackend::linear(
+            LinearSpec {
+                input: 64,
+                output: 8,
+                weight: parameter(weight_name),
+                bias: None,
+                format,
+            },
+            context.stream(),
+        )
+        .unwrap();
+
+        let companions = packed_weight_companions(
+            &linear,
+            WeightQuantization::Affine(AffineQuantization::default()),
+        )
+        .unwrap();
+        let target = companions
+            .get("encoder.blocks.3.projection.kernel")
+            .unwrap();
+        assert_eq!(target.weight_name, "encoder.blocks.3.projection.kernel");
+        assert_eq!(
+            target.scales_name,
+            "encoder.blocks.3.quantization.scale-table"
+        );
+        assert_eq!(
+            target.biases_name.as_deref(),
+            Some("encoder.blocks.3.quantization.zero-points")
+        );
+
+        let store: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                weight_name.to_owned(),
+                safetensors::Dtype::F32,
+                vec![8, 64],
+                vec![0; 8 * 64 * size_of::<f32>()],
+            )])
+            .unwrap(),
+        );
+        let (quantized, _) = quantize_parameterized_module_store(
+            store,
+            &source,
+            &linear,
+            WeightQuantization::Affine(AffineQuantization::default()),
+            context.stream(),
+        )
+        .unwrap();
+        assert!(quantized
+            .source_metadata("encoder.blocks.3.quantization.scale-table")
+            .is_ok());
+        assert!(quantized
+            .source_metadata("encoder.blocks.3.quantization.zero-points")
+            .is_ok());
+        assert!(quantized
+            .source_metadata("encoder.blocks.3.projection.kernel_scales")
+            .is_err());
+    }
 }
 
 pub fn quantize_parameterized_store<SM, U, SF, TF>(
@@ -428,56 +685,24 @@ where
     TF: FnMut(usize, &Stream) -> Result<U, Error>,
 {
     let mut recipes = BTreeMap::new();
-    let mut collect = |bindings: &[WeightBinding], selected: &BTreeMap<String, RecipeDtype>| {
-        for binding in bindings {
-            if binding.is_alias() {
-                continue;
-            }
-            let recipe = binding.source_recipe();
-            let metadata = recipe.infer(store.as_ref())?;
-            if !matches!(
-                metadata.dtype(),
-                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-            ) || metadata.shape().len() < 2
-            {
-                continue;
-            }
-            let canonical = crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                binding.name(),
-            );
-            let Some(companion_dtype) = selected.get(&canonical).cloned() else {
-                continue;
-            };
-            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-            match recipes.entry(target.to_string()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((recipe, companion_dtype));
-                }
-                std::collections::btree_map::Entry::Occupied(entry)
-                    if entry.get() != &(recipe, companion_dtype) =>
-                {
-                    return Err(Error::Quantization(format!(
-                        "load-time quantization target {target:?} has conflicting semantic recipes"
-                    )));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-        Ok::<(), Error>(())
-    };
-
     let source_static = crate::backend::nn::shared::MlxModule::new(source_static.clone());
     let target_static = crate::backend::nn::shared::MlxModule::new(target_static.clone());
-    collect(
+    collect_quantization_recipes(
+        store.as_ref(),
         &build_module_bindings(&source_static, "", store.as_ref())?,
-        &packed_weight_companion_dtypes(&target_static),
+        &packed_weight_companions(&target_static, quantization)?,
+        &mut recipes,
+        "load-time quantization",
     )?;
     for index in 0..unit_count {
         let source = crate::backend::nn::shared::MlxModule::new(source_unit(index, stream)?);
         let target = crate::backend::nn::shared::MlxModule::new(target_unit(index, stream)?);
-        collect(
+        collect_quantization_recipes(
+            store.as_ref(),
             &build_module_bindings(&source, "", store.as_ref())?,
-            &packed_weight_companion_dtypes(&target),
+            &packed_weight_companions(&target, quantization)?,
+            &mut recipes,
+            "load-time quantization",
         )?;
     }
     if recipes.is_empty() {
@@ -488,11 +713,16 @@ where
     }
     let targets = recipes
         .into_iter()
-        .map(|(target, (recipe, companion_dtype))| {
-            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+        .map(|(target, (recipe, companions))| {
+            let target = BoundedQuantizationTarget::from_recipe(
+                target,
+                companions.scales_name,
+                companions.biases_name,
+                recipe,
+            )?;
             match quantization {
                 WeightQuantization::Affine(_) => {
-                    target.with_affine_companion_dtype(companion_dtype)
+                    target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(
@@ -558,8 +788,8 @@ pub fn quantize_module_store_with_bindings<SM, U, SF, TF, SB, UB>(
     mut unit_bindings: UB,
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
-    SM: ModuleParameters,
-    U: ModuleParameters,
+    SM: ModuleParameters + Parameterized<crate::MlxTensor>,
+    U: ModuleParameters + Parameterized<crate::MlxTensor>,
     SF: FnMut(usize, &Stream) -> Result<U, Error>,
     TF: FnMut(usize, &Stream) -> Result<U, Error>,
     SB: FnOnce(
@@ -573,54 +803,22 @@ where
     ) -> Result<Vec<WeightBinding>, Error>,
 {
     let mut recipes = BTreeMap::new();
-    let mut collect = |bindings: &[WeightBinding], selected: &BTreeMap<String, RecipeDtype>| {
-        for binding in bindings {
-            if binding.is_alias() {
-                continue;
-            }
-            let recipe = binding.source_recipe();
-            let metadata = recipe.infer(store.as_ref())?;
-            if !matches!(
-                metadata.dtype(),
-                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-            ) || metadata.shape().len() < 2
-            {
-                continue;
-            }
-            let canonical = crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                binding.name(),
-            );
-            let Some(companion_dtype) = selected.get(&canonical).cloned() else {
-                continue;
-            };
-            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-            match recipes.entry(target.to_string()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((recipe, companion_dtype));
-                }
-                std::collections::btree_map::Entry::Occupied(entry)
-                    if entry.get() != &(recipe, companion_dtype) =>
-                {
-                    return Err(Error::Quantization(format!(
-                        "load-time quantization target {target:?} has conflicting semantic recipes"
-                    )));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-        Ok::<(), Error>(())
-    };
-
-    collect(
+    collect_quantization_recipes(
+        store.as_ref(),
         &static_bindings(source_static, store.as_ref())?,
-        &packed_weight_companion_dtypes(target_static),
+        &packed_weight_companions(target_static, quantization)?,
+        &mut recipes,
+        "load-time quantization",
     )?;
     for index in 0..unit_count {
         let source = source_unit(index, stream)?;
         let target = target_unit(index, stream)?;
-        collect(
+        collect_quantization_recipes(
+            store.as_ref(),
             &unit_bindings(index, &source, store.as_ref())?,
-            &packed_weight_companion_dtypes(&target),
+            &packed_weight_companions(&target, quantization)?,
+            &mut recipes,
+            "load-time quantization",
         )?;
     }
     if recipes.is_empty() {
@@ -631,11 +829,16 @@ where
     }
     let targets = recipes
         .into_iter()
-        .map(|(target, (recipe, companion_dtype))| {
-            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+        .map(|(target, (recipe, companions))| {
+            let target = BoundedQuantizationTarget::from_recipe(
+                target,
+                companions.scales_name,
+                companions.biases_name,
+                recipe,
+            )?;
             match quantization {
                 WeightQuantization::Affine(_) => {
-                    target.with_affine_companion_dtype(companion_dtype)
+                    target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(
@@ -688,12 +891,13 @@ impl<'a> PipelineStageQuantizationSelection<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn quantize_pipeline_stage_store_with<L, SU, Q, SL, TL, LB>(
+pub(crate) fn quantize_pipeline_stage_store_with<L, SU, Q, SL, TL, LB>(
     store: SharedCheckpointSource,
     selection: PipelineStageQuantizationSelection<'_>,
     quantization: WeightQuantization,
     stream: &Stream,
     model_type: &str,
+    static_companions: BTreeMap<String, PackedWeightCompanions>,
     source_static_units: SU,
     quantizes_static_binding: Q,
     mut source_layer: SL,
@@ -701,7 +905,7 @@ pub fn quantize_pipeline_stage_store_with<L, SU, Q, SL, TL, LB>(
     mut layer_bindings: LB,
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
-    L: ModuleParameters,
+    L: ModuleParameters + Parameterized<crate::MlxTensor>,
     SU: FnOnce(
         &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error>,
@@ -716,78 +920,42 @@ where
     ) -> Result<Vec<WeightBinding>, Error>,
 {
     let mut recipes = BTreeMap::new();
-    let mut collect =
-        |bindings: &[WeightBinding],
-         selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
-            for binding in bindings {
-                if binding.is_alias() {
-                    continue;
-                }
-                let recipe = binding.source_recipe();
-                let metadata = recipe.infer(store.as_ref())?;
-                if !matches!(
-                    metadata.dtype(),
-                    RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-                ) || metadata.shape().len() < 2
-                {
-                    continue;
-                }
-                let canonical_local =
-                    crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        binding.name(),
-                    );
-                if selected_local_weights
-                    .is_some_and(|selected| !selected.contains_key(&canonical_local))
-                {
-                    continue;
-                }
-                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-                let companion_dtype = selected_local_weights
-                    .and_then(|selected| selected.get(&canonical_local))
-                    .cloned()
-                    .unwrap_or(RecipeDtype::F32);
-                match recipes.entry(target.to_string()) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert((recipe, companion_dtype));
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() != &(recipe, companion_dtype) =>
-                    {
-                        return Err(Error::Quantization(format!(
-                        "pipeline load-time quantization target {target:?} has conflicting semantic recipes"
-                    )));
-                    }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
-                }
-            }
-            Ok::<(), Error>(())
-        };
-
     for unit in source_static_units(store.as_ref())? {
-        let selected = unit
+        let selected_names = unit
             .bindings()
             .iter()
             .filter(|binding| quantizes_static_binding(binding))
             .map(|binding| {
-                (
-                    crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        binding.name(),
-                    ),
-                    RecipeDtype::F32,
+                crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
+                    binding.name(),
                 )
             })
+            .collect::<BTreeSet<_>>();
+        let selected = static_companions
+            .iter()
+            .filter(|(name, _)| selected_names.contains(*name))
+            .map(|(name, companions)| (name.clone(), companions.clone()))
             .collect::<BTreeMap<_, _>>();
-        collect(unit.bindings(), Some(&selected))?;
+        collect_quantization_recipes(
+            store.as_ref(),
+            unit.bindings(),
+            &selected,
+            &mut recipes,
+            "pipeline load-time quantization",
+        )?;
     }
 
     for (group, range) in selection.layer_groups {
         for index in range {
             let source_layer = source_layer(group, index, stream)?;
             let target_layer = target_layer(group, index, stream)?;
-            let selected = packed_weight_companion_dtypes(&target_layer);
-            collect(
+            let selected = packed_weight_companions(&target_layer, quantization)?;
+            collect_quantization_recipes(
+                store.as_ref(),
                 &layer_bindings(group, index, &source_layer, store.as_ref())?,
-                Some(&selected),
+                &selected,
+                &mut recipes,
+                "pipeline load-time quantization",
             )?;
         }
     }
@@ -800,11 +968,16 @@ where
     }
     let targets = recipes
         .into_iter()
-        .map(|(target, (recipe, companion_dtype))| {
-            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+        .map(|(target, (recipe, companions))| {
+            let target = BoundedQuantizationTarget::from_recipe(
+                target,
+                companions.scales_name,
+                companions.biases_name,
+                recipe,
+            )?;
             match quantization {
                 WeightQuantization::Affine(_) => {
-                    target.with_affine_companion_dtype(companion_dtype)
+                    target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(

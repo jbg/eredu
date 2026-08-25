@@ -648,6 +648,10 @@ pub struct ParameterSpec {
     pub alias_of: Option<ParameterId>,
     /// Optional atomic encoding or sharding group.
     pub group: Option<String>,
+    /// Semantic role within an encoded linear parameter group.
+    pub linear_companion: Option<LinearCompanionRole>,
+    /// Primary linear weight owned by this physical companion.
+    pub linear_companion_of: Option<ParameterId>,
 }
 
 impl ParameterSpec {
@@ -658,8 +662,19 @@ impl ParameterSpec {
             trainable: true,
             alias_of: None,
             group: None,
+            linear_companion: None,
+            linear_companion_of: None,
         })
     }
+}
+
+/// Semantic role of a physical companion in an encoded linear parameter.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LinearCompanionRole {
+    /// Per-group or per-block scale tensor.
+    Scale,
+    /// Per-group affine zero-point/bias tensor.
+    AffineBias,
 }
 
 /// Parameter metadata observed during traversal.
@@ -673,6 +688,10 @@ pub struct ParameterMetadata {
     pub alias_of: Option<ParameterId>,
     /// Optional atomic parameter group.
     pub group: Option<String>,
+    /// Semantic role within an encoded linear parameter group.
+    pub linear_companion: Option<LinearCompanionRole>,
+    /// Primary linear weight owned by this physical companion.
+    pub linear_companion_of: Option<ParameterId>,
 }
 
 impl ParameterMetadata {
@@ -683,6 +702,8 @@ impl ParameterMetadata {
             trainable,
             alias_of: spec.alias_of.clone(),
             group: spec.group.clone(),
+            linear_companion: spec.linear_companion,
+            linear_companion_of: spec.linear_companion_of.clone(),
         }
     }
 }
@@ -837,6 +858,9 @@ impl LinearFormatSpec {
 
     /// Declares an encoding with one exact scale companion.
     pub fn scaled(format: LinearFormat, scale: ParameterSpec) -> Result<Self, Error> {
+        let mut scale = scale;
+        scale.linear_companion = Some(LinearCompanionRole::Scale);
+        scale.linear_companion_of = None;
         let spec = Self {
             format,
             scale: Some(scale),
@@ -852,6 +876,12 @@ impl LinearFormatSpec {
         scale: ParameterSpec,
         affine_bias: ParameterSpec,
     ) -> Result<Self, Error> {
+        let mut scale = scale;
+        scale.linear_companion = Some(LinearCompanionRole::Scale);
+        scale.linear_companion_of = None;
+        let mut affine_bias = affine_bias;
+        affine_bias.linear_companion = Some(LinearCompanionRole::AffineBias);
+        affine_bias.linear_companion_of = None;
         let spec = Self {
             format,
             scale: Some(scale),
@@ -900,6 +930,19 @@ impl LinearFormatSpec {
         {
             return Err(Error::backend(
                 "linear scale and affine-bias companions require distinct identities",
+            ));
+        }
+        if self
+            .scale
+            .as_ref()
+            .is_some_and(|scale| scale.linear_companion != Some(LinearCompanionRole::Scale))
+            || self
+                .affine_bias
+                .as_ref()
+                .is_some_and(|bias| bias.linear_companion != Some(LinearCompanionRole::AffineBias))
+        {
+            return Err(Error::backend(
+                "linear format companions have invalid semantic roles",
             ));
         }
         Ok(())
@@ -4802,6 +4845,8 @@ mod parameter_topology_tests {
                 trainable: true,
                 alias_of: Some(ParameterId::new("missing.weight").unwrap()),
                 group: None,
+                linear_companion: None,
+                linear_companion_of: None,
             },
             1,
         );
