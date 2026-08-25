@@ -11980,17 +11980,24 @@ fn nemotron_tp2_target_mtp_matches_replicated_and_rolls_back_draft_state() {
     let context = NumericContext::default();
     let architecture =
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let mut groups =
-        nemotron_h::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
-    let addresses = [(0, 0), (0, 1), (0, 2), (1, 0)];
-    for (flat, (group, index)) in addresses.iter().copied().enumerate() {
-        let unit = <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
-            NumericBackend,
-            DeviceState<NumericBackend, NumericHybridLayerState>,
-        >>::build_unit(&architecture, group, index, &context)
+    let parameter_description = architecture.parameter_description(&context).unwrap();
+    let groups = parameter_description
+        .groups()
+        .iter()
+        .map(|owned| owned.group().clone())
+        .collect::<Vec<_>>();
+    let addresses: [(usize, usize); 4] = (0..parameter_description.unit_layout().len())
+        .map(|ordinal| {
+            let address = parameter_description
+                .unit_layout()
+                .address(ordinal)
+                .unwrap();
+            (address.group(), address.index())
+        })
+        .collect::<Vec<_>>()
+        .try_into()
         .unwrap();
-        groups.extend(nemotron_h::unit_parallel_parameter_groups(&unit, &args, flat).unwrap());
-    }
+    assert_eq!(addresses, [(0, 0), (0, 1), (0, 2), (1, 0)]);
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
         architecture.runtime_state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),

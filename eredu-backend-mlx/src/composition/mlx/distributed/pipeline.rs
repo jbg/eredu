@@ -4230,6 +4230,48 @@ where
         .collect())
 }
 
+fn architecture_prediction_unit_ranges<A, S>(
+    architecture: &A,
+    description: &eredu_runtime::ArchitectureParameterDescription,
+) -> Result<Vec<(usize, Range<usize>)>, Error>
+where
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Error: std::fmt::Display,
+{
+    // Resolve group-local construction indices from the architecture's flat
+    // residency order instead of recreating a family prediction schedule.
+    architecture_prediction_groups::<A, S>(architecture)?
+        .into_iter()
+        .map(|group| {
+            let flat = description
+                .unit_layout()
+                .group_range(group)
+                .ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "parameter description has no execution group {group}"
+                    ))
+                })?;
+            let local = if flat.is_empty() {
+                0..0
+            } else {
+                let first = description
+                    .unit_layout()
+                    .address(flat.start)
+                    .expect("validated group range starts at a canonical unit")
+                    .index();
+                let last = description
+                    .unit_layout()
+                    .address(flat.end - 1)
+                    .expect("validated group range ends at a canonical unit")
+                    .index();
+                first..last + 1
+            };
+            Ok((group, local))
+        })
+        .collect()
+}
+
 fn architecture_single_prediction_units<A, S>(
     architecture: &A,
     description: &eredu_runtime::ArchitectureParameterDescription,
@@ -4239,28 +4281,16 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
-    architecture_prediction_groups::<A, S>(architecture)?
+    architecture_prediction_unit_ranges::<A, S>(architecture, description)?
         .into_iter()
-        .map(|group| {
-            let range = description
-                .unit_layout()
-                .group_range(group)
-                .ok_or_else(|| {
-                    Error::Parallel(format!(
-                        "parameter description has no execution group {group}"
-                    ))
-                })?;
+        .map(|(group, range)| {
             if range.len() != 1 {
                 return Err(Error::Parallel(format!(
                     "output-owner prediction group {group} declares {} units, expected one",
                     range.len()
                 )));
             }
-            let address = description
-                .unit_layout()
-                .address(range.start)
-                .expect("validated prediction range contains its unit");
-            Ok((group, address.index()))
+            Ok((group, range.start))
         })
         .collect()
 }
@@ -17970,10 +18000,6 @@ fn load_nemotron_h_pipeline(
     } else {
         NemotronHBindings::new()
     };
-    topology.preflight(
-        Some(source_args.num_hidden_layers as usize),
-        external_experts.then_some(source_args.n_routed_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -17996,60 +18022,34 @@ fn load_nemotron_h_pipeline(
     } else {
         NemotronHBindings::new()
     };
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let global_architecture =
         eredu_architectures::nemotron_h::LayeredModel::<MlxNeuralBackend>::new(
             target_args.clone(),
             stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut parameter_groups = eredu_architectures::nemotron_h::static_parallel_parameter_groups::<
-        MlxNeuralBackend,
-    >(global_architecture.static_modules())?;
-    let target_units = target_args.num_hidden_layers as usize;
-    let prediction_steps = target_args.num_nextn_predict_layers as usize;
-    let prediction_units = target_args
-        .mtp_policies()
-        .map_err(|error| Error::Parallel(error.to_string()))?
-        .len();
-    let prediction_pattern = prediction_units.checked_div(prediction_steps).unwrap_or(0);
+    let binding_parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
-    let prediction_groups = (0..prediction_steps)
-        .map(|depth| {
-            architecture_prediction_group::<_, MlxHybridState>(&global_architecture, depth)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for index in 0..target_units {
-        let unit = global_architecture
-            .construct_unit(decoder_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            eredu_architectures::nemotron_h::unit_parallel_parameter_groups(
-                &unit,
-                &target_args,
-                index,
-            )?,
-        );
-    }
-    for (depth, &prediction_group) in prediction_groups.iter().enumerate() {
-        for index in 0..prediction_pattern {
-            let unit = global_architecture
-                .construct_unit(prediction_group, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            let flat = target_units + depth * prediction_pattern + index;
-            parameter_groups.extend(
-                eredu_architectures::nemotron_h::unit_parallel_parameter_groups(
-                    &unit,
-                    &target_args,
-                    flat,
-                )?,
-            );
-        }
-    }
+    let target_units = binding_parameter_description
+        .unit_layout()
+        .group_range(decoder_group)
+        .ok_or_else(|| Error::Parallel("Nemotron-H parameter plan has no target group".into()))?
+        .len();
+    let prediction_units = architecture_prediction_unit_ranges::<_, MlxHybridState>(
+        &global_architecture,
+        &binding_parameter_description,
+    )?;
+    topology.preflight(
+        Some(target_units),
+        external_experts.then_some(source_args.n_routed_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
     let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
     let mut planner = build.planner();
-    for group in parameter_groups.iter().cloned() {
-        planner.register(group)?;
+    for group in binding_parameter_description.groups() {
+        planner.register(group.group().clone())?;
     }
     let (_, planned_layout) = planner.finish()?;
     let geometry = Arc::new(
@@ -18124,15 +18124,16 @@ fn load_nemotron_h_pipeline(
         .range()
         .map(|global_layer| stage.build_unit(decoder_group, global_layer, stream))
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp = stage.range().end == target_units && prediction_steps > 0;
+    let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
     info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp { prediction_steps } else { 0 };
-    info.global_embedded_mtp_layers = prediction_steps;
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
+    info.global_embedded_mtp_layers = prediction_units.len();
     if owns_mtp {
-        for &group in &prediction_groups {
+        for (group, units) in &prediction_units {
             stage.prediction_layers.push(
-                (0..prediction_pattern)
-                    .map(|index| stage.build_unit(group, index, stream))
+                units
+                    .clone()
+                    .map(|index| stage.build_unit(*group, index, stream))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -18147,8 +18148,8 @@ fn load_nemotron_h_pipeline(
                 stage.range().clone(),
             );
             if owns_mtp {
-                for &group in &prediction_groups {
-                    selection = selection.with_layer_group(group, 0..prediction_pattern);
+                for (group, units) in &prediction_units {
+                    selection = selection.with_layer_group(*group, units.clone());
                 }
             }
             let source_quantization =
@@ -18240,11 +18241,11 @@ fn load_nemotron_h_pipeline(
     if owns_mtp {
         let architecture = &stage.architecture;
         for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
-            let group = prediction_groups[depth];
-            for (index, layer) in layers.iter_mut().enumerate() {
+            let (group, units) = &prediction_units[depth];
+            for (index, layer) in units.clone().zip(layers) {
                 let bindings = binding_adapter.cartesian_layer_bindings(
                     architecture,
-                    group,
+                    *group,
                     index,
                     layer,
                     store.as_ref(),
@@ -18255,7 +18256,7 @@ fn load_nemotron_h_pipeline(
                     loaded.load_excluding_roles(
                         architecture_parameter_unit_owner::<_, MlxHybridState>(
                             architecture,
-                            group,
+                            *group,
                             index,
                         )?,
                         layer,
@@ -18270,7 +18271,7 @@ fn load_nemotron_h_pipeline(
                     loaded.load(
                         architecture_parameter_unit_owner::<_, MlxHybridState>(
                             architecture,
-                            group,
+                            *group,
                             index,
                         )?,
                         layer,
