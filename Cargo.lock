@@ -855,7 +855,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
  "tokenizers 0.23.1",
  "toktrie_hf_tokenizers",
@@ -997,7 +996,6 @@ version = "0.1.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn-macros",
- "serde",
  "thiserror",
 ]
 
@@ -2842,7 +2840,6 @@ dependencies = [
  "float_eq",
  "half",
  "itertools 0.15.0",
- "libc",
  "num-complex",
  "num-traits",
  "num_enum",
@@ -2883,7 +2880,6 @@ name = "safemlx-sys"
 version = "0.2.0"
 dependencies = [
  "bindgen",
- "cc",
  "cmake",
 ]
 

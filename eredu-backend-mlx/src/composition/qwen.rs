@@ -1,4 +1,4 @@
-//! Unified Qwen/Mistral loading across weight-residency policies.
+//! Unified Qwen loading across weight-residency policies.
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
@@ -366,7 +366,7 @@ pub fn quantize_neutral_qwen_store(
     Ok((store, target_args, report))
 }
 
-/// Qwen/Mistral causal LM whose execution engine follows its residency policy.
+/// Qwen causal LM whose execution engine follows its residency policy.
 pub struct QwenModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
@@ -1297,7 +1297,7 @@ fn load_neutral_qwen_parallel(
     })
 }
 
-/// Loads Qwen/Mistral through the generalized tensor-parallel execution engine.
+/// Loads Qwen through the generalized tensor-parallel execution engine.
 pub fn load_qwen_tensor_parallel_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
@@ -1380,7 +1380,7 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
     Ok(model)
 }
 
-/// Loads a Qwen/Mistral GGUF checkpoint using the selected residency policy.
+/// Loads a Qwen GGUF checkpoint using the selected residency policy.
 pub(crate) fn load_qwen_gguf_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,

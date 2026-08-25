@@ -53,6 +53,8 @@ execution, distributed, and model-composition support.
 
 | Feature | Additional support |
 | --- | --- |
+| `accelerate` | Accelerate-backed operations on Apple platforms |
+| `metal` | Metal execution on Apple platforms |
 | `media` | Typed multimodal processor and request preparation |
 | `image` | Image/video decoding primitives; implies `media` |
 | `audio` | Audio preprocessing; implies `media` |

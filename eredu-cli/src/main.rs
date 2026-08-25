@@ -37,6 +37,7 @@ use eredu_checkpoint::store::WeightStoreDiagnostics;
 use eredu_core::{
     residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     speculative::MtpStats,
+    RealizedDrafting,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
@@ -285,15 +286,8 @@ struct Cli {
     #[arg(long, value_name = "REVISION")]
     revision: Option<String>,
 
-    /// Acknowledge target and draft GGUFs from different cached commits.
-    ///
-    /// Mixed revisions are permitted by default after runtime compatibility
-    /// validation; this flag suppresses the provenance warning.
-    #[arg(long)]
-    allow_mixed_revisions: bool,
-
     /// Require target and draft GGUFs from one cached repository commit.
-    #[arg(long, conflicts_with = "allow_mixed_revisions")]
+    #[arg(long)]
     require_same_revision: bool,
 
     /// Maximum generated tokens. Defaults to the checkpoint value, then 256.
@@ -1941,14 +1935,7 @@ fn main() -> Result<()> {
         args.revision.as_deref(),
     )?;
     if let Some(draft) = &resolved_draft {
-        let mixed_revisions =
-            validate_artifact_pair(&resolved_model, draft, args.require_same_revision)?;
-        if mixed_revisions && !args.allow_mixed_revisions {
-            eprintln!(
-                "warning: target and draft artifacts come from different cached commits of {:?}; repository revision is provenance, not an MTP compatibility key (use --require-same-revision to enforce provenance equality or --allow-mixed-revisions to suppress this warning)",
-                resolved_model.repository.as_deref().unwrap_or("unknown"),
-            );
-        }
+        validate_artifact_pair(&resolved_model, draft, args.require_same_revision)?;
     }
     let model_path = resolved_model.path;
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
@@ -2269,7 +2256,7 @@ fn main() -> Result<()> {
     }
     let mut stderr = stderr.lock();
 
-    let drafting_enabled = !matches!(&drafting, eredu::RealizedDrafting::Disabled);
+    let drafting_enabled = !matches!(&drafting, RealizedDrafting::Disabled);
     let _component_timing_guard = args.verbose.then(LocalMtpComponentTimingGuard::enable);
     let scheduler_options = MtpSchedulerOptions {
         adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
@@ -3112,7 +3099,7 @@ fn validate_artifact_pair(
     target: &ResolvedModel,
     draft: &ResolvedModel,
     require_same_revision: bool,
-) -> Result<bool> {
+) -> Result<()> {
     let same_repository = target.repository.is_some() && target.repository == draft.repository;
     let mixed_commits = target.commit_hash.is_some()
         && draft.commit_hash.is_some()
@@ -3128,7 +3115,7 @@ fn validate_artifact_pair(
             target.repository.as_deref().unwrap_or("unknown"),
         );
     }
-    Ok(mixed_revisions)
+    Ok(())
 }
 
 fn split_hf_model_spec(spec: &str) -> Result<(&str, Option<&str>)> {
@@ -4550,7 +4537,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_repository_revisions_are_advisory_unless_strictly_required() {
+    fn mixed_repository_revisions_are_permitted_unless_strictly_required() {
         let target = ResolvedModel {
             path: "target.gguf".into(),
             repository: Some("owner/model".into()),
@@ -4562,13 +4549,13 @@ mod tests {
             commit_hash: Some("draft-commit".into()),
         };
 
-        assert!(validate_artifact_pair(&target, &draft, false).unwrap());
+        validate_artifact_pair(&target, &draft, false).unwrap();
         let error = validate_artifact_pair(&target, &draft, true).unwrap_err();
         assert!(error.to_string().contains("--require-same-revision"));
 
         let mut other_repository = draft;
         other_repository.repository = Some("owner/assistant".into());
-        assert!(!validate_artifact_pair(&target, &other_repository, false).unwrap());
+        validate_artifact_pair(&target, &other_repository, false).unwrap();
     }
 
     #[test]

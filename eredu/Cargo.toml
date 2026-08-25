@@ -77,7 +77,11 @@ features = ["mlx-image", "mlx-audio"]
 [features]
 default = ["mlx", "onig", "esaxx_fast"]
 
-mlx = ["dep:eredu-backend-mlx"]
+mlx = [
+    "dep:eredu-backend-mlx",
+    "eredu-backend-mlx/accelerate",
+    "eredu-backend-mlx/metal",
+]
 cuda = ["mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
@@ -107,4 +111,3 @@ toktrie_hf_tokenizers = "=1.7.6"
 
 [dev-dependencies]
 anyhow = "1"
-tempfile.workspace = true

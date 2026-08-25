@@ -33,6 +33,8 @@ required-features = ["codec"]
 
 [features]
 default = []
+accelerate = ["safemlx/accelerate"]
+metal = ["safemlx/metal"]
 cuda = ["safemlx/cuda"]
 nccl = ["cuda", "safemlx/nccl"]
 media = []
@@ -48,7 +50,7 @@ eredu-runtime.workspace = true
 eredu-architectures.workspace = true
 eredu-gguf.workspace = true
 eredu-codec = { workspace = true, optional = true }
-safemlx = { workspace = true, features = ["safetensors"] }
+safemlx = { workspace = true, default-features = false, features = ["safetensors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 safetensors = "0.8"
@@ -67,5 +69,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eredu-evaluation.workspace = true
 eredu-text = { workspace = true, default-features = false }
-libc = "0.2"
 tempfile.workspace = true

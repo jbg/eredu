@@ -105,7 +105,7 @@ pub fn discover_hardware() -> HardwareProfile {
     #[allow(unused_mut)] // Native-device probe diagnostics are target and feature gated.
     let mut details: Vec<String> = Vec::new();
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         let (available, detail) = match safemlx::metal::is_available() {
             Ok(available) => (available, None),

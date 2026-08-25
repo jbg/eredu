@@ -21,15 +21,19 @@ eredu-core        eredu-checkpoint        eredu-nn
 The neutral crates contain no native accelerator dependency under any feature.
 The `eredu` facade is also portable when built with
 `default-features = false`. Its default `mlx` feature selects the optional
-`eredu-backend-mlx` crate. The facade exposes a flat, application-facing local
-adapter under `eredu::api`; it does not reproduce the implementation crate's
-backend or composition module tree. Backend-internal fixtures and composition
-tests are crate-private unit tests; published crates expose no test-support
-feature or fixture namespace. The facade does not directly depend on `eredu-nn`
-in production; facade tests that exercise neutral neural contracts use it as a
-development dependency. Direct MLX backend users enable `image` and `audio`;
-the facade forwards its `mlx-image` and `mlx-audio` features to those backend
-features. Backend feature diagnostics name both active public spellings.
+`eredu-backend-mlx` crate and explicitly enables that crate's `accelerate` and
+`metal` features. The backend crate itself has no default features and disables
+the `safemlx` defaults, so direct backend users select native execution support
+explicitly. The facade exposes a flat, application-facing local adapter under
+`eredu::api`; it does not reproduce the implementation crate's backend or
+composition module tree. Backend-internal fixtures and composition tests are
+crate-private unit tests; published crates expose no test-support feature or
+fixture namespace. The facade does not directly depend on `eredu-nn` in
+production; facade tests that exercise neutral neural contracts use it as a
+development dependency. Direct MLX backend users also enable `image` and
+`audio` as needed; the facade forwards its `mlx-image` and `mlx-audio` features
+to those backend features. Backend feature diagnostics name both active public
+spellings.
 
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same

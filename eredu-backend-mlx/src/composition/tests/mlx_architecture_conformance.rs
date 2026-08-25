@@ -39,10 +39,13 @@ fn every_layered_family_exposes_authoritative_geometry_and_parameter_binding() {
 fn mlx_execution() -> Option<ExecutionContext> {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     let available = AVAILABLE.get_or_init(|| {
-        match safemlx::metal::is_available() {
-            Ok(true) => {}
-            Ok(false) => return false,
-            Err(error) => panic!("MLX Metal availability probe failed: {error}"),
+        #[cfg(feature = "metal")]
+        {
+            match safemlx::metal::is_available() {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => panic!("MLX Metal availability probe failed: {error}"),
+            }
         }
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         match safemlx::ops::zeros::<f32>(&[1], execution.stream())

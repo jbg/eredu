@@ -33,7 +33,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.89.0"
 
 [workspace.dependencies]
-safemlx = { version = "0.2.0", path = "safemlx" }
+safemlx = { version = "0.2.0", path = "safemlx", default-features = false }
 eredu-gguf = { version = "0.1.0", path = "eredu-gguf" }
 safemlx-sys = { version = "0.2.0", path = "safemlx-sys", default-features = false }
 safemlx-macros = { version = "0.1.2", path = "safemlx-macros" }

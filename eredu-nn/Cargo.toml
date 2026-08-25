@@ -11,5 +11,4 @@ description = "Backend-neutral neural computation contracts for Eredu architectu
 [dependencies]
 eredu-checkpoint.workspace = true
 eredu-nn-macros.workspace = true
-serde.workspace = true
 thiserror.workspace = true
