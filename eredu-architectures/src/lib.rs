@@ -27,6 +27,8 @@ pub use external_assistant::{
     prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
     Gemma4AssistantPreparationPlan, MuseGlimmerAssistantPreparationPlan,
 };
+/// Backend-neutral schedules and recipes for independent expert residency.
+pub mod expert_residency;
 mod gguf_admission;
 /// Backend-neutral family and checkpoint admission for sibling GGUF projectors.
 pub mod gguf_companion;
@@ -41,13 +43,7 @@ pub mod preparation;
 pub mod processor_plan;
 /// Architecture-owned external rotary configuration values.
 pub mod rotary;
-/// Architecture-owned static roles, parameter modules, and checkpoint rewrites.
-pub mod static_parameters;
-pub use static_parameters::{
-    BindableStaticParameters, StaticParameterVisitor, StaticParameterVisitorMut,
-};
-/// Backend-neutral schedules and recipes for independent expert residency.
-pub mod expert_residency;
+mod static_parameters;
 pub use expert_residency::{
     ExpertParameterRecipe, ExpertParameterRole, ExpertResidencyCatalog,
     ExpertResidencyCatalogError, ExpertResidencyDistribution, ExpertResidencyUnit,

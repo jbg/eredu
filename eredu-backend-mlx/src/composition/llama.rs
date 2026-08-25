@@ -5,8 +5,8 @@ pub mod checkpoint;
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CausalModel, ExecutionResidency, LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime,
-    RuntimeState, WeightResidency,
+    ArchitectureParameters, CausalModel, ExecutionResidency, LayerWeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, RuntimeState, WeightResidency,
 };
 
 use std::{path::Path, sync::Arc};
@@ -675,7 +675,7 @@ fn load_neutral_llama_parallel(
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static_bindings = build_module_bindings(
         &MlxModule::new(global_architecture.static_modules().clone()),

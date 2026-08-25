@@ -7,12 +7,14 @@ use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     store::{CheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource},
 };
+use eredu_nn::Parameterized;
 use eredu_runtime::{
-    DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture, LayeredTraversalHook,
-    LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport, ResidentLayerGroupReport, Sampler,
-    SequentialDecisionDriver, SequentialDecisionTraversal, ShardingPolicy,
+    ArchitectureParameters, DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture,
+    LayeredTraversalHook, LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport,
+    ResidentLayerGroupReport, Sampler, SequentialDecisionDriver, SequentialDecisionTraversal,
+    ShardingPolicy,
 };
-use safemlx::{module::ModuleParameters, Array, Stream};
+use safemlx::{Array, Stream};
 
 use crate::backend::{
     error::Error,
@@ -22,8 +24,7 @@ use crate::backend::{
         checkpoint::{
             artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
             binding::{
-                build_module_bindings_with_recipes_excluding, canonical_checkpoint_name,
-                full_parameter_names,
+                build_neutral_module_bindings_with_recipes_excluding, canonical_checkpoint_name,
             },
             quantization::should_quantize_on_load,
         },
@@ -402,15 +403,9 @@ pub fn load(
         stream,
         weights_stream,
         |_| false,
-        move |modules, store| {
-            bindings(
-                &MlxModule::new(modules.clone()),
-                store,
-                static_recipes.as_ref(),
-            )
-        },
+        move |modules, store| bindings(modules, store, static_recipes.as_ref()),
         move |_ordinal, _address, _path, unit, store, _stream| {
-            bindings(&MlxModule::new(unit), store, unit_recipes.as_ref())
+            bindings(&unit, store, unit_recipes.as_ref())
         },
     )?;
     metadata.set_model_type(target_config.effective_model_type().as_str());
@@ -494,9 +489,9 @@ fn load_parallel(
     )
     .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut composition = Architecture::new_parallel(target_config.clone(), geometry, stream)?;
-    let state_layout = composition.runtime_state_layout()?;
+    let state_layout = composition.state_layout()?;
     let local_layout = Arc::new(local_layout);
-    let static_module = MlxModule::new(global.static_modules().clone());
+    let static_module = global.static_modules().clone();
     let static_recipes = Arc::clone(&source_recipes);
     let static_sharding = Arc::clone(&local_layout);
     let unit_config = target_config.clone();
@@ -522,7 +517,7 @@ fn load_parallel(
         move |_ordinal, address, _path, _local, store, stream| {
             let global = build_addressed_unit(&unit_config, address, stream)?;
             shard_layer_bindings(
-                bindings(&MlxModule::new(global), store, unit_recipes.as_ref())?,
+                bindings(&global, store, unit_recipes.as_ref())?,
                 "",
                 store,
                 unit_sharding.as_ref(),
@@ -586,12 +581,19 @@ fn artifact_identity(
     fingerprint_artifact(config.effective_model_type().as_str(), files)
 }
 
-fn bindings(
-    module: &impl ModuleParameters,
+fn bindings<M>(
+    module: &M,
     store: &dyn CheckpointSource,
     recipes: &CanonicalBindingRecipes,
-) -> Result<Vec<eredu_runtime::WeightBinding>, Error> {
-    let names = full_parameter_names(module, "");
+) -> Result<Vec<eredu_runtime::WeightBinding>, Error>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    let names = eredu_nn::validate_parameter_topology(module)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .into_iter()
+        .map(|metadata| metadata.id.as_str().to_owned())
+        .collect::<Vec<_>>();
     let selected = names
         .iter()
         .filter_map(|name| {
@@ -617,10 +619,13 @@ fn bindings(
         .iter()
         .map(|(name, _, _)| name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let mut bindings =
-        build_module_bindings_with_recipes_excluding(module, "", store, selected, |name| {
-            alias_names.contains(name)
-        })?;
+    let mut selected = selected;
+    let mut bindings = build_neutral_module_bindings_with_recipes_excluding(
+        module,
+        store,
+        &mut selected,
+        |name| alias_names.contains(name),
+    )?;
     for (local, logical, owner) in aliases {
         let owner_recipe = recipes.outputs.get(&owner).ok_or_else(|| {
             Error::ArchitectureModel(format!(

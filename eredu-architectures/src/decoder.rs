@@ -2614,6 +2614,13 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B, Self::FeedForward>, Error>;
+
+    /// Declares the complete neutral parameter placement for one built block.
+    fn parameter_groups(
+        block: &TransformerBlock<B, Self::FeedForward>,
+        config: &C,
+        layer: usize,
+    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>;
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
@@ -2659,6 +2666,14 @@ impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B, Self::FeedForward>, Error> {
         TransformerBlock::new(config, layer, context)
+    }
+
+    fn parameter_groups(
+        block: &TransformerBlock<B, Self::FeedForward>,
+        config: &C,
+        layer: usize,
+    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+        layer_parallel_parameter_groups(block, config, layer)
     }
 }
 
@@ -2733,7 +2748,7 @@ where
     }
 
     /// Returns the replicated or rank-local mutable-state layout for this model.
-    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         self.parallel_geometry
             .as_ref()
             .map(|geometry| geometry.state_layout().clone())
@@ -3136,14 +3151,15 @@ where
     }
 }
 
-impl<B, C> LayeredModel<B, C, DenseBlockFactory>
+impl<B, C, P> LayeredModel<B, C, P>
 where
     B: NeuralBackend,
     C: Config,
+    P: BlockFactory<B, C>,
 {
     /// Describes every shared-decoder parameter group with explicit static or
     /// architecture-global unit ownership.
-    pub fn parameter_description(
+    fn parameter_description_impl(
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
@@ -3175,8 +3191,7 @@ where
         let group_id = layout.group_id(0).expect("decoder layout group").clone();
         for index in 0..count {
             let unit = self.construct_unit(index, context)?;
-            let groups = layer_parallel_parameter_groups(&unit, &self.args, index)
-                .map_err(Error::backend)?;
+            let groups = P::parameter_groups(&unit, &self.args, index).map_err(Error::backend)?;
             expected.extend(groups.iter().cloned());
             owned.extend(groups.into_iter().map(|group| {
                 OwnedParameterGroupSpec::new(
@@ -3190,15 +3205,28 @@ where
     }
 }
 
-impl<B, C, P> crate::BindableStaticParameters<B> for LayeredModel<B, C, P>
+impl<B, C, P> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B, C, P>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
 {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout_impl()
+    }
+
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        self.parameter_description_impl(context)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitor<B>,
+        V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.embeddings)?;
         visitor.visit("norm", &self.static_modules.norm)?;
@@ -3210,7 +3238,7 @@ where
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitorMut<B>,
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
         visitor.visit_mut("norm", &mut self.static_modules.norm)?;

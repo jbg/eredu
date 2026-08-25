@@ -4,7 +4,7 @@ use eredu_architectures::{
     decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
     gpt_oss,
     llama::{self, LayeredInput, ModelArgs},
-    moshi, qwen, BindableStaticParameters, StaticParameterVisitor,
+    moshi, qwen,
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
@@ -18,14 +18,14 @@ use eredu_nn::{
     VocabularyParallelRange,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
-    LayeredArchitecture, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, ParameterBackend,
-    ParameterGroupSpec, PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState,
-    ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest,
-    RuntimeLayerState, RuntimeState, Sampler, SamplingBackend, SequentialDecisionDriver,
-    SequentialDecisionMode, SequentialDecisionPlan, SequentialDecisionSource,
-    SequentialDecisionTraversal, StateError, SubmissionBackend, TensorPlacement, TokenDomain,
-    WeightBinding,
+    bind_materialized_unit, materialize_bindings, ArchitectureParameters, DeviceState, ExpertPass,
+    LayerRuntimeState, LayeredArchitecture, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
+    ParameterBackend, ParameterGroupSpec, PenaltyConfig, PredictionDirective,
+    ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
+    RoutedExpertRequest, RuntimeLayerState, RuntimeState, Sampler, SamplingBackend,
+    SequentialDecisionDriver, SequentialDecisionMode, SequentialDecisionPlan,
+    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StaticParameterVisitor,
+    SubmissionBackend, TensorPlacement, TokenDomain, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1977,7 +1977,7 @@ fn one_portable_moshi_model_runs_replicated_and_parallel_lifecycles() {
     assert_eq!(driver.decisions(), replicated.2.decisions());
     assert_eq!(
         state.layout(),
-        &runtime.architecture().runtime_state_layout().unwrap()
+        &runtime.architecture().state_layout().unwrap()
     );
 }
 

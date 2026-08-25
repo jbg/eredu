@@ -12,6 +12,7 @@ use eredu_checkpoint::{
     WeightQuantization,
 };
 use eredu_runtime::{
+    ArchitectureParameters,
     CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
     PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,

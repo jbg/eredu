@@ -329,15 +329,19 @@ tensor-parallel loaders validate the description against the neutral
 architecture and register its owned groups directly; they do not reconstruct
 target/prediction unit counts or enumerate family layer groups themselves.
 
-Pinned parameters additionally expose an architecture-owned bindable static
-module interface. The parameter description selects the roles owned by a
-partition, and the architecture resolves each role to its parameterized module
-for binding construction or mutable population. A backend may materialize and
-shard those visited modules, but must not map roles to family-specific fields,
-residency identifiers, or checkpoint roots. Stable parameter identities on the
-visited module are the checkpoint-binding namespace. Every pipeline-composed
-family, including multimodal and hybrid graphs, implements this interface;
-concrete backend adapters use one shared visitor rather than family binding tables.
+Every layered family implements the state-independent
+`ArchitectureParameters` supercontract. It is the authoritative source for the
+complete mutable `StateLayout`, owned `ArchitectureParameterDescription`, and
+role-addressed pinned parameter modules. The parameter description selects the
+roles owned by a partition, and the architecture resolves each role to its
+parameterized module for binding construction or mutable population. A backend
+may materialize and shard those visited modules, but must not map roles to
+family-specific fields, residency identifiers, or checkpoint roots. Stable
+parameter identities on the visited module are the checkpoint-binding
+namespace. `LayeredArchitecture` extends this contract with execution against a
+specific runtime-state realization; geometry and binding therefore remain
+callable without choosing that state type. Concrete backend adapters use one
+shared visitor rather than family binding tables.
 Pipeline stage loaders use that same visitor for both ordinary decoder families
 and multimodal families, leaving tensor-parallel binding selection generic and
 the role-to-module mapping entirely within the architecture. Distinct pinned
@@ -740,8 +744,9 @@ audio. MLX does not reconstruct modality, spatial-merging, or artifact policy.
 Layered model execution topology follows the same ownership rule. Loaders and
 materializers derive execution graphs and per-group unit counts through
 `LayeredArchitecture` into one canonical `ExecutionUnitLayout`; quantization,
-residency, parallel planning, parameter accounting, and unit construction all
-consume that layout. They do not reconstruct a family's group order,
+residency, parallel planning, parameter accounting, state allocation, and unit
+construction consume that layout together with the architecture's required
+state-independent parameter contract. They do not reconstruct a family's group order,
 dependencies, layer counts, or flat-to-group mapping from configuration. This
 keeps every backend realization aligned with architecture execution.
 
@@ -909,7 +914,10 @@ composition:
   catalogs translate optional media and prediction units into checkpoint-local
   identities instead of backend binders reconstructing group order or layer
   counts. Group ownership and parameter roots remain authoritative in the
-  address and path; and
+  address and path;
+- Moshi binding enumerates stable `Parameterized` identities and consumes its
+  architecture-owned canonical recipe publication; composition does not use
+  native module reflection to rediscover parameter names or aliases; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 

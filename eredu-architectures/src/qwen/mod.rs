@@ -22,7 +22,7 @@ pub use config::{
 pub use moe::{expert_bank_spec, localized_expert_bank_spec, FeedForward, RoutedGatedProduct};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
-    parameter_description, LocalGeometry,
+    LocalGeometry,
 };
 
 pub use crate::decoder::{
@@ -100,6 +100,14 @@ where
                 context,
             )?,
         })
+    }
+
+    fn parameter_groups(
+        block: &crate::decoder::TransformerBlock<B, Self::FeedForward>,
+        args: &ModelArgs,
+        layer: usize,
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
+        parallel::layer_parallel_parameter_groups(block, args, layer)
     }
 }
 

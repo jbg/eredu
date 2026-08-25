@@ -1,71 +1,14 @@
 //! Semantic tensor-parallel placement for Qwen decoder blocks.
 
-use eredu_nn::{RoutedNeuralBackend, Tensor};
+use eredu_nn::RoutedNeuralBackend;
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterRole,
+    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
 };
 
 use crate::decoder::{block_common_parallel_parameter_groups, dense_mlp_parallel_parameter_group};
 
 use super::{FeedForward, ModelArgs, TransformerBlock};
-
-/// Describes Qwen pinned parameters and every decoder unit with explicit
-/// architecture-global ownership.
-pub fn parameter_description<B: RoutedNeuralBackend>(
-    model: &super::LayeredModel<B>,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    let graph = ExecutionGraph::chain(["text_decoder"])
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let count = usize::try_from(model.args().num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Qwen layer count exceeds usize".into()))?;
-    let layout = ExecutionUnitLayout::new(&graph, [count])
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let static_groups = crate::decoder::static_parallel_parameter_groups::<B>(
-        &model.static_modules().embeddings,
-        &model.static_modules().norm,
-        model.static_modules().lm_head.as_ref(),
-        &model.args().parameter_root,
-    )?;
-    let mut expected = static_groups.clone();
-    let mut owned = static_groups
-        .into_iter()
-        .enumerate()
-        .map(|(index, group)| {
-            OwnedParameterGroupSpec::new(
-                if index == 0 && model.args().tie_word_embeddings {
-                    ParameterGroupOwner::static_any_of(["embedding", "output"])
-                } else {
-                    ParameterGroupOwner::static_role(match index {
-                        0 => "embedding",
-                        1 => "norm",
-                        _ => "output",
-                    })
-                },
-                group,
-            )
-        })
-        .collect::<Vec<_>>();
-    let owner_group = layout.group_id(0).expect("Qwen decoder group").clone();
-    for index in 0..count {
-        let unit = model
-            .construct_unit(index, context)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let groups = layer_parallel_parameter_groups(&unit, model.args(), index)?;
-        expected.extend(groups.iter().cloned());
-        owned.extend(groups.into_iter().map(|group| {
-            OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                group,
-            )
-        }));
-    }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-}
 
 /// Derives rank-local Qwen construction geometry from a semantic placement plan.
 pub fn local_block_args(

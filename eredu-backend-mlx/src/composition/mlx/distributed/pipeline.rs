@@ -10,20 +10,17 @@
 //! Multimodal encoder, projection, merge, finalization, and decoder groups use
 //! one validated placement DAG with topology-planned payload routes.
 
-use eredu_architectures::{
-    llama::ModelArgs as LlamaModelArgs, muse_glimmer, BindableStaticParameters, GgufArchitecture,
-    StaticParameterVisitor, StaticParameterVisitorMut,
-};
+use eredu_architectures::{llama::ModelArgs as LlamaModelArgs, muse_glimmer, GgufArchitecture};
 use eredu_checkpoint::{store::WeightStoreDiagnostics, WeightQuantization};
 use eredu_core::{
     MaterializationRoute, ModelArtifact, ModelPreparationPlan, PreparedInputIdentity,
 };
 use eredu_nn::{Parameterized, RoutedNeuralBackend, TensorParallelExpertOutput};
 use eredu_runtime::{
-    ArchitectureBoundary, DenseDiskStreamLoadOptions, LayerWeightResidency, LayeredArchitecture,
-    LayerwiseLoadOptions, OffloadUnit, ParallelLayeredArchitecture, ResidencyReport,
-    ShardingPolicy, StaticUnitBindings, WeightBinding, WeightMaterializationReport,
-    DENSE_TRANSFER_WINDOW,
+    ArchitectureBoundary, ArchitectureParameters, DenseDiskStreamLoadOptions, LayerWeightResidency,
+    LayeredArchitecture, LayerwiseLoadOptions, OffloadUnit, ParallelLayeredArchitecture,
+    ResidencyReport, ShardingPolicy, StaticParameterVisitor, StaticParameterVisitorMut,
+    StaticUnitBindings, WeightBinding, WeightMaterializationReport, DENSE_TRANSFER_WINDOW,
 };
 use ref_cast::RefCast;
 
@@ -259,7 +256,7 @@ fn architecture_static_quantization_companions<A>(
     quantization: WeightQuantization,
 ) -> Result<BTreeMap<String, PackedWeightCompanions>, Error>
 where
-    A: BindableStaticParameters<MlxNeuralBackend>,
+    A: ArchitectureParameters<MlxNeuralBackend>,
 {
     struct Visitor {
         quantization: WeightQuantization,
@@ -5424,7 +5421,7 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         let args = &self.architecture.args();
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -6951,7 +6948,7 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -7098,7 +7095,7 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let layout = complete
             .slice(self.range())
@@ -8088,7 +8085,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layout = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range().clone();
         let local = layout
@@ -8811,7 +8808,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layout = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         qwen_hybrid_pipeline_prompt_cache_identity(
             &self.args().text,
@@ -9006,7 +9003,7 @@ impl PipelineEmbeddedMtp for QwenConditionalPipelinePartition {
     ) -> Result<PipelineMtpCache, Error> {
         let layout = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
@@ -9140,7 +9137,7 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -9286,7 +9283,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -9488,7 +9485,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
     ) -> Result<PipelineMtpCache, Error> {
         let layout = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
@@ -9664,7 +9661,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -12422,7 +12419,7 @@ fn load_architecture_static_parameters<A>(
     stream: &Stream,
 ) -> Result<(), Error>
 where
-    A: BindableStaticParameters<MlxNeuralBackend>,
+    A: ArchitectureParameters<MlxNeuralBackend>,
 {
     let mut visitor = ArchitectureStaticLoader {
         selected_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
@@ -14122,7 +14119,7 @@ fn load_llama_pipeline(
         source_args.hidden_size,
     );
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
@@ -14364,9 +14361,9 @@ fn load_qwen_pipeline(
         .architecture
         .take()
         .expect("Qwen partition constructor owns a neutral architecture");
-    let binding_parameter_description =
-        eredu_architectures::qwen::parameter_description(&seed_architecture, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
+    let binding_parameter_description = seed_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::local_geometry(&target_args, &layout)
@@ -14406,7 +14403,7 @@ fn load_qwen_pipeline(
         .architecture
         .as_ref()
         .unwrap()
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = stage
@@ -14424,11 +14421,12 @@ fn load_qwen_pipeline(
             eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
-    let parameter_description = eredu_architectures::qwen::parameter_description(
-        stage.architecture.as_ref().unwrap(),
-        stream,
-    )
-    .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parameter_description = stage
+        .architecture
+        .as_ref()
+        .unwrap()
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_bindings =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
@@ -14709,7 +14707,7 @@ fn load_muse_glimmer_pipeline(
         muse_glimmer::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let binding_parameter_description = seed_architecture
-        .parameter_description()
+        .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let binding_decoder_group =
         architecture_decoder_group::<_, MlxKeyValueState>(&seed_architecture)?;
@@ -14749,7 +14747,7 @@ fn load_muse_glimmer_pipeline(
         source_args.hidden_size,
     );
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
@@ -14764,7 +14762,7 @@ fn load_muse_glimmer_pipeline(
             std::iter::empty(),
         )?;
     let parameter_description = architecture
-        .parameter_description()
+        .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_bindings =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
@@ -15186,7 +15184,7 @@ fn load_neutral_qwen_vl_pipeline(
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
     }
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let ownership_probe = info
         .placement
@@ -15590,7 +15588,7 @@ impl MuseGlimmerPipelinePartition {
                 }
             })
             .collect::<Vec<_>>();
-        let mut state = MlxKeyValueState::device(self.architecture.runtime_state_layout()?)?;
+        let mut state = MlxKeyValueState::device(self.architecture.state_layout()?)?;
         let model_input = muse_glimmer::ModelInput {
             parts: &parts,
             vision: prepared
@@ -17032,7 +17030,8 @@ fn load_gpt_oss_pipeline(
         .architecture
         .take()
         .expect("GPT-OSS neutral architecture");
-    let binding_parameter_description = gpt_oss::parameter_description(&seed_architecture, stream)
+    let binding_parameter_description = seed_architecture
+        .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
@@ -17073,7 +17072,7 @@ fn load_gpt_oss_pipeline(
         .architecture
         .as_ref()
         .unwrap()
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = stage
@@ -17091,9 +17090,12 @@ fn load_gpt_oss_pipeline(
             eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
-    let parameter_description =
-        gpt_oss::parameter_description(stage.architecture.as_ref().unwrap(), stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parameter_description = stage
+        .architecture
+        .as_ref()
+        .unwrap()
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let bindings = local_architecture_parameter_bindings(&parameter_description, &probe);
     let partition = info
         .placement
@@ -17558,7 +17560,7 @@ fn load_lfm2_pipeline(
         source_args.hidden_size,
     );
     let runtime_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info
         .placement
@@ -18055,7 +18057,7 @@ fn load_nemotron_h_pipeline(
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let neutral_placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
@@ -19051,7 +19053,7 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         qwen_hybrid_pipeline_prompt_cache_identity(
             self.args(),
@@ -19078,7 +19080,7 @@ impl PipelineEmbeddedMtp for QwenHybridPipelinePartition {
     ) -> Result<PipelineMtpCache, Error> {
         let layout = self
             .architecture
-            .runtime_state_layout()
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
@@ -19294,7 +19296,7 @@ fn load_neutral_qwen_hybrid_pipeline(
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
     }
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
@@ -19738,7 +19740,7 @@ fn load_neutral_qwen_conditional_pipeline(
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
     }
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let boundary_schema = architecture.pipeline_boundary_schema();
     let ownership_probe = info
@@ -20227,7 +20229,7 @@ fn load_kimi_linear_pipeline(
         source_args.hidden_size,
     );
     let runtime_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info
         .placement
@@ -20740,7 +20742,7 @@ fn load_neutral_inkling_pipeline(
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let neutral_placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
@@ -21153,7 +21155,7 @@ fn load_neutral_gemma4_pipeline(
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let neutral_placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
@@ -21689,7 +21691,7 @@ fn load_neutral_deepseek_v3_pipeline(
     }
     info.materialization = materialization.clone();
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
@@ -22106,7 +22108,7 @@ fn load_neutral_deepseek_v4_pipeline(
     }
     info.materialization = materialization.clone();
     let complete_state = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();

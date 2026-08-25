@@ -60,10 +60,23 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel<B> {
+impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout_impl()
+    }
+
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        self.parameter_description_impl(context)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitor<B>,
+        V: eredu_runtime::StaticParameterVisitor<B>,
     {
         let modules = self.decoder.static_modules();
         visitor.visit("embedding", &modules.embeddings)?;
@@ -76,7 +89,7 @@ impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitorMut<B>,
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         let modules = self.decoder.static_modules_mut();
         visitor.visit_mut("embedding", &mut modules.embeddings)?;
@@ -149,7 +162,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
     /// Describes pinned modules and heterogeneous units with explicit neutral
     /// graph ownership.
-    pub fn parameter_description(
+    fn parameter_description_impl(
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
@@ -210,7 +223,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     }
 
     /// State layout for this model's replicated or rank-local construction.
-    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         self.parallel_geometry
             .as_ref()
             .map(|geometry| geometry.state_layout().clone())

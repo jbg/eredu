@@ -621,9 +621,10 @@ mod tests {
     use crate::backend::{nn::shared::MlxNeuralBackend, runtime::cache::state::MlxHybridState};
     use eredu_nn::{ParameterVisitor, ParameterVisitorMut, Parameterized};
     use eredu_runtime::{
-        ArchitectureBoundary, ExecutionGroupId, LayeredArchitecture, LayeredForwardState,
-        MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec,
-        ParameterMemberSpec, ParameterRole,
+        ArchitectureBoundary, ArchitectureParameterDescription, ArchitectureParameters,
+        ExecutionGroupId, LayeredArchitecture, LayeredForwardState, MemberSharding,
+        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+        ParameterRole, StaticParameterVisitor, StaticParameterVisitorMut,
     };
     use safemlx::Stream;
 
@@ -668,6 +669,52 @@ mod tests {
                 unit_counts,
                 static_modules: EmptyModule,
             }
+        }
+    }
+
+    impl ArchitectureParameters<MlxNeuralBackend> for FixtureArchitecture {
+        type DefinitionError = String;
+
+        fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Self::DefinitionError> {
+            let policies = (0..self.unit_counts.iter().sum())
+                .map(|_| {
+                    eredu_core::cache::LayerCachePolicy::key_value(
+                        eredu_core::AttentionPolicy::Full,
+                        1,
+                        1,
+                    )
+                    .expect("fixture cache policy")
+                })
+                .collect::<Vec<_>>();
+            eredu_runtime::StateLayout::new(
+                eredu_core::LayerSchedule::new(policies.len(), policies)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        fn parameter_description(
+            &self,
+            _context: &Stream,
+        ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+            let layout = ExecutionUnitLayout::new(&self.graph, self.unit_counts.clone())
+                .map_err(|error| error.to_string())?;
+            ArchitectureParameterDescription::new(&self.graph, &layout, [], [])
+                .map_err(|error| error.to_string())
+        }
+
+        fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+        where
+            V: StaticParameterVisitor<MlxNeuralBackend>,
+        {
+            visitor.visit("static", &self.static_modules)
+        }
+
+        fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+        where
+            V: StaticParameterVisitorMut<MlxNeuralBackend>,
+        {
+            visitor.visit_mut("static", &mut self.static_modules)
         }
     }
 

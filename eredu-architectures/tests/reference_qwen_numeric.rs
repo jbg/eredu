@@ -33,10 +33,10 @@ use eredu_nn::{
     TensorParallelExpertOutput, TopKRouterSpec, TopKRoutingSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress, ExpertPass,
-    LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook, LayerwiseAcquireError,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
+    ArchitectureParameters, CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress,
+    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook,
+    LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
     ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
     RoutedExpertRequest, RoutedExpertTensorParallelOutput, RuntimeLayerState,
     RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
@@ -7169,7 +7169,7 @@ fn gemma4_tp2_text_matches_replicated_composite_graph() {
         groups.extend(gemma4::layer_parameter_groups(&family.text, layer).unwrap());
     }
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -7351,7 +7351,7 @@ fn gemma4_tp2_ordered_vision_audio_text_matches_replicated_multimodal_graph() {
         .map(|owned| owned.group().clone())
         .collect::<Vec<_>>();
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -8165,11 +8165,11 @@ fn deepseek_v3_dense_tp2_matches_replicated_with_uneven_vocabulary() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
-        |_, _| Ok::<_, Error>(NumericCompressedCache::resident()),
-    )
-    .unwrap();
+    let mut expected_state =
+        DeviceState::<NumericBackend, _>::create(architecture.state_layout().unwrap(), |_, _| {
+            Ok::<_, Error>(NumericCompressedCache::resident())
+        })
+        .unwrap();
     let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
     let tokens = NumericTensor::token_ids(&[0, 4, 6]);
     let expected = expected_runtime
@@ -8346,11 +8346,11 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
         DeviceState<NumericBackend, NumericPoolingCache>,
     >>::build_unit(&architecture, 0, 0, &context)
     .unwrap();
-    let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
-        |_, _| Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[])),
-    )
-    .unwrap();
+    let mut expected_state =
+        DeviceState::<NumericBackend, _>::create(architecture.state_layout().unwrap(), |_, _| {
+            Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[]))
+        })
+        .unwrap();
     let mut expected_runtime =
         LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit]));
     let tokens = NumericTensor::token_ids(&[0, 4, 6]);
@@ -8534,7 +8534,7 @@ fn gpt_oss_tp2_matches_replicated_with_biased_packed_experts() {
     .unwrap();
     groups.extend(gpt_oss::layer_parallel_parameter_groups(&unit, &args, 0).unwrap());
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -8783,7 +8783,7 @@ fn qwen3_vl_tp2_runs_full_vision_and_text_lifecycle() {
     };
     groups.extend(qwen::layer_parallel_parameter_groups(text_block, &args.text, 0).unwrap());
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -9043,7 +9043,7 @@ fn qwen35_conditional_tp2_runs_full_vision_and_text_lifecycle() {
         qwen::hybrid::unit_parallel_parameter_groups(&wrapped, &parsed.text, 0, 0).unwrap(),
     );
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -9286,7 +9286,7 @@ fn qwen_hybrid_tp2_reconstructs_uneven_untied_vocabulary_and_exact_collectives()
         })
         .collect::<Vec<_>>();
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -11104,7 +11104,7 @@ fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(
         })
         .collect::<Vec<_>>();
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -11468,7 +11468,7 @@ fn kimi_tp2_kda_mla_matches_replicated_and_rolls_back_invalid_tokens() {
         })
         .collect::<Vec<_>>();
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();
@@ -11999,7 +11999,7 @@ fn nemotron_tp2_target_mtp_matches_replicated_and_rolls_back_draft_state() {
         .unwrap();
     assert_eq!(addresses, [(0, 0), (0, 1), (0, 2), (1, 0)]);
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        architecture.runtime_state_layout().unwrap(),
+        architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
     )
     .unwrap();

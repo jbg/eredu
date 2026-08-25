@@ -8,8 +8,9 @@ use eredu_nn::{
     VocabularyParallelRange,
 };
 use eredu_runtime::{
-    ExecutionGraph, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    LayeredTraversalPoint, ParallelLayeredArchitecture, ResettableRuntimeState, SamplingBackend,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredTraversalPoint, OwnedParameterGroupSpec,
+    ParallelLayeredArchitecture, ParameterGroupOwner, ResettableRuntimeState, SamplingBackend,
     SequentialDecisionBoundary, SequentialDecisionError, StateLayout, StateSegmentId,
     StateSegmentLifetime, StateSegmentSpec, TokenDomain,
 };
@@ -328,6 +329,95 @@ pub struct LayeredModel<B: NeuralBackend> {
     parallel_geometry: Option<super::LocalGeometry>,
 }
 
+impl<B: NeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout_impl()
+    }
+
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        let graph = ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
+            .map_err(Error::backend)?;
+        let counts = [
+            usize::try_from(self.config.temporal().num_hidden_layers()).map_err(Error::backend)?,
+            self.config.frame_schedule().depth_audio_codebooks(),
+        ];
+        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
+        let static_groups = super::parallel::static_parameter_groups(&self.static_modules)
+            .map_err(Error::backend)?;
+        let embedding_count = self.static_modules.embeddings.tables.len();
+        let mut expected = static_groups.clone();
+        let mut owned = static_groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let role = if index < embedding_count {
+                    "embedding"
+                } else if index == embedding_count {
+                    "norm"
+                } else {
+                    "output"
+                };
+                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
+            })
+            .collect::<Vec<_>>();
+        for (group, count) in counts.into_iter().enumerate() {
+            let owner_group = layout
+                .group_id(group)
+                .expect("Moshi layout contains both execution groups")
+                .clone();
+            for index in 0..count {
+                let unit = self.build_unit_impl(group, index, context)?;
+                let groups =
+                    super::parallel::unit_parameter_groups(&unit, &self.config, group, index)
+                        .map_err(Error::backend)?;
+                expected.extend(groups.iter().cloned());
+                owned.extend(groups.into_iter().map(|group| {
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
+                        group,
+                    )
+                }));
+            }
+        }
+        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+            .map_err(Error::backend)
+    }
+
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        let recipes = super::checkpoint::canonical_recipes(&self.config, source)?.into_outputs();
+        crate::static_parameters::module_recipes(&self.static_modules, recipes)
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.embeddings)?;
+        visitor.visit("norm", &self.static_modules.output_norm)?;
+        visitor.visit("output", &self.static_modules.text_output)
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.output_norm)?;
+        visitor.visit_mut("output", &mut self.static_modules.text_output)
+    }
+}
+
 impl<B: NeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules from one normalized configuration.
     pub fn new(
@@ -385,11 +475,46 @@ impl<B: NeuralBackend> LayeredModel<B> {
     }
 
     /// State layout for this model's replicated or rank-local construction.
-    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         self.parallel_geometry
             .as_ref()
             .map(|geometry| geometry.state_layout().clone())
             .map_or_else(|| state_layout(&self.config), Ok)
+    }
+
+    fn build_unit_impl(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        let count = match group {
+            0 => usize::try_from(self.config.temporal().num_hidden_layers())
+                .map_err(Error::backend)?,
+            1 => self.config.frame_schedule().depth_audio_codebooks(),
+            _ => {
+                return Err(Error::backend(format!(
+                    "Moshi execution group {group} is outside 0..2"
+                )))
+            }
+        };
+        if index >= count {
+            return Err(Error::backend(format!(
+                "Moshi unit {index} is outside execution group {group}"
+            )));
+        }
+        if let Some(geometry) = &self.parallel_geometry {
+            return geometry.build_unit(&self.config, group, index, context);
+        }
+        match group {
+            0 => Ok(Unit::Temporal(block::build(
+                self.config.temporal(),
+                index,
+                context,
+            )?)),
+            1 => Ok(Unit::Depth(DepthSlice::new(&self.config, index, context)?)),
+            _ => unreachable!("group was validated"),
+        }
     }
 
     /// Starts a pass from a caller-produced embedding against an explicit
@@ -506,33 +631,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
-        let count = match group {
-            0 => usize::try_from(self.config.temporal().num_hidden_layers())
-                .map_err(Error::backend)?,
-            1 => self.config.frame_schedule().depth_audio_codebooks(),
-            _ => {
-                return Err(Error::backend(format!(
-                    "Moshi execution group {group} is outside 0..2"
-                )))
-            }
-        };
-        if index >= count {
-            return Err(Error::backend(format!(
-                "Moshi unit {index} is outside execution group {group}"
-            )));
-        }
-        if let Some(geometry) = &self.parallel_geometry {
-            return geometry.build_unit(&self.config, group, index, context);
-        }
-        match group {
-            0 => Ok(Unit::Temporal(block::build(
-                self.config.temporal(),
-                index,
-                context,
-            )?)),
-            1 => Ok(Unit::Depth(DepthSlice::new(&self.config, index, context)?)),
-            _ => unreachable!("group was validated"),
-        }
+        self.build_unit_impl(group, index, context)
     }
 
     fn begin_forward<'a>(

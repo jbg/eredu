@@ -18,15 +18,17 @@ use eredu_nn::{
     RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, ArchitecturePartition, CollectiveBackend,
+    bind_materialized_unit, materialize_bindings, ArchitectureParameterDescription,
+    ArchitectureParameters, ArchitecturePartition, CollectiveBackend,
     CompositeLayeredTraversalHook, DeviceState, ExecutionGraph, ExecutionGroupSpec,
-    ExecutionUnitAddress, LayeredArchitecture, LayeredForwardState, LayeredTraversalHook,
-    LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime, ParameterBackend,
-    PartitionOwnership, PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState,
-    ResettableRuntimeState, ResidentRuntime, RuntimeLayerState, Sampler, SamplingBackend,
-    SequentialDecisionBoundary, SequentialDecisionDriver, SequentialDecisionError,
-    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
-    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, SubmissionBackend,
+    ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture, LayeredForwardState,
+    LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy,
+    LayerwiseRuntime, ParameterBackend, PartitionOwnership, PenaltyConfig, PredictionDirective,
+    ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime, RuntimeLayerState,
+    Sampler, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionDriver,
+    SequentialDecisionError, SequentialDecisionPlan, SequentialDecisionSource,
+    SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId, StateSegmentLifetime,
+    StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend,
     TokenDomain, TransferBackend, WeightBinding,
 };
 
@@ -902,6 +904,48 @@ impl Parameterized<FakeTensor> for FakeUnit {
 struct GroupedFixture {
     static_modules: FakeOperator,
     trace: Vec<(usize, usize)>,
+}
+
+impl ArchitectureParameters<FakeBackend> for GroupedFixture {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        let policies = (0..4)
+            .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
+            .collect();
+        StateLayout::new(LayerSchedule::new(4, policies).unwrap()).map_err(Error::backend)
+    }
+
+    fn parameter_description(
+        &self,
+        _: &(),
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        let graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::root("audio"),
+                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
+            ],
+            "text",
+        )
+        .map_err(Error::backend)?;
+        let layout = ExecutionUnitLayout::new(&graph, [1, 1, 2]).map_err(Error::backend)?;
+        ArchitectureParameterDescription::new(&graph, &layout, [], []).map_err(Error::backend)
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitor<FakeBackend>,
+    {
+        visitor.visit("embedding", &self.static_modules)
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitorMut<FakeBackend>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules)
+    }
 }
 
 impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> for GroupedFixture {

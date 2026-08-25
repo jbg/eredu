@@ -72,13 +72,26 @@ where
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B> crate::BindableStaticParameters<B> for LayeredModel<B>
+impl<B> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
 where
     B: RoutedNeuralBackend + BlockwiseAttentionBackend,
 {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout_impl()
+    }
+
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        self.parameter_description_impl(context)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitor<B>,
+        V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.embeddings)?;
         visitor.visit("norm", &self.static_modules.norm)?;
@@ -90,7 +103,7 @@ where
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitorMut<B>,
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
         visitor.visit_mut("norm", &mut self.static_modules.norm)?;
@@ -174,7 +187,7 @@ where
 
     /// Describes every static and heterogeneous block parameter with explicit
     /// canonical unit ownership.
-    pub fn parameter_description(
+    fn parameter_description_impl(
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
@@ -235,7 +248,7 @@ where
     }
 
     /// State layout for this model's replicated or rank-local construction.
-    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         self.parallel_geometry
             .as_ref()
             .map(|geometry| geometry.state_layout().clone())

@@ -299,6 +299,21 @@ pub fn build_neutral_module_bindings_with_recipes<M>(
 where
     M: Parameterized<crate::MlxTensor>,
 {
+    build_neutral_module_bindings_with_recipes_excluding(module, store, recipes, |_| false)
+}
+
+/// Builds neutral bindings while excluding parameter identities managed by a
+/// separate architecture-owned alias or residency plan.
+pub fn build_neutral_module_bindings_with_recipes_excluding<M, F>(
+    module: &M,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+    exclude: F,
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+    F: Fn(&str) -> bool,
+{
     let parameters = neutral_parameter_refs(module, false).flatten();
     let names = parameters
         .iter()
@@ -319,11 +334,7 @@ where
         })
         .collect();
     build_flattened_module_binding_plan_with_recipes_excluding(
-        parameters,
-        "",
-        store,
-        selected,
-        |_| false,
+        parameters, "", store, selected, exclude,
     )?
     .build_bindings(store)
 }

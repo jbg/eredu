@@ -339,13 +339,26 @@ where
     parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
 }
 
-impl<B> crate::BindableStaticParameters<B> for Model<B>
+impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
 where
     B: HyperNeuralBackend + RoutedNeuralBackend,
 {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout_impl()
+    }
+
+    fn parameter_description(
+        &self,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
+        super::parallel::v4_parameter_description(&self.args).map_err(Error::backend)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitor<B>,
+        V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.text.embeddings)?;
         visitor.visit("norm", &self.static_modules.text.norm)?;
@@ -361,7 +374,7 @@ where
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
-        V: crate::StaticParameterVisitorMut<B>,
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
         visitor.visit_mut("norm", &mut self.static_modules.text.norm)?;
@@ -607,7 +620,7 @@ where
     }
 
     /// Returns the state layout matching the modules this instance builds.
-    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         match &self.parallel_geometry {
             Some(geometry) => Ok(geometry.state_layout().clone()),
             None => state_layout(&self.args),
@@ -2076,7 +2089,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self.runtime_state_layout()?;
+        let expected = self.state_layout_impl()?;
         if state.layout() != &expected {
             return Err(Error::backend(format!(
                 "V4 runtime state layout {:?} does not match architecture layout {expected:?}",

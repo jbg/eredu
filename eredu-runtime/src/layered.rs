@@ -2,13 +2,75 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+use std::collections::BTreeMap;
+
+use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_nn::{NeuralBackend, Parameterized};
 
 use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
     ExecutionUnitLayout, ExpertPass, ObservedExpertProvider, RoutedExpertProvider,
-    RoutedObservationPoint, RuntimeState, SubmissionBackend,
+    RoutedObservationPoint, RuntimeState, StateLayout, SubmissionBackend,
 };
+
+/// Statically dispatched visitor over one immutable pinned parameter module.
+pub trait StaticParameterVisitor<B: NeuralBackend> {
+    /// Failure returned by the consumer.
+    type Error;
+
+    /// Visits the module bound to one architecture-declared static role.
+    fn visit<M>(&mut self, role: &str, module: &M) -> Result<(), Self::Error>
+    where
+        M: Parameterized<B::Tensor>;
+}
+
+/// Statically dispatched visitor over one mutable pinned parameter module.
+pub trait StaticParameterVisitorMut<B: NeuralBackend> {
+    /// Failure returned by the consumer.
+    type Error;
+
+    /// Visits the mutable module bound to one architecture-declared static role.
+    fn visit_mut<M>(&mut self, role: &str, module: &mut M) -> Result<(), Self::Error>
+    where
+        M: Parameterized<B::Tensor>;
+}
+
+/// Architecture-owned enumeration and binding of pinned parameter modules.
+///
+/// Parameter descriptions select the roles owned by a partition. This
+/// contract resolves those roles to concrete neutral modules without making a
+/// backend know family fields or checkpoint roots.
+pub trait ArchitectureParameters<B: NeuralBackend> {
+    /// Architecture-owned failure while deriving geometry or topology.
+    type DefinitionError;
+
+    /// Returns the authoritative mutable-state geometry for this realization.
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError>;
+
+    /// Describes every parameter with its canonical graph owner and placement.
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<crate::ArchitectureParameterDescription, Self::DefinitionError>;
+
+    /// Returns architecture-owned checkpoint rewrites for pinned parameters.
+    fn static_parameter_recipes(
+        &self,
+        _source: &dyn CheckpointSource,
+    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+        Ok(BTreeMap::new())
+    }
+
+    /// Visits every available pinned parameter module exactly once.
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitor<B>;
+
+    /// Mutably visits every available pinned parameter module exactly once.
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitorMut<B>;
+}
 
 /// Backend-native activation and architecture-owned forward context.
 pub struct LayeredForwardState<T, C> {
@@ -313,7 +375,8 @@ where
 /// All hot values remain concrete associated types. Resident and bounded
 /// runtime policies call these same methods without erasing tensors, units, or
 /// mutable layer state.
-pub trait LayeredArchitecture<B, S>
+pub trait LayeredArchitecture<B, S>:
+    ArchitectureParameters<B, DefinitionError = Self::Error>
 where
     B: NeuralBackend,
     S: RuntimeState<B>,

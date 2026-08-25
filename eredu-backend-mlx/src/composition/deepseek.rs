@@ -5,9 +5,9 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use eredu_architectures::deepseek::{self, V3Args, V4Args};
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeLayerState,
-    RuntimeState, StateSegmentId, WeightResidency,
+    ArchitectureParameters, CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout,
+    LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole,
+    RuntimeLayerState, RuntimeState, StateSegmentId, WeightResidency,
 };
 use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -1934,13 +1934,13 @@ impl DeepSeekModel {
     pub fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
         match &self.inner {
             DeepSeekModelInner::V3 { execution, .. } => match execution {
-                V3Execution::Resident(runtime) => runtime.architecture().runtime_state_layout(),
-                V3Execution::Layerwise(runtime) => runtime.architecture().runtime_state_layout(),
+                V3Execution::Resident(runtime) => runtime.architecture().state_layout(),
+                V3Execution::Layerwise(runtime) => runtime.architecture().state_layout(),
             }
             .map_err(neutral_error),
             DeepSeekModelInner::V4 { execution, .. } => match execution {
-                V4Execution::Resident(runtime) => runtime.architecture().runtime_state_layout(),
-                V4Execution::Layerwise(runtime) => runtime.architecture().runtime_state_layout(),
+                V4Execution::Resident(runtime) => runtime.architecture().state_layout(),
+                V4Execution::Layerwise(runtime) => runtime.architecture().state_layout(),
             }
             .map_err(neutral_error),
         }

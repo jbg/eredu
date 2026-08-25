@@ -51,6 +51,14 @@ where
             )?,
         })
     }
+
+    fn parameter_groups(
+        block: &crate::decoder::TransformerBlock<B, Self::FeedForward>,
+        args: &ModelArgs,
+        layer: usize,
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
+        super::parallel::layer_parallel_parameter_groups(block, args, layer)
+    }
 }
 
 /// Builds one unloaded global GPT-OSS decoder layer.

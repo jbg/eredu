@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CausalModel, ExecutionResidency, LayerWeightResidency, LayerwiseRuntime, RuntimeState,
-    WeightResidency,
+    ArchitectureParameters, CausalModel, ExecutionResidency, LayerWeightResidency,
+    LayerwiseRuntime, RuntimeState, WeightResidency,
 };
 
 use std::{
@@ -248,7 +248,8 @@ fn load_neutral_qwen(
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
-        eredu_architectures::qwen::parameter_description(&architecture, stream)
+        architecture
+            .parameter_description(stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
@@ -1130,7 +1131,8 @@ fn load_neutral_qwen_parallel(
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
-        eredu_architectures::qwen::parameter_description(&global_architecture, stream)
+        global_architecture
+            .parameter_description(stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
@@ -1164,7 +1166,7 @@ fn load_neutral_qwen_parallel(
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static_bindings = build_module_bindings(
         &MlxModule::new(global_architecture.static_modules().clone()),

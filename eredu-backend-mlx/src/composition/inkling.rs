@@ -14,9 +14,9 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime,
-    PagedCacheOptions, ParallelModelInfo, ParameterRole, RuntimeState, StaticUnitBindings,
-    WeightBinding, WeightResidency,
+    ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -1808,7 +1808,7 @@ fn load_parallel_store(
         NeutralArchitecture::new_parallel(args.clone(), Arc::clone(&geometry), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(

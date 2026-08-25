@@ -5,10 +5,10 @@ use std::{path::Path, sync::Arc};
 use eredu_architectures::nemotron_h::{LayeredModel, ModelArgs, Unit, PREDICTION_STATE_SEGMENT};
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
-    LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
-    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, StaticUnitBindings,
-    WeightBinding, WeightResidency,
+    ActivationObserver, ArchitectureParameters, CacheResidencyPolicy, CausalModel,
+    DenseDiskStreamReport, LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata,
+    LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport,
+    StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -519,7 +519,7 @@ fn load_neutral_parallel(
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = NemotronHParallelUnitPopulator {
         external_experts,

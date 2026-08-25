@@ -3,10 +3,9 @@
 use ref_cast::RefCast;
 use safemlx::Array;
 
-use eredu_architectures::{BindableStaticParameters, StaticParameterVisitor};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_nn::Parameterized;
-use eredu_runtime::StaticUnitBindings;
+use eredu_runtime::{ArchitectureParameters, StaticParameterVisitor, StaticUnitBindings};
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
 
@@ -39,7 +38,7 @@ pub(crate) fn architecture_static_units<A>(
     store: &dyn CheckpointSource,
 ) -> Result<Vec<StaticUnitBindings>, Error>
 where
-    A: BindableStaticParameters<MlxNeuralBackend>,
+    A: ArchitectureParameters<MlxNeuralBackend>,
 {
     let recipes = architecture
         .static_parameter_recipes(store)

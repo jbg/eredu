@@ -15,9 +15,10 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, LayerWeightResidency, LayeredArchitecture,
-    LayeredForwardState, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
+    ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
+    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
+    ParallelModelInfo, ParameterRole, RuntimeState, StaticUnitBindings, WeightBinding,
+    WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -461,10 +462,22 @@ impl MuseGlimmerPipelineBindings {
         layout: Option<&eredu_runtime::LocalModelLayout>,
         _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = architecture
-            .parameter_description()
-            .map_err(|error| Error::Parallel(error.to_string()))?
-            .targets_for_role(ParameterRole::ExpertIntermediate);
+        let expert_targets = if group == 1 {
+            eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
+                .map_err(|error| Error::Parallel(error.to_string()))?
+                .into_iter()
+                .filter(|group| group.role() == ParameterRole::ExpertIntermediate)
+                .flat_map(|group| {
+                    group
+                        .members()
+                        .iter()
+                        .map(|member| member.target().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let recipes = crate::composition::muse_glimmer_expert::module_recipes(
             global_layer,
             architecture.args(),
@@ -494,15 +507,27 @@ impl MuseGlimmerPipelineBindings {
         &self,
         architecture: &NeutralArchitecture,
         group: usize,
-        _index: usize,
+        index: usize,
         layer: &MuseGlimmerPipelineUnit,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
-        let expert_targets = architecture
-            .parameter_description()
-            .map_err(|error| Error::Parallel(error.to_string()))?
-            .targets_for_role(ParameterRole::ExpertIntermediate);
+        let expert_targets = if group == 1 {
+            eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
+                .map_err(|error| Error::Parallel(error.to_string()))?
+                .into_iter()
+                .filter(|group| group.role() == ParameterRole::ExpertIntermediate)
+                .flat_map(|group| {
+                    group
+                        .members()
+                        .iter()
+                        .map(|member| member.target().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let recipes = crate::composition::muse_glimmer_expert::module_recipes(
             layer,
             architecture.args(),
@@ -1323,7 +1348,7 @@ fn load_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
-            .parameter_description()
+            .parameter_description(stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
@@ -1437,7 +1462,7 @@ fn load_parallel_store(
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::static_modules(

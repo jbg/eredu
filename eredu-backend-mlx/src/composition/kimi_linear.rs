@@ -5,9 +5,10 @@ use std::{collections::BTreeSet, path::Path, sync::Arc};
 use eredu_architectures::kimi_linear::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, LayerWeightResidency,
-    LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
+    ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
+    LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions,
+    ParallelModelInfo, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
+    WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -466,7 +467,7 @@ fn load_neutral_parallel(
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = KimiLinearParallelUnitPopulator {
         external_experts,

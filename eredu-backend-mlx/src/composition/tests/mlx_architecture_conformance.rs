@@ -15,8 +15,8 @@ use crate::backend::{
 use crate::MlxTensor;
 
 #[test]
-fn every_pipeline_composed_family_exposes_architecture_owned_static_bindings() {
-    fn assert_bindable<A: eredu_architectures::BindableStaticParameters<MlxNeuralBackend>>() {}
+fn every_layered_family_exposes_authoritative_geometry_and_parameter_binding() {
+    fn assert_bindable<A: eredu_runtime::ArchitectureParameters<MlxNeuralBackend>>() {}
 
     assert_bindable::<eredu_architectures::llama::LayeredModel<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>>();
@@ -33,6 +33,7 @@ fn every_pipeline_composed_family_exposes_architecture_owned_static_bindings() {
     assert_bindable::<eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::deepseek::v3::Model<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::moshi::LayeredModel<MlxNeuralBackend>>();
 }
 
 fn mlx_execution() -> Option<ExecutionContext> {

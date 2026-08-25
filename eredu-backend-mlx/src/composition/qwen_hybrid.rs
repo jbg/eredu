@@ -16,6 +16,7 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
+    ArchitectureParameters,
     CacheResidencyPolicy, CausalModel, ExecutionResidency, LayerWeightResidency,
     LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
     PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,

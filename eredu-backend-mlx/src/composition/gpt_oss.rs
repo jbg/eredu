@@ -12,10 +12,10 @@ use eredu_nn::{
     ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
 };
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionResidency,
-    LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, ResidencyReport, RuntimeState, StaticUnitBindings,
-    WeightBinding, WeightResidency,
+    ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
+    ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime,
+    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, RuntimeState,
+    StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -69,7 +69,8 @@ fn expert_parameter_targets(
     architecture: &NeutralArchitecture,
     stream: &Stream,
 ) -> Result<BTreeSet<String>, Error> {
-    let mut targets = eredu_architectures::gpt_oss::parameter_description(architecture, stream)
+    let mut targets = architecture
+        .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?
         .targets_for_role(ParameterRole::ExpertIntermediate);
     targets.extend(
@@ -412,7 +413,7 @@ fn load_neutral_parallel_with_store(
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
-        .runtime_state_layout()
+        .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = GptOssParallelUnitPopulator {
         external_experts,
