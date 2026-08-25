@@ -105,12 +105,14 @@ pub trait ModelConfigurationResolver {
         checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError>;
 
-    /// Enriches resolved architecture state with exact sidecars selected by inspection.
+    /// Finalizes resolved architecture state against the inspected tensor catalog
+    /// and exact sidecars selected by inspection.
     fn artifact_plan(
         &self,
         _path: &Path,
         _format: ArtifactFormat,
         _configuration: &ModelConfiguration,
+        _tensors: &TensorCatalog,
         _validated_gguf: Option<&ValidatedGguf>,
         resolved_plan: Self::ArtifactPlan,
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
@@ -513,6 +515,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         path,
         ArtifactFormat::Gguf,
         &configuration,
+        &tensors,
         Some(&validated_gguf),
         resolved_plan,
     )?;
@@ -709,6 +712,7 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
         path,
         ArtifactFormat::SafeTensors,
         &configuration,
+        &tensors,
         None,
         resolved_plan,
     )?;
@@ -1015,6 +1019,7 @@ mod tests {
             _path: &Path,
             format: ArtifactFormat,
             _configuration: &ModelConfiguration,
+            _tensors: &TensorCatalog,
             _validated_gguf: Option<&ValidatedGguf>,
             _resolved_plan: Self::ArtifactPlan,
         ) -> Result<Self::ArtifactPlan, ArtifactError> {

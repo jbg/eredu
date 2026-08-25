@@ -517,8 +517,12 @@ video support from a family name. Text-only and partially multimodal variants
 therefore do not acquire processor or feature requirements they cannot use.
 SafeTensors materialization retains the typed normalized family configuration,
 its complete architecture-derived checkpoint plan, and the validated tensor
-catalog from the preparation plan. MLX structural validation applies that exact
-checkpoint plan to its store and has no second raw-JSON family parser dispatch.
+catalog from the preparation plan. Catalog-dependent architecture admission is
+finalized against that neutral catalog before a backend receives the plan. For
+Moshi this proves the strict physical schema and canonical recipe publication
+as one architecture-owned operation and retains the recipes in the admitted
+plan. MLX structural validation applies the exact checkpoint plan generically;
+it has no family-specific recipe validation or second raw-JSON parser dispatch.
 Catalog strictness belongs to that architecture-owned checkpoint schema;
 residency and materialization options cannot weaken it. Conversely, tensors
 left unclaimed by an explicitly non-strict schema remain outside the resolved

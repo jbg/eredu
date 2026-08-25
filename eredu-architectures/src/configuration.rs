@@ -1,13 +1,18 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_checkpoint::{
+    recipe::{AtomicRecipeSet, RecipeCatalog},
     schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan},
-    validation::StrictLoadFailure,
+    store::{StoreError, TensorMetadata},
+    validation::{CatalogTensorMetadata, SafetensorsCatalog, StrictLoadFailure},
+    StoredDtype,
 };
 use eredu_core::{
-    artifact::ArtifactError, ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement,
-    GgufCompanionRole, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
-    ResolvedModelConfiguration, ValidatedGguf,
+    artifact::ArtifactError,
+    checkpoint::{TensorCatalog, TensorDtype},
+    ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement, GgufCompanionRole,
+    LoadingProtocol, ModelConfiguration, ModelConfigurationResolver, ResolvedModelConfiguration,
+    ValidatedGguf,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Serialize};
@@ -63,11 +68,13 @@ impl ModelConfigurationResolver for ModelConfigurations {
         path: &Path,
         format: ArtifactFormat,
         configuration: &ModelConfiguration,
+        tensors: &TensorCatalog,
         validated_gguf: Option<&ValidatedGguf>,
         resolved_plan: Self::ArtifactPlan,
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
         let plan = match format {
             ArtifactFormat::SafeTensors => {
+                let resolved_plan = resolved_plan.admit_safetensors_catalog(tensors)?;
                 let kind = resolved_plan.model_kind();
                 let model = serde_json::to_vec(configuration.json.as_ref().ok_or_else(|| {
                     ArtifactError::InvalidArtifact(
@@ -595,6 +602,7 @@ pub struct SafetensorsArchitecturePlan {
     kind: ModelKind,
     model: SafetensorsModelConfig,
     checkpoint: SafetensorsCheckpointPlan,
+    moshi_recipes: Option<AtomicRecipeSet>,
 }
 
 /// Typed, normalized family configuration retained from GGUF admission.
@@ -682,6 +690,94 @@ impl SafetensorsArchitecturePlan {
     /// Complete expected SafeTensors catalog derived from the normalized geometry.
     pub const fn checkpoint(&self) -> &SafetensorsCheckpointPlan {
         &self.checkpoint
+    }
+
+    /// Canonical Moshi binding recipes proven against the admitted catalog.
+    pub const fn moshi_recipes(&self) -> Option<&AtomicRecipeSet> {
+        self.moshi_recipes.as_ref()
+    }
+
+    pub(crate) fn admit_catalog(&mut self, tensors: &TensorCatalog) -> Result<(), ArtifactError> {
+        let SafetensorsModelConfig::Moshi(config) = &self.model else {
+            return Ok(());
+        };
+        let catalog = PortableSafetensorsCatalog(tensors);
+        self.moshi_recipes = Some(
+            crate::moshi::admit_checkpoint(config, &self.checkpoint, &catalog).map_err(
+                |error| {
+                    ArtifactError::InvalidArchitecturePlan(format!(
+                        "invalid Moshi checkpoint preparation: {error}"
+                    ))
+                },
+            )?,
+        );
+        Ok(())
+    }
+}
+
+struct PortableSafetensorsCatalog<'a>(&'a TensorCatalog);
+
+impl SafetensorsCatalog for PortableSafetensorsCatalog<'_> {
+    fn keys(&self) -> Vec<String> {
+        self.0
+            .descriptors()
+            .map(|tensor| tensor.name.clone())
+            .collect()
+    }
+
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+        let tensor = self
+            .0
+            .get(key)
+            .ok_or_else(|| format!("unknown checkpoint tensor {key:?}"))?;
+        Ok(CatalogTensorMetadata {
+            shape: tensor.shape.clone(),
+            stored_dtype: portable_stored_dtype(&tensor.dtype),
+        })
+    }
+}
+
+impl RecipeCatalog for PortableSafetensorsCatalog<'_> {
+    fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        let tensor = self
+            .0
+            .get(key)
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+        Ok(TensorMetadata {
+            name: tensor.name.clone(),
+            logical_shape: tensor.shape.clone(),
+            physical_shape: tensor.shape.clone(),
+            stored_dtype: portable_stored_dtype(&tensor.dtype),
+            encoded_byte_len: tensor.storage.as_ref().map_or(0, |storage| storage.length),
+            backing_shard: tensor
+                .storage
+                .as_ref()
+                .map(|storage| storage.member.clone().into()),
+        })
+    }
+}
+
+fn portable_stored_dtype(dtype: &TensorDtype) -> StoredDtype {
+    match dtype {
+        TensorDtype::Bool => StoredDtype::Bool,
+        TensorDtype::U8 => StoredDtype::U8,
+        TensorDtype::I8 => StoredDtype::I8,
+        TensorDtype::I16 => StoredDtype::I16,
+        TensorDtype::U16 => StoredDtype::U16,
+        TensorDtype::F16 => StoredDtype::F16,
+        TensorDtype::Bf16 => StoredDtype::BF16,
+        TensorDtype::I32 => StoredDtype::I32,
+        TensorDtype::U32 => StoredDtype::U32,
+        TensorDtype::F32 => StoredDtype::F32,
+        TensorDtype::F64 => StoredDtype::F64,
+        TensorDtype::I64 => StoredDtype::I64,
+        TensorDtype::U64 => StoredDtype::U64,
+        TensorDtype::Complex64 => StoredDtype::C64,
+        TensorDtype::Encoded(name) if name == "F8_E4M3" => StoredDtype::F8E4M3,
+        TensorDtype::Encoded(name) if name == "F4" => StoredDtype::F4,
+        TensorDtype::Encoded(name) if name == "F8_E8M0" => StoredDtype::F8E8M0,
+        TensorDtype::Encoded(name) if name == "F8_E5M2" => StoredDtype::F8E5M2,
+        TensorDtype::Encoded(name) => StoredDtype::Other(name.clone()),
     }
 }
 
@@ -795,6 +891,7 @@ fn resolve_safetensors_architecture(
         kind,
         model,
         checkpoint,
+        moshi_recipes: None,
     })
 }
 
@@ -864,6 +961,61 @@ mod tests {
         })
     }
 
+    fn tiny_moshi_config() -> Value {
+        serde_json::json!({
+            "model_type": "moshi", "dim": 32, "text_card": 101,
+            "n_q": 4, "dep_q": 3, "generated_audio_codebooks": 2, "card": 64,
+            "num_heads": 4, "num_layers": 2, "dim_feedforward": 48,
+            "causal": true, "context": 7, "max_period": 10000.0,
+            "positional_embedding": "rope", "depformer_dim": 24,
+            "depformer_dim_feedforward": 36, "depformer_num_heads": 4,
+            "depformer_num_layers": 2, "depformer_context": 3,
+            "depformer_max_period": 10000.0, "depformer_pos_emb": "none",
+            "delays": [0, 0, 1, 2, 1]
+        })
+    }
+
+    #[test]
+    fn moshi_artifact_plan_retains_catalog_admission_recipes() {
+        let (configuration, resolved_plan) = MODEL_CONFIGURATIONS
+            .resolve_safetensors(&tiny_moshi_config())
+            .unwrap()
+            .into_parts();
+        let checkpoint = resolved_plan
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint();
+        let tensors = TensorCatalog::new(checkpoint.common_tensors.iter().map(|tensor| {
+            eredu_core::checkpoint::TensorDescriptor {
+                name: tensor.key.clone(),
+                shape: tensor.shape.clone(),
+                dtype: TensorDtype::F32,
+                storage: None,
+            }
+        }))
+        .unwrap();
+
+        let admitted = MODEL_CONFIGURATIONS
+            .artifact_plan(
+                Path::new("fixture"),
+                ArtifactFormat::SafeTensors,
+                &configuration,
+                &tensors,
+                None,
+                resolved_plan,
+            )
+            .unwrap();
+        let plan = admitted.safetensors_architecture().unwrap();
+
+        assert_eq!(plan.model_kind(), ModelKind::Moshi);
+        assert!(plan.moshi_recipes().is_some());
+        assert!(plan
+            .moshi_recipes()
+            .unwrap()
+            .get("transformer.layers.0.self_attn.in_proj.weight")
+            .is_some());
+    }
+
     #[test]
     fn safetensors_processor_sidecars_are_snapshotted_during_inspection() {
         let root = tempfile::tempdir().unwrap();
@@ -891,6 +1043,7 @@ mod tests {
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
+                &TensorCatalog::new([]).unwrap(),
                 None,
                 resolved_plan,
             )
@@ -912,6 +1065,7 @@ mod tests {
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &next_configuration,
+                &TensorCatalog::new([]).unwrap(),
                 None,
                 next_resolved_plan,
             )

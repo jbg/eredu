@@ -6,10 +6,10 @@ use std::{
 };
 
 use eredu_checkpoint::{
-    recipe::AtomicRecipeSet,
+    recipe::{AtomicRecipeSet, RecipeCatalog},
     schema::SafetensorsCheckpointPlan,
     store::{SafetensorsWeightStore, StoreError},
-    validation::resolve_safetensors_plan,
+    validation::{resolve_safetensors_plan, CheckpointValidation, SafetensorsCatalog},
 };
 use serde_json::Value;
 
@@ -100,11 +100,15 @@ pub fn prepare_realtime_model(
     let store = SafetensorsWeightStore::open(&checkpoint_source)?;
     let checkpoint_plan =
         safetensors_plan(&config).map_err(RealtimePreparationError::InvalidArchitecture)?;
-    resolve_safetensors_plan(&store, &checkpoint_plan).map_err(|validation| {
-        RealtimePreparationError::InvalidCheckpoint(format!("{validation:?}"))
-    })?;
-    let recipes = canonical_recipes(&config, &store)
-        .map_err(RealtimePreparationError::InvalidArchitecture)?;
+    let recipes =
+        admit_checkpoint(&config, &checkpoint_plan, &store).map_err(|error| match error {
+            CheckpointPreparationError::Schema(validation) => {
+                RealtimePreparationError::InvalidCheckpoint(format!("{validation:?}"))
+            }
+            CheckpointPreparationError::Recipes(error) => {
+                RealtimePreparationError::InvalidArchitecture(error)
+            }
+        })?;
     Ok(RealtimePreparationPlan {
         artifact_root: artifact_root.to_owned(),
         checkpoint_source,
@@ -112,6 +116,29 @@ pub fn prepare_realtime_model(
         checkpoint_plan,
         recipes,
     })
+}
+
+/// Proves the strict physical schema and canonical recipe publication as one
+/// architecture-owned checkpoint admission.
+pub(crate) fn admit_checkpoint<C>(
+    config: &MoshiConfig,
+    checkpoint_plan: &SafetensorsCheckpointPlan,
+    catalog: &C,
+) -> Result<AtomicRecipeSet, CheckpointPreparationError>
+where
+    C: SafetensorsCatalog + RecipeCatalog + ?Sized,
+{
+    resolve_safetensors_plan(catalog, checkpoint_plan)
+        .map_err(CheckpointPreparationError::Schema)?;
+    canonical_recipes(config, catalog).map_err(CheckpointPreparationError::Recipes)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CheckpointPreparationError {
+    #[error("checkpoint schema validation failed: {0:?}")]
+    Schema(CheckpointValidation),
+    #[error("canonical recipe validation failed: {0}")]
+    Recipes(String),
 }
 
 fn checkpoint_source(

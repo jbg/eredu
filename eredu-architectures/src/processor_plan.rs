@@ -478,6 +478,25 @@ impl ArtifactArchitecturePlan {
         self
     }
 
+    /// Finalizes catalog-dependent SafeTensors admission before processor enrichment.
+    pub(crate) fn admit_safetensors_catalog(
+        mut self,
+        tensors: &eredu_core::checkpoint::TensorCatalog,
+    ) -> Result<Self, eredu_core::artifact::ArtifactError> {
+        match &mut self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => plan.admit_catalog(tensors)?,
+            ArtifactFamilyPlan::Gguf(_) => {
+                return Err(
+                    eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(
+                        "SafeTensors catalog admission requires a SafeTensors architecture plan"
+                            .into(),
+                    ),
+                );
+            }
+        }
+        Ok(self)
+    }
+
     /// Normalizes one SafeTensors family and its processor sidecars.
     pub(crate) fn with_safetensors_processors(
         mut self,

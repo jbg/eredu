@@ -11,16 +11,16 @@ use eredu_architectures::{GgufArchitecture, ModelKind};
 #[cfg(test)]
 use super::ModelLoadOptions;
 use crate::backend::error::Error;
-use eredu_checkpoint::{recipe::RecipeCatalog, validation::SafetensorsCatalog};
+use eredu_checkpoint::validation::SafetensorsCatalog;
 
 pub use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
     CheckpointValidation as StructuralValidation,
 };
 
-pub(crate) trait StructuralSafetensorsCatalog: SafetensorsCatalog + RecipeCatalog {}
+pub(crate) trait StructuralSafetensorsCatalog: SafetensorsCatalog {}
 
-impl<T> StructuralSafetensorsCatalog for T where T: SafetensorsCatalog + RecipeCatalog + ?Sized {}
+impl<T> StructuralSafetensorsCatalog for T where T: SafetensorsCatalog + ?Sized {}
 
 /// Native view of the GGUF source admitted by portable inspection.
 ///
@@ -390,32 +390,7 @@ pub fn validate_safetensors(
     plan: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: &(impl StructuralSafetensorsCatalog + ?Sized),
 ) -> StructuralValidation {
-    let validation =
-        eredu_checkpoint::validation::validate_safetensors_plan(store, plan.checkpoint());
-    let validation = if validation == StructuralValidation::Exact {
-        match plan.model() {
-            eredu_architectures::configuration::SafetensorsModelConfig::Moshi(config) => {
-                match eredu_architectures::moshi::canonical_recipes(config, store) {
-                    Ok(_) => StructuralValidation::Exact,
-                    Err(error) => invalid_geometry(error),
-                }
-            }
-            _ => validation,
-        }
-    } else {
-        validation
-    };
-    validation
-}
-
-fn invalid_geometry(detail: String) -> StructuralValidation {
-    StructuralValidation::Invalid(vec![StructuralIssue {
-        kind: StructuralIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
+    eredu_checkpoint::validation::validate_safetensors_plan(store, plan.checkpoint())
 }
 
 #[cfg(test)]
@@ -679,11 +654,7 @@ mod catalog_policy_tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use eredu_checkpoint::{
-        store::{StoreError, TensorMetadata},
-        validation::CatalogTensorMetadata,
-        StoredDtype,
-    };
+    use eredu_checkpoint::{validation::CatalogTensorMetadata, StoredDtype};
 
     #[derive(Clone)]
     struct TestCatalog(BTreeMap<String, Vec<usize>>);
@@ -701,23 +672,6 @@ mod catalog_policy_tests {
             Ok(CatalogTensorMetadata {
                 shape: shape.clone(),
                 stored_dtype: StoredDtype::F32,
-            })
-        }
-    }
-
-    impl RecipeCatalog for TestCatalog {
-        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-            let shape = self
-                .0
-                .get(key)
-                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-            Ok(TensorMetadata {
-                name: key.into(),
-                logical_shape: shape.clone(),
-                physical_shape: shape.clone(),
-                stored_dtype: StoredDtype::F32,
-                encoded_byte_len: 0,
-                backing_shard: None,
             })
         }
     }

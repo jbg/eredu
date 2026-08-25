@@ -480,6 +480,7 @@ mod runtime_state_dtype_tests {
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
+                &eredu_core::checkpoint::TensorCatalog::new([]).unwrap(),
                 None,
                 resolved_plan,
             )

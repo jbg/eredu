@@ -42,31 +42,6 @@ impl eredu_checkpoint::validation::SafetensorsCatalog for InspectedSafetensorsCa
     }
 }
 
-impl eredu_checkpoint::recipe::RecipeCatalog for InspectedSafetensorsCatalog<'_> {
-    fn tensor_metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
-        let tensor =
-            self.0
-                .get(key)
-                .ok_or_else(|| eredu_checkpoint::store::StoreError::UnknownTensor {
-                    key: key.into(),
-                })?;
-        Ok(eredu_checkpoint::store::TensorMetadata {
-            name: tensor.name.clone(),
-            logical_shape: tensor.shape.clone(),
-            physical_shape: tensor.shape.clone(),
-            stored_dtype: inspected_stored_dtype(&tensor.dtype),
-            encoded_byte_len: tensor.storage.as_ref().map_or(0, |storage| storage.length),
-            backing_shard: tensor
-                .storage
-                .as_ref()
-                .map(|storage| PathBuf::from(&storage.member)),
-        })
-    }
-}
-
 fn inspected_stored_dtype(dtype: &TensorDtype) -> eredu_checkpoint::StoredDtype {
     use eredu_checkpoint::StoredDtype;
     match dtype {
