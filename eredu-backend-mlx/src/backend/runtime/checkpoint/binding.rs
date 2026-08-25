@@ -22,9 +22,7 @@ use crate::{
     backend::error::Error,
     backend::nn::shared::neutral_parameter_refs,
     backend::runtime::checkpoint::binding_plan::{BindingPlan, BindingPlanError, PlannedBinding},
-    backend::runtime::checkpoint::load::{
-        load_array_quantized_strict, StrictLoadConfig, StrictLoadReport,
-    },
+    backend::runtime::checkpoint::load::{load_array_quantized_strict, StrictLoadReport},
     backend::runtime::checkpoint::recipe::{
         recipe_dtype_from_mlx, MlxWeightRecipeExt, WeightRecipeError,
     },
@@ -517,7 +515,6 @@ where
     F: Fn(&str) -> bool,
 {
     quantization.validate()?;
-    let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
     {
         let mut parameters = module.parameters_mut().flatten();
@@ -528,12 +525,11 @@ where
                 value.clone(),
                 stream,
                 quantization,
-                &config,
                 &mut report,
             )?;
         }
     }
-    report.finish_excluding(module, &config, excluded)
+    report.finish_excluding(module, excluded)
 }
 
 pub fn build_module_bindings_with_recipes_excluding<F>(

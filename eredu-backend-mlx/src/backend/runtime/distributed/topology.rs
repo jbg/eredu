@@ -16,8 +16,7 @@ use eredu_runtime::TensorPlacement;
 use safemlx::{distributed::Group, Array, Stream};
 
 use crate::{
-    backend::error::Error, backend::runtime::checkpoint::load::StrictLoadConfig,
-    backend::runtime::checkpoint::store::MlxParameterMaterializationContext,
+    backend::error::Error, backend::runtime::checkpoint::store::MlxParameterMaterializationContext,
 };
 
 #[cfg(test)]
@@ -321,7 +320,7 @@ struct TensorPlan {
     expected_source_shape: Option<Vec<usize>>,
 }
 
-/// Inspectable mapping from rewritten target names to typed placement decisions.
+/// Inspectable mapping from exact checkpoint names to typed placement decisions.
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
     topology: MlxParallelContext,
@@ -355,10 +354,10 @@ impl PlacementPlan {
         self.topology
     }
 
-    /// Adds or replaces a target-tensor placement.
-    pub fn insert(&mut self, target: impl Into<String>, placement: TensorPlacement) {
+    /// Adds or replaces a checkpoint-tensor placement.
+    pub fn insert(&mut self, source: impl Into<String>, placement: TensorPlacement) {
         self.tensors.insert(
-            target.into(),
+            source.into(),
             TensorPlan {
                 placement,
                 expected_source_shape: None,
@@ -369,14 +368,14 @@ impl PlacementPlan {
     /// Adds a placement with a required pre-slice checkpoint shape.
     pub fn insert_expected(
         &mut self,
-        target: impl Into<String>,
+        source: impl Into<String>,
         expected_source_shape: impl Into<Vec<usize>>,
         placement: TensorPlacement,
     ) -> Result<(), Error> {
         let expected_source_shape = expected_source_shape.into();
         validate_placement(&placement, &expected_source_shape, self.topology)?;
         self.tensors.insert(
-            target.into(),
+            source.into(),
             TensorPlan {
                 placement,
                 expected_source_shape: Some(expected_source_shape),
@@ -438,9 +437,9 @@ impl PlacementPlan {
         Ok(range)
     }
 
-    /// Returns an explicit tensor placement by rewritten target name.
-    pub fn placement(&self, target: &str) -> Option<&TensorPlacement> {
-        self.tensors.get(target).map(|plan| &plan.placement)
+    /// Returns an explicit tensor placement by exact checkpoint name.
+    pub fn placement(&self, source: &str) -> Option<&TensorPlacement> {
+        self.tensors.get(source).map(|plan| &plan.placement)
     }
 
     /// Validates every placement whose constraints are known before loading.
@@ -448,9 +447,9 @@ impl PlacementPlan {
     /// Axis bounds and divisibility require `insert_expected`; ownership and
     /// shard-coordinate bounds are validated for all entries.
     pub fn validate(&self) -> Result<(), Error> {
-        for (target, tensor) in &self.tensors {
+        for (source, tensor) in &self.tensors {
             validate_plan_entry(tensor, self.topology).map_err(|error| {
-                Error::Parallel(format!("placement for tensor {target}: {error}"))
+                Error::Parallel(format!("placement for tensor {source}: {error}"))
             })?;
         }
         if let Some(default) = &self.default {
@@ -465,28 +464,15 @@ impl PlacementPlan {
         Ok(())
     }
 
-    fn source_plan(&self, source: &str, config: &StrictLoadConfig) -> SourcePlan {
-        for candidate in config.candidates(source) {
-            if let Some(plan) = self.tensors.get(&candidate) {
-                return SourcePlan::Known {
-                    target: candidate,
-                    tensor: plan.clone(),
-                };
-            }
+    fn source_plan(&self, source: &str) -> SourcePlan {
+        if let Some(plan) = self.tensors.get(source) {
+            return SourcePlan::Known(plan.clone());
         }
         if let Some(placement) = &self.default {
-            let target = config
-                .candidates(source)
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| source.to_string());
-            SourcePlan::Known {
-                target,
-                tensor: TensorPlan {
-                    placement: placement.clone(),
-                    expected_source_shape: None,
-                },
-            }
+            SourcePlan::Known(TensorPlan {
+                placement: placement.clone(),
+                expected_source_shape: None,
+            })
         } else {
             SourcePlan::Unexpected
         }
@@ -536,7 +522,7 @@ fn validate_plan_entry(plan: &TensorPlan, topology: MlxParallelContext) -> Resul
 
 #[derive(Debug, Clone)]
 enum SourcePlan {
-    Known { target: String, tensor: TensorPlan },
+    Known(TensorPlan),
     Unexpected,
 }
 
@@ -678,9 +664,9 @@ impl RankPartition {
         self.topology
     }
 
-    /// Returns a locally materialized tensor by rewritten target name.
-    pub fn get(&self, target: &str) -> Option<&Array> {
-        self.tensors.get(target)
+    /// Returns a locally materialized tensor by exact checkpoint name.
+    pub fn get(&self, source: &str) -> Option<&Array> {
+        self.tensors.get(source)
     }
 
     /// Iterates over locally materialized tensors.
@@ -721,9 +707,9 @@ struct PartitionReport {
 }
 
 impl PartitionReport {
-    fn finish(self, plan: &PlacementPlan, config: &StrictLoadConfig) -> Result<(), Error> {
+    fn finish(self, plan: &PlacementPlan) -> Result<(), Error> {
         let mut missing = Vec::new();
-        for (target, tensor) in &plan.tensors {
+        for (source, tensor) in &plan.tensors {
             let locally_required = match tensor.placement {
                 TensorPlacement::Replicated
                 | TensorPlacement::Local
@@ -736,16 +722,12 @@ impl PartitionReport {
                     stage == plan.topology.pipeline_parallel_rank
                 }
             };
-            if locally_required && !self.loaded.contains(target) {
-                missing.push(target.clone());
+            if locally_required && !self.loaded.contains(source) {
+                missing.push(source.clone());
             }
         }
         missing.sort();
-        let mut unexpected = self
-            .unexpected
-            .into_iter()
-            .filter(|source| !config.is_unused_allowed(source))
-            .collect::<Vec<_>>();
+        let mut unexpected = self.unexpected;
         unexpected.sort();
         unexpected.dedup();
         if missing.is_empty() && unexpected.is_empty() {
@@ -761,7 +743,7 @@ impl PartitionReport {
 
 /// Selectively loads a safetensors checkpoint directory according to `plan`.
 ///
-/// For indexed checkpoints, key rewrites and placement are resolved from the
+/// For indexed checkpoints, exact-name placement is resolved from the
 /// index before any payload shard is opened. A shard containing no local
 /// tensors is therefore skipped completely. Within an opened shard, omitted
 /// tensors never become MLX arrays. Selected source views are sliced before
@@ -772,9 +754,8 @@ pub fn load_safetensors_partition(
     model_dir: impl AsRef<Path>,
     plan: &PlacementPlan,
     stream: &Stream,
-    config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
-    load_safetensors_partition_on_streams(model_dir, plan, stream, stream, config)
+    load_safetensors_partition_on_streams(model_dir, plan, stream, stream)
 }
 
 /// Selectively loads on a source/weights stream, then places only local results
@@ -789,10 +770,9 @@ pub fn load_safetensors_partition_on_streams(
     plan: &PlacementPlan,
     source_stream: &Stream,
     execution_stream: &Stream,
-    config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
     let store = SafetensorsWeightStore::open(model_dir)?;
-    load_partition_from_store_on_streams(&store, plan, source_stream, execution_stream, config)
+    load_partition_from_store_on_streams(&store, plan, source_stream, execution_stream)
 }
 
 /// Selectively loads a rank partition from a reusable checkpoint store.
@@ -800,9 +780,8 @@ pub fn load_partition_from_store(
     store: &(impl CheckpointSource + ?Sized),
     plan: &PlacementPlan,
     stream: &Stream,
-    config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
-    load_partition_from_store_on_streams(store, plan, stream, stream, config)
+    load_partition_from_store_on_streams(store, plan, stream, stream)
 }
 
 /// Selectively loads a rank partition from a reusable checkpoint store using
@@ -815,7 +794,6 @@ pub fn load_partition_from_store_on_streams(
     plan: &PlacementPlan,
     source_stream: &Stream,
     execution_stream: &Stream,
-    config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
     plan.validate()?;
     plan.topology.validate_execution_stream(execution_stream)?;
@@ -825,7 +803,7 @@ pub fn load_partition_from_store_on_streams(
     let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
 
     for source in store.source_keys() {
-        let SourcePlan::Known { target, tensor } = plan.source_plan(&source, config) else {
+        let SourcePlan::Known(tensor) = plan.source_plan(&source) else {
             report.unexpected.push(source);
             continue;
         };
@@ -837,9 +815,8 @@ pub fn load_partition_from_store_on_streams(
         }
 
         let metadata = store.source_metadata(&source)?;
-        let resolved = resolve_placement(&tensor, &metadata.logical_shape, plan.topology).map_err(
-            |error| Error::Parallel(format!("checkpoint tensor {source} -> {target}: {error}")),
-        )?;
+        let resolved = resolve_placement(&tensor, &metadata.logical_shape, plan.topology)
+            .map_err(|error| Error::Parallel(format!("checkpoint tensor {source}: {error}")))?;
         let selection = match resolved {
             ResolvedPlacement::Omit => continue,
             ResolvedPlacement::Materialize => TensorSelection::Full,
@@ -864,15 +841,15 @@ pub fn load_partition_from_store_on_streams(
             .weight_lease(lease)?
             .materialize(source_stream, execution_stream)?
             .synchronize()?;
-        report.loaded.insert(target.clone());
-        if tensors.insert(target.clone(), value).is_some() {
+        report.loaded.insert(source.clone());
+        if tensors.insert(source.clone(), value).is_some() {
             return Err(Error::Parallel(format!(
-                "multiple checkpoint tensors resolved to local target {target}"
+                "checkpoint tensor {source} was materialized more than once"
             )));
         }
     }
 
-    report.finish(plan, config)?;
+    report.finish(plan)?;
     Ok(RankPartition {
         topology: plan.topology,
         tensors,
@@ -1107,7 +1084,7 @@ mod tests {
             let topology = topology(rank, 2, 1, 1);
             let mut plan = PlacementPlan::new(topology);
             plan.insert_expected(
-                "projection.weight",
+                "model.projection.weight",
                 vec![2, 4],
                 TensorPlacement::Shard {
                     axis: 1,
@@ -1116,18 +1093,16 @@ mod tests {
                 },
             )
             .unwrap();
-            plan.insert("remote.weight", TensorPlacement::Omit);
-            let config = StrictLoadConfig::default().strip_prefix("model.");
-            let partition =
-                load_safetensors_partition(dir.path(), &plan, &stream, &config).unwrap();
+            plan.insert("model.remote.weight", TensorPlacement::Omit);
+            let partition = load_safetensors_partition(dir.path(), &plan, &stream).unwrap();
             assert_eq!(partition.len(), 1);
             assert_eq!(
                 partition.opened_shards(),
                 &[dir.path().join("local.safetensors")]
             );
-            assert!(partition.get("remote.weight").is_none());
+            assert!(partition.get("model.remote.weight").is_none());
             let local = partition
-                .get("projection.weight")
+                .get("model.projection.weight")
                 .unwrap()
                 .evaluated()
                 .unwrap();
@@ -1171,9 +1146,7 @@ mod tests {
             },
         )
         .unwrap();
-        let partition =
-            load_safetensors_partition(dir.path(), &plan, &stream, &StrictLoadConfig::default())
-                .unwrap();
+        let partition = load_safetensors_partition(dir.path(), &plan, &stream).unwrap();
         let local = partition.get("experts").unwrap().evaluated().unwrap();
         assert_eq!(local.as_array().shape(), &[2, 2]);
         assert_eq!(local.as_slice::<i32>(), &[30, 31, 10, 11]);
@@ -1201,9 +1174,7 @@ mod tests {
             vec![2, 2],
         );
         let plan = PlacementPlan::replicated(topology(0, 1, 1, 1));
-        let partition =
-            load_safetensors_partition(dir.path(), &plan, &stream, &StrictLoadConfig::default())
-                .unwrap();
+        let partition = load_safetensors_partition(dir.path(), &plan, &stream).unwrap();
         let loaded = partition.get("weight").unwrap().evaluated().unwrap();
         assert_eq!(loaded.as_slice::<i32>(), &[3, 5, 7, 9]);
     }
@@ -1221,9 +1192,7 @@ mod tests {
         .unwrap();
         let mut plan = PlacementPlan::new(topology(0, 1, 1, 1));
         plan.insert("remote", TensorPlacement::Omit);
-        let partition =
-            load_safetensors_partition(dir.path(), &plan, &stream(), &StrictLoadConfig::default())
-                .unwrap();
+        let partition = load_safetensors_partition(dir.path(), &plan, &stream()).unwrap();
         assert!(partition.is_empty());
     }
 
@@ -1234,9 +1203,7 @@ mod tests {
         write_index(dir.path(), &[("remote.weight", "remote.safetensors")]);
         let mut plan = PlacementPlan::new(topology(0, 1, 1, 1));
         plan.insert("remote.weight", TensorPlacement::Omit);
-        let partition =
-            load_safetensors_partition(dir.path(), &plan, &stream(), &StrictLoadConfig::default())
-                .unwrap();
+        let partition = load_safetensors_partition(dir.path(), &plan, &stream()).unwrap();
         assert!(partition.is_empty());
         assert!(partition.opened_shards().is_empty());
     }
@@ -1258,21 +1225,14 @@ mod tests {
             .insert_expected("present", vec![4, 2], TensorPlacement::Local)
             .unwrap();
         assert!(matches!(
-            load_safetensors_partition(
-                dir.path(),
-                &malformed,
-                &stream,
-                &StrictLoadConfig::default()
-            ),
+            load_safetensors_partition(dir.path(), &malformed, &stream),
             Err(Error::Parallel(_))
         ));
 
         let mut missing = PlacementPlan::new(topology);
         missing.insert("present", TensorPlacement::Omit);
         missing.insert("required", TensorPlacement::Local);
-        let error =
-            load_safetensors_partition(dir.path(), &missing, &stream, &StrictLoadConfig::default())
-                .unwrap_err();
+        let error = load_safetensors_partition(dir.path(), &missing, &stream).unwrap_err();
         match error {
             Error::StrictLoadValidation { missing, unused } => {
                 assert_eq!(missing, ["required"]);
@@ -1282,13 +1242,7 @@ mod tests {
         }
 
         let strict_empty = PlacementPlan::new(topology);
-        let error = load_safetensors_partition(
-            dir.path(),
-            &strict_empty,
-            &stream,
-            &StrictLoadConfig::default(),
-        )
-        .unwrap_err();
+        let error = load_safetensors_partition(dir.path(), &strict_empty, &stream).unwrap_err();
         match error {
             Error::StrictLoadValidation { missing, unused } => {
                 assert!(missing.is_empty());
@@ -1296,14 +1250,5 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-
-        let allowed = load_safetensors_partition(
-            dir.path(),
-            &strict_empty,
-            &stream,
-            &StrictLoadConfig::default().allow_unused_prefix("present"),
-        )
-        .unwrap();
-        assert!(allowed.is_empty());
     }
 }

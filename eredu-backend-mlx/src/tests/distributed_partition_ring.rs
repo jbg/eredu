@@ -13,7 +13,6 @@ use crate::native::{
     DeviceType, Stream,
 };
 use crate::{
-    backend::runtime::checkpoint::load::StrictLoadConfig,
     backend::runtime::distributed::topology::{load_safetensors_partition, PlacementPlan},
     backend::{DeviceAssignment, MlxParallelContext},
 };
@@ -39,7 +38,7 @@ fn partition_ring_worker() {
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let mut plan = PlacementPlan::new(topology);
     plan.insert_expected(
-        "projection.weight",
+        "model.projection.weight",
         vec![2, 4],
         TensorPlacement::Shard {
             axis: 1,
@@ -48,10 +47,8 @@ fn partition_ring_worker() {
         },
     )
     .unwrap();
-    plan.insert("remote.weight", TensorPlacement::Omit);
-    let config = StrictLoadConfig::default().strip_prefix("model.");
-    let partition =
-        load_safetensors_partition(Path::new(&checkpoint), &plan, &stream, &config).unwrap();
+    plan.insert("model.remote.weight", TensorPlacement::Omit);
+    let partition = load_safetensors_partition(Path::new(&checkpoint), &plan, &stream).unwrap();
     assert_eq!(partition.len(), 1);
     assert_eq!(partition.opened_shards().len(), 1);
     assert_eq!(
@@ -59,7 +56,7 @@ fn partition_ring_worker() {
         "local.safetensors"
     );
 
-    let local = partition.get("projection.weight").unwrap();
+    let local = partition.get("model.projection.weight").unwrap();
     assert_eq!(local.shape(), &[2, 2]);
     let gathered = distributed::all_gather(local, &group, &stream).unwrap();
     let gathered = gathered.evaluated().unwrap();

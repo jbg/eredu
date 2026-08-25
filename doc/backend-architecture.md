@@ -838,10 +838,12 @@ composition:
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
   residency workers, media processing, and collectives. Their production
-  checkpoint API consumes canonical parameter names and architecture-derived
-  recipes; generic matching applies only explicitly configured prefix rewrites
-  and backend-module parameter structure, and never invents family aliases or
-  exposes parsers for physical family checkpoint names;
+  checkpoint API consumes exact local parameter identities and
+  architecture-derived bindings and recipes. Strict module loading performs no
+  prefix stripping, prefix rewriting, unused-prefix exemptions, or implicit
+  parameter-name expansion. Selective partition loading likewise requires
+  exact checkpoint keys in its placement plan; neither surface invents family
+  aliases or exposes parsers for physical family checkpoint names;
 - GGUF family selection and portable family-specific structural admission are
   architecture-registry concerns. MLX composition resolves the already
   admitted spelling through the same registry, trusts the retained portable
