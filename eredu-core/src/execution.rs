@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 /// Schema version shared by execution-plan documents.
-pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 3;
 
 /// Default bound for simultaneously open checkpoint payload sources.
 pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
@@ -362,6 +362,10 @@ mod tests {
     fn plan_round_trips_with_extensible_backend_identity() {
         let plan = ExecutionPlan::fully_resident(DevicePlan::new("iree", "vulkan:2").unwrap());
         let encoded = serde_json::to_vec(&plan).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap()["schema_version"],
+            3
+        );
         assert_eq!(
             serde_json::from_slice::<ExecutionPlan>(&encoded).unwrap(),
             plan
