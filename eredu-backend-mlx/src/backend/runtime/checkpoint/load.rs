@@ -313,26 +313,59 @@ fn quantize_safetensors_for_test<M: ModuleParameters>(
     })
 }
 
+/// Strict-loads one canonically named checkpoint tensor into a module.
+///
+/// Canonical `weight` keys may target a private MLX `inner.weight` slot.
+/// Legacy checkpoint keys that expose that private slot are rejected.
 pub fn load_array_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
     value: Array,
     report: &mut StrictLoadReport,
 ) {
-    if params.contains_key(key.as_str()) {
-        if let Some(param) = params.get_mut(key.as_str()) {
+    if is_legacy_inner_weight_name(&key) {
+        report.record_unused(key);
+        return;
+    }
+    let parameter_key = if params.contains_key(key.as_str()) {
+        key.clone()
+    } else {
+        wrapped_weight_parameter_name(&key)
+            .filter(|candidate| params.contains_key(candidate.as_str()))
+            .unwrap_or_else(|| key.clone())
+    };
+    load_array_for_parameter_strict(params, key, parameter_key, value, report);
+}
+
+fn load_array_for_parameter_strict(
+    params: &mut FlattenedModuleParamMut<'_>,
+    source_key: String,
+    parameter_key: String,
+    value: Array,
+    report: &mut StrictLoadReport,
+) {
+    if params.contains_key(parameter_key.as_str()) {
+        if let Some(param) = params.get_mut(parameter_key.as_str()) {
             let expected_shape = param.shape().to_vec();
             let actual_shape = value.shape().to_vec();
             if expected_shape == actual_shape {
                 let checkpoint_native_blocks = value.dtype() == safemlx::Dtype::Uint8;
                 **param = value;
-                report.record_loaded(key.clone());
+                report.record_loaded(parameter_key.clone());
                 if checkpoint_native_blocks {
-                    let prefix = key
-                        .strip_suffix(".inner.weight")
-                        .or_else(|| key.strip_suffix(".weight"));
+                    let prefix = if matches!(parameter_key.as_str(), "inner.weight" | "weight") {
+                        Some("")
+                    } else {
+                        parameter_key
+                            .strip_suffix(".inner.weight")
+                            .or_else(|| parameter_key.strip_suffix(".weight"))
+                    };
                     if let Some(prefix) = prefix {
-                        let scales = format!("{prefix}.scales");
+                        let scales = if prefix.is_empty() {
+                            "scales".to_string()
+                        } else {
+                            format!("{prefix}.scales")
+                        };
                         if params
                             .get(scales.as_str())
                             .is_some_and(|scales| scales.shape() == [1])
@@ -344,11 +377,29 @@ pub fn load_array_strict(
                     }
                 }
             } else {
-                report.record_shape_mismatch(key.clone(), key, expected_shape, actual_shape);
+                report.record_shape_mismatch(
+                    source_key,
+                    parameter_key,
+                    expected_shape,
+                    actual_shape,
+                );
             }
         }
     } else {
-        report.record_unused(key);
+        report.record_unused(source_key);
+    }
+}
+
+fn is_legacy_inner_weight_name(key: &str) -> bool {
+    key == "inner.weight" || key.ends_with(".inner.weight")
+}
+
+fn wrapped_weight_parameter_name(key: &str) -> Option<String> {
+    if key == "weight" {
+        Some("inner.weight".into())
+    } else {
+        key.strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.inner.weight"))
     }
 }
 
@@ -356,9 +407,10 @@ pub fn load_array_strict(
 /// use the standard MLX affine quantized layout.
 ///
 /// Dense matrices are quantized and materialized one at a time as they are
-/// read, bounding the lazy graph and active allocation peak. A target module is
-/// recognized either by the standard safemlx `inner.weight` parameter plus
-/// sibling `scales`/`biases`, or by a packed `weight` with those siblings.
+/// read, bounding the lazy graph and active allocation peak. Checkpoint keys
+/// use canonical `weight` names; this helper privately maps them to a wrapped
+/// MLX `inner.weight` parameter or a packed `weight` with quantization
+/// companions. Legacy `inner.weight` checkpoint keys are left unused.
 pub fn load_array_quantized_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
@@ -369,17 +421,18 @@ pub fn load_array_quantized_strict(
 ) -> Result<(), Error> {
     {
         let weight_key = key.clone();
-        let (prefix, underscore_companions) = if weight_key == "inner.weight" {
-            (String::new(), false)
-        } else if let Some(prefix) = weight_key.strip_suffix(".inner.weight") {
-            (prefix.to_string(), false)
-        } else if let Some(prefix) = weight_key.strip_suffix(".weight") {
-            (prefix.to_string(), false)
-        } else if weight_key == "weight" {
-            (String::new(), false)
-        } else {
-            (weight_key.clone(), true)
-        };
+        if is_legacy_inner_weight_name(&weight_key) {
+            report.record_unused(weight_key);
+            return Ok(());
+        }
+        let (prefix, underscore_companions) =
+            if let Some(prefix) = weight_key.strip_suffix(".weight") {
+                (prefix.to_string(), false)
+            } else if weight_key == "weight" {
+                (String::new(), false)
+            } else {
+                (weight_key.clone(), true)
+            };
         let scales_key = if prefix.is_empty() {
             "scales".to_string()
         } else if underscore_companions {
@@ -394,18 +447,25 @@ pub fn load_array_quantized_strict(
         } else {
             format!("{prefix}.biases")
         };
-        let has_quantized_parameters = params.contains_key(weight_key.as_str())
+        let parameter_key = if params.contains_key(weight_key.as_str()) {
+            weight_key.clone()
+        } else {
+            wrapped_weight_parameter_name(&weight_key)
+                .filter(|candidate| params.contains_key(candidate.as_str()))
+                .unwrap_or_else(|| weight_key.clone())
+        };
+        let has_quantized_parameters = params.contains_key(parameter_key.as_str())
             && params.contains_key(scales_key.as_str())
             && (!quantization.has_biases() || params.contains_key(biases_key.as_str()));
-        let packed_direct_weight = !weight_key.ends_with(".inner.weight")
+        let wrapped_weight = parameter_key != weight_key;
+        let packed_direct_weight = !wrapped_weight
             && params
-                .get(weight_key.as_str())
+                .get(parameter_key.as_str())
                 .is_some_and(|target| target.shape() != value.shape());
-        let target = (has_quantized_parameters
-            && (weight_key.ends_with(".inner.weight") || packed_direct_weight))
-            .then_some((weight_key, scales_key, biases_key));
+        let target = (has_quantized_parameters && (wrapped_weight || packed_direct_weight))
+            .then_some((weight_key, parameter_key, scales_key, biases_key));
 
-        if let Some((weight_key, scales_key, biases_key)) = target {
+        if let Some((weight_key, parameter_key, scales_key, biases_key)) = target {
             let quantized = quantize_tensor(&value, quantization, quantization_stream)?;
             // MLX quantization is lazy. Materialize this tensor before the
             // source value leaves the streaming callback so subsequent
@@ -415,7 +475,13 @@ pub fn load_array_quantized_strict(
                 arrays.push(biases);
             }
             async_eval_with_event(arrays)?.synchronize()?;
-            load_array_strict(params, weight_key, quantized.weight, report);
+            load_array_for_parameter_strict(
+                params,
+                weight_key,
+                parameter_key,
+                quantized.weight,
+                report,
+            );
             load_array_strict(params, scales_key, quantized.scales, report);
             if let Some(biases) = quantized.biases {
                 load_array_strict(params, biases_key, biases, report);
@@ -599,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn quantized_strict_load_requires_exact_parameter_names() {
+    fn quantized_strict_load_maps_canonical_weight_names_to_private_slots() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -628,7 +694,7 @@ mod tests {
             "eredu-mlx-exact-quantized-load-{}-{suffix}.safetensors",
             std::process::id()
         ));
-        Array::save_safetensors([("projection.inner.weight", &dense)], None, &path).unwrap();
+        Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();
 
         let mut report = StrictLoadReport::default();
         quantize_safetensors_for_test(
@@ -679,6 +745,40 @@ mod tests {
     }
 
     #[test]
+    fn quantized_strict_load_rejects_legacy_inner_weight_source_names() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let quantization = AffineQuantization::default();
+        let mut model = QuantizedLinear {
+            projection: unloaded_maybe_quantized_linear(
+                64,
+                8,
+                false,
+                Some(quantization.into()),
+                stream,
+            )
+            .unwrap(),
+        };
+        let dense = Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]);
+        let mut report = StrictLoadReport::default();
+        load_arrays_quantized_strict(
+            &mut model,
+            HashMap::from([("projection.inner.weight".into(), dense)]),
+            stream,
+            quantization.into(),
+            &mut report,
+        )
+        .unwrap();
+
+        let error = report.finish(&model).unwrap_err();
+        let crate::backend::error::Error::StrictLoadValidation { missing, unused } = error else {
+            panic!("legacy source name should fail strict load validation")
+        };
+        assert!(missing.iter().any(|name| name == "projection.inner.weight"));
+        assert_eq!(unused, ["projection.inner.weight"]);
+    }
+
+    #[test]
     fn mxfp4_strict_load_streams_weight_and_scales_without_biases() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
@@ -703,7 +803,7 @@ mod tests {
             "eredu-mlx-mxfp4-strict-load-{}-{suffix}.safetensors",
             std::process::id()
         ));
-        Array::save_safetensors([("projection.inner.weight", &dense)], None, &path).unwrap();
+        Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();
         let mut report = StrictLoadReport::default();
         quantize_safetensors_for_test(
             &mut model,

@@ -9,8 +9,6 @@ use eredu_checkpoint::{
     store::{SafetensorsWeightStore, SharedCheckpointSource, TensorSelection},
     WeightQuantization,
 };
-#[cfg(test)]
-use eredu_runtime::OffloadUnit;
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
     StaticUnitBindings, WeightBinding, DENSE_TRANSFER_WINDOW,
@@ -25,10 +23,6 @@ use std::{
 
 use safemlx::{module::ModuleParameters, Dtype, Stream};
 
-#[cfg(test)]
-use crate::backend::runtime::checkpoint::binding::{
-    binding_bytes, is_materialized_module_parameter,
-};
 use crate::{
     backend::error::Error,
     backend::runtime::checkpoint::binding::{build_module_bindings, ModuleBindingError},
@@ -41,8 +35,6 @@ use crate::{
     },
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
-#[cfg(test)]
-use eredu_core::residency::{OffloadUnitSpec, ResidencyPolicy};
 
 use eredu_nn::{LinearCompanionRole, ParameterMetadata, ParameterVisitor, Parameterized};
 use eredu_runtime::WeightMaterializationReport;
@@ -1262,132 +1254,6 @@ pub fn shard_layer_bindings(
         output.push(sharded);
     }
     Ok(output)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn build_parallel_module_bindings(
-    module: &impl ModuleParameters,
-    prefix: &str,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<Vec<WeightBinding>, Error> {
-    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
-    let params = module.parameters().flatten();
-    let mut names = params
-        .iter()
-        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &params))
-        .map(|(name, _)| name.to_string())
-        .collect::<Vec<_>>();
-    names.sort();
-    let mut bindings = Vec::with_capacity(names.len());
-    for local_name in names {
-        let parameter = params.get(local_name.as_str()).expect("known parameter");
-        let destination = if prefix.is_empty() {
-            local_name.clone()
-        } else {
-            format!("{prefix}.{local_name}")
-        };
-        let canonical =
-            crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(&destination);
-        let checkpoint_key = if keys.contains(&destination) {
-            destination.clone()
-        } else if keys.contains(&canonical) {
-            canonical.clone()
-        } else {
-            return Err(
-                crate::backend::runtime::checkpoint::binding::ModuleBindingError::MissingParameter {
-                    destination,
-                }
-                .into(),
-            );
-        };
-        let metadata = store.source_metadata(&checkpoint_key)?;
-        let tensor = layout
-            .tensor(&checkpoint_key)
-            .or_else(|| layout.tensor(&canonical));
-        let (selection, expected_bytes) = if let Some(tensor) = tensor {
-            let local_shape = parameter
-                .shape()
-                .iter()
-                .map(|&dim| usize::try_from(dim))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| Error::Parallel(format!("invalid local shape for {destination}")))?;
-            let selection = stored_tensor_selection(tensor, &metadata.logical_shape)?;
-            let mut selected_shape = metadata.logical_shape.clone();
-            match &selection {
-                TensorSelection::Full => {}
-                TensorSelection::Range { axis, start, end } => {
-                    selected_shape[*axis] = end - start;
-                }
-                TensorSelection::Indices { axis, indices } => {
-                    selected_shape[*axis] = indices.len();
-                }
-                TensorSelection::Contiguous { .. } => {
-                    unreachable!("TP packed placement never emits a reshaped contiguous span")
-                }
-            }
-            if selected_shape != local_shape {
-                return Err(Error::Parallel(format!(
-                    "planned packed local shape {:?} for {destination} does not match runtime {:?}",
-                    selected_shape, local_shape
-                )));
-            }
-            let recipe = DerivedWeightRecipe::source(checkpoint_key.clone(), selection.clone());
-            let bytes = recipe.infer(store)?.byte_len();
-            (selection, bytes)
-        } else {
-            let expected = parameter
-                .shape()
-                .iter()
-                .map(|&dim| usize::try_from(dim))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| Error::Parallel(format!("invalid shape for {destination}")))?;
-            if metadata.logical_shape != expected {
-                return Err(Error::Parallel(format!(
-                    "unplanned parameter {destination} has checkpoint shape {:?}, runtime expects {:?}",
-                    metadata.logical_shape, expected
-                )));
-            }
-            (TensorSelection::Full, metadata.encoded_byte_len as u64)
-        };
-        bindings.push(WeightBinding::new(
-            local_name,
-            checkpoint_key,
-            selection,
-            expected_bytes,
-        )?);
-    }
-    Ok(bindings)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-#[allow(dead_code)]
-fn add_unit(
-    definitions: &mut Vec<OffloadUnit>,
-    specs: &mut Vec<OffloadUnitSpec>,
-    consumed: &mut BTreeSet<String>,
-    id: OffloadUnitId,
-    bindings: Vec<WeightBinding>,
-    policy: ResidencyPolicy,
-    tier: MemoryTier,
-    byte_total: &mut u64,
-) -> Result<(), Error> {
-    let bytes = binding_bytes(&bindings)?;
-    *byte_total = byte_total
-        .checked_add(bytes)
-        .ok_or(LayerwiseModelError::ArithmeticOverflow {
-            context: "static device byte total",
-        })?;
-    consumed.extend(
-        bindings
-            .iter()
-            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_string)),
-    );
-    definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-    specs.push(OffloadUnitSpec::new(id, bytes, policy, tier)?);
-    Ok(())
 }
 
 pub fn validate_unused<F>(

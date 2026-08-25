@@ -30,8 +30,7 @@ local adapter under `eredu::api`; it does not reproduce the implementation
 crate's backend or composition module tree. Backend-internal fixtures and
 composition tests are crate-private unit tests; published crates expose no
 test-support feature or fixture namespace. The facade does not directly depend
-on `eredu-nn` in production; facade tests that exercise neutral neural
-contracts use it as a development dependency. Direct MLX backend users also
+on `eredu-nn`. Direct MLX backend users also
 enable `image` and `audio` as needed; the facade forwards its `mlx-image` and
 `mlx-audio` features through the private adapter without selecting either
 platform bundle. Backend feature diagnostics name both active public spellings.

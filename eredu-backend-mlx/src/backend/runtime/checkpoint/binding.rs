@@ -563,9 +563,14 @@ where
     {
         let mut parameters = module.parameters_mut().flatten();
         for (name, value) in arrays {
+            // Materialized bindings are keyed by private module destinations.
+            // Re-enter the public loader through the canonical checkpoint
+            // identity rather than treating an MLX `inner.weight` slot as a
+            // valid source name.
+            let checkpoint_name = canonical_checkpoint_name(name);
             load_array_quantized_strict(
                 &mut parameters,
-                name.clone(),
+                checkpoint_name,
                 value.clone(),
                 stream,
                 quantization,
@@ -1003,7 +1008,38 @@ pub enum ModuleBindingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::nn::linear::unloaded_maybe_quantized_linear;
     use eredu_checkpoint::store::MemoryWeightStore;
+    use eredu_checkpoint::AffineQuantization;
+    use safemlx::{quantization::MaybeQuantized, Device, DeviceType, ExecutionContext};
+
+    #[test]
+    fn materialized_private_destination_is_canonicalized_before_quantized_loading() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let quantization = AffineQuantization::default();
+        let mut module =
+            unloaded_maybe_quantized_linear(64, 8, false, Some(quantization.into()), stream)
+                .unwrap();
+        let arrays = BTreeMap::from([(
+            "inner.weight".into(),
+            Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]),
+        )]);
+
+        populate_module_from_dense_arrays_quantized_excluding(
+            &mut module,
+            &arrays,
+            quantization.into(),
+            stream,
+            |_| false,
+        )
+        .unwrap();
+
+        let MaybeQuantized::Quantized(module) = module else {
+            panic!("target module should retain affine storage")
+        };
+        assert_eq!(module.inner.weight.shape(), &[8, 8]);
+    }
 
     #[test]
     fn rank_local_recipes_replace_sources_by_exact_logical_target() {
