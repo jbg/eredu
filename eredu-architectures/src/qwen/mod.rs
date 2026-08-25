@@ -22,7 +22,7 @@ pub use config::{
 pub use moe::{expert_bank_spec, localized_expert_bank_spec, FeedForward, RoutedGatedProduct};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
-    LocalGeometry,
+    routed_layer_parallel_parameter_groups, LocalGeometry,
 };
 
 pub use crate::decoder::{
@@ -32,28 +32,72 @@ pub use crate::decoder::{
 };
 
 use eredu_core::cache::PromptCacheTopology;
-use eredu_nn::{Error, NormalizationConstructionSpec, ParameterSpec, RoutedNeuralBackend, Tensor};
+use eredu_nn::{
+    Error, NeuralBackend, NormalizationConstructionSpec, ParameterSpec, RoutedNeuralBackend, Tensor,
+};
 use eredu_runtime::{ModelStateIdentity, StateLayout};
 
-/// The one Qwen decoder block type; dense versus MoE is its feed-forward policy.
-pub type TransformerBlock<B> = crate::decoder::TransformerBlock<B, FeedForward<B>>;
+/// Dense Qwen decoder block.
+pub type TransformerBlock<B> = crate::decoder::TransformerBlock<B>;
 
-/// Resident Qwen transformer body using the same dense-or-routed block policy.
-pub type Decoder<B> = crate::decoder::Decoder<B, FeedForward<B>>;
+/// Dense Qwen transformer body.
+pub type Decoder<B> = crate::decoder::Decoder<B>;
+
+/// Qwen decoder block selected dynamically between dense and routed feed-forward policy.
+pub type RoutedTransformerBlock<B> = crate::decoder::TransformerBlock<B, FeedForward<B>>;
+
+/// Qwen transformer body selected dynamically between dense and routed feed-forward policy.
+pub type RoutedDecoder<B> = crate::decoder::Decoder<B, FeedForward<B>>;
+
+fn assemble_block<B: NeuralBackend, F>(
+    args: &ModelArgs,
+    layer: usize,
+    mlp: F,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<crate::decoder::TransformerBlock<B, F>, Error> {
+    Ok(crate::decoder::TransformerBlock {
+        self_attention: Attention::new(args, layer, context)?,
+        mlp,
+        input_norm: B::normalization(
+            NormalizationConstructionSpec::learned(
+                args.hidden_size,
+                args.rms_norm_eps,
+                ParameterSpec::trainable(format!(
+                    "{}.layers.{layer}.input_layernorm.weight",
+                    args.parameter_root
+                ))
+                .map_err(Error::backend)?,
+            ),
+            context,
+        )?,
+        post_attention_norm: B::normalization(
+            NormalizationConstructionSpec::learned(
+                args.hidden_size,
+                args.rms_norm_eps,
+                ParameterSpec::trainable(format!(
+                    "{}.layers.{layer}.post_attention_layernorm.weight",
+                    args.parameter_root
+                ))
+                .map_err(Error::backend)?,
+            ),
+            context,
+        )?,
+    })
+}
 
 /// Builds one unloaded resident Qwen decoder body.
-pub fn new_decoder<B: RoutedNeuralBackend>(
+pub fn new_decoder<B: NeuralBackend>(
     args: &ModelArgs,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Decoder<B>, Error> {
     crate::decoder::Decoder::new_with_factory::<ModelArgs, QwenBlockFactory>(args, context)
 }
 
-/// Statically dispatched Qwen block construction policy.
+/// Statically dispatched dense Qwen block construction policy.
 pub struct QwenBlockFactory;
 
-/// Builds one unloaded Qwen dense-or-routed decoder block.
-pub fn new_block<B: RoutedNeuralBackend>(
+/// Builds one unloaded dense Qwen decoder block.
+pub fn new_block<B: NeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
@@ -63,43 +107,26 @@ pub fn new_block<B: RoutedNeuralBackend>(
 
 impl<B> crate::decoder::BlockFactory<B, ModelArgs> for QwenBlockFactory
 where
-    B: RoutedNeuralBackend,
+    B: NeuralBackend,
 {
-    type FeedForward = FeedForward<B>;
+    type FeedForward = Mlp<B>;
+
+    fn validate(args: &ModelArgs) -> Result<(), Error> {
+        if args.is_moe() {
+            return Err(Error::backend(
+                "dense Qwen construction does not accept a routed MoE configuration",
+            ));
+        }
+        Ok(())
+    }
 
     fn build(
         args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B>, Error> {
-        Ok(crate::decoder::TransformerBlock {
-            self_attention: Attention::new(args, layer, context)?,
-            mlp: FeedForward::new(args, layer, context)?,
-            input_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.input_layernorm.weight",
-                        args.parameter_root
-                    ))
-                    .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            post_attention_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.post_attention_layernorm.weight",
-                        args.parameter_root
-                    ))
-                    .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-        })
+        <Self as crate::decoder::BlockFactory<B, ModelArgs>>::validate(args)?;
+        assemble_block(args, layer, Mlp::new(args, layer, context)?, context)
     }
 
     fn parameter_groups(
@@ -111,8 +138,61 @@ where
     }
 }
 
-/// Shared layered lifecycle specialized to Qwen dense-or-routed block policy.
+/// Shared layered lifecycle specialized to dense Qwen policy.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, QwenBlockFactory>;
+
+/// Statically dispatched Qwen policy for adapters that admit dense and MoE configurations.
+pub struct RoutedQwenBlockFactory;
+
+impl<B> crate::decoder::BlockFactory<B, ModelArgs> for RoutedQwenBlockFactory
+where
+    B: RoutedNeuralBackend,
+{
+    type FeedForward = FeedForward<B>;
+
+    fn build(
+        args: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedTransformerBlock<B>, Error> {
+        assemble_block(
+            args,
+            layer,
+            FeedForward::new(args, layer, context)?,
+            context,
+        )
+    }
+
+    fn parameter_groups(
+        block: &RoutedTransformerBlock<B>,
+        args: &ModelArgs,
+        layer: usize,
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
+        parallel::routed_layer_parallel_parameter_groups(block, args, layer)
+    }
+}
+
+/// Builds a Qwen body for a backend adapter that dynamically admits dense or MoE configuration.
+pub fn new_routed_decoder<B: RoutedNeuralBackend>(
+    args: &ModelArgs,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<RoutedDecoder<B>, Error> {
+    crate::decoder::Decoder::new_with_factory::<ModelArgs, RoutedQwenBlockFactory>(args, context)
+}
+
+/// Builds a Qwen block for a backend adapter that dynamically admits dense or MoE configuration.
+pub fn new_routed_block<B: RoutedNeuralBackend>(
+    args: &ModelArgs,
+    layer: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<RoutedTransformerBlock<B>, Error> {
+    <RoutedQwenBlockFactory as crate::decoder::BlockFactory<B, ModelArgs>>::build(
+        args, layer, context,
+    )
+}
+
+/// Layered Qwen lifecycle for adapters that dynamically admit dense and MoE configurations.
+pub type RoutedLayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, RoutedQwenBlockFactory>;
 
 /// Declares Qwen cache identity independently of concrete cache storage.
 pub fn state_identity(
@@ -139,4 +219,27 @@ pub fn state_identity(
         sink_tokens: 0,
         topology,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // This generic body is a compile-time contract: none of these dense Qwen
+    // entry points may acquire a RoutedNeuralBackend bound.
+    #[allow(dead_code)]
+    fn dense_qwen_accepts_any_neural_backend<B: NeuralBackend>(
+        args: ModelArgs,
+        context: &<B::Tensor as Tensor>::Context,
+    ) {
+        let _: Result<Decoder<B>, Error> = new_decoder::<B>(&args, context);
+        let _: Result<TransformerBlock<B>, Error> = new_block::<B>(&args, 0, context);
+        let _: Result<LayeredModel<B>, Error> = LayeredModel::<B>::new(args, context);
+    }
+
+    #[test]
+    fn dense_qwen_api_has_no_routed_backend_bound() {
+        // The generic helper above is type-checked even though no concrete
+        // backend is needed to exercise this compile-time assertion.
+    }
 }

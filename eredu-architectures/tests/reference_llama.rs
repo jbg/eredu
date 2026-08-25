@@ -2769,7 +2769,7 @@ fn shared_decoder_runs_qwen2_and_qwen3_without_mlx() {
                 })
             })
             .unwrap();
-        let architecture = qwen::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
+        let architecture = qwen::RoutedLayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
         let mut runtime = ResidentRuntime::new(architecture, &()).unwrap();
         let parameters = runtime
             .units()

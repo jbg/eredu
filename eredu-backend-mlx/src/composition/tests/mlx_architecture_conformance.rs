@@ -20,7 +20,7 @@ fn every_layered_family_exposes_authoritative_geometry_and_parameter_binding() {
 
     assert_bindable::<eredu_architectures::llama::LayeredModel<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>>();
-    assert_bindable::<eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>>();
     assert_bindable::<eredu_architectures::nemotron_h::LayeredModel<MlxNeuralBackend>>();
@@ -509,7 +509,7 @@ fn neutral_llama_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_qwen_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>;
+    type Architecture = eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
         "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
         "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,

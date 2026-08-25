@@ -1,6 +1,6 @@
 //! Semantic tensor-parallel placement for Qwen decoder blocks.
 
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::{NeuralBackend, RoutedNeuralBackend};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
@@ -8,7 +8,7 @@ use eredu_runtime::{
 
 use crate::decoder::{block_common_parallel_parameter_groups, dense_mlp_parallel_parameter_group};
 
-use super::{FeedForward, ModelArgs, TransformerBlock};
+use super::{FeedForward, ModelArgs, RoutedTransformerBlock, TransformerBlock};
 
 /// Derives rank-local Qwen construction geometry from a semantic placement plan.
 pub fn local_block_args(
@@ -106,9 +106,20 @@ pub fn local_geometry(
     crate::decoder::local_geometry(args, layout, local_block_args)
 }
 
-/// Declares every rank-local placement group for one Qwen dense-or-routed block.
-pub fn layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
+/// Declares every rank-local placement group for one dense Qwen block.
+pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     block: &TransformerBlock<B>,
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
+    groups.push(dense_mlp_parallel_parameter_group(&block.mlp, args, layer)?);
+    Ok(groups)
+}
+
+/// Declares every rank-local placement group for a dynamically dense-or-routed Qwen block.
+pub fn routed_layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
+    block: &RoutedTransformerBlock<B>,
     args: &ModelArgs,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {

@@ -394,9 +394,9 @@ impl_pipeline_architecture_bindings!(
 );
 impl_pipeline_architecture_bindings!(
     crate::composition::qwen::QwenPipelineBindings,
-    eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
+    eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>,
     MlxKeyValueState,
-    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>
+    MlxModule<eredu_architectures::qwen::RoutedTransformerBlock<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     Lfm2Bindings,
@@ -2512,10 +2512,10 @@ type LlamaPipelinePartition = DecoderPipelineRealization<
 >;
 
 type QwenPipelinePartition = DecoderPipelineRealization<
-    eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
+    eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>,
     eredu_architectures::qwen::LocalGeometry,
     crate::composition::qwen::QwenPipelineBindings,
-    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>,
+    MlxModule<eredu_architectures::qwen::RoutedTransformerBlock<MlxNeuralBackend>>,
 >;
 
 type GptOssPipelinePartition = DecoderPipelineRealization<
@@ -2532,12 +2532,12 @@ impl<A, G, C, L> DecoderPipelineRealization<A, G, C, L> {
 }
 
 fn construct_qwen_partition_unit(
-    architecture: &eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
+    architecture: &eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>,
     bindings: &crate::composition::qwen::QwenPipelineBindings,
     index: usize,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
-) -> Result<MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>, Error> {
+) -> Result<MlxModule<eredu_architectures::qwen::RoutedTransformerBlock<MlxNeuralBackend>>, Error> {
     let local_intermediate_size = architecture
         .shared_parallel_geometry()
         .and_then(|geometry| geometry.block(index).map(|args| args.moe_intermediate_size))
@@ -13836,7 +13836,7 @@ fn load_qwen_pipeline(
         let geometry = eredu_architectures::qwen::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         stage.architecture = Some(
-            eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new_parallel(
+            eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new_parallel(
                 target_args.clone(),
                 geometry,
                 stream,
@@ -13922,20 +13922,19 @@ fn load_qwen_pipeline(
     let static_roles = parameter_description.select_static_roles(&stage.partition);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let source_architecture = match stage.architecture.shared_parallel_geometry() {
-                Some(geometry) => {
-                    eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new_parallel(
+            let source_architecture =
+                match stage.architecture.shared_parallel_geometry() {
+                    Some(geometry) => eredu_architectures::qwen::RoutedLayeredModel::<
+                        MlxNeuralBackend,
+                    >::new_parallel(
+                        source_args.clone(), (*geometry).clone(), stream
+                    ),
+                    None => eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
                         source_args.clone(),
-                        (*geometry).clone(),
                         stream,
-                    )
+                    ),
                 }
-                None => eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new(
-                    source_args.clone(),
-                    stream,
-                ),
-            }
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let source_quantization =
                 BoundPipelineBindings::new(&binding_adapter, &source_architecture);
             let target_quantization =
@@ -14986,10 +14985,10 @@ impl QwenPipelinePartition {
         stream: &Stream,
     ) -> Result<
         DecoderPipelineBuilder<
-            eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
+            eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>,
             eredu_architectures::qwen::LocalGeometry,
             crate::composition::qwen::QwenPipelineBindings,
-            MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>,
+            MlxModule<eredu_architectures::qwen::RoutedTransformerBlock<MlxNeuralBackend>>,
         >,
         Error,
     > {
@@ -14998,9 +14997,11 @@ impl QwenPipelinePartition {
         } else {
             crate::composition::qwen::QwenPipelineBindings::new()
         };
-        let architecture =
-            eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new(args.clone(), stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let architecture = eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
+            args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = range
             .clone()
             .map(|layer| {

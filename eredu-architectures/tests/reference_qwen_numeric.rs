@@ -6526,7 +6526,7 @@ fn forward(model_type: &str, tied: bool) -> Result<ForwardResult, Error> {
     let args =
         qwen::model_args_from_config_value(&config(model_type, tied)).map_err(Error::backend)?;
     let context = NumericContext::default();
-    let mut decoder = qwen::new_decoder::<NumericBackend>(&args, &context)?;
+    let mut decoder = qwen::new_routed_decoder::<NumericBackend>(&args, &context)?;
     let mut head = (!tied)
         .then(|| {
             NumericBackend::linear(
@@ -6630,6 +6630,28 @@ fn numerical_qwen2_qwen3_and_moe_prefill_decode_goldens() {
             }
         );
         assert_eq!(result.sliding_calls, usize::from(model_type == "qwen2"));
+    }
+}
+
+#[test]
+fn dense_qwen_construction_rejects_moe_configuration() {
+    let args = qwen::model_args_from_config_value(&config("qwen3_moe", false)).unwrap();
+    let context = NumericContext::default();
+    let errors = [
+        qwen::new_decoder::<NumericBackend>(&args, &context)
+            .err()
+            .unwrap(),
+        qwen::new_block::<NumericBackend>(&args, 0, &context)
+            .err()
+            .unwrap(),
+        qwen::LayeredModel::<NumericBackend>::new(args, &context)
+            .err()
+            .unwrap(),
+    ];
+    for error in errors {
+        assert!(error
+            .to_string()
+            .contains("dense Qwen construction does not accept a routed MoE configuration"));
     }
 }
 
@@ -7949,7 +7971,8 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
     }
     let args = qwen::model_args_from_config_value(&value).unwrap();
     let context = NumericContext::default();
-    let architecture = qwen::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let architecture =
+        qwen::RoutedLayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
     let mut groups = qwen::static_parallel_parameter_groups::<NumericBackend>(
         &architecture.static_modules().embeddings,
         &architecture.static_modules().norm,
@@ -7958,16 +7981,16 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
     )
     .unwrap();
     for layer in 0..args.num_hidden_layers as usize {
-        let unit = <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+        let unit = <qwen::RoutedLayeredModel<NumericBackend> as LayeredArchitecture<
             NumericBackend,
             DeviceState<NumericBackend, NumericHybridLayerState>,
         >>::build_unit(&architecture, 0, layer, &context)
         .unwrap();
-        groups.extend(qwen::layer_parallel_parameter_groups(&unit, &args, layer).unwrap());
+        groups.extend(qwen::routed_layer_parallel_parameter_groups(&unit, &args, layer).unwrap());
     }
     let units = (0..args.num_hidden_layers as usize)
         .map(|layer| {
-            <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+            <qwen::RoutedLayeredModel<NumericBackend> as LayeredArchitecture<
                 NumericBackend,
                 DeviceState<NumericBackend, NumericHybridLayerState>,
             >>::build_unit(&architecture, 0, layer, &context)
@@ -7996,7 +8019,7 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
     let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
     let tp1_geometry = qwen::local_geometry(&args, &tp1_layout).unwrap();
     let tp1_state_layout = tp1_geometry.state_layout().clone();
-    let tp1_architecture = qwen::LayeredModel::<NumericBackend>::new_parallel(
+    let tp1_architecture = qwen::RoutedLayeredModel::<NumericBackend>::new_parallel(
         args.clone(),
         tp1_geometry,
         &tp1_context,
@@ -8004,7 +8027,7 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
     .unwrap();
     let tp1_units = (0..args.num_hidden_layers as usize)
         .map(|layer| {
-            <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+            <qwen::RoutedLayeredModel<NumericBackend> as LayeredArchitecture<
                 NumericBackend,
                 DeviceState<NumericBackend, NumericHybridLayerState>,
             >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
@@ -8060,7 +8083,7 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
                     let context = NumericContext::with_local_layout(layout.clone());
                     let geometry = qwen::local_geometry(&args, &layout).unwrap();
                     let state_layout = geometry.state_layout().clone();
-                    let architecture = qwen::LayeredModel::<NumericBackend>::new_parallel(
+                    let architecture = qwen::RoutedLayeredModel::<NumericBackend>::new_parallel(
                         args.clone(),
                         geometry,
                         &context,
@@ -8068,7 +8091,7 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
                     .unwrap();
                     let units = (0..args.num_hidden_layers as usize)
                         .map(|layer| {
-                            <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+                            <qwen::RoutedLayeredModel<NumericBackend> as LayeredArchitecture<
                                 NumericBackend,
                                 DeviceState<NumericBackend, NumericHybridLayerState>,
                             >>::build_unit(
@@ -8781,7 +8804,7 @@ fn qwen3_vl_tp2_runs_full_vision_and_text_lifecycle() {
     let qwen::vl::Unit::Text(text_block) = &text_unit else {
         unreachable!()
     };
-    groups.extend(qwen::layer_parallel_parameter_groups(text_block, &args.text, 0).unwrap());
+    groups.extend(qwen::routed_layer_parallel_parameter_groups(text_block, &args.text, 0).unwrap());
     let mut expected_state = DeviceState::<NumericBackend, _>::create(
         architecture.state_layout().unwrap(),
         |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),

@@ -1981,6 +1981,7 @@ where
         C: Config,
         P: BlockFactory<B, C, FeedForward = F>,
     {
+        P::validate(config)?;
         let layers = (0..config.num_hidden_layers() as usize)
             .map(|layer| P::build(config, layer, context))
             .collect::<Result<Vec<_>, _>>()?;
@@ -2608,6 +2609,12 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
     type FeedForward: FeedForwardOperator<B>;
 
+    /// Validates configuration requirements specific to this block policy.
+    fn validate(config: &C) -> Result<(), Error> {
+        let _ = config;
+        Ok(())
+    }
+
     /// Builds one unloaded decoder block.
     fn build(
         config: &C,
@@ -2694,6 +2701,7 @@ where
     /// Builds unloaded pinned modules from normalized architecture arguments.
     pub fn new(args: C, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate_config()?;
+        P::validate(&args)?;
         if args.learned_attention_sinks() {
             crate::operator_requirements::require::<B>(
                 "shared decoder attention sinks",
@@ -2716,6 +2724,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         args.validate_config()?;
+        P::validate(&args)?;
         if args.learned_attention_sinks() {
             crate::operator_requirements::require::<B>(
                 "shared decoder attention sinks",

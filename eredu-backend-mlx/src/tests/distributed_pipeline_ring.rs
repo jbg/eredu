@@ -2257,7 +2257,7 @@ fn qwen_fixture_arrays(
         }
     }
 
-    let architecture = eredu_architectures::qwen::LayeredModel::<
+    let architecture = eredu_architectures::qwen::RoutedLayeredModel::<
         crate::backend::nn::MlxNeuralBackend,
     >::new(args.clone(), stream)
     .unwrap();
@@ -2269,7 +2269,7 @@ fn qwen_fixture_arrays(
         .static_modules()
         .visit_parameters(&mut collector);
     for layer in 0..args.num_hidden_layers as usize {
-        eredu_architectures::qwen::new_block::<crate::backend::nn::MlxNeuralBackend>(
+        eredu_architectures::qwen::new_routed_block::<crate::backend::nn::MlxNeuralBackend>(
             args, layer, stream,
         )
         .unwrap()

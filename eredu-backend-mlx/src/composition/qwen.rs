@@ -88,9 +88,9 @@ use eredu_runtime::{
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
 
-type NeutralBlock = eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>;
+type NeutralBlock = eredu_architectures::qwen::RoutedTransformerBlock<MlxNeuralBackend>;
 
-type NeutralArchitecture = eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>;
+type NeutralArchitecture = eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>;
 
 fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
     let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
@@ -344,7 +344,7 @@ pub fn quantize_neutral_qwen_store(
         source.static_modules(),
         target.static_modules(),
         move |index, stream| {
-            eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
+            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(
                 &source_unit_args,
                 index,
                 stream,
@@ -352,7 +352,7 @@ pub fn quantize_neutral_qwen_store(
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         move |index, stream| {
-            eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
+            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(
                 &target_unit_args,
                 index,
                 stream,
@@ -1147,11 +1147,13 @@ fn load_neutral_qwen_parallel(
         planner.register(group)?;
     }
     for index in 0..layer_count {
-        let unit = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&args, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        for group in eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
-            &unit, &args, index,
-        )? {
+        let unit =
+            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(&args, index, stream)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        for group in eredu_architectures::qwen::routed_layer_parallel_parameter_groups::<
+            MlxNeuralBackend,
+        >(&unit, &args, index)?
+        {
             planner.register(group)?;
         }
     }
@@ -1175,8 +1177,9 @@ fn load_neutral_qwen_parallel(
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for index in 0..layer_count {
-        let unit = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&args, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let unit =
+            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(&args, index, stream)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let recipes = if external_experts {
             BTreeMap::new()
         } else {
@@ -1219,7 +1222,7 @@ fn load_neutral_qwen_parallel(
         },
         |_ordinal, address, path, _local, store, stream| {
             let index = address.index();
-            let global = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
+            let global = eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(
                 &binding_args,
                 index,
                 stream,
@@ -1511,7 +1514,7 @@ impl QwenPipelineBindings {
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
         let expert_targets = parameter_role_targets(
-            &eredu_architectures::qwen::layer_parallel_parameter_groups(
+            &eredu_architectures::qwen::routed_layer_parallel_parameter_groups(
                 global_layer,
                 architecture.args(),
                 index,
@@ -1592,7 +1595,7 @@ impl QwenPipelineBindings {
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
         let expert_targets = parameter_role_targets(
-            &eredu_architectures::qwen::layer_parallel_parameter_groups(
+            &eredu_architectures::qwen::routed_layer_parallel_parameter_groups(
                 layer,
                 architecture.args(),
                 index,

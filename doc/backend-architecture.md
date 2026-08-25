@@ -145,6 +145,13 @@ plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
+The ordinary Qwen decoder, block, and layered lifecycle are dense construction
+surfaces and require only `NeuralBackend`. Concrete adapters that dynamically
+admit both dense and Qwen MoE configurations use the separate routed Qwen
+lifecycle, which requires `RoutedNeuralBackend`. A backend implementing dense
+Qwen is therefore not required to provide a router or either expert-bank
+implementation.
+
 External RoPE maps and their family aliases are architecture configuration
 input, not a backend contract. Architectures normalize them into the closed
 `RotaryAlgorithm` carried by `RotarySpec`, including all defaults and validated

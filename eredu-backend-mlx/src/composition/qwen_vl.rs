@@ -154,7 +154,7 @@ fn unit_expert_targets(
         return Ok(BTreeSet::new());
     };
     Ok(parameter_role_targets(
-        &qwen::layer_parallel_parameter_groups(block, &architecture.args().text, index)?,
+        &qwen::routed_layer_parallel_parameter_groups(block, &architecture.args().text, index)?,
         ParameterRole::ExpertIntermediate,
     ))
 }

@@ -85,7 +85,7 @@ pub enum Unit<B: RoutedNeuralBackend> {
     /// Shared vision transformer block.
     Vision(VisionBlock<B>),
     /// Existing neutral ordinary Qwen dense-or-MoE block.
-    Text(qwen::TransformerBlock<B>),
+    Text(qwen::RoutedTransformerBlock<B>),
 }
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
@@ -722,7 +722,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                         index,
                     ),
                     Unit::Text(block) => {
-                        qwen::layer_parallel_parameter_groups(&block, &self.args.text, index)
+                        qwen::routed_layer_parallel_parameter_groups(&block, &self.args.text, index)
                     }
                 }
                 .map_err(Error::backend)?;
@@ -819,7 +819,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                     .as_ref()
                     .and_then(|geometry| geometry.text().block(index))
                     .unwrap_or(&self.args.text);
-                Ok(Unit::Text(qwen::new_block(args, index, context)?))
+                Ok(Unit::Text(qwen::new_routed_block(args, index, context)?))
             }
             _ => unreachable!(),
         }
