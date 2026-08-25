@@ -623,10 +623,12 @@ mod tests {
     use crate::backend::{nn::shared::MlxNeuralBackend, runtime::cache::state::MlxHybridState};
     use eredu_nn::{ParameterVisitor, ParameterVisitorMut, Parameterized};
     use eredu_runtime::{
-        ArchitectureBoundary, ArchitectureParameterDescription, ArchitectureParameters,
-        ExecutionGroupId, LayeredArchitecture, LayeredForwardState, MemberSharding,
-        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-        ParameterRole, StaticParameterVisitor, StaticParameterVisitorMut,
+        ArchitectureBoundary, ArchitectureGroupKind, ArchitectureGroupPlacement,
+        ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParallelSubgroup,
+        ArchitectureParameterDescription, ArchitectureParameters, ExecutionGroupId,
+        LayeredArchitecture, LayeredForwardState, MemberSharding, OwnedParameterGroupSpec,
+        ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        StaticParameterVisitor, StaticParameterVisitorMut,
     };
     use safemlx::Stream;
 
@@ -727,6 +729,18 @@ mod tests {
         type ForwardContext = ();
         type RetainedContextValues<'a> = std::iter::Empty<&'a crate::MlxTensor>;
         type Error = String;
+
+        fn group_transport(&self, _group: usize) -> ArchitectureGroupTransport {
+            ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::Decoder,
+                first_owner_static_roles: Vec::new(),
+                last_owner_static_roles: Vec::new(),
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
+                request_optional: false,
+            }
+        }
 
         fn model_identity(&self) -> &str {
             "placement-fixture"

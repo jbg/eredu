@@ -1372,9 +1372,10 @@ mod tests {
         let mut value = fixture();
         value["num_nextn_predict_layers"] = Value::from(2);
 
-        let capabilities =
-            crate::preparation::safetensors_capabilities(crate::ModelKind::DeepSeekV3, &value)
-                .unwrap();
+        let plan = crate::configuration::resolve_model_config(&value)
+            .unwrap()
+            .architecture;
+        let capabilities = crate::preparation::prepared_safetensors_capabilities(&plan).unwrap();
 
         assert_eq!(capabilities.embedded_draft_layers(), Some(2));
     }

@@ -709,8 +709,10 @@ mod tests {
             "unrelated": {"num_nextn_predict_layers": 7}
         });
 
-        let capabilities =
-            crate::preparation::safetensors_capabilities(crate::ModelKind::Llama, &value).unwrap();
+        let plan = crate::configuration::resolve_model_config(&value)
+            .unwrap()
+            .architecture;
+        let capabilities = crate::preparation::prepared_safetensors_capabilities(&plan).unwrap();
 
         assert_eq!(capabilities.embedded_draft_layers(), Some(0));
     }

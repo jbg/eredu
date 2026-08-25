@@ -3,8 +3,7 @@
 use std::num::NonZeroU8;
 
 use eredu_architectures::media_plan::{
-    self, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality, PreparedInputPart,
-    PreparedInputPartPlan, PreparedInputPayload, PreparedMediaInput,
+    self, MediaShapePlan, PreparedInputModality, PreparedInputPart, PreparedInputPartPlan,
 };
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
@@ -14,7 +13,7 @@ use eredu_core::{
 use safemlx::{Array, Stream};
 
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
-use crate::backend::runtime::media::input::{self, InputPayload, Modality};
+use crate::backend::runtime::media::input::{self, InputPayload};
 use eredu_core::residency::MemoryTier;
 
 fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
@@ -152,98 +151,6 @@ fn runtime_counter(
     }
 }
 
-fn array_shape(array: &Array) -> Result<Vec<u64>, CapabilityError> {
-    array
-        .shape()
-        .iter()
-        .map(|dimension| {
-            u64::try_from(*dimension).map_err(|_| CapabilityError::ArithmeticOverflow {
-                operation: "prepared media array dimension",
-            })
-        })
-        .collect()
-}
-
-fn i32_metadata(array: Option<&Array>) -> Result<Option<MediaMetadata<i32>>, CapabilityError> {
-    array
-        .map(|array| {
-            let evaluated = array
-                .evaluated()
-                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-            let values = evaluated
-                .try_as_slice::<i32>()
-                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-            Ok(MediaMetadata {
-                shape: array_shape(array)?,
-                values: values.to_vec(),
-            })
-        })
-        .transpose()
-}
-
-fn bool_metadata(array: Option<&Array>) -> Result<Option<MediaMetadata<bool>>, CapabilityError> {
-    array
-        .map(|array| {
-            let evaluated = array
-                .evaluated()
-                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-            let values = evaluated
-                .try_as_slice::<bool>()
-                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-            Ok(MediaMetadata {
-                shape: array_shape(array)?,
-                values: values.to_vec(),
-            })
-        })
-        .transpose()
-}
-
-fn prepared_media_input(
-    modality: Modality,
-    payload: &Array,
-    metadata: input::InputMetadata<'_>,
-) -> Result<PreparedMediaInput, CapabilityError> {
-    let modality = match modality {
-        Modality::Image => MediaModality::Image,
-        Modality::Audio => MediaModality::Audio,
-        Modality::Video => MediaModality::Video,
-        Modality::Text => unreachable!("text handled separately"),
-    };
-    Ok(PreparedMediaInput {
-        modality,
-        payload_shape: array_shape(payload)?,
-        patch_grid: i32_metadata(metadata.patch_grid)?,
-        patch_positions: i32_metadata(metadata.patch_positions)?,
-        audio_mask: bool_metadata(metadata.audio_mask)?,
-        patch_extent: metadata.patch_extent,
-        audio_valid_frames: metadata.audio_valid_frames,
-    })
-}
-
-fn prepared_input_part(part: input::InputPart<'_>) -> Result<PreparedInputPart, CapabilityError> {
-    let modality = match part.modality {
-        Modality::Text => PreparedInputModality::Text,
-        Modality::Image => PreparedInputModality::Image,
-        Modality::Audio => PreparedInputModality::Audio,
-        Modality::Video => PreparedInputModality::Video,
-    };
-    let payload = match part.payload {
-        InputPayload::TokenIds(tokens) => PreparedInputPayload::TokenIds(array_shape(tokens)?),
-        InputPayload::Embeddings(embeddings) => {
-            PreparedInputPayload::Embeddings(array_shape(embeddings)?)
-        }
-        InputPayload::Tensor(tensor) => PreparedInputPayload::Tensor {
-            shape: array_shape(tensor)?,
-            media: if part.modality == Modality::Text {
-                None
-            } else {
-                Some(prepared_media_input(part.modality, tensor, part.metadata)?)
-            },
-        },
-    };
-    Ok(PreparedInputPart { modality, payload })
-}
-
 fn array_bytes(array: &Array, operation: &'static str) -> Result<u64, CapabilityError> {
     u64::try_from(array.nbytes()).map_err(|_| CapabilityError::ArithmeticOverflow { operation })
 }
@@ -303,7 +210,9 @@ pub fn count_prepared_input(
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
     for &part in prepared.parts {
-        match session.prepared_input_part_plan(&prepared_input_part(part)?)? {
+        let prepared_part = input::prepared_input_part(part)
+            .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+        match session.prepared_input_part_plan(&prepared_part)? {
             PreparedInputPartPlan::Text { positions } => {
                 text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
             }

@@ -12807,10 +12807,11 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
             ]
         }
     });
-    let resolved = eredu_architectures::configuration::resolve_model_identity(&config).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
     assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
     let capabilities =
-        eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
+        eredu_architectures::preparation::prepared_safetensors_capabilities(&resolved.architecture)
+            .unwrap();
     let topology = MlxParallelContext::for_rank(
         0,
         2,
@@ -12831,10 +12832,11 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 
     config["text_config"]["model_type"] = serde_json::json!("qwen3_5_text");
     config["text_config"]["intermediate_size"] = serde_json::json!(48);
-    let resolved = eredu_architectures::configuration::resolve_model_identity(&config).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
     assert_eq!(resolved.effective_model_type, "qwen3_5_text");
     let capabilities =
-        eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
+        eredu_architectures::preparation::prepared_safetensors_capabilities(&resolved.architecture)
+            .unwrap();
     let error = validate_distributed_stage_capabilities(
         capabilities,
         topology,

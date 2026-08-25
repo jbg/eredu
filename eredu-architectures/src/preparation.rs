@@ -2,10 +2,10 @@
 
 use std::fmt::Display;
 
-use crate::ModelKind;
 use eredu_checkpoint::schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan};
 use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
 use eredu_core::InputModalities;
+#[cfg(test)]
 use serde_json::Value;
 
 use crate::GgufArchitecture;
@@ -322,126 +322,6 @@ fn resolve_declared_runtime_state_dtype_source(
     }
 }
 
-/// Resolves the physical SafeTensors value that establishes runtime-state
-/// scalar dtype from the exact normalized architecture and its checkpoint
-/// schema.
-///
-/// This deliberately fails if the architecture-declared source is absent or
-/// ambiguous. Backends must not guess from family-name conventions or apply a
-/// default width for an unrecognized valid alias.
-pub fn safetensors_runtime_state_dtype_source(
-    kind: ModelKind,
-    config: &Value,
-    tensors: &TensorCatalog,
-) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
-    let (plan, parameter) = match kind {
-        ModelKind::DeepSeekV3 => {
-            let args = crate::deepseek::parse_v3_config(config).map_err(invalid)?;
-            (
-                crate::deepseek::v3_safetensors_plan(&args, true).map_err(invalid)?,
-                "model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::DeepSeekV4 => {
-            let args = crate::deepseek::parse_v4_config(config).map_err(invalid)?;
-            (
-                crate::deepseek::v4_safetensors_plan(&args).map_err(invalid)?,
-                "model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::Gemma4 => {
-            let bytes = serde_json::to_vec(config).map_err(invalid)?;
-            let family = crate::gemma4::FamilyConfig::from_hf_json(&bytes).map_err(invalid)?;
-            (
-                crate::gemma4::safetensors_plan(&family).map_err(invalid)?,
-                "model.language_model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::GptOss => {
-            let args = crate::gpt_oss::model_args_from_config_value(config).map_err(invalid)?;
-            let parameter = format!("{}.embed_tokens.weight", args.parameter_root);
-            (
-                crate::gpt_oss::safetensors_plan(&args).map_err(invalid)?,
-                parameter,
-            )
-        }
-        ModelKind::Inkling => {
-            let bytes = serde_json::to_vec(config).map_err(invalid)?;
-            let args = crate::inkling::ModelArgs::from_hf_json(&bytes).map_err(invalid)?;
-            (
-                crate::inkling::safetensors_plan(&args).map_err(invalid)?,
-                "model.llm.embed.weight".into(),
-            )
-        }
-        ModelKind::KimiLinear => {
-            let args = crate::kimi_linear::model_args_from_config_value(config).map_err(invalid)?;
-            (
-                crate::kimi_linear::safetensors_plan(&args).map_err(invalid)?,
-                "model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::Lfm2 => {
-            let args = crate::lfm2::model_args_from_config_value(config).map_err(invalid)?;
-            (
-                crate::lfm2::safetensors_plan(&args, true).map_err(invalid)?,
-                "model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::Llama => {
-            let args = crate::llama::model_args_from_config_value(config).map_err(invalid)?;
-            (
-                crate::llama::safetensors_plan(&args).map_err(invalid)?,
-                "model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::MuseGlimmer => {
-            let args =
-                crate::muse_glimmer::DecoderConfig::from_hf_value(config).map_err(invalid)?;
-            (
-                crate::muse_glimmer::safetensors_plan(&args).map_err(invalid)?,
-                "model.language_model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::NemotronH => {
-            let args = crate::nemotron_h::model_args_from_config_value(config).map_err(invalid)?;
-            (
-                crate::nemotron_h::safetensors_plan(&args).map_err(invalid)?,
-                "backbone.embeddings.weight".into(),
-            )
-        }
-        ModelKind::Qwen2 | ModelKind::Qwen3 => {
-            let args = crate::qwen::model_args_from_config_value(config).map_err(invalid)?;
-            let parameter = format!("{}.embed_tokens.weight", args.parameter_root);
-            (
-                crate::qwen::safetensors_plan(&args).map_err(invalid)?,
-                parameter,
-            )
-        }
-        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
-            let args =
-                crate::qwen::hybrid::model_args_from_config_value(config).map_err(invalid)?;
-            (
-                crate::qwen::hybrid::safetensors_plan(&args.text).map_err(invalid)?,
-                "model.embed_tokens.weight".into(),
-            )
-        }
-        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            let args = crate::qwen::vl::model_args_from_config_value(config).map_err(invalid)?;
-            let parameter = format!("{}.embed_tokens.weight", args.text.parameter_root);
-            (
-                crate::qwen::vl::safetensors_plan(&args).map_err(invalid)?,
-                parameter,
-            )
-        }
-        ModelKind::Moshi => {
-            return Err(invalid(
-                "Moshi runtime-state dtype belongs to the realtime loader contract",
-            ));
-        }
-    };
-    resolve_runtime_state_dtype_source(&plan, &parameter, tensors)
-}
-
 /// Resolves runtime-state dtype from the exact SafeTensors plan retained at admission.
 pub fn prepared_safetensors_runtime_state_dtype_source(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
@@ -501,246 +381,6 @@ pub fn prepared_gguf_runtime_state_dtype_source(
         | GgufModelConfig::QwenHybrid(_) => "token_embd.weight",
     };
     resolve_gguf_runtime_state_dtype_source(architecture.checkpoint(), parameter, tensors)
-}
-
-/// Derives preparation capabilities from a normalized SafeTensors family
-/// configuration.
-pub fn safetensors_capabilities(
-    kind: ModelKind,
-    config: &Value,
-) -> Result<ArchitectureCapabilities, PreparationCapabilityError> {
-    let (parallel, independently_addressable_experts, input_modalities, embedded_draft_layers) =
-        match kind {
-            ModelKind::DeepSeekV3 => {
-                let args = crate::deepseek::parse_v3_config(config).map_err(invalid)?;
-                (
-                    ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
-                    true,
-                    InputModalities::TEXT,
-                    usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
-                )
-            }
-            ModelKind::DeepSeekV4 => {
-                let args = crate::deepseek::parse_v4_config(config).map_err(invalid)?;
-                (
-                    ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
-                    true,
-                    InputModalities::TEXT,
-                    usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
-                )
-            }
-            ModelKind::Gemma4 => {
-                let bytes = serde_json::to_vec(config).map_err(invalid)?;
-                let family = crate::gemma4::FamilyConfig::from_hf_json(&bytes).map_err(invalid)?;
-                let routed = family.text.num_experts.is_some();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    family.input_modalities(),
-                    0,
-                )
-            }
-            ModelKind::GptOss => {
-                crate::gpt_oss::model_args_from_config_value(config).map_err(invalid)?;
-                (
-                    ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
-                    true,
-                    InputModalities::TEXT,
-                    0,
-                )
-            }
-            ModelKind::Inkling => {
-                let bytes = serde_json::to_vec(config).map_err(invalid)?;
-                let args = crate::inkling::ModelArgs::from_hf_json(&bytes).map_err(invalid)?;
-                let routed = args.text_config.layer_schedule.iter().any(|policy| {
-                    policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe
-                });
-                let embedded = args
-                    .mtp_config
-                    .as_ref()
-                    .map_or(0, |mtp| mtp.num_nextn_predict_layers);
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    args.input_modalities(),
-                    usize::try_from(embedded).map_err(invalid)?,
-                )
-            }
-            ModelKind::KimiLinear => {
-                let args =
-                    crate::kimi_linear::model_args_from_config_value(config).map_err(invalid)?;
-                let routed = args.has_sparse_moe_layers();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities::TEXT,
-                    0,
-                )
-            }
-            ModelKind::Lfm2 => {
-                let args = crate::lfm2::model_args_from_config_value(config).map_err(invalid)?;
-                let routed = args.has_sparse_moe_layers();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities::TEXT,
-                    0,
-                )
-            }
-            ModelKind::MuseGlimmer => {
-                let args =
-                    crate::muse_glimmer::DecoderConfig::from_hf_value(config).map_err(invalid)?;
-                let routed = args.is_moe();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities {
-                        text: true,
-                        image: true,
-                        audio: false,
-                        video: args.weight_convention
-                            == crate::muse_glimmer::WeightConvention::HuggingFace,
-                    },
-                    0,
-                )
-            }
-            ModelKind::NemotronH => {
-                let args =
-                    crate::nemotron_h::model_args_from_config_value(config).map_err(invalid)?;
-                let routed = args.has_sparse_moe_layers();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities::TEXT,
-                    usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
-                )
-            }
-            ModelKind::Qwen2 | ModelKind::Qwen3 => {
-                let args = crate::qwen::model_args_from_config_value(config).map_err(invalid)?;
-                let routed = args.is_moe();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities::TEXT,
-                    0,
-                )
-            }
-            ModelKind::Qwen3Next | ModelKind::Qwen35 => {
-                let args =
-                    crate::qwen::hybrid::model_args_from_config_value(config).map_err(invalid)?;
-                let multimodal = args.vision.is_some();
-                let routed = args.text.is_moe();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities {
-                        text: true,
-                        image: multimodal,
-                        audio: false,
-                        video: multimodal,
-                    },
-                    usize::try_from(args.text.mtp_num_hidden_layers).map_err(invalid)?,
-                )
-            }
-            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-                let args =
-                    crate::qwen::vl::model_args_from_config_value(config).map_err(invalid)?;
-                let routed = args.text.is_moe();
-                (
-                    if routed {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
-                    } else {
-                        ParallelCapabilityPlan::TENSOR_PIPELINE
-                    },
-                    routed,
-                    InputModalities {
-                        text: true,
-                        image: true,
-                        audio: false,
-                        video: true,
-                    },
-                    0,
-                )
-            }
-            ModelKind::Moshi => (
-                ParallelCapabilityPlan::TENSOR_ONLY,
-                false,
-                InputModalities {
-                    text: true,
-                    image: false,
-                    audio: true,
-                    video: false,
-                },
-                0,
-            ),
-            ModelKind::Llama => {
-                crate::llama::model_args_from_config_value(config).map_err(invalid)?;
-                (
-                    ParallelCapabilityPlan::TENSOR_PIPELINE,
-                    false,
-                    InputModalities::TEXT,
-                    0,
-                )
-            }
-        };
-    let nonresident_safetensors_quantization = matches!(
-        kind,
-        ModelKind::DeepSeekV3
-            | ModelKind::DeepSeekV4
-            | ModelKind::Gemma4
-            | ModelKind::GptOss
-            | ModelKind::Inkling
-            | ModelKind::KimiLinear
-            | ModelKind::Lfm2
-            | ModelKind::Llama
-            | ModelKind::MuseGlimmer
-            | ModelKind::NemotronH
-            | ModelKind::Qwen2
-            | ModelKind::Qwen3
-            | ModelKind::Qwen3Next
-            | ModelKind::Qwen3Vl
-            | ModelKind::Qwen3VlMoe
-            | ModelKind::Qwen35
-    );
-    Ok(ArchitectureCapabilities::new(
-        parallel,
-        independently_addressable_experts,
-        nonresident_safetensors_quantization,
-        input_modalities,
-        Some(embedded_draft_layers),
-    ))
 }
 
 /// Derives preparation capabilities from the exact SafeTensors plan retained at admission.
@@ -1005,25 +645,40 @@ mod tests {
         })
     }
 
+    fn safetensors_plan(config: &Value) -> crate::configuration::SafetensorsArchitecturePlan {
+        crate::configuration::resolve_model_config(config)
+            .unwrap()
+            .architecture
+    }
+
     #[test]
     fn parallel_capabilities_follow_the_exact_normalized_variant() {
-        let dense =
-            safetensors_capabilities(ModelKind::Qwen35, &qwen35_text_config("qwen3_5_text"))
-                .unwrap();
+        let dense_plan = safetensors_plan(&qwen35_text_config("qwen3_5_text"));
+        let dense = prepared_safetensors_capabilities(&dense_plan).unwrap();
         assert!(dense.parallel_plan().tensor_parallel());
         assert!(dense.parallel_plan().pipeline_parallel());
         assert!(!dense.parallel_plan().expert_parallel());
         assert!(!dense.independently_addressable_experts());
 
-        let moe =
-            safetensors_capabilities(ModelKind::Qwen35, &qwen35_text_config("qwen3_5_moe_text"))
-                .unwrap();
+        let moe_plan = safetensors_plan(&qwen35_text_config("qwen3_5_moe_text"));
+        let moe = prepared_safetensors_capabilities(&moe_plan).unwrap();
         assert!(moe.parallel_plan().tensor_parallel());
         assert!(moe.parallel_plan().pipeline_parallel());
         assert!(moe.parallel_plan().expert_parallel());
         assert!(moe.independently_addressable_experts());
 
-        let realtime = safetensors_capabilities(ModelKind::Moshi, &Value::Null).unwrap();
+        let realtime_plan = safetensors_plan(&serde_json::json!({
+            "model_type": "moshi", "dim": 32, "text_card": 101,
+            "n_q": 4, "dep_q": 3, "generated_audio_codebooks": 2, "card": 64,
+            "num_heads": 4, "num_layers": 2, "dim_feedforward": 48,
+            "causal": true, "context": 7, "max_period": 10000.0,
+            "positional_embedding": "rope", "depformer_dim": 24,
+            "depformer_dim_feedforward": 36, "depformer_num_heads": 4,
+            "depformer_num_layers": 2, "depformer_context": 3,
+            "depformer_max_period": 10000.0, "depformer_pos_emb": "none",
+            "delays": [0, 0, 1, 2, 1]
+        }));
+        let realtime = prepared_safetensors_capabilities(&realtime_plan).unwrap();
         assert!(realtime.parallel_plan().tensor_parallel());
         assert!(!realtime.parallel_plan().pipeline_parallel());
         assert!(!realtime.parallel_plan().expert_parallel());
@@ -1067,11 +722,11 @@ mod tests {
     #[test]
     fn normalized_architecture_selects_its_state_dtype_parameter() {
         let config = qwen35_text_config("qwen3_5_text");
+        let plan = safetensors_plan(&config);
         let catalog =
             TensorCatalog::new([tensor("model.embed_tokens.weight", TensorDtype::F16)]).unwrap();
 
-        let source =
-            safetensors_runtime_state_dtype_source(ModelKind::Qwen35, &config, &catalog).unwrap();
+        let source = prepared_safetensors_runtime_state_dtype_source(&plan, &catalog).unwrap();
         assert_eq!(source.parameter(), "model.embed_tokens.weight");
         assert_eq!(source.checkpoint_tensor(), "model.embed_tokens.weight");
         assert_eq!(source.dtype(), &TensorDtype::F16);
@@ -1137,7 +792,8 @@ mod tests {
             "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,"routed_scaling_factor":1.0,
             "first_k_dense_replace":1,"num_expert_group":1,"topk_group":1
         });
-        let capabilities = safetensors_capabilities(ModelKind::KimiLinear, &config).unwrap();
+        let plan = safetensors_plan(&config);
+        let capabilities = prepared_safetensors_capabilities(&plan).unwrap();
         assert!(capabilities.nonresident_safetensors_quantization());
     }
 

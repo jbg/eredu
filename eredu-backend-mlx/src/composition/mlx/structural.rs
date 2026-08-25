@@ -329,8 +329,16 @@ fn validate_safetensors_preparation_for_test(
     if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
-    let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let resolved = eredu_architectures::configuration::resolve_model_config(config)?;
+    if resolved.kind != kind {
+        return Err(Error::ArchitectureModel(format!(
+            "test requested {kind:?} preparation for a configuration resolved as {:?}",
+            resolved.kind
+        )));
+    }
+    let capabilities =
+        eredu_architectures::preparation::prepared_safetensors_capabilities(&resolved.architecture)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_preparation_capability_intersection(
         kind,
         eredu_core::ArtifactFormat::SafeTensors,

@@ -473,7 +473,9 @@ facts from that exact normalized report instead of reconstructing support from
 raw or wrapper `model_type` values. GGUF inspection, planning, and
 materialization all validate requested preparation against the architecture
 plan retained by portable admission. A backend must not reparse the raw GGUF
-checkpoint to derive a second capability report.
+checkpoint to derive a second capability report. SafeTensors capability and
+runtime-state dtype derivation likewise accept only the typed architecture plan
+retained by admission; raw JSON is parsed once by the architecture registry.
 Validated architecture parameter descriptions retain their canonical
 execution-unit layout alongside owner-tagged parameter groups. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for
@@ -590,8 +592,10 @@ from native arrays, apply physical scalar widths, and account for the arrays'
 actual byte sizes. Architecture input-part plans additionally classify payload
 representations for every family, including explicit rejection plans for
 text-only models. The same plan must drive prefill materialization and
-capability accounting so those paths cannot disagree about an accepted
-modality/payload pair; backend admission has no rank-only fallback.
+capability accounting, and both paths must consume the same backend extraction
+of native input facts, so they cannot disagree about an accepted
+modality/payload pair or its metadata; backend admission has no rank-only
+fallback.
 
 Backend types also declare the optional neural and tensor operations they
 support. This includes every `Tensor` method whose default implementation fails
