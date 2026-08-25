@@ -431,6 +431,11 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     }
     let composition = inspect_gguf_projector(&mut report, path, gguf_architecture, validated);
     report.expected_modalities = artifact_modalities(composite_plan.input_modalities(composition));
+    if composition
+        == eredu_architectures::preparation::GgufArtifactComposition::ValidatedMediaProjector
+    {
+        report.multimodal = multimodal_feature_readiness(&report.expected_modalities);
+    }
 
     report
 }
@@ -589,11 +594,6 @@ fn inspect_gguf_projector(
             match prepared_projector(validated) {
                 Some(projector) => {
                     composition = GgufArtifactComposition::ValidatedMediaProjector;
-                    report.multimodal = if cfg!(feature = "image") {
-                        InspectionReadiness::Ready
-                    } else {
-                        InspectionReadiness::Unsupported
-                    };
                     report.requirements.push(InspectionRequirement {
                         code: InspectionIssueCode::MissingMediaProjector,
                         readiness: InspectionReadiness::Ready,
@@ -613,11 +613,6 @@ fn inspect_gguf_projector(
             match prepared_projector(validated) {
                 Some(projector_path) => {
                     composition = GgufArtifactComposition::ValidatedMediaProjector;
-                    report.multimodal = if cfg!(feature = "image") {
-                        InspectionReadiness::Ready
-                    } else {
-                        InspectionReadiness::Unsupported
-                    };
                     report.requirements.push(InspectionRequirement {
                         code: InspectionIssueCode::MissingMediaProjector,
                         readiness: InspectionReadiness::Ready,
@@ -645,11 +640,6 @@ fn inspect_gguf_projector(
         GgufArchitecture::Inkling => match prepared_projector(validated) {
             Some(_projector_path) => {
                 composition = GgufArtifactComposition::ValidatedMediaProjector;
-                report.multimodal = if cfg!(all(feature = "image", feature = "audio")) {
-                    InspectionReadiness::Ready
-                } else {
-                    InspectionReadiness::Unsupported
-                };
             }
             None => {
                 report.multimodal = InspectionReadiness::Missing;
@@ -670,11 +660,6 @@ fn inspect_gguf_projector(
         GgufArchitecture::Gemma4 => match prepared_projector(validated) {
             Some(projector_path) => {
                 composition = GgufArtifactComposition::ValidatedMediaProjector;
-                report.multimodal = if cfg!(any(feature = "image", feature = "audio")) {
-                    InspectionReadiness::Ready
-                } else {
-                    InspectionReadiness::Unsupported
-                };
                 report.requirements.push(InspectionRequirement {
                     code: InspectionIssueCode::MissingMediaProjector,
                     readiness: InspectionReadiness::Ready,
@@ -702,11 +687,6 @@ fn inspect_gguf_projector(
         GgufArchitecture::MuseGlimmer => match prepared_projector(validated) {
             Some(projector_path) => {
                 composition = GgufArtifactComposition::ValidatedMediaProjector;
-                report.multimodal = if cfg!(feature = "image") {
-                    InspectionReadiness::Ready
-                } else {
-                    InspectionReadiness::Unsupported
-                };
                 report.requirements.push(InspectionRequirement {
                     code: InspectionIssueCode::MissingMediaProjector,
                     readiness: InspectionReadiness::Ready,
@@ -769,30 +749,17 @@ fn inspect_safetensors_media(
     report: &mut ModelInspectionReport,
     plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
 ) {
-    if report.expected_modalities == [ArtifactModality::Text] {
+    let feature_readiness = multimodal_feature_readiness(&report.expected_modalities);
+    if feature_readiness == InspectionReadiness::NotApplicable {
         report.multimodal = InspectionReadiness::NotApplicable;
         return;
     }
     if plan.has_processor() {
-        let features_available = report
-            .expected_modalities
-            .iter()
-            .all(|modality| match modality {
-                ArtifactModality::Text => true,
-                ArtifactModality::Image | ArtifactModality::Video => {
-                    cfg!(feature = "image")
-                }
-                ArtifactModality::Audio => cfg!(feature = "audio"),
-            });
-        report.multimodal = if features_available {
-            InspectionReadiness::Ready
-        } else {
-            InspectionReadiness::Unsupported
-        };
+        report.multimodal = feature_readiness;
         report.requirements.push(InspectionRequirement {
             code: InspectionIssueCode::MissingProcessor,
             readiness: report.multimodal,
-            detail: if features_available {
+            detail: if feature_readiness == InspectionReadiness::Ready {
                 "authoritative processor plan and required media build features are available"
                     .into()
             } else {
@@ -808,6 +775,22 @@ fn inspect_safetensors_media(
             "authoritative architecture inspection admitted no media processor",
             Some(report.path.clone()),
         );
+    }
+}
+
+fn multimodal_feature_readiness(expected_modalities: &[ArtifactModality]) -> InspectionReadiness {
+    if expected_modalities == [ArtifactModality::Text] {
+        return InspectionReadiness::NotApplicable;
+    }
+    let features_available = expected_modalities.iter().all(|modality| match modality {
+        ArtifactModality::Text => true,
+        ArtifactModality::Image | ArtifactModality::Video => cfg!(feature = "image"),
+        ArtifactModality::Audio => cfg!(feature = "audio"),
+    });
+    if features_available {
+        InspectionReadiness::Ready
+    } else {
+        InspectionReadiness::Unsupported
     }
 }
 
@@ -1134,6 +1117,26 @@ mod tests {
                 plan.input_modalities(GgufArtifactComposition::ValidatedMediaProjector);
             assert_eq!(artifact_modalities(modalities), expected);
         }
+    }
+
+    #[test]
+    fn gemma4_gguf_readiness_requires_image_and_audio_features() {
+        use eredu_architectures::preparation::{
+            gguf_composite_artifact_plan, GgufArtifactComposition,
+        };
+
+        let modalities = gguf_composite_artifact_plan(GgufArchitecture::Gemma4)
+            .input_modalities(GgufArtifactComposition::ValidatedMediaProjector);
+        let readiness = multimodal_feature_readiness(&artifact_modalities(modalities));
+
+        assert_eq!(
+            readiness,
+            if cfg!(all(feature = "image", feature = "audio")) {
+                InspectionReadiness::Ready
+            } else {
+                InspectionReadiness::Unsupported
+            }
+        );
     }
 
     #[test]
