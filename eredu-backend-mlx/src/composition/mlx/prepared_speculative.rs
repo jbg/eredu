@@ -62,40 +62,6 @@ struct MlxSpeculativeLaneRuntime<'a, C> {
 
 type MlxPreparedSampler<C> = ConstrainedSampler<GenerationSampler, C>;
 
-pub fn validate_external_drafter(
-    runtime: &ModelRuntime<MlxBackend<'_>>,
-    drafter: &MlxDrafter,
-) -> Result<(), Error> {
-    let model = runtime.session().complete_model().ok_or_else(|| {
-        Error::Speculative("external drafting is unavailable for pipeline sessions".into())
-    })?;
-    match (model, drafter.kind()) {
-        (Model::Gemma4(_, target), MlxDrafterKind::Gemma4Assistant) => {
-            let assistant = drafter.gemma4();
-            let target = &target.args().text;
-            let _compatibility = assistant
-                .config
-                .prove_compatibility(target)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        }
-        (Model::MuseGlimmer(_, target), MlxDrafterKind::MuseGlimmerDFlash) => {
-            let assistant = drafter.muse_glimmer();
-            let _compatibility = assistant
-                .config
-                .prove_compatibility(target.args())
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        }
-        (model, kind) => {
-            return Err(Error::ArchitectureModel(format!(
-                "drafter {kind:?} is incompatible with target {} ({:?})",
-                model.effective_model_type(),
-                model.mtp_capability()
-            )))
-        }
-    }
-    Ok(())
-}
-
 fn run_speculative_batch<'a, B, C, S, K>(
     backend: &'a mut B,
     lanes: Vec<MlxSpeculativeLaneRuntime<'a, C>>,
@@ -269,7 +235,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     /// The validation covers the target architecture, shared tensor geometry,
     /// and the portable token-id vocabulary compatibility contract.
     fn validate_drafter_compatibility(&self, drafter: &MlxDrafter) -> Result<(), Error> {
-        validate_external_drafter(self.runtime, drafter)?;
+        self.runtime.session().validate_external_drafter(drafter)?;
         drafter
             .tokenizer_compatibility()
             .validate_target(self.tokenizer_fingerprint)

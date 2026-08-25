@@ -11,12 +11,16 @@ use eredu_architectures::moshi::{
 use eredu_core::{
     backend::{Completion, Submission},
     realtime::{
-        RealtimeBackend, RealtimeDecisionDiagnostics, RealtimeError, RealtimeFrameForcing,
-        RealtimeFrameSlot, RealtimeInputFrame, RealtimeModel, RealtimeModelLoadingBackend,
-        RealtimeOutputFrame, RealtimeSampling, RealtimeScheduler, RealtimeSlotCoordinate,
-        RealtimeSpeechConfig, RealtimeTargetSource, RealtimeTemporalSource,
+        RealtimeBackend, RealtimeDecisionDiagnostics, RealtimeFrameForcing, RealtimeFrameSlot,
+        RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
+        RealtimeSlotCoordinate, RealtimeSpeechConfig, RealtimeTargetSource, RealtimeTemporalSource,
     },
-    scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
+    scheduler::{SemanticStateTransaction, WorkDescriptor},
+};
+#[cfg(test)]
+use eredu_core::{
+    realtime::{RealtimeModel, RealtimeScheduler},
+    scheduler::{RequestId, SchedulerLimits},
 };
 #[cfg(test)]
 use eredu_runtime::DefaultSampler;
@@ -194,14 +198,6 @@ pub struct MlxRealtimeOutput {
     pub output_audio_tokens: Option<Array>,
     /// Complete text-then-depth decision logits when requested by the input.
     pub diagnostics: Vec<Array>,
-}
-
-/// MLX text tokens and delay-aligned codec tokens from offline generation.
-pub struct MlxEncodedAudioOutput {
-    /// Sampled text tokens shaped `[batch, input_frames]`.
-    pub text_tokens: Array,
-    /// Generated codec tokens shaped `[batch, generated_codebooks, output_frames]`.
-    pub audio_tokens: Array,
 }
 
 fn encode_array_descriptor(array: &Array, output: &mut Vec<u32>) -> Result<(), Error> {
@@ -391,73 +387,6 @@ fn materialize_realtime_model(
     }
     neutral_moshi::load(preparation, options, stream, weights_stream)
         .map(|model| MlxRealtimeModel { model })
-}
-
-/// Greedily generates delay-aligned codec tokens through the canonical scheduler.
-///
-/// Input and output use `[batch, codebooks, frames]` layout. This helper does
-/// not append encoded silence, so delayed tail frames are not flushed after the
-/// supplied input ends.
-pub fn generate_encoded_greedy(
-    model: &mut RealtimeModel<MlxRealtimeBackend>,
-    input_audio_tokens: &Array,
-) -> Result<MlxEncodedAudioOutput, Error> {
-    let stream = model.backend().stream().clone();
-    let config = model.speech_config();
-    let input_audio_codebooks = config.input_audio_codebooks() as i32;
-    let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
-    if input_audio_tokens.shape().len() != 3 || input_audio_tokens.dim(1) != input_audio_codebooks {
-        return Err(Error::Parallel(format!(
-            "encoded input sequence must have shape [batch, {}, frames], got {:?}",
-            input_audio_codebooks,
-            input_audio_tokens.shape()
-        )));
-    }
-
-    let batch = input_audio_tokens.dim(0);
-    let request = RequestId::new(0);
-    let mut scheduler =
-        RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?).map_err(realtime_error)?;
-    scheduler
-        .register_request(model, request, RealtimeSampling::greedy())
-        .map_err(realtime_error)?;
-    let mut text = Vec::with_capacity(input_audio_tokens.dim(2) as usize);
-    let mut audio = Vec::new();
-    for frame in 0..input_audio_tokens.dim(2) {
-        let input = input_audio_tokens.try_index_device((.., .., frame), &stream)?;
-        scheduler
-            .enqueue(model, request, MlxRealtimeInput::encoded_audio(&input))
-            .map_err(realtime_error)?;
-        let output = loop {
-            if let Some(completed) = scheduler.run_queued(model).map_err(realtime_error)?.pop() {
-                break completed.into_parts().1;
-            }
-            std::thread::yield_now();
-        };
-        text.push(output.text_token.squeeze_axes(&[-1], &stream)?);
-        if let Some(tokens) = output.output_audio_tokens {
-            audio.push(tokens);
-        }
-    }
-    scheduler.finish_request(request).map_err(realtime_error)?;
-    let text_tokens = if text.is_empty() {
-        Array::zeros::<i32>(&[batch, 0], &stream)?
-    } else {
-        stack_axis(&text, 1, &stream)?
-    };
-    let audio_tokens = if audio.is_empty() {
-        Array::zeros::<i32>(&[batch, generated_audio_codebooks, 0], &stream)?
-    } else {
-        stack_axis(&audio, 2, &stream)?
-    };
-    Ok(MlxEncodedAudioOutput {
-        text_tokens,
-        audio_tokens,
-    })
-}
-
-fn realtime_error(error: RealtimeError<Error>) -> Error {
-    Error::Parallel(error.to_string())
 }
 
 fn array_i32_host(array: &Array) -> Result<Vec<i32>, Error> {

@@ -561,6 +561,10 @@ semantics by searching raw configuration documents.
 
 `BackendSession` provides high-level prefill and decode submissions. Associated
 types keep prompts, tokens, outputs, session state, and completions opaque.
+Concrete sessions dispatch complete-model and pipeline variants internally;
+they do not expose model/cache parts or variant-specific constructors to
+callers. Operations unavailable for a valid session topology return typed
+errors rather than relying on unreachable or panicking accessors.
 
 Every submission returns an exact completion object. A completion observes
 only the submitted work; it must not drain unrelated backend work. Schedulers
@@ -659,7 +663,9 @@ completion is observed, even when its client has cancelled or disconnected.
 
 Realtime and distributed request scheduling use the same ownership rules.
 Protocol framing and cross-rank schedule agreement are portable; transport and
-native collective execution belong to the backend.
+native collective execution belong to the backend. Realtime backends expose
+step submission and completion, while facade/runtime schedulers own offline
+greedy loops, request registration, frame progression, and output collection.
 
 ## Cache and residency
 

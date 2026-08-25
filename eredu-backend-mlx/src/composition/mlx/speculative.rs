@@ -321,7 +321,8 @@ impl<S> MlxSpeculativeSampling<S> {
         Self { inner }
     }
 
-    /// Returns the public sampling policy after generation completes.
+    /// Returns the sampling policy after a test generation completes.
+    #[cfg(test)]
     pub fn into_inner(self) -> S {
         self.inner
     }

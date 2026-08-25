@@ -19,9 +19,9 @@ pub use crate::composition::mlx::automatic::{
 };
 pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
 pub use crate::composition::mlx::realtime::{
-    generate_encoded_greedy, MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion,
-    MlxRealtimeInput, MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeModelState,
-    MlxRealtimeModelStateBranch, MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
+    MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
+    MlxRealtimeModelIdentity, MlxRealtimeModelState, MlxRealtimeModelStateBranch,
+    MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
 };
 pub use crate::composition::mlx::speculative::{MlxDrafter, MtpComponentTimingGuard};
 pub use crate::composition::mlx::{

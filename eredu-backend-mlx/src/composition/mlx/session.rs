@@ -36,7 +36,10 @@ use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheO
 use eredu_core::MtpCapability;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
-use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, Model, ModelCache};
+use super::{
+    speculative::{MlxDrafter, MlxDrafterKind},
+    MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, Model, ModelCache,
+};
 
 struct ArrayObserverAdapter<'a, O: ?Sized> {
     inner: &'a mut O,
@@ -692,11 +695,41 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    pub(super) fn complete_model(&self) -> Option<&Model> {
+    pub(super) fn validate_external_drafter(&self, drafter: &MlxDrafter) -> Result<(), Error> {
         match &self.inner {
-            MlxSessionKind::Complete(model, _) => Some(model),
-            MlxSessionKind::Pipeline(_, _) => None,
+            MlxSessionKind::Complete(Model::Gemma4(_, target), _)
+                if drafter.kind() == MlxDrafterKind::Gemma4Assistant =>
+            {
+                let _compatibility = drafter
+                    .gemma4()
+                    .config
+                    .prove_compatibility(&target.args().text)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            }
+            MlxSessionKind::Complete(Model::MuseGlimmer(_, target), _)
+                if drafter.kind() == MlxDrafterKind::MuseGlimmerDFlash =>
+            {
+                let _compatibility = drafter
+                    .muse_glimmer()
+                    .config
+                    .prove_compatibility(target.args())
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            }
+            MlxSessionKind::Complete(model, _) => {
+                return Err(Error::ArchitectureModel(format!(
+                    "drafter {:?} is incompatible with target {} ({:?})",
+                    drafter.kind(),
+                    model.effective_model_type(),
+                    model.mtp_capability()
+                )))
+            }
+            MlxSessionKind::Pipeline(_, _) => {
+                return Err(Error::Speculative(
+                    "external drafting is unavailable for pipeline sessions".into(),
+                ))
+            }
         }
+        Ok(())
     }
 
     pub(super) fn capability_estimate(
@@ -735,26 +768,6 @@ impl<'a> MlxModelSession<'a> {
                     )
                 })?;
                 Ok(MlxSpeculativeSessionParts::Pipeline { model, execution })
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub fn test_complete_model(&self) -> &Model {
-        match &self.inner {
-            MlxSessionKind::Complete(model, _) => model,
-            MlxSessionKind::Pipeline(_, _) => {
-                panic!("test expected a replicated MLX model session")
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub fn test_complete_cache(&self) -> &ModelCache {
-        match &self.inner {
-            MlxSessionKind::Complete(_, cache) => cache,
-            MlxSessionKind::Pipeline(_, _) => {
-                panic!("test expected a replicated MLX model-session cache")
             }
         }
     }

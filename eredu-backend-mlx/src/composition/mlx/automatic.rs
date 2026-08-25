@@ -19,7 +19,6 @@ use safemlx::{Device, DeviceType, Stream};
 use super::{
     capability::available_memory,
     inspection::{inspect_model, MlxInspectionOptions},
-    prepared_speculative::validate_external_drafter,
     realtime::MlxRealtimeBackend,
     speculative::MlxDrafter,
     MlxBackend, ModelLoadOptions,
@@ -426,7 +425,9 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                     target.backend().weights_stream(),
                 )
                 .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                validate_external_drafter(target, &drafter)
+                target
+                    .session()
+                    .validate_external_drafter(&drafter)
                     .map_err(|error| planning_backend_error("validate_external_drafter", error))?;
                 draft_stream.synchronize().map_err(|error| {
                     planning_backend_error("complete_external_drafter_load", error)
