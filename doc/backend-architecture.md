@@ -685,7 +685,10 @@ Automatic planning produces a portable `ExecutionPlan`. An
 backend load options, and the selected disabled, embedded, or external drafting
 configuration. `LoadedModel::load_execution_plan` and
 `LoadedModel::plan_and_load` therefore do not require callers to construct
-backend devices, queues, streams, or assistant models.
+backend devices, queues, streams, or assistant models. Concrete device families
+are validated against the backend features and runtime hardware during
+realization. The backend reports the canonical identity derived from that
+realized device binding rather than echoing the plan's requested identifier.
 
 External assistants cross that factory boundary as an architecture-owned
 `ExternalAssistantPreparationPlan`. Architecture inspection fixes the

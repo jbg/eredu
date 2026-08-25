@@ -1492,7 +1492,7 @@ fn cli_device_for_plan(device: &DevicePlan) -> Result<CliDevice> {
         .context("planned MLX device index is invalid")?;
     match family {
         "cpu" if index == 0 => Ok(CliDevice::Cpu),
-        "metal" | "cuda" | "gpu" => Ok(CliDevice::Gpu(index)),
+        "metal" | "cuda" => Ok(CliDevice::Gpu(index)),
         "cpu" => bail!("CPU plan device index must be zero"),
         _ => bail!("unsupported MLX device family {family:?}"),
     }

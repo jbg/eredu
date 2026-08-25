@@ -28,7 +28,7 @@ use eredu_core::backend::{
 };
 use std::num::NonZeroU8;
 
-use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
+use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Event, Stream};
 
 #[cfg(feature = "media")]
 use crate::composition::mlx::ModelProcessor;
@@ -46,6 +46,136 @@ fn backend_capabilities(has_world: bool) -> BackendCapabilities {
         output_observation: true,
         activation_inspection: true,
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum MlxAcceleratorFamily {
+    Metal,
+    Cuda,
+}
+
+impl MlxAcceleratorFamily {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+        }
+    }
+
+    pub(crate) const fn is_compiled(self) -> bool {
+        match self {
+            Self::Metal => cfg!(all(feature = "metal", target_vendor = "apple")),
+            Self::Cuda => cfg!(feature = "cuda"),
+        }
+    }
+
+    pub(crate) fn is_available(self) -> Result<bool, Error> {
+        match self {
+            Self::Metal => {
+                #[cfg(all(feature = "metal", target_vendor = "apple"))]
+                {
+                    return safemlx::metal::is_available().map_err(Into::into);
+                }
+                #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+                {
+                    Ok(false)
+                }
+            }
+            Self::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    return safemlx::cuda::is_available().map_err(Into::into);
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct MlxDeviceIdentity {
+    kind: DeviceType,
+    family: &'static str,
+    index: i32,
+}
+
+impl MlxDeviceIdentity {
+    pub(crate) fn from_realized_device(
+        device: &Device,
+        accelerator_family: Option<MlxAcceleratorFamily>,
+    ) -> Result<Self, Error> {
+        let kind = device.get_type()?;
+        let family = match (kind, accelerator_family) {
+            (DeviceType::Cpu, None) => "cpu",
+            (DeviceType::Gpu, Some(family)) => family.as_str(),
+            (DeviceType::Cpu, Some(family)) => {
+                return Err(Error::AutomaticPlanning(format!(
+                    "realized CPU device cannot have accelerator family {}",
+                    family.as_str()
+                )))
+            }
+            (DeviceType::Gpu, None) => {
+                return Err(Error::AutomaticPlanning(
+                    "realized GPU device is missing its concrete accelerator family".into(),
+                ))
+            }
+        };
+        Ok(Self {
+            kind,
+            family,
+            index: device.get_index()?,
+        })
+    }
+
+    fn validate_device(&self, device: &Device) -> Result<(), Error> {
+        let kind = device.get_type()?;
+        let index = device.get_index()?;
+        if kind != self.kind || index != self.index {
+            return Err(Error::AutomaticPlanning(format!(
+                "realized device identity {}:{} does not match backend stream device {kind:?}:{index}",
+                self.family, self.index
+            )));
+        }
+        Ok(())
+    }
+
+    fn descriptor(&self) -> DeviceDescriptor {
+        DeviceDescriptor {
+            id: format!("{}:{}", self.family, self.index),
+            name: format!("MLX {} {}", self.family, self.index),
+            family: self.family.into(),
+            memory_bytes: None,
+        }
+    }
+}
+
+fn infer_native_device_identity(device: &Device) -> Result<MlxDeviceIdentity, Error> {
+    if device.get_type()? == DeviceType::Cpu {
+        return MlxDeviceIdentity::from_realized_device(device, None);
+    }
+
+    let mut available = Vec::new();
+    for family in [MlxAcceleratorFamily::Metal, MlxAcceleratorFamily::Cuda] {
+        if family.is_compiled() && family.is_available()? {
+            available.push(family);
+        }
+    }
+    let family = available.first().copied().ok_or_else(|| {
+        Error::AutomaticPlanning(
+            "cannot identify native MLX GPU stream because no compiled accelerator family is available"
+                .into(),
+        )
+    })?;
+    if available.len() != 1 {
+        return Err(Error::AutomaticPlanning(
+            "cannot identify native MLX GPU stream because multiple accelerator families are available"
+                .into(),
+        ));
+    }
+    MlxDeviceIdentity::from_realized_device(device, Some(family))
 }
 
 /// Opaque MLX executable selected for one complete model session.
@@ -202,7 +332,7 @@ pub struct MlxModelConfig {
 pub struct MlxBackend<'a> {
     stream: Stream,
     weights_stream: Stream,
-    planned_device_id: Option<String>,
+    realized_device: Option<MlxDeviceIdentity>,
     world: Option<&'a safemlx::distributed::Group>,
 }
 
@@ -211,7 +341,7 @@ impl MlxBackend<'static> {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
-            planned_device_id: None,
+            realized_device: None,
             world: None,
         }
     }
@@ -219,12 +349,12 @@ impl MlxBackend<'static> {
     pub(crate) fn for_execution_plan(
         stream: &Stream,
         weights_stream: &Stream,
-        device_id: String,
+        realized_device: MlxDeviceIdentity,
     ) -> Self {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
-            planned_device_id: Some(device_id),
+            realized_device: Some(realized_device),
             world: None,
         }
     }
@@ -239,7 +369,7 @@ impl<'a> MlxBackend<'a> {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
-            planned_device_id: None,
+            realized_device: None,
             world: Some(world),
         }
     }
@@ -281,28 +411,15 @@ impl<'a> BackendProvider for MlxBackend<'a> {
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
         let device = self.stream.get_device()?;
-        let index = device.get_index()?;
-        let inferred_family = match device.get_type()? {
-            DeviceType::Cpu => "cpu",
-            DeviceType::Gpu if cfg!(feature = "cuda") => "cuda",
-            DeviceType::Gpu if cfg!(target_os = "macos") => "metal",
-            DeviceType::Gpu => "gpu",
+        let identity = match &self.realized_device {
+            Some(identity) => {
+                identity.validate_device(&device)?;
+                identity.clone()
+            }
+            None => infer_native_device_identity(&device)?,
         };
-        let id = self
-            .planned_device_id
-            .clone()
-            .unwrap_or_else(|| format!("{inferred_family}:{index}"));
-        let family = id.split_once(':').map_or_else(
-            || inferred_family.to_owned(),
-            |(family, _)| family.to_owned(),
-        );
         Ok(vec![(
-            DeviceDescriptor {
-                id,
-                name: format!("MLX {family} {index}"),
-                family,
-                memory_bytes: None,
-            },
+            identity.descriptor(),
             backend_capabilities(self.world.is_some()),
         )])
     }
@@ -345,7 +462,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_capabilities, MlxBackend};
+    use super::{backend_capabilities, MlxBackend, MlxDeviceIdentity};
     use eredu_core::BackendProvider as _;
     use safemlx::{Device, DeviceType, ExecutionContext};
 
@@ -362,6 +479,19 @@ mod tests {
         let devices = backend.devices().unwrap();
         assert_eq!(devices.len(), 1);
         assert!(!devices[0].1.collectives);
+    }
+
+    #[test]
+    fn planned_backend_rejects_a_stream_that_differs_from_its_realized_device() {
+        let realized = Device::new(DeviceType::Cpu, 0);
+        let identity = MlxDeviceIdentity::from_realized_device(&realized, None).unwrap();
+        let other = ExecutionContext::new(Device::new(DeviceType::Cpu, 1));
+        let backend = MlxBackend::for_execution_plan(other.stream(), other.stream(), identity);
+
+        let error = backend.devices().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match backend stream device"));
     }
 }
 

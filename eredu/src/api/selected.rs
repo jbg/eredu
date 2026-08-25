@@ -138,15 +138,8 @@ pub fn local_device_plan(device: LocalDevice) -> crate::DevicePlan {
         LocalDevice::Accelerator(index) => {
             let family = if cfg!(feature = "cuda") {
                 "cuda"
-            } else if cfg!(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "visionos"
-            )) {
-                "metal"
             } else {
-                "gpu"
+                "metal"
             };
             format!("{family}:{index}")
         }
@@ -387,7 +380,10 @@ pub fn benchmark_local_expert_cache(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_expert_cache_benchmark_prompt, LocalExpertCacheBenchmarkError};
+    use super::{
+        local_device_plan, validate_expert_cache_benchmark_prompt, LocalDevice,
+        LocalExpertCacheBenchmarkError,
+    };
 
     #[test]
     fn empty_benchmark_prompt_is_a_facade_input_error() {
@@ -396,5 +392,16 @@ mod tests {
             Err(LocalExpertCacheBenchmarkError::EmptyPrompt)
         ));
         validate_expert_cache_benchmark_prompt(&[1]).unwrap();
+    }
+
+    #[test]
+    fn local_accelerator_plan_names_the_compiled_family() {
+        let plan = local_device_plan(LocalDevice::Accelerator(3));
+        let expected = if cfg!(feature = "cuda") {
+            "cuda:3"
+        } else {
+            "metal:3"
+        };
+        assert_eq!(plan.device, expected);
     }
 }

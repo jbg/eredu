@@ -24,10 +24,10 @@ use super::{
     MlxBackend, ModelLoadOptions,
 };
 use crate::{
-    backend::error::Error,
     backend::runtime::{
         execution::layerwise::LayerwiseModelError, residency::expert_cache::ExpertCacheReport,
     },
+    backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
 use eredu_runtime::{
@@ -70,8 +70,9 @@ pub fn create_realtime_backend(
     >,
     Error,
 > {
-    let device = mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
-    let stream = Stream::new_with_device(&device);
+    let realized =
+        mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
+    let stream = Stream::new_with_device(&realized.device);
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     Ok(MlxRealtimeBackend::new(&stream, &weights_stream))
 }
@@ -331,9 +332,10 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
                 ));
             }
         }
-        let stream = Stream::new_with_device(&mlx_device(&probe.device)?);
+        let realized = mlx_device(&probe.device)?;
+        let stream = Stream::new_with_device(&realized.device);
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let backend = MlxBackend::new(&stream, &weights_stream);
+        let backend = MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity);
         let options = mlx_load_options(self, &probe)
             .map_err(|error| planning_backend_error("realize_probe", error))?;
         match eredu_core::load_model(&backend, model_path, options) {
@@ -371,12 +373,13 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         &self,
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
-        let stream = Stream::new_with_device(&mlx_device(&plan.device)?);
+        let realized = mlx_device(&plan.device)?;
+        let stream = Stream::new_with_device(&realized.device);
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let options = mlx_load_options(self, plan)
             .map_err(|error| planning_backend_error("realize_execution_plan_target", error))?;
         Ok(ExecutionPlanTarget::new(
-            MlxBackend::for_execution_plan(&stream, &weights_stream, plan.device.device.clone()),
+            MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity),
             options,
         ))
     }
@@ -421,7 +424,8 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 let draft_stream = match placement {
                     DraftPlacementPlan::Target => target.backend().stream().clone(),
                     DraftPlacementPlan::Device { device } => {
-                        Stream::new_with_device(&mlx_device(device)?)
+                        let realized = mlx_device(device)?;
+                        Stream::new_with_device(&realized.device)
                     }
                 };
                 let options = mlx_drafter_load_options(plan)
@@ -519,7 +523,13 @@ fn memory_semantics(value: PhysicalMemorySemantics) -> HardwareMemorySemantics {
     }
 }
 
-fn mlx_device(device: &DevicePlan) -> Result<Device, AutomaticPlanningError> {
+#[derive(Debug)]
+struct RealizedMlxDevice {
+    device: Device,
+    identity: MlxDeviceIdentity,
+}
+
+fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlanningError> {
     if device.backend.as_str() != "mlx" {
         return Err(AutomaticPlanningError::Invalid(format!(
             "MLX cannot probe backend {}",
@@ -536,16 +546,49 @@ fn mlx_device(device: &DevicePlan) -> Result<Device, AutomaticPlanningError> {
         AutomaticPlanningError::Invalid(format!("invalid MLX device index: {error}"))
     })?)
     .map_err(|_| AutomaticPlanningError::Invalid("MLX device index exceeds i32".into()))?;
-    let kind = match family {
-        "cpu" => DeviceType::Cpu,
-        "metal" | "cuda" | "gpu" => DeviceType::Gpu,
+    let accelerator_family = match family {
+        "cpu" => None,
+        "metal" => Some(MlxAcceleratorFamily::Metal),
+        "cuda" => Some(MlxAcceleratorFamily::Cuda),
         other => {
             return Err(AutomaticPlanningError::Invalid(format!(
                 "unknown MLX device family {other:?}"
             )))
         }
     };
-    Ok(Device::new(kind, index))
+    let canonical_id = format!("{family}:{index}");
+    if device.device != canonical_id {
+        return Err(AutomaticPlanningError::Invalid(format!(
+            "MLX device identifier {:?} is not canonical; use {canonical_id:?}",
+            device.device
+        )));
+    }
+    if let Some(family) = accelerator_family {
+        if !family.is_compiled() {
+            return Err(AutomaticPlanningError::Invalid(format!(
+                "MLX {} device family is not compiled for this target",
+                family.as_str()
+            )));
+        }
+        let available = family.is_available().map_err(|error| {
+            planning_backend_error("discover_accelerator_family_availability", error)
+        })?;
+        if !available {
+            return Err(AutomaticPlanningError::Invalid(format!(
+                "MLX {} device family is not available on the discovered hardware",
+                family.as_str()
+            )));
+        }
+    }
+    let kind = if accelerator_family.is_some() {
+        DeviceType::Gpu
+    } else {
+        DeviceType::Cpu
+    };
+    let device = Device::new(kind, index);
+    let identity = MlxDeviceIdentity::from_realized_device(&device, accelerator_family)
+        .map_err(|error| planning_backend_error("derive_realized_device_identity", error))?;
+    Ok(RealizedMlxDevice { device, identity })
 }
 
 fn transfer_direction_name(direction: TransferDirection) -> &'static str {
@@ -572,6 +615,7 @@ fn planning_backend_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::BackendProvider as _;
 
     #[test]
     fn mlx_discovery_always_reports_cpu() {
@@ -588,5 +632,69 @@ mod tests {
         let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
         plan.topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
         assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
+    }
+
+    #[test]
+    fn realized_cpu_identity_is_derived_from_the_native_device() {
+        let plan = DevicePlan::new("mlx", "cpu:0").unwrap();
+        let realized = mlx_device(&plan).unwrap();
+        let stream = Stream::new_with_device(&realized.device);
+        let backend = MlxBackend::for_execution_plan(&stream, &stream, realized.identity);
+
+        let devices = backend.devices().unwrap();
+        assert_eq!(devices[0].0.id, "cpu:0");
+        assert_eq!(devices[0].0.family, "cpu");
+    }
+
+    #[test]
+    fn realization_rejects_generic_gpu_family() {
+        let plan = DevicePlan::new("mlx", "gpu:0").unwrap();
+        let error = mlx_device(&plan).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown MLX device family \"gpu\""));
+    }
+
+    #[test]
+    fn realization_rejects_noncanonical_device_identity() {
+        let plan = DevicePlan::new("mlx", "cpu:00").unwrap();
+        let error = mlx_device(&plan).unwrap_err();
+        assert!(error.to_string().contains("is not canonical"));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn realization_rejects_cuda_without_compiled_support() {
+        let plan = DevicePlan::new("mlx", "cuda:0").unwrap();
+        let error = mlx_device(&plan).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cuda device family is not compiled"));
+    }
+
+    #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+    #[test]
+    fn realization_rejects_metal_without_compiled_support() {
+        let plan = DevicePlan::new("mlx", "metal:0").unwrap();
+        let error = mlx_device(&plan).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("metal device family is not compiled"));
+    }
+
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    #[test]
+    fn realized_metal_plan_reports_metal_from_the_native_binding() {
+        if !safemlx::metal::is_available().unwrap() {
+            return;
+        }
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0").unwrap());
+        let target =
+            eredu_core::realize_execution_plan_target(&MlxBackendFactory::default(), &plan)
+                .unwrap();
+        let devices = target.backend().devices().unwrap();
+
+        assert_eq!(devices[0].0.id, "metal:0");
+        assert_eq!(devices[0].0.family, "metal");
     }
 }
