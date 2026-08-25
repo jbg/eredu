@@ -40,8 +40,8 @@ eredu = { version = "0.4", default-features = false }
 
 The portable build includes artifact inspection, tokenizer and chat metadata,
 generation orchestration, media request descriptions, execution planning, and
-the backend contracts. Applications supply an implementation of the required
-backend capabilities.
+application-facing backend metadata. Backend implementers import the required
+contracts directly from their owning crates.
 
 ## Loading a model
 

@@ -6,7 +6,7 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Backend-neutral text model architectures for Eredu"
+description = "Backend-neutral text, multimodal, and realtime model architectures for Eredu"
 
 [dependencies]
 eredu-checkpoint.workspace = true
