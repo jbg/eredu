@@ -17642,7 +17642,7 @@ fn load_lfm2_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &global_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -17662,11 +17662,15 @@ fn load_lfm2_pipeline(
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().zip(&mut stage.layers) {
+            let binding_layer = global_architecture
+                .construct_unit(global_decoder_group, global_layer, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
-                decoder_group,
+                &global_architecture,
+                global_decoder_group,
                 global_layer,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -17710,6 +17714,7 @@ fn load_lfm2_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let architecture = &stage.architecture;
+        let binding_architecture = &global_architecture;
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -17730,12 +17735,16 @@ fn load_lfm2_pipeline(
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
+                let binding_layer = binding_architecture
+                    .construct_unit(global_decoder_group, global_layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 binding_adapter.cartesian_layer_bindings(
-                    architecture,
-                    decoder_group,
+                    binding_architecture,
+                    global_decoder_group,
                     global_layer,
-                    layer,
+                    &binding_layer,
                     store,
                     streamed_layout.as_ref(),
                     streamed_assignment.as_ref(),
@@ -20304,7 +20313,7 @@ fn load_kimi_linear_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &global_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -20324,11 +20333,15 @@ fn load_kimi_linear_pipeline(
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().zip(&mut stage.layers) {
+            let binding_layer = global_architecture
+                .construct_unit(global_decoder_group, global_layer, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
-                decoder_group,
+                &global_architecture,
+                global_decoder_group,
                 global_layer,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -20367,11 +20380,22 @@ fn load_kimi_linear_pipeline(
     }
     let static_bytes = loaded.finish(&mut info)?;
     let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let mut materialized_shards = if info.materialization.is_some() {
+        store.materialized_source_shards()
+    } else {
+        Vec::new()
+    };
+    materialized_shards.extend(checkpoint_backing_shards(
+        store.as_ref(),
+        info.owned_tensors.iter().map(String::as_str),
+    )?);
+    materialized_shards.sort();
+    materialized_shards.dedup();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let architecture = &stage.architecture;
+        let binding_architecture = &global_architecture;
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -20392,12 +20416,16 @@ fn load_kimi_linear_pipeline(
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
+                let binding_layer = binding_architecture
+                    .construct_unit(global_decoder_group, global_layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 binding_adapter.cartesian_layer_bindings(
-                    architecture,
-                    decoder_group,
+                    binding_architecture,
+                    global_decoder_group,
                     global_layer,
-                    layer,
+                    &binding_layer,
                     store,
                     streamed_layout.as_ref(),
                     streamed_assignment.as_ref(),

@@ -92,7 +92,7 @@ pub fn unit_recipes(
     let normalized = normalized_checkpoint_keys(store);
     for (runtime, raw) in &normalized {
         if runtime.starts_with(&format!("{root}.mlp."))
-            && (include_experts || !runtime.starts_with(&expert_prefix))
+            && !runtime.starts_with(&expert_prefix)
             && runtime != raw
         {
             recipes.insert(
@@ -1405,7 +1405,8 @@ mod tests {
                 ("w2", vec![12, 9]),
                 ("w3", vec![9, 12]),
             ] {
-                let name = format!("model.layers.1.mlp.experts.{expert}.{projection}.weight");
+                let name =
+                    format!("model.layers.1.block_sparse_moe.experts.{expert}.{projection}.weight");
                 tensors.insert(name.clone(), metadata(&name, shape));
             }
         }
@@ -1427,6 +1428,9 @@ mod tests {
             sparse.get("model.layers.1.mlp.experts.gate_up_proj"),
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 2
         ));
+        assert!(!sparse
+            .keys()
+            .any(|name| name.contains(".mlp.experts.0.") || name.contains(".mlp.experts.1.")));
         assert!(matches!(
             expert_recipes(&catalog, &args, 1, 0)
                 .unwrap()

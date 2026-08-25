@@ -874,7 +874,7 @@ pub fn state_identity(
         )));
     }
     Ok(ModelStateIdentity {
-        model_family: "kimi-linear".into(),
+        model_family: crate::ModelKind::KimiLinear.canonical_name().into(),
         effective_model_type: args.model_type.clone(),
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
         layer_count,
