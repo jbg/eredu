@@ -18,7 +18,7 @@ pub use config::{
     prompt_cache_architecture_fingerprint, state_identity, state_layout, ConfigError, ModelArgs,
     MxFp4Config,
 };
-pub use model::{new_layered_model, LayerUnit, LayeredModel};
+pub use model::{new_layered_model, LayeredModel};
 pub use moe::{expert_bank_spec, localized_expert_bank_spec, RoutedMlp};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,

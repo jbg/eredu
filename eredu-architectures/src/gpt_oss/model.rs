@@ -2,10 +2,7 @@
 
 use eredu_nn::{Error, RoutedNeuralBackend, Tensor};
 
-use super::{
-    block::{GptOssBlockFactory, TransformerBlock},
-    config::ModelArgs,
-};
+use super::{block::GptOssBlockFactory, config::ModelArgs};
 
 /// Shared layered lifecycle specialized to GPT-OSS blocks.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, GptOssBlockFactory>;
@@ -17,6 +14,3 @@ pub fn new_layered_model<B: RoutedNeuralBackend>(
 ) -> Result<LayeredModel<B>, Error> {
     LayeredModel::new(args, context)
 }
-
-/// Unit type used by layered residency and pipeline executors.
-pub type LayerUnit<B> = TransformerBlock<B>;
