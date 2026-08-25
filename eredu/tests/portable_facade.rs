@@ -4,10 +4,13 @@ use eredu::api::{
     AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu::{
-    ArtifactFormat, BackendCapabilities, BackendDescriptor, BackendProvider, BackendSession,
-    Completion, DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness,
-    ModelInspectionReport, ModelRuntime, ObservationSet, ObservationValue, PreparedModel,
-    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
+    ArtifactFormat, BackendCapabilities, BackendDescriptor, DeviceDescriptor,
+    GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport, ObservationSet,
+    ObservationValue, TextGenerationConfig, TokenFilter, TokenOutput,
+};
+use eredu_core::{
+    BackendProvider, BackendSession, Completion, ModelRuntime, PreparedModel, Submission,
+    TextGenerationBackend,
 };
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 

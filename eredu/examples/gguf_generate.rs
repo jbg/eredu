@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use eredu::{
     api::{local_device_plan, LoadedModel, LocalBackendFactory, LocalDevice},
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationBackend, TextGenerationConfig,
-    TokenOutput,
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
+use eredu_core::TextGenerationBackend;
 
 fn generate<B: TextGenerationBackend>(
     model: &mut LoadedModel<B>,

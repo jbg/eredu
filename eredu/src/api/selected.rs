@@ -77,7 +77,7 @@ impl LocalRealtimeBackendFactory {
     pub fn create(
         &self,
     ) -> Result<
-        impl crate::RealtimeModelLoadingBackend<
+        impl eredu_core::RealtimeModelLoadingBackend<
             Preparation = crate::RealtimePreparationPlan,
             LoadOptions = LocalLoadOptions,
             Error = LocalBackendError,
@@ -254,7 +254,7 @@ struct ExpertSnapshot {
 }
 
 fn expert_snapshot(
-    runtime: &crate::ModelRuntime<LocalBackend<'static>>,
+    runtime: &eredu_core::ModelRuntime<LocalBackend<'static>>,
 ) -> Result<ExpertSnapshot, LocalExpertCacheBenchmarkError> {
     let report = runtime
         .session()
@@ -318,11 +318,11 @@ fn validate_expert_cache_benchmark_prompt(
 
 /// Benchmarks selected-backend expert-cache reuse without exposing tensors or streams.
 pub fn benchmark_local_expert_cache(
-    runtime: &mut crate::ModelRuntime<LocalBackend<'static>>,
+    runtime: &mut eredu_core::ModelRuntime<LocalBackend<'static>>,
     token_ids: &[u32],
 ) -> Result<LocalExpertCacheBenchmark, LocalExpertCacheBenchmarkError> {
     validate_expert_cache_benchmark_prompt(token_ids)?;
-    let prompt = <LocalBackend<'static> as crate::TextGenerationBackend>::prepare_text_prompt(
+    let prompt = <LocalBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
         runtime.backend(),
         token_ids.to_vec(),
     )?;

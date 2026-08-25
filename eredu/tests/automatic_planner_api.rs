@@ -1,8 +1,8 @@
 use eredu::{
     api::LocalBackendFactory, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
-    BackendProvider, DevicePlan, ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
+    DevicePlan, ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
 };
-use eredu_core::realize_execution_plan_target;
+use eredu_core::{realize_execution_plan_target, BackendProvider};
 
 #[test]
 fn portable_planner_realizes_an_owned_mlx_backend() {

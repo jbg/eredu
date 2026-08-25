@@ -48,7 +48,10 @@ The facade likewise does not alias `eredu-core` or re-export `eredu-runtime`
 infrastructure. Cache workers, checkpoint storage bindings, residency and
 prefetch engines, generic schedulers and work-lifecycle contracts, parameter
 plans, and other infrastructure contracts are imported from their owning
-crates. The facade root retains only deliberately application-facing types.
+crates. Backend providers, sessions, prepared models, runtime handles,
+completion and submission primitives, and distributed execution contracts are
+likewise imported directly from `eredu-core`. The facade root retains only
+deliberately application-facing types.
 
 The selected adapter exposes the causal backend type and a facade-owned
 realtime backend factory because the neutral execution contracts have

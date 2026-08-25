@@ -1,6 +1,6 @@
 //! End-to-end conformance suite for a backend implemented without MLX.
 //!
-//! The client probes are generic over the facade contracts so new backend
+//! The client probes are generic over neutral contracts so new backend
 //! implementations can reuse the same loading, generation, capability, media,
 //! speculative, realtime, distributed, automatic-planning, and residency
 //! realization call shapes.
@@ -22,38 +22,38 @@ use eredu::{
         PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpError,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, RgbImage,
     },
-    load_realtime_model_with_options, AdmissionRequest, AdmissionResult, ArtifactFormat,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
-    BackendCapabilities, BackendDescriptor, BackendId, BackendProvider, BackendSession,
-    CacheStateStrategy, CapabilityError, CollectiveScope, DeviceDescriptor, DevicePlan,
-    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    DraftPlacementPlan, DraftingPlan, EstimationCompleteness, ExecutionPlan,
-    ExecutionPlanBackendFactory, ExecutionPlanTarget, ExternalDraftArtifact, FinishReason,
-    GenerationConfigOverrides, GrowingState, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, ModelCapabilities,
-    ModelCapabilityBackend, ModelKind, ModelLoadingBackend, ModelResourceProfile, ModelRuntime,
-    MtpCapability, MtpCheckpointKind, MultimodalPreparationBackend, ObservationSet,
-    ObservationValue, Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics,
-    PreparedModel, RealizedDrafting, RealtimeBackend, RealtimeFrameConvention,
-    RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig,
-    ResidencyPlan, RuntimeStateEstimate, SemanticEvent, SpeculativeDraft,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput,
-    SpeculativeTokenFilterController, StateLayout, StaticMemoryReport, Submission,
-    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
-    AUTOMATIC_SCHEMA_VERSION,
+    AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlanningError, BackendCapabilities, BackendDescriptor, BackendId, CacheStateStrategy,
+    CapabilityError, DeviceDescriptor, DevicePlan, DistributedCapabilities, DraftPlacementPlan,
+    DraftingPlan, EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides,
+    GrowingState, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, InputModalities, InputTokenCount, ModelCapabilities, ModelKind,
+    ModelResourceProfile, MtpCapability, MtpCheckpointKind, ObservationSet, ObservationValue,
+    Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, RealtimeFrameConvention,
+    RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RuntimeStateEstimate,
+    SemanticEvent, SpeculativeDraft, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, StaticMemoryReport,
+    TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::{
     checkpoint::TensorDtype,
+    load_realtime_model_with_options,
     residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedger,
         ResidencyPolicy,
     },
     scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
-    BoundedResidencyRequirement, CandidateAdmission, Completion, PreparedSpeculativeLane,
-    ProposalDecision, SamplingPlacement, SpeculativeCallbackPublisher, SpeculativeCommit,
-    SpeculativeExecutor, SpeculativeGenerationVisitor, SpeculativeOutputRuntime,
-    SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling, SpeculativeSemanticConstraint,
+    AutomaticPlanningBackend, BackendProvider, BackendSession, BoundedResidencyRequirement,
+    CandidateAdmission, CollectiveScope, Completion, DistributedBackend, DistributedSession,
+    DistributedSessionDescriptor, ExecutionPlanBackendFactory, ExecutionPlanTarget,
+    ExternalDraftArtifact, ModelCapabilityBackend, ModelLoadingBackend, ModelRuntime,
+    MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
+    PreparedSpeculativeLane, ProposalDecision, RealizedDrafting, RealtimeBackend,
+    RealtimeModelLoadingBackend, SamplingPlacement, SpeculativeCallbackPublisher,
+    SpeculativeCommit, SpeculativeExecutor, SpeculativeGenerationBackend,
+    SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativePrefill,
+    SpeculativeRandomness, SpeculativeSampling, SpeculativeSemanticConstraint,
+    SpeculativeTokenFilterController, StateLayout, Submission, TextGenerationBackend,
 };
 use tokenizers::{
     decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
@@ -395,7 +395,7 @@ impl MultimodalPreparationBackend for MockBackend {
         _: &ModelRuntime<Self>,
         request: &eredu::TokenizedMultimodalRequest,
         encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Self::Prompt, eredu::MultimodalPreparationFailure<Self::Error, E>>
+    ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
     where
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -408,9 +408,7 @@ impl MultimodalPreparationBackend for MockBackend {
                 eredu::TokenizedMultimodalSegment::Media(_) => prompt.push(2_001),
             }
         }
-        prompt.extend(
-            encode_backend_text("hello").map_err(eredu::MultimodalPreparationFailure::Text)?,
-        );
+        prompt.extend(encode_backend_text("hello").map_err(MultimodalPreparationFailure::Text)?);
         Ok(prompt)
     }
 }

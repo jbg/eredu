@@ -1,7 +1,5 @@
-use eredu::{
-    api::{LocalBackendError, LocalDevice, LocalLoadOptions, LocalRealtimeBackendFactory},
-    RealtimeBackend, RealtimeModelLoadingBackend,
-};
+use eredu::api::{LocalBackendError, LocalDevice, LocalLoadOptions, LocalRealtimeBackendFactory};
+use eredu_core::{RealtimeBackend, RealtimeModelLoadingBackend};
 
 fn assert_selected_realtime_backend<B>(backend: &B)
 where

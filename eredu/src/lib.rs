@@ -2,6 +2,24 @@
 //!
 //! [`api`] and [`runtime`] remain available without an execution backend. The
 //! default `mlx` feature adds the MLX model implementations and runtime.
+//!
+//! Backend implementation contracts are imported from their owning crates:
+//!
+//! ```compile_fail
+//! use eredu::BackendProvider;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::BackendSession;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::PreparedModel;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::Completion;
+//! ```
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]
@@ -36,14 +54,9 @@ pub use eredu_core::artifact::{
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,
     PreparationPolicy, QuantizationRequest, ResidencyRequest,
 };
-pub use eredu_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use eredu_core::cache::{
-    CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
-    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, PromptCacheBlock,
-    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass,
-    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-    StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
+    CachePolicyError, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
+    PromptCacheOptions, PROMPT_CACHE_SCHEMA_VERSION,
 };
 pub use eredu_core::generation::{
     CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,
@@ -51,42 +64,32 @@ pub use eredu_core::generation::{
     ResolvedGenerationConfig, SemanticEvent,
 };
 pub use eredu_core::{
-    load_model, load_realtime_model, load_realtime_model_with_options, Admission,
-    AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry, ArtifactModality,
-    ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
-    AutomaticPlanningBackend, AutomaticPlanningError, AvailableMemory, BackendCapabilities,
-    BackendDescriptor, BackendError, BackendId, BackendProvider, BackendSession,
-    CacheStateStrategy, CapabilityError, CollectiveScope, Completion, ControlledTextGeneration,
-    ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DevicePlan,
-    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    DraftPlacementPlan, DraftingPlan, DurationSeconds, EstimationCompleteness, ExecutionPlan,
-    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget, ExecutionTelemetry,
-    ExpertCachePlan, ExpertCacheTelemetry, ExternalDraftArtifact, GrowingState,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    InputModalities, InputTokenCount, InspectableBackendSession, InspectedOutput, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity, Media,
-    MediaBinding, MediaRequestError, ModelCapabilities, ModelCapabilityBackend,
-    ModelInspectionReport, ModelLoadError, ModelLoadingBackend, ModelResourceProfile, ModelRuntime,
-    MtpCapability, MtpCheckpointKind, MtpTelemetry, MultimodalPreparationBackend,
-    MultimodalPreparationFailure, MultimodalRequest, MultimodalSegment, ObservationError,
+    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
+    ArtifactModality, ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, AutomaticPlanningError, AvailableMemory, BackendCapabilities,
+    BackendDescriptor, BackendId, CacheStateStrategy, CapabilityError, DeviceDescriptor,
+    DevicePlan, DistributedCapabilities, DraftPlacementPlan, DraftingPlan, DurationSeconds,
+    EstimationCompleteness, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCachePlan, ExpertCacheTelemetry, GrowingState, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
+    InputTokenCount, InspectedOutput, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    InspectionRequirement, InspectionSeverity, Media, MediaBinding, MediaRequestError,
+    ModelCapabilities, ModelInspectionReport, ModelResourceProfile, MtpCapability,
+    MtpCheckpointKind, MtpTelemetry, MultimodalRequest, MultimodalSegment, ObservationError,
     ObservationKind, ObservationRequest, ObservationSelector, ObservationSet, ObservationValue,
-    Observed, ParallelAxis, ParallelCoordinates, ParallelRankTopology, ParallelTopology,
-    PhysicalMemorySemantics, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-    PreparedModel, RealizedDrafting, RealtimeBackend, RealtimeCompletedStep, RealtimeConfigError,
+    Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, RealtimeCompletedStep, RealtimeConfigError,
     RealtimeDecisionDiagnostics, RealtimeError, RealtimeFrameConvention, RealtimeFrameForcing,
     RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition, RealtimeInputFrame,
-    RealtimeModel, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeScheduleError, RealtimeScheduler, RealtimeSession, RealtimeSlotCoordinate,
-    RealtimeSlotOccupancy, RealtimeSpeechConfig, RealtimeTargetDecision, RealtimeTargetSource,
-    RealtimeTemporalSource, ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate,
-    SlidingWindowLayerCount, SpeculativeDraft, SpeculativeGenerationBackend,
+    RealtimeOutputFrame, RealtimeSampling, RealtimeScheduleError, RealtimeScheduler,
+    RealtimeSlotCoordinate, RealtimeSlotOccupancy, RealtimeSpeechConfig, RealtimeTargetDecision,
+    RealtimeTargetSource, RealtimeTemporalSource, ResidencyPlan, ResidencyTelemetry, RgbImage,
+    RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeGenerationOutput, SpeculativeTokenFilterController, StateLayout,
-    StateMemoryAssumptions, StaticMemoryReport, SubgroupMembership, Submission, TensorObservation,
-    TensorObservationData, TextGeneration, TextGenerationBackend, TextGenerationConfig,
-    TextSamplingStrategy, TimingTelemetry, TokenFilter, TokenFilterController, TokenFilterError,
-    TokenOutput, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
-    TokenizerCompatibilityError, TokenizerCompatibilityProof, TopologyPreflightReport,
+    SpeculativeGenerationOutput, StateMemoryAssumptions, StaticMemoryReport, TensorObservation,
+    TensorObservationData, TextGenerationConfig, TextSamplingStrategy, TimingTelemetry,
+    TokenFilter, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
+    TokenizedMultimodalSegment, TokenizerCompatibilityError, TokenizerCompatibilityProof,
     TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
     AUTOMATIC_SCHEMA_VERSION, EXECUTION_PLAN_SCHEMA_VERSION,
 };
