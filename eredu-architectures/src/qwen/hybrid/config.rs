@@ -1008,6 +1008,21 @@ pub fn fp8_block_row_widths(widths: &[i32]) -> Result<Vec<i32>, HybridConfigErro
 
 /// Stable prompt-cache identity for global hybrid architecture semantics.
 pub fn prompt_cache_architecture_fingerprint(config: &HybridConfig) -> String {
+    let fp8 = config.fp8.as_ref().map_or_else(
+        || "none".into(),
+        |fp8| {
+            let mut exclusions = fp8.modules_to_not_convert.clone();
+            exclusions.sort_unstable();
+            format!(
+                "{}:{}:{}:{:?}:{}",
+                fp8.quant_method,
+                fp8.fmt,
+                fp8.activation_scheme,
+                fp8.weight_block_size,
+                exclusions.join(";")
+            )
+        },
+    );
     derive_prompt_cache_architecture_fingerprint(
         "qwen_hybrid",
         [
@@ -1039,6 +1054,12 @@ pub fn prompt_cache_architecture_fingerprint(config: &HybridConfig) -> String {
                 canonical_config_map(&config.rope_parameters),
             ),
             ("rope_scaling", canonical_config_map(&config.rope_scaling)),
+            ("fp8", fp8),
+            ("quantization", format!("{:?}", config.quantization)),
+            (
+                "linear_formats",
+                crate::cache_identity::debug_map(Some(&config.linear_formats)),
+            ),
         ],
     )
 }
@@ -1386,6 +1407,25 @@ mod tests {
         let conditional = model_args_from_config_value(&conditional).unwrap();
         assert_eq!(conditional.text.variant, HybridVariant::Qwen35Moe);
         assert!(conditional.vision.is_some());
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_load_time_quantization() {
+        let dense = model_args_from_config_value(&text_config("qwen3_next"))
+            .unwrap()
+            .text;
+        let quantized = crate::qwen::hybrid::load_time_quantization(
+            &dense,
+            eredu_checkpoint::AffineQuantization::new(16, 4)
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            prompt_cache_architecture_fingerprint(&dense),
+            prompt_cache_architecture_fingerprint(&quantized)
+        );
     }
 
     #[test]

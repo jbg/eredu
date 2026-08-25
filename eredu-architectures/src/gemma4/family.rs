@@ -230,6 +230,42 @@ impl FamilyConfig {
                 ("vision", vision),
                 ("audio", audio),
                 (
+                    "vision_quantization",
+                    self.vision.as_ref().map_or_else(
+                        || "none".into(),
+                        |config| {
+                            format!(
+                                "default={:?};weights={};overrides={}",
+                                config.weight_quantization,
+                                crate::cache_identity::string_set(
+                                    config.quantized_weights.as_ref()
+                                ),
+                                crate::cache_identity::debug_map(
+                                    config.quantized_weight_configs.as_ref()
+                                )
+                            )
+                        },
+                    ),
+                ),
+                (
+                    "audio_quantization",
+                    self.audio.as_ref().map_or_else(
+                        || "none".into(),
+                        |config| {
+                            format!(
+                                "default={:?};weights={};overrides={}",
+                                config.weight_quantization,
+                                crate::cache_identity::string_set(
+                                    config.quantized_weights.as_ref()
+                                ),
+                                crate::cache_identity::debug_map(
+                                    config.quantized_weight_configs.as_ref()
+                                )
+                            )
+                        },
+                    ),
+                ),
+                (
                     "tokens",
                     format!(
                         "{:?}:{:?}:{:?}",
@@ -294,6 +330,27 @@ mod tests {
             }
         );
         assert!(!parsed.architecture_fingerprint().is_empty());
+    }
+
+    #[test]
+    fn family_fingerprint_includes_component_quantization() {
+        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        let dense = parsed.architecture_fingerprint();
+        let format = eredu_checkpoint::AffineQuantization::new(16, 4)
+            .unwrap()
+            .into();
+
+        let mut vision_quantized = parsed.clone();
+        vision_quantized
+            .vision
+            .as_mut()
+            .unwrap()
+            .weight_quantization = Some(format);
+        assert_ne!(dense, vision_quantized.architecture_fingerprint());
+
+        let mut audio_quantized = parsed;
+        audio_quantized.audio.as_mut().unwrap().weight_quantization = Some(format);
+        assert_ne!(dense, audio_quantized.architecture_fingerprint());
     }
 
     #[test]

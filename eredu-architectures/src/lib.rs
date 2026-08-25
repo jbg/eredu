@@ -13,6 +13,7 @@
     clippy::type_complexity
 )]
 
+mod cache_identity;
 /// Portable model capabilities and scalar runtime-state estimates.
 pub mod capability;
 /// Exact architecture-owned plans for dense checkpoint conversion.

@@ -708,6 +708,15 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
             ("norm_eps", format!("{:08x}", args.norm_eps.to_bits())),
             ("conv_history", args.conv_l_cache.to_string()),
             ("conv_bias", args.conv_bias.to_string()),
+            ("quantization", format!("{:?}", args.weight_quantization)),
+            (
+                "quantized_weights",
+                crate::cache_identity::string_set(args.quantized_weights.as_ref()),
+            ),
+            (
+                "quantized_weight_configs",
+                crate::cache_identity::debug_map(args.quantized_weight_configs.as_ref()),
+            ),
         ],
     )
 }
@@ -916,6 +925,23 @@ mod tests {
         assert_eq!(args.dense_intermediate_size, 24);
         assert_eq!(args.layer_schedule_fingerprint(), "cd,cd,afd,cd");
         assert!(!args.tie_word_embeddings);
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_load_time_quantization() {
+        let dense = model_args_from_config_value(&dense_fixture()).unwrap();
+        let quantized = crate::lfm2::load_time_quantization(
+            &dense,
+            eredu_checkpoint::AffineQuantization::new(16, 4)
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            prompt_cache_architecture_fingerprint(&dense),
+            prompt_cache_architecture_fingerprint(&quantized)
+        );
     }
 
     #[test]

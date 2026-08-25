@@ -436,6 +436,15 @@ impl ModelArgs {
                         .join(","),
                 ),
                 ("layer_rope", layer_rope),
+                ("quantization", format!("{:?}", self.weight_quantization)),
+                (
+                    "quantized_weights",
+                    crate::cache_identity::string_set(self.quantized_weights.as_ref()),
+                ),
+                (
+                    "quantized_weight_configs",
+                    crate::cache_identity::debug_map(self.quantized_weight_configs.as_ref()),
+                ),
             ],
         )
     }
@@ -1045,6 +1054,19 @@ mod tests {
         assert_eq!(args.layer_policy(4).unwrap().intermediate_size.get(), 128);
         assert_eq!(args.rope_theta_for(AttentionPolicy::Full), 1_000_000.0);
         assert_ne!(args.architecture_fingerprint(), "");
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_effective_quantization() {
+        let mut args = ModelArgs::from_hf_json(&serde_json::to_vec(&fixture()).unwrap()).unwrap();
+        let dense = args.architecture_fingerprint();
+        args.weight_quantization = Some(
+            eredu_checkpoint::AffineQuantization::new(16, 4)
+                .unwrap()
+                .into(),
+        );
+
+        assert_ne!(dense, args.architecture_fingerprint());
     }
 
     #[test]

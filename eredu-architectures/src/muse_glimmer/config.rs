@@ -292,6 +292,25 @@ impl DecoderConfig {
                     "tokens",
                     format!("{}:{}", self.image_token_id, self.video_token_id),
                 ),
+                ("quantization", format!("{:?}", self.quantization)),
+                (
+                    "quantized_weights",
+                    crate::cache_identity::string_set(self.quantized_weights.as_ref()),
+                ),
+                (
+                    "quantized_weight_configs",
+                    crate::cache_identity::debug_map(self.quantized_weight_configs.as_ref()),
+                ),
+                (
+                    "vision_quantization",
+                    format!(
+                        "default={:?};overrides={}",
+                        self.vision_config.weight_quantization,
+                        crate::cache_identity::debug_map(Some(
+                            &self.vision_config.quantized_weight_configs
+                        ))
+                    ),
+                ),
             ],
         )
     }
@@ -1129,6 +1148,23 @@ mod tests {
         );
         assert_eq!(config.layer_uses_rope, [true, false]);
         assert_eq!(config.vision_config.schedule, [VisionAttentionPolicy::Full]);
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_component_quantization() {
+        let args = DecoderConfig::from_hf_value(&config()).unwrap();
+        let dense = args.architecture_fingerprint();
+        let format = eredu_checkpoint::AffineQuantization::new(16, 4)
+            .unwrap()
+            .into();
+
+        let mut text_quantized = args.clone();
+        text_quantized.quantization = Some(format);
+        assert_ne!(dense, text_quantized.architecture_fingerprint());
+
+        let mut vision_quantized = args;
+        vision_quantized.vision_config.weight_quantization = Some(format);
+        assert_ne!(dense, vision_quantized.architecture_fingerprint());
     }
 
     #[test]

@@ -807,6 +807,38 @@ impl ModelArgs {
                         self.text_config.d_rel
                     ),
                 ),
+                (
+                    "text_quantization",
+                    format!(
+                        "default={:?};overrides={}",
+                        self.text_config.weight_quantization,
+                        crate::cache_identity::debug_map(
+                            self.text_config.quantized_weight_configs.as_ref()
+                        )
+                    ),
+                ),
+                (
+                    "vision_quantization",
+                    self.vision_config.as_ref().map_or_else(
+                        || "none".into(),
+                        |config| {
+                            crate::cache_identity::debug_map(
+                                config.quantized_weight_configs.as_ref(),
+                            )
+                        },
+                    ),
+                ),
+                (
+                    "audio_quantization",
+                    self.audio_config.as_ref().map_or_else(
+                        || "none".into(),
+                        |config| {
+                            crate::cache_identity::debug_map(
+                                config.quantized_weight_configs.as_ref(),
+                            )
+                        },
+                    ),
+                ),
             ],
         )
     }
@@ -1275,6 +1307,28 @@ mod tests {
             }
         );
         assert!(!args.architecture_fingerprint().is_empty());
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_component_quantization() {
+        let args = ModelArgs::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        let dense = args.architecture_fingerprint();
+        let format = eredu_checkpoint::AffineQuantization::new(16, 4)
+            .unwrap()
+            .into();
+
+        let mut text_quantized = args.clone();
+        text_quantized.text_config.weight_quantization = Some(format);
+        assert_ne!(dense, text_quantized.architecture_fingerprint());
+
+        let mut vision_quantized = args;
+        vision_quantized
+            .vision_config
+            .as_mut()
+            .unwrap()
+            .quantized_weight_configs =
+            Some(HashMap::from([("vision.proj.weight".into(), format)]));
+        assert_ne!(dense, vision_quantized.architecture_fingerprint());
     }
 
     #[test]

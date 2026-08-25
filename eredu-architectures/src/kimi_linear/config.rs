@@ -788,6 +788,11 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
+            ("quantization", format!("{:?}", args.weight_quantization)),
+            (
+                "quantized_weight_configs",
+                crate::cache_identity::debug_map(args.quantized_weight_configs.as_ref()),
+            ),
         ],
     )
 }
@@ -834,6 +839,19 @@ mod tests {
         let point = args.routed_observation_point("model.layers.1", 1).unwrap();
         assert_eq!(point.path(), "model.layers.1.mlp");
         assert_eq!(point.expert_count(), 2);
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_effective_quantization() {
+        let mut args = model_args_from_config_value(&fixture()).unwrap();
+        let dense = prompt_cache_architecture_fingerprint(&args);
+        args.weight_quantization = Some(
+            eredu_checkpoint::AffineQuantization::new(16, 4)
+                .unwrap()
+                .into(),
+        );
+
+        assert_ne!(dense, prompt_cache_architecture_fingerprint(&args));
     }
 
     #[test]

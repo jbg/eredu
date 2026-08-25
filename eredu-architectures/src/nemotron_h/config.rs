@@ -957,6 +957,15 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
                 "mtp",
                 args.mtp_hybrid_override_pattern.clone().unwrap_or_default(),
             ),
+            ("quantization", format!("{:?}", args.weight_quantization)),
+            (
+                "quantized_weights",
+                crate::cache_identity::string_set(args.quantized_weights.as_ref()),
+            ),
+            (
+                "quantized_weight_configs",
+                crate::cache_identity::debug_map(args.quantized_weight_configs.as_ref()),
+            ),
         ],
     )
 }
@@ -1083,9 +1092,8 @@ fn default_topk_group() -> i32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn normalizes_physical_and_mtp_patterns() {
-        let args = model_args_from_config_value(&serde_json::json!({
+    fn fixture() -> serde_json::Value {
+        serde_json::json!({
             "model_type":"nemotron_h", "vocab_size":32, "hidden_size":16,
             "intermediate_size":24, "num_hidden_layers":4,
             "hybrid_override_pattern":"M*-E", "num_attention_heads":4,
@@ -1095,8 +1103,12 @@ mod tests {
             "moe_intermediate_size":8, "moe_shared_expert_intermediate_size":8,
             "num_experts_per_tok":2, "n_group":2, "topk_group":1,
             "num_nextn_predict_layers":1, "mtp_hybrid_override_pattern":"*E"
-        }))
-        .unwrap();
+        })
+    }
+
+    #[test]
+    fn normalizes_physical_and_mtp_patterns() {
+        let args = model_args_from_config_value(&fixture()).unwrap();
         assert_eq!(args.layer_schedule.len(), 4);
         assert_eq!(args.mtp_policies().unwrap().len(), 2);
         assert!(matches!(
@@ -1119,5 +1131,22 @@ mod tests {
         .prompt_cache_identity(&layout)
         .unwrap();
         assert_eq!(identity.layer_prefix_offsets, [0, 0, 0, 0, -1, -1]);
+    }
+
+    #[test]
+    fn prompt_cache_fingerprint_includes_load_time_quantization() {
+        let dense = model_args_from_config_value(&fixture()).unwrap();
+        let quantized = crate::nemotron_h::load_time_quantization(
+            &dense,
+            eredu_checkpoint::AffineQuantization::new(16, 4)
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            prompt_cache_architecture_fingerprint(&dense),
+            prompt_cache_architecture_fingerprint(&quantized)
+        );
     }
 }
