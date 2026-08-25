@@ -756,46 +756,14 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    pub(super) fn prepared_media_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        match &self.inner {
-            MlxSessionKind::Complete(model, _) => model.prepared_media_plan(input),
-            MlxSessionKind::Pipeline(model, _) => model.prepared_media_plan(input),
-        }
-    }
-
-    pub(super) fn qwen_vl_input_part_plan(
+    pub(super) fn prepared_input_part_plan(
         &self,
         input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
         match &self.inner {
-            MlxSessionKind::Complete(model, _) => model.qwen_vl_input_part_plan(input),
-            MlxSessionKind::Pipeline(model, _) => model.qwen_vl_input_part_plan(input),
-        }
-    }
-
-    pub(super) fn gemma4_input_part_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
-    {
-        match &self.inner {
-            MlxSessionKind::Complete(model, _) => model.gemma4_input_part_plan(input),
-            MlxSessionKind::Pipeline(model, _) => model.gemma4_input_part_plan(input),
-        }
-    }
-
-    pub(super) fn qwen_hybrid_input_part_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
-    {
-        match &self.inner {
-            MlxSessionKind::Complete(model, _) => model.qwen_hybrid_input_part_plan(input),
-            MlxSessionKind::Pipeline(model, _) => model.qwen_hybrid_input_part_plan(input),
+            MlxSessionKind::Complete(model, _) => model.prepared_input_part_plan(input),
+            MlxSessionKind::Pipeline(model, _) => model.prepared_input_part_plan(input),
         }
     }
 

@@ -3,9 +3,8 @@
 use std::num::NonZeroU8;
 
 use eredu_architectures::media_plan::{
-    self, Gemma4InputPartPlan, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality,
-    PreparedInputPart, PreparedInputPayload, PreparedMediaInput, QwenHybridInputPartPlan,
-    QwenVlInputPartPlan,
+    self, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality, PreparedInputPart,
+    PreparedInputPartPlan, PreparedInputPayload, PreparedMediaInput,
 };
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
@@ -17,13 +16,6 @@ use safemlx::{Array, Stream};
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::backend::runtime::media::input::{self, InputPayload, Modality};
 use eredu_core::residency::MemoryTier;
-
-fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
-    u64::try_from(value).map_err(|_| CapabilityError::InvalidConfiguration {
-        field,
-        detail: format!("expected a non-negative value, got {value}"),
-    })
-}
 
 fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
     left.checked_add(right)
@@ -68,6 +60,42 @@ fn estimate_mlx_runtime_state(
 }
 
 impl Model {
+    pub(super) fn prepared_input_part_plan(
+        &self,
+        input: &PreparedInputPart,
+    ) -> Result<PreparedInputPartPlan, CapabilityError> {
+        match self {
+            Self::Gemma4(_, model) => {
+                media_plan::gemma4_input_part(model.args(), input).map(Into::into)
+            }
+            Self::Inkling(_, model) => {
+                media_plan::inkling_input_part(model.args(), input).map(Into::into)
+            }
+            Self::MuseGlimmer(_, model) => {
+                media_plan::muse_glimmer_input_part(model.args(), input).map(Into::into)
+            }
+            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
+                media_plan::qwen_vl_input_part(model.args(), input).map(Into::into)
+            }
+            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => {
+                if model.vision_config().is_some() {
+                    media_plan::qwen_hybrid_input_part(model.parsed_args(), input).map(Into::into)
+                } else {
+                    media_plan::qwen_hybrid_text_input_part(model.args(), input).map(Into::into)
+                }
+            }
+            Self::DeepSeek(_, _)
+            | Self::GptOss(_, _)
+            | Self::KimiLinear(_, _)
+            | Self::Llama(_, _)
+            | Self::Lfm2(_, _)
+            | Self::NemotronH(_, _)
+            | Self::Qwen(_, _) => {
+                media_plan::text_only_input_part(self.effective_model_type(), input)
+            }
+        }
+    }
+
     pub(super) fn architecture_capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, CapabilityError> {
@@ -224,91 +252,6 @@ fn four_byte_scalars(scalars: u64, operation: &'static str) -> Result<u64, Capab
     checked_mul(scalars, 4, operation)
 }
 
-impl Model {
-    pub(super) fn prepared_media_plan(
-        &self,
-        input: &PreparedMediaInput,
-    ) -> Result<MediaShapePlan, CapabilityError> {
-        match self {
-            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
-                media_plan::qwen_vision(&model.args().vision, input, self.effective_model_type())
-            }
-            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => media_plan::qwen_hybrid_vision(
-                model.vision_config(),
-                input,
-                self.effective_model_type(),
-            ),
-            Self::Gemma4(_, model) => media_plan::gemma4(model.args(), input),
-            Self::Inkling(_, model) => media_plan::inkling(model.args(), input),
-            Self::MuseGlimmer(_, model) => media_plan::muse_glimmer(model.args(), input),
-            Self::DeepSeek(_, _)
-            | Self::GptOss(_, _)
-            | Self::KimiLinear(_, _)
-            | Self::Llama(_, _)
-            | Self::Lfm2(_, _)
-            | Self::NemotronH(_, _)
-            | Self::Qwen(_, _) => media_plan::text_only(self.effective_model_type(), input),
-        }
-    }
-
-    pub(super) fn qwen_vl_input_part_plan(
-        &self,
-        input: &PreparedInputPart,
-    ) -> Result<QwenVlInputPartPlan, CapabilityError> {
-        match self {
-            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
-                media_plan::qwen_vl_input_part(model.args(), input)
-            }
-            _ => Err(CapabilityError::UnsupportedInput {
-                architecture: self.effective_model_type().into(),
-                reason: "Qwen3-VL input admission requested for another architecture".into(),
-            }),
-        }
-    }
-
-    pub(super) fn gemma4_input_part_plan(
-        &self,
-        input: &PreparedInputPart,
-    ) -> Result<Gemma4InputPartPlan, CapabilityError> {
-        match self {
-            Self::Gemma4(_, model) => media_plan::gemma4_input_part(model.args(), input),
-            _ => Err(CapabilityError::UnsupportedInput {
-                architecture: self.effective_model_type().into(),
-                reason: "Gemma 4 input admission requested for another architecture".into(),
-            }),
-        }
-    }
-
-    pub(super) fn qwen_hybrid_input_part_plan(
-        &self,
-        input: &PreparedInputPart,
-    ) -> Result<QwenHybridInputPartPlan, CapabilityError> {
-        match self {
-            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => {
-                if model.vision_config().is_some() {
-                    media_plan::qwen_hybrid_input_part(model.parsed_args(), input)
-                } else {
-                    media_plan::qwen_hybrid_text_input_part(model.args(), input)
-                }
-            }
-            _ => Err(CapabilityError::UnsupportedInput {
-                architecture: self.effective_model_type().into(),
-                reason: "Qwen hybrid input admission requested for another architecture".into(),
-            }),
-        }
-    }
-}
-fn prepared_media_accounting(
-    session: &MlxModelSession<'_>,
-    modality: Modality,
-    payload: &Array,
-    metadata: input::InputMetadata<'_>,
-) -> Result<(u64, u64), CapabilityError> {
-    let input = prepared_media_input(modality, payload, metadata)?;
-    let plan = session.prepared_media_plan(&input)?;
-    prepared_media_accounting_with_plan(payload, metadata, &plan)
-}
-
 fn prepared_media_accounting_with_plan(
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -359,158 +302,31 @@ pub fn count_prepared_input(
     let mut media_positions = 0u64;
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
-    let model_family = session.model_family();
     for &part in prepared.parts {
-        if model_family == eredu_architectures::ModelKind::Gemma4 {
-            match session.gemma4_input_part_plan(&prepared_input_part(part)?)? {
-                Gemma4InputPartPlan::TextTokens { positions } => {
+        match session.prepared_input_part_plan(&prepared_input_part(part)?)? {
+            PreparedInputPartPlan::Text { positions } => {
+                text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
+            }
+            PreparedInputPartPlan::Projected {
+                modality,
+                positions,
+            } => {
+                if modality == PreparedInputModality::Text {
                     text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
-                }
-                Gemma4InputPartPlan::Projected {
-                    modality,
-                    positions,
-                    ..
-                } => {
-                    if modality == PreparedInputModality::Text {
-                        text_tokens =
-                            checked_add(text_tokens, positions, "prepared text-token total")?;
-                    } else {
-                        media_positions = checked_add(
-                            media_positions,
-                            positions,
-                            "prepared media-position total",
-                        )?;
-                    }
-                }
-                Gemma4InputPartPlan::Vision { shape, .. }
-                | Gemma4InputPartPlan::Audio { shape, .. } => {
-                    let InputPayload::Tensor(tensor) = part.payload else {
-                        unreachable!()
-                    };
-                    let (positions, workspace_bytes) =
-                        prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
+                } else {
                     media_positions =
                         checked_add(media_positions, positions, "prepared media-position total")?;
-                    media_execution_workspace_bytes = checked_add(
-                        media_execution_workspace_bytes,
-                        workspace_bytes,
-                        "prepared media-workspace total",
-                    )?;
-                    media_execution_workspace_kind = ObservationKind::Conservative;
                 }
             }
-            continue;
-        }
-        if matches!(
-            model_family,
-            eredu_architectures::ModelKind::Qwen3Vl | eredu_architectures::ModelKind::Qwen3VlMoe
-        ) {
-            match session.qwen_vl_input_part_plan(&prepared_input_part(part)?)? {
-                QwenVlInputPartPlan::TextTokens { positions }
-                | QwenVlInputPartPlan::ProjectedText { positions } => {
-                    text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
-                }
-                QwenVlInputPartPlan::Media { shape, .. } => {
-                    let InputPayload::Tensor(tensor) = part.payload else {
-                        unreachable!()
-                    };
-                    let (positions, workspace_bytes) =
-                        prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
-                    media_positions =
-                        checked_add(media_positions, positions, "prepared media-position total")?;
-                    media_execution_workspace_bytes = checked_add(
-                        media_execution_workspace_bytes,
-                        workspace_bytes,
-                        "prepared media-workspace total",
-                    )?;
-                    media_execution_workspace_kind = ObservationKind::Conservative;
-                }
-            }
-            continue;
-        }
-        if matches!(
-            model_family,
-            eredu_architectures::ModelKind::Qwen3Next | eredu_architectures::ModelKind::Qwen35
-        ) {
-            match session.qwen_hybrid_input_part_plan(&prepared_input_part(part)?)? {
-                QwenHybridInputPartPlan::TextTokens { positions } => {
-                    text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
-                }
-                QwenHybridInputPartPlan::Projected {
-                    modality,
-                    positions,
-                } => {
-                    if modality == PreparedInputModality::Text {
-                        text_tokens =
-                            checked_add(text_tokens, positions, "prepared text-token total")?;
-                    } else {
-                        media_positions = checked_add(
-                            media_positions,
-                            positions,
-                            "prepared media-position total",
-                        )?;
-                    }
-                }
-                QwenHybridInputPartPlan::Media { shape, .. } => {
-                    let InputPayload::Tensor(tensor) = part.payload else {
-                        unreachable!()
-                    };
-                    let (positions, workspace_bytes) =
-                        prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
-                    media_positions =
-                        checked_add(media_positions, positions, "prepared media-position total")?;
-                    media_execution_workspace_bytes = checked_add(
-                        media_execution_workspace_bytes,
-                        workspace_bytes,
-                        "prepared media-workspace total",
-                    )?;
-                    media_execution_workspace_kind = ObservationKind::Conservative;
-                }
-            }
-            continue;
-        }
-        match (part.modality, part.payload) {
-            (Modality::Text, InputPayload::TokenIds(tokens)) => {
-                if tokens.ndim() != 2 || tokens.dim(0) != 1 {
+            PreparedInputPartPlan::Media { shape } => {
+                let InputPayload::Tensor(tensor) = part.payload else {
                     return Err(CapabilityError::UnsupportedInput {
                         architecture: session.effective_model_type().into(),
-                        reason: format!(
-                            "prepared text token IDs must be [1, sequence], got {:?}",
-                            tokens.shape()
-                        ),
+                        reason: "architecture media plan requires a tensor payload".into(),
                     });
-                }
-                text_tokens = checked_add(
-                    text_tokens,
-                    positive(tokens.dim(1), "prepared text sequence")?,
-                    "prepared text-token total",
-                )?;
-            }
-            (Modality::Text, _) => {
-                return Err(CapabilityError::UnsupportedInput {
-                    architecture: session.effective_model_type().into(),
-                    reason: "prepared text is not represented by tokenizer IDs".into(),
-                });
-            }
-            (_modality, InputPayload::Embeddings(embeddings)) => {
-                if embeddings.ndim() != 3 || embeddings.dim(0) != 1 {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: session.effective_model_type().into(),
-                        reason: format!(
-                            "prepared media embeddings must be [1, sequence, hidden], got {:?}",
-                            embeddings.shape()
-                        ),
-                    });
-                }
-                media_positions = checked_add(
-                    media_positions,
-                    positive(embeddings.dim(1), "prepared embedding sequence")?,
-                    "prepared media-position total",
-                )?;
-            }
-            (modality, InputPayload::Tensor(tensor)) => {
+                };
                 let (positions, workspace_bytes) =
-                    prepared_media_accounting(session, modality, tensor, part.metadata)?;
+                    prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
                 media_positions =
                     checked_add(media_positions, positions, "prepared media-position total")?;
                 media_execution_workspace_bytes = checked_add(
@@ -519,12 +335,6 @@ pub fn count_prepared_input(
                     "prepared media-workspace total",
                 )?;
                 media_execution_workspace_kind = ObservationKind::Conservative;
-            }
-            (_, InputPayload::TokenIds(_)) => {
-                return Err(CapabilityError::UnsupportedInput {
-                    architecture: session.effective_model_type().into(),
-                    reason: "non-text prepared input cannot contain tokenizer IDs".into(),
-                });
             }
         }
     }

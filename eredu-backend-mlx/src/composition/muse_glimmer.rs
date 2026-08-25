@@ -519,36 +519,38 @@ pub fn prepare_muse_input(
     let mut pixels = Vec::new();
     let mut grid = Vec::new();
     for part in typed.parts {
-        match (part.modality, part.payload) {
-            (input::Modality::Text, input::InputPayload::TokenIds(value)) => {
+        let architecture_input = input::prepared_input_part(*part)?;
+        let plan = media_plan::muse_glimmer_input_part(args, &architecture_input)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        match (plan, part.payload) {
+            (
+                media_plan::MuseGlimmerInputPartPlan::TextTokens { .. },
+                input::InputPayload::TokenIds(value),
+            ) => {
                 tokens.push(crate::MlxTensor::from_array(value.clone()));
                 media.push(false);
             }
             (
-                input::Modality::Image | input::Modality::Video,
+                media_plan::MuseGlimmerInputPartPlan::Vision { ingress, .. },
                 input::InputPayload::Tensor(value),
             ) => {
-                let architecture_input =
-                    input::prepared_media_input(part.modality, value, part.metadata)?;
-                let plan = media_plan::muse_glimmer_ingress(args, &architecture_input)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                let count = usize::try_from(plan.placeholder_count).map_err(|_| {
+                let count = usize::try_from(ingress.placeholder_count).map_err(|_| {
                     Error::ArchitectureModel(
                         "Muse-Glimmer placeholder span exceeds host capacity".into(),
                     )
                 })?;
                 tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                    &vec![plan.placeholder_token_id; count],
+                    &vec![ingress.placeholder_token_id; count],
                     stream,
                 )?));
                 media.push(true);
                 pixels.push(value.clone());
-                grid.extend(plan.patch_grid);
+                grid.extend(ingress.patch_grid);
             }
-            (modality, _) => {
+            _ => {
                 return Err(Error::ArchitectureModel(format!(
-                    "Muse-Glimmer does not accept this {} payload",
-                    modality.as_str()
+                    "Muse-Glimmer input plan disagrees with the prepared {} payload",
+                    part.modality.as_str()
                 )))
             }
         }

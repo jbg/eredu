@@ -120,6 +120,28 @@ pub struct PreparedInputPart {
     pub payload: PreparedInputPayload,
 }
 
+/// Architecture-owned admission and accounting plan for one prepared input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedInputPartPlan {
+    /// Text decoder positions supplied as token IDs or accepted embeddings.
+    Text {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Decoder-width embeddings supplied directly by the caller.
+    Projected {
+        /// Semantic modality retained by decoder input assembly.
+        modality: PreparedInputModality,
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Model-native media requiring tower execution.
+    Media {
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+}
+
 /// Architecture-derived geometry and conservative execution workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaShapePlan {
@@ -221,6 +243,123 @@ pub enum Gemma4InputPartPlan {
         /// Decoder and workspace accounting for tower execution.
         shape: MediaShapePlan,
     },
+}
+
+impl From<Gemma4InputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: Gemma4InputPartPlan) -> Self {
+        match plan {
+            Gemma4InputPartPlan::TextTokens { positions } => Self::Text { positions },
+            Gemma4InputPartPlan::Projected {
+                modality,
+                positions,
+                ..
+            } => Self::Projected {
+                modality,
+                positions,
+            },
+            Gemma4InputPartPlan::Vision { shape, .. }
+            | Gemma4InputPartPlan::Audio { shape, .. } => Self::Media { shape },
+        }
+    }
+}
+
+impl From<QwenVlInputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: QwenVlInputPartPlan) -> Self {
+        match plan {
+            QwenVlInputPartPlan::TextTokens { positions }
+            | QwenVlInputPartPlan::ProjectedText { positions } => Self::Text { positions },
+            QwenVlInputPartPlan::Media { shape, .. } => Self::Media { shape },
+        }
+    }
+}
+
+impl From<QwenHybridInputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: QwenHybridInputPartPlan) -> Self {
+        match plan {
+            QwenHybridInputPartPlan::TextTokens { positions } => Self::Text { positions },
+            QwenHybridInputPartPlan::Projected {
+                modality,
+                positions,
+            } => Self::Projected {
+                modality,
+                positions,
+            },
+            QwenHybridInputPartPlan::Media { shape, .. } => Self::Media { shape },
+        }
+    }
+}
+
+/// Inkling admission and execution plan for one prepared input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InklingInputPartPlan {
+    /// Ordinary text token IDs.
+    TextTokens {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Decoder-width image or audio embeddings supplied by the caller.
+    Projected {
+        /// Semantic modality retained by decoder input assembly.
+        modality: PreparedInputModality,
+        /// Architecture-selected placeholder token repeated under the embeddings.
+        placeholder_token_id: u32,
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Model-native image or audio input.
+    Media {
+        /// Semantic modality consumed by the tower.
+        modality: PreparedInputModality,
+        /// Architecture-selected placeholder and span.
+        ingress: InklingIngressPlan,
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+}
+
+impl From<InklingInputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: InklingInputPartPlan) -> Self {
+        match plan {
+            InklingInputPartPlan::TextTokens { positions } => Self::Text { positions },
+            InklingInputPartPlan::Projected {
+                modality,
+                positions,
+                ..
+            } => Self::Projected {
+                modality,
+                positions,
+            },
+            InklingInputPartPlan::Media { shape, .. } => Self::Media { shape },
+        }
+    }
+}
+
+/// Muse-Glimmer admission and execution plan for one prepared input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MuseGlimmerInputPartPlan {
+    /// Ordinary text token IDs.
+    TextTokens {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Model-native image or video input.
+    Vision {
+        /// Semantic modality consumed by the vision tower.
+        modality: PreparedInputModality,
+        /// Architecture-selected placeholder span and patch grid.
+        ingress: MuseGlimmerIngressPlan,
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+}
+
+impl From<MuseGlimmerInputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: MuseGlimmerInputPartPlan) -> Self {
+        match plan {
+            MuseGlimmerInputPartPlan::TextTokens { positions } => Self::Text { positions },
+            MuseGlimmerInputPartPlan::Vision { shape, .. } => Self::Media { shape },
+        }
+    }
 }
 
 /// Architecture-owned Inkling ingress policy for one prepared tensor.
@@ -646,7 +785,7 @@ pub fn qwen_vl_ingress(
     )
 }
 
-fn qwen_batch_one_sequence(
+fn batch_one_sequence(
     shape: &[u64],
     rank: usize,
     name: &str,
@@ -670,11 +809,11 @@ pub fn qwen_vl_input_part(
     match (&input.modality, &input.payload) {
         (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
             Ok(QwenVlInputPartPlan::TextTokens {
-                positions: qwen_batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
+                positions: batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
             })
         }
         (PreparedInputModality::Text, PreparedInputPayload::Embeddings(shape)) => {
-            let positions = qwen_batch_one_sequence(shape, 3, "text embeddings", &args.model_type)?;
+            let positions = batch_one_sequence(shape, 3, "text embeddings", &args.model_type)?;
             let hidden = positive(args.text.hidden_size, "Qwen3-VL hidden size")?;
             if shape[2] != hidden {
                 return Err(unsupported(
@@ -734,7 +873,7 @@ fn qwen_hybrid_input_part_with_policy(
     match (&input.modality, &input.payload) {
         (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
             Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: qwen_batch_one_sequence(shape, 2, "text token IDs", &text.model_type)?,
+                positions: batch_one_sequence(shape, 2, "text token IDs", &text.model_type)?,
             })
         }
         (
@@ -743,7 +882,7 @@ fn qwen_hybrid_input_part_with_policy(
             | PreparedInputModality::Video),
             PreparedInputPayload::Embeddings(shape),
         ) => {
-            let positions = qwen_batch_one_sequence(
+            let positions = batch_one_sequence(
                 shape,
                 3,
                 &format!("{} embeddings", modality.as_str()),
@@ -824,7 +963,7 @@ pub fn qwen_hybrid_text_input_part(
     match (&input.modality, &input.payload) {
         (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
             Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: qwen_batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
+                positions: batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
             })
         }
         (modality, payload) => Err(unsupported(
@@ -1473,26 +1612,96 @@ pub fn inkling(
     }
 }
 
-/// Derives the authoritative Inkling placeholder token and span for execution.
-pub fn inkling_ingress(
+/// Validates one prepared Inkling part and derives the exact placeholder,
+/// ingress geometry, and capability-accounting plan consumed by a backend.
+pub fn inkling_input_part(
     args: &crate::inkling::ModelArgs,
-    input: &PreparedMediaInput,
-) -> Result<InklingIngressPlan, CapabilityError> {
-    let shape = inkling(args, input)?;
-    let placeholder_token_id = match input.modality {
-        MediaModality::Image => args.image_token_id,
-        MediaModality::Audio => args.audio_token_id,
-        MediaModality::Video => {
-            return Err(unsupported(
-                &args.model_type,
-                "video is not a supported Inkling modality",
-            ))
+    input: &PreparedInputPart,
+) -> Result<InklingInputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(InklingInputPartPlan::TextTokens {
+                positions: batch_one_sequence(
+                    shape,
+                    2,
+                    "Inkling text token IDs",
+                    &args.model_type,
+                )?,
+            })
         }
-    };
-    Ok(InklingIngressPlan {
-        placeholder_token_id,
-        placeholder_count: shape.decoder_positions,
-    })
+        (
+            modality @ (PreparedInputModality::Image | PreparedInputModality::Audio),
+            PreparedInputPayload::Embeddings(shape),
+        ) => {
+            let positions = batch_one_sequence(
+                shape,
+                3,
+                &format!("Inkling {} embeddings", modality.as_str()),
+                &args.model_type,
+            )?;
+            let hidden = positive(args.text_config.hidden_size, "Inkling text hidden size")?;
+            if shape[2] != hidden {
+                return Err(unsupported(
+                    &args.model_type,
+                    format!(
+                        "prepared Inkling {} embeddings must have hidden width {hidden}, got {shape:?}",
+                        modality.as_str()
+                    ),
+                ));
+            }
+            let placeholder_token_id = match modality {
+                PreparedInputModality::Image => args.image_token_id,
+                PreparedInputModality::Audio => args.audio_token_id,
+                PreparedInputModality::Text | PreparedInputModality::Video => unreachable!(),
+            };
+            Ok(InklingInputPartPlan::Projected {
+                modality: *modality,
+                placeholder_token_id,
+                positions,
+            })
+        }
+        (
+            modality @ (PreparedInputModality::Image | PreparedInputModality::Audio),
+            PreparedInputPayload::Tensor {
+                shape,
+                media: Some(media),
+            },
+        ) => {
+            let expected = if *modality == PreparedInputModality::Image {
+                MediaModality::Image
+            } else {
+                MediaModality::Audio
+            };
+            if media.modality != expected || media.payload_shape != *shape {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared Inkling input modality or shape disagrees with its media metadata",
+                ));
+            }
+            let shape = inkling(args, media)?;
+            let ingress = InklingIngressPlan {
+                placeholder_token_id: if *modality == PreparedInputModality::Image {
+                    args.image_token_id
+                } else {
+                    args.audio_token_id
+                },
+                placeholder_count: shape.decoder_positions,
+            };
+            Ok(InklingInputPartPlan::Media {
+                modality: *modality,
+                ingress,
+                shape,
+            })
+        }
+        (modality, payload) => Err(unsupported(
+            &args.model_type,
+            format!(
+                "Inkling does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
 }
 
 /// Derives prepared Muse-Glimmer media geometry and artifact modality policy.
@@ -1589,51 +1798,96 @@ pub fn muse_glimmer(
     })
 }
 
-/// Derives the authoritative Muse-Glimmer placeholder span and vision grid.
-pub fn muse_glimmer_ingress(
+/// Validates one prepared Muse-Glimmer part and derives the exact placeholder,
+/// ingress geometry, and capability-accounting plan consumed by a backend.
+pub fn muse_glimmer_input_part(
     args: &crate::muse_glimmer::DecoderConfig,
-    input: &PreparedMediaInput,
-) -> Result<MuseGlimmerIngressPlan, CapabilityError> {
-    let shape = muse_glimmer(args, input)?;
-    let placeholder_token_id = match input.modality {
-        MediaModality::Image => args.image_token_id,
-        MediaModality::Video => args.video_token_id,
-        MediaModality::Audio => {
-            return Err(unsupported(
-                &args.model_type,
-                "loaded Muse-Glimmer artifact does not support audio",
-            ))
+    input: &PreparedInputPart,
+) -> Result<MuseGlimmerInputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(MuseGlimmerInputPartPlan::TextTokens {
+                positions: batch_one_sequence(
+                    shape,
+                    2,
+                    "Muse-Glimmer text token IDs",
+                    &args.model_type,
+                )?,
+            })
         }
-    };
-    let patch_grid = input
-        .patch_grid
-        .as_ref()
-        .ok_or_else(|| {
-            unsupported(
-                &args.model_type,
-                "Muse-Glimmer media requires patch_grid metadata",
-            )
-        })?
-        .values
-        .chunks_exact(3)
-        .map(|entry| (entry[0], entry[1], entry[2]))
-        .collect();
-    Ok(MuseGlimmerIngressPlan {
-        placeholder_token_id,
-        placeholder_count: shape.decoder_positions,
-        patch_grid,
-    })
+        (
+            modality @ (PreparedInputModality::Image | PreparedInputModality::Video),
+            PreparedInputPayload::Tensor {
+                shape,
+                media: Some(media),
+            },
+        ) => {
+            let expected = if *modality == PreparedInputModality::Image {
+                MediaModality::Image
+            } else {
+                MediaModality::Video
+            };
+            if media.modality != expected || media.payload_shape != *shape {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared Muse-Glimmer input modality or shape disagrees with its media metadata",
+                ));
+            }
+            let shape = muse_glimmer(args, media)?;
+            let placeholder_token_id = if *modality == PreparedInputModality::Image {
+                args.image_token_id
+            } else {
+                args.video_token_id
+            };
+            let patch_grid = media
+                .patch_grid
+                .as_ref()
+                .expect("Muse-Glimmer shape validation requires a patch grid")
+                .values
+                .chunks_exact(3)
+                .map(|entry| (entry[0], entry[1], entry[2]))
+                .collect();
+            Ok(MuseGlimmerInputPartPlan::Vision {
+                modality: *modality,
+                ingress: MuseGlimmerIngressPlan {
+                    placeholder_token_id,
+                    placeholder_count: shape.decoder_positions,
+                    patch_grid,
+                },
+                shape,
+            })
+        }
+        (modality, payload) => Err(unsupported(
+            &args.model_type,
+            format!(
+                "Muse-Glimmer does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
 }
 
-/// Rejects prepared media for a text-only architecture.
-pub fn text_only(
+/// Validates one prepared input part for a text-only architecture.
+pub fn text_only_input_part(
     architecture: &str,
-    input: &PreparedMediaInput,
-) -> Result<MediaShapePlan, CapabilityError> {
-    Err(unsupported(
-        architecture,
-        format!("{} media is not supported", input.modality.as_str()),
-    ))
+    input: &PreparedInputPart,
+) -> Result<PreparedInputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(PreparedInputPartPlan::Text {
+                positions: batch_one_sequence(shape, 2, "text token IDs", architecture)?,
+            })
+        }
+        (modality, payload) => Err(unsupported(
+            architecture,
+            format!(
+                "text-only architecture does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1793,6 +2047,34 @@ mod tests {
             qwen_hybrid_text_input_part(&args.text, &projected_text),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
+    }
+
+    #[test]
+    fn text_only_input_plan_rejects_every_non_token_payload() {
+        let tokens = PreparedInputPart {
+            modality: PreparedInputModality::Text,
+            payload: PreparedInputPayload::TokenIds(vec![1, 4]),
+        };
+        assert_eq!(
+            text_only_input_part("llama", &tokens).unwrap(),
+            PreparedInputPartPlan::Text { positions: 4 }
+        );
+
+        for input in [
+            PreparedInputPart {
+                modality: PreparedInputModality::Text,
+                payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+            },
+            PreparedInputPart {
+                modality: PreparedInputModality::Image,
+                payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+            },
+        ] {
+            assert!(matches!(
+                text_only_input_part("llama", &input),
+                Err(CapabilityError::UnsupportedInput { .. })
+            ));
+        }
     }
 
     #[test]
@@ -2086,10 +2368,23 @@ mod tests {
         let image = input(MediaModality::Image, &[1, 2, 40, 40, 3]);
         let image_plan = inkling(&args, &image).unwrap();
         assert_eq!(image_plan.decoder_positions, 1);
-        assert_eq!(
-            inkling_ingress(&args, &image).unwrap().placeholder_token_id,
-            args.image_token_id
-        );
+        let image_part = PreparedInputPart {
+            modality: PreparedInputModality::Image,
+            payload: PreparedInputPayload::Tensor {
+                shape: image.payload_shape.clone(),
+                media: Some(image),
+            },
+        };
+        assert!(matches!(
+            inkling_input_part(&args, &image_part).unwrap(),
+            InklingInputPartPlan::Media {
+                ingress: InklingIngressPlan {
+                    placeholder_token_id,
+                    placeholder_count: 1,
+                },
+                ..
+            } if placeholder_token_id == args.image_token_id
+        ));
 
         let mut audio = input(MediaModality::Audio, &[1, 3, 80]);
         audio.audio_mask = Some(MediaMetadata {
@@ -2098,13 +2393,27 @@ mod tests {
         });
         let audio_plan = inkling(&args, &audio).unwrap();
         assert_eq!(audio_plan.decoder_positions, 2);
-        let ingress = inkling_ingress(&args, &audio).unwrap();
-        assert_eq!(ingress.placeholder_token_id, args.audio_token_id);
-        assert_eq!(ingress.placeholder_count, 2);
+        let audio_part = |media: PreparedMediaInput| PreparedInputPart {
+            modality: PreparedInputModality::Audio,
+            payload: PreparedInputPayload::Tensor {
+                shape: media.payload_shape.clone(),
+                media: Some(media),
+            },
+        };
+        assert!(matches!(
+            inkling_input_part(&args, &audio_part(audio.clone())).unwrap(),
+            InklingInputPartPlan::Media {
+                ingress: InklingIngressPlan {
+                    placeholder_token_id,
+                    placeholder_count: 2,
+                },
+                ..
+            } if placeholder_token_id == args.audio_token_id
+        ));
 
         audio.audio_mask.as_mut().unwrap().values = vec![true, false, true];
         assert!(matches!(
-            inkling_ingress(&args, &audio),
+            inkling_input_part(&args, &audio_part(audio)),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
         assert!(matches!(
@@ -2115,6 +2424,34 @@ mod tests {
             inkling(&args, &input(MediaModality::Video, &[1, 2])),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
+    }
+
+    #[test]
+    fn inkling_input_plan_matches_projected_execution_policy() {
+        let args = tiny_inkling();
+        let projected = PreparedInputPart {
+            modality: PreparedInputModality::Image,
+            payload: PreparedInputPayload::Embeddings(vec![1, 3, 32]),
+        };
+        assert_eq!(
+            inkling_input_part(&args, &projected).unwrap(),
+            InklingInputPartPlan::Projected {
+                modality: PreparedInputModality::Image,
+                placeholder_token_id: args.image_token_id,
+                positions: 3,
+            }
+        );
+
+        for modality in [PreparedInputModality::Text, PreparedInputModality::Video] {
+            let rejected = PreparedInputPart {
+                modality,
+                payload: PreparedInputPayload::Embeddings(vec![1, 3, 32]),
+            };
+            assert!(matches!(
+                inkling_input_part(&args, &rejected),
+                Err(CapabilityError::UnsupportedInput { .. })
+            ));
+        }
     }
 
     fn tiny_muse() -> crate::muse_glimmer::DecoderConfig {
@@ -2148,15 +2485,52 @@ mod tests {
         let mut args = tiny_muse();
         let plan = muse_glimmer(&args, &prepared).unwrap();
         assert_eq!(plan.decoder_positions, 1);
-        let ingress = muse_glimmer_ingress(&args, &prepared).unwrap();
-        assert_eq!(ingress.placeholder_token_id, 23);
-        assert_eq!(ingress.placeholder_count, 1);
-        assert_eq!(ingress.patch_grid, vec![(1, 2, 2)]);
+        let prepared_part = |media: PreparedMediaInput| PreparedInputPart {
+            modality: PreparedInputModality::Video,
+            payload: PreparedInputPayload::Tensor {
+                shape: media.payload_shape.clone(),
+                media: Some(media),
+            },
+        };
+        assert!(matches!(
+            muse_glimmer_input_part(&args, &prepared_part(prepared.clone())).unwrap(),
+            MuseGlimmerInputPartPlan::Vision {
+                ingress: MuseGlimmerIngressPlan {
+                    placeholder_token_id: 23,
+                    placeholder_count: 1,
+                    patch_grid,
+                },
+                ..
+            } if patch_grid == vec![(1, 2, 2)]
+        ));
 
         args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
         assert!(matches!(
-            muse_glimmer(&args, &prepared),
+            muse_glimmer_input_part(&args, &prepared_part(prepared)),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
+    }
+
+    #[test]
+    fn muse_input_plan_rejects_projected_and_audio_payloads() {
+        let args = tiny_muse();
+        for input in [
+            PreparedInputPart {
+                modality: PreparedInputModality::Image,
+                payload: PreparedInputPayload::Embeddings(vec![1, 1, 16]),
+            },
+            PreparedInputPart {
+                modality: PreparedInputModality::Audio,
+                payload: PreparedInputPayload::Tensor {
+                    shape: vec![1, 2, 3],
+                    media: Some(input(MediaModality::Audio, &[1, 2, 3])),
+                },
+            },
+        ] {
+            assert!(matches!(
+                muse_glimmer_input_part(&args, &input),
+                Err(CapabilityError::UnsupportedInput { .. })
+            ));
+        }
     }
 }

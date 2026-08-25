@@ -2869,45 +2869,10 @@ trait PipelinePartitionMetadata {
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>;
 
-    fn prepared_media_plan(
+    fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::text_only(self.model_kind().canonical_name(), input)
-    }
-
-    fn qwen_vl_input_part_plan(
-        &self,
-        _input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
-    {
-        Err(eredu_core::CapabilityError::UnsupportedInput {
-            architecture: self.model_kind().canonical_name().into(),
-            reason: "Qwen3-VL input admission requested for another architecture".into(),
-        })
-    }
-
-    fn gemma4_input_part_plan(
-        &self,
-        _input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
-    {
-        Err(eredu_core::CapabilityError::UnsupportedInput {
-            architecture: self.model_kind().canonical_name().into(),
-            reason: "Gemma 4 input admission requested for another architecture".into(),
-        })
-    }
-
-    fn qwen_hybrid_input_part_plan(
-        &self,
-        _input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
-    {
-        Err(eredu_core::CapabilityError::UnsupportedInput {
-            architecture: self.model_kind().canonical_name().into(),
-            reason: "Qwen hybrid input admission requested for another architecture".into(),
-        })
-    }
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>;
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         eredu_runtime::NoAuxiliaryBoundary
@@ -5363,6 +5328,17 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         eredu_architectures::capability::llama(self.architecture.args())
     }
 
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -5671,6 +5647,17 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
         eredu_architectures::capability::deepseek_v3(self.args())
+    }
+
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6158,6 +6145,17 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
         eredu_architectures::capability::deepseek_v4(self.args())
+    }
+
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6683,19 +6681,12 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
         eredu_architectures::capability::gemma4(self.args())
     }
 
-    fn prepared_media_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::gemma4(self.args(), input)
-    }
-
-    fn gemma4_input_part_plan(
+    fn prepared_input_part_plan(
         &self,
         input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::gemma4_input_part(self.args(), input)
+        eredu_architectures::media_plan::gemma4_input_part(self.args(), input).map(Into::into)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6890,6 +6881,17 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         eredu_architectures::capability::qwen(self.args())
     }
 
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -7032,11 +7034,13 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
         eredu_architectures::capability::muse_glimmer(self.architecture.args())
     }
 
-    fn prepared_media_plan(
+    fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::muse_glimmer(self.architecture.args(), input)
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::muse_glimmer_input_part(self.architecture.args(), input)
+            .map(Into::into)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7291,11 +7295,12 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
         eredu_architectures::capability::inkling(self.args())
     }
 
-    fn prepared_media_plan(
+    fn prepared_input_part_plan(
         &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::inkling(self.args(), input)
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::inkling_input_part(self.args(), input).map(Into::into)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8025,23 +8030,12 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         eredu_architectures::capability::qwen_vl(self.args())
     }
 
-    fn prepared_media_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::qwen_vision(
-            &self.args().vision,
-            input,
-            self.model_kind().canonical_name(),
-        )
-    }
-
-    fn qwen_vl_input_part_plan(
+    fn prepared_input_part_plan(
         &self,
         input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::qwen_vl_input_part(self.args(), input)
+        eredu_architectures::media_plan::qwen_vl_input_part(self.args(), input).map(Into::into)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -8752,23 +8746,12 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         eredu_architectures::capability::qwen_hybrid(self.args())
     }
 
-    fn prepared_media_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::qwen_hybrid_vision(
-            self.args().vision.as_ref(),
-            input,
-            self.model_kind().canonical_name(),
-        )
-    }
-
-    fn qwen_hybrid_input_part_plan(
+    fn prepared_input_part_plan(
         &self,
         input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::qwen_hybrid_input_part(self.args(), input)
+        eredu_architectures::media_plan::qwen_hybrid_input_part(self.args(), input).map(Into::into)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -9114,6 +9097,17 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         eredu_architectures::capability::gpt_oss(self.args())
     }
 
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -9256,6 +9250,17 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
         eredu_architectures::capability::lfm2(self.args())
     }
 
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -9396,6 +9401,17 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
         eredu_architectures::capability::nemotron_h(self.args())
+    }
+
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -9624,6 +9640,17 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
         eredu_architectures::capability::kimi_linear(self.args())
+    }
+
+    fn prepared_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::text_only_input_part(
+            self.model_kind().canonical_name(),
+            input,
+        )
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9987,35 +10014,12 @@ impl PipelineModel {
         self.stage.capability_estimate()
     }
 
-    pub(in crate::composition::mlx) fn prepared_media_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedMediaInput,
-    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        self.stage.prepared_media_plan(input)
-    }
-
-    pub(in crate::composition::mlx) fn qwen_vl_input_part_plan(
+    pub(in crate::composition::mlx) fn prepared_input_part_plan(
         &self,
         input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        self.stage.qwen_vl_input_part_plan(input)
-    }
-
-    pub(in crate::composition::mlx) fn gemma4_input_part_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::Gemma4InputPartPlan, eredu_core::CapabilityError>
-    {
-        self.stage.gemma4_input_part_plan(input)
-    }
-
-    pub(in crate::composition::mlx) fn qwen_hybrid_input_part_plan(
-        &self,
-        input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
-    {
-        self.stage.qwen_hybrid_input_part_plan(input)
+        self.stage.prepared_input_part_plan(input)
     }
 
     /// Returns stage-local disk-stream observations when enabled.
@@ -19059,12 +19063,13 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         eredu_architectures::capability::qwen_hybrid_text(self.args())
     }
 
-    fn qwen_hybrid_input_part_plan(
+    fn prepared_input_part_plan(
         &self,
         input: &eredu_architectures::media_plan::PreparedInputPart,
-    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
         eredu_architectures::media_plan::qwen_hybrid_text_input_part(self.args(), input)
+            .map(Into::into)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {

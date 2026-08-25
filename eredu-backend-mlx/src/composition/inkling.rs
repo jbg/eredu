@@ -1183,47 +1183,60 @@ impl PreparedInklingInput {
         let mut images = Vec::new();
         let mut audio = Vec::new();
         for part in typed.parts {
-            match (part.modality, part.payload) {
-                (input::Modality::Text, input::InputPayload::TokenIds(value)) => {
+            let architecture_input = input::prepared_input_part(*part)?;
+            let plan = media_plan::inkling_input_part(args, &architecture_input)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            match (plan, part.payload) {
+                (
+                    media_plan::InklingInputPartPlan::TextTokens { .. },
+                    input::InputPayload::TokenIds(value),
+                ) => {
                     tokens.push(crate::MlxTensor::from_array(value.clone()));
                     kinds.push(input::Modality::Text);
                     projected.push(None);
                 }
-                (input::Modality::Image, input::InputPayload::Tensor(value)) => {
-                    let architecture_input =
-                        input::prepared_media_input(part.modality, value, part.metadata)?;
-                    let plan = media_plan::inkling_ingress(args, &architecture_input)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    let count = usize::try_from(plan.placeholder_count).map_err(|_| {
+                (
+                    media_plan::InklingInputPartPlan::Media {
+                        modality: media_plan::PreparedInputModality::Image,
+                        ingress,
+                        ..
+                    },
+                    input::InputPayload::Tensor(value),
+                ) => {
+                    let count = usize::try_from(ingress.placeholder_count).map_err(|_| {
                         Error::ArchitectureModel(
                             "Inkling image placeholder span exceeds host capacity".into(),
                         )
                     })?;
                     tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                        &vec![plan.placeholder_token_id; count],
+                        &vec![ingress.placeholder_token_id; count],
                         stream,
                     )?));
                     kinds.push(input::Modality::Image);
                     projected.push(None);
                     images.push(value.clone());
                 }
-                (input::Modality::Audio, input::InputPayload::Tensor(value)) => {
-                    let architecture_input =
-                        input::prepared_media_input(part.modality, value, part.metadata)?;
-                    let plan = media_plan::inkling_ingress(args, &architecture_input)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    let count = usize::try_from(plan.placeholder_count).map_err(|_| {
+                (
+                    media_plan::InklingInputPartPlan::Media {
+                        modality: media_plan::PreparedInputModality::Audio,
+                        ingress,
+                        ..
+                    },
+                    input::InputPayload::Tensor(value),
+                ) => {
+                    let count = usize::try_from(ingress.placeholder_count).map_err(|_| {
                         Error::ArchitectureModel(
                             "Inkling audio placeholder span exceeds host capacity".into(),
                         )
                     })?;
-                    let retained_frames = i32::try_from(plan.placeholder_count).map_err(|_| {
-                        Error::ArchitectureModel(
-                            "Inkling audio placeholder span exceeds tensor capacity".into(),
-                        )
-                    })?;
+                    let retained_frames =
+                        i32::try_from(ingress.placeholder_count).map_err(|_| {
+                            Error::ArchitectureModel(
+                                "Inkling audio placeholder span exceeds tensor capacity".into(),
+                            )
+                        })?;
                     tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                        &vec![plan.placeholder_token_id; count],
+                        &vec![ingress.placeholder_token_id; count],
                         stream,
                     )?));
                     kinds.push(input::Modality::Audio);
@@ -1231,26 +1244,34 @@ impl PreparedInklingInput {
                     audio.push(value.try_index_device((.., ..retained_frames, ..), stream)?);
                 }
                 (
-                    modality @ (input::Modality::Image | input::Modality::Audio),
+                    media_plan::InklingInputPartPlan::Projected {
+                        modality,
+                        placeholder_token_id,
+                        positions,
+                    },
                     input::InputPayload::Embeddings(value),
                 ) => {
-                    let count = value.dim(1);
-                    let token = if modality == input::Modality::Image {
-                        args.image_token_id
-                    } else {
-                        args.audio_token_id
-                    };
-                    tokens.push(crate::MlxTensor::from_array(Array::from_slice(
-                        &vec![token; count as usize],
-                        &[1, count],
-                    )));
-                    kinds.push(modality);
+                    let count = usize::try_from(positions).map_err(|_| {
+                        Error::ArchitectureModel(
+                            "Inkling projected placeholder span exceeds host capacity".into(),
+                        )
+                    })?;
+                    tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
+                        &vec![placeholder_token_id; count],
+                        stream,
+                    )?));
+                    kinds.push(match modality {
+                        media_plan::PreparedInputModality::Image => input::Modality::Image,
+                        media_plan::PreparedInputModality::Audio => input::Modality::Audio,
+                        media_plan::PreparedInputModality::Text
+                        | media_plan::PreparedInputModality::Video => unreachable!(),
+                    });
                     projected.push(Some(crate::MlxTensor::from_array(value.clone())));
                 }
-                (modality, _) => {
+                _ => {
                     return Err(Error::ArchitectureModel(format!(
-                        "Inkling does not accept this {} payload",
-                        modality.as_str()
+                        "Inkling input plan disagrees with the prepared {} payload",
+                        part.modality.as_str()
                     )))
                 }
             }

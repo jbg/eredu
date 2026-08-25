@@ -519,9 +519,10 @@ modality policy, then report decoder positions and conservative scalar
 workspace. Concrete backends only extract shapes and small metadata values
 from native arrays, apply physical scalar widths, and account for the arrays'
 actual byte sizes. Architecture input-part plans additionally classify payload
-representations when a family admits projected embeddings. The same plan must
-drive prefill materialization and capability accounting so those paths cannot
-disagree about an accepted modality/payload pair.
+representations for every family, including explicit rejection plans for
+text-only models. The same plan must drive prefill materialization and
+capability accounting so those paths cannot disagree about an accepted
+modality/payload pair; backend admission has no rank-only fallback.
 
 Backend types also declare the optional neural forward operators they support.
 Architecture constructors preflight family-owned operator requirement sets
@@ -676,12 +677,13 @@ non-text embeddings are rejected. Conditional Qwen3.5 uses its own shared
 input-part plan across resident prefill, pipeline prefill, and capability
 preflight: projected text, image, and video embeddings must be batch-one at
 decoder width, while native image/video tensors use the vision ingress plan.
-Inkling execution likewise consumes an architecture ingress plan for its exact
-hMLP and dMel geometry, placeholder token, valid audio prefix, and decoder span.
-Muse-Glimmer execution consumes the
-architecture-returned placeholder span and validated grid, including the
-checkpoint-convention video policy; MLX does not reconstruct spatial merging or
-artifact modality rules.
+Inkling execution and capability preflight consume one architecture input-part
+plan covering text, decoder-width projected image/audio embeddings, exact hMLP
+and dMel geometry, placeholder tokens, valid audio prefixes, and decoder spans.
+Muse-Glimmer likewise uses one architecture input-part plan for text and native
+image/video tensors; the plan owns the placeholder span, validated grid, and
+checkpoint-convention video policy while rejecting projected embeddings and
+audio. MLX does not reconstruct modality, spatial-merging, or artifact policy.
 
 Layered model execution topology follows the same ownership rule. Loaders and
 materializers derive execution graphs and per-group unit counts through
