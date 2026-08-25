@@ -365,6 +365,9 @@ partition slices preserve and rebase the intersecting segment metadata.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
+If a backend model and cache representation do not match, dispatch rejects that
+pair before descriptor validation rather than synthesizing a model identity for
+the invalid pairing.
 Draft commit and pipeline prompt-cache persistence likewise select the
 architecture's named prediction segment; family configuration layer counts are
 not commit-range metadata.

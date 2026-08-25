@@ -2,10 +2,7 @@
 
 use std::path::Path;
 
-use eredu_core::cache::{
-    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheModelIdentity, PromptCacheOptions,
-};
+use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use eredu_core::{MtpCapability, MtpCheckpointKind};
 use safemlx::{error::Exception, Array, Stream};
 
@@ -620,36 +617,6 @@ impl Model {
             }
             _ => {}
         }
-        let layer_layout = self.prompt_cache_layer_layout()?;
-        let model_family = match self {
-            Self::DeepSeek(_, model) => model.model_type(),
-            Self::Llama(_, _) => "llama",
-            Self::GptOss(_, _) => "gpt_oss",
-            Self::Qwen(_, _) => "qwen",
-            Self::MuseGlimmer(_, _) => "muse_glimmer",
-            Self::KimiLinear(_, _) => "kimi_linear",
-            Self::Lfm2(_, _) => "lfm2",
-            Self::NemotronH(_, _) => "nemotron_h",
-            Self::Qwen3Next(_, _) | Self::Qwen35(_, _) => "qwen_hybrid",
-            Self::Qwen3Vl(_, _) | Self::Qwen3VlMoe(_, _) => "qwen3_vl",
-            Self::Gemma4(_, _) => "gemma4",
-            Self::Inkling(_, _) => "inkling",
-        };
-        let layer_count = layer_layout.len();
-        let identity = PromptCacheModelIdentity {
-            model_family: model_family.into(),
-            effective_model_type: self.effective_model_type().into(),
-            architecture_fingerprint: self.prompt_cache_architecture_fingerprint()?,
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            layer_prefix_offsets: self.prompt_cache_layer_prefix_offsets()?,
-            topology: Default::default(),
-            layer_layout,
-        };
-        validate_prompt_cache_model_identity(&descriptor, &identity)
-            .map_err(|error| Exception::custom(error.to_string()))?;
         Err(Exception::custom(
             "model and cache representations do not match for prompt-cache publication",
         ))
