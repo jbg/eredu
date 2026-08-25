@@ -1434,7 +1434,7 @@ where
                 parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
                 request_optional: true,
             },
-            1 => eredu_runtime::ArchitectureGroupTransport::decoder(),
+            1 => crate::transport::decoder(),
             _ => conditional_prediction_group_transport(group),
         }
     }
@@ -1762,7 +1762,7 @@ where
 fn conditional_prediction_group_transport(
     group: usize,
 ) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
+    let mut transport = crate::transport::prediction();
     if group == 2 {
         transport.first_owner_static_roles.push("mtp".into());
     }

@@ -18,18 +18,19 @@ use eredu_nn::{
     RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, ArchitectureParameterDescription,
-    ArchitectureParameters, ArchitecturePartition, CollectiveBackend,
-    CompositeLayeredTraversalHook, DeviceState, ExecutionGraph, ExecutionGroupSpec,
-    ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture, LayeredForwardState,
-    LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy,
-    LayerwiseRuntime, ParameterBackend, PartitionOwnership, PenaltyConfig, PredictionDirective,
-    ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime, RuntimeLayerState,
-    Sampler, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionDriver,
-    SequentialDecisionError, SequentialDecisionPlan, SequentialDecisionSource,
-    SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId, StateSegmentLifetime,
-    StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend,
-    TokenDomain, TransferBackend, WeightBinding,
+    bind_materialized_unit, materialize_bindings, ArchitectureGroupKind,
+    ArchitectureGroupPlacement, ArchitectureGroupTransport, ArchitectureMergeDestination,
+    ArchitectureParameterDescription, ArchitectureParameters, ArchitecturePartition,
+    CollectiveBackend, CompositeLayeredTraversalHook, DeviceState, ExecutionGraph,
+    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
+    LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
+    LayerwisePolicy, LayerwiseRuntime, ParameterBackend, PartitionOwnership, PenaltyConfig,
+    PredictionDirective, ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime,
+    RuntimeLayerState, Sampler, SamplingBackend, SequentialDecisionBoundary,
+    SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
+    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId,
+    StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut,
+    SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -955,6 +956,38 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
     type ForwardContext = Vec<(usize, usize)>;
     type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
     type Error = Error;
+
+    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
+        match group {
+            0 => ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::VisionEncoder,
+                first_owner_static_roles: vec!["embedding".into()],
+                last_owner_static_roles: Vec::new(),
+                merge_destination: ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            },
+            1 => ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::AudioEncoder,
+                first_owner_static_roles: Vec::new(),
+                last_owner_static_roles: Vec::new(),
+                merge_destination: ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            },
+            _ => ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::Decoder,
+                first_owner_static_roles: Vec::new(),
+                last_owner_static_roles: Vec::new(),
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            },
+        }
+    }
 
     fn model_identity(&self) -> &str {
         "grouped-fixture"

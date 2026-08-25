@@ -2043,7 +2043,7 @@ where
         if group == 0 {
             target_group_transport()
         } else {
-            let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
+            let mut transport = crate::transport::prediction();
             if group == 1 {
                 transport.first_owner_static_roles.push("mtp".into());
             }
@@ -2424,7 +2424,7 @@ where
 }
 
 fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = eredu_runtime::ArchitectureGroupTransport::decoder();
+    let mut transport = crate::transport::decoder();
     transport.last_owner_static_roles.push("hyper_head".into());
     transport
 }

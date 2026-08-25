@@ -147,34 +147,6 @@ pub struct ArchitectureGroupTransport {
     pub request_optional: bool,
 }
 
-impl ArchitectureGroupTransport {
-    /// Standard pipeline-balanced decoder transport.
-    pub fn decoder() -> Self {
-        Self {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Decoder,
-            first_owner_static_roles: vec!["embedding".into()],
-            last_owner_static_roles: vec!["norm".into(), "output".into()],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
-            request_optional: false,
-        }
-    }
-
-    /// Output-owner prediction transport without additional pinned modules.
-    pub fn prediction() -> Self {
-        Self {
-            placement: ArchitectureGroupPlacement::OutputOwner,
-            kind: ArchitectureGroupKind::Prediction,
-            first_owner_static_roles: Vec::new(),
-            last_owner_static_roles: Vec::new(),
-            merge_destination: ArchitectureMergeDestination::OutputOwner,
-            parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
-            request_optional: false,
-        }
-    }
-}
-
 /// Stable layered traversal boundary exposed to generic runtime drivers.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LayeredTraversalPoint {
@@ -402,9 +374,7 @@ where
     type Error;
 
     /// Declares transport and physical placement semantics for one canonical group slot.
-    fn group_transport(&self, _group: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport::decoder()
-    }
+    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport;
 
     /// Stable architecture compatibility identity.
     fn model_identity(&self) -> &str;

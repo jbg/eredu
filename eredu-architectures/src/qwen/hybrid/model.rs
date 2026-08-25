@@ -679,7 +679,7 @@ where
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         if group == 0 {
-            eredu_runtime::ArchitectureGroupTransport::decoder()
+            crate::transport::decoder()
         } else {
             prediction_group_transport(group)
         }
@@ -868,7 +868,7 @@ where
 }
 
 fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
+    let mut transport = crate::transport::prediction();
     if group == 1 {
         transport.first_owner_static_roles.push("mtp".into());
     }

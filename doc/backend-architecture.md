@@ -145,6 +145,16 @@ plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
+Execution-group transport is also architecture policy. The runtime defines the
+neutral placement, semantic-kind, merge-destination, and parallel-subgroup data
+types, but every `LayeredArchitecture` must declare the transport for each of
+its groups. Shared decoder defaults live in `eredu-architectures`; the runtime
+does not assign decoder roles or placement to an unspecified group. Composite
+families may declare different policies per group. In particular, Moshi places
+its temporal decoder across the pipeline with the pinned embedding and output
+modules, while its ordered depth predictions run on the output owner and own no
+pinned static roles.
+
 The ordinary Qwen decoder, block, and layered lifecycle are dense construction
 surfaces and require only `NeuralBackend`. Concrete adapters that dynamically
 admit both dense and Qwen MoE configurations use the separate routed Qwen

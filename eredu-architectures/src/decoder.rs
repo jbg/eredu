@@ -3276,6 +3276,10 @@ where
         B::Tensor: 'a;
     type Error = Error;
 
+    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        crate::transport::decoder()
+    }
+
     fn model_identity(&self) -> &str {
         self.args.model_identity()
     }

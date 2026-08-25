@@ -883,7 +883,7 @@ where
                 request_optional: true,
             }
         } else {
-            eredu_runtime::ArchitectureGroupTransport::decoder()
+            crate::transport::decoder()
         }
     }
 
