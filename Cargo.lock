@@ -2834,7 +2834,7 @@ checksum = "3944826ff8fa8093089aba3acb4ef44b9446a99a16f3bf4e74af3f77d340ab7d"
 
 [[package]]
 name = "safemlx"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -2861,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "safemlx-internal-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "itertools 0.15.0",
  "proc-macro2",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "safemlx-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "safemlx-sys"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "cc",
