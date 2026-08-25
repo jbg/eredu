@@ -2030,6 +2030,15 @@ mod tests {
             residency.units()[7].identity(),
             eredu_runtime::ExpertIdentity::new(2, 3)
         );
+        let prediction = residency
+            .into_units_selected_by_owner(|group, unit| group.as_str() == "mtp.0" && unit == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(prediction.len(), 4);
+        assert!(prediction.iter().all(|unit| {
+            unit.identity().layer == 2
+                && unit.owner_group().as_str() == "mtp.0"
+                && unit.owner_unit() == 0
+        }));
     }
 
     #[test]

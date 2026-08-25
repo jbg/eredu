@@ -21985,35 +21985,23 @@ fn load_neutral_deepseek_v3_pipeline(
                     .tensor_parallel_rank
                     .checked_mul(width)
                     .ok_or_else(|| Error::Parallel("local V3 expert range overflowed".into()))?;
-                crate::composition::deepseek_expert::v3_parallel_catalog(
+                crate::composition::deepseek_expert::v3_parallel_catalog_selected(
                     &args,
                     start..start + width,
                     store.as_ref(),
+                    |group, unit| partition.owns_unit(group.as_str(), unit),
                 )?
             }
-            None => crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?,
+            None => crate::composition::deepseek_expert::v3_catalog_selected(
+                &args,
+                store.as_ref(),
+                |group, unit| partition.owns_unit(group.as_str(), unit),
+            )?,
         };
-        let owned_unit_ordinals = range
-            .clone()
-            .map(|index| {
-                parameter_description
-                    .unit_layout()
-                    .ordinal(decoder_group, index)
-                    .expect("V3 target range derives from the parameter layout")
-            })
-            .chain(
-                owns_mtp
-                    .then_some(prediction_units.iter().map(|(_, ordinal)| *ordinal))
-                    .into_iter()
-                    .flatten(),
-            )
-            .collect::<BTreeSet<_>>();
         let entries = catalog
             .into_iter()
             .filter(|entry| {
-                let layer = entry.identity().layer;
-                owned_unit_ordinals.contains(&layer)
-                    && assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
             })
             .collect::<Vec<_>>();
         if !entries.is_empty() {
@@ -22415,35 +22403,23 @@ fn load_neutral_deepseek_v4_pipeline(
                     .tensor_parallel_rank
                     .checked_mul(width)
                     .ok_or_else(|| Error::Parallel("local V4 expert range overflowed".into()))?;
-                crate::composition::deepseek_expert::v4_parallel_catalog(
+                crate::composition::deepseek_expert::v4_parallel_catalog_selected(
                     &args,
                     start..start + width,
                     store.as_ref(),
+                    |group, unit| partition.owns_unit(group.as_str(), unit),
                 )?
             }
-            None => crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?,
+            None => crate::composition::deepseek_expert::v4_catalog_selected(
+                &args,
+                store.as_ref(),
+                |group, unit| partition.owns_unit(group.as_str(), unit),
+            )?,
         };
-        let owned_unit_ordinals = range
-            .clone()
-            .map(|index| {
-                parameter_description
-                    .unit_layout()
-                    .ordinal(decoder_group, index)
-                    .expect("V4 target range derives from the parameter layout")
-            })
-            .chain(
-                owns_mtp
-                    .then_some(prediction_units.iter().map(|(_, ordinal)| *ordinal))
-                    .into_iter()
-                    .flatten(),
-            )
-            .collect::<BTreeSet<_>>();
         let entries = catalog
             .into_iter()
             .filter(|entry| {
-                let layer = entry.identity().layer;
-                owned_unit_ordinals.contains(&layer)
-                    && assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
             })
             .collect::<Vec<_>>();
         if !entries.is_empty() {

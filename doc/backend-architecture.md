@@ -231,9 +231,13 @@ exact acquired-bank binding names, exact logical parameter targets, and
 checkpoint-derived recipes. Each parameter also declares whether it must be
 preserved or is a load-time-quantizable projection; quantizable projections
 carry the exact local scale and affine-bias companion binding names. Backends
-consume that declaration directly and never infer eligibility or companion
-identity from binding spelling, dtype, or rank. Family code owns sparse-layer selection, routed
-versus shared-bank scheduling, expert counts, and cache-layer numbering.
+filter neutral expert catalogs by the architecture's owning group and
+group-local unit before lowering them to backend cache entries. Router/cache
+identity is not an ownership address and must not be flattened back into one.
+Backends consume the remaining declaration directly and never infer eligibility
+or companion identity from binding spelling, dtype, or rank. Family code owns
+sparse-layer selection, routed versus shared-bank scheduling, expert counts,
+and cache-layer numbering.
 This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, LFM2,
 Kimi Linear, and later
 families: each architecture checkpoint module emits its complete
