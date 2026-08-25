@@ -2888,6 +2888,8 @@ mod neutral_semantic_operator_tests {
             operator_requirements::QWEN_HYBRID,
             operator_requirements::NEMOTRON_H,
             operator_requirements::QWEN_VISION,
+            operator_requirements::QWEN_VL,
+            operator_requirements::DEEPSEEK_V3,
             operator_requirements::DEEPSEEK_V4,
             operator_requirements::INKLING,
             operator_requirements::GEMMA4,

@@ -595,8 +595,7 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
-            crate::operator_requirements::QWEN_HYBRID
-                .union(crate::operator_requirements::QWEN_VISION),
+            crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
         )?;
         let vision = parsed
             .vision
@@ -671,8 +670,7 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
-            crate::operator_requirements::QWEN_HYBRID
-                .union(crate::operator_requirements::QWEN_VISION),
+            crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
         )?;
         geometry.validate_for(&parsed).map_err(Error::backend)?;
         let vision_config = parsed

@@ -296,6 +296,10 @@ where
 impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Builds the unloaded pinned V3 modules.
     pub fn new(args: V3Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "DeepSeek-V3",
+            crate::operator_requirements::DEEPSEEK_V3,
+        )?;
         args.validate().map_err(Error::backend)?;
         let static_modules = StaticModules::from_spec(static_spec(&args), context)?;
         Ok(Self {
@@ -314,7 +318,8 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "DeepSeek-V3 tensor parallelism",
-            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+            crate::operator_requirements::DEEPSEEK_V3
+                .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
         )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;

@@ -527,7 +527,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",
-            crate::operator_requirements::QWEN_VISION,
+            crate::operator_requirements::QWEN_VL,
         )?;
         args.vision
             .validate_for(VisionMode::DeepStack)
@@ -549,7 +549,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",
-            crate::operator_requirements::QWEN_VISION,
+            crate::operator_requirements::QWEN_VL,
         )?;
         args.vision
             .validate_for(VisionMode::DeepStack)

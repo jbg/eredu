@@ -2744,12 +2744,12 @@ pub trait PoolingAttentionCache<T: Tensor>: Debug {
     fn clear(&mut self) -> Result<(), Error>;
 }
 
-/// Explicit forward-pass operators a backend promises to execute.
+/// Explicit optional operations a backend promises to execute.
 ///
-/// These capabilities cover optional methods on [`NeuralBackend`] whose
-/// default implementations fail closed. Architectures validate their required
-/// set while constructing modules, before parameters are loaded or a forward
-/// pass can begin.
+/// These capabilities cover explicitly admitted methods on [`NeuralBackend`]
+/// and every optional [`Tensor`] method whose default implementation fails
+/// closed. Architectures validate their required set while constructing
+/// modules, before parameters are loaded or a forward pass can begin.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct NeuralOperatorCapabilities(u64);
 
@@ -2796,8 +2796,46 @@ impl NeuralOperatorCapabilities {
     pub const GROUPED_LINEAR: Self = Self(1 << 18);
     /// Tensor-parallel sum reduction.
     pub const SUM_PARALLEL: Self = Self(1 << 19);
-    /// Every currently declared optional forward operator.
-    pub const ALL: Self = Self((1 << 20) - 1);
+    /// Unloaded signed 32-bit integer parameter allocation.
+    pub const UNLOADED_I32: Self = Self(1 << 20);
+    /// Signed 32-bit integer tensor construction from host data.
+    pub const FROM_I32_SLICE: Self = Self(1 << 21);
+    /// Floating-point host materialization.
+    pub const TO_F32_VEC: Self = Self(1 << 22);
+    /// Signed 32-bit integer host materialization.
+    pub const TO_I32_VEC: Self = Self(1 << 23);
+    /// Floating-point filled tensor construction.
+    pub const FULL_F32: Self = Self(1 << 24);
+    /// Signed 32-bit integer filled tensor construction.
+    pub const FULL_I32: Self = Self(1 << 25);
+    /// Elementwise hyperbolic tangent.
+    pub const TANH: Self = Self(1 << 26);
+    /// Elementwise clamp with tensor bounds.
+    pub const CLIP: Self = Self(1 << 27);
+    /// Axis-wise softmax.
+    pub const SOFTMAX_AXIS: Self = Self(1 << 28);
+    /// Tensor broadcasting.
+    pub const BROADCAST_TO: Self = Self(1 << 29);
+    /// Dtype-preserving zero allocation.
+    pub const ZEROS_LIKE: Self = Self(1 << 30);
+    /// Signed integer scalar comparison.
+    pub const EQUAL_I32: Self = Self(1 << 31);
+    /// Elementwise logical disjunction.
+    pub const LOGICAL_OR: Self = Self(1 << 32);
+    /// Conditional tensor selection.
+    pub const WHERE_CONDITION: Self = Self(1 << 33);
+    /// Masked tensor scatter.
+    pub const MASKED_SCATTER: Self = Self(1 << 34);
+    /// Rotary positions with caller-supplied frequencies.
+    pub const ROPE_WITH_FREQUENCIES: Self = Self(1 << 35);
+    /// Two-dimensional convolution.
+    pub const CONV2D: Self = Self(1 << 36);
+    /// Multi-axis rotary embedding construction.
+    pub const MULTI_AXIS_ROTARY_EMBEDDINGS: Self = Self(1 << 37);
+    /// Masked vocabulary output projection.
+    pub const MASKED_OUTPUT_PROJECTION: Self = Self(1 << 38);
+    /// Every currently declared optional operation.
+    pub const ALL: Self = Self((1 << 39) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -2873,6 +2911,37 @@ impl NeuralOperatorCapabilities {
             ),
             (NeuralOperatorCapabilities::GROUPED_LINEAR, "grouped_linear"),
             (NeuralOperatorCapabilities::SUM_PARALLEL, "sum_parallel"),
+            (NeuralOperatorCapabilities::UNLOADED_I32, "unloaded_i32"),
+            (NeuralOperatorCapabilities::FROM_I32_SLICE, "from_i32_slice"),
+            (NeuralOperatorCapabilities::TO_F32_VEC, "to_f32_vec"),
+            (NeuralOperatorCapabilities::TO_I32_VEC, "to_i32_vec"),
+            (NeuralOperatorCapabilities::FULL_F32, "full_f32"),
+            (NeuralOperatorCapabilities::FULL_I32, "full_i32"),
+            (NeuralOperatorCapabilities::TANH, "tanh"),
+            (NeuralOperatorCapabilities::CLIP, "clip"),
+            (NeuralOperatorCapabilities::SOFTMAX_AXIS, "softmax_axis"),
+            (NeuralOperatorCapabilities::BROADCAST_TO, "broadcast_to"),
+            (NeuralOperatorCapabilities::ZEROS_LIKE, "zeros_like"),
+            (NeuralOperatorCapabilities::EQUAL_I32, "equal_i32"),
+            (NeuralOperatorCapabilities::LOGICAL_OR, "logical_or"),
+            (
+                NeuralOperatorCapabilities::WHERE_CONDITION,
+                "where_condition",
+            ),
+            (NeuralOperatorCapabilities::MASKED_SCATTER, "masked_scatter"),
+            (
+                NeuralOperatorCapabilities::ROPE_WITH_FREQUENCIES,
+                "rope_with_frequencies",
+            ),
+            (NeuralOperatorCapabilities::CONV2D, "conv2d"),
+            (
+                NeuralOperatorCapabilities::MULTI_AXIS_ROTARY_EMBEDDINGS,
+                "multi_axis_rotary_embeddings",
+            ),
+            (
+                NeuralOperatorCapabilities::MASKED_OUTPUT_PROJECTION,
+                "masked_output_projection",
+            ),
         ];
         NAMES
             .iter()
@@ -2880,6 +2949,42 @@ impl NeuralOperatorCapabilities {
                 (required.contains(*capability) && !self.contains(*capability)).then_some(*name)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod neural_operator_capability_tests {
+    use super::NeuralOperatorCapabilities as C;
+
+    #[test]
+    fn all_includes_every_fail_closed_tensor_operation() {
+        for (capability, name) in [
+            (C::UNLOADED_I32, "unloaded_i32"),
+            (C::FROM_I32_SLICE, "from_i32_slice"),
+            (C::TO_F32_VEC, "to_f32_vec"),
+            (C::TO_I32_VEC, "to_i32_vec"),
+            (C::FULL_F32, "full_f32"),
+            (C::FULL_I32, "full_i32"),
+            (C::TANH, "tanh"),
+            (C::CLIP, "clip"),
+            (C::SOFTMAX_AXIS, "softmax_axis"),
+            (C::BROADCAST_TO, "broadcast_to"),
+            (C::ZEROS_LIKE, "zeros_like"),
+            (C::EQUAL_I32, "equal_i32"),
+            (C::LOGICAL_OR, "logical_or"),
+            (C::WHERE_CONDITION, "where_condition"),
+            (C::MASKED_SCATTER, "masked_scatter"),
+            (C::ROPE_WITH_FREQUENCIES, "rope_with_frequencies"),
+            (C::CONV2D, "conv2d"),
+            (
+                C::MULTI_AXIS_ROTARY_EMBEDDINGS,
+                "multi_axis_rotary_embeddings",
+            ),
+            (C::MASKED_OUTPUT_PROJECTION, "masked_output_projection"),
+        ] {
+            assert!(C::ALL.contains(capability));
+            assert_eq!(C::NONE.missing_names(capability), [name]);
+        }
     }
 }
 

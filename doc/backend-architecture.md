@@ -572,12 +572,16 @@ text-only models. The same plan must drive prefill materialization and
 capability accounting so those paths cannot disagree about an accepted
 modality/payload pair; backend admission has no rank-only fallback.
 
-Backend types also declare the optional neural forward operators they support.
+Backend types also declare the optional neural and tensor operations they
+support. This includes every `Tensor` method whose default implementation fails
+closed, alongside the explicitly admitted `NeuralBackend` methods.
 Architecture constructors preflight family-owned operator requirement sets
-before allocating modules or loading parameters, so a missing recurrent scan,
-sparse-attention primitive, normalization, activation, or collective rejects
-composition instead of failing on the first forward pass. Concrete backends
-must keep that declaration aligned with their `NeuralBackend` implementation.
+before allocating modules or loading parameters, so a missing tensor
+construction, recurrent scan, sparse-attention primitive, normalization,
+activation, media operator, or collective rejects composition instead of
+failing on the first affected forward pass. Concrete backends must keep that
+declaration aligned with both their `NeuralBackend` and `Tensor`
+implementations.
 
 A backend owns runtime-specific resources and computation:
 
