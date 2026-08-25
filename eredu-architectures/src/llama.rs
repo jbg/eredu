@@ -59,7 +59,6 @@ pub fn local_block_args(
     let tensor = |suffix: &str| {
         layout
             .tensor(&format!("{prefix}.{suffix}.weight"))
-            .or_else(|| layout.tensor(&format!("{prefix}.{suffix}.inner.weight")))
             .ok_or_else(|| {
                 ParallelPlanError::InvalidTensor(format!(
                     "missing local layout for {prefix}.{suffix}.weight"

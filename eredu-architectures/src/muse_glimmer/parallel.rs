@@ -207,7 +207,6 @@ pub fn local_decoder_config(
     let tensor = |suffix: &str| {
         layout
             .tensor(&format!("{root}.{suffix}.weight"))
-            .or_else(|| layout.tensor(&format!("{root}.{suffix}.inner.weight")))
             .or_else(|| layout.tensor(&format!("{root}.{suffix}")))
             .ok_or_else(|| {
                 ParallelPlanError::InvalidTensor(format!(

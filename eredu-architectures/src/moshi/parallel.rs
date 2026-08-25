@@ -642,7 +642,6 @@ fn required_parameter<'a>(
 ) -> Result<&'a eredu_runtime::LocalTensorLayout, ParallelPlanError> {
     layout
         .tensor(&format!("{parameter}.weight"))
-        .or_else(|| layout.tensor(&format!("{parameter}.inner.weight")))
         .or_else(|| layout.tensor(parameter))
         .ok_or_else(|| {
             ParallelPlanError::InvalidTensor(format!(

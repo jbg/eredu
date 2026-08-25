@@ -44,15 +44,7 @@ pub fn with_checkpoint_formats(
 }
 
 fn canonical_recipe_name(name: &str) -> String {
-    let canonical = name
-        .replace(".inner.weight", ".weight")
-        .replace(".inner.bias", ".bias")
-        .replace(".block_sparse_moe.", ".mlp.");
-    match canonical.as_str() {
-        "inner.weight" => "weight".into(),
-        "inner.bias" => "bias".into(),
-        _ => canonical,
-    }
+    name.replace(".block_sparse_moe.", ".mlp.")
 }
 
 fn normalized_checkpoint_keys(store: &dyn CheckpointSource) -> BTreeMap<String, String> {
@@ -801,20 +793,13 @@ fn physical_names(canonical: &str) -> Vec<String> {
     if canonical.contains(".mlp.") {
         names.push(canonical.replace(".mlp.", ".block_sparse_moe."));
     }
-    for name in names.clone() {
-        if let Some(prefix) = name.strip_suffix(".weight") {
-            names.push(format!("{prefix}.inner.weight"));
-        }
-    }
     names.sort();
     names.dedup();
     names
 }
 
 fn outer_prefix(name: &str) -> &str {
-    name.strip_suffix(".inner.weight")
-        .or_else(|| name.strip_suffix(".weight"))
-        .unwrap_or(name)
+    name.strip_suffix(".weight").unwrap_or(name)
 }
 
 /// Builds the GGUF physical catalog plan.
@@ -1390,6 +1375,15 @@ mod tests {
         assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
         assert!(!formats.contains_key(&format!("{prefix}.gate_proj")));
         assert!(!formats.contains_key(&format!("{prefix}.up_proj")));
+    }
+
+    #[test]
+    fn portable_names_do_not_normalize_module_tree_paths() {
+        assert_eq!(
+            canonical_recipe_name("projection.inner.weight"),
+            "projection.inner.weight"
+        );
+        assert_eq!(physical_names("projection.weight"), ["projection.weight"]);
     }
 
     #[test]

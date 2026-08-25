@@ -218,6 +218,14 @@ dtype, size, or substring; derive companion identities; canonicalize legacy
 names; or inject compatibility metadata into `config.json`. Conversion fails
 closed when a declared source is absent or any declared output collides with
 another checkpoint tensor.
+
+Portable SafeTensors schemas use released checkpoint names directly. In
+particular, a matrix is named `*.weight`; the `*.inner.weight` spelling from an
+old safemlx module serialization is neither a portable alias nor an accepted
+architecture layout identity. Backend implementations may translate canonical
+schema names to private module slots, but that translation must not widen the
+checkpoint contract.
+
 These catalogs are model-wide and configuration-derived. Backend adapters may
 filter their outputs to the parameters present in a static module, execution
 unit, or independently resident bank; that filtering does not transfer source

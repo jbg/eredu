@@ -999,12 +999,6 @@ fn safe_alias_constraints(
     quantization: Option<WeightQuantization>,
 ) -> Result<Vec<SafetensorsTensorConstraint>, String> {
     let mut names = vec![official.to_string(), canonical.to_string()];
-    if quantization.is_some() {
-        names.extend(names.clone().into_iter().filter_map(|name| {
-            name.strip_suffix(".weight")
-                .map(|prefix| format!("{prefix}.inner.weight"))
-        }));
-    }
     names.sort();
     names.dedup();
     let primary = official.to_string();
@@ -1079,9 +1073,7 @@ fn safe_alias_constraints(
 }
 
 fn outer_prefix(name: &str) -> &str {
-    name.strip_suffix(".inner.weight")
-        .or_else(|| name.strip_suffix(".weight"))
-        .unwrap_or(name)
+    name.strip_suffix(".weight").unwrap_or(name)
 }
 
 /// Builds the strict GGUF tensor plan for the normalized physical schedule.
@@ -1543,6 +1535,21 @@ mod tests {
                 .map(|variant| variant.id.as_str())
                 .eq(["packed", "split"])
         }));
+    }
+
+    #[test]
+    fn packed_weights_keep_only_released_checkpoint_aliases() {
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let constraints = safe_alias_constraints(
+            "backbone.projection.weight",
+            "model.projection.weight",
+            vec![64, 64],
+            Some(quantization),
+        )
+        .unwrap();
+
+        assert_eq!(constraints[0].aliases, ["model.projection.weight"]);
     }
 
     #[test]

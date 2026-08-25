@@ -355,7 +355,6 @@ pub fn local_block_args(
         let root = format!("model.language_model.layers.{layer}");
         layout
             .tensor(&format!("{root}.{suffix}.weight"))
-            .or_else(|| layout.tensor(&format!("{root}.{suffix}.inner.weight")))
             .or_else(|| layout.tensor(&format!("{root}.{suffix}")))
     };
     let tensor = |suffix: &str| {

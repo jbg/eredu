@@ -13,15 +13,9 @@ fn tensor<'a>(
     layout: &'a eredu_runtime::LocalModelLayout,
     name: &str,
 ) -> Result<&'a eredu_runtime::LocalTensorLayout, ParallelPlanError> {
-    layout
-        .tensor(name)
-        .or_else(|| {
-            name.strip_suffix(".weight")
-                .and_then(|root| layout.tensor(&format!("{root}.inner.weight")))
-        })
-        .ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!("missing local vision layout for {name}"))
-        })
+    layout.tensor(name).ok_or_else(|| {
+        ParallelPlanError::InvalidTensor(format!("missing local vision layout for {name}"))
+    })
 }
 
 /// Rank-local head and MLP widths resolved from one vision block layout.

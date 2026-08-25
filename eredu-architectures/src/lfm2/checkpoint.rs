@@ -657,10 +657,6 @@ fn safe_matrix_constraints(
     let mut companion = shape;
     *companion.last_mut().expect("matrix shape") = input / group;
     let prefix = outer_prefix(name);
-    let aliases = name
-        .strip_suffix(".weight")
-        .map(|prefix| vec![format!("{prefix}.inner.weight")])
-        .unwrap_or_default();
     let companion_dtype = || {
         StoredDtypeConstraint::OneOf(vec![
             StoredDtype::F16,
@@ -673,8 +669,7 @@ fn safe_matrix_constraints(
         name,
         packed,
         StoredDtypeConstraint::Exact(StoredDtype::U32),
-    )
-    .with_aliases(aliases)];
+    )];
     constraints.push(
         SafetensorsTensorConstraint::required(
             format!("{prefix}.scales"),
@@ -701,9 +696,7 @@ fn safe(key: impl Into<String>, shape: Vec<usize>) -> SafetensorsTensorConstrain
 }
 
 fn outer_prefix(name: &str) -> &str {
-    name.strip_suffix(".inner.weight")
-        .or_else(|| name.strip_suffix(".weight"))
-        .unwrap_or(name)
+    name.strip_suffix(".weight").unwrap_or(name)
 }
 
 /// Builds the complete physical GGUF tensor contract.
@@ -1067,6 +1060,16 @@ mod tests {
             translate_gguf_weight_name("blk.2.ffn_gate_exps.weight", true),
             "model.layers.2.feed_forward.experts.gate_proj"
         );
+    }
+
+    #[test]
+    fn packed_weights_use_only_canonical_checkpoint_names() {
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let constraints =
+            safe_matrix_constraints("projection.weight", vec![64, 64], Some(quantization)).unwrap();
+
+        assert!(constraints[0].aliases.is_empty());
     }
 
     #[test]

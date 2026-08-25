@@ -340,14 +340,6 @@ pub fn matrix_for_linear_format(
     let mut companion = shape;
     *companion.last_mut().expect("matrix shape") = input / group;
     let prefix = name.strip_suffix(".weight").unwrap_or(&name).to_string();
-    let weight_aliases = aliases
-        .iter()
-        .cloned()
-        .chain(
-            name.strip_suffix(".weight")
-                .map(|prefix| format!("{prefix}.inner.weight")),
-        )
-        .collect::<Vec<_>>();
     let companion_dtype = || {
         StoredDtypeConstraint::OneOf(vec![
             StoredDtype::F16,
@@ -370,7 +362,7 @@ pub fn matrix_for_linear_format(
         packed,
         StoredDtypeConstraint::Exact(StoredDtype::U32),
     )
-    .with_aliases(weight_aliases)];
+    .with_aliases(aliases.clone())];
     let scale = scale_companion.unwrap_or_else(|| MatrixScaleNames {
         key: format!("{prefix}.scales"),
         aliases: companion_alias("scales"),
@@ -998,7 +990,7 @@ checkpoint_plan!(GgufCheckpointPlan, GgufTensorConstraint);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockFp8Format, BlockFp8ScaleEncoding};
+    use crate::{BlockFp8Format, BlockFp8ScaleEncoding, WeightQuantization};
 
     #[test]
     fn block_fp8_matrix_declares_exact_weight_scale_geometry_and_dtype() {
@@ -1043,6 +1035,23 @@ mod tests {
             ),
             Err(MatrixConstraintError::MissingBlockScaleName { .. })
         ));
+    }
+
+    #[test]
+    fn packed_matrix_accepts_only_declared_physical_aliases() {
+        let format = LinearFormat::from(WeightQuantization::Affine(
+            crate::AffineQuantization::new(32, 4).unwrap(),
+        ));
+        let constraints = matrix_for_linear_format(
+            "projection.weight",
+            ["projection.alias.weight"],
+            vec![64, 64],
+            format,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(constraints[0].aliases, ["projection.alias.weight"]);
     }
 
     #[test]

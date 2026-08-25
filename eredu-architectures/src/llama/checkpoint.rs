@@ -208,8 +208,7 @@ fn safe_matrix_constraints(
         name,
         packed,
         StoredDtypeConstraint::Exact(StoredDtype::U32),
-    )
-    .with_aliases([format!("{prefix}.inner.weight")])];
+    )];
     constraints.push(
         SafetensorsTensorConstraint::required(
             format!("{prefix}.scales"),
@@ -448,6 +447,16 @@ mod tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key == "lm_head.weight"));
+    }
+
+    #[test]
+    fn packed_weights_use_only_canonical_checkpoint_names() {
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let constraints =
+            safe_matrix_constraints("projection.weight", vec![64, 64], Some(quantization)).unwrap();
+
+        assert!(constraints[0].aliases.is_empty());
     }
 
     #[test]

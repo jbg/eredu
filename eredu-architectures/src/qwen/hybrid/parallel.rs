@@ -285,12 +285,9 @@ fn local_width(
     name: &str,
     axis: usize,
 ) -> Result<i32, ParallelPlanError> {
-    let tensor = layout
-        .tensor(name)
-        .or_else(|| layout.tensor(&format!("{name}.inner.weight")))
-        .ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!("missing local Qwen hybrid layout for {name}"))
-        })?;
+    let tensor = layout.tensor(name).ok_or_else(|| {
+        ParallelPlanError::InvalidTensor(format!("missing local Qwen hybrid layout for {name}"))
+    })?;
     i32::try_from(*tensor.local_shape().get(axis).ok_or_else(|| {
         ParallelPlanError::InvalidTensor(format!("Qwen hybrid tensor {name} has no axis {axis}"))
     })?)
