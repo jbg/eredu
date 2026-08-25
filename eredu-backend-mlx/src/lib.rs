@@ -22,20 +22,55 @@ pub use adapter::*;
 /// Deliberate access to native MLX handles for backend-author tools that
 /// configure devices, streams, memory, or low-level tensor inputs.
 ///
-/// Native realtime types are not part of the flat curated adapter:
+/// Native session, completion, drafting, input, and realtime types are not
+/// part of the flat curated adapter:
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxCompletion;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxDrafter;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxModelInput;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxModelSession;
+/// ```
 ///
 /// ```compile_fail
 /// use eredu_backend_mlx::MlxRealtimeInput;
 /// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxSessionCompletion;
+/// ```
+///
+/// Raw completion submission is internal even though the opaque completion
+/// type also participates in the public reusable backend implementation:
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::{backend::MlxCompletion, native::Array};
+///
+/// fn submit(output: Array) {
+///     let _ = MlxCompletion::submission(output);
+/// }
+/// ```
 pub mod native {
     pub use crate::backend::nn::generation::sample;
     pub use crate::backend::runtime::generation::sampler::Sampler;
+    pub use crate::backend::MlxCompletion;
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
         MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
         MlxRealtimeModelIdentity, MlxRealtimeModelState, MlxRealtimeModelStateBranch,
         MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
     };
+    pub use crate::composition::mlx::speculative::MlxDrafter;
+    pub use crate::composition::mlx::{MlxModelInput, MlxModelSession, MlxSessionCompletion};
     pub use safemlx::*;
 
     /// Constructs an MLX backend from explicitly selected native streams.

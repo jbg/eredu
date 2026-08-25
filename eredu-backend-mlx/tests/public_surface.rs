@@ -5,7 +5,8 @@ use eredu_backend_mlx::backend::{
     MlxBackend,
 };
 use eredu_backend_mlx::native::{
-    error::Exception, random::RandomState, sample, Array, MlxRealtimeModel, Sampler, Stream,
+    error::Exception, random::RandomState, sample, Array, MlxCompletion, MlxDrafter, MlxModelInput,
+    MlxModelSession, MlxRealtimeModel, MlxSessionCompletion, Sampler, Stream,
 };
 use eredu_backend_mlx::{MlxModelOutput, MlxTensor};
 
@@ -24,6 +25,15 @@ fn reusable_backend_modules_are_rooted_directly_under_backend() {
 fn raw_sampling_api_is_rooted_under_native() {
     let _: fn(&Array, f32, Option<&mut RandomState>, &Stream) -> Result<Array, Exception> = sample;
     assert_public_type::<dyn Sampler>();
+}
+
+#[test]
+fn native_model_execution_types_are_rooted_under_native() {
+    assert_public_type::<MlxCompletion>();
+    assert_public_type::<MlxDrafter>();
+    assert_public_type::<MlxModelInput>();
+    assert_public_type::<MlxModelSession<'static>>();
+    assert_public_type::<MlxSessionCompletion>();
 }
 
 #[test]

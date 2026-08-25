@@ -81,9 +81,12 @@ streams, or random state are exported only through that native namespace, not
 through the flat application-facing adapter. Concrete realtime backend types,
 inputs, outputs, sessions, completions, and prompt helpers follow the same
 rule; the flat realtime factory returns an opaque neutral-trait implementation.
-The flat adapter likewise keeps
-the native borrowed model-input views private and returns model logits through
-the backend-owned `MlxTensor` handle.
+Concrete causal sessions, exact completion types, speculative drafters, and
+owned model inputs also live under `eredu-backend-mlx::native`; callers of the
+flat backend use their neutral trait interfaces and inferred associated types.
+Raw completion submission remains crate-private. The flat adapter keeps native
+borrowed model-input views private and returns model logits through the
+backend-owned `MlxTensor` handle.
 Facade examples follow the same rule and construct selected local sessions
 through `eredu::api`. Backend-author probes that intentionally manipulate MLX
 tensors, streams, distributed groups, caches, or checkpoint packing live as
@@ -916,7 +919,7 @@ composition:
   parameter, submission, and transfer traits for architecture specialization.
 - `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and
   is the sole MLX implementation of `eredu_nn::Tensor`;
-- `composition::mlx::MlxModelSession` owns the executable model, cache,
+- `native::MlxModelSession` composition owns the executable model, cache,
   processor state, and
   optional distributed context. The prepared `MlxModel` wrapper exposes
   neutral capabilities and telemetry while keeping its executable kind and

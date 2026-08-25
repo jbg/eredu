@@ -429,7 +429,7 @@ impl Drop for MlxCompletion {
 }
 
 impl MlxCompletion {
-    pub fn submission(output: Array) -> Result<Submission<Array, Self>, Error> {
+    pub(crate) fn submission(output: Array) -> Result<Submission<Array, Self>, Error> {
         Self::submission_retaining(output, std::iter::empty())
     }
 

@@ -17,9 +17,9 @@ use eredu_backend_mlx::backend::runtime::media::input::{InputPart, ModelInput};
 use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
-    Array, Device, DeviceType, ExecutionContext, Stream,
+    Array, Device, DeviceType, ExecutionContext, MlxModelInput, MlxModelSession, Stream,
 };
-use eredu_backend_mlx::{MlxBackend, MlxModelInput, MlxModelSession, ModelLoadOptions};
+use eredu_backend_mlx::{MlxBackend, ModelLoadOptions};
 use eredu_core::{
     load_model, BackendProvider as _, BackendSession as _, ObservationValue, TensorObservationData,
 };
