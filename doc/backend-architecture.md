@@ -42,7 +42,8 @@ streams, tensors, samplers, or backend load options. Tests that require those
 backend facilities live in `eredu-backend-mlx`, while facade sampling-policy
 tests use neutral sampling traits and mock backends. The backend crate does not
 alias neutral crates into its namespace; direct backend consumers import
-neutral contracts from their owning crates.
+neutral contracts from their owning crates. Composition-only load validation
+helpers remain crate-private rather than becoming part of the backend API.
 
 The facade likewise does not alias `eredu-core` or re-export `eredu-runtime`
 infrastructure. Cache workers, checkpoint storage bindings, residency and

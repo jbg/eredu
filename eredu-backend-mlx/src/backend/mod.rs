@@ -17,7 +17,6 @@ pub mod residency;
 pub mod runtime;
 /// MLX process-local device binding for a canonical core rank topology.
 pub mod topology;
-pub use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;

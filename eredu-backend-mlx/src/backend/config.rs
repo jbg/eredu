@@ -45,6 +45,19 @@ impl ModelLoadOptions {
         self
     }
 
+    pub(crate) fn validate_replicated(self) -> Result<(), Error> {
+        if self
+            .parallel
+            .is_some_and(|topology| !topology.is_replicated())
+        {
+            return Err(Error::Parallel(
+                "replicated MLX model loading requires a replicated topology; construct a distributed MlxBackend and MlxModelSession for partitioned execution"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn preparation_policy(self) -> Result<eredu_core::PreparationPolicy, Error> {
         use eredu_core::{QuantizationRequest, ResidencyRequest};
         use eredu_runtime::LayerWeightResidency;
@@ -88,19 +101,6 @@ impl ModelLoadOptions {
             topology: self.parallel.map(MlxParallelContext::topology),
         })
     }
-}
-
-pub fn ensure_replicated_load_options(options: ModelLoadOptions) -> Result<(), Error> {
-    if options
-        .parallel
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(Error::Parallel(
-            "this facade owns replicated runtime state; load through a distributed MlxBackend and create its MlxModelSession"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

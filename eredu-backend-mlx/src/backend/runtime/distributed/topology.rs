@@ -1020,14 +1020,14 @@ mod tests {
     }
 
     #[test]
-    fn replicated_facades_reject_distributed_session_topologies() {
+    fn replicated_load_options_reject_distributed_session_topologies() {
         let default = crate::backend::ModelLoadOptions::default();
         assert_eq!(default.quantization, None);
         assert_eq!(default.parallel, None);
-        crate::backend::ensure_replicated_load_options(default).unwrap();
+        default.validate_replicated().unwrap();
 
         let singleton = crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1));
-        crate::backend::ensure_replicated_load_options(singleton).unwrap();
+        singleton.validate_replicated().unwrap();
         let combined = crate::backend::ModelLoadOptions::with_quantization(
             eredu_checkpoint::WeightQuantization::MxFp4,
         )
@@ -1039,15 +1039,15 @@ mod tests {
         assert!(combined.parallel.unwrap().is_replicated());
 
         let tensor_parallel = crate::backend::ModelLoadOptions::with_parallel(topology(0, 2, 1, 1));
-        assert!(crate::backend::ensure_replicated_load_options(tensor_parallel).is_err());
+        assert!(tensor_parallel.validate_replicated().is_err());
 
         let pipeline_partitioned =
             crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 2, 1));
-        assert!(crate::backend::ensure_replicated_load_options(pipeline_partitioned).is_err());
+        assert!(pipeline_partitioned.validate_replicated().is_err());
 
         let expert_partitioned =
             crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 2));
-        assert!(crate::backend::ensure_replicated_load_options(expert_partitioned).is_err());
+        assert!(expert_partitioned.validate_replicated().is_err());
     }
 
     #[test]

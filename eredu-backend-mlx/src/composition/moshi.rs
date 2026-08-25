@@ -15,7 +15,6 @@ use eredu_runtime::{
 use safemlx::{module::ModuleParameters, Array, Stream};
 
 use crate::backend::{
-    ensure_replicated_load_options,
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
@@ -389,7 +388,7 @@ pub fn load(
             weights_stream,
         );
     }
-    ensure_replicated_load_options(options)?;
+    options.validate_replicated()?;
 
     let mut architecture = Architecture::new(target_config.clone(), stream)?;
     let static_recipes = Arc::clone(&source_recipes);
