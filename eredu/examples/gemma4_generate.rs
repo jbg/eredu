@@ -1,17 +1,9 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 use eredu::{
-    api::{
-        local_device_plan, LoadedModel, LoadedModelLoadError, LocalBackend, LocalBackendError,
-        LocalBackendFactory, LocalDevice,
-    },
-    ExecutionPlan, GenerationConfigOverrides, PlannedModelLoadError, TextGenerationConfig,
-    TokenOutput,
+    api::{local_device_plan, LoadedModel, LocalBackend, LocalBackendFactory, LocalDevice},
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use serde_json::Value;
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -29,30 +21,14 @@ fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(0.0);
 
-    print_config_summary(&model_dir)?;
-
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
-    let planned = match LoadedModel::load_execution_plan(
-        &LocalBackendFactory::default(),
-        &model_dir,
-        &plan,
-    ) {
-        Ok(model) => model,
-        Err(PlannedModelLoadError::Loading(LoadedModelLoadError::Backend(
-            LocalBackendError::StrictLoadValidation { missing, unused },
-        ))) => {
-            print_strict_report(&missing, &unused);
-            anyhow::bail!(
-                "strict load failed; implement the missing architecture or key mapping above"
-            );
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
 
     let rendered = model
         .apply_chat_template_json(
-            vec![vec![gemma4_message(&prompt, model.model_id_for_template())]],
+            vec![vec![gemma4_message(&prompt, model.model_id())]],
             None,
             true,
         )?
@@ -139,75 +115,4 @@ fn default_e4b_snapshot() -> Option<PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .find(|path| path.join("config.json").exists())
-}
-
-fn print_config_summary(model_dir: &Path) -> anyhow::Result<()> {
-    let config_path = model_dir.join("config.json");
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-    let text = config.get("text_config").unwrap_or(&config);
-    println!("=== Gemma 4 E4B generation ===");
-    println!("model_dir: {}", model_dir.display());
-    for key in [
-        "model_type",
-        "hidden_size",
-        "num_hidden_layers",
-        "hidden_size_per_layer_input",
-        "num_kv_shared_layers",
-        "attention_k_eq_v",
-        "enable_moe_block",
-    ] {
-        println!("{key}: {}", text.get(key).unwrap_or(&Value::Null));
-    }
-    if let Some(quantization) = config.get("quantization") {
-        println!("quantization: {quantization}");
-    }
-    Ok(())
-}
-
-fn print_strict_report(missing: &[String], unused: &[String]) {
-    println!("\n=== strict load failed ===");
-    println!("missing parameters: {}", missing.len());
-    print_groups("missing", missing);
-    print_examples("missing examples", missing);
-    println!("\nunused weights: {}", unused.len());
-    print_groups("unused", unused);
-    print_examples("unused examples", unused);
-}
-
-fn print_groups(label: &str, keys: &[String]) {
-    let mut groups = BTreeMap::<String, usize>::new();
-    for key in keys {
-        *groups.entry(group_key(key)).or_default() += 1;
-    }
-    println!("\n{label} groups:");
-    for (group, count) in groups.iter().take(80) {
-        println!("  {count:4}  {group}");
-    }
-    if groups.len() > 80 {
-        println!("  ... and {} more groups", groups.len() - 80);
-    }
-}
-
-fn print_examples(label: &str, keys: &[String]) {
-    println!("\n{label}:");
-    for key in keys.iter().take(80) {
-        println!("  {key}");
-    }
-    if keys.len() > 80 {
-        println!("  ... and {} more", keys.len() - 80);
-    }
-}
-
-fn group_key(key: &str) -> String {
-    let key = key
-        .strip_prefix("language_model.model.")
-        .or_else(|| key.strip_prefix("model.language_model."))
-        .unwrap_or(key);
-    let mut parts = key.split('.').collect::<Vec<_>>();
-    for part in &mut parts {
-        if part.chars().all(|ch| ch.is_ascii_digit()) {
-            *part = "#";
-        }
-    }
-    parts.into_iter().take(4).collect::<Vec<_>>().join(".")
 }

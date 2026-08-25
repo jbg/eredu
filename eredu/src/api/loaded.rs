@@ -398,11 +398,6 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         ))
     }
 
-    /// Returns the model id passed to chat-template rendering.
-    pub fn model_id_for_template(&self) -> &str {
-        &self.model_id
-    }
-
     /// Returns the stable identity of the template selected for `tools`.
     pub fn selected_chat_template_identity(
         &self,
