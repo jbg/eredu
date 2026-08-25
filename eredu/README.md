@@ -74,10 +74,11 @@ drafter described by the plan.
 
 ## Cargo features
 
-- `mlx`: MLX model loading and execution; enabled by default.
+- `mlx`: MLX execution with Metal and Accelerate; enabled by default.
 - `mlx-image`: MLX image and video preprocessing.
 - `mlx-audio`: MLX audio preprocessing.
-- `cuda`: MLX CUDA execution on supported Linux and Windows hosts.
+- `cuda`: MLX CUDA execution on supported Linux and Windows hosts without
+  enabling Metal or Accelerate.
 - `nccl`: NCCL distributed support for CUDA builds.
 - `onig`: Oniguruma tokenizer regular expressions; enabled by default.
 - `esaxx_fast`: fast SentencePiece-compatible tokenization; enabled by

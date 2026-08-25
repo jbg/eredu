@@ -1,7 +1,7 @@
 //! Backend-neutral language-model facade.
 //!
 //! This module is available without an execution backend. Enabling the
-//! default `mlx` feature adds the selected local execution adapter.
+//! `mlx` or `cuda` feature adds the selected local execution adapter.
 
 mod media;
 mod metadata;
@@ -9,7 +9,7 @@ mod portable;
 mod request;
 mod tokenizer;
 
-#[cfg(feature = "mlx")]
+#[cfg(feature = "_mlx")]
 mod selected;
 
 pub use crate::runtime::chat::constraints::ConstraintError;
@@ -23,7 +23,7 @@ pub use request::{
     PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpGenerationOptions,
     PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint,
 };
-#[cfg(feature = "mlx")]
+#[cfg(feature = "_mlx")]
 pub use selected::*;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 

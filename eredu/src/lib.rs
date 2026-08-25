@@ -1,7 +1,7 @@
 //! Backend-neutral model loading, generation, and realtime facade.
 //!
 //! [`api`] and [`runtime`] remain available without an execution backend. The
-//! default `mlx` feature adds the MLX model implementations and runtime.
+//! `mlx` or `cuda` feature adds the MLX model implementations and runtime.
 //!
 //! Backend implementation contracts are imported from their owning crates:
 //!

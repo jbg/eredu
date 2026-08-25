@@ -16,27 +16,27 @@ autoexamples = false
 [[example]]
 name = "gemma4_generate"
 path = "examples/gemma4_generate.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[example]]
 name = "gemma4_speculative_generate"
 path = "examples/gemma4_speculative_generate.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[example]]
 name = "gguf_generate"
 path = "examples/gguf_generate.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[example]]
 name = "native_tool_calling"
 path = "examples/native_tool_calling.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[example]]
 name = "qwen35_moe_bench"
 path = "examples/qwen35_moe_bench.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[test]]
 name = "backend_conformance"
@@ -57,36 +57,37 @@ path = "tests/portable_facade.rs"
 [[test]]
 name = "selected_backend_api"
 path = "tests/selected_backend_api.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[test]]
 name = "automatic_planner_api"
 path = "tests/automatic_planner_api.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [[test]]
 name = "native_tool_checkpoints"
 path = "tests/native_tool_checkpoints.rs"
-required-features = ["mlx"]
+required-features = ["_mlx"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
 no-default-features = true
-features = ["mlx-image", "mlx-audio"]
+features = ["mlx", "mlx-image", "mlx-audio"]
 
 [features]
 default = ["mlx", "onig", "esaxx_fast"]
 
+_mlx = ["dep:eredu-backend-mlx"]
 mlx = [
-    "dep:eredu-backend-mlx",
+    "_mlx",
     "eredu-backend-mlx/accelerate",
     "eredu-backend-mlx/metal",
 ]
-cuda = ["mlx", "eredu-backend-mlx/cuda"]
+cuda = ["_mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
 nccl = ["cuda", "eredu-backend-mlx/nccl"]
-mlx-media = ["mlx", "eredu-backend-mlx/media"]
+mlx-media = ["_mlx", "eredu-backend-mlx/media"]
 mlx-image = ["mlx-media", "eredu-backend-mlx/image"]
 mlx-audio = ["mlx-media", "eredu-backend-mlx/audio"]
 

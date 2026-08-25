@@ -4,7 +4,9 @@
 //! behind this module. Applications configure and operate the selected local
 //! backend through portable plans and facade-owned diagnostics.
 
-use std::{path::PathBuf, time::Duration};
+#[cfg(feature = "mlx")]
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// Discovers hardware available to the selected local backend.
 pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
@@ -97,6 +99,7 @@ impl Default for LocalRealtimeBackendFactory {
 /// Process-global configuration for the selected local runtime.
 #[derive(Debug, Clone, Default)]
 pub struct LocalRuntimeConfiguration {
+    #[cfg(feature = "mlx")]
     accelerator_library_path: Option<PathBuf>,
     allocator_cache_limit: Option<usize>,
 }
@@ -106,6 +109,7 @@ impl LocalRuntimeConfiguration {
     ///
     /// Embedded Apple applications use this when their bundled library cannot
     /// be found through the runtime's default search path.
+    #[cfg(feature = "mlx")]
     pub fn with_accelerator_library(mut self, path: impl Into<PathBuf>) -> Self {
         self.accelerator_library_path = Some(path.into());
         self
@@ -122,6 +126,7 @@ impl LocalRuntimeConfiguration {
 pub fn configure_local_runtime(
     configuration: &LocalRuntimeConfiguration,
 ) -> Result<(), LocalBackendError> {
+    #[cfg(feature = "mlx")]
     if let Some(path) = &configuration.accelerator_library_path {
         eredu_backend_mlx::native::metal::set_metallib_path(path)?;
     }
