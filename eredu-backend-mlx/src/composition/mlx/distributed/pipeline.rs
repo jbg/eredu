@@ -14055,7 +14055,6 @@ fn load_llama_pipeline(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Llama], "Llama")?;
-    topology.preflight(Some(source_args.attention_schedule.len()), None)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -14079,42 +14078,25 @@ fn load_llama_pipeline(
         }
         None => (store, source_args.clone(), None),
     };
-    let range = topology.layer_range(source_args.attention_schedule.len())?;
     let binding_adapter = crate::composition::llama::LlamaPipelineBindings::new();
     let seed_architecture = eredu_architectures::llama::LayeredModel::<MlxNeuralBackend>::new(
         target_args.clone(),
         stream,
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut parameter_groups =
-        eredu_architectures::llama::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &seed_architecture.static_modules().embeddings,
-            &seed_architecture.static_modules().norm,
-            seed_architecture.static_modules().lm_head.as_ref(),
-            "model",
-        )?;
-    for layer in 0..target_args.num_hidden_layers as usize {
-        let block = eredu_architectures::llama::TransformerBlock::<MlxNeuralBackend>::new(
-            &target_args,
-            layer,
-            stream,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            eredu_architectures::llama::layer_parallel_parameter_groups::<MlxNeuralBackend>(
-                &block,
-                &target_args,
-                layer,
-            )?,
-        );
-    }
+    let binding_parameter_description = seed_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&seed_architecture)?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        decoder_group,
+        "Llama decoder",
+    )?;
+    topology.preflight(Some(target_units), None)?;
+    let range = topology.layer_range(target_units)?;
     let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::llama::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let architecture =
@@ -14703,10 +14685,6 @@ fn load_muse_glimmer_pipeline(
     } else {
         MuseGlimmerPipelineBindings::new()
     };
-    topology.preflight(
-        Some(source_args.num_hidden_layers as usize),
-        external_experts.then_some(source_args.num_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             should_quantize_on_load("Muse-Glimmer pipeline", source_args.quantization, requested)
@@ -14727,21 +14705,26 @@ fn load_muse_glimmer_pipeline(
     } else {
         MuseGlimmerPipelineBindings::new()
     };
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
-    let mut parameter_groups = muse_glimmer::static_parameter_groups(&target_args)?;
-    for layer in 0..target_args.num_hidden_layers as usize {
-        parameter_groups.extend(muse_glimmer::layer_parameter_groups(&target_args, layer)?);
-    }
     let seed_architecture =
         muse_glimmer::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let binding_parameter_description = seed_architecture
+        .parameter_description()
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let binding_decoder_group =
+        architecture_decoder_group::<_, MlxKeyValueState>(&seed_architecture)?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        binding_decoder_group,
+        "Muse-Glimmer decoder",
+    )?;
+    topology.preflight(
+        Some(target_units),
+        external_experts.then_some(source_args.num_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
     let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = muse_glimmer::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let architecture = muse_glimmer::LayeredModel::<MlxNeuralBackend>::new_parallel(
@@ -15125,10 +15108,6 @@ fn load_neutral_qwen_vl_pipeline(
     } else {
         QwenVlPipelineBindings::new()
     };
-    topology.preflight(
-        Some(source_args.text.num_hidden_layers as usize),
-        external_experts.then_some(source_args.text.num_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -15152,75 +15131,32 @@ fn load_neutral_qwen_vl_pipeline(
     } else {
         QwenVlPipelineBindings::new()
     };
-    let range = topology.layer_range(source_args.text.num_hidden_layers as usize)?;
     let binding_architecture =
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let static_modules =
-        <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules(&binding_architecture);
-    let mut parameter_groups =
-        eredu_architectures::qwen::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &static_modules.text.embeddings,
-            &static_modules.text.norm,
-            static_modules.text.lm_head.as_ref(),
-            &target_args.text.parameter_root,
-        )?;
-    parameter_groups.extend(
-        eredu_architectures::qwen::vision::static_parallel_parameter_groups::<MlxNeuralBackend>(
-            &static_modules.vision,
-            &target_args.vision,
-            "model.visual",
-        )?,
-    );
+    let binding_parameter_description = binding_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
         &binding_architecture,
         eredu_runtime::ArchitectureGroupKind::VisionEncoder,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
-    for index in 0..target_args.vision.layer_count() {
-        let unit = binding_architecture
-            .construct_unit(vision_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let eredu_architectures::qwen::vl::Unit::Vision(block) = unit else {
-            unreachable!()
-        };
-        parameter_groups.extend(
-            eredu_architectures::qwen::vision::block_parallel_parameter_groups(
-                &block,
-                &target_args.vision,
-                "model.visual",
-                index,
-            )?,
-        );
-    }
-    for index in 0..target_args.text.num_hidden_layers as usize {
-        let unit = binding_architecture
-            .construct_unit(decoder_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let eredu_architectures::qwen::vl::Unit::Text(block) = unit else {
-            unreachable!()
-        };
-        parameter_groups.extend(
-            eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
-                &block,
-                &target_args.text,
-                index,
-            )?,
-        );
-    }
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        decoder_group,
+        "Qwen3-VL decoder",
+    )?;
+    topology.preflight(
+        Some(target_units),
+        external_experts.then_some(source_args.text.num_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        for group in parameter_groups.iter().cloned() {
-            planner.register(group)?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::vl::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         architecture = eredu_architectures::qwen::vl::LayeredModel::new_parallel(
@@ -17553,12 +17489,6 @@ fn load_lfm2_pipeline(
     } else {
         Lfm2Bindings::new()
     };
-    topology.preflight(
-        Some(source_args.layer_schedule.len()),
-        expert_cache_options
-            .is_some()
-            .then_some(source_args.num_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -17583,33 +17513,29 @@ fn load_lfm2_pipeline(
     } else {
         Lfm2Bindings::new()
     };
-    let range = topology.layer_range(source_args.layer_schedule.len())?;
     let global_architecture = eredu_architectures::lfm2::LayeredModel::<MlxNeuralBackend>::new(
         target_args.clone(),
         stream,
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut parameter_groups = eredu_architectures::lfm2::static_parallel_parameter_groups::<
-        MlxNeuralBackend,
-    >(global_architecture.static_modules())?;
+    let binding_parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_decoder_group =
         architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
-    for index in 0..target_args.num_hidden_layers as usize {
-        let block = global_architecture
-            .construct_unit(global_decoder_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(eredu_architectures::lfm2::layer_parallel_parameter_groups(
-            &block,
-            &target_args,
-            index,
-        )?);
-    }
-    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-    let mut planner = build.planner();
-    for group in parameter_groups.iter().cloned() {
-        planner.register(group)?;
-    }
-    let (_, planned_layout) = planner.finish()?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        global_decoder_group,
+        "LFM2 decoder",
+    )?;
+    topology.preflight(
+        Some(target_units),
+        expert_cache_options
+            .is_some()
+            .then_some(source_args.num_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
+    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::lfm2::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -18107,12 +18033,7 @@ fn load_nemotron_h_pipeline(
         external_experts.then_some(source_args.n_routed_experts as usize),
     )?;
     let range = topology.layer_range(target_units)?;
-    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-    let mut planner = build.planner();
-    for group in binding_parameter_description.groups() {
-        planner.register(group.group().clone())?;
-    }
-    let (_, planned_layout) = planner.finish()?;
+    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::nemotron_h::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -19333,12 +19254,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     )?;
     let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        for group in binding_parameter_description.groups() {
-            planner.register(group.group().clone())?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::hybrid::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         architecture =
@@ -19784,11 +19700,7 @@ fn load_neutral_qwen_conditional_pipeline(
     )?;
     let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
-        for group in binding_parameter_description.groups() {
-            planner.register(group.group().clone())?;
-        }
-        let (_, layout) = planner.finish()?;
+        let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry =
             eredu_architectures::qwen::hybrid::conditional_local_geometry(&target, &layout)
                 .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -20236,12 +20148,6 @@ fn load_kimi_linear_pipeline(
     } else {
         KimiLinearBindings::new()
     };
-    topology.preflight(
-        Some(source_args.num_hidden_layers as usize),
-        expert_cache_options
-            .is_some()
-            .then_some(source_args.num_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -20265,36 +20171,30 @@ fn load_kimi_linear_pipeline(
     } else {
         KimiLinearBindings::new()
     };
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let global_architecture =
         eredu_architectures::kimi_linear::LayeredModel::<MlxNeuralBackend>::new(
             target_args.clone(),
             stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut parameter_groups = eredu_architectures::kimi_linear::static_parallel_parameter_groups::<
-        MlxNeuralBackend,
-    >(global_architecture.static_modules())?;
+    let binding_parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_decoder_group =
         architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
-    for index in 0..target_args.num_hidden_layers as usize {
-        let block = global_architecture
-            .construct_unit(global_decoder_group, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        parameter_groups.extend(
-            eredu_architectures::kimi_linear::layer_parallel_parameter_groups(
-                &block,
-                &target_args,
-                index,
-            )?,
-        );
-    }
-    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-    let mut planner = build.planner();
-    for group in parameter_groups.iter().cloned() {
-        planner.register(group)?;
-    }
-    let (_, planned_layout) = planner.finish()?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        global_decoder_group,
+        "Kimi Linear decoder",
+    )?;
+    topology.preflight(
+        Some(target_units),
+        expert_cache_options
+            .is_some()
+            .then_some(source_args.num_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
+    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::kimi_linear::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -20755,10 +20655,6 @@ fn load_neutral_inkling_pipeline(
     } else {
         InklingBindings::new()
     };
-    topology.preflight(
-        Some(source_args.text_config.num_hidden_layers as usize),
-        external_experts.then_some(source_args.text_config.n_routed_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -20783,28 +20679,27 @@ fn load_neutral_inkling_pipeline(
     } else {
         InklingBindings::new()
     };
-    let range = topology.layer_range(source_args.text_config.num_hidden_layers as usize)?;
-    let parameter_groups = eredu_architectures::inkling::static_parameter_groups(&target_args)?
-        .into_iter()
-        .chain(eredu_architectures::inkling::mtp_parameter_groups(
-            &target_args,
-        )?)
-        .chain(
-            (0..target_args.text_config.num_hidden_layers as usize)
-                .map(|layer| {
-                    eredu_architectures::inkling::layer_parameter_groups(&target_args, layer)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten(),
-        )
-        .collect::<Vec<_>>();
-    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-    let mut planner = build.planner();
-    for group in parameter_groups.iter().cloned() {
-        planner.register(group)?;
-    }
-    let (_, planned_layout) = planner.finish()?;
+    let global_architecture = eredu_architectures::inkling::LayeredModel::<MlxNeuralBackend>::new(
+        target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let binding_parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let global_decoder_group =
+        architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        global_decoder_group,
+        "Inkling decoder",
+    )?;
+    topology.preflight(
+        Some(target_units),
+        external_experts.then_some(source_args.text_config.n_routed_experts as usize),
+    )?;
+    let range = topology.layer_range(target_units)?;
+    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::inkling::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -21169,7 +21064,6 @@ fn load_neutral_gemma4_pipeline(
                 })
         })
         .transpose()?;
-    topology.preflight(Some(source_args.text.num_hidden_layers()), expert_count)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -21190,32 +21084,36 @@ fn load_neutral_gemma4_pipeline(
         },
     )?;
     let target_binding_adapter = Gemma4Bindings::new(external_experts);
-    let ranges = source_args
+    let global_architecture = eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::new(
+        target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let binding_parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let global_decoder_group =
+        architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        global_decoder_group,
+        "Gemma 4 decoder",
+    )?;
+    topology.preflight(Some(target_units), expert_count)?;
+    let ranges = target_args
         .text
         .pipeline_layer_ranges(topology.pipeline_parallel_size)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    if ranges.iter().map(Range::len).sum::<usize>() != target_units {
+        return Err(Error::Parallel(
+            "Gemma 4 architecture pipeline ranges disagree with its parameter description".into(),
+        ));
+    }
     let range = ranges
         .get(topology.pipeline_parallel_rank)
         .cloned()
         .ok_or_else(|| Error::Parallel("Gemma 4 pipeline rank has no layer range".into()))?;
-    let parameter_groups = eredu_architectures::gemma4::static_parameter_groups(&target_args.text)?
-        .into_iter()
-        .chain(
-            (0..target_args.text.num_hidden_layers())
-                .map(|layer| {
-                    eredu_architectures::gemma4::layer_parameter_groups(&target_args.text, layer)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten(),
-        )
-        .collect::<Vec<_>>();
-    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-    let mut planner = build.planner();
-    for group in parameter_groups.iter().cloned() {
-        planner.register(group)?;
-    }
-    let (_, planned_layout) = planner.finish()?;
+    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::gemma4::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -21612,6 +21510,18 @@ fn architecture_parallel_layout(
         planner.register(group.group().clone())?;
     }
     planner.finish().map(|(_, layout)| layout)
+}
+
+fn architecture_group_unit_count(
+    description: &eredu_runtime::ArchitectureParameterDescription,
+    group: usize,
+    label: &str,
+) -> Result<usize, Error> {
+    description
+        .unit_layout()
+        .group_range(group)
+        .map(|range| range.len())
+        .ok_or_else(|| Error::Parallel(format!("{label} parameter plan has no execution group")))
 }
 
 fn v3_sharded_unit_bindings(

@@ -605,7 +605,17 @@ fn pipeline_ring_worker() {
             ModelLoadOptions::with_parallel(topology)
         };
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
-        let expected_effective_model_type = family.descriptor_names().1;
+        let expected_effective_model_type = if family == FixtureFamily::Gemma {
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
+                    .unwrap();
+            match config["model_type"].as_str().unwrap() {
+                "gemma4_unified" => "gemma4_unified",
+                _ => family.descriptor_names().1,
+            }
+        } else {
+            family.descriptor_names().1
+        };
         let expected_model_family =
             ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
         assert_eq!(model.model_family(), expected_model_family);
@@ -650,7 +660,7 @@ fn pipeline_ring_worker() {
         let capabilities =
             <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::model_capabilities(&runtime)
                 .unwrap();
-        assert_eq!(capabilities.model_type, family.descriptor_names().1);
+        assert_eq!(capabilities.model_type, expected_effective_model_type);
         let counted = <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::count_prepared_input(
             &runtime,
             &capability_input,
@@ -1771,9 +1781,9 @@ fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
             "hidden_size": 4,
             "num_hidden_layers": 2,
             "intermediate_size": 8,
-            "num_attention_heads": 1,
-            "num_key_value_heads": 1,
-            "head_dim": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
             "rms_norm_eps": 0.00001,
             "vocab_size": 8,
             "max_position_embeddings": 32,
@@ -3572,6 +3582,7 @@ fn inkling_config() -> serde_json::Value {
             "torch_dtype": "float32",
             "hidden_size": 16,
             "num_hidden_layers": 3,
+            "model_max_length": 32,
             "vocab_size": 32,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
