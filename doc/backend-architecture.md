@@ -199,8 +199,11 @@ Loaded backend models and sessions preserve these as two distinct identities:
 `effective_model_type()` returns the parsed implementation or nested text-model
 type. Complete-model materialization stores the already resolved `ModelKind`
 alongside the concrete model implementation; it does not reconstruct family
-identity from the effective type. Both identities are invariant across
-replicated, tensor-parallel, and pipeline-parallel placement.
+identity from the effective type. Distributed composition carries that same
+admitted `ModelKind` into every pipeline stage; a rank-local architecture
+partition does not derive another family identity from its parsed variant or
+nested configuration. Both identities are invariant across replicated,
+tensor-parallel, and pipeline-parallel placement.
 
 Architecture checkpoint modules also own canonical name translation and the
 complete derived-weight recipe catalogs for static modules, execution units,

@@ -137,14 +137,6 @@ use safemlx::ops::indexing::TryIndexOp;
 
 type LlamaBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxNeuralBackend>>;
 
-fn qwen_model_kind(args: &eredu_architectures::qwen::ModelArgs) -> ModelKind {
-    match args.variant {
-        eredu_architectures::qwen::QwenVariant::Qwen2 => ModelKind::Qwen2,
-        eredu_architectures::qwen::QwenVariant::Qwen3
-        | eredu_architectures::qwen::QwenVariant::Qwen3Moe => ModelKind::Qwen3,
-    }
-}
-
 /// Cold-path checkpoint capabilities needed while assembling a pipeline stage.
 ///
 /// This deliberately excludes forward execution, cache semantics, and residency
@@ -2951,8 +2943,6 @@ type InklingPipelinePartition = MediaPipelineRealization<
 /// execution. Transport, persistence, residency, and sampling stay in
 /// [`PipelineModel`].
 trait PipelinePartitionMetadata {
-    fn model_kind(&self) -> ModelKind;
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>;
@@ -3142,10 +3132,9 @@ trait PipelineForward: PipelinePartitionMetadata {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if execution.is_some_and(ParallelExecutionContext::is_tensor_parallel) {
-            return Err(Error::Parallel(format!(
-                "pipeline architecture {:?} has no tensor-sharded stage implementation",
-                self.model_kind()
-            )));
+            return Err(Error::Parallel(
+                "pipeline architecture has no tensor-sharded stage implementation".into(),
+            ));
         }
         self.forward(input, step, mask, cache, stream)
     }
@@ -5405,10 +5394,6 @@ fn pipeline_state_offset(family: &str, caches: &[PipelineLayerCache]) -> Result<
 }
 
 impl PipelinePartitionMetadata for LlamaPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::Llama
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -5421,10 +5406,7 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("llama", input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -5726,10 +5708,6 @@ impl DeepSeekV3PipelinePartition {
 }
 
 impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::DeepSeekV3
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -5742,10 +5720,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("deepseek_v3", input)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6224,10 +6199,6 @@ impl DeepSeekV4PipelinePartition {
 }
 
 impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::DeepSeekV4
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -6240,10 +6211,7 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("deepseek_v4", input)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6758,10 +6726,6 @@ impl PipelineForward for DeepSeekV4PipelinePartition {
 }
 
 impl PipelinePartitionMetadata for Gemma4PipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::Gemma4
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -6958,10 +6922,6 @@ impl PipelineForward for Gemma4PipelinePartition {
 }
 
 impl PipelinePartitionMetadata for QwenPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        qwen_model_kind(self.args())
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -6974,10 +6934,7 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("qwen", input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7111,10 +7068,6 @@ impl PipelineForward for QwenPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::MuseGlimmer
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -7372,10 +7325,6 @@ impl PipelineForward for MuseGlimmerPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for InklingPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::Inkling
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -8103,14 +8052,6 @@ impl QwenVlPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for QwenVlPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        if self.args().text.is_moe() {
-            ModelKind::Qwen3VlMoe
-        } else {
-            ModelKind::Qwen3Vl
-        }
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -8823,10 +8764,6 @@ impl QwenConditionalPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::Qwen35
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -9174,10 +9111,6 @@ impl PipelineForward for QwenConditionalPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for GptOssPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::GptOss
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -9190,10 +9123,7 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("gpt_oss", input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9327,10 +9257,6 @@ impl PipelineForward for GptOssPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for Lfm2PipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::Lfm2
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -9343,10 +9269,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("lfm2", input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9480,10 +9403,6 @@ impl PipelineForward for Lfm2PipelinePartition {
 }
 
 impl PipelinePartitionMetadata for NemotronHPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::NemotronH
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -9496,10 +9415,7 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("nemotron_h", input)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -9719,10 +9635,6 @@ impl PipelineForward for NemotronHPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        ModelKind::KimiLinear
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -9735,10 +9647,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
         input: &eredu_architectures::media_plan::PreparedInputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        eredu_architectures::media_plan::text_only_input_part(
-            self.model_kind().canonical_name(),
-            input,
-        )
+        eredu_architectures::media_plan::text_only_input_part("kimi_linear", input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -10037,13 +9946,6 @@ impl PipelineModel {
         }
         info.concurrent_residency_peak_bytes = info.planned_owned_parameter_bytes;
         info.observed_concurrent_residency_peak_bytes = info.local_parameter_bytes as u64;
-        if stage.model_kind() != info.model_kind {
-            return Err(Error::Parallel(format!(
-                "pipeline adapter architecture {:?} does not match stage architecture {:?}",
-                stage.model_kind(),
-                info.model_kind
-            )));
-        }
         let cache_identity = stage.prompt_cache_model_identity(topology)?;
         if cache_identity.global_layer_start != info.global_layer_range.start
             || cache_identity.global_layer_end < info.global_layer_range.end
@@ -11867,6 +11769,25 @@ fn validate_distributed_stage_topology(topology: MlxParallelContext) -> Result<(
     Ok(())
 }
 
+fn validate_admitted_pipeline_kind(
+    model_kind: ModelKind,
+    supported_kinds: &[ModelKind],
+    adapter: &str,
+) -> Result<(), Error> {
+    if supported_kinds.contains(&model_kind) {
+        return Ok(());
+    }
+    Err(Error::ArchitectureModel(format!(
+        "artifact admitted {}, but the {adapter} pipeline adapter supports {}",
+        model_kind.canonical_name(),
+        supported_kinds
+            .iter()
+            .map(|kind| kind.canonical_name())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )))
+}
+
 #[cfg(test)]
 #[test]
 fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
@@ -11889,6 +11810,23 @@ fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
     )
     .unwrap();
     assert!(validate_distributed_stage_topology(replicated).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn pipeline_kind_validation_trusts_admission_and_checks_the_adapter() {
+    validate_admitted_pipeline_kind(
+        ModelKind::Qwen2,
+        &[ModelKind::Qwen2, ModelKind::Qwen3],
+        "Qwen",
+    )
+    .unwrap();
+    assert!(validate_admitted_pipeline_kind(
+        ModelKind::Qwen35,
+        &[ModelKind::Qwen2, ModelKind::Qwen3],
+        "Qwen",
+    )
+    .is_err());
 }
 
 fn base_info(
@@ -13506,6 +13444,7 @@ pub fn load_pipeline_model_with_options(
         }
     };
     let (artifact, architecture_plan, _policy, route) = plan.into_parts();
+    let model_kind = architecture_plan.model_kind();
     let (expert_cache, dense_stream) = match route {
         MaterializationRoute::Resident => (None, None),
         MaterializationRoute::Layerwise => {
@@ -13577,6 +13516,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_neutral_deepseek_v4_pipeline(
                         args.clone(),
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13596,6 +13536,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_llama_pipeline(
                         prepared.args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13618,6 +13559,7 @@ pub fn load_pipeline_model_with_options(
                         )?;
                     load_muse_glimmer_pipeline(
                         args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13643,6 +13585,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_neutral_deepseek_v3_pipeline(
                         args.clone(),
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13660,6 +13603,7 @@ pub fn load_pipeline_model_with_options(
                     )?;
                     load_neutral_gemma4_pipeline(
                         args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13686,6 +13630,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_qwen_pipeline(
                         args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13707,6 +13652,7 @@ pub fn load_pipeline_model_with_options(
                     )?;
                     load_neutral_qwen_vl_pipeline(
                         args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13726,6 +13672,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_gpt_oss_pipeline(
                         prepared.args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13748,6 +13695,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_lfm2_pipeline(
                         prepared.args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13768,6 +13716,7 @@ pub fn load_pipeline_model_with_options(
                     let _ = architecture;
                     load_nemotron_h_pipeline(
                         prepared.args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13788,6 +13737,7 @@ pub fn load_pipeline_model_with_options(
                     if parsed.vision.is_some() {
                         load_neutral_qwen_conditional_pipeline(
                             parsed,
+                            model_kind,
                             store,
                             topology,
                             options.quantization,
@@ -13799,6 +13749,7 @@ pub fn load_pipeline_model_with_options(
                     } else {
                         load_neutral_qwen_hybrid_pipeline(
                             parsed.text,
+                            model_kind,
                             store,
                             topology,
                             options.quantization,
@@ -13819,6 +13770,7 @@ pub fn load_pipeline_model_with_options(
                     )?);
                     load_kimi_linear_pipeline(
                         prepared.args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13836,6 +13788,7 @@ pub fn load_pipeline_model_with_options(
                     )?;
                     load_neutral_inkling_pipeline(
                         args,
+                        model_kind,
                         store,
                         topology,
                         options.quantization,
@@ -13885,6 +13838,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::Llama(args) => {
             load_llama_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13897,6 +13851,7 @@ pub fn load_pipeline_model_with_options(
             let args = args.clone();
             load_neutral_deepseek_v3_pipeline(
                 args,
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13910,6 +13865,7 @@ pub fn load_pipeline_model_with_options(
             let args = args.clone();
             load_neutral_deepseek_v4_pipeline(
                 args,
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13923,6 +13879,7 @@ pub fn load_pipeline_model_with_options(
             let args = args.clone();
             load_neutral_gemma4_pipeline(
                 args,
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13935,6 +13892,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args) => {
             load_qwen_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13947,6 +13905,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::MuseGlimmer(args) => {
             load_muse_glimmer_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13959,6 +13918,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::QwenVl(args) => {
             load_neutral_qwen_vl_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13971,6 +13931,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::GptOss(args) => {
             load_gpt_oss_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13983,6 +13944,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::Lfm2(args) => {
             load_lfm2_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -13995,6 +13957,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::NemotronH(args) => {
             load_nemotron_h_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -14005,11 +13968,12 @@ pub fn load_pipeline_model_with_options(
             )
         }
         eredu_architectures::configuration::SafetensorsModelConfig::QwenHybrid(parsed)
-            if architecture_plan.model_kind() == ModelKind::Qwen3Next =>
+            if model_kind == ModelKind::Qwen3Next =>
         {
             let parsed = parsed.clone();
             load_neutral_qwen_hybrid_pipeline(
                 parsed.text,
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -14024,6 +13988,7 @@ pub fn load_pipeline_model_with_options(
             if parsed.vision.is_none() {
                 load_neutral_qwen_hybrid_pipeline(
                     parsed.text,
+                    model_kind,
                     store,
                     topology,
                     options.quantization,
@@ -14035,6 +14000,7 @@ pub fn load_pipeline_model_with_options(
             } else {
                 load_neutral_qwen_conditional_pipeline(
                     parsed,
+                    model_kind,
                     store,
                     topology,
                     options.quantization,
@@ -14048,6 +14014,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::configuration::SafetensorsModelConfig::KimiLinear(args) => {
             load_kimi_linear_pipeline(
                 args.clone(),
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -14061,6 +14028,7 @@ pub fn load_pipeline_model_with_options(
             let args = args.clone();
             load_neutral_inkling_pipeline(
                 args,
+                model_kind,
                 store,
                 topology,
                 options.quantization,
@@ -14078,6 +14046,7 @@ pub fn load_pipeline_model_with_options(
 
 fn load_llama_pipeline(
     source_args: LlamaModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -14085,6 +14054,7 @@ fn load_llama_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::Llama], "Llama")?;
     topology.preflight(Some(source_args.attention_schedule.len()), None)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
@@ -14166,7 +14136,7 @@ fn load_llama_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::Llama,
+        model_kind,
         source_args.hidden_size,
     );
     let complete_state = architecture
@@ -14356,6 +14326,7 @@ impl LlamaPipelinePartition {
 #[allow(clippy::too_many_arguments)]
 fn load_qwen_pipeline(
     source_args: eredu_architectures::qwen::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -14364,6 +14335,7 @@ fn load_qwen_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::Qwen2, ModelKind::Qwen3], "Qwen")?;
     if expert_cache_options.is_some() && !source_args.is_moe() {
         return Err(Error::Parallel(
             "pipeline independent expert caching requires a Qwen3-MoE checkpoint".into(),
@@ -14438,7 +14410,7 @@ fn load_qwen_pipeline(
         topology,
         range.clone(),
         placement,
-        qwen_model_kind(&source_args),
+        model_kind,
         source_args.hidden_size,
     );
     let expert_assignment = binding_adapter
@@ -14710,6 +14682,7 @@ fn load_qwen_pipeline(
 }
 fn load_muse_glimmer_pipeline(
     source_args: muse_glimmer::DecoderConfig,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -14718,6 +14691,7 @@ fn load_muse_glimmer_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::MuseGlimmer], "Muse-Glimmer")?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
     if external_experts && !source_args.is_moe() {
         return Err(Error::Parallel(
@@ -14788,7 +14762,7 @@ fn load_muse_glimmer_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::MuseGlimmer,
+        model_kind,
         source_args.hidden_size,
     );
     let complete_state = architecture
@@ -15129,6 +15103,7 @@ fn load_muse_glimmer_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn load_neutral_qwen_vl_pipeline(
     source_args: eredu_architectures::qwen::vl::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -15137,6 +15112,11 @@ fn load_neutral_qwen_vl_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(
+        model_kind,
+        &[ModelKind::Qwen3Vl, ModelKind::Qwen3VlMoe],
+        "Qwen3-VL",
+    )?;
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let external_experts = expert_cache_options.is_some();
@@ -15173,11 +15153,6 @@ fn load_neutral_qwen_vl_pipeline(
         QwenVlPipelineBindings::new()
     };
     let range = topology.layer_range(source_args.text.num_hidden_layers as usize)?;
-    let kind = if source_args.text.is_moe() {
-        ModelKind::Qwen3VlMoe
-    } else {
-        ModelKind::Qwen3Vl
-    };
     let binding_architecture =
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -15266,7 +15241,7 @@ fn load_neutral_qwen_vl_pipeline(
         topology,
         range.clone(),
         placement,
-        kind,
+        model_kind,
         source_args.text.hidden_size,
     );
     let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
@@ -17061,6 +17036,7 @@ fn execute_pipeline_cached_nemotron_h(
 #[allow(clippy::too_many_arguments)]
 fn load_gpt_oss_pipeline(
     source_args: gpt_oss::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -17069,6 +17045,7 @@ fn load_gpt_oss_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::GptOss], "GPT-OSS")?;
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
@@ -17146,7 +17123,7 @@ fn load_gpt_oss_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::GptOss,
+        model_kind,
         source_args.hidden_size,
     );
     let expert_assignment = binding_adapter
@@ -17559,6 +17536,7 @@ impl GptOssPipelinePartition {
 #[allow(clippy::too_many_arguments)]
 fn load_lfm2_pipeline(
     source_args: eredu_architectures::lfm2::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -17567,6 +17545,7 @@ fn load_lfm2_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::Lfm2], "LFM2")?;
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
@@ -17649,7 +17628,7 @@ fn load_lfm2_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::Lfm2,
+        model_kind,
         source_args.hidden_size,
     );
     let runtime_state = architecture
@@ -18061,6 +18040,7 @@ impl Lfm2PipelinePartition {
 
 fn load_nemotron_h_pipeline(
     source_args: eredu_architectures::nemotron_h::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -18069,6 +18049,7 @@ fn load_nemotron_h_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::NemotronH], "Nemotron-H")?;
     let explicit_expert_cache = expert_cache_options.is_some();
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
@@ -18154,7 +18135,7 @@ fn load_nemotron_h_pipeline(
         topology,
         range.clone(),
         Arc::clone(&neutral_placement),
-        ModelKind::NemotronH,
+        model_kind,
         source_args.hidden_size,
     );
     let ownership_probe = neutral_placement
@@ -19099,14 +19080,6 @@ impl QwenHybridPipelinePartition {
 }
 
 impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
-    fn model_kind(&self) -> ModelKind {
-        if self.args().variant == eredu_architectures::qwen::hybrid::HybridVariant::Qwen3Next {
-            ModelKind::Qwen3Next
-        } else {
-            ModelKind::Qwen35
-        }
-    }
-
     fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
@@ -19282,6 +19255,7 @@ impl PipelineForward for QwenHybridPipelinePartition {
 #[allow(clippy::too_many_arguments)]
 fn load_neutral_qwen_hybrid_pipeline(
     source_args: eredu_architectures::qwen::hybrid::HybridConfig,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -19290,6 +19264,11 @@ fn load_neutral_qwen_hybrid_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(
+        model_kind,
+        &[ModelKind::Qwen3Next, ModelKind::Qwen35],
+        "Qwen hybrid",
+    )?;
     let explicit_expert_cache = expert_cache_options.is_some();
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
@@ -19326,12 +19305,6 @@ fn load_neutral_qwen_hybrid_pipeline(
         QwenHybridPipelineBindings::new_external_experts()
     } else {
         QwenHybridPipelineBindings::new()
-    };
-    let kind = if source_args.variant == eredu_architectures::qwen::hybrid::HybridVariant::Qwen3Next
-    {
-        ModelKind::Qwen3Next
-    } else {
-        ModelKind::Qwen35
     };
     let binding_architecture =
         eredu_architectures::qwen::hybrid::LayeredModel::<MlxNeuralBackend>::new(
@@ -19387,7 +19360,7 @@ fn load_neutral_qwen_hybrid_pipeline(
         topology,
         range.clone(),
         placement,
-        kind,
+        model_kind,
         source_args.hidden_size,
     );
     let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
@@ -19733,6 +19706,7 @@ fn load_neutral_qwen_hybrid_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn load_neutral_qwen_conditional_pipeline(
     source: eredu_architectures::qwen::hybrid::ParsedHybridConfig,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -19741,6 +19715,7 @@ fn load_neutral_qwen_conditional_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::Qwen35], "conditional Qwen3.5")?;
     let explicit_expert_cache = expert_cache_options.is_some();
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
@@ -19833,7 +19808,7 @@ fn load_neutral_qwen_conditional_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::Qwen35,
+        model_kind,
         source.text.hidden_size,
     );
     let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
@@ -20244,6 +20219,7 @@ fn load_neutral_qwen_conditional_pipeline(
 
 fn load_kimi_linear_pipeline(
     source_args: eredu_architectures::kimi_linear::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -20252,6 +20228,7 @@ fn load_kimi_linear_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::KimiLinear], "Kimi Linear")?;
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
@@ -20337,7 +20314,7 @@ fn load_kimi_linear_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::KimiLinear,
+        model_kind,
         source_args.hidden_size,
     );
     let runtime_state = architecture
@@ -20754,6 +20731,7 @@ impl KimiLinearPipelinePartition {
 #[allow(clippy::too_many_arguments)]
 fn load_neutral_inkling_pipeline(
     source_args: eredu_architectures::inkling::ModelArgs,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -20762,6 +20740,7 @@ fn load_neutral_inkling_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::Inkling], "Inkling")?;
     let sparse = source_args.text_config.layer_schedule.iter().any(|policy| {
         policy.feed_forward == eredu_architectures::inkling::FeedForwardPolicy::SparseMoe
     });
@@ -20848,7 +20827,7 @@ fn load_neutral_inkling_pipeline(
         topology,
         range.clone(),
         Arc::clone(&neutral_placement),
-        ModelKind::Inkling,
+        model_kind,
         source_args.text_config.hidden_size,
     );
     let ownership_probe = neutral_placement
@@ -21157,6 +21136,7 @@ fn load_neutral_inkling_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn load_neutral_gemma4_pipeline(
     source_args: eredu_architectures::gemma4::FamilyConfig,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -21165,6 +21145,7 @@ fn load_neutral_gemma4_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::Gemma4], "Gemma 4")?;
     let sparse = source_args.text.layer_schedule.iter().any(|policy| {
         policy.feed_forward == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
     });
@@ -21256,7 +21237,7 @@ fn load_neutral_gemma4_pipeline(
         topology,
         range.clone(),
         Arc::clone(&neutral_placement),
-        ModelKind::Gemma4,
+        model_kind,
         source_args.text.hidden_size,
     );
     let ownership_probe = neutral_placement
@@ -21674,6 +21655,7 @@ fn v4_sharded_unit_bindings(
 #[allow(clippy::too_many_arguments)]
 fn load_neutral_deepseek_v3_pipeline(
     source_args: eredu_architectures::deepseek::V3Args,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -21682,6 +21664,7 @@ fn load_neutral_deepseek_v3_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV3], "DeepSeek-V3")?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
     let expert_assignment = external_experts
         .then(|| {
@@ -21756,7 +21739,7 @@ fn load_neutral_deepseek_v3_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::DeepSeekV3,
+        model_kind,
         args.hidden_size,
     );
     info.owns_embedded_mtp = owns_mtp;
@@ -22075,6 +22058,7 @@ fn load_neutral_deepseek_v3_pipeline(
 }
 fn load_neutral_deepseek_v4_pipeline(
     source_args: eredu_architectures::deepseek::V4Args,
+    model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -22083,6 +22067,7 @@ fn load_neutral_deepseek_v4_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV4], "DeepSeek-V4")?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
     let expert_assignment = external_experts
         .then(|| {
@@ -22167,7 +22152,7 @@ fn load_neutral_deepseek_v4_pipeline(
         topology,
         range.clone(),
         placement,
-        ModelKind::DeepSeekV4,
+        model_kind,
         args.hidden_size,
     );
     info.activation_hidden_size = args

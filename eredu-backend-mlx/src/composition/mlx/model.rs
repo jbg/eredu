@@ -16,24 +16,16 @@ use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
-/// Architecture identity checked against both the concrete model variant and
-/// its parsed effective model type.
+/// Admitted architecture identity checked against the concrete model variant.
 #[derive(Clone, Copy)]
-pub struct ValidatedModelKind(ModelKind);
+pub struct AdmittedModelKind(ModelKind);
 
-impl ValidatedModelKind {
-    fn new(
-        artifact_kind: ModelKind,
-        effective_model_type: &str,
-        supported_kinds: &[ModelKind],
-    ) -> Result<Self, Error> {
-        let configured_kind = ModelKind::resolve_model_type(effective_model_type)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        if artifact_kind != configured_kind || !supported_kinds.contains(&configured_kind) {
+impl AdmittedModelKind {
+    fn new(artifact_kind: ModelKind, supported_kinds: &[ModelKind]) -> Result<Self, Error> {
+        if !supported_kinds.contains(&artifact_kind) {
             return Err(Error::ArchitectureModel(format!(
-                "complete model identity mismatch: artifact selected {}, effective model type {effective_model_type:?} resolved to {}, but the concrete model variant supports {}",
+                "complete model identity mismatch: artifact admitted {}, but the concrete model variant supports {}",
                 artifact_kind.canonical_name(),
-                configured_kind.canonical_name(),
                 supported_kinds
                     .iter()
                     .map(|kind| kind.canonical_name())
@@ -41,7 +33,7 @@ impl ValidatedModelKind {
                     .join(" or ")
             )));
         }
-        Ok(Self(configured_kind))
+        Ok(Self(artifact_kind))
     }
 
     const fn get(self) -> ModelKind {
@@ -56,57 +48,48 @@ impl ValidatedModelKind {
 pub enum Model {
     /// Neutral DeepSeek-V3/V4 architecture with policy-selected residency.
     DeepSeek(
-        ValidatedModelKind,
+        AdmittedModelKind,
         Box<crate::composition::deepseek::DeepSeekModel>,
     ),
     /// Gemma 4 text and multimodal model.
-    Gemma4(ValidatedModelKind, crate::composition::gemma4::Gemma4Model),
+    Gemma4(AdmittedModelKind, crate::composition::gemma4::Gemma4Model),
     /// OpenAI GPT-OSS model.
-    GptOss(ValidatedModelKind, crate::composition::gpt_oss::GptOssModel),
+    GptOss(AdmittedModelKind, crate::composition::gpt_oss::GptOssModel),
     /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.
     KimiLinear(
-        ValidatedModelKind,
+        AdmittedModelKind,
         crate::composition::kimi_linear::KimiLinearModel,
     ),
     /// Thinking Machines Lab Inkling multimodal model.
-    Inkling(
-        ValidatedModelKind,
-        crate::composition::inkling::InklingModel,
-    ),
+    Inkling(AdmittedModelKind, crate::composition::inkling::InklingModel),
     /// Llama-compatible dense model.
-    Llama(ValidatedModelKind, crate::composition::llama::LlamaModel),
+    Llama(AdmittedModelKind, crate::composition::llama::LlamaModel),
     /// Meta Muse-Glimmer dense multimodal model.
     MuseGlimmer(
-        ValidatedModelKind,
+        AdmittedModelKind,
         crate::composition::muse_glimmer::MuseGlimmerModel,
     ),
     /// Liquid AI LFM2/LFM2.5 model.
-    Lfm2(ValidatedModelKind, crate::composition::lfm2::Lfm2Model),
+    Lfm2(AdmittedModelKind, crate::composition::lfm2::Lfm2Model),
     /// Nemotron-H hybrid model.
     NemotronH(
-        ValidatedModelKind,
+        AdmittedModelKind,
         crate::composition::nemotron_h::NemotronHModel,
     ),
     /// Neutral Qwen2/Qwen2.5/Qwen3/Qwen3-MoE model.
-    Qwen(ValidatedModelKind, crate::composition::qwen::QwenModel),
+    Qwen(AdmittedModelKind, crate::composition::qwen::QwenModel),
     /// Qwen3-Next model.
     Qwen3Next(
-        ValidatedModelKind,
+        AdmittedModelKind,
         crate::composition::qwen::hybrid::QwenHybridModel,
     ),
     /// Qwen3-VL multimodal model.
-    Qwen3Vl(
-        ValidatedModelKind,
-        crate::composition::qwen::vl::QwenVlModel,
-    ),
+    Qwen3Vl(AdmittedModelKind, crate::composition::qwen::vl::QwenVlModel),
     /// Qwen3-VL-MoE multimodal model.
-    Qwen3VlMoe(
-        ValidatedModelKind,
-        crate::composition::qwen::vl::QwenVlModel,
-    ),
+    Qwen3VlMoe(AdmittedModelKind, crate::composition::qwen::vl::QwenVlModel),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
     Qwen35(
-        ValidatedModelKind,
+        AdmittedModelKind,
         crate::composition::qwen::hybrid::QwenHybridModel,
     ),
 }
@@ -116,11 +99,8 @@ impl Model {
         kind: ModelKind,
         model: Box<crate::composition::deepseek::DeepSeekModel>,
     ) -> Result<Self, Error> {
-        let identity = ValidatedModelKind::new(
-            kind,
-            model.model_type(),
-            &[ModelKind::DeepSeekV3, ModelKind::DeepSeekV4],
-        )?;
+        let identity =
+            AdmittedModelKind::new(kind, &[ModelKind::DeepSeekV3, ModelKind::DeepSeekV4])?;
         Ok(Self::DeepSeek(identity, model))
     }
 
@@ -128,8 +108,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::gemma4::Gemma4Model,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::Gemma4])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Gemma4])?;
         Ok(Self::Gemma4(identity, model))
     }
 
@@ -137,8 +116,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::gpt_oss::GptOssModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::GptOss])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::GptOss])?;
         Ok(Self::GptOss(identity, model))
     }
 
@@ -146,8 +124,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::kimi_linear::KimiLinearModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::KimiLinear])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::KimiLinear])?;
         Ok(Self::KimiLinear(identity, model))
     }
 
@@ -155,8 +132,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::inkling::InklingModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::Inkling])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Inkling])?;
         Ok(Self::Inkling(identity, model))
     }
 
@@ -164,8 +140,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::llama::LlamaModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::Llama])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Llama])?;
         Ok(Self::Llama(identity, model))
     }
 
@@ -173,8 +148,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::muse_glimmer::MuseGlimmerModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::MuseGlimmer])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::MuseGlimmer])?;
         Ok(Self::MuseGlimmer(identity, model))
     }
 
@@ -182,7 +156,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::lfm2::Lfm2Model,
     ) -> Result<Self, Error> {
-        let identity = ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::Lfm2])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Lfm2])?;
         Ok(Self::Lfm2(identity, model))
     }
 
@@ -190,8 +164,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::nemotron_h::NemotronHModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::NemotronH])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::NemotronH])?;
         Ok(Self::NemotronH(identity, model))
     }
 
@@ -199,11 +172,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::qwen::QwenModel,
     ) -> Result<Self, Error> {
-        let identity = ValidatedModelKind::new(
-            kind,
-            &model.args().model_type,
-            &[ModelKind::Qwen2, ModelKind::Qwen3],
-        )?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen2, ModelKind::Qwen3])?;
         Ok(Self::Qwen(identity, model))
     }
 
@@ -211,8 +180,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::qwen::hybrid::QwenHybridModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::Qwen3Next])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen3Next])?;
         Ok(Self::Qwen3Next(identity, model))
     }
 
@@ -220,7 +188,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::qwen::vl::QwenVlModel,
     ) -> Result<Self, Error> {
-        let identity = ValidatedModelKind::new(kind, model.model_type(), &[ModelKind::Qwen3Vl])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen3Vl])?;
         Ok(Self::Qwen3Vl(identity, model))
     }
 
@@ -228,7 +196,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::qwen::vl::QwenVlModel,
     ) -> Result<Self, Error> {
-        let identity = ValidatedModelKind::new(kind, model.model_type(), &[ModelKind::Qwen3VlMoe])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen3VlMoe])?;
         Ok(Self::Qwen3VlMoe(identity, model))
     }
 
@@ -236,8 +204,7 @@ impl Model {
         kind: ModelKind,
         model: crate::composition::qwen::hybrid::QwenHybridModel,
     ) -> Result<Self, Error> {
-        let identity =
-            ValidatedModelKind::new(kind, &model.args().model_type, &[ModelKind::Qwen35])?;
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen35])?;
         Ok(Self::Qwen35(identity, model))
     }
 
@@ -923,27 +890,18 @@ mod tests {
     }
 
     #[test]
-    fn complete_model_identity_accepts_only_matching_artifact_config_and_variant() {
-        let identity = ValidatedModelKind::new(
-            ModelKind::Qwen3,
-            "qwen3_moe",
-            &[ModelKind::Qwen2, ModelKind::Qwen3],
-        )
-        .unwrap();
+    fn complete_model_identity_trusts_admission_and_checks_the_concrete_variant() {
+        let identity =
+            AdmittedModelKind::new(ModelKind::Qwen3, &[ModelKind::Qwen2, ModelKind::Qwen3])
+                .unwrap();
         assert_eq!(identity.get(), ModelKind::Qwen3);
 
-        assert!(ValidatedModelKind::new(
-            ModelKind::Qwen2,
-            "qwen3_moe",
-            &[ModelKind::Qwen2, ModelKind::Qwen3],
-        )
-        .is_err());
-        assert!(ValidatedModelKind::new(
-            ModelKind::Qwen35,
-            "qwen3_5_moe_text",
-            &[ModelKind::Qwen3Next],
-        )
-        .is_err());
+        let aliased_identity =
+            AdmittedModelKind::new(ModelKind::Qwen2, &[ModelKind::Qwen2, ModelKind::Qwen3])
+                .unwrap();
+        assert_eq!(aliased_identity.get(), ModelKind::Qwen2);
+
+        assert!(AdmittedModelKind::new(ModelKind::Qwen35, &[ModelKind::Qwen3Next]).is_err());
     }
 
     #[test]
