@@ -53,23 +53,50 @@ pub struct ModelConfiguration {
     pub json: Option<Value>,
 }
 
+/// Portable configuration plus the architecture-owned plan produced while resolving it.
+#[derive(Debug, Clone)]
+pub struct ResolvedModelConfiguration<P> {
+    /// Backend-neutral configuration facts used by core orchestration.
+    pub configuration: ModelConfiguration,
+    /// Typed architecture state proven valid by the resolver.
+    pub architecture_plan: P,
+}
+
+impl<P> ResolvedModelConfiguration<P> {
+    /// Couples one portable configuration with the exact plan derived from it.
+    pub fn new(configuration: ModelConfiguration, architecture_plan: P) -> Self {
+        Self {
+            configuration,
+            architecture_plan,
+        }
+    }
+
+    /// Separates the portable facts from architecture-owned state.
+    pub fn into_parts(self) -> (ModelConfiguration, P) {
+        (self.configuration, self.architecture_plan)
+    }
+}
+
 /// Architecture-owned resolver used by neutral artifact inspection.
 ///
 /// Core owns the transport contract but deliberately does not recognize model
 /// family aliases, GGUF architecture spellings, or nested configuration wrappers.
 pub trait ModelConfigurationResolver {
     /// Architecture-owned state retained from artifact inspection through materialization.
-    type ArtifactPlan: Clone + std::fmt::Debug + Default;
+    type ArtifactPlan: Clone + std::fmt::Debug;
 
     /// Resolves one Hugging Face `config.json` value to its canonical family.
-    fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError>;
+    fn resolve_safetensors(
+        &self,
+        json: &Value,
+    ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError>;
 
     /// Resolves and structurally admits one GGUF architecture and checkpoint.
     fn resolve_gguf(
         &self,
         architecture: &str,
         checkpoint: &GgufCheckpoint,
-    ) -> Result<ModelConfiguration, ArtifactError>;
+    ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError>;
 
     /// Declares the sibling artifacts required by one admitted GGUF architecture.
     fn gguf_companion_requirements(
@@ -78,15 +105,16 @@ pub trait ModelConfigurationResolver {
         checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError>;
 
-    /// Derives typed architecture state from the exact artifact admitted by inspection.
+    /// Enriches resolved architecture state with exact sidecars selected by inspection.
     fn artifact_plan(
         &self,
         _path: &Path,
         _format: ArtifactFormat,
         _configuration: &ModelConfiguration,
         _validated_gguf: Option<&ValidatedGguf>,
+        resolved_plan: Self::ArtifactPlan,
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
-        Ok(Self::ArtifactPlan::default())
+        Ok(resolved_plan)
     }
 }
 
@@ -439,7 +467,9 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         .get("general.architecture")
         .and_then(MetadataValue::as_str)
         .ok_or(ArtifactError::MissingGgufArchitecture)?;
-    let configuration = resolver.resolve_gguf(architecture_name, &checkpoint)?;
+    let (configuration, resolved_plan) = resolver
+        .resolve_gguf(architecture_name, &checkpoint)?
+        .into_parts();
     let requirements = resolver.gguf_companion_requirements(architecture_name, &checkpoint)?;
     let companions = resolve_gguf_companions(path, &requirements)?;
     validate_gguf_container(&checkpoint)?;
@@ -477,6 +507,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         ArtifactFormat::Gguf,
         &configuration,
         Some(&validated_gguf),
+        resolved_plan,
     )?;
     Ok(ArtifactInspection {
         path: path.to_path_buf(),
@@ -649,7 +680,7 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
-    let configuration = resolver.resolve_safetensors(&json)?;
+    let (configuration, resolved_plan) = resolver.resolve_safetensors(&json)?.into_parts();
     let shards = safetensors_shards(path)?;
     let mut descriptors = Vec::new();
     let mut names = BTreeSet::new();
@@ -667,8 +698,13 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
             "SafeTensors checkpoint contains no tensors".into(),
         ));
     }
-    let architecture_plan =
-        resolver.artifact_plan(path, ArtifactFormat::SafeTensors, &configuration, None)?;
+    let architecture_plan = resolver.artifact_plan(
+        path,
+        ArtifactFormat::SafeTensors,
+        &configuration,
+        None,
+        resolved_plan,
+    )?;
     Ok(ArtifactInspection {
         path: path.to_path_buf(),
         format: ArtifactFormat::SafeTensors,
@@ -888,7 +924,10 @@ mod tests {
     impl ModelConfigurationResolver for FixtureResolver {
         type ArtifactPlan = FixtureArtifactPlan;
 
-        fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+        fn resolve_safetensors(
+            &self,
+            json: &Value,
+        ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
             let model_type = json
                 .get("model_type")
                 .and_then(Value::as_str)
@@ -899,32 +938,38 @@ mod tests {
                 "future" => "future_family",
                 other => return Err(ArtifactError::UnsupportedModelType(other.into())),
             };
-            Ok(ModelConfiguration {
-                declared_model_type: model_type.into(),
-                effective_model_type: model_type.into(),
-                family: family.into(),
-                loading_protocol: LoadingProtocol::Model,
-                json: Some(json.clone()),
-            })
+            Ok(ResolvedModelConfiguration::new(
+                ModelConfiguration {
+                    declared_model_type: model_type.into(),
+                    effective_model_type: model_type.into(),
+                    family: family.into(),
+                    loading_protocol: LoadingProtocol::Model,
+                    json: Some(json.clone()),
+                },
+                FixtureArtifactPlan::default(),
+            ))
         }
 
         fn resolve_gguf(
             &self,
             architecture: &str,
             _checkpoint: &GgufCheckpoint,
-        ) -> Result<ModelConfiguration, ArtifactError> {
+        ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
             let family = match architecture {
                 "llama" => "llama",
                 "future" => "future_family",
                 other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
             };
-            Ok(ModelConfiguration {
-                declared_model_type: architecture.into(),
-                effective_model_type: architecture.into(),
-                family: family.into(),
-                loading_protocol: LoadingProtocol::Model,
-                json: None,
-            })
+            Ok(ResolvedModelConfiguration::new(
+                ModelConfiguration {
+                    declared_model_type: architecture.into(),
+                    effective_model_type: architecture.into(),
+                    family: family.into(),
+                    loading_protocol: LoadingProtocol::Model,
+                    json: None,
+                },
+                FixtureArtifactPlan::default(),
+            ))
         }
 
         fn gguf_companion_requirements(
@@ -950,6 +995,7 @@ mod tests {
             format: ArtifactFormat,
             _configuration: &ModelConfiguration,
             _validated_gguf: Option<&ValidatedGguf>,
+            _resolved_plan: Self::ArtifactPlan,
         ) -> Result<Self::ArtifactPlan, ArtifactError> {
             Ok(FixtureArtifactPlan {
                 format: Some(format),

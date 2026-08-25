@@ -1,10 +1,13 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
-use eredu_checkpoint::validation::{CheckpointValidation, StrictLoadFailure};
+use eredu_checkpoint::{
+    schema::SafetensorsCheckpointPlan,
+    validation::{CheckpointValidation, StrictLoadFailure},
+};
 use eredu_core::{
     artifact::ArtifactError, ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement,
     GgufCompanionRole, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
-    ValidatedGguf,
+    ResolvedModelConfiguration, ValidatedGguf,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Serialize};
@@ -19,18 +22,32 @@ pub struct ModelConfigurations;
 pub static MODEL_CONFIGURATIONS: ModelConfigurations = ModelConfigurations;
 
 impl ModelConfigurationResolver for ModelConfigurations {
-    type ArtifactPlan = crate::processor_plan::ArtifactProcessorPlan;
+    type ArtifactPlan = crate::processor_plan::ArtifactArchitecturePlan;
 
-    fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
-        resolve_portable_model_configuration(json)
+    fn resolve_safetensors(
+        &self,
+        json: &Value,
+    ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
+        let resolved = resolve_model_config(json)?;
+        let configuration = portable_model_configuration(json, &resolved);
+        Ok(ResolvedModelConfiguration::new(
+            configuration,
+            crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
+                resolved.architecture,
+            ),
+        ))
     }
 
     fn resolve_gguf(
         &self,
         architecture: &str,
         checkpoint: &GgufCheckpoint,
-    ) -> Result<ModelConfiguration, ArtifactError> {
-        resolve_gguf_configuration(architecture, checkpoint)
+    ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
+        let (configuration, architecture) = resolve_gguf_configuration(architecture, checkpoint)?;
+        Ok(ResolvedModelConfiguration::new(
+            configuration,
+            crate::processor_plan::ArtifactArchitecturePlan::from_gguf_architecture(architecture),
+        ))
     }
 
     fn gguf_companion_requirements(
@@ -47,10 +64,11 @@ impl ModelConfigurationResolver for ModelConfigurations {
         format: ArtifactFormat,
         configuration: &ModelConfiguration,
         validated_gguf: Option<&ValidatedGguf>,
+        resolved_plan: Self::ArtifactPlan,
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
         let plan = match format {
             ArtifactFormat::SafeTensors => {
-                let kind = ModelKind::resolve_family(&configuration.family)?;
+                let kind = resolved_plan.model_kind();
                 let model = serde_json::to_vec(configuration.json.as_ref().ok_or_else(|| {
                     ArtifactError::InvalidArtifact(
                         "SafeTensors inspection omitted normalized JSON configuration".into(),
@@ -84,8 +102,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 } else {
                     None
                 };
-                crate::processor_plan::ArtifactProcessorPlan::from_safetensors(
-                    kind,
+                resolved_plan.with_safetensors_processors(
                     &model,
                     image.as_deref(),
                     video.as_deref(),
@@ -93,7 +110,6 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 )
             }
             ArtifactFormat::Gguf => {
-                let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
                 let validated = validated_gguf.ok_or_else(|| {
                     ArtifactError::InvalidArtifact(
                         "GGUF inspection omitted its validated checkpoint".into(),
@@ -102,11 +118,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 let projector = validated
                     .companion(&GgufCompanionRole::MediaProjector)
                     .map(|companion| companion.checkpoint().metadata());
-                crate::processor_plan::ArtifactProcessorPlan::from_gguf(
-                    architecture,
-                    validated.checkpoint().metadata(),
-                    projector,
-                )
+                resolved_plan.with_gguf_processors(validated.checkpoint().metadata(), projector)
             }
         };
         plan.map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))
@@ -416,16 +428,19 @@ impl GgufArchitecture {
 fn resolve_gguf_configuration(
     name: &str,
     checkpoint: &GgufCheckpoint,
-) -> Result<ModelConfiguration, ArtifactError> {
+) -> Result<(ModelConfiguration, GgufArchitecture), ArtifactError> {
     let architecture = GgufArchitecture::resolve(name)?;
     validate_gguf_structure(architecture, checkpoint)?;
-    Ok(ModelConfiguration {
-        declared_model_type: name.into(),
-        effective_model_type: name.into(),
-        family: architecture.model_kind().canonical_name().into(),
-        loading_protocol: architecture.model_kind().loading_protocol(),
-        json: None,
-    })
+    Ok((
+        ModelConfiguration {
+            declared_model_type: name.into(),
+            effective_model_type: name.into(),
+            family: architecture.model_kind().canonical_name().into(),
+            loading_protocol: architecture.model_kind().loading_protocol(),
+            json: None,
+        },
+        architecture,
+    ))
 }
 
 fn validate_gguf_structure(
@@ -486,27 +501,40 @@ fn effective_model_type(metadata: &ConfigMetadata) -> String {
     }
 }
 
+/// Family identity resolved before architecture geometry is parsed.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResolvedModelIdentity {
+    /// Canonical architecture family.
+    pub kind: ModelKind,
+    /// Declared outer model type.
+    pub model_type: String,
+    /// Effective nested text model type.
+    pub effective_model_type: String,
+}
+
 /// Resolves family aliases and nested wrappers without parsing family geometry.
-pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelConfig, ArtifactError> {
+pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, ArtifactError> {
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
     let effective_model_type = effective_model_type(&metadata);
     let kind = ModelKind::resolve_model_type(&effective_model_type)?;
-    Ok(ResolvedModelConfig {
+    Ok(ResolvedModelIdentity {
         model_type: metadata.model_type,
         effective_model_type,
         kind,
     })
 }
 
-fn resolve_portable_model_configuration(json: &Value) -> Result<ModelConfiguration, ArtifactError> {
-    let resolved = resolve_model_identity(json)?;
-    Ok(ModelConfiguration {
-        declared_model_type: resolved.model_type,
-        effective_model_type: resolved.effective_model_type,
+fn portable_model_configuration(
+    json: &Value,
+    resolved: &ResolvedModelConfig,
+) -> ModelConfiguration {
+    ModelConfiguration {
+        declared_model_type: resolved.model_type.clone(),
+        effective_model_type: resolved.effective_model_type.clone(),
         family: resolved.kind.canonical_name().into(),
         loading_protocol: resolved.kind.loading_protocol(),
         json: Some(json.clone()),
-    })
+    }
 }
 
 fn invalid_configuration(kind: ModelKind, error: impl std::fmt::Display) -> ArtifactError {
@@ -516,72 +544,179 @@ fn invalid_configuration(kind: ModelKind, error: impl std::fmt::Display) -> Arti
     ))
 }
 
-/// Validates a resolved Hugging Face config with its architecture-owned parser.
-fn validate_model_configuration(json: &Value, kind: ModelKind) -> Result<(), ArtifactError> {
-    match kind {
+/// Typed, normalized family configuration retained from SafeTensors admission.
+#[derive(Debug, Clone)]
+pub enum SafetensorsModelConfig {
+    /// DeepSeek-V3/R1 family geometry.
+    DeepSeekV3(crate::deepseek::V3Args),
+    /// DeepSeek-V4 family geometry.
+    DeepSeekV4(crate::deepseek::V4Args),
+    /// Gemma 4 family geometry.
+    Gemma4(crate::gemma4::FamilyConfig),
+    /// GPT-OSS family geometry.
+    GptOss(crate::gpt_oss::ModelArgs),
+    /// Inkling family geometry.
+    Inkling(crate::inkling::ModelArgs),
+    /// Kimi Linear family geometry.
+    KimiLinear(crate::kimi_linear::ModelArgs),
+    /// Llama-compatible family geometry.
+    Llama(crate::llama::ModelArgs),
+    /// Muse-Glimmer family geometry.
+    MuseGlimmer(crate::muse_glimmer::DecoderConfig),
+    /// LFM2 family geometry.
+    Lfm2(crate::lfm2::ModelArgs),
+    /// Nemotron-H family geometry.
+    NemotronH(crate::nemotron_h::ModelArgs),
+    /// Moshi-family realtime geometry.
+    Moshi(crate::moshi::MoshiConfig),
+    /// Qwen2/Qwen3 family geometry.
+    Qwen(crate::qwen::ModelArgs),
+    /// Qwen hybrid-family geometry.
+    QwenHybrid(crate::qwen::hybrid::ParsedHybridConfig),
+    /// Qwen3-VL family geometry.
+    QwenVl(crate::qwen::vl::ModelArgs),
+}
+
+/// Architecture configuration and checkpoint schema proven valid at admission.
+#[derive(Debug, Clone)]
+pub struct SafetensorsArchitecturePlan {
+    kind: ModelKind,
+    model: SafetensorsModelConfig,
+    checkpoint: SafetensorsCheckpointPlan,
+}
+
+impl SafetensorsArchitecturePlan {
+    /// Canonical family selected for this exact configuration.
+    pub const fn model_kind(&self) -> ModelKind {
+        self.kind
+    }
+
+    /// Typed normalized family configuration.
+    pub const fn model(&self) -> &SafetensorsModelConfig {
+        &self.model
+    }
+
+    /// Complete expected SafeTensors catalog derived from the normalized geometry.
+    pub const fn checkpoint(&self) -> &SafetensorsCheckpointPlan {
+        &self.checkpoint
+    }
+}
+
+fn resolve_safetensors_architecture(
+    json: &Value,
+    kind: ModelKind,
+) -> Result<SafetensorsArchitecturePlan, ArtifactError> {
+    let model = match kind {
         ModelKind::DeepSeekV3 => crate::deepseek::parse_v3_config(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::DeepSeekV3)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::DeepSeekV4 => crate::deepseek::parse_v4_config(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::DeepSeekV4)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Gemma4 => serde_json::to_vec(json)
             .map_err(ArtifactError::from)
             .and_then(|bytes| {
                 crate::gemma4::FamilyConfig::from_hf_json(&bytes)
-                    .map(|_| ())
+                    .map(SafetensorsModelConfig::Gemma4)
                     .map_err(|error| invalid_configuration(kind, error))
             }),
         ModelKind::GptOss => crate::gpt_oss::model_args_from_config_value(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::GptOss)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Inkling => serde_json::to_vec(json)
             .map_err(ArtifactError::from)
             .and_then(|bytes| {
                 crate::inkling::ModelArgs::from_hf_json(&bytes)
-                    .map(|_| ())
+                    .map(SafetensorsModelConfig::Inkling)
                     .map_err(|error| invalid_configuration(kind, error))
             }),
         ModelKind::KimiLinear => crate::kimi_linear::model_args_from_config_value(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::KimiLinear)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Llama => crate::llama::model_args_from_config_value(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::Llama)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::MuseGlimmer => serde_json::to_vec(json)
             .map_err(ArtifactError::from)
             .and_then(|bytes| {
                 crate::muse_glimmer::DecoderConfig::from_hf_json(&bytes)
-                    .map(|_| ())
+                    .map(SafetensorsModelConfig::MuseGlimmer)
                     .map_err(|error| invalid_configuration(kind, error))
             }),
         ModelKind::Lfm2 => crate::lfm2::model_args_from_config_value(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::Lfm2)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::NemotronH => crate::nemotron_h::model_args_from_config_value(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::NemotronH)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Moshi => crate::moshi::MoshiConfig::from_config_value(Some(json))
-            .map(|_| ())
+            .map(SafetensorsModelConfig::Moshi)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Qwen2 | ModelKind::Qwen3 => crate::qwen::model_args_from_config_value(json)
-            .map(|_| ())
+            .map(SafetensorsModelConfig::Qwen)
             .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Qwen3Next | ModelKind::Qwen35 => {
             crate::qwen::hybrid::model_args_from_config_value(json)
-                .map(|_| ())
+                .map(SafetensorsModelConfig::QwenHybrid)
                 .map_err(|error| invalid_configuration(kind, error))
         }
         ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
             crate::qwen::vl::model_args_from_config_value(json)
-                .map(|_| ())
+                .map(SafetensorsModelConfig::QwenVl)
                 .map_err(|error| invalid_configuration(kind, error))
         }
-    }
+    }?;
+    let checkpoint = match &model {
+        SafetensorsModelConfig::DeepSeekV3(args) => {
+            crate::deepseek::v3_safetensors_plan(args, true)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::DeepSeekV4(args) => crate::deepseek::v4_safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Gemma4(args) => crate::gemma4::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::GptOss(args) => crate::gpt_oss::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Inkling(args) => crate::inkling::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::KimiLinear(args) => crate::kimi_linear::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Llama(args) => crate::llama::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::MuseGlimmer(args) => crate::muse_glimmer::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Lfm2(args) => crate::lfm2::safetensors_plan(args, true)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Moshi(args) => crate::moshi::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Qwen(args) => crate::qwen::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::QwenHybrid(args) => {
+            crate::qwen::hybrid::safetensors_plan(&args.text)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::QwenVl(args) => {
+            if args.text.is_moe() != (kind == ModelKind::Qwen3VlMoe) {
+                return Err(invalid_configuration(
+                    kind,
+                    "nested text configuration does not match dense/MoE family dispatch",
+                ));
+            }
+            crate::qwen::vl::safetensors_plan(args)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+    };
+    Ok(SafetensorsArchitecturePlan {
+        kind,
+        model,
+        checkpoint,
+    })
 }
 
 /// Architecture-owned family identity consumed by backend composition and inspection.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ResolvedModelConfig {
     /// Canonical architecture family.
     pub kind: ModelKind,
@@ -589,20 +724,27 @@ pub struct ResolvedModelConfig {
     pub model_type: String,
     /// Effective nested text model type.
     pub effective_model_type: String,
+    /// Typed model geometry and checkpoint schema proven valid during resolution.
+    pub architecture: SafetensorsArchitecturePlan,
 }
 
 /// Resolves and validates one config into its architecture-owned dispatch identity.
 pub fn resolve_model_config(json: &Value) -> Result<ResolvedModelConfig, ArtifactError> {
     let resolved = resolve_model_identity(json)?;
-    validate_model_configuration(json, resolved.kind)?;
-    Ok(resolved)
+    let architecture = resolve_safetensors_architecture(json, resolved.kind)?;
+    Ok(ResolvedModelConfig {
+        kind: resolved.kind,
+        model_type: resolved.model_type,
+        effective_model_type: resolved.effective_model_type,
+        architecture,
+    })
 }
 
 /// Inspects an artifact using this crate's authoritative family registry.
 pub fn inspect_artifact(
     path: impl AsRef<Path>,
 ) -> Result<
-    eredu_core::ArtifactInspection<crate::processor_plan::ArtifactProcessorPlan>,
+    eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
     ArtifactError,
 > {
     eredu_core::inspect_artifact(path, &MODEL_CONFIGURATIONS)
@@ -613,6 +755,31 @@ mod tests {
     use super::*;
     use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
     use std::{collections::BTreeMap, fs::File};
+
+    fn qwen_vl_config() -> Value {
+        serde_json::json!({
+            "model_type": "qwen3_vl",
+            "image_token_id": 61,
+            "video_token_id": 62,
+            "vision_start_token_id": 44,
+            "vision_end_token_id": 45,
+            "tie_word_embeddings": true,
+            "text_config": {
+                "model_type": "qwen3_vl_text", "hidden_size": 32,
+                "num_hidden_layers": 3, "intermediate_size": 64,
+                "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                "rms_norm_eps": 0.000001, "vocab_size": 64,
+                "max_position_embeddings": 128, "rope_theta": 1000000.0,
+                "rope_scaling": {"mrope_section": [2, 1, 1], "mrope_interleaved": true}
+            },
+            "vision_config": {
+                "depth": 4, "hidden_size": 16, "intermediate_size": 24,
+                "num_heads": 4, "num_position_embeddings": 16, "in_channels": 3,
+                "patch_size": 2, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                "out_hidden_size": 32, "deepstack_visual_indexes": [1, 3]
+            }
+        })
+    }
 
     #[test]
     fn safetensors_processor_sidecars_are_snapshotted_during_inspection() {
@@ -632,39 +799,38 @@ mod tests {
             .unwrap()
         };
         std::fs::write(&processor_path, visual(0.25)).unwrap();
-        let configuration = ModelConfiguration {
-            declared_model_type: "qwen3_vl".into(),
-            effective_model_type: "qwen3_vl_text".into(),
-            family: ModelKind::Qwen3Vl.canonical_name().into(),
-            loading_protocol: LoadingProtocol::Model,
-            json: Some(serde_json::json!({
-                "model_type": "qwen3_vl",
-                "vision_start_token_id": 44,
-                "vision_end_token_id": 45
-            })),
-        };
+        let (configuration, resolved_plan) = MODEL_CONFIGURATIONS
+            .resolve_safetensors(&qwen_vl_config())
+            .unwrap()
+            .into_parts();
         let plan = MODEL_CONFIGURATIONS
             .artifact_plan(
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
                 None,
+                resolved_plan,
             )
             .unwrap();
 
         std::fs::write(&processor_path, visual(0.75)).unwrap();
 
-        assert_eq!(plan.model_kind(), Some(ModelKind::Qwen3Vl));
+        assert_eq!(plan.model_kind(), ModelKind::Qwen3Vl);
         assert_eq!(
             plan.qwen().unwrap().image(8, 8).unwrap().transform.mean,
             [0.25; 3]
         );
+        let (next_configuration, next_resolved_plan) = MODEL_CONFIGURATIONS
+            .resolve_safetensors(&qwen_vl_config())
+            .unwrap()
+            .into_parts();
         let next = MODEL_CONFIGURATIONS
             .artifact_plan(
                 root.path(),
                 ArtifactFormat::SafeTensors,
-                &configuration,
+                &next_configuration,
                 None,
+                next_resolved_plan,
             )
             .unwrap();
         assert_eq!(
@@ -688,10 +854,35 @@ mod tests {
             let json = serde_json::json!({"model_type": model_type});
             let resolved = resolve_model_identity(&json).unwrap();
             assert_eq!(resolved.kind, ModelKind::Moshi);
-            let portable = MODEL_CONFIGURATIONS.resolve_safetensors(&json).unwrap();
-            assert_eq!(portable.family, "moshi");
-            assert_eq!(portable.loading_protocol, LoadingProtocol::Realtime);
+            assert_eq!(resolved.kind.loading_protocol(), LoadingProtocol::Realtime);
         }
+    }
+
+    #[test]
+    fn authoritative_resolver_rejects_malformed_family_geometry() {
+        let malformed = serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 16,
+            "num_hidden_layers": 0,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "rms_norm_eps": 0.000001,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": true
+        });
+
+        assert_eq!(
+            resolve_model_identity(&malformed).unwrap().kind,
+            ModelKind::Qwen3
+        );
+        assert!(matches!(
+            MODEL_CONFIGURATIONS.resolve_safetensors(&malformed),
+            Err(ArtifactError::InvalidArtifact(_))
+        ));
     }
 
     #[test]

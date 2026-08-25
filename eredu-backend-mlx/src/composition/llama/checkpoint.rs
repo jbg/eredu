@@ -10,55 +10,9 @@ use eredu_architectures::llama::ModelArgs;
 use eredu_checkpoint::WeightQuantization;
 use safemlx::ops::GgufMetadataValue;
 use safemlx::Stream;
-use serde_json::Value;
 
 use crate::backend::error::Error;
 use crate::backend::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
-use eredu_checkpoint::validation;
-use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
-
-pub fn validate_safetensors(
-    config: &Value,
-    store: &(impl eredu_checkpoint::validation::SafetensorsCatalog + ?Sized),
-) -> CheckpointValidation {
-    let args = match eredu_architectures::llama::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let plan = match eredu_architectures::llama::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(eredu_architectures::llama::SafetensorsPlanError::Geometry(error)) => {
-            return invalid_geometry(error)
-        }
-        Err(eredu_architectures::llama::SafetensorsPlanError::Companion { name, detail }) => {
-            return CheckpointValidation::Invalid(vec![CheckpointIssue {
-                kind: CheckpointIssueKind::CompanionMismatch,
-                detail,
-                tensor_name: Some(name),
-                tensor_type_code: None,
-                metadata_key: Some("quantization_config.quant_method".into()),
-            }]);
-        }
-    };
-    validation::validate_safetensors_plan(store, &plan)
-}
-
-fn invalid_geometry(detail: String) -> CheckpointValidation {
-    CheckpointValidation::Invalid(vec![CheckpointIssue {
-        kind: CheckpointIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
-}
 
 pub(crate) struct PreparedLlamaGguf {
     pub args: ModelArgs,

@@ -145,7 +145,7 @@ impl<'a> PortableMediaView<'a> {
 impl ModelProcessor {
     /// Lowers the authoritative architecture-owned processor plan to MLX execution.
     pub fn from_plan(
-        plan: &eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     ) -> Option<Self> {
         if let Some(processor) = plan
             .gemma4()

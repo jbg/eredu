@@ -10,7 +10,7 @@ use eredu_core::VideoSampling;
 use eredu_gguf::{MetadataArray, MetadataValue};
 use serde::Deserialize;
 
-use crate::{GgufArchitecture, ModelKind};
+use crate::{configuration::SafetensorsArchitecturePlan, GgufArchitecture, ModelKind};
 
 /// Conventional Hugging Face still-image processor configuration filename.
 pub const PROCESSOR_CONFIG_FILENAME: &str = "preprocessor_config.json";
@@ -424,9 +424,9 @@ fn parse_qwen_visual_source(source: &QwenVisualSource) -> Result<(), ProcessorPl
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ArtifactFamilyPlan {
-    Safetensors(ModelKind),
+    Safetensors(SafetensorsArchitecturePlan),
     Gguf(GgufArchitecture),
 }
 
@@ -440,24 +440,43 @@ enum NormalizedProcessorPlan {
 
 /// Authoritative normalized family and processor state retained by inspection.
 ///
-/// The empty default exists only for the generic preparation transport. Every
-/// artifact admitted by the architecture registry receives a concrete family
-/// identity before materialization.
-#[derive(Debug, Clone, Default)]
-pub struct ArtifactProcessorPlan {
-    family: Option<ArtifactFamilyPlan>,
+/// Every artifact admitted by the architecture registry contains a concrete
+/// typed family plan before processor enrichment or materialization.
+#[derive(Debug, Clone)]
+pub struct ArtifactArchitecturePlan {
+    family: ArtifactFamilyPlan,
     processor: Option<NormalizedProcessorPlan>,
 }
 
-impl ArtifactProcessorPlan {
+impl ArtifactArchitecturePlan {
+    /// Retains the typed SafeTensors architecture and checkpoint plan from resolution.
+    pub(crate) fn from_safetensors_architecture(architecture: SafetensorsArchitecturePlan) -> Self {
+        Self {
+            family: ArtifactFamilyPlan::Safetensors(architecture),
+            processor: None,
+        }
+    }
+
+    /// Retains the exact GGUF architecture from resolution.
+    pub(crate) fn from_gguf_architecture(architecture: GgufArchitecture) -> Self {
+        Self {
+            family: ArtifactFamilyPlan::Gguf(architecture),
+            processor: None,
+        }
+    }
+
     /// Normalizes one SafeTensors family and its processor sidecars.
-    pub(crate) fn from_safetensors(
-        kind: ModelKind,
+    pub(crate) fn with_safetensors_processors(
+        mut self,
         model: &[u8],
         image: Option<&[u8]>,
         video: Option<&[u8]>,
         muse: Option<&[u8]>,
     ) -> Result<Self, ProcessorPlanError> {
+        let architecture = self.safetensors_architecture().ok_or_else(|| {
+            invalid("SafeTensors processor planning requires a validated architecture plan")
+        })?;
+        let kind = architecture.model_kind();
         let processor = match kind {
             ModelKind::Gemma4 => Gemma4ProcessorPlan::from_hf_json(model, image, video)?
                 .map(NormalizedProcessorPlan::Gemma4),
@@ -474,18 +493,19 @@ impl ArtifactProcessorPlan {
             }
             _ => None,
         };
-        Ok(Self {
-            family: Some(ArtifactFamilyPlan::Safetensors(kind)),
-            processor,
-        })
+        self.processor = processor;
+        Ok(self)
     }
 
     /// Normalizes one GGUF architecture and its admitted media projector.
-    pub(crate) fn from_gguf(
-        architecture: GgufArchitecture,
+    pub(crate) fn with_gguf_processors(
+        mut self,
         model: &BTreeMap<String, MetadataValue>,
         projector: Option<&BTreeMap<String, MetadataValue>>,
     ) -> Result<Self, ProcessorPlanError> {
+        let architecture = self
+            .gguf_architecture()
+            .ok_or_else(|| invalid("GGUF processor planning requires a resolved architecture"))?;
         let as_hash_map = |metadata: &BTreeMap<String, MetadataValue>| {
             metadata
                 .iter()
@@ -520,26 +540,31 @@ impl ArtifactProcessorPlan {
                 .map(NormalizedProcessorPlan::Qwen),
             _ => None,
         };
-        Ok(Self {
-            family: Some(ArtifactFamilyPlan::Gguf(architecture)),
-            processor,
-        })
+        self.processor = processor;
+        Ok(self)
     }
 
     /// Returns the normalized model family retained during inspection.
-    pub const fn model_kind(&self) -> Option<ModelKind> {
-        match self.family {
-            Some(ArtifactFamilyPlan::Safetensors(kind)) => Some(kind),
-            Some(ArtifactFamilyPlan::Gguf(architecture)) => Some(architecture.model_kind()),
-            None => None,
+    pub const fn model_kind(&self) -> ModelKind {
+        match &self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => plan.model_kind(),
+            ArtifactFamilyPlan::Gguf(architecture) => architecture.model_kind(),
         }
     }
 
     /// Returns the exact normalized GGUF architecture, when applicable.
     pub const fn gguf_architecture(&self) -> Option<GgufArchitecture> {
-        match self.family {
-            Some(ArtifactFamilyPlan::Gguf(architecture)) => Some(architecture),
-            Some(ArtifactFamilyPlan::Safetensors(_)) | None => None,
+        match &self.family {
+            ArtifactFamilyPlan::Gguf(architecture) => Some(*architecture),
+            ArtifactFamilyPlan::Safetensors(_) => None,
+        }
+    }
+
+    /// Returns the validated SafeTensors architecture and checkpoint plan.
+    pub const fn safetensors_architecture(&self) -> Option<&SafetensorsArchitecturePlan> {
+        match &self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => Some(plan),
+            ArtifactFamilyPlan::Gguf(_) => None,
         }
     }
 
@@ -2110,7 +2135,7 @@ fn metadata_rgb(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactProcessorPlan, AudioFrameCount, AudioWindow, Gemma4ProcessorPlan,
+        ArtifactArchitecturePlan, AudioFrameCount, AudioWindow, Gemma4ProcessorPlan,
         InklingProcessorPlan, Logarithm, MelNormalization, MelScale, MuseProcessorPlan,
         QwenProcessorPlan, SpectrumValue,
     };
@@ -2130,18 +2155,22 @@ mod tests {
     }
 
     #[test]
-    fn artifact_plan_retains_every_safetensors_family_and_exact_gguf_identity() {
-        for kind in ModelKind::ALL {
-            let model = if kind == ModelKind::Inkling {
-                br#"{"model_type":"inkling_mm_model"}"#.as_slice()
-            } else {
-                br#"{}"#.as_slice()
-            };
-            let plan =
-                ArtifactProcessorPlan::from_safetensors(kind, model, None, None, None).unwrap();
-            assert_eq!(plan.model_kind(), Some(kind));
-            assert_eq!(plan.gguf_architecture(), None);
-        }
+    fn artifact_plan_retains_validated_safetensors_plan_and_exact_gguf_identity() {
+        let architecture = crate::configuration::resolve_model_config(&serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64
+        }))
+        .unwrap()
+        .architecture;
+        let plan = ArtifactArchitecturePlan::from_safetensors_architecture(architecture);
+        assert_eq!(plan.model_kind(), ModelKind::Llama);
+        assert!(plan.safetensors_architecture().is_some());
+        assert_eq!(plan.gguf_architecture(), None);
 
         for architecture in [
             GgufArchitecture::Llama,
@@ -2151,9 +2180,10 @@ mod tests {
             GgufArchitecture::MuseGlimmer,
             GgufArchitecture::Qwen35Moe,
         ] {
-            let plan =
-                ArtifactProcessorPlan::from_gguf(architecture, &BTreeMap::new(), None).unwrap();
-            assert_eq!(plan.model_kind(), Some(architecture.model_kind()));
+            let plan = ArtifactArchitecturePlan::from_gguf_architecture(architecture)
+                .with_gguf_processors(&BTreeMap::new(), None)
+                .unwrap();
+            assert_eq!(plan.model_kind(), architecture.model_kind());
             assert_eq!(plan.gguf_architecture(), Some(architecture));
         }
     }
@@ -2164,46 +2194,29 @@ mod tests {
             "boi_token_id":43,"eoi_token_id":44,
             "vision_config":{"patch_size":2,"pooling_kernel_size":1}
         }"#;
-        let plan = ArtifactProcessorPlan::from_safetensors(
-            ModelKind::Gemma4,
-            gemma_model,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(plan.gemma4().is_some());
+        assert!(Gemma4ProcessorPlan::from_hf_json(gemma_model, None, None)
+            .unwrap()
+            .is_some());
 
-        let plan = ArtifactProcessorPlan::from_safetensors(
-            ModelKind::Inkling,
-            br#"{"model_type":"inkling_mm_model"}"#,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(plan.inkling().is_some());
+        assert!(
+            InklingProcessorPlan::from_hf_json(br#"{"model_type":"inkling_mm_model"}"#)
+                .unwrap()
+                .is_some()
+        );
 
-        let plan = ArtifactProcessorPlan::from_safetensors(
-            ModelKind::MuseGlimmer,
-            br#"{}"#,
-            None,
-            None,
-            Some(br#"{"image_processor":{},"video_processor":{}}"#),
-        )
-        .unwrap();
-        assert!(plan.muse().is_some());
+        assert!(
+            MuseProcessorPlan::from_hf_json(br#"{"image_processor":{},"video_processor":{}}"#)
+                .is_ok()
+        );
 
         let visual = qwen_visual();
-        let plan = ArtifactProcessorPlan::from_safetensors(
-            ModelKind::Qwen3Vl,
+        let plan = QwenProcessorPlan::from_hf_json(
             br#"{"vision_start_token_id":44,"vision_end_token_id":45}"#,
             Some(&visual),
             None,
-            None,
         )
         .unwrap();
-        assert!(plan.qwen().is_some());
+        assert!(plan.is_some());
 
         let gemma_model = BTreeMap::from([
             ("gemma4.boi_token_id".into(), MetadataValue::Uint32(43)),
@@ -2211,22 +2224,20 @@ mod tests {
         ]);
         let gemma_projector =
             BTreeMap::from([("clip.vision.patch_size".into(), MetadataValue::Uint32(2))]);
-        assert!(ArtifactProcessorPlan::from_gguf(
-            GgufArchitecture::Gemma4,
-            &gemma_model,
-            Some(&gemma_projector),
-        )
-        .unwrap()
-        .gemma4()
-        .is_some());
-        assert!(ArtifactProcessorPlan::from_gguf(
-            GgufArchitecture::Inkling,
-            &BTreeMap::new(),
-            Some(&BTreeMap::new()),
-        )
-        .unwrap()
-        .inkling()
-        .is_some());
+        assert!(
+            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::Gemma4)
+                .with_gguf_processors(&gemma_model, Some(&gemma_projector))
+                .unwrap()
+                .gemma4()
+                .is_some()
+        );
+        assert!(
+            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::Inkling)
+                .with_gguf_processors(&BTreeMap::new(), Some(&BTreeMap::new()))
+                .unwrap()
+                .inkling()
+                .is_some()
+        );
 
         let muse_projector = BTreeMap::from([
             ("clip.vision.patch_size".into(), MetadataValue::Uint32(2)),
@@ -2243,14 +2254,13 @@ mod tests {
                 MetadataValue::Array(MetadataArray::Float32(vec![1.0; 3])),
             ),
         ]);
-        assert!(ArtifactProcessorPlan::from_gguf(
-            GgufArchitecture::MuseGlimmer,
-            &BTreeMap::new(),
-            Some(&muse_projector),
-        )
-        .unwrap()
-        .muse()
-        .is_some());
+        assert!(
+            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::MuseGlimmer)
+                .with_gguf_processors(&BTreeMap::new(), Some(&muse_projector))
+                .unwrap()
+                .muse()
+                .is_some()
+        );
 
         let qwen_model = BTreeMap::from([(
             "tokenizer.ggml.tokens".into(),
@@ -2259,14 +2269,13 @@ mod tests {
                 "<|vision_end|>".into(),
             ])),
         )]);
-        assert!(ArtifactProcessorPlan::from_gguf(
-            GgufArchitecture::Qwen3Vl,
-            &qwen_model,
-            Some(&muse_projector),
-        )
-        .unwrap()
-        .qwen()
-        .is_some());
+        assert!(
+            ArtifactArchitecturePlan::from_gguf_architecture(GgufArchitecture::Qwen3Vl)
+                .with_gguf_processors(&qwen_model, Some(&muse_projector))
+                .unwrap()
+                .qwen()
+                .is_some()
+        );
     }
 
     #[test]

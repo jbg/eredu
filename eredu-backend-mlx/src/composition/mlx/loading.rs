@@ -2,7 +2,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 
-use eredu_architectures::processor_plan::ArtifactProcessorPlan;
+use eredu_architectures::processor_plan::ArtifactArchitecturePlan;
 use eredu_architectures::{GgufArchitecture, ModelKind};
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
 use safemlx::ops::GgufCheckpoint;
@@ -200,7 +200,7 @@ fn materialize_gguf_model(
 }
 
 pub fn materialize_model_plan(
-    plan: ModelPreparationPlan<ArtifactProcessorPlan>,
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -211,7 +211,7 @@ pub fn materialize_model_plan(
         .parallel
         .filter(|topology| !topology.is_replicated())
     {
-        let kind = prepared_model_kind(plan.inspection().architecture_plan())?;
+        let kind = prepared_model_kind(plan.inspection().architecture_plan());
         if structural::requires_distributed_stage_loader(kind, topology.topology()) {
             #[cfg(feature = "media")]
             let processor = ModelProcessor::from_plan(plan.inspection().architecture_plan());
@@ -245,17 +245,12 @@ pub fn materialize_model_plan(
                 let prepared = super::artifact::PreparedSafetensorsArtifact::open(
                     path,
                     configuration,
+                    prepared_safetensors_architecture(&architecture_plan)?.clone(),
                     tensors,
                     options.weight_residency.max_mapped_shards(),
                 )?;
-                let model = materialize_tensor_parallel(
-                    prepared_model_kind(&architecture_plan)?,
-                    &prepared,
-                    options,
-                    stream,
-                    weights_stream,
-                )
-                .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
+                let model = materialize_tensor_parallel(&prepared, options, stream, weights_stream)
+                    .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
                 attach_processor(model, &architecture_plan)
             }
         };
@@ -271,14 +266,14 @@ pub fn materialize_model_plan(
             configuration,
             tensors,
         } => {
-            let kind = prepared_model_kind(&architecture_plan)?;
             let prepared = super::artifact::PreparedSafetensorsArtifact::open(
                 path,
                 configuration,
+                prepared_safetensors_architecture(&architecture_plan)?.clone(),
                 tensors,
                 options.weight_residency.max_mapped_shards(),
             )?;
-            let model = materialize_safetensors(kind, &prepared, options, stream, weights_stream)
+            let model = materialize_safetensors(&prepared, options, stream, weights_stream)
                 .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
             attach_processor(model, &architecture_plan)
         }
@@ -286,7 +281,7 @@ pub fn materialize_model_plan(
 }
 
 fn inspected_runtime_state_dtype_bytes(
-    inspection: &eredu_core::ArtifactInspection<ArtifactProcessorPlan>,
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<std::num::NonZeroU8, Error> {
     if inspection.format() == eredu_core::ArtifactFormat::Gguf {
         // MLX native GGUF embeddings dequantize to Float32. Their catalog dtype
@@ -300,7 +295,7 @@ fn inspected_runtime_state_dtype_bytes(
         )
     })?;
     let source = eredu_architectures::preparation::safetensors_runtime_state_dtype_source(
-        prepared_model_kind(inspection.architecture_plan())?,
+        prepared_model_kind(inspection.architecture_plan()),
         config,
         inspection.tensors(),
     )
@@ -405,9 +400,7 @@ mod runtime_state_dtype_tests {
     #[cfg(feature = "image")]
     #[test]
     fn mlx_processor_consumes_retained_qwen_plan_after_sidecar_removal() {
-        use eredu_core::{
-            ArtifactFormat, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
-        };
+        use eredu_core::{ArtifactFormat, ModelConfigurationResolver};
 
         let root = tempfile::tempdir().unwrap();
         let sidecar = root
@@ -422,28 +415,42 @@ mod runtime_state_dtype_tests {
             }"#,
         )
         .unwrap();
-        let configuration = ModelConfiguration {
-            declared_model_type: "qwen3_vl".into(),
-            effective_model_type: "qwen3_vl_text".into(),
-            family: ModelKind::Qwen3Vl.canonical_name().into(),
-            loading_protocol: LoadingProtocol::Model,
-            json: Some(serde_json::json!({
-                "model_type": "qwen3_vl",
-                "vision_start_token_id": 44,
-                "vision_end_token_id": 45
-            })),
-        };
+        let config = serde_json::json!({
+            "model_type": "qwen3_vl", "image_token_id": 61, "video_token_id": 62,
+            "vision_start_token_id": 44, "vision_end_token_id": 45,
+            "tie_word_embeddings": true,
+            "text_config": {
+                "model_type": "qwen3_vl_text", "hidden_size": 32,
+                "num_hidden_layers": 3, "intermediate_size": 64,
+                "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                "rms_norm_eps": 0.000001, "vocab_size": 64,
+                "max_position_embeddings": 128, "rope_theta": 1000000.0,
+                "rope_scaling": {"mrope_section": [2, 1, 1], "mrope_interleaved": true}
+            },
+            "vision_config": {
+                "depth": 4, "hidden_size": 16, "intermediate_size": 24,
+                "num_heads": 4, "num_position_embeddings": 16, "in_channels": 3,
+                "patch_size": 2, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                "out_hidden_size": 32, "deepstack_visual_indexes": [1, 3]
+            }
+        });
+        let (configuration, resolved_plan) =
+            eredu_architectures::configuration::MODEL_CONFIGURATIONS
+                .resolve_safetensors(&config)
+                .unwrap()
+                .into_parts();
         let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
             .artifact_plan(
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
                 None,
+                resolved_plan,
             )
             .unwrap();
         std::fs::remove_file(sidecar).unwrap();
 
-        assert_eq!(architecture_plan.model_kind(), Some(ModelKind::Qwen3Vl));
+        assert_eq!(architecture_plan.model_kind(), ModelKind::Qwen3Vl);
         assert!(crate::composition::mlx::ModelProcessor::from_plan(&architecture_plan).is_some());
     }
 
@@ -484,13 +491,21 @@ mod runtime_state_dtype_tests {
     }
 }
 
-fn prepared_model_kind(plan: &ArtifactProcessorPlan) -> Result<ModelKind, Error> {
-    plan.model_kind().ok_or_else(|| {
-        Error::ArchitectureModel("preparation omitted its architecture-owned model family".into())
+fn prepared_model_kind(plan: &ArtifactArchitecturePlan) -> ModelKind {
+    plan.model_kind()
+}
+
+pub(super) fn prepared_safetensors_architecture(
+    plan: &ArtifactArchitecturePlan,
+) -> Result<&eredu_architectures::configuration::SafetensorsArchitecturePlan, Error> {
+    plan.safetensors_architecture().ok_or_else(|| {
+        Error::ArchitectureModel(
+            "SafeTensors preparation omitted its validated architecture plan".into(),
+        )
     })
 }
 
-fn prepared_gguf_architecture(plan: &ArtifactProcessorPlan) -> Result<GgufArchitecture, Error> {
+fn prepared_gguf_architecture(plan: &ArtifactArchitecturePlan) -> Result<GgufArchitecture, Error> {
     plan.gguf_architecture().ok_or_else(|| {
         Error::ArchitectureModel(
             "GGUF preparation omitted its architecture-owned GGUF identity".into(),
@@ -500,7 +515,7 @@ fn prepared_gguf_architecture(plan: &ArtifactProcessorPlan) -> Result<GgufArchit
 
 fn attach_processor(
     model: MlxModel,
-    architecture_plan: &ArtifactProcessorPlan,
+    architecture_plan: &ArtifactArchitecturePlan,
 ) -> Result<MlxModel, Error> {
     #[cfg(feature = "media")]
     {
@@ -524,12 +539,12 @@ fn complete_gguf_model(
 }
 
 fn materialize_tensor_parallel(
-    kind: ModelKind,
     artifact: &super::artifact::PreparedSafetensorsArtifact,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    let kind = artifact.architecture().model_kind();
     let topology = options.parallel.ok_or_else(|| {
         Error::Parallel("tensor-parallel materialization requires a topology".into())
     })?;
@@ -663,7 +678,7 @@ fn materialize_tensor_parallel(
 }
 
 pub(super) fn validate_plan_options(
-    plan: &ModelPreparationPlan<ArtifactProcessorPlan>,
+    plan: &ModelPreparationPlan<ArtifactArchitecturePlan>,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
     if plan.policy() != options.preparation_policy()? {
@@ -677,7 +692,7 @@ pub(super) fn validate_plan_options(
 
 fn materialize_gguf_artifact(
     artifact: ModelArtifact,
-    architecture_plan: ArtifactProcessorPlan,
+    architecture_plan: ArtifactArchitecturePlan,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -926,12 +941,12 @@ pub fn validate_gguf_quantization_source<
 }
 
 pub(super) fn materialize_safetensors(
-    kind: ModelKind,
     artifact: &super::artifact::PreparedSafetensorsArtifact,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    let kind = artifact.architecture().model_kind();
     if let (Some(expert_cache), Some(non_expert)) = (
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),

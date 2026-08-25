@@ -538,7 +538,7 @@ impl<B> LoadedModel<B>
 where
     B: eredu_core::TextGenerationBackend + eredu_core::ModelLoadingBackend,
     B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-        ArtifactPlan = eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
 {
     /// Realizes a complete portable execution plan through the selected factory.
@@ -641,7 +641,7 @@ where
     fn from_inspected(
         backend: B,
         inspection: eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         options: B::LoadOptions,
         tokenizer: ChatTokenizer,

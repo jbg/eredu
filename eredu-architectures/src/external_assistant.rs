@@ -5,7 +5,7 @@ use std::{collections::HashMap, path::PathBuf};
 use eredu_checkpoint::validation::{resolve_gguf_plan, ResolvedCheckpointPlan};
 use eredu_core::{
     artifact::ArtifactError, ArtifactFormat, LoadingProtocol, ModelConfiguration,
-    ModelConfigurationResolver,
+    ModelConfigurationResolver, ResolvedModelConfiguration,
 };
 use eredu_gguf::{Checkpoint, MetadataValue};
 use serde_json::Value;
@@ -187,7 +187,10 @@ struct AssistantConfigurations;
 impl ModelConfigurationResolver for AssistantConfigurations {
     type ArtifactPlan = ();
 
-    fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+    fn resolve_safetensors(
+        &self,
+        json: &Value,
+    ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
         let bytes = serde_json::to_vec(json)?;
         let model_type = json
             .get("model_type")
@@ -206,20 +209,23 @@ impl ModelConfigurationResolver for AssistantConfigurations {
             }
             other => return Err(ArtifactError::UnsupportedModelType(other.into())),
         };
-        Ok(ModelConfiguration {
-            declared_model_type: model_type.into(),
-            effective_model_type: model_type.into(),
-            family: family.into(),
-            loading_protocol: LoadingProtocol::Model,
-            json: Some(json.clone()),
-        })
+        Ok(ResolvedModelConfiguration::new(
+            ModelConfiguration {
+                declared_model_type: model_type.into(),
+                effective_model_type: model_type.into(),
+                family: family.into(),
+                loading_protocol: LoadingProtocol::Model,
+                json: Some(json.clone()),
+            },
+            (),
+        ))
     }
 
     fn resolve_gguf(
         &self,
         architecture: &str,
         checkpoint: &Checkpoint,
-    ) -> Result<ModelConfiguration, ArtifactError> {
+    ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
         let metadata = gguf_metadata(checkpoint);
         let family = match architecture {
             "gemma4_assistant" | "gemma4-assistant" => {
@@ -234,13 +240,16 @@ impl ModelConfigurationResolver for AssistantConfigurations {
             }
             other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
         };
-        Ok(ModelConfiguration {
-            declared_model_type: architecture.into(),
-            effective_model_type: family.into(),
-            family: family.into(),
-            loading_protocol: LoadingProtocol::Model,
-            json: None,
-        })
+        Ok(ResolvedModelConfiguration::new(
+            ModelConfiguration {
+                declared_model_type: architecture.into(),
+                effective_model_type: family.into(),
+                family: family.into(),
+                loading_protocol: LoadingProtocol::Model,
+                json: None,
+            },
+            (),
+        ))
     }
 
     fn gguf_companion_requirements(

@@ -25,6 +25,7 @@ use eredu_core::{
 /// cannot rediscover configuration or checkpoint topology after admission.
 pub struct PreparedSafetensorsArtifact {
     configuration: ModelConfiguration,
+    architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: SharedCheckpointSource,
 }
 
@@ -32,6 +33,7 @@ impl PreparedSafetensorsArtifact {
     pub fn open(
         path: PathBuf,
         configuration: ModelConfiguration,
+        architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
         catalog: TensorCatalog,
         max_mapped_shards: usize,
     ) -> Result<Self, Error> {
@@ -43,12 +45,17 @@ impl PreparedSafetensorsArtifact {
         };
         Ok(Self {
             configuration,
+            architecture,
             store: Arc::new(store),
         })
     }
 
     pub fn configuration(&self) -> &ModelConfiguration {
         &self.configuration
+    }
+
+    pub fn architecture(&self) -> &eredu_architectures::configuration::SafetensorsArchitecturePlan {
+        &self.architecture
     }
 
     pub fn config(&self) -> Result<&serde_json::Value, Error> {
@@ -228,6 +235,20 @@ mod tests {
         }
     }
 
+    fn architecture() -> eredu_architectures::configuration::SafetensorsArchitecturePlan {
+        eredu_architectures::configuration::resolve_model_config(&serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64
+        }))
+        .unwrap()
+        .architecture
+    }
+
     fn catalog_for(path: &std::path::Path, shape: Vec<usize>, length: u64) -> TensorCatalog {
         TensorCatalog::new([TensorDescriptor {
             name: "weight".into(),
@@ -270,6 +291,7 @@ mod tests {
         let artifact = PreparedSafetensorsArtifact::open(
             directory.path().to_owned(),
             configuration(prepared.clone()),
+            architecture(),
             catalog_for(directory.path(), vec![1], 4),
             1,
         )
@@ -285,6 +307,7 @@ mod tests {
         let error = PreparedSafetensorsArtifact::open(
             directory.path().to_owned(),
             configuration(serde_json::json!({"model_type": "llama"})),
+            architecture(),
             catalog_for(directory.path(), vec![1], 4),
             1,
         )

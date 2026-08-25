@@ -53,8 +53,8 @@ pub use artifact::{
     validate_preparation_policy, ArtifactFormat, ArtifactInspection, GgufCompanionEncoding,
     GgufCompanionRequirement, GgufCompanionRole, LoadingProtocol, MaterializationRoute,
     ModelArtifact, ModelConfiguration, ModelConfigurationResolver, ModelPreparationPlan,
-    PreparationPolicy, QuantizationRequest, ResidencyRequest, ValidatedGguf,
-    ValidatedGgufCompanion,
+    PreparationPolicy, QuantizationRequest, ResidencyRequest, ResolvedModelConfiguration,
+    ValidatedGguf, ValidatedGgufCompanion,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{

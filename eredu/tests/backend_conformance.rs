@@ -493,7 +493,7 @@ impl ModelLoadingBackend for MockBackend {
     fn validate_preparation(
         &self,
         _: &eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         _: eredu_core::PreparationPolicy,
     ) -> Result<(), Self::Error> {
@@ -503,7 +503,7 @@ impl ModelLoadingBackend for MockBackend {
     fn model_config(
         &self,
         plan: eredu_core::ModelPreparationPlan<
-            eredu_architectures::processor_plan::ArtifactProcessorPlan,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         _: Self::LoadOptions,
     ) -> Result<Self::ModelConfig, Self::Error> {
@@ -1138,7 +1138,11 @@ fn assert_single_lane_speculative_cardinality_is_validated(
 fn write_loadable_text_artifact(root: &std::path::Path) {
     std::fs::write(
         root.join("config.json"),
-        r#"{"model_type":"llama","eos_token_id":0}"#,
+        r#"{
+          "model_type":"llama","eos_token_id":0,"hidden_size":16,
+          "num_hidden_layers":2,"intermediate_size":32,
+          "num_attention_heads":4,"rms_norm_eps":0.00001,"vocab_size":64
+        }"#,
     )
     .unwrap();
     let header = br#"{"token_embd.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
@@ -1224,7 +1228,7 @@ where
     F::Backend: TextGenerationBackend,
     <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
         eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactProcessorPlan,
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
 {
     let request = AutomaticPlanRequest::new(

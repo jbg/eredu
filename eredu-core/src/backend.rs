@@ -1275,33 +1275,39 @@ mod tests {
         fn resolve_safetensors(
             &self,
             json: &serde_json::Value,
-        ) -> Result<crate::ModelConfiguration, ArtifactError> {
-            Ok(crate::ModelConfiguration {
-                declared_model_type: "llama".into(),
-                effective_model_type: "llama".into(),
-                family: "llama".into(),
-                loading_protocol: crate::LoadingProtocol::Model,
-                json: Some(json.clone()),
-            })
+        ) -> Result<crate::ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
+            Ok(crate::ResolvedModelConfiguration::new(
+                crate::ModelConfiguration {
+                    declared_model_type: "llama".into(),
+                    effective_model_type: "llama".into(),
+                    family: "llama".into(),
+                    loading_protocol: crate::LoadingProtocol::Model,
+                    json: Some(json.clone()),
+                },
+                (),
+            ))
         }
 
         fn resolve_gguf(
             &self,
             architecture: &str,
             _checkpoint: &eredu_gguf::Checkpoint,
-        ) -> Result<crate::ModelConfiguration, ArtifactError> {
+        ) -> Result<crate::ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
             if architecture != "llama" {
                 return Err(ArtifactError::UnsupportedGgufArchitecture(
                     architecture.into(),
                 ));
             }
-            Ok(crate::ModelConfiguration {
-                declared_model_type: architecture.into(),
-                effective_model_type: architecture.into(),
-                family: "llama".into(),
-                loading_protocol: crate::LoadingProtocol::Model,
-                json: None,
-            })
+            Ok(crate::ResolvedModelConfiguration::new(
+                crate::ModelConfiguration {
+                    declared_model_type: architecture.into(),
+                    effective_model_type: architecture.into(),
+                    family: "llama".into(),
+                    loading_protocol: crate::LoadingProtocol::Model,
+                    json: None,
+                },
+                (),
+            ))
         }
 
         fn gguf_companion_requirements(

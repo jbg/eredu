@@ -130,7 +130,7 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
 
 pub(super) fn read_model_configuration(
     model_dir: &Path,
-) -> Result<eredu_architectures::configuration::ResolvedModelConfig, TextMetadataError> {
+) -> Result<eredu_architectures::configuration::ResolvedModelIdentity, TextMetadataError> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     let json = serde_json::from_reader(file)?;

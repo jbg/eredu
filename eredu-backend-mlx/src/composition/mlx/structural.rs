@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
+#[cfg(test)]
 use serde_json::Value;
 
 use eredu_architectures::{GgufArchitecture, ModelKind};
@@ -10,7 +11,6 @@ use eredu_architectures::{GgufArchitecture, ModelKind};
 use super::ModelLoadOptions;
 use crate::backend::error::Error;
 use crate::backend::runtime::checkpoint::load::GgufTensorNames;
-use crate::composition::llama::checkpoint as llama_checkpoint;
 use eredu_checkpoint::{recipe::RecipeCatalog, validation::SafetensorsCatalog};
 
 pub use eredu_checkpoint::validation::{
@@ -303,7 +303,7 @@ pub(crate) fn validate_gguf_preparation(
 
 pub(crate) fn validate_inspected_preparation(
     inspection: &eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactProcessorPlan,
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
@@ -313,9 +313,7 @@ pub(crate) fn validate_inspected_preparation(
     }
     let configuration = inspection.configuration();
     let architecture_plan = inspection.architecture_plan();
-    let kind = architecture_plan.model_kind().ok_or_else(|| {
-        Error::ArchitectureModel("preparation omitted its architecture-owned model family".into())
-    })?;
+    let kind = architecture_plan.model_kind();
     let capabilities = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => {
             eredu_architectures::preparation::safetensors_capabilities(
@@ -354,54 +352,26 @@ fn validate_gguf_load_policy(
 }
 
 pub fn validate_safetensors(
-    kind: ModelKind,
-    config: &Value,
+    plan: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: &(impl StructuralSafetensorsCatalog + ?Sized),
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let validation = match kind {
-        ModelKind::DeepSeekV3 => validate_neutral_deepseek_v3_safetensors(config, store),
-        ModelKind::DeepSeekV4 => validate_neutral_deepseek_v4_safetensors(config, store),
-        ModelKind::Gemma4 => validate_neutral_gemma4_safetensors(config, store),
-        ModelKind::GptOss => validate_neutral_gpt_oss_safetensors(config, store),
-        ModelKind::Inkling => validate_neutral_inkling_safetensors(config, store),
-        ModelKind::KimiLinear => validate_neutral_kimi_safetensors(config, store),
-        ModelKind::Lfm2 => validate_neutral_lfm2_safetensors(config, store),
-        ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
-        ModelKind::MuseGlimmer => validate_neutral_muse_glimmer_safetensors(config, store),
-        ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
-        ModelKind::Moshi => validate_neutral_moshi_safetensors(config, store),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
-        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
-            validate_neutral_qwen_hybrid_safetensors(config, store)
+    let validation =
+        eredu_checkpoint::validation::validate_safetensors_plan(store, plan.checkpoint());
+    let validation = if validation == StructuralValidation::Exact {
+        match plan.model() {
+            eredu_architectures::configuration::SafetensorsModelConfig::Moshi(config) => {
+                match eredu_architectures::moshi::canonical_recipes(config, store) {
+                    Ok(_) => StructuralValidation::Exact,
+                    Err(error) => invalid_geometry(error),
+                }
+            }
+            _ => validation,
         }
-        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            validate_neutral_qwen_vl_safetensors(kind, config, store)
-        }
+    } else {
+        validation
     };
     validation.with_strict_catalog(options.weight_residency.strict_loading())
-}
-
-fn validate_neutral_moshi_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let config = match eredu_architectures::moshi::MoshiConfig::from_config_value(Some(config)) {
-        Ok(config) => config,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::moshi::safetensors_plan(&config) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    let validation = eredu_checkpoint::validation::validate_safetensors_plan(store, &plan);
-    if validation != StructuralValidation::Exact {
-        return validation;
-    }
-    match eredu_architectures::moshi::canonical_recipes(&config, store) {
-        Ok(_) => StructuralValidation::Exact,
-        Err(error) => invalid_geometry(error),
-    }
 }
 
 pub fn validate_gguf(
@@ -415,78 +385,6 @@ pub fn validate_gguf(
     eredu_architectures::configuration::validate_gguf_checkpoint(architecture, checkpoint.catalog())
 }
 
-fn validate_neutral_gemma4_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let bytes = match serde_json::to_vec(config) {
-        Ok(bytes) => bytes,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let args = match eredu_architectures::gemma4::FamilyConfig::from_hf_json(&bytes) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::gemma4::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_gpt_oss_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::gpt_oss::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::gpt_oss::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_inkling_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let bytes = match serde_json::to_vec(config) {
-        Ok(bytes) => bytes,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let args = match eredu_architectures::inkling::ModelArgs::from_hf_json(&bytes) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::inkling::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_muse_glimmer_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let bytes = match serde_json::to_vec(config) {
-        Ok(bytes) => bytes,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(&bytes) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::muse_glimmer::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
 struct NeutralMuseGlimmerGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl eredu_architectures::muse_glimmer::GgufTensorCatalog for NeutralMuseGlimmerGgufCatalog<'_> {
@@ -495,144 +393,12 @@ impl eredu_architectures::muse_glimmer::GgufTensorCatalog for NeutralMuseGlimmer
     }
 }
 
-fn validate_neutral_qwen_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::qwen::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::qwen::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_lfm2_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::lfm2::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::lfm2::safetensors_plan(&args, true) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_nemotron_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::nemotron_h::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::nemotron_h::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_kimi_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::kimi_linear::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::kimi_linear::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_deepseek_v3_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::deepseek::parse_v3_config(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::deepseek::v3_safetensors_plan(&args, true) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_deepseek_v4_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::deepseek::parse_v4_config(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::deepseek::v4_safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
 struct NeutralQwenGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl eredu_architectures::qwen::GgufTensorCatalog for NeutralQwenGgufCatalog<'_> {
     fn contains(&self, name: &str) -> bool {
         self.0.contains_gguf_tensor(name)
     }
-}
-
-fn validate_neutral_qwen_hybrid_safetensors(
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let parsed = match eredu_architectures::qwen::hybrid::model_args_from_config_value(config) {
-        Ok(parsed) => parsed,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match eredu_architectures::qwen::hybrid::safetensors_plan(&parsed.text) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
-}
-
-fn validate_neutral_qwen_vl_safetensors(
-    kind: ModelKind,
-    config: &Value,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    let args = match eredu_architectures::qwen::vl::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.text.is_moe() != (kind == ModelKind::Qwen3VlMoe) {
-        return invalid_geometry(format!(
-            "Qwen3-VL dispatch selected {}, but the nested text configuration is {}",
-            if kind == ModelKind::Qwen3VlMoe {
-                "MoE"
-            } else {
-                "dense"
-            },
-            if args.text.is_moe() { "MoE" } else { "dense" }
-        ));
-    }
-    let plan = match eredu_architectures::qwen::vl::safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
 }
 
 pub fn validate_inkling_mmproj_gguf(

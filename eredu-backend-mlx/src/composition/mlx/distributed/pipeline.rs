@@ -13354,7 +13354,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 /// stage-local bounded packed overlay before parameter residency is selected;
 /// fully resident stages never fall back to eager complete-matrix conversion.
 pub fn load_pipeline_model_with_options(
-    plan: ModelPreparationPlan<eredu_architectures::processor_plan::ArtifactProcessorPlan>,
+    plan: ModelPreparationPlan<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -13756,6 +13756,10 @@ pub fn load_pipeline_model_with_options(
         } => crate::composition::mlx::artifact::PreparedSafetensorsArtifact::open(
             path,
             configuration,
+            crate::composition::mlx::loading::prepared_safetensors_architecture(
+                &architecture_plan,
+            )?
+            .clone(),
             tensors,
             max_mapped_shards,
         )?,
@@ -13763,11 +13767,7 @@ pub fn load_pipeline_model_with_options(
 
     let configuration = artifact.configuration();
     let config = artifact.config()?;
-    let kind = architecture_plan.model_kind().ok_or_else(|| {
-        Error::ArchitectureModel(
-            "SafeTensors preparation omitted its architecture-owned model family".into(),
-        )
-    })?;
+    let kind = architecture_plan.model_kind();
     if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
         return Err(Error::ArchitectureModel(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"

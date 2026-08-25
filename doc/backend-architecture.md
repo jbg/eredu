@@ -151,19 +151,23 @@ or decide which model-family scaling names are supported.
 
 The architecture configuration registry is the sole owner of Hugging Face
 family aliases, GGUF `general.architecture` spellings, nested-wrapper
-normalization, and the exhaustive dispatch to family parsers. During GGUF
-inspection, core passes the complete portable header catalog to that registry;
-the registry performs full family parsing, canonical-name collision checks,
-and architecture checkpoint-schema validation before admission. Concrete
-backends consume that result and do not repeat a family admission match. Its
+normalization, and the exhaustive dispatch to family parsers. During
+SafeTensors resolution, the registry parses and validates the complete family
+geometry and derives its typed checkpoint plan before Core admits the
+configuration. During GGUF inspection, core passes the complete portable
+header catalog to that registry; the registry performs full family parsing,
+canonical-name collision checks, and architecture checkpoint-schema validation
+before admission. Concrete backends consume those results and do not repeat a
+family admission match. Its
 external assistant resolvers likewise own both SafeTensors `model_type` and GGUF
 `general.architecture` identities and aliases. `eredu-core` accepts that
 registry through `ModelConfigurationResolver` while inspecting both
-SafeTensors and GGUF artifacts. The resolver returns an open canonical family
-string, the neutral `LoadingProtocol`, and any GGUF companion requirements
-needed to prepare the artifact. Core routes that protocol and resolves
-companion paths; it neither recognizes family strings nor exposes an exhaustive
-family type.
+SafeTensors and GGUF artifacts. Each resolution couples the open canonical
+family string and neutral `LoadingProtocol` with opaque architecture-owned
+typed state. Artifact enrichment carries that state forward while adding any
+processor sidecars or GGUF companions; it does not reconstruct it from the
+portable configuration. Core routes the protocol and resolves companion paths;
+it neither recognizes family strings nor exposes an exhaustive family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
 in `eredu-architectures`. Nested `text_config.model_type` normalization is
@@ -422,12 +426,14 @@ that exact normalized configuration. Backends translate those neutral flags
 into report and build-feature readiness, but do not infer image, audio, or
 video support from a family name. Text-only and partially multimodal variants
 therefore do not acquire processor or feature requirements they cannot use.
-SafeTensors materialization retains the normalized configuration and validated
-tensor catalog from the preparation plan, opens one catalog-checked checkpoint
-store, and passes that composition object to every family loader. Family
-composition does not reopen `config.json`, rediscover checkpoint shards, or
-select a second catalog after admission. Every admitted artifact plan retains
-the normalized `ModelKind`; GGUF plans additionally retain the exact
+SafeTensors materialization retains the typed normalized family configuration,
+its complete architecture-derived checkpoint plan, and the validated tensor
+catalog from the preparation plan. MLX structural validation applies that exact
+checkpoint plan to its store and has no second raw-JSON family parser dispatch.
+Family composition does not reopen `config.json`, rediscover checkpoint shards,
+or select a second catalog after admission. Every admitted artifact plan
+retains the normalized `ModelKind`; SafeTensors plans additionally retain typed
+family geometry and the checkpoint schema, while GGUF plans retain the exact
 `GgufArchitecture`. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
 also parses and retains the family processor plan from the admitted model,
 projector, and SafeTensors processor sidecars. Materialization consumes that

@@ -174,9 +174,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     };
     let configuration = portable.configuration();
     let architecture_plan = portable.architecture_plan();
-    let kind = architecture_plan
-        .model_kind()
-        .expect("architecture inspection must retain its normalized model family");
+    let kind = architecture_plan.model_kind();
     let config = configuration
         .json
         .as_ref()
@@ -235,7 +233,13 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             report.expected_modalities = artifact_modalities(capabilities.input_modalities());
             apply_structural_validation(
                 &mut report,
-                structural::validate_safetensors(kind, config, &inspected_catalog, options.load),
+                structural::validate_safetensors(
+                    architecture_plan.safetensors_architecture().expect(
+                        "SafeTensors inspection must retain its validated architecture plan",
+                    ),
+                    &inspected_catalog,
+                    options.load,
+                ),
                 path,
             );
             match options
@@ -883,7 +887,7 @@ fn reject_projector(
 
 fn inspect_safetensors_media(
     report: &mut ModelInspectionReport,
-    plan: &eredu_architectures::processor_plan::ArtifactProcessorPlan,
+    plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
 ) {
     if report.expected_modalities == [ArtifactModality::Text] {
         report.multimodal = InspectionReadiness::NotApplicable;
@@ -1113,11 +1117,22 @@ mod tests {
         let mut report =
             ModelInspectionReport::unverified(Path::new("unused"), ArtifactFormat::SafeTensors);
         report.expected_modalities = artifact_modalities(InputModalities::TEXT);
+        let plan = eredu_core::ModelConfigurationResolver::resolve_safetensors(
+            &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+            &serde_json::json!({
+                "model_type": "llama",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "intermediate_size": 32,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 0.00001,
+                "vocab_size": 64
+            }),
+        )
+        .unwrap()
+        .architecture_plan;
 
-        inspect_safetensors_media(
-            &mut report,
-            &eredu_architectures::processor_plan::ArtifactProcessorPlan::default(),
-        );
+        inspect_safetensors_media(&mut report, &plan);
 
         assert_eq!(report.expected_modalities, [ArtifactModality::Text]);
         assert_eq!(report.multimodal, InspectionReadiness::NotApplicable);
