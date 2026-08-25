@@ -17546,11 +17546,13 @@ fn load_lfm2_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.weight_quantization = Some(quantization);
-        target_args.quantized_weight_configs = None;
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::lfm2::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let expert_quantization = quantize_on_load;
     let target_binding_adapter = if expert_cache_options.is_some() {
         Lfm2Bindings::new_external_experts()
@@ -18042,11 +18044,13 @@ fn load_nemotron_h_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.weight_quantization = Some(quantization);
-        target_args.quantized_weight_configs = None;
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::nemotron_h::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let expert_quantization = quantize_on_load;
     let target_binding_adapter = if external_experts {
         NemotronHBindings::new_external_experts()

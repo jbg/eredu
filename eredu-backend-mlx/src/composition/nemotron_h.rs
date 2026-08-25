@@ -690,10 +690,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = args.clone();
-    target.weight_quantization = Some(quantization);
-    target.quantized_weights = None;
-    target.quantized_weight_configs = None;
+    let target = eredu_architectures::nemotron_h::load_time_quantization(args, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)

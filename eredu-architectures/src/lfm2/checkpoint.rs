@@ -17,6 +17,21 @@ use eredu_core::AttentionPolicy;
 
 use super::config::{FeedForwardPolicy, ModelArgs, OperatorPolicy};
 
+/// Derives an LFM2 configuration whose physical matrix formats reflect
+/// load-time quantization instead of checkpoint-specific format selections.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.weight_quantization = Some(quantization);
+    target.quantized_weights = None;
+    target.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 fn expert_source(
     store: &dyn CheckpointSource,
     prefix: &str,
@@ -978,6 +993,28 @@ mod tests {
             "use_expert_bias": true
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn load_time_quantization_replaces_checkpoint_format_policy() {
+        let mut source = fixture();
+        source.quantized_weights = Some(Default::default());
+        source.quantized_weight_configs = Some(Default::default());
+        let requested =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+
+        let target = load_time_quantization(&source, requested).unwrap();
+
+        assert_eq!(target.weight_quantization, Some(requested));
+        assert_eq!(target.quantized_weights, None);
+        assert_eq!(target.quantized_weight_configs, None);
+        assert_eq!(
+            target.weight_quantization_for("model.layers.0.feed_forward.w1.weight"),
+            Some(requested)
+        );
+        assert!(source
+            .weight_quantization_for("model.layers.0.feed_forward.w1.weight")
+            .is_none());
     }
 
     #[test]

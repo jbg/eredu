@@ -13,8 +13,8 @@ pub mod parallel;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
-    expert_recipes, expert_residency_catalog, gguf_plan, normalize_weight_formats,
-    safetensors_plan, translate_gguf_weight_name, unit_recipes,
+    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
+    normalize_weight_formats, safetensors_plan, translate_gguf_weight_name, unit_recipes,
 };
 
 pub use config::{

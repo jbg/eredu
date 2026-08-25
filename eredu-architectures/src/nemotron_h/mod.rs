@@ -13,8 +13,9 @@ pub mod parallel;
 pub use attention::{new_attention, new_attention_at};
 pub use block::{Block, Operator};
 pub use checkpoint::{
-    expert_recipes, expert_residency_catalog, gguf_plan, normalized_checkpoint_keys,
-    safetensors_plan, static_recipes, translate_gguf_weight_name, unit_recipes, unit_recipes_flat,
+    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
+    normalized_checkpoint_keys, safetensors_plan, static_recipes, translate_gguf_weight_name,
+    unit_recipes, unit_recipes_flat,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
