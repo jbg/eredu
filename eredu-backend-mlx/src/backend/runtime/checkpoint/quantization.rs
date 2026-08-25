@@ -1,10 +1,8 @@
-//! Model-agnostic load-time quantization for dense SafeTensors and GGUF checkpoints.
+//! Execution of architecture-owned dense SafeTensors quantization plans.
 //!
-//! The serialized representation follows the MLX-LM convention: a dense
-//! `name.weight` tensor becomes a packed `name.weight` tensor plus
-//! `name.scales` and `name.biases`. Quantization settings are stored in both
-//! the `quantization` and `quantization_config` keys in `config.json` for
-//! compatibility with MLX-LM and Hugging Face tooling.
+//! This module owns MLX packing, streaming, and shard persistence. Exact
+//! source eligibility, output identities, companion presence, and output
+//! configuration come from `eredu-architectures` and are consumed literally.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -15,7 +13,12 @@ use std::{
 use safemlx::{ops, Array, Stream};
 use serde_json::{json, Value};
 
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use eredu_architectures::checkpoint_conversion::{
+    SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
+};
+#[cfg(test)]
+use eredu_checkpoint::AffineQuantization;
+use eredu_checkpoint::WeightQuantization;
 
 use crate::{backend::error::Error, backend::runtime::checkpoint::load as weights};
 
@@ -70,64 +73,31 @@ pub fn gguf_affine_quantization(
     )))
 }
 
-/// Tensor selection and output-sharding options for checkpoint conversion.
+/// Architecture plan and output-sharding options for checkpoint conversion.
 #[derive(Debug, Clone)]
 pub struct CheckpointQuantizationOptions {
-    /// Output weight encoding.
-    pub quantization: WeightQuantization,
+    /// Exact architecture-owned conversion decision.
+    pub plan: SafetensorsQuantizationPlan,
     /// Maximum uncompressed tensor bytes accumulated before writing a shard.
     pub shard_size_bytes: usize,
-    /// Only quantize tensor names containing at least one of these strings.
-    /// An empty list includes every otherwise eligible tensor.
-    pub include: Vec<String>,
-    /// Do not quantize tensor names containing any of these strings.
-    pub exclude: Vec<String>,
-    /// Skip otherwise eligible matrices smaller than this many elements.
-    pub minimum_elements: usize,
-}
-
-impl Default for CheckpointQuantizationOptions {
-    fn default() -> Self {
-        Self {
-            quantization: AffineQuantization::default().into(),
-            shard_size_bytes: 512 * 1024 * 1024,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            minimum_elements: 0,
-        }
-    }
 }
 
 impl CheckpointQuantizationOptions {
-    /// Returns whether a tensor is a matrix selected for affine quantization.
-    pub fn selects(&self, name: &str, tensor: &Array) -> bool {
-        canonical_weight_name(name).is_some()
-            && tensor.ndim() == 2
-            && tensor.dtype().is_float()
-            && tensor.dim(1) % self.quantization.group_size() == 0
-            && tensor.dim(1) % 32 == 0
-            && tensor.size() >= self.minimum_elements
-            && (self.include.is_empty() || self.include.iter().any(|needle| name.contains(needle)))
-            && !self.exclude.iter().any(|needle| name.contains(needle))
+    /// Creates conversion options with the default 512 MiB shard bound.
+    pub fn new(plan: SafetensorsQuantizationPlan) -> Self {
+        Self {
+            plan,
+            shard_size_bytes: 512 * 1024 * 1024,
+        }
     }
 
     fn validate(&self) -> Result<(), Error> {
-        self.quantization.validate()?;
         if self.shard_size_bytes == 0 {
             return Err(Error::Quantization(
                 "shard_size_bytes must be greater than zero".into(),
             ));
         }
         Ok(())
-    }
-}
-
-fn canonical_weight_name(name: &str) -> Option<String> {
-    if name.ends_with(".weight") {
-        Some(name.to_string())
-    } else {
-        name.strip_suffix("_weight")
-            .map(|prefix| format!("{prefix}.weight"))
     }
 }
 
@@ -143,19 +113,30 @@ pub struct QuantizedTensor {
 }
 
 impl QuantizedTensor {
-    /// Returns the standard MLX-LM checkpoint keys and arrays for `weight_name`.
-    pub fn into_named_arrays(self, weight_name: &str) -> Result<Vec<(String, Array)>, Error> {
-        let prefix = weight_name.strip_suffix(".weight").ok_or_else(|| {
-            Error::Quantization(format!(
-                "quantized tensor name must end in .weight: {weight_name}"
-            ))
-        })?;
+    /// Associates packed arrays with the architecture-declared identities.
+    pub fn into_named_arrays(
+        self,
+        target: &SafetensorsQuantizationTarget,
+    ) -> Result<Vec<(String, Array)>, Error> {
         let mut arrays = vec![
-            (weight_name.to_string(), self.weight),
-            (format!("{prefix}.scales"), self.scales),
+            (target.weight_name().to_owned(), self.weight),
+            (target.scales_name().to_owned(), self.scales),
         ];
-        if let Some(biases) = self.biases {
-            arrays.push((format!("{prefix}.biases"), biases));
+        match (self.biases, target.biases_name()) {
+            (Some(biases), Some(name)) => arrays.push((name.to_owned(), biases)),
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(Error::Quantization(format!(
+                    "architecture target {:?} omits the affine-bias output produced by its encoding",
+                    target.source_name()
+                )))
+            }
+            (None, Some(name)) => {
+                return Err(Error::Quantization(format!(
+                    "architecture target {:?} requires affine-bias output {name:?}, but its encoding produced none",
+                    target.source_name()
+                )))
+            }
         }
         Ok(arrays)
     }
@@ -236,7 +217,7 @@ pub fn mlx_quantization_mode(config: WeightQuantization) -> ops::QuantizationMod
 /// Summary returned after converting and saving a checkpoint directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointQuantizationReport {
-    /// Number of source matrices converted to packed affine tensors.
+    /// Number of source matrices converted to packed tensors.
     pub quantized_tensors: usize,
     /// Number of source tensors copied without conversion.
     pub copied_tensors: usize,
@@ -265,11 +246,11 @@ impl PendingShard {
     }
 }
 
-/// Quantizes a model directory tensor-by-tensor and saves an MLX-LM-compatible checkpoint.
+/// Executes an architecture-owned conversion plan and saves the checkpoint.
 ///
 /// The source directory may contain a single `model.safetensors` file or a
 /// Hugging Face sharded checkpoint index. Non-weight files are copied, while
-/// `config.json` is updated with both standard MLX-LM quantization keys.
+/// `config.json` is replaced by the exact architecture-authored output value.
 pub fn quantize_checkpoint(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
@@ -284,18 +265,6 @@ pub fn quantize_checkpoint(
             "source is not a directory: {}",
             source_dir.display()
         )));
-    }
-    if let Some(existing) = checkpoint_quantization_metadata(source_dir)? {
-        return if existing == options.quantization {
-            Err(Error::Quantization(format!(
-                "checkpoint already uses {existing:?}; reuse it instead of quantizing it again"
-            )))
-        } else {
-            Err(Error::Quantization(format!(
-                "checkpoint is already quantized as {existing:?}, requested {:?}; implicit transcoding is unsupported",
-                options.quantization
-            )))
-        };
     }
     fs::create_dir(output_dir).map_err(|error| {
         Error::Quantization(format!(
@@ -312,35 +281,6 @@ pub fn quantize_checkpoint(
     result
 }
 
-fn checkpoint_quantization_metadata(
-    source_dir: &Path,
-) -> Result<Option<WeightQuantization>, Error> {
-    let path = source_dir.join("config.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let config: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let Some(object) = config.as_object() else {
-        return Err(Error::Quantization(
-            "config.json must contain a JSON object".into(),
-        ));
-    };
-    for key in ["quantization", "quantization_config"] {
-        let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
-            continue;
-        };
-        if value.get("mode").is_some() {
-            return serde_json::from_value(value.clone())
-                .map(Some)
-                .map_err(|error| Error::Quantization(format!("invalid {key} metadata: {error}")));
-        }
-        return Err(Error::Quantization(format!(
-            "checkpoint contains prequantized {key} metadata that is not MLX affine/MXFP4; implicit transcoding is unsupported"
-        )));
-    }
-    Ok(None)
-}
-
 fn quantize_checkpoint_inner(
     source_dir: &Path,
     output_dir: &Path,
@@ -349,7 +289,16 @@ fn quantize_checkpoint_inner(
 ) -> Result<CheckpointQuantizationReport, Error> {
     let weight_files = weights::safetensors_files(source_dir)?;
     copy_checkpoint_assets(source_dir, output_dir, &weight_files)?;
-    write_quantized_config(source_dir, output_dir, options.quantization)?;
+    write_planned_config(output_dir, options.plan.output_config())?;
+
+    let targets = options
+        .plan
+        .targets()
+        .iter()
+        .map(|target| (target.source_name(), target))
+        .collect::<BTreeMap<_, _>>();
+    let mut converted_sources = std::collections::BTreeSet::new();
+    let mut emitted_names = std::collections::BTreeSet::new();
 
     let mut pending = PendingShard::new();
     let mut temporary_shards = Vec::new();
@@ -363,11 +312,11 @@ fn quantize_checkpoint_inner(
             file,
             stream,
             |name, tensor| {
-                let arrays = if options.selects(&name, &tensor) {
+                let arrays = if let Some(target) = targets.get(name.as_str()) {
                     quantized_tensors += 1;
-                    let weight_name = canonical_weight_name(&name).expect("selected weight name");
-                    quantize_tensor(&tensor, options.quantization, stream)?
-                        .into_named_arrays(&weight_name)?
+                    converted_sources.insert(name.clone());
+                    quantize_tensor(&tensor, options.plan.quantization(), stream)?
+                        .into_named_arrays(target)?
                 } else {
                     copied_tensors += 1;
                     vec![(name, tensor)]
@@ -388,12 +337,32 @@ fn quantize_checkpoint_inner(
                     )?;
                 }
                 for (name, array) in arrays {
+                    if !emitted_names.insert(name.clone()) {
+                        return Err(Error::Quantization(format!(
+                            "architecture quantization output {name:?} collides with another checkpoint tensor"
+                        )));
+                    }
                     total_size += array.nbytes();
                     pending.insert(name, array);
                 }
                 Ok(())
             },
         )?;
+    }
+    let missing = targets
+        .keys()
+        .filter(|name| !converted_sources.contains(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Error::Quantization(format!(
+            "checkpoint is missing architecture quantization targets: {}",
+            missing
+                .into_iter()
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
     if !pending.arrays.is_empty() {
         flush_temporary_shard(
@@ -491,26 +460,10 @@ fn copy_checkpoint_assets(
     Ok(())
 }
 
-fn write_quantized_config(
-    source_dir: &Path,
-    output_dir: &Path,
-    quantization: WeightQuantization,
-) -> Result<(), Error> {
-    let path = source_dir.join("config.json");
-    let mut config = if path.exists() {
-        serde_json::from_slice::<Value>(&fs::read(path)?)?
-    } else {
-        json!({})
-    };
-    let object = config
-        .as_object_mut()
-        .ok_or_else(|| Error::Quantization("config.json must contain a JSON object".into()))?;
-    let value = serde_json::to_value(quantization)?;
-    object.insert("quantization".into(), value.clone());
-    object.insert("quantization_config".into(), value);
+fn write_planned_config(output_dir: &Path, config: &Value) -> Result<(), Error> {
     fs::write(
         output_dir.join("config.json"),
-        serde_json::to_vec_pretty(&config)?,
+        serde_json::to_vec_pretty(config)?,
     )?;
     Ok(())
 }
@@ -519,6 +472,9 @@ fn write_quantized_config(
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use eredu_architectures::checkpoint_conversion::{
+        SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
+    };
     use safemlx::{Device, DeviceType, Dtype, ExecutionContext};
 
     use super::*;
@@ -561,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn quantized_config_preserves_unknown_artifact_fields() {
+    fn planned_config_is_written_without_backend_metadata_rewrites() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -570,53 +526,42 @@ mod tests {
             "eredu-mlx-neutral-quantization-config-{}-{suffix}",
             std::process::id()
         ));
-        let source = root.join("source");
         let output = root.join("output");
-        fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&output).unwrap();
-        fs::write(
-            source.join("config.json"),
-            br#"{"model_type":"opaque","artifact_filename":"custom.safetensors"}"#,
-        )
-        .unwrap();
-
-        write_quantized_config(&source, &output, WeightQuantization::MxFp4).unwrap();
+        let planned = json!({
+            "model_type": "opaque",
+            "artifact_filename": "custom.safetensors",
+            "architecture_quantization": {"encoding": "mxfp4"}
+        });
+        write_planned_config(&output, &planned).unwrap();
         let config: Value =
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["artifact_filename"], "custom.safetensors");
-        assert_eq!(config["quantization"]["mode"], "mxfp4");
+        assert_eq!(config, planned);
+        assert!(config.get("quantization").is_none());
+        assert!(config.get("quantization_config").is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn checkpoint_conversion_rejects_prequantized_inputs() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "eredu-mlx-prequantized-rejection-{}-{suffix}",
-            std::process::id()
-        ));
-        let source = root.join("source");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(
-            source.join("config.json"),
-            serde_json::to_vec(&json!({
-                "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
-            }))
-            .unwrap(),
+    fn options_have_no_tensor_name_selection_policy() {
+        let plan = SafetensorsQuantizationPlan::new(
+            WeightQuantization::MxFp4,
+            [SafetensorsQuantizationTarget::new(
+                "architecture.exact.source",
+                "architecture.exact.packed",
+                "architecture.exact.scale",
+                None::<String>,
+            )],
+            json!({"model_type": "test"}),
         )
         .unwrap();
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let options = CheckpointQuantizationOptions {
-            quantization: WeightQuantization::MxFp4,
-            ..Default::default()
-        };
-        let error = quantize_checkpoint(&source, root.join("output"), &options, context.stream())
-            .unwrap_err();
-        assert!(error.to_string().contains("implicit transcoding"));
-        fs::remove_dir_all(root).unwrap();
+        let options = CheckpointQuantizationOptions::new(plan);
+        assert_eq!(options.plan.targets().len(), 1);
+        assert_eq!(
+            options.plan.targets()[0].source_name(),
+            "architecture.exact.source"
+        );
     }
 
     #[test]
@@ -643,17 +588,6 @@ mod tests {
         assert!(AffineQuantization::new(32, 5).is_ok());
         assert!(AffineQuantization::new(32, 6).is_ok());
         assert!(AffineQuantization::new(32, 7).is_err());
-    }
-
-    #[test]
-    fn selection_is_model_agnostic_and_filterable() {
-        let tensor = Array::from_slice::<f32>(&vec![0.0; 128 * 64], &[128, 64]);
-        let vector = Array::from_slice::<f32>(&vec![0.0; 8192], &[8192]);
-        let mut options = CheckpointQuantizationOptions::default();
-        assert!(options.selects("anything.proj.weight", &tensor));
-        assert!(!options.selects("anything.norm.weight", &vector));
-        options.exclude.push("proj".into());
-        assert!(!options.selects("anything.proj.weight", &tensor));
     }
 
     #[test]
@@ -692,10 +626,21 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let options = CheckpointQuantizationOptions {
-            quantization: WeightQuantization::MxFp4,
-            ..Default::default()
-        };
+        let plan = SafetensorsQuantizationPlan::new(
+            WeightQuantization::MxFp4,
+            [SafetensorsQuantizationTarget::new(
+                "model.proj.weight",
+                "model.proj.weight",
+                "model.proj.scales",
+                None::<String>,
+            )],
+            json!({
+                "model_type": "test",
+                "architecture_quantization": {"mode": "mxfp4"}
+            }),
+        )
+        .unwrap();
+        let options = CheckpointQuantizationOptions::new(plan);
         quantize_checkpoint(&source, &output, &options, stream).unwrap();
         let arrays =
             Array::load_safetensors(output.join("model.safetensors"), weights_context.stream())
@@ -705,8 +650,9 @@ mod tests {
         assert!(!arrays.contains_key("model.proj.biases"));
         let config: Value =
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
-        assert_eq!(config["quantization"], config["quantization_config"]);
-        assert_eq!(config["quantization"]["mode"], "mxfp4");
+        assert_eq!(config["architecture_quantization"]["mode"], "mxfp4");
+        assert!(config.get("quantization").is_none());
+        assert!(config.get("quantization_config").is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -729,13 +675,17 @@ mod tests {
             .map(|index| (index as f32 - 255.5) / 64.0)
             .collect::<Vec<_>>();
         let weight = Array::from_slice(&values, &[8, 64]);
-        let norm = Array::from_slice(&vec![1.0f32; 64], &[64]);
+        let embedding = Array::from_slice(&vec![1.0f32; 3 * 64], &[3, 64]);
         Array::save_safetensors(
-            [("model.proj.weight", &weight), ("model.norm.weight", &norm)],
+            [
+                ("model.proj.weight", &weight),
+                ("model.embed_tokens.weight", &embedding),
+            ],
             None,
             source.join("model.safetensors"),
         )
         .unwrap();
+        let norm = Array::from_slice(&vec![1.0f32; 64], &[64]);
         Array::save_safetensors(
             [("auxiliary.weight", &norm)],
             None,
@@ -748,10 +698,22 @@ mod tests {
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let weights_stream = weights_context.stream();
         let expected = quantize_tensor(&weight, AffineQuantization::default(), stream).unwrap();
-        let options = CheckpointQuantizationOptions {
-            shard_size_bytes: 1,
-            ..Default::default()
-        };
+        let plan = SafetensorsQuantizationPlan::new(
+            AffineQuantization::default(),
+            [SafetensorsQuantizationTarget::new(
+                "model.proj.weight",
+                "runtime.projection.packed",
+                "runtime.projection.scale",
+                Some("runtime.projection.zero"),
+            )],
+            json!({
+                "model_type": "test",
+                "architecture_quantization": {"mode": "affine"}
+            }),
+        )
+        .unwrap();
+        let mut options = CheckpointQuantizationOptions::new(plan);
+        options.shard_size_bytes = 1;
         let report = quantize_checkpoint(&source, &output, &options, stream).unwrap();
         assert_eq!(report.quantized_tensors, 1);
         assert_eq!(report.copied_tensors, 1);
@@ -761,21 +723,21 @@ mod tests {
         for file in weights::safetensors_files(&output).unwrap() {
             saved.extend(Array::load_safetensors(file, weights_stream).unwrap());
         }
-        let saved_weight = &saved["model.proj.weight"];
+        let saved_weight = &saved["runtime.projection.packed"];
         assert_eq!(saved_weight.dtype(), Dtype::Uint32);
         assert_eq!(
             saved_weight.evaluated().unwrap().as_slice::<u32>(),
             expected.weight.evaluated().unwrap().as_slice::<u32>()
         );
         assert_eq!(
-            saved["model.proj.scales"]
+            saved["runtime.projection.scale"]
                 .evaluated()
                 .unwrap()
                 .as_slice::<f32>(),
             expected.scales.evaluated().unwrap().as_slice::<f32>()
         );
         assert_eq!(
-            saved["model.proj.biases"]
+            saved["runtime.projection.zero"]
                 .evaluated()
                 .unwrap()
                 .as_slice::<f32>(),
@@ -788,17 +750,18 @@ mod tests {
                 .as_slice::<f32>()
         );
         assert_eq!(
-            saved["model.norm.weight"]
+            saved["model.embed_tokens.weight"]
                 .evaluated()
                 .unwrap()
                 .as_slice::<f32>(),
-            norm.evaluated().unwrap().as_slice::<f32>()
+            embedding.evaluated().unwrap().as_slice::<f32>()
         );
 
         let config: Value =
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
-        assert_eq!(config["quantization"], config["quantization_config"]);
-        assert_eq!(config["quantization"]["mode"], "affine");
+        assert_eq!(config["architecture_quantization"]["mode"], "affine");
+        assert!(config.get("quantization").is_none());
+        assert!(config.get("quantization_config").is_none());
         assert!(output.join("auxiliary.safetensors").exists());
         fs::remove_dir_all(root).unwrap();
     }

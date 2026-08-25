@@ -1,8 +1,11 @@
-//! Quantize a checkpoint with MLX packing operators.
+//! Execute an architecture-authored checkpoint quantization plan with MLX.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, str::FromStr};
 
 use clap::{Parser, ValueEnum};
+use eredu_architectures::checkpoint_conversion::{
+    SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
+};
 use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 use eredu_backend_mlx::{quantize_checkpoint, CheckpointQuantizationOptions};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
@@ -20,6 +23,12 @@ struct Args {
     source: PathBuf,
     /// New output directory. It must not already exist.
     output: PathBuf,
+    /// Architecture-authored output config.json.
+    #[arg(long)]
+    output_config: PathBuf,
+    /// Exact SOURCE,WEIGHT,SCALES[,BIASES] target (repeatable).
+    #[arg(long, value_parser = parse_target)]
+    target: Vec<SafetensorsQuantizationTarget>,
     /// Quantized weight encoding.
     #[arg(long, value_enum, default_value_t = Mode::Affine)]
     mode: Mode,
@@ -32,15 +41,25 @@ struct Args {
     /// Approximate maximum output shard size in MiB.
     #[arg(long, default_value_t = 512)]
     shard_size_mib: usize,
-    /// Only quantize tensor names containing this string (repeatable).
-    #[arg(long)]
-    include: Vec<String>,
-    /// Do not quantize tensor names containing this string (repeatable).
-    #[arg(long)]
-    exclude: Vec<String>,
-    /// Skip matrices with fewer than this many elements.
-    #[arg(long, default_value_t = 0)]
-    minimum_elements: usize,
+}
+
+fn parse_target(value: &str) -> Result<SafetensorsQuantizationTarget, String> {
+    let fields = value.split(',').collect::<Vec<_>>();
+    match fields.as_slice() {
+        [source, weight, scales] => Ok(SafetensorsQuantizationTarget::new(
+            *source,
+            *weight,
+            *scales,
+            None::<String>,
+        )),
+        [source, weight, scales, biases] => Ok(SafetensorsQuantizationTarget::new(
+            *source,
+            *weight,
+            *scales,
+            Some(*biases),
+        )),
+        _ => Err("expected SOURCE,WEIGHT,SCALES[,BIASES]".into()),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,13 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             WeightQuantization::MxFp4
         }
     };
-    let options = CheckpointQuantizationOptions {
-        quantization,
-        shard_size_bytes: args.shard_size_mib * 1024 * 1024,
-        include: args.include,
-        exclude: args.exclude,
-        minimum_elements: args.minimum_elements,
-    };
+    let output_config = serde_json::Value::from_str(&std::fs::read_to_string(args.output_config)?)?;
+    let plan = SafetensorsQuantizationPlan::new(quantization, args.target, output_config)?;
+    let mut options = CheckpointQuantizationOptions::new(plan);
+    options.shard_size_bytes = args.shard_size_mib * 1024 * 1024;
     let report = quantize_checkpoint(args.source, args.output, &options, stream)?;
     println!("quantized_tensors={}", report.quantized_tensors);
     println!("copied_tensors={}", report.copied_tensors);

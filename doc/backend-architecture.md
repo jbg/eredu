@@ -192,6 +192,14 @@ redeclare family-specific stacking, concatenation, reshaping, normalization,
 or recurrent-weight transformations. This includes format-dependent recipes
 such as fused projection assembly and recurrent transition conversion; backend
 composition may inspect recipe outputs but does not construct their equations.
+Architecture-owned SafeTensors conversion plans likewise enumerate every exact
+dense source, packed-weight output, scale companion, optional affine-bias
+companion, and the complete output model configuration. Concrete backends
+execute those plans literally. They do not select tensors by suffix, rank,
+dtype, size, or substring; derive companion identities; canonicalize legacy
+names; or inject compatibility metadata into `config.json`. Conversion fails
+closed when a declared source is absent or any declared output collides with
+another checkpoint tensor.
 These catalogs are model-wide and configuration-derived. Backend adapters may
 filter their outputs to the parameters present in a static module, execution
 unit, or independently resident bank; that filtering does not transfer source

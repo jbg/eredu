@@ -15,6 +15,8 @@
 
 /// Portable model capabilities and scalar runtime-state estimates.
 pub mod capability;
+/// Exact architecture-owned plans for dense checkpoint conversion.
+pub mod checkpoint_conversion;
 /// Authoritative model-family identity and Hugging Face/GGUF configuration parsing.
 pub mod configuration;
 pub use configuration::{GgufArchitecture, ModelKind};
