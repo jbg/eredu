@@ -33,8 +33,6 @@ pub mod input;
 pub mod inspection;
 /// Portable decoded-media requests and backend preparation inputs.
 pub mod media;
-/// Stable model and artifact identities.
-pub mod model;
 /// Portable, explicitly requested execution observations.
 pub mod observation;
 /// Backend-generic realtime token-session execution and scheduling.

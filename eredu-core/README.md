@@ -15,7 +15,7 @@ eredu-core = "0.1"
 
 ## What the crate provides
 
-- Artifact inspection, model identity, tensor catalogs, and preparation plans
+- Artifact inspection, resolved model configuration, tensor catalogs, and preparation plans
   for SafeTensors and GGUF checkpoints.
 - Whole-model backend, session, prefill, decode, completion, capability, and
   optional distributed contracts.

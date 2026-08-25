@@ -173,7 +173,8 @@ portable configuration. Core routes the protocol and resolves companion paths;
 it neither recognizes family strings nor exposes an exhaustive family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
-in `eredu-architectures`. Nested `text_config.model_type` normalization is
+in `eredu-architectures`; core does not publish a parallel serialized model or
+artifact identity schema. Nested `text_config.model_type` normalization is
 available only to outer wrapper identities explicitly admitted by that closed
 registry; an unknown outer `model_type` is rejected even when its nested text
 identity is known. External assistant admission remains separate: its closed
