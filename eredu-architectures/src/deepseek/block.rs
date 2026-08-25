@@ -3,7 +3,7 @@
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, HyperConnection,
     HyperConnectionSpec, HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec, Parameterized,
+    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
     PoolingAttentionCache, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
@@ -85,12 +85,12 @@ where
             return Err(Error::backend(format!("V4 layer {layer} is out of range")));
         }
         let norm = |name: String| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(name)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    parameter(name)?,
+                ),
                 context,
             )
         };
@@ -574,12 +574,12 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> V3Block<B> {
     ) -> Result<Self, Error> {
         let root = format!("model.layers.{layer}");
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(format!("{root}.{field}.weight"))?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    parameter(format!("{root}.{field}.weight"))?,
+                ),
                 context,
             )
         };

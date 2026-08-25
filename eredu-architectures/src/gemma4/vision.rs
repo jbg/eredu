@@ -8,8 +8,8 @@ use eredu_nn::{
     multimodal::{
         multi_axis_rotary_embeddings, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
     },
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, Parameter, ParameterSpec, Parameterized, Tensor,
+    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, Parameter, ParameterSpec, Parameterized, Tensor,
 };
 use serde::Deserialize;
 
@@ -357,13 +357,13 @@ impl<B: NeuralBackend> VisionAttention<B> {
     ) -> Result<Self, Error> {
         let prefix = format!("model.vision_tower.encoder.layers.{layer}.self_attn");
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.head_dim,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.head_dim,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
@@ -521,13 +521,13 @@ impl<B: NeuralBackend> VisionLayer<B> {
     ) -> Result<Self, Error> {
         let prefix = format!("model.vision_tower.encoder.layers.{layer}");
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };

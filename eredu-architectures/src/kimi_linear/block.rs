@@ -1,8 +1,8 @@
 //! Kimi Linear normalization, residual, and heterogeneous mixer assembly.
 
 use eredu_nn::{
-    BlockwiseAttentionBackend, CompressedAttentionCache, Error, NormalizationOperator,
-    NormalizationSpec, ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
+    BlockwiseAttentionBackend, CompressedAttentionCache, Error, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
 
@@ -104,15 +104,13 @@ where
             )?),
         };
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!(
-                        "model.layers.{layer}.{field}.weight"
-                    ))
-                    .map_err(Error::backend)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
+                        .map_err(Error::backend)?,
+                ),
                 context,
             )
         };

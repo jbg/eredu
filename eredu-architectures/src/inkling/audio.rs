@@ -1,8 +1,8 @@
 //! Neutral Inkling dMel audio projection.
 
 use eredu_nn::{
-    EmbeddingOperator, EmbeddingSpec, Error, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, ParameterSpec, Parameterized, Tensor,
+    EmbeddingOperator, EmbeddingSpec, Error, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 
 use super::AudioConfig;
@@ -47,13 +47,12 @@ impl<B: NeuralBackend> AudioTower<B> {
                 },
                 context,
             )?,
-            final_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.text_hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable("audio.final_norm.weight")
-                        .map_err(Error::backend)?,
-                },
+            final_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.text_hidden_size,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable("audio.final_norm.weight").map_err(Error::backend)?,
+                ),
                 context,
             )?,
             num_codebooks: config.num_codebooks,

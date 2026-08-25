@@ -24,8 +24,8 @@ use eredu_nn::{
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
     JointExpertRoutingInput, JointExpertRoutingResult, LinearOperator, LinearSpec,
     LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, NormalizationSpec, PadMode, ParameterMetadata,
-    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
+    NormalizationOperator, NormalizationScale, PadMode, ParameterMetadata, ParameterSpec,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
     PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
     RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
     RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend, RoutingOperator,
@@ -2779,14 +2779,6 @@ impl NeuralBackend for NumericBackend {
         };
         let local = linear.forward(input, context)?;
         parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
-    }
-
-    fn rms_norm(spec: NormalizationSpec, _: &NumericContext) -> Result<Self::Normalization, Error> {
-        Ok(NumericNorm {
-            weight: parameter(&spec.weight, vec![spec.dimensions], true),
-            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
-            epsilon: spec.epsilon,
-        })
     }
 
     fn normalization(
@@ -10819,11 +10811,11 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
                 bias: None,
                 format: dense_linear_format(),
             }),
-            normalization: NormalizationSpec {
-                dimensions: 2,
-                epsilon: 0.0,
-                weight: parameter("low_rank.norm.weight"),
-            },
+            normalization: NormalizationConstructionSpec::learned(
+                2,
+                1e-6,
+                parameter("low_rank.norm.weight"),
+            ),
             second: LinearSpec {
                 input: 2,
                 output: 1,
@@ -10855,7 +10847,7 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
         )
         .unwrap();
     assert_eq!(output.shape, [1, 1]);
-    assert_close(output.data[0], 2.0 / 12.5_f32.sqrt());
+    assert_close(output.data[0], 2.0 / (12.5_f32 + 1e-6).sqrt());
 }
 
 #[test]

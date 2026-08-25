@@ -3,9 +3,9 @@
 
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, HyperHead, HyperHeadSpec,
-    HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, ParameterSpec, Parameterized, PoolingAttentionCache, RoutedNeuralBackend,
-    Tensor,
+    HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, PoolingAttentionCache,
+    RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider};
 
@@ -163,12 +163,12 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
         let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + depth;
         let root = format!("model.layers.{global}");
         let norm = |name: String| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(name)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    parameter(name)?,
+                ),
                 context,
             )
         };
@@ -374,12 +374,12 @@ where
         let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + depth;
         let root = format!("mtp.{depth}");
         let norm = |name: String| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(name)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    parameter(name)?,
+                ),
                 context,
             )
         };

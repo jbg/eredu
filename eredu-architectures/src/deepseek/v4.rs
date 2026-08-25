@@ -11,9 +11,9 @@ use eredu_core::{
 };
 use eredu_nn::{
     EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, HyperHead, HyperHeadSpec,
-    HyperNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationOperator,
-    NormalizationSpec, ParameterSpec, Parameterized, PoolingAttentionCache, RoutedNeuralBackend,
-    Tensor,
+    HyperNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, PoolingAttentionCache,
+    RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
@@ -1947,12 +1947,12 @@ impl<B: HyperNeuralBackend> DsparkStatic<B> {
     ) -> Result<Self, Error> {
         let last = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)? - 1;
         let norm = |name: String| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(name)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    parameter(name)?,
+                ),
                 context,
             )
         };

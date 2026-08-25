@@ -3,8 +3,8 @@
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
     CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    GatedDeltaScanInput, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, Parameter, ParameterSpec, Tensor,
+    GatedDeltaScanInput, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, Parameter, ParameterSpec, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -112,12 +112,12 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
                 &[projection],
                 context,
             )?,
-            o_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: head_dim,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(format!("{prefix}.o_norm.weight"))?,
-                },
+            o_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    head_dim,
+                    args.rms_norm_eps,
+                    parameter(format!("{prefix}.o_norm.weight"))?,
+                ),
                 context,
             )?,
             o_proj: linear("o_proj", projection, args.hidden_size)?,

@@ -9,9 +9,9 @@ use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
     Error, FusedProjectionLayout, FusedProjectionSegment, GatedProductPolicy, Index,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter,
-    ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend,
-    Tensor, VocabularyParallelRange,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, Parameter, ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RotarySubspace, RoutedNeuralBackend, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
@@ -1023,16 +1023,16 @@ impl<B: NeuralBackend> Attention<B> {
             query_norm: config
                 .query_key_norm_epsilon()
                 .map(|epsilon| {
-                    B::rms_norm(
-                        NormalizationSpec {
-                            dimensions: head,
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            head,
                             epsilon,
-                            weight: ParameterSpec::trainable(format!(
+                            ParameterSpec::trainable(format!(
                                 "{prefix}.{}.weight",
                                 fields.attention_query_norm
                             ))
                             .map_err(Error::backend)?,
-                        },
+                        ),
                         context,
                     )
                 })
@@ -1040,16 +1040,16 @@ impl<B: NeuralBackend> Attention<B> {
             key_norm: config
                 .query_key_norm_epsilon()
                 .map(|epsilon| {
-                    B::rms_norm(
-                        NormalizationSpec {
-                            dimensions: head,
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            head,
                             epsilon,
-                            weight: ParameterSpec::trainable(format!(
+                            ParameterSpec::trainable(format!(
                                 "{prefix}.{}.weight",
                                 fields.attention_key_norm
                             ))
                             .map_err(Error::backend)?,
-                        },
+                        ),
                         context,
                     )
                 })
@@ -1502,30 +1502,30 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
         Ok(Self {
             self_attention: Attention::new(config, layer, context)?,
             mlp: Mlp::new(config, layer, context)?,
-            input_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.hidden_size(),
-                    epsilon: config.rms_norm_epsilon(),
-                    weight: ParameterSpec::trainable(format!(
+            input_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size(),
+                    config.rms_norm_epsilon(),
+                    ParameterSpec::trainable(format!(
                         "{}.layers.{layer}.{}.weight",
                         config.parameter_root(),
                         fields.input_norm
                     ))
                     .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
-            post_attention_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.hidden_size(),
-                    epsilon: config.rms_norm_epsilon(),
-                    weight: ParameterSpec::trainable(format!(
+            post_attention_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size(),
+                    config.rms_norm_epsilon(),
+                    ParameterSpec::trainable(format!(
                         "{}.layers.{layer}.{}.weight",
                         config.parameter_root(),
                         fields.post_attention_norm
                     ))
                     .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
         })
@@ -1954,16 +1954,13 @@ impl<B: NeuralBackend> Decoder<B, Mlp<B>> {
                 context,
             )?,
             layers,
-            norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.hidden_size(),
-                    epsilon: config.rms_norm_epsilon(),
-                    weight: ParameterSpec::trainable(format!(
-                        "{}.norm.weight",
-                        config.parameter_root()
-                    ))
-                    .map_err(Error::backend)?,
-                },
+            norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size(),
+                    config.rms_norm_epsilon(),
+                    ParameterSpec::trainable(format!("{}.norm.weight", config.parameter_root()))
+                        .map_err(Error::backend)?,
+                ),
                 context,
             )?,
         })

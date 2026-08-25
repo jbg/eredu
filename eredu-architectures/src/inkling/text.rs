@@ -5,9 +5,9 @@ use eredu_nn::{
     AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error,
     GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, Parameter, ParameterSpec, Parameterized, RelativeAttentionInput,
-    RoutedNeuralBackend, RoutingResult, Tensor,
+    JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
+    RelativeAttentionInput, RoutedNeuralBackend, RoutingResult, Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -186,13 +186,13 @@ impl<B: NeuralBackend> Attention<B> {
             )
         };
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: head_dimensions,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    head_dimensions,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
@@ -1067,13 +1067,13 @@ impl<B: RoutedNeuralBackend> DecoderLayer<B> {
     ) -> Result<Self, Error> {
         let prefix = block_root;
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
@@ -1450,12 +1450,12 @@ impl<B: RoutedNeuralBackend> TextModel<B> {
     /// Builds the complete neutral text model.
     pub fn new(args: &TextArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let norm = |name: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(name).map_err(Error::backend)?,
+                ),
                 context,
             )
         };

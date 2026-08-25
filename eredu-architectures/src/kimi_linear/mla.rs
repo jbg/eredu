@@ -3,8 +3,8 @@
 use eredu_nn::{
     AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec, CompressedAttentionCache,
     CompressedAttentionState, Error, Index, LinearOperator, LinearSpec, LowRankProjection,
-    LowRankProjectionSpec, NormalizationOperator, NormalizationSpec, ParameterSpec, Parameterized,
-    Tensor,
+    LowRankProjectionSpec, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
+    Parameterized, Tensor,
 };
 
 use super::ModelArgs;
@@ -110,11 +110,11 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
                         args.hidden_size,
                         rank,
                     )?),
-                    normalization: NormalizationSpec {
-                        dimensions: rank,
-                        epsilon: args.rms_norm_eps,
-                        weight: parameter(format!("{root}.q_a_layernorm.weight"))?,
-                    },
+                    normalization: NormalizationConstructionSpec::learned(
+                        rank,
+                        args.rms_norm_eps,
+                        parameter(format!("{root}.q_a_layernorm.weight"))?,
+                    ),
                     second: linear_spec(format!("{root}.q_b_proj.weight"), rank, query_dimensions)?,
                 },
                 context,
@@ -147,12 +147,12 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
                 )?,
                 context,
             )?,
-            kv_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.kv_lora_rank,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(format!("{root}.kv_a_layernorm.weight"))?,
-                },
+            kv_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.kv_lora_rank,
+                    args.rms_norm_eps,
+                    parameter(format!("{root}.kv_a_layernorm.weight"))?,
+                ),
                 context,
             )?,
             kv_b: if args.split_kv_b {

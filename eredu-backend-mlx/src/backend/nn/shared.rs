@@ -18,11 +18,11 @@ use eredu_nn::{
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
     JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearFormatSpec,
     LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, NormalizationSpec, ParameterMetadata, ParameterSpec,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
-    RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
-    RoutingResult, RoutingScoring, SegmentedAttentionInput, SelectiveStateSpaceScanInput,
+    NormalizationOperator, NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
+    RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
+    RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult,
+    RoutingScoring, SegmentedAttentionInput, SelectiveStateSpaceScanInput,
     SelectiveStateSpaceScanOutput, Tensor, TensorParallelExpertOutput, TopKRouterSpec,
     VocabularyParallelRange,
 };
@@ -1605,10 +1605,6 @@ impl NeuralBackend for MlxNeuralBackend {
         compute_tensor(safemlx::distributed::all_gather_uneven_axis(
             &local, -1, &widths, parallel, context,
         ))
-    }
-
-    fn rms_norm(spec: NormalizationSpec, context: &Stream) -> Result<MlxRmsNorm, ComputeError> {
-        Self::normalization(spec.into(), context)
     }
 
     fn normalization(

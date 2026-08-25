@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_nn::{
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, PadMode, Parameter, ParameterSpec, Parameterized, Tensor,
+    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, PadMode, Parameter, ParameterSpec, Parameterized, Tensor,
 };
 use serde::Deserialize;
 
@@ -907,12 +907,12 @@ fn rms_norm<B: NeuralBackend>(
     weight: &str,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Normalization, Error> {
-    B::rms_norm(
-        NormalizationSpec {
-            dimensions: config.hidden_size,
-            epsilon: config.rms_norm_eps,
-            weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
-        },
+    B::normalization(
+        NormalizationConstructionSpec::learned(
+            config.hidden_size,
+            config.rms_norm_eps,
+            ParameterSpec::trainable(weight).map_err(Error::backend)?,
+        ),
         context,
     )
 }

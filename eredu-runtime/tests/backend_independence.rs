@@ -13,9 +13,9 @@ use eredu_core::{
 };
 use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy, Index,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, Tensor,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, PadMode, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, ArchitecturePartition, CollectiveBackend,
@@ -265,7 +265,10 @@ impl NeuralBackend for FakeBackend {
     fn embedding(_: EmbeddingSpec, _: &()) -> Result<Self::Embedding, Error> {
         Ok(FakeOperator)
     }
-    fn rms_norm(_: NormalizationSpec, _: &()) -> Result<Self::Normalization, Error> {
+    fn normalization(
+        _: NormalizationConstructionSpec,
+        _: &(),
+    ) -> Result<Self::Normalization, Error> {
         Ok(FakeOperator)
     }
     fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {

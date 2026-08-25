@@ -1,8 +1,8 @@
 //! Neutral Inkling folded hMLP image tower.
 
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec,
-    ParameterSpec, Parameterized, Tensor,
+    Error, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 
 use super::VisionConfig;
@@ -45,15 +45,15 @@ impl<B: NeuralBackend> VisionLayer<B> {
             )?,
             norm: (layer + 1 != config.num_hidden_layers as usize)
                 .then(|| {
-                    B::rms_norm(
-                        NormalizationSpec {
-                            dimensions: output,
-                            epsilon: config.rms_norm_eps,
-                            weight: ParameterSpec::trainable(format!(
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            output,
+                            config.rms_norm_eps,
+                            ParameterSpec::trainable(format!(
                                 "visual.layers.{layer}.layer_norm.weight"
                             ))
                             .map_err(Error::backend)?,
-                        },
+                        ),
                         context,
                     )
                 })
@@ -94,13 +94,12 @@ impl<B: NeuralBackend> VisionStatic<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            final_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.text_hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable("visual.final_norm.weight")
-                        .map_err(Error::backend)?,
-                },
+            final_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.text_hidden_size,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable("visual.final_norm.weight").map_err(Error::backend)?,
+                ),
                 context,
             )?,
             hidden_size: config.text_hidden_size,

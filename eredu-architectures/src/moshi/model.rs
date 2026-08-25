@@ -4,7 +4,7 @@ use crate::decoder::{self, Config as DecoderConfig, MultiTableEmbedding, NamedEm
 use eredu_core::LayerSchedule;
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingSpec, Error, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, Tensor,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Tensor,
     VocabularyParallelRange,
 };
 use eredu_runtime::{
@@ -130,12 +130,12 @@ impl<B: NeuralBackend> StaticModules<B> {
 
     fn new(config: &MoshiConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let embeddings = MultiTableEmbedding::new(Self::embedding_specs(config)?, context)?;
-        let output_norm = B::rms_norm(
-            NormalizationSpec {
-                dimensions: config.temporal().hidden_size(),
-                epsilon: config.temporal().rms_norm_epsilon(),
-                weight: ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
-            },
+        let output_norm = B::normalization(
+            NormalizationConstructionSpec::learned(
+                config.temporal().hidden_size(),
+                config.temporal().rms_norm_epsilon(),
+                ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
+            ),
             context,
         )?;
         let text_output = B::linear(
@@ -188,12 +188,12 @@ impl<B: NeuralBackend> StaticModules<B> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let embeddings = MultiTableEmbedding::new_vocabulary_parallel(specs, ranges, context)?;
-        let output_norm = B::rms_norm(
-            NormalizationSpec {
-                dimensions: config.temporal().hidden_size(),
-                epsilon: config.temporal().rms_norm_epsilon(),
-                weight: ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
-            },
+        let output_norm = B::normalization(
+            NormalizationConstructionSpec::learned(
+                config.temporal().hidden_size(),
+                config.temporal().rms_norm_epsilon(),
+                ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
+            ),
             context,
         )?;
         let local = geometry

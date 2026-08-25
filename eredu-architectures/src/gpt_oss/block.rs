@@ -1,7 +1,8 @@
 //! Shared pre-normalized residual block specialized to GPT-OSS routed experts.
 
 use eredu_nn::{
-    AttentionCache, Error, NormalizationSpec, ParameterSpec, RoutedNeuralBackend, Tensor,
+    AttentionCache, Error, NormalizationConstructionSpec, ParameterSpec, RoutedNeuralBackend,
+    Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider};
 
@@ -30,24 +31,22 @@ where
         Ok(crate::decoder::TransformerBlock {
             self_attention: Attention::new(args, layer, context)?,
             mlp: RoutedMlp::new(args, layer, context)?,
-            input_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
+            input_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
-            post_attention_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!(
-                        "{prefix}.post_attention_layernorm.weight"
-                    ))
-                    .map_err(Error::backend)?,
-                },
+            post_attention_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.post_attention_layernorm.weight"))
+                        .map_err(Error::backend)?,
+                ),
                 context,
             )?,
         })

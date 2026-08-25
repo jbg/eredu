@@ -11,9 +11,9 @@ use eredu_checkpoint::{
 };
 use eredu_gguf::{MetadataArray, MetadataValue};
 use eredu_nn::{
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec,
-    Tensor,
+    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySpec, Tensor,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -515,13 +515,13 @@ impl<B: NeuralBackend> DFlashAttention<B> {
             )
         };
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.head_dim,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.head_dim,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
@@ -655,13 +655,13 @@ impl<B: NeuralBackend> DFlashBlock<B> {
     ) -> Result<Self, Error> {
         let root = format!("layers.{layer}");
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{root}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
@@ -755,12 +755,12 @@ impl<B: NeuralBackend> DFlash<B> {
             context,
         )?;
         let norm = |name: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size,
+                    config.rms_norm_eps,
+                    ParameterSpec::trainable(name).map_err(Error::backend)?,
+                ),
                 context,
             )
         };

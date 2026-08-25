@@ -1,8 +1,8 @@
 //! Exact Nemotron-H physical-unit normalization and residual order.
 
 use eredu_nn::{
-    AttentionCache, Error, NormalizationOperator, NormalizationSpec, ParameterSpec, Parameterized,
-    RoutedNeuralBackend, Tensor,
+    AttentionCache, Error, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
+    Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
 
@@ -109,13 +109,13 @@ impl<B: RoutedNeuralBackend> Block<B> {
         };
         Ok(Self {
             operator,
-            norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.layer_norm_epsilon,
-                    weight: ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
+            norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.layer_norm_epsilon,
+                    ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
             residual_in_fp32: args.residual_in_fp32,
@@ -190,13 +190,13 @@ impl<B: RoutedNeuralBackend> Block<B> {
         };
         Ok(Self {
             operator,
-            norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.layer_norm_epsilon,
-                    weight: ParameterSpec::trainable(format!("{root}.norm.weight"))
+            norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.layer_norm_epsilon,
+                    ParameterSpec::trainable(format!("{root}.norm.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
             residual_in_fp32: args.residual_in_fp32,

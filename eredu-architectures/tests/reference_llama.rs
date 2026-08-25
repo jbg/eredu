@@ -11,10 +11,11 @@ use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionMask, AttentionRequest,
     EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GatedProductExpertBankOperator,
     GatedProductExpertBankSpec, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
-    RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
-    RoutingResult, Tensor, TopKRouterSpec, VocabularyParallelRange,
+    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, PadMode,
+    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, Tensor, TopKRouterSpec,
+    VocabularyParallelRange,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
@@ -527,10 +528,23 @@ impl NeuralBackend for ReferenceBackend {
     ) -> Result<Self::Tensor, Error> {
         embedding.as_linear(input, context)
     }
-    fn rms_norm(spec: NormalizationSpec, _: &()) -> Result<Self::Normalization, Error> {
+    fn normalization(
+        spec: NormalizationConstructionSpec,
+        _: &(),
+    ) -> Result<Self::Normalization, Error> {
+        spec.validate()?;
+        let weight = match spec.scale {
+            NormalizationScale::Learned(weight)
+            | NormalizationScale::LearnedOffset { weight, .. } => weight,
+            NormalizationScale::Unit => {
+                return Err(Error::backend(
+                    "reference backend does not model parameterless normalization",
+                ));
+            }
+        };
         Ok(ReferenceNorm {
             weight: ReferenceTensor(vec![spec.dimensions]),
-            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
         })
     }
     fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {

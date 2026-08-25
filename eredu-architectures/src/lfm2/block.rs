@@ -3,8 +3,8 @@
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
     AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    GatedShortConvolution, GatedShortConvolutionSpec, LinearSpec, NormalizationOperator,
-    NormalizationSpec, ParameterSpec, Parameterized, RotarySpec, RoutedNeuralBackend, Tensor,
+    GatedShortConvolution, GatedShortConvolutionSpec, LinearSpec, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, RotarySpec, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -112,13 +112,13 @@ impl<B: RoutedNeuralBackend> Block<B> {
                     )
                 };
                 let norm = |field: &str| {
-                    B::rms_norm(
-                        NormalizationSpec {
-                            dimensions: head_dim,
-                            epsilon: args.norm_eps,
-                            weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            head_dim,
+                            args.norm_eps,
+                            ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                                 .map_err(Error::backend)?,
-                        },
+                        ),
                         context,
                     )
                 };
@@ -158,13 +158,13 @@ impl<B: RoutedNeuralBackend> Block<B> {
             }
         };
         let normalization = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.norm_eps,
-                    weight: ParameterSpec::trainable(format!("{root}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.norm_eps,
+                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };

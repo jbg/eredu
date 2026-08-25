@@ -6,8 +6,8 @@ use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
-    Index, LinearOperator, LinearSpec, NormalizationOperator, NormalizationSpec, ParameterSpec,
-    Parameterized, RoutedNeuralBackend, Tensor,
+    Index, LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
+    ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
@@ -46,12 +46,12 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
     fn new(args: &ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let text = &args.text_config;
         let norm = |name: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: text.hidden_size,
-                    epsilon: text.rms_norm_eps,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    text.hidden_size,
+                    text.rms_norm_eps,
+                    ParameterSpec::trainable(name).map_err(Error::backend)?,
+                ),
                 context,
             )
         };
@@ -105,12 +105,12 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
     ) -> Result<Self, Error> {
         let text = &args.text_config;
         let norm = |name: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: text.hidden_size,
-                    epsilon: text.rms_norm_eps,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    text.hidden_size,
+                    text.rms_norm_eps,
+                    ParameterSpec::trainable(name).map_err(Error::backend)?,
+                ),
                 context,
             )
         };

@@ -1,8 +1,8 @@
 //! Graph-visible embedded multi-token prediction units.
 
 use eredu_nn::{
-    AttentionCache, Error, LinearOperator, LinearSpec, NormalizationOperator, NormalizationSpec,
-    ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, Error, LinearOperator, LinearSpec, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
 
@@ -151,12 +151,12 @@ impl<B: RoutedNeuralBackend> PredictionUnit<B> {
         let root = format!("model.mtp.layers.{physical}");
         let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
         let norm = |name: String| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.layer_norm_epsilon,
-                    weight: parameter(name)?,
-                },
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.layer_norm_epsilon,
+                    parameter(name)?,
+                ),
                 context,
             )
         };

@@ -3,8 +3,8 @@
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, AuxiliaryConvolutionState, Error, LinearOperator, LinearSpec,
-    NormalizationOperator, NormalizationSpec, ParameterSpec, Parameterized, RoutedNeuralBackend,
-    Tensor,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
+    RoutedNeuralBackend, Tensor,
 };
 
 use super::{DecoderLayer, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs};
@@ -83,13 +83,13 @@ impl<B: RoutedNeuralBackend> MtpModel<B> {
             let text = mtp_text_args(&args.text_config, config, attention)?;
             let root = format!("model.mtp.layers.{depth}");
             let norm = |field: &str| {
-                B::rms_norm(
-                    NormalizationSpec {
-                        dimensions: text.hidden_size,
-                        epsilon: text.rms_norm_eps,
-                        weight: ParameterSpec::trainable(format!("{root}.{field}.weight"))
+                B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        text.hidden_size,
+                        text.rms_norm_eps,
+                        ParameterSpec::trainable(format!("{root}.{field}.weight"))
                             .map_err(Error::backend)?,
-                    },
+                    ),
                     context,
                 )
             };
@@ -124,13 +124,13 @@ impl<B: RoutedNeuralBackend> MtpModel<B> {
         let chain_norm = config
             .chain_hidden_post_norm
             .then(|| {
-                B::rms_norm(
-                    NormalizationSpec {
-                        dimensions: args.text_config.hidden_size,
-                        epsilon: args.text_config.rms_norm_eps,
-                        weight: ParameterSpec::trainable("model.mtp.chain_norm.weight")
+                B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        args.text_config.hidden_size,
+                        args.text_config.rms_norm_eps,
+                        ParameterSpec::trainable("model.mtp.chain_norm.weight")
                             .map_err(Error::backend)?,
-                    },
+                    ),
                     context,
                 )
             })

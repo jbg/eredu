@@ -1090,17 +1090,6 @@ impl FusedProjectionLayout {
     }
 }
 
-/// Complete construction specification for normalization.
-#[derive(Debug, Clone)]
-pub struct NormalizationSpec {
-    /// Normalized feature count.
-    pub dimensions: i32,
-    /// Numerical stability epsilon.
-    pub epsilon: f32,
-    /// Stable scale parameter slot.
-    pub weight: ParameterSpec,
-}
-
 /// Parameterization policy for a reusable RMS normalization operator.
 ///
 /// Architectures select the semantic scale form while the backend retains the
@@ -1133,6 +1122,15 @@ pub struct NormalizationConstructionSpec {
 }
 
 impl NormalizationConstructionSpec {
+    /// Creates an RMS normalization with an ordinary learned scale.
+    pub fn learned(dimensions: i32, epsilon: f32, weight: ParameterSpec) -> Self {
+        Self {
+            dimensions,
+            epsilon,
+            scale: NormalizationScale::Learned(weight),
+        }
+    }
+
     /// Validates feature geometry and fixed scalar policy.
     pub fn validate(&self) -> Result<(), Error> {
         let offset = match &self.scale {
@@ -1150,16 +1148,6 @@ impl NormalizationConstructionSpec {
             )));
         }
         Ok(())
-    }
-}
-
-impl From<NormalizationSpec> for NormalizationConstructionSpec {
-    fn from(spec: NormalizationSpec) -> Self {
-        Self {
-            dimensions: spec.dimensions,
-            epsilon: spec.epsilon,
-            scale: NormalizationScale::Learned(spec.weight),
-        }
     }
 }
 
@@ -1317,7 +1305,7 @@ pub struct LowRankProjectionSpec {
     /// represented in rank space.
     pub first: Option<LinearSpec>,
     /// Normalization applied in rank space.
-    pub normalization: NormalizationSpec,
+    pub normalization: NormalizationConstructionSpec,
     /// Rank-to-output projection.
     pub second: LinearSpec,
 }
@@ -1375,7 +1363,7 @@ impl<B: NeuralBackend> LowRankProjection<B> {
                 .first
                 .map(|projection| B::linear(projection, context))
                 .transpose()?,
-            normalization: B::rms_norm(spec.normalization, context)?,
+            normalization: B::normalization(spec.normalization, context)?,
             second: B::linear(spec.second, context)?,
         })
     }
@@ -2959,38 +2947,11 @@ pub trait NeuralBackend: Sized + 'static {
             "backend does not implement tied vocabulary-parallel projection",
         ))
     }
-    /// Builds one RMS normalization operator.
-    fn rms_norm(
-        spec: NormalizationSpec,
-        context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Normalization, Error>;
     /// Builds an RMS normalization with an explicit scale policy.
-    ///
-    /// Backends predating the generalized construction surface continue to
-    /// support ordinary learned scales through `rms_norm`; other policies fail
-    /// closed until implemented by that backend.
     fn normalization(
         spec: NormalizationConstructionSpec,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Normalization, Error> {
-        spec.validate()?;
-        match spec.scale {
-            NormalizationScale::Learned(weight) => Self::rms_norm(
-                NormalizationSpec {
-                    dimensions: spec.dimensions,
-                    epsilon: spec.epsilon,
-                    weight,
-                },
-                context,
-            ),
-            NormalizationScale::LearnedOffset { .. } => Err(Error::backend(
-                "learned-offset RMS normalization is not implemented by this backend",
-            )),
-            NormalizationScale::Unit => Err(Error::backend(
-                "weightless RMS normalization construction is not implemented by this backend",
-            )),
-        }
-    }
+    ) -> Result<Self::Normalization, Error>;
     /// Builds the model's rotary-position operator.
     fn rotary(
         spec: RotarySpec,

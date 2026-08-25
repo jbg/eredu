@@ -32,7 +32,7 @@ pub use crate::decoder::{
 };
 
 use eredu_core::cache::PromptCacheTopology;
-use eredu_nn::{Error, NormalizationSpec, ParameterSpec, RoutedNeuralBackend, Tensor};
+use eredu_nn::{Error, NormalizationConstructionSpec, ParameterSpec, RoutedNeuralBackend, Tensor};
 use eredu_runtime::{ModelStateIdentity, StateLayout};
 
 /// The one Qwen decoder block type; dense versus MoE is its feed-forward policy.
@@ -75,28 +75,28 @@ where
         Ok(crate::decoder::TransformerBlock {
             self_attention: Attention::new(args, layer, context)?,
             mlp: FeedForward::new(args, layer, context)?,
-            input_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!(
+            input_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!(
                         "{}.layers.{layer}.input_layernorm.weight",
                         args.parameter_root
                     ))
                     .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
-            post_attention_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!(
+            post_attention_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!(
                         "{}.layers.{layer}.post_attention_layernorm.weight",
                         args.parameter_root
                     ))
                     .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
         })

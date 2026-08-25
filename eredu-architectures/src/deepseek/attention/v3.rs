@@ -3,8 +3,8 @@
 use eredu_nn::{
     AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec, CompressedAttentionCache,
     CompressedAttentionState, Error, Index, LinearOperator, LinearSpec, LowRankProjection,
-    NormalizationOperator, NormalizationSpec, ParameterSpec, Parameterized, RotaryOperator,
-    RotaryPosition, RotarySpec, Tensor,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
+    RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 
 use crate::deepseek::{projection::ProjectionPolicy, V3Args};
@@ -132,12 +132,12 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
                 args.hidden_size,
                 args.kv_lora_rank + args.qk_rope_head_dim,
             )?,
-            kv_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.kv_lora_rank,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(format!("{root}.kv_a_layernorm.weight"))?,
-                },
+            kv_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.kv_lora_rank,
+                    args.rms_norm_eps,
+                    parameter(format!("{root}.kv_a_layernorm.weight"))?,
+                ),
                 context,
             )?,
             kv_b: linear(

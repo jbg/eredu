@@ -3,8 +3,8 @@
 use eredu_nn::{
     AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
     GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    LinearOperator, LinearSpec, NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec,
-    Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
+    LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator, Parameter,
+    ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
     RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
@@ -138,13 +138,13 @@ impl<B: RoutedNeuralBackend> Attention<B> {
         };
         let gguf = args.weight_convention == WeightConvention::Gguf;
         let norm = |field: &str| {
-            B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.head_dim,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.head_dim,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
@@ -853,13 +853,12 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                 },
                 context,
             )?,
-            final_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable("model.norm.weight")
-                        .map_err(Error::backend)?,
-                },
+            final_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
+                ),
                 context,
             )?,
             head: (!args.tie_word_embeddings)
@@ -907,13 +906,12 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                 geometry.embedding_range().clone(),
                 context,
             )?,
-            final_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable("model.norm.weight")
-                        .map_err(Error::backend)?,
-                },
+            final_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
+                ),
                 context,
             )?,
             head: (!args.tie_word_embeddings)

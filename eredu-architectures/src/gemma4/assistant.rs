@@ -11,8 +11,8 @@ use eredu_gguf::MetadataValue;
 use eredu_nn::{
     multimodal::{masked_output_projection, MaskedOutputProjectionInput},
     AttentionCache, AttentionStateSource, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator,
-    LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec,
-    Parameterized, RotaryPosition, RoutedNeuralBackend, Tensor,
+    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter,
+    ParameterSpec, Parameterized, RotaryPosition, RoutedNeuralBackend, Tensor,
 };
 use serde::Deserialize;
 
@@ -595,13 +595,12 @@ impl<B: RoutedNeuralBackend> Assistant<B> {
             .transpose()?;
         Ok(Self {
             layers,
-            final_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.hidden_size,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable("model.norm.weight")
-                        .map_err(Error::backend)?,
-                },
+            final_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
+                ),
                 context,
             )?,
             pre_projection: linear(

@@ -2,9 +2,9 @@
 
 use eredu_nn::{
     AttentionRequest, Error, Index, IndexedAttentionInput, LinearOperator, LinearSpec,
-    LowRankProjection, NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter,
-    ParameterSpec, Parameterized, PooledAttentionInput, PooledPositionInput, PoolingAttentionCache,
-    PoolingOverlap, PoolingWindows, Tensor,
+    LowRankProjection, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
+    Parameter, ParameterSpec, Parameterized, PooledAttentionInput, PooledPositionInput,
+    PoolingAttentionCache, PoolingOverlap, PoolingWindows, Tensor,
 };
 
 use crate::deepseek::{projection::ProjectionPolicy, V4Args, V4AttentionPolicy};
@@ -157,12 +157,12 @@ impl<B: NeuralBackend> Compressor<B> {
                 context,
             )?,
             ape: Parameter::unloaded(parameter(format!("{root}.ape"))?, &[ratio, output], context)?,
-            norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: head_dimensions,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(format!("{root}.norm.weight"))?,
-                },
+            norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    head_dimensions,
+                    args.rms_norm_eps,
+                    parameter(format!("{root}.norm.weight"))?,
+                ),
                 context,
             )?,
             rope: V4Rotary::new(args, args.compress_rope_theta, true, ratio, context)?,
@@ -510,12 +510,12 @@ impl<B: NeuralBackend> Attention<B> {
                 args.linear_format_for(&format!("{root}.wkv.weight")),
                 context,
             )?,
-            kv_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: args.head_dim,
-                    epsilon: args.rms_norm_eps,
-                    weight: parameter(format!("{root}.kv_norm.weight"))?,
-                },
+            kv_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.head_dim,
+                    args.rms_norm_eps,
+                    parameter(format!("{root}.kv_norm.weight"))?,
+                ),
                 context,
             )?,
             wo_a: linear::<B>(

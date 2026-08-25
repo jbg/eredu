@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
-    Error, LinearSpec, LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationSpec,
-    ParameterSpec, Tensor,
+    Error, LinearSpec, LowRankProjection, LowRankProjectionSpec, NeuralBackend,
+    NormalizationConstructionSpec, ParameterSpec, Tensor,
 };
 
 /// Architecture-owned identities and geometry for one normalized low-rank
@@ -54,12 +54,11 @@ impl ProjectionPolicy {
                         linear(weight, self.input_dimensions, self.rank, self.first_format)
                     })
                     .transpose()?,
-                normalization: NormalizationSpec {
-                    dimensions: self.rank,
-                    epsilon: self.epsilon,
-                    weight: ParameterSpec::trainable(&self.normalization_weight)
-                        .map_err(Error::backend)?,
-                },
+                normalization: NormalizationConstructionSpec::learned(
+                    self.rank,
+                    self.epsilon,
+                    ParameterSpec::trainable(&self.normalization_weight).map_err(Error::backend)?,
+                ),
                 second: linear(
                     &self.second_weight,
                     self.rank,

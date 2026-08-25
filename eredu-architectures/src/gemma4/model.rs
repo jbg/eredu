@@ -2193,8 +2193,8 @@ fn slice_component<T: Tensor>(
 // media without changing their stable parameter identities.
 pub(crate) mod model_text {
     use eredu_nn::{
-        EmbeddingSpec, Error, LinearOperator, LinearSpec, NormalizationSpec, ParameterSpec,
-        Parameterized, RoutedNeuralBackend, Tensor,
+        EmbeddingSpec, Error, LinearOperator, LinearSpec, NormalizationConstructionSpec,
+        ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
     };
 
     use super::super::ModelArgs;
@@ -2280,26 +2280,26 @@ pub(crate) mod model_text {
                     .transpose()?,
                 per_layer_norm: (args.hidden_size_per_layer_input > 0)
                     .then(|| {
-                        B::rms_norm(
-                            NormalizationSpec {
-                                dimensions: args.hidden_size_per_layer_input,
-                                epsilon: args.rms_norm_eps,
-                                weight: ParameterSpec::trainable(
+                        B::normalization(
+                            NormalizationConstructionSpec::learned(
+                                args.hidden_size_per_layer_input,
+                                args.rms_norm_eps,
+                                ParameterSpec::trainable(
                                     "model.language_model.per_layer_projection_norm.weight",
                                 )
                                 .map_err(Error::backend)?,
-                            },
+                            ),
                             context,
                         )
                     })
                     .transpose()?,
-                norm: B::rms_norm(
-                    NormalizationSpec {
-                        dimensions: args.hidden_size,
-                        epsilon: args.rms_norm_eps,
-                        weight: ParameterSpec::trainable("model.language_model.norm.weight")
+                norm: B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        ParameterSpec::trainable("model.language_model.norm.weight")
                             .map_err(Error::backend)?,
-                    },
+                    ),
                     context,
                 )?,
                 head: (!args.tie_word_embeddings)
@@ -2388,26 +2388,26 @@ pub(crate) mod model_text {
                     .transpose()?,
                 per_layer_norm: (per_layer_width > 0)
                     .then(|| {
-                        B::rms_norm(
-                            NormalizationSpec {
-                                dimensions: per_layer_width,
-                                epsilon: args.rms_norm_eps,
-                                weight: ParameterSpec::trainable(
+                        B::normalization(
+                            NormalizationConstructionSpec::learned(
+                                per_layer_width,
+                                args.rms_norm_eps,
+                                ParameterSpec::trainable(
                                     "model.language_model.per_layer_projection_norm.weight",
                                 )
                                 .map_err(Error::backend)?,
-                            },
+                            ),
                             context,
                         )
                     })
                     .transpose()?,
-                norm: B::rms_norm(
-                    NormalizationSpec {
-                        dimensions: args.hidden_size,
-                        epsilon: args.rms_norm_eps,
-                        weight: ParameterSpec::trainable("model.language_model.norm.weight")
+                norm: B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        ParameterSpec::trainable("model.language_model.norm.weight")
                             .map_err(Error::backend)?,
-                    },
+                    ),
                     context,
                 )?,
                 head: if args.tie_word_embeddings {

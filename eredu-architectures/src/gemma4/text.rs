@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionStateSource, AttentionValueSource, Error, GatedProductExpertBankSpec,
-    GatedProductExpertLayout, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, RotarySubspace, RoutedNeuralBackend, RouterInputTransformSpec, RoutingOperator,
-    RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    GatedProductExpertLayout, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
+    RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend,
+    RouterInputTransformSpec, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec,
+    TopKRoutingSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -132,24 +133,24 @@ impl<B: NeuralBackend> Attention<B> {
                 args.num_attention_heads * head_dim,
                 args.hidden_size,
             )?,
-            query_norm: B::rms_norm(
-                NormalizationSpec {
-                    dimensions: head_dim,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.q_norm.weight"))
+            query_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    head_dim,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.q_norm.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )?,
             key_norm: owns_state
                 .then(|| {
-                    B::rms_norm(
-                        NormalizationSpec {
-                            dimensions: head_dim,
-                            epsilon: args.rms_norm_eps,
-                            weight: ParameterSpec::trainable(format!("{prefix}.k_norm.weight"))
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            head_dim,
+                            args.rms_norm_eps,
+                            ParameterSpec::trainable(format!("{prefix}.k_norm.weight"))
                                 .map_err(Error::backend)?,
-                        },
+                        ),
                         context,
                     )
                 })
@@ -456,13 +457,13 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
             .ok_or_else(|| Error::backend(format!("missing Gemma 4 layer policy {layer}")))?;
         let prefix = format!("{layer_root}.{layer}");
         let norm = |field: &str, dimensions| {
-            B::rms_norm(
-                NormalizationSpec {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
                     dimensions,
-                    epsilon: args.rms_norm_eps,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
-                },
+                ),
                 context,
             )
         };
