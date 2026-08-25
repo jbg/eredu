@@ -271,15 +271,20 @@ pub fn materialize_model_plan(
 fn inspected_runtime_state_dtype_bytes(
     inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<std::num::NonZeroU8, Error> {
-    if inspection.format() == eredu_core::ArtifactFormat::Gguf {
-        // MLX native GGUF embeddings dequantize to Float32. Their catalog dtype
-        // describes packed storage rather than the resulting activation.
-        return Ok(std::num::NonZeroU8::new(4).expect("Float32 width is nonzero"));
+    let source = match inspection.format() {
+        eredu_core::ArtifactFormat::Gguf => {
+            eredu_architectures::preparation::prepared_gguf_runtime_state_dtype_source(
+                prepared_gguf_plan(inspection.architecture_plan())?,
+                inspection.tensors(),
+            )
+        }
+        eredu_core::ArtifactFormat::SafeTensors => {
+            eredu_architectures::preparation::prepared_safetensors_runtime_state_dtype_source(
+                prepared_safetensors_architecture(inspection.architecture_plan())?,
+                inspection.tensors(),
+            )
+        }
     }
-    let source = eredu_architectures::preparation::prepared_safetensors_runtime_state_dtype_source(
-        prepared_safetensors_architecture(inspection.architecture_plan())?,
-        inspection.tensors(),
-    )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     mlx_runtime_state_dtype_bytes(source.dtype()).map_err(|dtype| {
         Error::ArchitectureModel(format!(
@@ -298,10 +303,10 @@ fn mlx_runtime_state_dtype_bytes(
         TensorDtype::F16 | TensorDtype::Bf16 => 2,
         TensorDtype::F32 => 4,
         TensorDtype::F64 | TensorDtype::Complex64 => 8,
-        // MLX materializes supported packed SafeTensors embeddings as Float32
-        // activations. These cases are reached only after the architecture
-        // schema resolved the exact embedding parameter; they are not a
-        // fallback for an unknown checkpoint name.
+        // MLX materializes supported packed embeddings as Float32 activations.
+        // These cases are reached only after the architecture schema resolved
+        // the exact embedding parameter; they are not a fallback for an
+        // unknown checkpoint name.
         TensorDtype::U32 | TensorDtype::Encoded(_) => 4,
         dtype => return Err(dtype.clone()),
     };
@@ -310,12 +315,62 @@ fn mlx_runtime_state_dtype_bytes(
 
 #[cfg(test)]
 mod runtime_state_dtype_tests {
-    use super::{mlx_runtime_state_dtype_bytes, reject_complete_tensor_parallel_quantization};
+    use super::{
+        inspected_runtime_state_dtype_bytes, mlx_runtime_state_dtype_bytes,
+        reject_complete_tensor_parallel_quantization,
+    };
     use crate::backend::{DeviceAssignment, MlxParallelContext};
     use eredu_architectures::ModelKind;
     use eredu_checkpoint::WeightQuantization;
     use eredu_core::checkpoint::TensorDtype;
+    use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
     use safemlx::DeviceType;
+    use std::collections::BTreeMap;
+
+    fn write_minimal_llama_gguf(path: &std::path::Path, dtype: GgmlType) {
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("llama".into()),
+            ),
+            ("llama.block_count".into(), MetadataValue::Uint32(1)),
+            ("llama.embedding_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.attention.head_count".into(),
+                MetadataValue::Uint32(1),
+            ),
+            ("llama.feed_forward_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::Float32(1e-5),
+            ),
+            ("llama.vocab_size".into(), MetadataValue::Uint32(1)),
+            ("llama.context_length".into(), MetadataValue::Uint32(1)),
+        ]);
+        let data = [0_u8; 2];
+        let tensor = |name, dimensions| TensorInput {
+            name,
+            dimensions,
+            ggml_type: dtype,
+            data: &data,
+        };
+        let tensors = [
+            tensor("token_embd.weight", &[1, 1]),
+            tensor("output_norm.weight", &[1]),
+            tensor("blk.0.attn_norm.weight", &[1]),
+            tensor("blk.0.ffn_norm.weight", &[1]),
+            tensor("blk.0.attn_q.weight", &[1, 1]),
+            tensor("blk.0.attn_k.weight", &[1, 1]),
+            tensor("blk.0.attn_v.weight", &[1, 1]),
+            tensor("blk.0.attn_output.weight", &[1, 1]),
+            tensor("blk.0.ffn_gate.weight", &[1, 1]),
+            tensor("blk.0.ffn_up.weight", &[1, 1]),
+            tensor("blk.0.ffn_down.weight", &[1, 1]),
+        ];
+        Writer::default()
+            .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+            .unwrap();
+    }
 
     #[test]
     fn deepseek_pure_tp_uses_distributed_stage_loader() {
@@ -444,6 +499,27 @@ mod runtime_state_dtype_tests {
             (TensorDtype::F64, 8),
         ] {
             assert_eq!(mlx_runtime_state_dtype_bytes(&dtype).unwrap().get(), bytes);
+        }
+    }
+
+    #[test]
+    fn dense_half_gguf_embeddings_select_two_byte_runtime_state() {
+        for dtype in [GgmlType::F16, GgmlType::Bf16] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("model.gguf");
+            write_minimal_llama_gguf(&path, dtype);
+            let inspection = eredu_core::inspect_artifact(
+                &path,
+                &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+            )
+            .unwrap();
+
+            assert_eq!(
+                inspected_runtime_state_dtype_bytes(&inspection)
+                    .unwrap()
+                    .get(),
+                2
+            );
         }
     }
 

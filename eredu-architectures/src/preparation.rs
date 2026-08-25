@@ -3,7 +3,7 @@
 use std::fmt::Display;
 
 use crate::ModelKind;
-use eredu_checkpoint::schema::SafetensorsCheckpointPlan;
+use eredu_checkpoint::schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan};
 use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
 use eredu_core::InputModalities;
 use serde_json::Value;
@@ -260,8 +260,45 @@ fn resolve_runtime_state_dtype_source(
                 plan.identity
             ))
         })?;
-    let present = std::iter::once(constraint.key.as_str())
-        .chain(constraint.aliases.iter().map(String::as_str))
+    resolve_declared_runtime_state_dtype_source(
+        &plan.identity,
+        parameter,
+        &constraint.aliases,
+        tensors,
+    )
+}
+
+fn resolve_gguf_runtime_state_dtype_source(
+    plan: &GgufCheckpointPlan,
+    parameter: &str,
+    tensors: &TensorCatalog,
+) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+    let constraint = plan
+        .common_tensors
+        .iter()
+        .find(|constraint| constraint.key == parameter)
+        .ok_or_else(|| {
+            invalid(format!(
+                "architecture checkpoint plan {:?} does not declare runtime-state dtype source {parameter:?} as a common tensor",
+                plan.identity
+            ))
+        })?;
+    resolve_declared_runtime_state_dtype_source(
+        &plan.identity,
+        parameter,
+        &constraint.aliases,
+        tensors,
+    )
+}
+
+fn resolve_declared_runtime_state_dtype_source(
+    plan_identity: &str,
+    parameter: &str,
+    aliases: &[String],
+    tensors: &TensorCatalog,
+) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+    let present = std::iter::once(parameter)
+        .chain(aliases.iter().map(String::as_str))
         .filter_map(|name| tensors.get(name))
         .collect::<Vec<_>>();
     match present.as_slice() {
@@ -272,11 +309,11 @@ fn resolve_runtime_state_dtype_source(
         }),
         [] => Err(invalid(format!(
             "architecture checkpoint plan {:?} did not find runtime-state dtype source {parameter:?} or any of its declared aliases",
-            plan.identity
+            plan_identity
         ))),
         tensors => Err(invalid(format!(
             "architecture checkpoint plan {:?} found multiple physical aliases for runtime-state dtype source {parameter:?}: {:?}",
-            plan.identity,
+            plan_identity,
             tensors
                 .iter()
                 .map(|tensor| tensor.name.as_str())
@@ -440,6 +477,30 @@ pub fn prepared_safetensors_runtime_state_dtype_source(
         | SafetensorsModelConfig::QwenHybrid(_) => "model.embed_tokens.weight".into(),
     };
     resolve_runtime_state_dtype_source(architecture.checkpoint(), &parameter, tensors)
+}
+
+/// Resolves runtime-state dtype from the exact GGUF plan retained at admission.
+pub fn prepared_gguf_runtime_state_dtype_source(
+    architecture: &crate::configuration::GgufArchitecturePlan,
+    tensors: &TensorCatalog,
+) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+    use crate::configuration::GgufModelConfig;
+
+    let parameter = match architecture.model() {
+        GgufModelConfig::DeepSeekV3(_)
+        | GgufModelConfig::DeepSeekV4(_)
+        | GgufModelConfig::Gemma4(_)
+        | GgufModelConfig::GptOss(_)
+        | GgufModelConfig::Inkling(_)
+        | GgufModelConfig::KimiLinear(_)
+        | GgufModelConfig::Lfm2(_)
+        | GgufModelConfig::Llama(_)
+        | GgufModelConfig::MuseGlimmer(_)
+        | GgufModelConfig::NemotronH(_)
+        | GgufModelConfig::Qwen(_)
+        | GgufModelConfig::QwenHybrid(_) => "token_embd.weight",
+    };
+    resolve_gguf_runtime_state_dtype_source(architecture.checkpoint(), parameter, tensors)
 }
 
 /// Derives preparation capabilities from a normalized SafeTensors family
@@ -892,6 +953,23 @@ mod tests {
         .unwrap()
     }
 
+    fn gguf_dtype_source_plan() -> GgufCheckpointPlan {
+        GgufCheckpointPlan::new(
+            "test GGUF architecture",
+            vec![eredu_checkpoint::schema::GgufTensorConstraint::required(
+                "token_embd.weight",
+                vec![32, 16],
+                eredu_checkpoint::schema::GgufTypeConstraint::OperationClass(
+                    eredu_checkpoint::schema::TensorOperation::Matrix,
+                ),
+            )
+            .with_aliases(["released_token_embd.weight"])],
+            Vec::new(),
+            eredu_checkpoint::schema::CatalogPolicy::strict(),
+        )
+        .unwrap()
+    }
+
     fn tensor(name: &str, dtype: TensorDtype) -> eredu_core::checkpoint::TensorDescriptor {
         eredu_core::checkpoint::TensorDescriptor {
             name: name.into(),
@@ -966,6 +1044,24 @@ mod tests {
         assert_eq!(source.parameter(), "released.embedding.weight");
         assert_eq!(source.checkpoint_tensor(), "canonical.embedding.weight");
         assert_eq!(source.dtype(), &TensorDtype::Bf16);
+    }
+
+    #[test]
+    fn gguf_runtime_state_dtype_source_preserves_dense_half_widths() {
+        for dtype in [TensorDtype::F16, TensorDtype::Bf16] {
+            let catalog =
+                TensorCatalog::new([tensor("released_token_embd.weight", dtype.clone())]).unwrap();
+            let source = resolve_gguf_runtime_state_dtype_source(
+                &gguf_dtype_source_plan(),
+                "token_embd.weight",
+                &catalog,
+            )
+            .unwrap();
+
+            assert_eq!(source.parameter(), "token_embd.weight");
+            assert_eq!(source.checkpoint_tensor(), "released_token_embd.weight");
+            assert_eq!(source.dtype(), &dtype);
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! materializes tensor payloads or creates a device/runtime object.
 
 use crate::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage};
-use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
+use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType, MetadataValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -499,7 +499,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
             Ok(TensorDescriptor {
                 name: descriptor.name.clone(),
                 shape,
-                dtype: TensorDtype::Encoded(format!("{:?}", descriptor.ggml_type)),
+                dtype: gguf_dtype(descriptor.ggml_type),
                 storage: None,
             })
         })
@@ -856,6 +856,20 @@ fn safetensors_dtype(dtype: &str) -> TensorDtype {
     }
 }
 
+fn gguf_dtype(dtype: GgmlType) -> TensorDtype {
+    match dtype {
+        GgmlType::F32 => TensorDtype::F32,
+        GgmlType::F16 => TensorDtype::F16,
+        GgmlType::Bf16 => TensorDtype::Bf16,
+        GgmlType::I8 => TensorDtype::I8,
+        GgmlType::I16 => TensorDtype::I16,
+        GgmlType::I32 => TensorDtype::I32,
+        GgmlType::I64 => TensorDtype::I64,
+        GgmlType::F64 => TensorDtype::F64,
+        encoded => TensorDtype::Encoded(format!("{encoded:?}")),
+    }
+}
+
 fn is_gguf(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -1167,6 +1181,17 @@ mod tests {
     }
 
     #[test]
+    fn gguf_dense_dtypes_remain_typed_in_the_portable_catalog() {
+        assert_eq!(gguf_dtype(GgmlType::F16), TensorDtype::F16);
+        assert_eq!(gguf_dtype(GgmlType::Bf16), TensorDtype::Bf16);
+        assert_eq!(gguf_dtype(GgmlType::F32), TensorDtype::F32);
+        assert_eq!(
+            gguf_dtype(GgmlType::Q4K),
+            TensorDtype::Encoded("Q4K".into())
+        );
+    }
+
+    #[test]
     fn core_accepts_families_defined_only_by_the_resolver() {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "future");
@@ -1259,7 +1284,7 @@ mod tests {
     fn gguf_plan_owns_the_portable_checkpoint_for_later_materialization() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("model.gguf");
-        let data = 1.0_f32.to_le_bytes();
+        let data = [0_u8; 2];
         let metadata = BTreeMap::from([
             (
                 "general.architecture".into(),
@@ -1275,7 +1300,7 @@ mod tests {
                 &[TensorInput {
                     name: "token_embd.weight",
                     dimensions: &[1],
-                    ggml_type: GgmlType::F32,
+                    ggml_type: GgmlType::F16,
                     data: &data,
                 }],
             )
@@ -1285,6 +1310,10 @@ mod tests {
         let validated = inspection.validated_gguf().unwrap();
         assert_eq!(validated.checkpoint().physical_tensor_count(), 1);
         assert_eq!(inspection.configuration().declared_model_type, "llama");
+        assert_eq!(
+            inspection.tensors().get("token_embd.weight").unwrap().dtype,
+            TensorDtype::F16
+        );
 
         let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
         let (artifact, architecture_plan, _, _) = plan.into_parts();

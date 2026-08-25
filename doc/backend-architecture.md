@@ -383,13 +383,14 @@ separate checkpoint, use configured embedded prediction layers, or are absent.
 A backend maps that declaration to executable or unsupported status according
 to its implementation; it does not maintain a family-name MTP table.
 
-For SafeTensors materialization, architecture preparation also identifies the
-checkpoint parameter that establishes runtime-state dtype and resolves its
-schema-declared physical aliases against the inspected catalog. A concrete
-backend maps that resolved dtype to its physical scalar width; generic backend
-composition must not recognize family checkpoint names or silently choose a
-width when the declared source is missing. Backend-native encoded formats may
-instead report their known materialized activation dtype.
+For SafeTensors and GGUF materialization, architecture preparation also
+identifies the checkpoint parameter that establishes runtime-state dtype and
+resolves its schema-declared physical aliases against the inspected catalog.
+Dense GGUF scalar types remain typed in that portable catalog, so a concrete
+backend can preserve the width used by its loader; packed encodings instead map
+to their known materialized activation dtype. Generic backend composition must
+not recognize family checkpoint names or silently choose a width when the
+declared source is missing.
 
 Runtime state follows the same contract at materialization time. Architecture
 `StateLayout` values are authoritative for per-layer attention windows,
