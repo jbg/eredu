@@ -14150,15 +14150,15 @@ fn load_qwen_pipeline(
         let catalog =
             eredu_architectures::qwen::expert_residency_catalog(store.as_ref(), &source_args)
                 .map_err(Error::ArchitectureModel)?;
-        let units = catalog
-            .into_iter()
-            .filter(|unit| range.contains(&unit.owner_unit()))
-            .filter(|unit| {
-                unit.distribution() == eredu_architectures::ExpertResidencyDistribution::Replicated
-                    || stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                        assignment.owner(unit.identity().global_expert) == Some(assignment.rank())
-                    })
-            });
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                })
+            },
+        );
         let entries = crate::composition::architecture_expert_units(
             units,
             store.as_ref(),
@@ -14563,14 +14563,17 @@ fn load_muse_glimmer_pipeline(
         let assignment = stage.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("Muse-Glimmer external experts have no assignment".into())
         })?;
-        let entries =
-            crate::composition::muse_glimmer_expert::expert_catalog(&source_args, store.as_ref())?
-                .into_iter()
-                .filter(|entry| stage.range().contains(&entry.identity().layer))
-                .filter(|entry| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                })
-                .collect::<Vec<_>>();
+        let catalog = eredu_architectures::muse_glimmer::expert_residency_catalog(
+            store.as_ref(),
+            &source_args,
+        )
+        .map_err(Error::ArchitectureModel)?;
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
+        );
+        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
@@ -14980,15 +14983,15 @@ fn load_neutral_qwen_vl_pipeline(
         let catalog =
             eredu_architectures::qwen::expert_residency_catalog(store.as_ref(), &source_args.text)
                 .map_err(Error::ArchitectureModel)?;
-        let units = catalog
-            .into_iter()
-            .filter(|unit| stage.range().contains(&unit.owner_unit()))
-            .filter(|unit| {
-                unit.distribution() == eredu_architectures::ExpertResidencyDistribution::Replicated
-                    || stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                        assignment.owner(unit.identity().global_expert) == Some(assignment.rank())
-                    })
-            });
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                })
+            },
+        );
         let entries = crate::composition::architecture_expert_units(
             units,
             store.as_ref(),
@@ -16614,19 +16617,23 @@ fn load_gpt_oss_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = neutral_gpt_oss::expert::expert_catalog(
-            &source_args,
+        let catalog =
+            eredu_architectures::gpt_oss::expert_residency_catalog(store.as_ref(), &source_args)
+                .map_err(Error::ArchitectureModel)?;
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                })
+            },
+        );
+        let entries = crate::composition::architecture_expert_units(
+            units,
             store.as_ref(),
             parallel_layout.as_ref(),
-        )?
-        .into_iter()
-        .filter(|entry| range.contains(&entry.identity().layer))
-        .filter(|entry| {
-            stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-            })
-        })
-        .collect::<Vec<_>>();
+        )?;
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
@@ -17104,15 +17111,19 @@ fn load_lfm2_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = crate::composition::lfm2::expert_catalog(&source_args, store.as_ref())?
-            .into_iter()
-            .filter(|entry| stage.range().contains(&entry.identity().layer))
-            .filter(|entry| {
+        let catalog =
+            eredu_architectures::lfm2::expert_residency_catalog(store.as_ref(), &source_args)
+                .map_err(Error::ArchitectureModel)?;
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| {
                 stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                    assignment.owner(identity.global_expert) == Some(assignment.rank())
                 })
-            })
-            .collect::<Vec<_>>();
+            },
+        );
+        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -19621,16 +19632,21 @@ fn load_kimi_linear_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries =
-            crate::composition::kimi_linear::expert_catalog(&source_args, store.as_ref())?
-                .into_iter()
-                .filter(|entry| stage.range().contains(&entry.identity().layer))
-                .filter(|entry| {
-                    stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                        assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                    })
+        let catalog = eredu_architectures::kimi_linear::expert_residency_catalog(
+            store.as_ref(),
+            &source_args,
+        )
+        .map_err(Error::ArchitectureModel)?;
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(identity.global_expert) == Some(assignment.rank())
                 })
-                .collect::<Vec<_>>();
+            },
+        );
+        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -20186,13 +20202,11 @@ fn load_neutral_inkling_pipeline(
         let catalog =
             eredu_architectures::inkling::expert_residency_catalog(&source_args, store.as_ref())
                 .map_err(Error::ArchitectureModel)?;
-        let units = catalog
-            .into_iter()
-            .filter(|unit| stage.range().contains(&unit.owner_unit()))
-            .filter(|unit| {
-                unit.distribution() == eredu_architectures::ExpertResidencyDistribution::Replicated
-                    || assignment.owner(unit.identity().global_expert) == Some(assignment.rank())
-            });
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
+        );
         let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
@@ -20674,14 +20688,17 @@ fn load_neutral_gemma4_pipeline(
             .expert_assignment
             .as_ref()
             .expect("Gemma 4 expert assignment");
-        let entries =
-            crate::composition::gemma4_expert::expert_catalog(&source_args.text, store.as_ref())?
-                .into_iter()
-                .filter(|entry| stage.range().contains(&entry.identity().layer))
-                .filter(|entry| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                })
-                .collect::<Vec<_>>();
+        let catalog = eredu_architectures::gemma4::expert_residency_catalog(
+            store.as_ref(),
+            &source_args.text,
+        )
+        .map_err(Error::ArchitectureModel)?;
+        let units = crate::composition::select_architecture_expert_units(
+            catalog,
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
+            |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
+        );
+        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,

@@ -58,6 +58,10 @@ where
     Ok(visitor.units)
 }
 
+/// Lowers already-selected neutral expert units into native cache entries.
+///
+/// Callers that realize only part of an architecture must consume neutral owner
+/// and distribution policy with [`select_architecture_expert_units`] first.
 pub(crate) fn architecture_expert_units(
     units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
     store: &dyn CheckpointSource,
@@ -115,6 +119,27 @@ pub(crate) fn architecture_expert_units(
         .collect()
 }
 
+/// Retains expert units owned by one realized execution partition and expert rank.
+///
+/// Ownership and distribution are architecture addresses, so both predicates must
+/// run while the neutral declarations are still available. Native cache entries
+/// intentionally retain only router identity and materialization state.
+pub(crate) fn select_architecture_expert_units(
+    units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
+    mut owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
+    mut owns_expert: impl FnMut(eredu_runtime::ExpertIdentity) -> bool,
+) -> impl Iterator<Item = eredu_architectures::ExpertResidencyUnit> {
+    units.into_iter().filter(move |unit| {
+        owns_unit(unit.owner_group(), unit.owner_unit())
+            && match unit.distribution() {
+                eredu_architectures::ExpertResidencyDistribution::ExpertParallel => {
+                    owns_expert(unit.identity())
+                }
+                eredu_architectures::ExpertResidencyDistribution::Replicated => true,
+            }
+    })
+}
+
 pub(crate) fn tensor_ref(array: &Array) -> &crate::MlxTensor {
     crate::MlxTensor::ref_cast(array)
 }
@@ -152,3 +177,74 @@ pub mod qwen;
 #[cfg(test)]
 #[path = "tests/mlx_architecture_conformance.rs"]
 mod mlx_architecture_conformance;
+
+#[cfg(test)]
+mod expert_selection_tests {
+    use eredu_architectures::{
+        ExpertParameterRecipe, ExpertParameterRole, ExpertResidencyDistribution,
+        ExpertResidencyUnit,
+    };
+    use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+    use eredu_runtime::{ExecutionGroupId, ExpertIdentity};
+
+    fn expert_unit(
+        identity: ExpertIdentity,
+        group: &str,
+        owner_unit: usize,
+        distribution: ExpertResidencyDistribution,
+    ) -> ExpertResidencyUnit {
+        let parameter = ExpertParameterRecipe::new(
+            "weight",
+            format!("{group}.{owner_unit}.weight"),
+            DerivedWeightRecipe::source("source", TensorSelection::Full),
+            ExpertParameterRole::Preserved,
+        )
+        .unwrap();
+        ExpertResidencyUnit::new(
+            identity,
+            ExecutionGroupId::new(group).unwrap(),
+            owner_unit,
+            format!("{group}.{owner_unit}"),
+            distribution,
+            [parameter],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn expert_selection_uses_owner_address_and_distribution_before_lowering() {
+        let units = vec![
+            expert_unit(
+                ExpertIdentity::new(1, 0),
+                "target",
+                7,
+                ExpertResidencyDistribution::ExpertParallel,
+            ),
+            expert_unit(
+                ExpertIdentity::new(7, 1),
+                "mtp.0",
+                1,
+                ExpertResidencyDistribution::ExpertParallel,
+            ),
+            expert_unit(
+                ExpertIdentity::new(9, 2),
+                "mtp.0",
+                1,
+                ExpertResidencyDistribution::Replicated,
+            ),
+        ];
+
+        let selected = super::select_architecture_expert_units(
+            units,
+            |group, unit| group.as_str() == "mtp.0" && unit == 1,
+            |identity| identity.global_expert == 1,
+        )
+        .map(|unit| unit.identity())
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            selected,
+            vec![ExpertIdentity::new(7, 1), ExpertIdentity::new(9, 2)]
+        );
+    }
+}
