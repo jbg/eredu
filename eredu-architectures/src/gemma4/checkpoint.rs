@@ -1,6 +1,6 @@
 //! Composite artifact policy for Gemma 4 checkpoints.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use eredu_checkpoint::composite::{
     ArtifactComponentSchema, ArtifactRole, ComponentId, ComponentParameterCatalog,
@@ -47,6 +47,18 @@ pub fn load_time_quantization(
         audio.quantized_weights = None;
         audio.quantized_weight_configs = None;
     }
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies canonical text checkpoint formats to a complete Gemma 4 family
+/// configuration.
+pub fn with_checkpoint_formats(
+    config: &FamilyConfig,
+    formats: HashMap<String, WeightQuantization>,
+) -> Result<FamilyConfig, String> {
+    let mut target = config.clone();
+    target.text.quantized_weight_configs = Some(formats);
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
 }

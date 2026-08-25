@@ -843,7 +843,7 @@ impl ModelArgs {
         )
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         let text = &self.text_config;
         if self.model_type != "inkling_mm_model" {
             return Err(invalid(format!(

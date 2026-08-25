@@ -270,7 +270,12 @@ its complete validated target configuration and format map, including mixed
 checkpoint-policy replacement, aligned vision projections, and target and
 prediction-unit roots, from architecture checkpoint APIs. Resident, bounded,
 and distributed backend paths consume those same derived configurations rather
-than rewriting family quantization fields. Pipeline telemetry likewise resolves
+than rewriting family quantization fields. GGUF adapters hand the architecture
+only canonical per-weight formats; architecture-owned `with_checkpoint_formats`
+derivations normalize family names, partition composite text/media formats,
+preserve native expert encodings, and return the complete validated source
+configuration. The same rule applies to external assistant configurations.
+Pipeline telemetry likewise resolves
 checkpoint ownership from architecture-declared execution-unit paths rather
 than synthesizing family layer prefixes. Catalog policies declare any
 admitted checkpoint-only names by exact key, prefix, or suffix, and composite

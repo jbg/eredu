@@ -262,6 +262,32 @@ pub fn v4_load_time_quantization(
     Ok(target)
 }
 
+/// Applies canonical checkpoint formats to a complete DeepSeek V3
+/// configuration.
+pub fn v3_with_checkpoint_formats(
+    args: &V3Args,
+    mut formats: BTreeMap<String, LinearFormat>,
+) -> Result<V3Args, String> {
+    normalize_v3_weight_formats(args, &mut formats);
+    let mut target = args.clone();
+    target.linear_formats = formats;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies canonical checkpoint formats to a complete DeepSeek V4
+/// configuration.
+pub fn v4_with_checkpoint_formats(
+    args: &V4Args,
+    mut formats: BTreeMap<String, LinearFormat>,
+) -> Result<V4Args, String> {
+    normalize_v4_weight_formats(args, &mut formats);
+    let mut target = args.clone();
+    target.linear_formats = formats;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 /// Builds the canonical llama.cpp DeepSeek2 GGUF plan. Fused and split MLA
 /// KV-B storage are one global alternative layout so a checkpoint cannot mix
 /// the two representations across layers.

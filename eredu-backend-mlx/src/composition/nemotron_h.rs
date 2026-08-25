@@ -2032,12 +2032,10 @@ pub(crate) fn prepare_gguf(
             "Nemotron-H GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = args.clone();
     let translate = eredu_architectures::nemotron_h::translate_gguf_weight_name;
     let configs = gguf_quantization_configs(checkpoint, translate)?;
-    args.quantized_weights = Some(configs.keys().cloned().collect());
-    args.quantized_weight_configs = Some(configs);
-    args.weight_quantization = None;
+    let args = eredu_architectures::nemotron_h::with_checkpoint_formats(args, configs)
+        .map_err(Error::ArchitectureModel)?;
     Ok(PreparedGguf { args })
 }
 

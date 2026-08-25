@@ -4,7 +4,8 @@ mod checkpoint;
 mod config;
 
 pub use checkpoint::{
-    gguf_plan, safetensors_plan, translate_gguf_weight_name, SafetensorsPlanError,
+    gguf_plan, load_time_quantization, safetensors_plan, translate_gguf_weight_name,
+    with_checkpoint_formats, SafetensorsPlanError,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,

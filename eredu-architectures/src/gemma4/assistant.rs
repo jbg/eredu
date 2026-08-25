@@ -302,6 +302,41 @@ impl AssistantConfig {
         Ok(())
     }
 
+    /// Derives the complete assistant configuration for load-time
+    /// quantization, replacing any checkpoint-specific text formats.
+    pub fn load_time_quantization(
+        &self,
+        quantization: WeightQuantization,
+    ) -> Result<Self, AssistantConfigError> {
+        quantization
+            .validate()
+            .map_err(|error| AssistantConfigError::Invalid(error.to_string()))?;
+        if self.use_ordered_embeddings {
+            return Err(AssistantConfigError::Invalid(
+                "ordered Gemma 4 assistant embeddings cannot be quantized".into(),
+            ));
+        }
+        let mut target = self.clone();
+        target.quantization = Some(quantization);
+        target.text_config.weight_quantization = Some(quantization);
+        target.text_config.quantized_weights = None;
+        target.text_config.quantized_weight_configs = None;
+        target.validate()?;
+        Ok(target)
+    }
+
+    /// Applies canonical checkpoint formats to a complete assistant
+    /// configuration.
+    pub fn with_checkpoint_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, AssistantConfigError> {
+        let mut target = self.clone();
+        target.text_config.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+        target.validate()?;
+        Ok(target)
+    }
+
     /// Proves that this assistant can consume shared state from `target`.
     ///
     /// This relationship is independent of tensor storage and execution backend.

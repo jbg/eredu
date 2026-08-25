@@ -16,8 +16,9 @@ pub mod parallel;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
-    expert_recipes, expert_residency_catalog, gguf_plan, normalize_weight_formats,
-    safetensors_plan, translate_gguf_weight_name, unit_recipes,
+    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
+    normalize_weight_formats, safetensors_plan, translate_gguf_weight_name, unit_recipes,
+    with_checkpoint_formats,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,

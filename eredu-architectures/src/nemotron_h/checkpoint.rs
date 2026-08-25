@@ -32,6 +32,20 @@ pub fn load_time_quantization(
     Ok(target)
 }
 
+/// Applies canonical checkpoint format metadata to a complete Nemotron-H
+/// configuration.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    formats: std::collections::HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    let mut target = args.clone();
+    target.quantized_weights = Some(formats.keys().cloned().collect());
+    target.quantized_weight_configs = Some(formats);
+    target.weight_quantization = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 fn unit_root(
     args: &ModelArgs,
     group: usize,

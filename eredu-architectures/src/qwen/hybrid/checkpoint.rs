@@ -1,6 +1,6 @@
 //! SafeTensors contracts and fused-projection recipes for the hybrid decoder.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeCatalog},
@@ -42,6 +42,40 @@ pub fn conditional_load_time_quantization(
         vision
             .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
             .map_err(|error| error.to_string())?;
+    }
+    Ok(target)
+}
+
+/// Applies canonical text and optional projector checkpoint formats to a
+/// complete conditional hybrid configuration.
+pub fn conditional_with_checkpoint_formats(
+    config: &ParsedHybridConfig,
+    text_formats: HashMap<String, WeightQuantization>,
+    vision_formats: Option<HashMap<String, WeightQuantization>>,
+) -> Result<ParsedHybridConfig, String> {
+    let mut target = config.clone();
+    target.text.linear_formats = text_formats
+        .into_iter()
+        .map(|(name, format)| (name, format.into()))
+        .collect();
+    target.text.validate().map_err(|error| error.to_string())?;
+    match (target.vision.as_mut(), vision_formats) {
+        (Some(vision), Some(formats)) => {
+            vision.linear_formats = formats
+                .into_iter()
+                .map(|(name, format)| (name, format.into()))
+                .collect();
+            vision
+                .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+                .map_err(|error| error.to_string())?;
+        }
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err("conditional Qwen projector formats are missing".into());
+        }
+        (None, Some(_)) => {
+            return Err("conditional Qwen projector formats have no vision configuration".into());
+        }
     }
     Ok(target)
 }

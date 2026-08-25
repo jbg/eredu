@@ -1554,16 +1554,10 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
             "GPT-OSS GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = args.clone();
     let translate = eredu_architectures::gpt_oss::translate_gguf_weight_name;
-    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    let expert_targets = eredu_architectures::gpt_oss::gguf_expert_quantization_targets(&args)
-        .map_err(Error::ArchitectureModel)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    configs.retain(|name, _| !expert_targets.contains(name));
-    args.quantized_weight_configs = Some(configs);
-    args.quantization = None;
+    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let args = eredu_architectures::gpt_oss::with_checkpoint_formats(args, configs)
+        .map_err(Error::ArchitectureModel)?;
     Ok(PreparedGptOssGguf { args })
 }
 

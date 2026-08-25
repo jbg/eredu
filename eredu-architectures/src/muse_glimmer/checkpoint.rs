@@ -18,9 +18,27 @@ use eredu_checkpoint::{
         SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
     },
     store::TensorSelection,
+    WeightQuantization,
 };
 
 use super::DecoderConfig;
+
+/// Derives a Muse-Glimmer configuration whose text and vision matrix formats
+/// reflect load-time quantization instead of checkpoint-specific selections.
+pub fn load_time_quantization(
+    args: &DecoderConfig,
+    quantization: WeightQuantization,
+) -> Result<DecoderConfig, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.quantization = Some(quantization);
+    target.quantized_weights = None;
+    target.quantized_weight_configs = None;
+    target.vision_config.weight_quantization = Some(quantization);
+    target.vision_config.quantized_weight_configs.clear();
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
 
 /// Decoder plus optional split projector/assistant artifact policy.
 #[derive(Debug, Clone, Eq, PartialEq)]

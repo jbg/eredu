@@ -15,6 +15,33 @@ use eredu_checkpoint::{
 
 use super::{FeedForwardPolicy, ModelArgs};
 
+/// Derives an Inkling configuration whose text matrix formats reflect
+/// load-time quantization instead of checkpoint-specific selections.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.text_config.weight_quantization = Some(quantization);
+    target.text_config.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies canonical checkpoint format metadata to a complete Inkling
+/// configuration.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    mut formats: HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    normalize_gguf_weight_formats(args, &mut formats)?;
+    let mut target = args.clone();
+    target.text_config.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 /// Canonical target and released source identity.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParameterAlias {

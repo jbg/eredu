@@ -28,6 +28,27 @@ pub fn load_time_quantization(
     Ok(target)
 }
 
+/// Applies canonical text and projector checkpoint formats to a complete
+/// Qwen3-VL configuration.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    mut text_formats: HashMap<String, WeightQuantization>,
+    vision_formats: HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    let mut target = args.clone();
+    normalize_text_weight_formats(&args.text, &mut text_formats);
+    target.text = qwen::with_checkpoint_formats(&args.text, text_formats)?;
+    target.vision.linear_formats = vision_formats
+        .into_iter()
+        .map(|(name, format)| (name, format.into()))
+        .collect();
+    target
+        .vision
+        .validate_for(vision::VisionMode::DeepStack)
+        .map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 /// Builds the projector checkpoint contract from an admitted Qwen3-VL composite.
 ///
 /// Family mode and decoder/projector width compatibility are revalidated here

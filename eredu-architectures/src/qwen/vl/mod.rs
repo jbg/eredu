@@ -9,7 +9,7 @@ mod positions;
 pub use checkpoint::{
     load_time_quantization, normalize_text_weight_formats, projector_gguf_plan,
     rank_local_unit_recipes, safetensors_plan, static_recipes, translate_text_gguf_weight_name,
-    translate_vision_gguf_weight_name, unit_recipes,
+    translate_vision_gguf_weight_name, unit_recipes, with_checkpoint_formats,
 };
 pub use config::{
     model_args_from_config_value, model_args_from_gguf_parts,

@@ -35,6 +35,21 @@ pub fn load_time_quantization(
     Ok(target)
 }
 
+/// Applies canonical checkpoint format metadata to a complete Qwen
+/// configuration.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    mut formats: HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    normalize_weight_formats(args, &mut formats);
+    let mut target = args.clone();
+    target.quantized_weights = Some(formats.keys().cloned().collect());
+    target.quantized_weight_configs = Some(formats);
+    target.quantization = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 /// Builds the canonical Qwen SafeTensors catalog plan.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     safetensors_plan_with_root(args, &args.parameter_root, true)

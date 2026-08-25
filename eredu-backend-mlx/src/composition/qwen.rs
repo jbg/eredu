@@ -1336,15 +1336,12 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
             "Qwen GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = args.clone();
     let is_moe = args.is_moe();
     let translate =
         |name: &str| eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe);
-    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    eredu_architectures::qwen::normalize_weight_formats(&args, &mut configs);
-    args.quantized_weights = Some(configs.keys().cloned().collect());
-    args.quantized_weight_configs = Some(configs);
-    args.quantization = None;
+    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let args = eredu_architectures::qwen::with_checkpoint_formats(args, configs)
+        .map_err(Error::ArchitectureModel)?;
     Ok(PreparedQwenGguf { args })
 }
 

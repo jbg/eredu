@@ -11,7 +11,7 @@ pub use block::{new_block, GptOssBlockFactory, TransformerBlock};
 pub use checkpoint::{
     expert_recipes, expert_residency_catalog, gguf_expert_quantization_targets, gguf_plan,
     load_time_quantization, rank_local_expert_recipes, safetensors_expert_tensors,
-    safetensors_plan, translate_gguf_weight_name, validate_gguf,
+    safetensors_plan, translate_gguf_weight_name, validate_gguf, with_checkpoint_formats,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,

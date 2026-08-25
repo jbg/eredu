@@ -1598,9 +1598,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = source.clone();
-    target.text_config.weight_quantization = Some(quantization);
-    target.text_config.quantized_weight_configs = None;
+    let target = eredu_architectures::inkling::load_time_quantization(source, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source_architecture = NeutralArchitecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
@@ -2086,7 +2085,7 @@ fn open_gguf_store(
             "Inkling GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = match projector {
+    let args = match projector {
         Some(projector) => {
             let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Inkling(args) =
                 projector.model()
@@ -2100,12 +2099,11 @@ fn open_gguf_store(
         None => primary_args.clone(),
     };
     let translation_args = args.clone();
-    let mut text_formats = gguf_quantization_configs(checkpoint, |name| {
+    let text_formats = gguf_quantization_configs(checkpoint, |name| {
         eredu_architectures::inkling::translate_gguf_weight_name_for_model(name, &translation_args)
     })?;
-    eredu_architectures::inkling::normalize_gguf_weight_formats(&args, &mut text_formats)
-        .map_err(Error::Quantization)?;
-    args.text_config.quantized_weight_configs = (!text_formats.is_empty()).then_some(text_formats);
+    let args = eredu_architectures::inkling::with_checkpoint_formats(&args, text_formats)
+        .map_err(Error::ArchitectureModel)?;
     let translation_args = args.clone();
     let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?

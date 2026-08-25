@@ -284,6 +284,34 @@ impl DFlashConfig {
         Ok(())
     }
 
+    /// Derives the complete assistant configuration for load-time
+    /// quantization, replacing any checkpoint-specific formats.
+    pub fn load_time_quantization(
+        &self,
+        quantization: WeightQuantization,
+    ) -> Result<Self, DFlashConfigError> {
+        quantization
+            .validate()
+            .map_err(|error| DFlashConfigError::Invalid(error.to_string()))?;
+        let mut target = self.clone();
+        target.quantization = Some(quantization);
+        target.quantized_weights.clear();
+        target.validate_released()?;
+        Ok(target)
+    }
+
+    /// Applies canonical checkpoint formats to a complete DFlash
+    /// configuration.
+    pub fn with_checkpoint_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, DFlashConfigError> {
+        let mut target = self.clone();
+        target.quantized_weights = formats;
+        target.validate_released()?;
+        Ok(target)
+    }
+
     /// Proves that the target exposes every state and token required by DFlash.
     ///
     /// This relationship is independent of tensor storage and execution backend.

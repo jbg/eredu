@@ -14,8 +14,8 @@ pub use assistant::{
     DFlashCompatibilityError, DFlashConfig, DFlashConfigError, DFlashContext, DFlashLayerContext,
 };
 pub use checkpoint::{
-    expert_recipes, expert_residency_catalog, gguf_plan, projector_gguf_plan,
-    safetensors_parameter_names, safetensors_plan, safetensors_recipes,
+    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
+    projector_gguf_plan, safetensors_parameter_names, safetensors_plan, safetensors_recipes,
     translate_projector_gguf_name, translate_text_gguf_name, ArtifactConfig,
 };
 pub use config::{

@@ -2557,14 +2557,13 @@ pub fn load_gguf(
     let options = residency.layers();
     let model = match source.model() {
         eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) => {
-            let mut args = args.clone();
-            let mut linear_formats =
+            let linear_formats =
                 gguf_quantization_configs(checkpoint, deepseek::translate_v4_gguf_weight_name)?
                     .into_iter()
                     .map(|(name, format)| (name, format.into()))
                     .collect();
-            deepseek::normalize_v4_weight_formats(&args, &mut linear_formats);
-            args.linear_formats = linear_formats;
+            let args = deepseek::v4_with_checkpoint_formats(args, linear_formats)
+                .map_err(Error::ArchitectureModel)?;
             let store = Arc::new(open_gguf_checkpoint_source(
                 checkpoint.clone(),
                 source.plan().checkpoint(),
@@ -2581,14 +2580,13 @@ pub fn load_gguf(
             )?
         }
         eredu_architectures::configuration::GgufModelConfig::DeepSeekV3(args) => {
-            let mut args = args.clone();
-            let mut linear_formats =
+            let linear_formats =
                 gguf_quantization_configs(checkpoint, deepseek::translate_v3_gguf_weight_name)?
                     .into_iter()
                     .map(|(name, format)| (name, format.into()))
                     .collect();
-            deepseek::normalize_v3_weight_formats(&args, &mut linear_formats);
-            args.linear_formats = linear_formats;
+            let args = deepseek::v3_with_checkpoint_formats(args, linear_formats)
+                .map_err(Error::ArchitectureModel)?;
             let store = Arc::new(open_gguf_checkpoint_source(
                 checkpoint.clone(),
                 source.plan().checkpoint(),

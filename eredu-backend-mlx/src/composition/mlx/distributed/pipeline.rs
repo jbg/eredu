@@ -13499,11 +13499,7 @@ pub fn load_pipeline_model_with_options(
                     )
                 }
                 GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                    let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(
-                        &admitted,
-                        None,
-                        weights_stream,
-                    )?;
+                    let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(&admitted)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
@@ -14678,13 +14674,13 @@ fn load_muse_glimmer_pipeline(
         .transpose()?
         .flatten();
     let expert_quantization = quantize_on_load;
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
-        target_args.quantized_weight_configs = None;
-        target_args.vision_config.weight_quantization = Some(quantization);
-        target_args.vision_config.quantized_weight_configs.clear();
-    }
+    let target_args = quantize_on_load
+        .map(|quantization| {
+            eredu_architectures::muse_glimmer::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        })
+        .transpose()?
+        .unwrap_or_else(|| source_args.clone());
     let target_binding_adapter = if external_experts {
         MuseGlimmerPipelineBindings::new_external_experts()
     } else {
@@ -20231,11 +20227,13 @@ fn load_kimi_linear_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.weight_quantization = Some(quantization);
-        target_args.quantized_weight_configs = None;
-    }
+    let target_args = quantize_on_load
+        .map(|quantization| {
+            eredu_architectures::kimi_linear::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        })
+        .transpose()?
+        .unwrap_or_else(|| source_args.clone());
     let target_binding_adapter = if expert_cache_options.is_some() {
         KimiLinearBindings::new_external_experts()
     } else {
@@ -20745,11 +20743,13 @@ fn load_neutral_inkling_pipeline(
         .transpose()?
         .flatten();
     let expert_quantization = quantize_on_load;
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.text_config.weight_quantization = Some(quantization);
-        target_args.text_config.quantized_weight_configs = None;
-    }
+    let target_args = quantize_on_load
+        .map(|quantization| {
+            eredu_architectures::inkling::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        })
+        .transpose()?
+        .unwrap_or_else(|| source_args.clone());
     let target_binding_adapter = if external_experts {
         InklingBindings::new_external_experts()
     } else {

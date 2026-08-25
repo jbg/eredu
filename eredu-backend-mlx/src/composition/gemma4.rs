@@ -368,26 +368,19 @@ pub fn load_assistant_safetensors(
     let requested = options
         .quantization
         .map(|requested| {
-            if source_config.use_ordered_embeddings {
-                return Err(Error::Quantization(
-                    "Gemma 4 ordered assistant heads cannot be quantized".into(),
-                ));
-            }
             should_quantize_on_load("Gemma 4 assistant", source_config.quantization, requested)
                 .map(|required| required.then_some(requested))
         })
         .transpose()?
         .flatten();
-    let mut config = source_config.clone();
-    if let Some(requested) = requested {
-        if config.use_ordered_embeddings {
-            return Err(Error::Quantization(
-                "Gemma 4 ordered assistant heads cannot be quantized".into(),
-            ));
-        }
-        config.quantization = Some(requested);
-        config.text_config.weight_quantization = Some(requested);
-    }
+    let config = requested
+        .map(|requested| {
+            source_config
+                .load_time_quantization(requested)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| source_config.clone());
     let store =
         open_safetensors_weight_store(model_dir, options.weight_residency.max_mapped_shards())?;
     let store = if let Some(requested) = requested {
@@ -412,7 +405,7 @@ pub fn load_assistant_safetensors(
 pub fn load_assistant_gguf(
     checkpoint: eredu_gguf::Checkpoint,
     resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
-    mut source_config: eredu_architectures::gemma4::AssistantConfig,
+    source_config: eredu_architectures::gemma4::AssistantConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -436,14 +429,9 @@ pub fn load_assistant_gguf(
         &mlx_checkpoint,
         eredu_architectures::gemma4::translate_assistant_gguf_weight_name,
     )?;
-    if !formats.is_empty() {
-        source_config.text_config.quantized_weight_configs = Some(formats);
-    }
-    if source_config.use_ordered_embeddings && options.quantization.is_some() {
-        return Err(Error::Quantization(
-            "Gemma 4 ordered assistant heads cannot be quantized".into(),
-        ));
-    }
+    let source_config = source_config
+        .with_checkpoint_formats(formats)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     crate::composition::mlx::validate_gguf_quantization_source(
         &mlx_checkpoint,
         &metadata,
@@ -457,11 +445,10 @@ pub fn load_assistant_gguf(
             })?
             .build()?,
     );
-    let mut config = source_config.clone();
     let (store, config) = if let Some(requested) = options.quantization {
-        config.quantization = Some(requested);
-        config.text_config.weight_quantization = Some(requested);
-        config.text_config.quantized_weight_configs = None;
+        let config = source_config
+            .load_time_quantization(requested)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let source = NeutralAssistant::new(source_config, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = NeutralAssistant::new(config.clone(), stream)
@@ -471,7 +458,7 @@ pub fn load_assistant_gguf(
             config,
         )
     } else {
-        (store, config)
+        (store, source_config)
     };
     let mut module = MlxModule::new(
         NeutralAssistant::new(config.clone(), stream)
@@ -1925,7 +1912,7 @@ pub fn open_pipeline_gguf_store(
             "Gemma 4 GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = match projector {
+    let args = match projector {
         Some(projector) => {
             let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Gemma4(family) =
                 projector.model()
@@ -1938,10 +1925,12 @@ pub fn open_pipeline_gguf_store(
         }
         None => family.clone(),
     };
-    args.text.quantized_weight_configs = Some(gguf_quantization_configs(
+    let formats = gguf_quantization_configs(
         checkpoint,
         eredu_architectures::gemma4::translate_gguf_weight_name,
-    )?);
+    )?;
+    let args = eredu_architectures::gemma4::with_checkpoint_formats(&args, formats)
+        .map_err(Error::ArchitectureModel)?;
     let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
         .add_checkpoint(

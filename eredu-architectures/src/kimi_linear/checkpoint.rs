@@ -15,6 +15,34 @@ use eredu_checkpoint::{
 
 use super::{AttentionKind, FeedForwardPolicy, ModelArgs};
 
+/// Derives a Kimi Linear configuration whose physical matrix formats reflect
+/// load-time quantization instead of checkpoint-specific format selections.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.weight_quantization = Some(quantization);
+    target.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies canonical checkpoint format metadata to a complete Kimi Linear
+/// configuration.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    mut formats: HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    normalize_weight_formats(args, &mut formats);
+    let mut target = args.clone();
+    target.quantized_weight_configs = Some(formats);
+    target.weight_quantization = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 fn canonical_recipe_name(name: &str) -> String {
     let canonical = name
         .replace(".inner.weight", ".weight")
@@ -1270,6 +1298,27 @@ mod tests {
         let mut args = super::super::config::model_args_from_config_value(&value).unwrap();
         args.split_kv_b = split_kv_b;
         args
+    }
+
+    #[test]
+    fn architecture_derives_checkpoint_and_load_time_format_policy() {
+        let source = fixture(false, None);
+        let name = "model.layers.0.mlp.gate_proj.weight".to_string();
+        let checkpoint =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 8).unwrap());
+        let checkpoint_args =
+            with_checkpoint_formats(&source, HashMap::from([(name.clone(), checkpoint)])).unwrap();
+        assert_eq!(
+            checkpoint_args.weight_quantization_for(&name),
+            Some(checkpoint)
+        );
+
+        let requested =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let target = load_time_quantization(&checkpoint_args, requested).unwrap();
+        assert_eq!(target.weight_quantization, Some(requested));
+        assert_eq!(target.quantized_weight_configs, None);
+        assert_eq!(target.weight_quantization_for(&name), Some(requested));
     }
 
     #[test]

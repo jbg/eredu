@@ -964,23 +964,18 @@ pub fn prepare_gguf_pipeline(
             "Qwen3-VL GGUF loader received a mismatched media-projector plan".into(),
         ));
     };
-    let mut args = args.clone();
+    let args = args.clone();
     let is_moe = args.text.is_moe();
     let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
-    let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
-    vl::normalize_text_weight_formats(&args.text, &mut text_formats);
-    args.text.quantized_weights = Some(text_formats.keys().cloned().collect());
-    args.text.quantized_weight_configs = Some(text_formats);
-    args.text.quantization = None;
+    let text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
     let deepstack = args.vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
-    args.vision.linear_formats = gguf_quantization_configs(
+    let vision_formats = gguf_quantization_configs(
         projector.checkpoint(),
         translate_vision,
-    )?
-    .into_iter()
-    .map(|(name, format)| (name, format.into()))
-    .collect();
+    )?;
+    let args = vl::with_checkpoint_formats(&args, text_formats, vision_formats)
+        .map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),

@@ -610,7 +610,7 @@ fn prepare_hybrid_gguf_store(
             "Qwen hybrid GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut parsed = match projector {
+    let parsed = match projector {
         Some(projector) => {
             let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Qwen35(parsed) =
                 projector.model()
@@ -623,11 +623,7 @@ fn prepare_hybrid_gguf_store(
         }
         None => primary.clone(),
     };
-    parsed.text.linear_formats =
-        gguf_quantization_configs(checkpoint, hybrid::translate_gguf_weight_name)?
-            .into_iter()
-            .map(|(name, config)| (name, config.into()))
-            .collect();
+    let text_formats = gguf_quantization_configs(checkpoint, hybrid::translate_gguf_weight_name)?;
     let text: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
@@ -635,9 +631,13 @@ fn prepare_hybrid_gguf_store(
         max_mapped_shards,
     )?);
     if parsed.text.variant == hybrid::HybridVariant::Qwen3Next {
+        let parsed = hybrid::conditional_with_checkpoint_formats(&parsed, text_formats, None)
+            .map_err(Error::ArchitectureModel)?;
         return Ok((parsed, text));
     }
     let Some(projector) = projector else {
+        let parsed = hybrid::conditional_with_checkpoint_formats(&parsed, text_formats, None)
+            .map_err(Error::ArchitectureModel)?;
         return Ok((parsed, text));
     };
     let vision = parsed.vision.as_ref().ok_or_else(|| {
@@ -645,20 +645,19 @@ fn prepare_hybrid_gguf_store(
     })?;
     let deepstack = vision.deepstack_layers();
     let translate = |name: &str| hybrid::translate_vision_gguf_weight_name(name, &deepstack);
-    parsed
-        .vision
-        .as_mut()
-        .expect("admitted Qwen3.5 vision geometry was checked above")
-        .linear_formats = gguf_quantization_configs(projector.checkpoint(), translate)?
-        .into_iter()
-        .map(|(name, format)| (name, format.into()))
-        .collect();
+    let vision_formats = gguf_quantization_configs(projector.checkpoint(), translate)?;
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         projector.checkpoint().clone(),
         projector.plan().checkpoint(),
         translate,
         max_mapped_shards,
     )?);
+    let parsed = hybrid::conditional_with_checkpoint_formats(
+        &parsed,
+        text_formats,
+        Some(vision_formats),
+    )
+    .map_err(Error::ArchitectureModel)?;
     Ok((
         parsed,
         Arc::new(CompositeCheckpointSource::new([text, vision_source])?),

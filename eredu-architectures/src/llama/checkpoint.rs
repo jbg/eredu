@@ -5,7 +5,7 @@
 //! exclusions accepted by the Llama-compatible loaders. Generic checkpoint
 //! code only evaluates the resulting declarative constraints.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use eredu_checkpoint::schema::{
     CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
@@ -14,6 +14,35 @@ use eredu_checkpoint::schema::{
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use super::ModelArgs;
+
+/// Derives a Llama configuration whose physical matrix formats reflect
+/// load-time quantization instead of checkpoint-specific format selections.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.quantization = Some(quantization);
+    target.quantized_weights = None;
+    target.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies canonical checkpoint format metadata to a complete Llama
+/// configuration.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    formats: HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    let mut target = args.clone();
+    target.quantized_weights = Some(formats.keys().cloned().collect());
+    target.quantization = None;
+    target.quantized_weight_configs = Some(formats);
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
 
 /// Translates one llama.cpp GGUF tensor name into the canonical HF layout.
 pub fn translate_gguf_weight_name(name: &str) -> String {
@@ -359,7 +388,7 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     use super::*;
 
@@ -372,6 +401,32 @@ mod tests {
             "attention_bias": true, "mlp_bias": true, "tie_word_embeddings": false
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn architecture_derives_checkpoint_and_load_time_format_policy() {
+        let source = args();
+        let checkpoint =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 8).unwrap());
+        let name = "model.layers.0.mlp.up_proj.weight".to_string();
+        let checkpoint_args =
+            with_checkpoint_formats(&source, HashMap::from([(name.clone(), checkpoint)])).unwrap();
+        assert_eq!(
+            checkpoint_args.quantized_weights,
+            Some(HashSet::from([name.clone()]))
+        );
+        assert_eq!(
+            checkpoint_args.weight_quantization_for(&name),
+            Some(checkpoint)
+        );
+
+        let requested =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let target = load_time_quantization(&checkpoint_args, requested).unwrap();
+        assert_eq!(target.quantization, Some(requested));
+        assert_eq!(target.quantized_weights, None);
+        assert_eq!(target.quantized_weight_configs, None);
+        assert_eq!(target.weight_quantization_for(&name), Some(requested));
     }
 
     #[test]

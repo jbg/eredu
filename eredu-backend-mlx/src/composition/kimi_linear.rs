@@ -594,9 +594,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = args.clone();
-    target.weight_quantization = Some(quantization);
-    target.quantized_weight_configs = None;
+    let target = eredu_architectures::kimi_linear::load_time_quantization(args, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)
@@ -1325,12 +1324,10 @@ pub(crate) fn prepare_gguf(
             "Kimi Linear GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = args.clone();
     let translate = eredu_architectures::kimi_linear::translate_gguf_weight_name;
-    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    eredu_architectures::kimi_linear::normalize_weight_formats(&args, &mut configs);
-    args.quantized_weight_configs = Some(configs);
-    args.weight_quantization = None;
+    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let args = eredu_architectures::kimi_linear::with_checkpoint_formats(args, configs)
+        .map_err(Error::ArchitectureModel)?;
     Ok(PreparedGguf { args })
 }
 

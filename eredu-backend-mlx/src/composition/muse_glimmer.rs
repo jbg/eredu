@@ -260,10 +260,14 @@ pub fn load_dflash_safetensors(
         })
         .transpose()?
         .flatten();
-    let mut config = source_config.clone();
-    if let Some(requested) = requested {
-        config.quantization = Some(requested);
-    }
+    let config = requested
+        .map(|requested| {
+            source_config
+                .load_time_quantization(requested)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| source_config.clone());
     let store =
         open_safetensors_weight_store(model_dir, options.weight_residency.max_mapped_shards())?;
     let store = if let Some(requested) = requested {
@@ -288,7 +292,7 @@ pub fn load_dflash_safetensors(
 pub fn load_dflash_gguf(
     checkpoint: eredu_gguf::Checkpoint,
     resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
-    mut source_config: eredu_architectures::muse_glimmer::DFlashConfig,
+    source_config: eredu_architectures::muse_glimmer::DFlashConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -308,10 +312,13 @@ pub fn load_dflash_gguf(
     }
     let mlx_checkpoint = GgufCheckpoint::from_portable(checkpoint.clone());
     let metadata = gguf_metadata(&mlx_checkpoint);
-    source_config.quantized_weights = gguf_quantization_configs(
+    let formats = gguf_quantization_configs(
         &mlx_checkpoint,
         eredu_architectures::muse_glimmer::translate_dflash_gguf_weight_name,
     )?;
+    let source_config = source_config
+        .with_checkpoint_formats(formats)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     crate::composition::mlx::validate_gguf_quantization_source(
         &mlx_checkpoint,
         &metadata,
@@ -325,10 +332,10 @@ pub fn load_dflash_gguf(
             })?
             .build()?,
     );
-    let mut config = source_config.clone();
     let (store, config) = if let Some(requested) = options.quantization {
-        config.quantization = Some(requested);
-        config.quantized_weights.clear();
+        let config = source_config
+            .load_time_quantization(requested)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let source = NeutralDFlash::new(source_config, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = NeutralDFlash::new(config.clone(), stream)
@@ -338,7 +345,7 @@ pub fn load_dflash_gguf(
             config,
         )
     } else {
-        (store, config)
+        (store, source_config)
     };
     let mut module = MlxModule::new(
         NeutralDFlash::new(config.clone(), stream)
@@ -1250,12 +1257,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = source.clone();
-    target.quantization = Some(quantization);
-    target.quantized_weights = None;
-    target.quantized_weight_configs = None;
-    target.vision_config.weight_quantization = Some(quantization);
-    target.vision_config.quantized_weight_configs.clear();
+    let target = eredu_architectures::muse_glimmer::load_time_quantization(source, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source_architecture = NeutralArchitecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)

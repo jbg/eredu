@@ -1,6 +1,6 @@
 //! Pure checkpoint schemas, name translation, and expert normalization for GPT-OSS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
@@ -34,6 +34,23 @@ pub fn load_time_quantization(
     let mut target = args.clone();
     target.quantization = Some(quantization);
     target.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies canonical checkpoint format metadata to a complete GPT-OSS
+/// configuration while preserving native expert formats.
+pub fn with_checkpoint_formats(
+    args: &ModelArgs,
+    mut formats: HashMap<String, WeightQuantization>,
+) -> Result<ModelArgs, String> {
+    let expert_targets = gguf_expert_quantization_targets(args)?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    formats.retain(|name, _| !expert_targets.contains(name));
+    let mut target = args.clone();
+    target.quantized_weight_configs = Some(formats);
+    target.quantization = None;
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
 }
