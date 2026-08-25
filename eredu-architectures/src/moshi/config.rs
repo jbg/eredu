@@ -69,8 +69,8 @@ impl ArtifactProfile {
 /// Physical SafeTensors namespace selected by artifact metadata.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum CheckpointLayout {
-    /// Original MLX-style Moshi SafeTensors names.
-    NativeMlx,
+    /// Original Moshi SafeTensors namespace.
+    MoshiSafetensors,
     /// Published PyTorch-style PersonaPlex SafeTensors names.
     PersonaPlexPytorch,
 }
@@ -78,7 +78,7 @@ pub enum CheckpointLayout {
 impl CheckpointLayout {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::NativeMlx => "native_mlx",
+            Self::MoshiSafetensors => "moshi_safetensors",
             Self::PersonaPlexPytorch => "personaplex_pytorch",
         }
     }
@@ -881,7 +881,7 @@ fn normalize_native(
         source,
         EffectiveModelType::Moshi,
         profile,
-        CheckpointLayout::NativeMlx,
+        CheckpointLayout::MoshiSafetensors,
         RealtimeFrameConvention::FeedbackAlignedHistory,
         ParameterSharing::IndependentDepthSlices,
         version,
@@ -1446,7 +1446,10 @@ mod tests {
         assert_eq!(config.family(), MOSHI_FAMILY);
         assert_eq!(config.effective_model_type(), EffectiveModelType::Moshi);
         assert_eq!(config.artifact_profile(), ArtifactProfile::NativeV0_1);
-        assert_eq!(config.checkpoint_layout(), CheckpointLayout::NativeMlx);
+        assert_eq!(
+            config.checkpoint_layout(),
+            CheckpointLayout::MoshiSafetensors
+        );
         assert_eq!(config.identity().version(), Some("0.1"));
         assert_eq!(
             config.frame_schedule().frame_convention(),
@@ -1477,6 +1480,18 @@ mod tests {
             MoshiConfig::native_v0_1()
                 .unwrap()
                 .architecture_fingerprint()
+        );
+    }
+
+    #[test]
+    fn checkpoint_layout_identity_names_physical_namespaces() {
+        assert_eq!(
+            CheckpointLayout::MoshiSafetensors.as_str(),
+            "moshi_safetensors"
+        );
+        assert_eq!(
+            CheckpointLayout::PersonaPlexPytorch.as_str(),
+            "personaplex_pytorch"
         );
     }
 

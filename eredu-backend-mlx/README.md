@@ -70,16 +70,3 @@ Completed text-session outputs are materialized through the neutral
 the architecture's named activation points to `InspectableBackendSession`.
 Parity policy and numerical comparison remain in `eredu-evaluation`; the
 backend owns only execution and host observation.
-
-## Migration notes
-
-This crate is new in the backend extraction release. The concrete tensor type
-at Eredu's neutral trait boundary is now `eredu_backend_mlx::MlxTensor`, not
-`safemlx::Array`. Use `MlxTensor::from_array`, `MlxTensor::as_array`, and
-`MlxTensor::into_array` at native integration boundaries; these conversions do
-not evaluate or copy the lazy MLX handle.
-
-The former `eredu-nn/mlx` and `eredu-codec/mlx` features were removed. Backend
-code depends on `eredu-backend-mlx` directly for concrete tensor or Mimi
-integration and enables its `codec` feature for Mimi. Application code uses
-the selected adapter exposed by `eredu::api`.

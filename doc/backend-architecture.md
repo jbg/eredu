@@ -487,8 +487,10 @@ architecture preparation. Moshi inspection parses optional native defaults or
 released PersonaPlex configuration, resolves the confined `moshi_name` or
 indexed checkpoint source, validates the strict SafeTensors contract, and
 publishes canonical binding recipes in `RealtimePreparationPlan`. Concrete
-backends consume that plan and load tensor payloads; they do not receive a raw
-artifact path or reinterpret family configuration and filename policy.
+backends consume that plan and load tensor payloads; checkpoint-layout identity
+names the physical Moshi or PersonaPlex SafeTensors namespace and never a
+concrete backend. Backends do not receive a raw artifact path or reinterpret
+family configuration and filename policy.
 
 Prepared-media admission follows the same boundary after tensor construction.
 Architecture media plans validate family payload shapes,

@@ -19,12 +19,12 @@ pub fn safetensors_plan(config: &MoshiConfig) -> Result<SafetensorsCheckpointPla
     let g = Geometry::new(config)?;
     let mut tensors = Vec::new();
     match config.checkpoint_layout() {
-        CheckpointLayout::NativeMlx => native_catalog(config, g, &mut tensors)?,
+        CheckpointLayout::MoshiSafetensors => native_catalog(config, g, &mut tensors)?,
         CheckpointLayout::PersonaPlexPytorch => personaplex_catalog(config, g, &mut tensors)?,
     }
     SafetensorsCheckpointPlan::new(
         match config.checkpoint_layout() {
-            CheckpointLayout::NativeMlx => "Moshi native MLX SafeTensors",
+            CheckpointLayout::MoshiSafetensors => "Moshi SafeTensors",
             CheckpointLayout::PersonaPlexPytorch => "PersonaPlex released PyTorch SafeTensors",
         },
         tensors,
@@ -43,7 +43,7 @@ pub fn canonical_recipes<C: RecipeCatalog + ?Sized>(
     let g = Geometry::new(config)?;
     let mut builder = RecipeBuilder::new(config, catalog);
     match config.checkpoint_layout() {
-        CheckpointLayout::NativeMlx => native_recipes(g, &mut builder)?,
+        CheckpointLayout::MoshiSafetensors => native_recipes(g, &mut builder)?,
         CheckpointLayout::PersonaPlexPytorch => personaplex_recipes(g, &mut builder)?,
     }
     builder.publish()
@@ -410,7 +410,7 @@ fn matrix_constraint(
             StoredDtype::F32,
             StoredDtype::U8,
         ]),
-        CheckpointLayout::NativeMlx => match quantization {
+        CheckpointLayout::MoshiSafetensors => match quantization {
             WeightQuantization::Affine(_) => StoredDtypeConstraint::Floating,
             WeightQuantization::MxFp4 => StoredDtypeConstraint::Exact(StoredDtype::U8),
             WeightQuantization::GgufIQuant { .. } => unreachable!(),
