@@ -1478,41 +1478,6 @@ pub fn load_gpt_oss_safetensors_mlx(
     Ok(model)
 }
 
-/// Loads a SafeTensors checkpoint through unified layered residency.
-pub fn load_gpt_oss_layerwise_model(
-    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
-    options: impl Into<LayerWeightResidency>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssModel, Error> {
-    load_gpt_oss_safetensors_mlx(
-        artifact,
-        WeightResidency::with_layers(options.into()),
-        quantization,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads GPT-OSS with experts managed independently from ordinary blocks.
-pub fn load_gpt_oss_expert_cache_model(
-    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
-    non_expert: eredu_runtime::NonExpertWeightResidency,
-    options: eredu_runtime::ExpertCacheLoadOptions,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssModel, Error> {
-    load_gpt_oss_safetensors_mlx(
-        artifact,
-        WeightResidency::with_expert_cache(non_expert, options),
-        quantization,
-        stream,
-        weights_stream,
-    )
-}
-
 /// Loads SafeTensors or an inspected GGUF through the neutral GPT-OSS tensor-parallel graph.
 pub fn load_gpt_oss_tensor_parallel_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
@@ -1628,15 +1593,4 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
         false,
     )?;
     Ok(model)
-}
-
-/// Loads portable GGUF weights with the requested unified residency policy.
-pub(crate) fn load_gpt_oss_gguf_layerwise_model(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    residency: WeightResidency,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssModel, Error> {
-    load_gpt_oss_gguf_model(source, residency, quantization, stream, weights_stream)
 }

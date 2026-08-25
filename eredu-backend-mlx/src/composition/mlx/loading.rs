@@ -62,7 +62,7 @@ fn materialize_gguf_model(
             Model::deepseek(kind, Box::new(loaded))?
         }
         GgufArchitecture::GptOss => {
-            let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_layerwise_model(
+            let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_model(
                 source,
                 options.weight_residency,
                 options.quantization,
@@ -1027,8 +1027,12 @@ pub(super) fn materialize_safetensors(
                 ))?)
             }
             ModelKind::GptOss => Ok(Model::gpt_oss(kind,
-                crate::composition::gpt_oss::load_gpt_oss_expert_cache_model(
-                    artifact, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
+                    artifact,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )?),
             ModelKind::Gemma4 => Ok(Model::gemma4(kind,
@@ -1216,9 +1220,9 @@ pub(super) fn materialize_safetensors(
         )?),
         ModelKind::GptOss => Ok(Model::gpt_oss(
             kind,
-            crate::composition::gpt_oss::load_gpt_oss_layerwise_model(
+            crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
                 artifact,
-                execution,
+                options.weight_residency,
                 options.quantization,
                 stream,
                 weights_stream,
