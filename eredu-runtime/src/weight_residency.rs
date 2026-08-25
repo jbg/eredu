@@ -178,8 +178,6 @@ pub struct LayerwiseLoadOptions {
     pub offload: OffloadConfig,
     /// Maximum number of checkpoint payload shards retained as mappings.
     pub max_mapped_shards: usize,
-    /// Reject checkpoint tensors unrelated to the architecture parameter tree.
-    pub strict_loading: bool,
     /// Sample backend allocator memory when a forward pass completes.
     pub sample_backend_memory: bool,
     /// Sample process memory metrics when a forward pass completes.
@@ -187,7 +185,7 @@ pub struct LayerwiseLoadOptions {
 }
 
 impl LayerwiseLoadOptions {
-    /// Creates strict options with the default mapped-shard bound.
+    /// Creates layerwise options with the default mapped-shard bound.
     pub fn new(offload: OffloadConfig) -> Self {
         Self {
             offload,
@@ -201,7 +199,6 @@ impl Default for LayerwiseLoadOptions {
         Self {
             offload: OffloadConfig::default(),
             max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
-            strict_loading: true,
             sample_backend_memory: false,
             sample_process_memory: false,
         }
@@ -223,8 +220,6 @@ pub struct DenseDiskStreamLoadOptions {
     pub eviction_policy: CacheEvictionPolicy,
     /// Maximum number of checkpoint payload shards retained as mappings.
     pub max_mapped_shards: usize,
-    /// Reject checkpoint tensors unrelated to the architecture parameter tree.
-    pub strict_loading: bool,
     /// Sample backend allocator memory after a forward pass.
     pub sample_backend_memory: bool,
     /// Sample process memory and page-fault counters after a forward pass.
@@ -232,7 +227,7 @@ pub struct DenseDiskStreamLoadOptions {
 }
 
 impl DenseDiskStreamLoadOptions {
-    /// Creates strict streaming options with finite tier budgets.
+    /// Creates streaming options with finite tier budgets.
     pub fn new(
         device_budget_bytes: u64,
         host_budget_bytes: u64,
@@ -246,7 +241,6 @@ impl DenseDiskStreamLoadOptions {
             background_queue_capacity,
             eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
             max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
-            strict_loading: true,
             sample_backend_memory: false,
             sample_process_memory: false,
         };
@@ -526,11 +520,6 @@ impl WeightResidency {
     pub const fn max_mapped_shards(self) -> usize {
         self.layers().max_mapped_shards()
     }
-
-    /// Returns whether whole-artifact admission rejects unrelated tensors.
-    pub const fn strict_loading(self) -> bool {
-        self.layers().strict_loading()
-    }
 }
 
 impl Default for WeightResidency {
@@ -546,15 +535,6 @@ impl LayerWeightResidency {
             Self::FullyResident => DEFAULT_MAX_MAPPED_SHARDS,
             Self::LayerwiseHost(options) => options.max_mapped_shards,
             Self::DenseDiskStream(options) => options.max_mapped_shards,
-        }
-    }
-
-    /// Returns whether whole-artifact admission rejects unrelated tensors.
-    pub const fn strict_loading(self) -> bool {
-        match self {
-            Self::FullyResident => true,
-            Self::LayerwiseHost(options) => options.strict_loading,
-            Self::DenseDiskStream(options) => options.strict_loading,
         }
     }
 

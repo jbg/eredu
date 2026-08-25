@@ -1220,19 +1220,14 @@ fn add_unit(
 pub fn validate_unused<F>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     consumed: &BTreeSet<String>,
-    strict: bool,
     ignored: F,
 ) -> Result<(), Error>
 where
     F: Fn(&str) -> bool,
 {
-    if !strict {
-        return Ok(());
-    }
     let unused = store
         .source_keys()
         .into_iter()
-        .chain(store.unclaimed_checkpoint_keys())
         .filter(|key| !consumed.contains(key))
         .filter(|key| !ignored(key))
         .collect::<Vec<_>>();
@@ -1240,6 +1235,52 @@ where
         Ok(())
     } else {
         Err(LayerwiseModelError::UnexpectedCheckpointParameters { unused }.into())
+    }
+}
+
+#[cfg(test)]
+mod validate_unused_tests {
+    use super::*;
+    use eredu_checkpoint::store::{
+        CheckpointLease, CheckpointSource, StoreError, TensorMetadata, TensorReadRequest,
+        WeightStoreDiagnostics,
+    };
+
+    struct ResolvedTestSource;
+
+    impl CheckpointSource for ResolvedTestSource {
+        fn source_keys(&self) -> Vec<String> {
+            vec!["claimed.weight".into()]
+        }
+
+        fn source_metadata(&self, _key: &str) -> Result<TensorMetadata, StoreError> {
+            unreachable!("unused-key validation does not read tensor metadata")
+        }
+
+        fn acquire_lease(
+            &self,
+            _request: TensorReadRequest,
+        ) -> Result<CheckpointLease, StoreError> {
+            unreachable!("unused-key validation does not acquire tensor payloads")
+        }
+
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+            unreachable!("unused-key validation does not inspect storage diagnostics")
+        }
+
+        fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+            vec!["schema.allowed.extra".into()]
+        }
+
+        fn is_checkpoint_contract_resolved(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn schema_unclaimed_keys_are_not_backend_unused_parameters() {
+        let consumed = BTreeSet::from(["claimed.weight".into()]);
+        validate_unused(&ResolvedTestSource, &consumed, |_| false).unwrap();
     }
 }
 

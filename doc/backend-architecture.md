@@ -466,6 +466,10 @@ SafeTensors materialization retains the typed normalized family configuration,
 its complete architecture-derived checkpoint plan, and the validated tensor
 catalog from the preparation plan. MLX structural validation applies that exact
 checkpoint plan to its store and has no second raw-JSON family parser dispatch.
+Catalog strictness belongs to that architecture-owned checkpoint schema;
+residency and materialization options cannot weaken it. Conversely, tensors
+left unclaimed by an explicitly non-strict schema remain outside the resolved
+store presented to backend parameter binding.
 Family composition does not reopen `config.json`, rediscover checkpoint shards,
 or select a second catalog after admission. Every admitted artifact plan
 retains the normalized `ModelKind`; SafeTensors plans additionally retain typed

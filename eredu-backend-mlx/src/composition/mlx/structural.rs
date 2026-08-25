@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
+#[cfg(test)]
 use super::ModelLoadOptions;
 use crate::backend::error::Error;
 use eredu_checkpoint::{recipe::RecipeCatalog, validation::SafetensorsCatalog};
@@ -380,7 +381,6 @@ pub(crate) fn validate_inspected_preparation(
 pub fn validate_safetensors(
     plan: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: &(impl StructuralSafetensorsCatalog + ?Sized),
-    options: ModelLoadOptions,
 ) -> StructuralValidation {
     let validation =
         eredu_checkpoint::validation::validate_safetensors_plan(store, plan.checkpoint());
@@ -397,7 +397,7 @@ pub fn validate_safetensors(
     } else {
         validation
     };
-    validation.with_strict_catalog(options.weight_residency.strict_loading())
+    validation
 }
 
 fn invalid_geometry(detail: String) -> StructuralValidation {
@@ -664,32 +664,118 @@ mod admission_policy_tests {
         )
         .unwrap();
     }
+}
+
+#[cfg(test)]
+mod catalog_policy_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use eredu_checkpoint::{
+        store::{StoreError, TensorMetadata},
+        validation::CatalogTensorMetadata,
+        StoredDtype,
+    };
+
+    #[derive(Clone)]
+    struct TestCatalog(BTreeMap<String, Vec<usize>>);
+
+    impl SafetensorsCatalog for TestCatalog {
+        fn keys(&self) -> Vec<String> {
+            self.0.keys().cloned().collect()
+        }
+
+        fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+            let shape = self
+                .0
+                .get(key)
+                .ok_or_else(|| format!("unknown test tensor {key:?}"))?;
+            Ok(CatalogTensorMetadata {
+                shape: shape.clone(),
+                stored_dtype: StoredDtype::F32,
+            })
+        }
+    }
+
+    impl RecipeCatalog for TestCatalog {
+        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            let shape = self
+                .0
+                .get(key)
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+            Ok(TensorMetadata {
+                name: key.into(),
+                logical_shape: shape.clone(),
+                physical_shape: shape.clone(),
+                stored_dtype: StoredDtype::F32,
+                encoded_byte_len: 0,
+                backing_shard: None,
+            })
+        }
+    }
+
+    fn llama_catalog() -> TestCatalog {
+        let mut tensors = BTreeMap::from([
+            ("model.embed_tokens.weight".into(), vec![8, 4]),
+            ("model.norm.weight".into(), vec![4]),
+            ("lm_head.weight".into(), vec![8, 4]),
+        ]);
+        for (suffix, shape) in [
+            ("self_attn.q_proj.weight", vec![4, 4]),
+            ("self_attn.k_proj.weight", vec![4, 4]),
+            ("self_attn.v_proj.weight", vec![4, 4]),
+            ("self_attn.o_proj.weight", vec![4, 4]),
+            ("mlp.gate_proj.weight", vec![8, 4]),
+            ("mlp.up_proj.weight", vec![8, 4]),
+            ("mlp.down_proj.weight", vec![4, 8]),
+            ("input_layernorm.weight", vec![4]),
+            ("post_attention_layernorm.weight", vec![4]),
+        ] {
+            tensors.insert(format!("model.layers.0.{suffix}"), shape);
+        }
+        TestCatalog(tensors)
+    }
 
     #[test]
-    fn non_strict_catalog_ignores_only_unexpected_tensors() {
-        let unexpected = StructuralIssue {
-            kind: StructuralIssueKind::UnexpectedTensor,
-            detail: "test catalog contains unexpected tensor \"unrelated.weight\"".into(),
-            tensor_name: Some("unrelated.weight".into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        };
-        let malformed = eredu_checkpoint::validation::shape_mismatch("model.weight", &[2, 2], &[1]);
+    fn residency_cannot_weaken_the_architecture_catalog_contract() {
+        let resolved = eredu_core::ModelConfigurationResolver::resolve_safetensors(
+            &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+            &serde_json::json!({
+                "model_type": "llama",
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "intermediate_size": 8,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "rms_norm_eps": 0.00001,
+                "vocab_size": 8,
+                "max_position_embeddings": 32,
+                "tie_word_embeddings": false,
+                "attention_bias": false,
+                "mlp_bias": false
+            }),
+        )
+        .unwrap();
+        let plan = resolved
+            .architecture_plan
+            .safetensors_architecture()
+            .unwrap();
+        let catalog = llama_catalog();
         assert_eq!(
-            StructuralValidation::Invalid(vec![unexpected.clone(), malformed.clone()])
-                .with_strict_catalog(false),
-            StructuralValidation::Invalid(vec![malformed])
+            validate_safetensors(plan, &catalog),
+            StructuralValidation::Exact
         );
 
-        let error = StructuralValidation::Invalid(vec![unexpected])
-            .into_loader_result()
-            .map_err(Error::from)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::StrictLoadValidation { missing, unused }
-                if missing.is_empty() && unused == ["unrelated.weight"]
-        ));
+        let mut with_extra = catalog.clone();
+        with_extra.0.insert("unrelated.weight".into(), vec![1]);
+        let StructuralValidation::Invalid(issues) = validate_safetensors(plan, &with_extra) else {
+            panic!("strict Llama catalog accepted an unexpected tensor");
+        };
+        assert!(issues.iter().any(|issue| {
+            issue.kind == StructuralIssueKind::UnexpectedTensor
+                && issue.tensor_name.as_deref() == Some("unrelated.weight")
+        }));
     }
 }
 

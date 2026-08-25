@@ -186,8 +186,7 @@ fn distributed_materialization_uses_the_planned_configuration() {
     let topology =
         MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
-    let mut layerwise = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-    layerwise.strict_loading = false;
+    let layerwise = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
     let options = ModelLoadOptions::with_parallel(topology)
         .with_weight_residency(WeightResidency::layerwise_host(layerwise));
     let inspection =

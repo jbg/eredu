@@ -134,20 +134,6 @@ impl CheckpointValidation {
         }
     }
 
-    /// Applies a caller-selected strict catalog policy.
-    pub fn with_strict_catalog(self, strict: bool) -> Self {
-        if strict {
-            return self;
-        }
-        match self {
-            Self::Invalid(mut issues) => {
-                issues.retain(|issue| issue.kind != CheckpointIssueKind::UnexpectedTensor);
-                Self::from_issues(issues)
-            }
-            validation => validation,
-        }
-    }
-
     /// Builds exact or invalid validation from a diagnostic sequence.
     pub fn from_issues(issues: Vec<CheckpointIssue>) -> Self {
         if issues.is_empty() {

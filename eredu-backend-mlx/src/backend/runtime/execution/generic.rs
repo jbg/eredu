@@ -775,7 +775,7 @@ where
         unit_bytes.push(bytes);
     }
     consumed.extend(store.materialized_source_keys());
-    validate_unused(store.as_ref(), &consumed, options.strict_loading(), ignored)?;
+    validate_unused(store.as_ref(), &consumed, ignored)?;
     let device_window_bytes = (0..layout.group_count())
         .map(|group| {
             let range = layout

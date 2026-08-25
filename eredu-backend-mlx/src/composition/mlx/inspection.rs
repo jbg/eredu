@@ -230,7 +230,6 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                         "SafeTensors inspection must retain its validated architecture plan",
                     ),
                     &inspected_catalog,
-                    options.load,
                 ),
                 path,
             );
