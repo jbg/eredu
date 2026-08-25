@@ -6,9 +6,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, RoutedExpertProvider,
-    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, OwnedParameterGroupSpec,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
+    RuntimeStateComponents, StateLayout,
 };
 
 use super::{
@@ -1319,6 +1320,92 @@ where
                 parallel,
                 context,
             ),
+        }
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    type Boundary = TargetBoundarySchema;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
+                hidden,
+                boundary: auxiliary,
+            },
+        };
+        self.begin_partition_target(input, mask, state, expected, first_state_ordinal, context)
+            .map(|(forward, _)| forward)
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
+                hidden,
+                boundary: auxiliary,
+            },
+        };
+        self.begin_partition_target_parallel(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+        )
+        .map(|(forward, _)| forward)
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: Some(hidden.clone()),
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: TargetBoundary::new(forward.tokens.clone(), forward.embedded.clone()),
+            })
         }
     }
 }

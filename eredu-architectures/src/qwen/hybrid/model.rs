@@ -7,8 +7,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, ModelStateIdentity, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ResidentExpertProvider,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    ParameterGroupOwner, PartitionedLayeredArchitecture, ResidentExpertProvider,
     RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -1020,6 +1021,104 @@ where
                 parallel,
                 context,
             ),
+        }
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "Qwen hybrid partition state layout mismatch",
+            ));
+        }
+        let (input, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                (TargetPartitionInput::Tokens(tokens), tokens.dim(1))
+            }
+            LayeredPartitionInput::Hidden { hidden, .. } => {
+                let sequence = hidden.dim(1);
+                (TargetPartitionInput::Hidden(hidden), sequence)
+            }
+        };
+        let offset = state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .position();
+        self.begin_routed_target_partition(input, mask, sequence, offset, None, context)
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "Qwen hybrid partition state layout mismatch",
+            ));
+        }
+        let (input, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                (TargetPartitionInput::Tokens(tokens), tokens.dim(1))
+            }
+            LayeredPartitionInput::Hidden { hidden, .. } => {
+                let sequence = hidden.dim(1);
+                (TargetPartitionInput::Hidden(hidden), sequence)
+            }
+        };
+        let offset = state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .position();
+        self.begin_routed_target_partition(input, mask, sequence, offset, Some(parallel), context)
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: Some(hidden.clone()),
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
+            })
         }
     }
 }

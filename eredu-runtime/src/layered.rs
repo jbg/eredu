@@ -9,8 +9,8 @@ use eredu_nn::{NeuralBackend, Parameterized};
 
 use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
-    ExecutionUnitLayout, ExpertPass, ObservedExpertProvider, RoutedExpertProvider,
-    RoutedObservationPoint, RuntimeState, StateLayout, SubmissionBackend,
+    ExecutionUnitLayout, ExpertPass, NoAuxiliaryBoundary, ObservedExpertProvider,
+    RoutedExpertProvider, RoutedObservationPoint, RuntimeState, StateLayout, SubmissionBackend,
 };
 
 /// Statically dispatched visitor over one immutable pinned parameter module.
@@ -83,8 +83,10 @@ pub struct LayeredForwardState<T, C> {
 /// Architecture-authored semantic kind for one transport-visible execution group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ArchitectureGroupKind {
-    /// Text target or prediction decoding.
+    /// Primary text decoding.
     Decoder,
+    /// Embedded prediction after the primary decoder output.
+    Prediction,
     /// Visual encoding.
     VisionEncoder,
     /// Audio encoding.
@@ -163,7 +165,7 @@ impl ArchitectureGroupTransport {
     pub fn prediction() -> Self {
         Self {
             placement: ArchitectureGroupPlacement::OutputOwner,
-            kind: ArchitectureGroupKind::Decoder,
+            kind: ArchitectureGroupKind::Prediction,
             first_owner_static_roles: Vec::new(),
             last_owner_static_roles: Vec::new(),
             merge_destination: ArchitectureMergeDestination::OutputOwner,
@@ -592,30 +594,65 @@ where
 
 /// Input accepted at a rank-local layered partition boundary.
 ///
-/// The first partition embeds borrowed token ids. Later partitions consume an
-/// owned hidden tensor received from the preceding pipeline owner.
+/// A partition either embeds borrowed token ids or consumes an owned hidden
+/// tensor prepared by architecture ingress or a preceding pipeline owner.
 #[derive(Debug)]
-pub enum LayeredPartitionInput<'a, T> {
+pub enum LayeredPartitionInput<'a, T, A = NoAuxiliaryBoundary> {
     /// Token ids supplied to the architecture input owner.
     Tokens(&'a T),
-    /// Hidden state supplied to a non-input partition.
-    Hidden(T),
+    /// Architecture-prepared or upstream hidden state.
+    Hidden {
+        /// Evolving activation received from the preceding owner.
+        hidden: T,
+        /// Architecture-typed context carried across the partition boundary.
+        auxiliary: A,
+    },
+}
+
+/// Architecture-owned result of completing one layered partition.
+///
+/// The runtime and concrete transports only distinguish a final output from a
+/// transport boundary. Families retain ownership of auxiliary boundary values
+/// and of any hidden activation required by an embedded predictor.
+pub enum LayeredPartitionOutput<T, A = NoAuxiliaryBoundary> {
+    /// Complete architecture output produced by the output owner.
+    Final {
+        /// Projected architecture output, normally vocabulary logits.
+        output: T,
+        /// Optional pre-projection value consumed by an embedded predictor.
+        retained: Option<T>,
+    },
+    /// Values transported to the next pipeline owner.
+    Boundary {
+        /// Evolving activation.
+        hidden: T,
+        /// Architecture-typed auxiliary context.
+        auxiliary: A,
+    },
 }
 
 /// Architecture-owned preparation for rank-local partition execution.
 ///
-/// The neutral partition driver owns validation, group setup, completion, and
-/// output ownership. Architectures implement only the semantic conversion of
-/// a partition input into their typed forward state.
+/// The neutral partition driver owns validation, group sequencing, and output
+/// ownership. Architectures own the semantic conversion of partition inputs,
+/// entry into and completion of their selected execution group, and typed
+/// partition output.
 pub trait PartitionedLayeredArchitecture<B, S>: ParallelLayeredArchitecture<B, S>
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Architecture-owned schema for auxiliary partition transport.
+    type Boundary: crate::ArchitectureBoundary;
+
     /// Prepares a replicated partition from tokens or upstream hidden state.
     fn begin_partition<'a>(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &crate::StateLayout,
@@ -627,7 +664,11 @@ where
     #[allow(clippy::too_many_arguments)]
     fn begin_partition_parallel<'a>(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &crate::StateLayout,
@@ -635,6 +676,72 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Enters the selected execution group after the partition input has been
+    /// prepared. The default is the ordinary layered group entry with no graph
+    /// dependencies; graph architectures may override this when their
+    /// partition input is already assembled.
+    #[allow(clippy::too_many_arguments)]
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match parallel {
+            Some(parallel) => self.begin_execution_group_parallel(
+                group,
+                initial,
+                &[],
+                state,
+                forward,
+                parallel,
+                context,
+            ),
+            None => self.begin_execution_group(group, initial, &[], state, forward, context),
+        }
+    }
+
+    /// Completes the selected execution group before the architecture emits
+    /// its final value or typed pipeline boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn leave_partition_group(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match parallel {
+            Some(parallel) => self.complete_execution_group_parallel(
+                group, hidden, state, forward, parallel, context,
+            ),
+            None => self.complete_execution_group(group, hidden, state, forward, context),
+        }
+    }
+
+    /// Emits an architecture partition after its execution group has closed.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        Self::Error,
+    >;
 }
 
 /// Provider-aware unit execution for architectures with routed feed-forward work.

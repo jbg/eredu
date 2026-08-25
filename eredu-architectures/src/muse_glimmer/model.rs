@@ -6,8 +6,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, PartitionedLayeredArchitecture,
     RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
 };
 
@@ -205,6 +206,42 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
 }
 
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
+    #[allow(clippy::too_many_arguments)]
+    fn begin_text_partition<S>(
+        &mut self,
+        input: LayeredPartitionInput<'_, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "Muse-Glimmer partition state layout mismatch",
+            ));
+        }
+        let (input, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                (TextPartitionInput::Tokens(tokens), tokens.dim(1))
+            }
+            LayeredPartitionInput::Hidden { hidden, .. } => {
+                let sequence = hidden.dim(1);
+                (TextPartitionInput::Hidden(hidden), sequence)
+            }
+        };
+        let offset = state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .offset();
+        self.begin_routed_text_partition(input, mask, sequence, offset, parallel, context)
+    }
+
     /// Builds unloaded pinned modules.
     pub fn new(
         args: DecoderConfig,
@@ -1169,5 +1206,95 @@ where
             )?,
         };
         self.static_modules.text.finish_logits(logits, context)
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_text_partition(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            None,
+            context,
+        )
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_text_partition(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            Some(parallel),
+            context,
+        )
+    }
+
+    fn enter_partition_group(
+        &mut self,
+        _group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(initial.clone())
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: None,
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
+            })
+        }
     }
 }

@@ -297,7 +297,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 .static_modules_mut()
                 .embeddings
                 .forward(tokens, context)?,
-            LayeredPartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         self.begin_embedded_partition_with_layout(
             hidden,
@@ -333,7 +333,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 parallel,
                 context,
             )?,
-            LayeredPartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         self.begin_embedded_partition_with_layout(
             hidden,
@@ -695,6 +695,8 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+
     fn begin_partition<'a>(
         &mut self,
         input: LayeredPartitionInput<'a, B::Tensor>,
@@ -735,6 +737,34 @@ where
             parallel,
             context,
         )
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::LayeredPartitionOutput<B::Tensor>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(eredu_runtime::LayeredPartitionOutput::Final {
+                output,
+                retained: None,
+            })
+        } else {
+            Ok(eredu_runtime::LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
+            })
+        }
     }
 }
 

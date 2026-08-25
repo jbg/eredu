@@ -2853,7 +2853,7 @@ where
             LayeredPartitionInput::Tokens(tokens) => {
                 self.static_modules.embeddings.forward(tokens, context)?
             }
-            LayeredPartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         self.begin_embedded_with_layout_at(
             hidden,
@@ -2890,7 +2890,7 @@ where
                 parallel,
                 context,
             )?,
-            LayeredPartitionInput::Hidden(hidden) => hidden,
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         self.begin_embedded_with_layout_at(
             hidden,
@@ -3450,6 +3450,8 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+
     fn begin_partition<'a>(
         &mut self,
         input: LayeredPartitionInput<'a, B::Tensor>,
@@ -3490,6 +3492,34 @@ where
             parallel,
             context,
         )
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::LayeredPartitionOutput<B::Tensor>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(eredu_runtime::LayeredPartitionOutput::Final {
+                output,
+                retained: None,
+            })
+        } else {
+            Ok(eredu_runtime::LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
+            })
+        }
     }
 }
 

@@ -11,9 +11,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterGroupOwner, RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ModelStateIdentity, OwnedParameterGroupSpec,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
@@ -1655,4 +1656,92 @@ fn slice_component<T: Tensor>(
         ],
         context,
     )
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
+{
+    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        _mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        _first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        if state.layout() != expected {
+            return Err(Error::backend("Inkling partition state layout mismatch"));
+        }
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TextPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, .. } => TextPartitionInput::Hidden(hidden),
+        };
+        self.begin_routed_text_partition(input, None, context)
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        _mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        _first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        if state.layout() != expected {
+            return Err(Error::backend("Inkling partition state layout mismatch"));
+        }
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TextPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, .. } => TextPartitionInput::Hidden(hidden),
+        };
+        self.begin_routed_text_partition(input, Some(parallel), context)
+    }
+
+    fn enter_partition_group(
+        &mut self,
+        _group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(initial.clone())
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: Some(hidden.clone()),
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
+            })
+        }
+    }
 }

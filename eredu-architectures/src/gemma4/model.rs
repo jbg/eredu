@@ -9,10 +9,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelPlanError,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, RoutedExpertProvider,
-    RoutedLayeredArchitecture, StateLayout,
+    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
+    ParallelPlanError, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
@@ -58,6 +58,131 @@ fn text_static_parameter_ownership(
             OwnedParameterGroupSpec::new(owner, group)
         })
         .collect())
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    type Boundary = TextBoundarySchema;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        _expected: &StateLayout,
+        _first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                let parts = [DecoderInputPart::Text(tokens)];
+                self.begin_forward(
+                    ModelInput {
+                        parts: &parts,
+                        vision: None,
+                        audio: None,
+                        per_layer_tokens: None,
+                        mask,
+                    },
+                    state,
+                    context,
+                )
+            }
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
+                self.resume_pipeline_text(hidden, mask.cloned(), auxiliary.per_layer_input, state)
+            }
+        }
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        _expected: &StateLayout,
+        _first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                let parts = [DecoderInputPart::Text(tokens)];
+                self.begin_forward_parallel(
+                    ModelInput {
+                        parts: &parts,
+                        vision: None,
+                        audio: None,
+                        per_layer_tokens: None,
+                        mask,
+                    },
+                    state,
+                    parallel,
+                    context,
+                )
+            }
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
+                self.resume_pipeline_text(hidden, mask.cloned(), auxiliary.per_layer_input, state)
+            }
+        }
+    }
+
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if forward.parts.is_empty() {
+            return Ok(initial.clone());
+        }
+        match parallel {
+            Some(parallel) => self.begin_execution_group_parallel(
+                group,
+                initial,
+                &[],
+                state,
+                forward,
+                parallel,
+                context,
+            ),
+            None => self.begin_execution_group(group, initial, &[], state, forward, context),
+        }
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TextBoundary<B::Tensor>>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: None,
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: TextBoundary::new(forward.pipeline_per_layer_inputs().cloned()),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

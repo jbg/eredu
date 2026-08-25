@@ -16,8 +16,9 @@ use eredu_nn::{
     RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, RoutedExpertProvider,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ModelStateIdentity, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
     RoutedLayeredArchitecture, StateLayout, StateSegmentLifetime, StateSegmentSpec,
 };
 
@@ -2762,6 +2763,86 @@ where
                 .clone()
                 .ok_or_else(|| Error::backend("V4 draft group produced no logits")),
             ForwardMode::DsparkContext => Ok(hidden.clone()),
+        }
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    type Boundary = TargetBoundarySchema;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        _state: &mut S,
+        _expected: &StateLayout,
+        _first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
+                hidden,
+                boundary: auxiliary,
+            },
+        };
+        self.begin_routed_target_partition(input, mask, None, context)
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        _state: &mut S,
+        _expected: &StateLayout,
+        _first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
+                hidden,
+                boundary: auxiliary,
+            },
+        };
+        self.begin_routed_target_partition(input, mask, Some(parallel), context)
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Self::Error> {
+        match self.finish_routed_target_partition(
+            hidden,
+            forward,
+            owns_output,
+            parallel,
+            context,
+        )? {
+            TargetPartitionOutput::Final {
+                logits,
+                draft_hidden,
+            } => Ok(LayeredPartitionOutput::Final {
+                output: logits,
+                retained: Some(draft_hidden),
+            }),
+            TargetPartitionOutput::Boundary { hidden, boundary } => {
+                Ok(LayeredPartitionOutput::Boundary {
+                    hidden,
+                    auxiliary: boundary,
+                })
+            }
         }
     }
 }

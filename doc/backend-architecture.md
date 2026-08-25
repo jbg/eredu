@@ -840,11 +840,18 @@ ranges and ownership, but cannot substitute a caller-built topology that only
 resembles the architecture it will execute.
 
 `LayeredPartitionDriver` executes that canonical partition contract. It
-validates backend unit storage and mutable-state ranges, enforces input and
-output ownership, and owns execution-group setup, completion, and final
-projection for both replicated and tensor-parallel paths. Architectures supply
-typed partition input preparation through `PartitionedLayeredArchitecture`;
-concrete backends supply only unit residency, state storage, and collectives.
+validates backend unit storage and mutable-state ranges, enforces ownership,
+and sequences the selected group for both replicated and tensor-parallel
+paths. `PartitionedLayeredArchitecture` owns typed entry, group entry and
+completion, and typed exit: it converts tokens or an architecture-prepared or
+upstream activation plus auxiliary state into a forward context, projects only
+on the output owner, and returns either a typed transport boundary or a final
+output with an optional embedded-predictor capture. Concrete backends supply
+only unit residency, state storage, collectives, and encoding or decoding
+through the partition's `ArchitectureBoundary`; backend composition does not
+reconstruct a family's begin/finish lifecycle. Primary decoder and embedded
+prediction groups have distinct semantic kinds, so multimodal ingress ends at
+the decoder boundary and prediction runs only in its explicit phase.
 
 The partition also carries an architecture-owned boundary schema. That schema
 declares every auxiliary tensor's stable role, canonical order, symbolic shape,

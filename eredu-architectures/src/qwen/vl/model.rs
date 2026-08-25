@@ -8,10 +8,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterGroupOwner, RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents,
-    StateLayout,
+    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, PartitionedLayeredArchitecture,
+    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
 use crate::decoder::static_parallel_parameter_groups;
@@ -151,6 +151,7 @@ pub struct ForwardContext<T> {
     tokens: Option<T>,
     parts: Vec<PreparedPart<T>>,
     rotary: (T, T),
+    position_delta: T,
     vision_state: Option<VisionState<T>>,
     vision_initial: Option<T>,
     vision_output: Option<T>,
@@ -189,7 +190,7 @@ pub struct PipelinePrepared<T> {
     pub visual_mask: Option<T>,
 }
 
-impl<T> PipelinePrepared<T> {
+impl<T: Clone> PipelinePrepared<T> {
     /// Converts decoder preparation into the canonical layered forward state.
     pub fn into_layered_forward(self) -> (LayeredForwardState<T, ForwardContext<T>>, T) {
         let position_delta = self.position_delta;
@@ -201,6 +202,7 @@ impl<T> PipelinePrepared<T> {
                     tokens: None,
                     parts: Vec::new(),
                     rotary: (self.cosine, self.sine),
+                    position_delta: position_delta.clone(),
                     vision_state: None,
                     vision_initial: None,
                     vision_output: None,
@@ -436,6 +438,66 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
 }
 
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
+    #[allow(clippy::too_many_arguments)]
+    fn begin_distributed_partition<S>(
+        &mut self,
+        input: LayeredPartitionInput<'_, B::Tensor, PipelineBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        if state.layout() != expected {
+            return Err(Error::backend("Qwen3-VL partition state layout mismatch"));
+        }
+        let (offset, persisted_delta) = {
+            let layer = state.layer(first_state_ordinal).map_err(Error::backend)?;
+            let offset = layer.position();
+            let delta = layer
+                .fixed_component(StateTensorRole::PositionDelta)
+                .map_err(Error::backend)?
+                .clone();
+            (offset, delta)
+        };
+        let (input, batch, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => (
+                PipelinePartitionInput::Tokens {
+                    tokens,
+                    offset,
+                    position_delta: persisted_delta.as_ref(),
+                },
+                tokens.dim(0),
+                tokens.dim(1),
+            ),
+            LayeredPartitionInput::Hidden {
+                hidden,
+                auxiliary: boundary,
+            } => {
+                let batch = hidden.dim(0);
+                let sequence = hidden.dim(1);
+                (
+                    PipelinePartitionInput::Hidden { hidden, boundary },
+                    batch,
+                    sequence,
+                )
+            }
+        };
+        let (forward, position_delta) = self
+            .begin_routed_text_partition(input, mask, batch, sequence, offset, parallel, context)?;
+        *state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .fixed_component(StateTensorRole::PositionDelta)
+            .map_err(Error::backend)? = Some(position_delta);
+        Ok(forward)
+    }
+
     /// Prepares one routed decoder partition, including DeepStack defaults,
     /// shape validation, and architecture-owned causal masking.
     #[allow(clippy::too_many_arguments)]
@@ -1579,6 +1641,10 @@ where
         } else if let Some(delta) = delta.as_ref() {
             positions = positions.add(delta, context)?;
         }
+        let position_delta = delta
+            .as_ref()
+            .expect("Qwen3-VL installs position delta")
+            .clone();
         let rotary = mrope_embeddings(
             &positions,
             self.args.text.head_dim,
@@ -1611,6 +1677,7 @@ where
                 tokens: assembled_tokens,
                 parts,
                 rotary,
+                position_delta,
                 vision_state,
                 vision_initial,
                 vision_output: None,
@@ -1774,6 +1841,7 @@ where
         values.extend(forward.mask.iter());
         values.extend(forward.tokens.iter());
         values.extend([&forward.rotary.0, &forward.rotary.1]);
+        values.push(&forward.position_delta);
         values.extend(forward.vision_initial.iter());
         values.extend(forward.vision_output.iter());
         values.extend(forward.deepstack.iter());
@@ -1879,6 +1947,10 @@ where
         } else if let Some(delta) = delta.as_ref() {
             positions = positions.add(delta, context)?;
         }
+        let position_delta = delta
+            .as_ref()
+            .expect("Qwen3-VL installs position delta")
+            .clone();
         let rotary = mrope_embeddings(
             &positions,
             self.args.text.head_dim,
@@ -1911,6 +1983,7 @@ where
                 tokens: assembled_tokens,
                 parts,
                 rotary,
+                position_delta,
                 vision_state,
                 vision_initial,
                 vision_output: None,
@@ -1989,6 +2062,101 @@ where
                 parallel,
                 context,
             ),
+        }
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    type Boundary = PipelineBoundarySchema;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, PipelineBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_distributed_partition(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            None,
+            context,
+        )
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, PipelineBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_distributed_partition(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            Some(parallel),
+            context,
+        )
+    }
+
+    fn enter_partition_group(
+        &mut self,
+        _group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(initial.clone())
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, PipelineBoundary<B::Tensor>>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: None,
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: PipelineBoundary {
+                    cosine: forward.rotary.0.clone(),
+                    sine: forward.rotary.1.clone(),
+                    position_delta: forward.position_delta.clone(),
+                    deepstack: forward.deepstack.clone(),
+                },
+            })
         }
     }
 }

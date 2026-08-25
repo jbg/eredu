@@ -907,10 +907,6 @@ impl PlacedGroupPayload {
         placement: &PlacedExecutionDag,
         producer: usize,
         active: bool,
-        info: &PipelineStageInfo,
-        step: PipelineStep,
-        schema: &eredu_runtime::BoundaryWireSchema,
-        auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
     ) -> Result<(), Error> {
         if self.producer != producer {
             return Err(Error::Parallel(format!(
@@ -918,16 +914,7 @@ impl PlacedGroupPayload {
                 self.producer
             )));
         }
-        if active {
-            validate_pipeline_payload_arrays(
-                info,
-                &self.arrays,
-                step,
-                schema.identity(),
-                auxiliary_specs,
-                &format!("placed payload from {:?}", placement.groups()[producer].id),
-            )?;
-        } else if !self.arrays.is_empty() {
+        if !active && !self.arrays.is_empty() {
             return Err(Error::Parallel(format!(
                 "inactive placed payload from {:?} contains {} tensors",
                 placement.groups()[producer].id,
@@ -960,10 +947,6 @@ impl PlacedPayloadStore {
         placement: &PlacedExecutionDag,
         consumer: usize,
         active: &[bool],
-        info: &PipelineStageInfo,
-        step: PipelineStep,
-        schema: &eredu_runtime::BoundaryWireSchema,
-        auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
     ) -> Result<Vec<PlacedGroupPayload>, Error> {
         placement
             .dependency_indices(consumer)
@@ -977,15 +960,7 @@ impl PlacedPayloadStore {
                         placement.groups()[producer].id
                     ))
                 })?;
-                payload.validate_for(
-                    placement,
-                    producer,
-                    active[producer],
-                    info,
-                    step,
-                    schema,
-                    auxiliary_specs,
-                )?;
+                payload.validate_for(placement, producer, active[producer])?;
                 Ok(payload)
             })
             .collect()
@@ -1251,19 +1226,6 @@ impl PipelinePayload {
         std::iter::once(self.hidden)
             .chain(self.auxiliary.tensors)
             .collect()
-    }
-
-    fn from_arrays(mut arrays: Vec<Array>) -> Result<Self, Error> {
-        if arrays.is_empty() {
-            return Err(Error::Parallel(
-                "placed modality finalization produced an empty decoder payload".into(),
-            ));
-        }
-        let hidden = arrays.remove(0);
-        Ok(Self {
-            hidden,
-            auxiliary: PipelineAuxiliaryState::new(arrays),
-        })
     }
 }
 
@@ -1967,76 +1929,6 @@ impl Gemma4PipelinePartition {
                     .collect(),
             ),
         })
-    }
-
-    fn prepare_tokens<S>(
-        &mut self,
-        tokens: &Array,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        state: &mut S,
-        stream: &Stream,
-    ) -> Result<
-        eredu_runtime::LayeredForwardState<
-            crate::MlxTensor,
-            eredu_architectures::gemma4::ForwardContext<crate::MlxTensor>,
-        >,
-        Error,
-    >
-    where
-        S: eredu_runtime::LayerRuntimeState<MlxNeuralBackend>,
-        S::LayerState: eredu_nn::AttentionCache<crate::MlxTensor>,
-    {
-        let parts = [eredu_architectures::gemma4::DecoderInputPart::Text(
-            crate::composition::tensor_ref(tokens),
-        )];
-        let input = eredu_architectures::gemma4::ModelInput {
-            parts: &parts,
-            vision: None,
-            audio: None,
-            per_layer_tokens: None,
-            mask: None,
-        };
-        let decoder_group = architecture_decoder_group::<_, S>(&self.architecture)?;
-        let mut forward = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                S,
-            >>::begin_forward_parallel(&mut self.architecture, input, state, parallel, stream),
-            None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                S,
-            >>::begin_forward(&mut self.architecture, input, state, stream),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                S,
-            >>::begin_execution_group_parallel(
-                &mut self.architecture,
-                decoder_group,
-                &forward.hidden,
-                &[],
-                state,
-                &mut forward.context,
-                parallel,
-                stream,
-            ),
-            None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                S,
-            >>::begin_execution_group(
-                &mut self.architecture,
-                decoder_group,
-                &forward.hidden,
-                &[],
-                state,
-                &mut forward.context,
-                stream,
-            ),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(forward)
     }
 }
 
@@ -4568,11 +4460,14 @@ where
         PipelineRangeState<'state>,
         Unit = U,
         ForwardContext = F,
+        Boundary = Boundary,
     >,
+    Boundary: eredu_runtime::ArchitectureBoundary,
     for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
         std::fmt::Display,
 {
-    let driver = eredu_runtime::LayeredPartitionDriver::new(partition, storage_range)
+    let group = architecture_decoder_group::<A, PipelineRangeState<'_>>(architecture)?;
+    let driver = eredu_runtime::LayeredPartitionDriver::new(partition, group, storage_range)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel = execution
         .filter(|execution| execution.is_tensor_parallel())
@@ -4583,17 +4478,28 @@ where
         })
         .transpose()?;
     let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) => (
-            eredu_runtime::LayeredPartitionInput::Tokens(crate::composition::tensor_ref(tokens)),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Hidden(payload) => (
-            eredu_runtime::LayeredPartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
+    let input = match input {
+        PipelineStageInput::Tokens(tokens) => {
+            eredu_runtime::LayeredPartitionInput::Tokens(crate::composition::tensor_ref(tokens))
+        }
+        PipelineStageInput::Hidden(payload) => {
+            let auxiliary = partition
+                .auxiliary_boundary()
+                .decode(
+                    payload
+                        .auxiliary
+                        .tensors()
+                        .iter()
+                        .cloned()
+                        .map(crate::MlxTensor::from_array)
+                        .collect(),
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::LayeredPartitionInput::Hidden {
+                hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
+                auxiliary,
+            }
+        }
     };
     let input = driver
         .input(input)
@@ -4640,13 +4546,24 @@ where
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?
     };
     Ok(match output {
-        eredu_runtime::LayeredPartitionOutput::Output(output) => {
-            PipelineStageOutput::Logits(output.into_array())
-        }
-        eredu_runtime::LayeredPartitionOutput::Hidden(hidden) => {
+        eredu_runtime::LayeredPartitionOutput::Final { output, retained } => match retained {
+            Some(hidden) => PipelineStageOutput::EmbeddedMtpLogits {
+                logits: output.into_array(),
+                hidden: hidden.into_array(),
+            },
+            None => PipelineStageOutput::Logits(output.into_array()),
+        },
+        eredu_runtime::LayeredPartitionOutput::Boundary { hidden, auxiliary } => {
+            let auxiliary = partition
+                .auxiliary_boundary()
+                .encode(auxiliary)
+                .map_err(|error| Error::Parallel(error.to_string()))?
+                .into_iter()
+                .map(crate::MlxTensor::into_array)
+                .collect();
             PipelineStageOutput::Hidden(PipelinePayload {
                 hidden: hidden.into_array(),
-                auxiliary,
+                auxiliary: PipelineAuxiliaryState::new(auxiliary),
             })
         }
     })
@@ -4678,6 +4595,7 @@ where
             PipelineRangeState<'state>,
             Unit = U,
             ForwardContext = F,
+            Boundary = Boundary,
         > + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<
             MlxNeuralBackend,
@@ -4685,8 +4603,10 @@ where
         >,
     for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
         std::fmt::Display,
+    Boundary: eredu_runtime::ArchitectureBoundary,
 {
-    let driver = eredu_runtime::LayeredPartitionDriver::new(partition, storage_range)
+    let group = architecture_decoder_group::<A, PipelineRangeState<'_>>(architecture)?;
+    let driver = eredu_runtime::LayeredPartitionDriver::new(partition, group, storage_range)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel = execution
         .filter(|execution| execution.is_tensor_parallel())
@@ -4697,17 +4617,28 @@ where
         })
         .transpose()?;
     let execution_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-    let (input, auxiliary) = match input {
-        PipelineStageInput::Tokens(tokens) => (
-            eredu_runtime::LayeredPartitionInput::Tokens(crate::composition::tensor_ref(tokens)),
-            PipelineAuxiliaryState::default(),
-        ),
-        PipelineStageInput::Hidden(payload) => (
-            eredu_runtime::LayeredPartitionInput::Hidden(crate::MlxTensor::from_array(
-                payload.hidden.clone(),
-            )),
-            payload.auxiliary.clone(),
-        ),
+    let input = match input {
+        PipelineStageInput::Tokens(tokens) => {
+            eredu_runtime::LayeredPartitionInput::Tokens(crate::composition::tensor_ref(tokens))
+        }
+        PipelineStageInput::Hidden(payload) => {
+            let auxiliary = partition
+                .auxiliary_boundary()
+                .decode(
+                    payload
+                        .auxiliary
+                        .tensors()
+                        .iter()
+                        .cloned()
+                        .map(crate::MlxTensor::from_array)
+                        .collect(),
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::LayeredPartitionInput::Hidden {
+                hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
+                auxiliary,
+            }
+        }
     };
     let input = driver
         .input(input)
@@ -4756,13 +4687,24 @@ where
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?
     };
     Ok(match output {
-        eredu_runtime::LayeredPartitionOutput::Output(output) => {
-            PipelineStageOutput::Logits(output.into_array())
-        }
-        eredu_runtime::LayeredPartitionOutput::Hidden(hidden) => {
+        eredu_runtime::LayeredPartitionOutput::Final { output, retained } => match retained {
+            Some(hidden) => PipelineStageOutput::EmbeddedMtpLogits {
+                logits: output.into_array(),
+                hidden: hidden.into_array(),
+            },
+            None => PipelineStageOutput::Logits(output.into_array()),
+        },
+        eredu_runtime::LayeredPartitionOutput::Boundary { hidden, auxiliary } => {
+            let auxiliary = partition
+                .auxiliary_boundary()
+                .encode(auxiliary)
+                .map_err(|error| Error::Parallel(error.to_string()))?
+                .into_iter()
+                .map(crate::MlxTensor::into_array)
+                .collect();
             PipelineStageOutput::Hidden(PipelinePayload {
                 hidden: hidden.into_array(),
-                auxiliary,
+                auxiliary: PipelineAuxiliaryState::new(auxiliary),
             })
         }
     })
@@ -5328,68 +5270,6 @@ fn validate_scheduled_pipeline_kv_cache(
     Ok(())
 }
 
-fn pipeline_kv_offset(caches: &[PipelineLayerCache]) -> i32 {
-    caches.first().map_or(0, |cache| match cache {
-        PipelineLayerCache::KeyValue {
-            cache: PipelineKeyValueCache::Standard(cache),
-            ..
-        } => cache.offset(),
-        PipelineLayerCache::KeyValue {
-            cache: PipelineKeyValueCache::Paged(cache),
-            ..
-        } => cache.offset(),
-        PipelineLayerCache::PoolingAttention { cache, .. } => cache.offset(),
-        PipelineLayerCache::StateSlots { .. } | PipelineLayerCache::CompressedLatent { .. } => 0,
-    })
-}
-
-fn pipeline_state_offset(family: &str, caches: &[PipelineLayerCache]) -> Result<i32, Error> {
-    let mut offset = None;
-    for cache in caches {
-        let (global_layer, attention_offset, slots) = match cache {
-            PipelineLayerCache::StateSlots {
-                global_layer,
-                slots,
-            } => (*global_layer, None, slots.as_slice()),
-            PipelineLayerCache::KeyValue {
-                global_layer,
-                cache: PipelineKeyValueCache::Standard(cache),
-                slots,
-            } => (*global_layer, Some(cache.offset()), slots.as_slice()),
-            PipelineLayerCache::KeyValue {
-                global_layer,
-                cache: PipelineKeyValueCache::Paged(cache),
-                slots,
-            } => (*global_layer, Some(cache.offset()), slots.as_slice()),
-            PipelineLayerCache::CompressedLatent {
-                global_layer,
-                cache,
-                slots,
-            } => (*global_layer, Some(cache.offset()), slots.as_slice()),
-            PipelineLayerCache::PoolingAttention {
-                global_layer,
-                cache,
-            } => (*global_layer, Some(cache.offset()), &[][..]),
-        };
-        for current in attention_offset
-            .into_iter()
-            .chain((!slots.is_empty()).then(|| slots[0].offset))
-            .chain(slots.iter().skip(1).map(|slot| slot.offset))
-        {
-            if let Some(expected) = offset {
-                if current != expected {
-                    return Err(Error::Parallel(format!(
-                        "{family} pipeline state offsets disagree at global layer {global_layer}: found {current}, expected {expected}"
-                    )));
-                }
-            } else {
-                offset = Some(current);
-            }
-        }
-    }
-    Ok(offset.unwrap_or(0))
-}
-
 impl PipelinePartitionMetadata for LlamaPipelinePartition {
     fn capability_estimate(
         &self,
@@ -5509,93 +5389,6 @@ impl DeepSeekV3PipelinePartition {
             )));
         }
         let decoder_range = self.range();
-        let tensor_group = execution
-            .filter(|execution| execution.is_tensor_parallel())
-            .map(|execution| {
-                execution.group().ok_or_else(|| {
-                    Error::Parallel(
-                        "neutral DeepSeek V3 tensor stage has no TP communicator".into(),
-                    )
-                })
-            })
-            .transpose()?;
-        let owns_input = self.partition.ownership().owns_input();
-        let target_input = match input {
-            PipelineStageInput::Tokens(tokens) if owns_input => {
-                eredu_architectures::deepseek::v3::TargetPartitionInput::Tokens(
-                    crate::composition::tensor_ref(tokens),
-                )
-            }
-            PipelineStageInput::Hidden(payload) if !owns_input => {
-                let boundary = self
-                    .partition
-                    .auxiliary_boundary()
-                    .decode(
-                        payload
-                            .auxiliary
-                            .tensors()
-                            .iter()
-                            .cloned()
-                            .map(crate::MlxTensor::from_array)
-                            .collect(),
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                eredu_architectures::deepseek::v3::TargetPartitionInput::Hidden {
-                    hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
-                    boundary,
-                }
-            }
-            PipelineStageInput::Tokens(_) => {
-                return Err(Error::Parallel(
-                    "non-input DeepSeek V3 partition received token ids".into(),
-                ))
-            }
-            PipelineStageInput::Hidden(_) => {
-                return Err(Error::Parallel(
-                    "input DeepSeek V3 partition received upstream hidden state".into(),
-                ))
-            }
-        };
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("DeepSeek V3 partition has no state".into()))?
-            .layout()
-            .clone();
-        let (forward, boundary) = {
-            let mut state =
-                PipelineRangeState::new(state_layout.clone(), decoder_range.clone(), caches)?;
-            match tensor_group {
-                Some(group) => self.architecture.begin_partition_target_parallel(
-                    target_input,
-                    crate::composition::tensor_opt(explicit_mask),
-                    &mut state,
-                    &state_layout,
-                    decoder_range.start,
-                    group,
-                    stream,
-                ),
-                None => self.architecture.begin_partition_target(
-                    target_input,
-                    crate::composition::tensor_opt(explicit_mask),
-                    &mut state,
-                    &state_layout,
-                    decoder_range.start,
-                    stream,
-                ),
-            }
-        }
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let mut forward = forward;
-        let auxiliary = PipelineAuxiliaryState::new(
-            self.partition
-                .auxiliary_boundary()
-                .encode(boundary)
-                .map_err(|error| Error::Parallel(error.to_string()))?
-                .into_iter()
-                .map(crate::MlxTensor::into_array)
-                .collect(),
-        );
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
@@ -5610,9 +5403,7 @@ impl DeepSeekV3PipelinePartition {
         let expert_cache = self.expert_storage.cache();
         let assignment = self.expert_assignment.as_ref();
         let statistics = &mut self.routing_statistics;
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V3 external experts have no assignment".into())
             })?;
@@ -5637,21 +5428,21 @@ impl DeepSeekV3PipelinePartition {
                     .map_err(|error: Error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
+            )
         } else {
             if expert_group.is_some() {
                 return Err(Error::Parallel(
@@ -5659,47 +5450,21 @@ impl DeepSeekV3PipelinePartition {
                 ));
             }
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
-        };
-        if self.partition.ownership().owns_output() {
-            let capture = hidden.clone();
-            let logits = match tensor_group {
-                Some(group) => self
-                    .architecture
-                    .finish_partition_target_parallel(
-                        crate::composition::tensor_ref(&hidden),
-                        group,
-                        stream,
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None => self
-                    .architecture
-                    .finish_partition_target(crate::composition::tensor_ref(&hidden), stream)
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-            };
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: logits.into_array(),
-                hidden: capture,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
+            )
         }
     }
 }
@@ -6030,56 +5795,6 @@ impl DeepSeekV4PipelinePartition {
             )));
         }
         let decoder_range = self.range();
-        let tensor_group = execution
-            .filter(|execution| execution.is_tensor_parallel())
-            .map(|execution| {
-                execution.group().ok_or_else(|| {
-                    Error::Parallel(
-                        "neutral DeepSeek V4 tensor stage has no TP communicator".into(),
-                    )
-                })
-            })
-            .transpose()?;
-        let boundary_schema = *self.partition.auxiliary_boundary();
-        let target_input = match input {
-            PipelineStageInput::Tokens(tokens) => {
-                eredu_architectures::deepseek::v4::TargetPartitionInput::Tokens(
-                    crate::composition::tensor_ref(tokens),
-                )
-            }
-            PipelineStageInput::Hidden(payload) => {
-                let boundary = boundary_schema
-                    .decode(
-                        payload
-                            .auxiliary
-                            .tensors()
-                            .iter()
-                            .cloned()
-                            .map(crate::MlxTensor::from_array)
-                            .collect(),
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                eredu_architectures::deepseek::v4::TargetPartitionInput::Hidden {
-                    hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
-                    boundary,
-                }
-            }
-        };
-        let mut forward = self
-            .architecture
-            .begin_routed_target_partition(
-                target_input,
-                crate::composition::tensor_opt(mask),
-                tensor_group,
-                stream,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("DeepSeek V4 partition has no state".into()))?
-            .layout()
-            .clone();
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
@@ -6094,9 +5809,7 @@ impl DeepSeekV4PipelinePartition {
         let expert_cache = self.expert_storage.cache();
         let assignment = self.expert_assignment.as_ref();
         let statistics = &mut self.routing_statistics;
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V4 external experts have no assignment".into())
             })?;
@@ -6121,21 +5834,21 @@ impl DeepSeekV4PipelinePartition {
                     .map_err(|error: Error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
+            )
         } else {
             if expert_group.is_some() {
                 return Err(Error::Parallel(
@@ -6143,54 +5856,21 @@ impl DeepSeekV4PipelinePartition {
                 ));
             }
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
-                stream,
-            )?
-        };
-        match self
-            .architecture
-            .finish_routed_target_partition(
-                crate::composition::tensor_ref(&hidden),
-                &forward.context,
-                self.partition.ownership().owns_output(),
-                tensor_group,
                 stream,
             )
-            .map_err(|error| Error::Parallel(error.to_string()))?
-        {
-            eredu_architectures::deepseek::v4::TargetPartitionOutput::Final {
-                logits,
-                draft_hidden,
-            } => Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: logits.into_array(),
-                hidden: draft_hidden.into_array(),
-            }),
-            eredu_architectures::deepseek::v4::TargetPartitionOutput::Boundary {
-                hidden,
-                boundary,
-            } => Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden: hidden.into_array(),
-                auxiliary: PipelineAuxiliaryState::new(
-                    boundary_schema
-                        .encode(boundary)
-                        .map_err(|error| Error::Parallel(error.to_string()))?
-                        .into_iter()
-                        .map(crate::MlxTensor::into_array)
-                        .collect(),
-                ),
-            })),
         }
     }
 }
@@ -7656,46 +7336,6 @@ impl PipelineForward for InklingPipelinePartition {
     }
 }
 
-fn qwen_vl_pipeline_delta(caches: &[PipelineLayerCache]) -> Option<crate::MlxTensor> {
-    caches.iter().find_map(|cache| {
-        let slots = match cache {
-            PipelineLayerCache::StateSlots { slots, .. }
-            | PipelineLayerCache::KeyValue { slots, .. }
-            | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
-            PipelineLayerCache::PoolingAttention { .. } => return None,
-        };
-        slots
-            .iter()
-            .find(|slot| slot.policy.role == StateTensorRole::PositionDelta)
-            .and_then(|slot| slot.value.clone())
-    })
-}
-
-fn set_qwen_vl_pipeline_delta(
-    caches: &mut [PipelineLayerCache],
-    delta: crate::MlxTensor,
-    offset: i32,
-) -> Result<(), Error> {
-    for cache in caches {
-        let slots = match cache {
-            PipelineLayerCache::StateSlots { slots, .. }
-            | PipelineLayerCache::KeyValue { slots, .. }
-            | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
-            PipelineLayerCache::PoolingAttention { .. } => continue,
-        };
-        if let Some(slot) = slots
-            .iter_mut()
-            .find(|slot| slot.policy.role == StateTensorRole::PositionDelta)
-        {
-            slot.value = Some(delta);
-            slot.offset = offset;
-            synchronize_outputs(slot.value.iter().map(crate::MlxTensor::as_array))?;
-            break;
-        }
-    }
-    Ok(())
-}
-
 impl QwenVlPipelinePartition {
     fn args(&self) -> &eredu_architectures::qwen::vl::ModelArgs {
         self.architecture.args()
@@ -7875,50 +7515,9 @@ impl QwenVlPipelinePartition {
                 self.range().len()
             )));
         }
-        let offset = pipeline_kv_offset(caches);
         let tensor_group = execution
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
-        let boundary_schema = self.boundary_schema()?;
-        let persisted_delta = qwen_vl_pipeline_delta(caches);
-        let partition_input = match input {
-            PipelineStageInput::Tokens(tokens) => {
-                eredu_architectures::qwen::vl::PipelinePartitionInput::Tokens {
-                    tokens: crate::composition::tensor_ref(tokens),
-                    offset,
-                    position_delta: persisted_delta.as_ref(),
-                }
-            }
-            PipelineStageInput::Hidden(payload) => {
-                let boundary = boundary_schema
-                    .decode(
-                        payload
-                            .auxiliary
-                            .tensors()
-                            .iter()
-                            .cloned()
-                            .map(crate::MlxTensor::from_array)
-                            .collect(),
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                eredu_architectures::qwen::vl::PipelinePartitionInput::Hidden {
-                    hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
-                    boundary,
-                }
-            }
-        };
-        let (mut forward, position_delta) = self
-            .architecture
-            .begin_routed_text_partition(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                step.batch_size,
-                step.sequence_length,
-                offset,
-                tensor_group,
-                stream,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?;
         let assignment = self.expert_assignment.clone();
         if let Some(assignment) = assignment.as_ref() {
             validate_pipeline_expert_dispatch(
@@ -7934,16 +7533,8 @@ impl QwenVlPipelinePartition {
             ExpertPass::Decode
         };
         let cache = self.expert_storage.cache();
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("Qwen3-VL partition has no state layout".into()))?
-            .layout()
-            .clone();
         let decoder_range = self.range();
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = cache {
+        if let Some(expert_cache) = cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Qwen3-VL external experts have no assignment".into())
             })?;
@@ -7974,76 +7565,37 @@ impl QwenVlPipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
-                &mut self.layers,
-                self.dense_layers.as_ref(),
-                step,
-                caches,
-                &state_layout,
-                &mut forward,
-                pass,
-                &mut provider,
-                tensor_group,
-                stream,
-            )?
-        } else {
-            execute_neutral_routed_partition_group(
-                &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
+                pass,
+                &mut provider,
+                stream,
+            )
+        } else {
+            execute_routed_layered_partition(
+                &mut self.architecture,
+                &self.partition,
+                decoder_range,
+                &mut self.layers,
+                self.dense_layers.as_ref(),
+                input,
+                step,
+                explicit_mask,
+                caches,
+                execution,
                 pass,
                 &mut eredu_runtime::ResidentExpertProvider,
-                tensor_group,
                 stream,
-            )?
-        };
-        forward.hidden = crate::MlxTensor::from_array(hidden.clone());
-        let completed_offset = pipeline_kv_offset(caches);
-        set_qwen_vl_pipeline_delta(caches, position_delta.clone(), completed_offset)?;
-        let (hidden, boundary) =
-            eredu_architectures::qwen::vl::PipelinePrepared::from_layered_forward(
-                forward,
-                position_delta,
-            );
-        let auxiliary = PipelineAuxiliaryState::new(
-            boundary_schema
-                .encode(boundary)
-                .map_err(|error| Error::Parallel(error.to_string()))?
-                .into_iter()
-                .map(crate::MlxTensor::into_array)
-                .collect(),
-        );
-        if self.partition.ownership().owns_output() {
-            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
-                let group = execution
-                    .group()
-                    .ok_or_else(|| Error::Parallel("Qwen3-VL TP output group is missing".into()))?;
-                let logits = self
-                    .architecture
-                    .finish_partition_text_parallel(&hidden, group, stream)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                Ok(PipelineStageOutput::Logits(logits.into_array()))
-            } else {
-                let logits = self
-                    .architecture
-                    .finish_partition_text(&hidden, stream)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                Ok(PipelineStageOutput::Logits(logits.into_array()))
-            }
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden: hidden.into_array(),
-                auxiliary,
-            }))
+            )
         }
     }
 }
@@ -8496,48 +8048,6 @@ impl QwenConditionalPipelinePartition {
                 self.range().len()
             )));
         }
-        let offset = pipeline_kv_offset(caches);
-        let tensor_group = execution
-            .filter(|execution| execution.is_tensor_parallel())
-            .and_then(ParallelExecutionContext::group);
-        let boundary_schema = self.boundary_schema()?;
-        let partition_input = match input {
-            PipelineStageInput::Tokens(tokens) => {
-                eredu_architectures::qwen::hybrid::ConditionalPartitionInput::Tokens {
-                    tokens: crate::composition::tensor_ref(tokens),
-                    offset,
-                }
-            }
-            PipelineStageInput::Hidden(payload) => boundary_schema
-                .decode(
-                    payload
-                        .auxiliary
-                        .tensors()
-                        .iter()
-                        .cloned()
-                        .map(crate::MlxTensor::from_array)
-                        .collect(),
-                )
-                .map(|boundary| {
-                    eredu_architectures::qwen::hybrid::ConditionalPartitionInput::Hidden {
-                        hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
-                        boundary,
-                    }
-                })
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-        };
-        let mut forward = self
-            .architecture
-            .begin_routed_target_partition(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                step.batch_size,
-                step.sequence_length,
-                offset,
-                tensor_group,
-                stream,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?;
         let assignment = self.expert_assignment.clone();
         if let Some(assignment) = assignment.as_ref() {
             validate_pipeline_expert_dispatch(
@@ -8553,18 +8063,8 @@ impl QwenConditionalPipelinePartition {
         };
         self.routing_statistics = RoutingStatistics::default();
         let expert_cache = self.expert_storage.cache();
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| {
-                Error::Parallel("conditional Qwen partition has no state layout".into())
-            })?
-            .layout()
-            .clone();
         let decoder_range = self.range();
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("conditional Qwen external experts have no assignment".into())
             })?;
@@ -8598,75 +8098,37 @@ impl QwenConditionalPipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
-                &mut self.layers,
-                self.dense_layers.as_ref(),
-                step,
-                caches,
-                &state_layout,
-                &mut forward,
-                pass,
-                &mut provider,
-                tensor_group,
-                stream,
-            )?
-        } else {
-            execute_neutral_routed_partition_group(
-                &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
+                pass,
+                &mut provider,
+                stream,
+            )
+        } else {
+            execute_routed_layered_partition(
+                &mut self.architecture,
+                &self.partition,
+                decoder_range,
+                &mut self.layers,
+                self.dense_layers.as_ref(),
+                input,
+                step,
+                explicit_mask,
+                caches,
+                execution,
                 pass,
                 &mut eredu_runtime::ResidentExpertProvider,
-                tensor_group,
                 stream,
-            )?
-        };
-        forward.hidden = crate::MlxTensor::from_array(hidden.clone());
-        if self.partition.ownership().owns_output() {
-            let mtp_hidden = hidden.clone();
-            let logits = if let Some(execution) =
-                execution.filter(|execution| execution.is_tensor_parallel())
-            {
-                self.architecture
-                    .finish_partition_target_parallel(
-                        crate::composition::tensor_ref(&hidden),
-                        execution.group().ok_or_else(|| {
-                            Error::Parallel("conditional Qwen3.5 TP group is missing".into())
-                        })?,
-                        stream,
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-            } else {
-                self.architecture
-                    .finish_partition_target(crate::composition::tensor_ref(&hidden), stream)
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-            };
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: logits.into_array(),
-                hidden: mtp_hidden,
-            })
-        } else {
-            let (hidden, boundary) = eredu_architectures::qwen::hybrid::ConditionalPipelinePrepared::from_layered_forward(forward);
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden: hidden.into_array(),
-                auxiliary: PipelineAuxiliaryState::new(
-                    boundary_schema
-                        .encode(boundary)
-                        .map_err(|error| Error::Parallel(error.to_string()))?
-                        .into_iter()
-                        .map(crate::MlxTensor::into_array)
-                        .collect(),
-                ),
-            }))
+            )
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -10692,6 +10154,7 @@ impl PipelineModel {
                     .iter()
                     .any(|dependency| active[*dependency]),
                 ExecutionGroupKind::ModalityFinalization | ExecutionGroupKind::Decoder => true,
+                ExecutionGroupKind::Prediction => false,
             };
         }
 
@@ -10755,15 +10218,7 @@ impl PipelineModel {
                     continue;
                 }
                 if placed.first_owner() == Some(self.info.pipeline_stage) {
-                    let dependencies = payloads.ordered_dependencies(
-                        &placement,
-                        index,
-                        &active,
-                        &self.info,
-                        step,
-                        &boundary_schema,
-                        &auxiliary_specs,
-                    )?;
+                    let dependencies = payloads.ordered_dependencies(&placement, index, &active)?;
                     let arrays = dependencies
                         .into_iter()
                         .flat_map(|payload| payload.arrays)
@@ -10829,12 +10284,31 @@ impl PipelineModel {
                         }
                         ExecutionGroupKind::Decoder => {
                             let arrays = working.remove(&index).unwrap_or_default();
-                            decoder_payload = Some(PipelinePayload::from_arrays(arrays.clone())?);
+                            if arrays.is_empty() && !placed.dependencies.is_empty() {
+                                return Err(Error::Parallel(format!(
+                                    "placed decoder group {:?} on PP rank {} received no values from dependencies {:?}",
+                                    placed.id, self.info.pipeline_stage, placed.dependencies
+                                )));
+                            }
+                            self.stage.merge_placed_ingress_arrays(arrays)?;
+                            let payload =
+                                self.stage.finish_placed_ingress(tensor, execution_stream)?;
+                            let arrays = payload.clone().into_arrays();
+                            validate_pipeline_payload_arrays(
+                                &self.info,
+                                &arrays,
+                                step,
+                                boundary_schema.identity(),
+                                &auxiliary_specs,
+                                &format!("placed decoder payload for {:?}", placed.id),
+                            )?;
+                            decoder_payload = Some(payload);
                             arrays
                         }
                         ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => {
                             working.remove(&index).unwrap_or_default()
                         }
+                        ExecutionGroupKind::Prediction => Vec::new(),
                     };
                     let completion = DistributedCompletion::submit((), arrays.iter())?;
                     submissions.insert(index, (arrays.clone(), completion));
@@ -10948,15 +10422,7 @@ impl PipelineModel {
                             producer: index,
                             arrays,
                         };
-                        payload.validate_for(
-                            &placement,
-                            index,
-                            active[index],
-                            &self.info,
-                            step,
-                            &boundary_schema,
-                            &auxiliary_specs,
-                        )?;
+                        payload.validate_for(&placement, index, active[index])?;
                         payloads.insert(consumer, payload)?;
                         if active[index] && !schedule.routed_transfers.contains(route) {
                             schedule.routed_transfers.push(route.clone());
@@ -11898,6 +11364,7 @@ where
         };
         let kind = match transport.kind {
             eredu_runtime::ArchitectureGroupKind::Decoder => ExecutionGroupKind::Decoder,
+            eredu_runtime::ArchitectureGroupKind::Prediction => ExecutionGroupKind::Prediction,
             eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
                 ExecutionGroupKind::VisionEncoder
             }
@@ -15785,35 +15252,6 @@ impl MuseGlimmerPipelinePartition {
             &self.architecture.args().attention_schedule,
             caches,
         )?;
-        let (partition_input, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                eredu_architectures::muse_glimmer::TextPartitionInput::Tokens(
-                    crate::composition::tensor_ref(tokens),
-                ),
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => (
-                eredu_architectures::muse_glimmer::TextPartitionInput::Hidden(
-                    crate::MlxTensor::from_array(payload.hidden.clone()),
-                ),
-                payload.auxiliary.clone(),
-            ),
-        };
-        let offset = pipeline_kv_offset(caches);
-        let tensor_group = execution
-            .filter(|value| value.is_tensor_parallel())
-            .and_then(ParallelExecutionContext::group);
-        let mut forward = self
-            .architecture
-            .begin_routed_text_partition(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                step.sequence_length,
-                offset,
-                tensor_group,
-                stream,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let args = self.architecture.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
@@ -15834,16 +15272,8 @@ impl MuseGlimmerPipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("Muse-Glimmer partition has no state".into()))?
-            .layout()
-            .clone();
         let decoder_range = self.range();
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Muse-Glimmer external experts have no assignment".into())
             })?;
@@ -15865,63 +15295,38 @@ impl MuseGlimmerPipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
-                &mut self.layers,
-                self.dense_layers.as_ref(),
-                step,
-                caches,
-                &state_layout,
-                &mut forward,
-                pass,
-                &mut provider,
-                tensor_group,
-                stream,
-            )?
-        } else {
-            let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
-                &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
-        };
-        if self.partition.ownership().owns_output() {
-            let logits =
-                if let Some(execution) = execution.filter(|value| value.is_tensor_parallel()) {
-                    let group = execution.group().ok_or_else(|| {
-                        Error::Parallel("Muse-Glimmer TP group is missing".into())
-                    })?;
-                    self.architecture
-                        .finish_partition_text_parallel(
-                            crate::composition::tensor_ref(&hidden),
-                            group,
-                            execution.stream(),
-                        )
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-                } else {
-                    self.architecture
-                        .finish_partition_text(crate::composition::tensor_ref(&hidden), stream)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-                };
-            Ok(PipelineStageOutput::Logits(logits.into_array()))
+            )
         } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
+            let mut provider = eredu_runtime::ResidentExpertProvider;
+            execute_routed_layered_partition(
+                &mut self.architecture,
+                &self.partition,
+                decoder_range,
+                &mut self.layers,
+                self.dense_layers.as_ref(),
+                input,
+                step,
+                explicit_mask,
+                caches,
+                execution,
+                pass,
+                &mut provider,
+                stream,
+            )
         }
     }
 }
@@ -16066,43 +15471,6 @@ impl Gemma4PipelinePartition {
                 self.range().len()
             )));
         }
-        let state_layout = self.state_layout()?;
-        let mut state =
-            PipelineRangeState::new(state_layout.clone(), self.range().clone(), caches)?;
-        let mut forward = match input {
-            PipelineStageInput::Tokens(tokens) => {
-                self.prepare_tokens(tokens, execution, &mut state, stream)?
-            }
-            PipelineStageInput::Hidden(payload) => {
-                let per_layer = self
-                    .partition
-                    .auxiliary_boundary()
-                    .decode(
-                        payload
-                            .auxiliary
-                            .tensors()
-                            .iter()
-                            .cloned()
-                            .map(crate::MlxTensor::from_array)
-                            .collect(),
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-                    .per_layer_input;
-                self.architecture
-                    .resume_pipeline_text(
-                        crate::MlxTensor::from_array(payload.hidden.clone()),
-                        explicit_mask.cloned().map(crate::MlxTensor::from_array),
-                        per_layer,
-                        &mut state,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-            }
-        };
-        forward
-            .context
-            .set_pipeline_mask(explicit_mask.cloned().map(crate::MlxTensor::from_array));
-        drop(state);
-
         let assignment = self.expert_assignment.clone();
         if let Some(assignment) = assignment.as_ref() {
             validate_pipeline_expert_dispatch(
@@ -16121,9 +15489,7 @@ impl Gemma4PipelinePartition {
         let expert_args = self.args().text.clone();
         let decoder_range = self.range();
         let statistics = &mut self.routing_statistics;
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        forward.hidden = crate::MlxTensor::from_array(if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Gemma 4 external experts have no assignment".into())
             })?;
@@ -16145,79 +15511,38 @@ impl Gemma4PipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
-                &mut self.layers,
-                self.dense_layers.as_ref(),
-                step,
-                caches,
-                &state_layout,
-                &mut forward,
-                pass,
-                &mut provider,
-                execution.and_then(ParallelExecutionContext::group),
-                stream,
-            )?
-        } else {
-            let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
-                &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                execution.and_then(ParallelExecutionContext::group),
                 stream,
-            )?
-        });
-        if self.partition.ownership().owns_output() {
-            let logits = match execution.and_then(ParallelExecutionContext::group) {
-                Some(parallel) => {
-                    let mut state =
-                        PipelineRangeState::new(state_layout, self.range().clone(), caches)?;
-                    <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                        MlxNeuralBackend,
-                        PipelineRangeState<'_>,
-                    >>::finish_forward_parallel(
-                        &mut self.architecture,
-                        &forward.hidden,
-                        &mut state,
-                        &forward.context,
-                        parallel,
-                        stream,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-                }
-                None => self
-                    .architecture
-                    .project_pipeline_logits(&forward.hidden, stream)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-            };
-            Ok(PipelineStageOutput::Logits(logits.into_array()))
+            )
         } else {
-            let boundary = eredu_architectures::gemma4::TextBoundary::new(
-                forward.context.pipeline_per_layer_inputs().cloned(),
-            );
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden: forward.hidden.into_array(),
-                auxiliary: PipelineAuxiliaryState::new(
-                    self.partition
-                        .auxiliary_boundary()
-                        .encode(boundary)
-                        .map_err(|error| Error::Parallel(error.to_string()))?
-                        .into_iter()
-                        .map(crate::MlxTensor::into_array)
-                        .collect(),
-                ),
-            }))
+            let mut provider = eredu_runtime::ResidentExpertProvider;
+            execute_routed_layered_partition(
+                &mut self.architecture,
+                &self.partition,
+                decoder_range,
+                &mut self.layers,
+                self.dense_layers.as_ref(),
+                input,
+                step,
+                explicit_mask,
+                caches,
+                execution,
+                pass,
+                &mut provider,
+                stream,
+            )
         }
     }
 }
@@ -16323,25 +15648,6 @@ impl InklingPipelinePartition {
                 self.range().len()
             )));
         }
-        let (partition_input, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                eredu_architectures::inkling::TextPartitionInput::Tokens(
-                    crate::composition::tensor_ref(tokens),
-                ),
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => (
-                eredu_architectures::inkling::TextPartitionInput::Hidden(
-                    crate::MlxTensor::from_array(payload.hidden.clone()),
-                ),
-                payload.auxiliary.clone(),
-            ),
-        };
-        let tensor_group = execution.and_then(ParallelExecutionContext::group);
-        let mut forward = self
-            .architecture
-            .begin_routed_text_partition(partition_input, tensor_group, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let args = self.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
@@ -16358,16 +15664,8 @@ impl InklingPipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("Inkling partition has no state".into()))?
-            .layout()
-            .clone();
         let decoder_range = self.range();
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Inkling external experts have no assignment".into())
             })?;
@@ -16389,60 +15687,38 @@ impl InklingPipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
-                &mut self.layers,
-                self.dense_layers.as_ref(),
-                step,
-                caches,
-                &state_layout,
-                &mut forward,
-                pass,
-                &mut provider,
-                tensor_group,
-                stream,
-            )?
-        } else {
-            let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
-                &mut self.architecture,
-                decoder_group,
+                &self.partition,
                 decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                None,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
-        };
-        if self.partition.ownership().owns_output() {
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: match tensor_group {
-                    Some(parallel) => self.architecture.project_target_logits_parallel(
-                        crate::composition::tensor_ref(&hidden),
-                        parallel,
-                        stream,
-                    ),
-                    None => self
-                        .architecture
-                        .project_target_logits(crate::composition::tensor_ref(&hidden), stream),
-                }
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-                .into_array(),
-                hidden,
-            })
+            )
         } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
+            let mut provider = eredu_runtime::ResidentExpertProvider;
+            execute_routed_layered_partition(
+                &mut self.architecture,
+                &self.partition,
+                decoder_range,
+                &mut self.layers,
+                self.dense_layers.as_ref(),
+                input,
+                step,
+                None,
+                caches,
+                execution,
+                pass,
+                &mut provider,
+                stream,
+            )
         }
     }
 }
@@ -18453,86 +17729,6 @@ impl NemotronHPipelinePartition {
                 self.layers.len()
             )));
         }
-        let tensor_group = execution
-            .filter(|execution| execution.is_tensor_parallel())
-            .and_then(ParallelExecutionContext::group);
-        let owns_input = self.partition.ownership().owns_input();
-        let target_input = match input {
-            PipelineStageInput::Tokens(tokens) if owns_input => {
-                eredu_architectures::nemotron_h::TargetPartitionInput::Tokens(
-                    crate::composition::tensor_ref(tokens),
-                )
-            }
-            PipelineStageInput::Hidden(payload) if !owns_input => {
-                let boundary = self
-                    .partition
-                    .auxiliary_boundary()
-                    .decode(
-                        payload
-                            .auxiliary
-                            .tensors()
-                            .iter()
-                            .cloned()
-                            .map(crate::MlxTensor::from_array)
-                            .collect(),
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                eredu_architectures::nemotron_h::TargetPartitionInput::Hidden {
-                    hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
-                    boundary,
-                }
-            }
-            PipelineStageInput::Tokens(_) => {
-                return Err(Error::Parallel(
-                    "non-input Nemotron-H partition received token ids".into(),
-                ))
-            }
-            PipelineStageInput::Hidden(_) => {
-                return Err(Error::Parallel(
-                    "input Nemotron-H partition received upstream hidden state".into(),
-                ))
-            }
-        };
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("Nemotron-H partition has no state".into()))?
-            .layout()
-            .clone();
-        let (forward, boundary) = {
-            let mut state =
-                PipelineRangeState::new(state_layout.clone(), self.range().clone(), caches)?;
-            match tensor_group {
-                Some(group) => self.architecture.begin_partition_target_parallel(
-                    target_input,
-                    crate::composition::tensor_opt(explicit_mask),
-                    &mut state,
-                    &state_layout,
-                    self.range().start,
-                    group,
-                    stream,
-                ),
-                None => self.architecture.begin_partition_target(
-                    target_input,
-                    crate::composition::tensor_opt(explicit_mask),
-                    &mut state,
-                    &state_layout,
-                    self.range().start,
-                    stream,
-                ),
-            }
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let mut forward = forward;
-        let auxiliary = PipelineAuxiliaryState::new(
-            self.partition
-                .auxiliary_boundary()
-                .encode(boundary)
-                .map_err(|error| Error::Parallel(error.to_string()))?
-                .into_iter()
-                .map(crate::MlxTensor::into_array)
-                .collect(),
-        );
         let assignment = self.expert_assignment.clone();
         if let Some(assignment) = assignment.as_ref() {
             validate_pipeline_expert_dispatch(
@@ -18550,9 +17746,7 @@ impl NemotronHPipelinePartition {
         let args = self.args().clone();
         let expert_cache = self.expert_storage.cache();
         let decoder_range = self.range();
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Nemotron-H external experts have no assignment".into())
             })?;
@@ -18574,21 +17768,21 @@ impl NemotronHPipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
+            )
         } else if let Some(assignment) = assignment.as_ref() {
             let expert_group = expert_group.ok_or_else(|| {
                 Error::Parallel("Nemotron-H expert assignment requires its EP communicator".into())
@@ -18613,61 +17807,38 @@ impl NemotronHPipelinePartition {
                     )
                 };
             let mut provider = ResidentExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
+            )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
-        };
-        if self.partition.ownership().owns_output() {
-            let mtp_hidden = hidden.clone();
-            let logits = match tensor_group {
-                Some(group) => self.architecture.finish_partition_target_parallel(
-                    crate::composition::tensor_ref(&hidden),
-                    group,
-                    stream,
-                ),
-                None => self
-                    .architecture
-                    .finish_partition_target(crate::composition::tensor_ref(&hidden), stream),
-            };
-            let logits = logits.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: logits.into_array(),
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
+            )
         }
     }
 
@@ -18783,34 +17954,6 @@ impl QwenHybridPipelinePartition {
                 self.layers.len()
             )));
         }
-        let tensor = execution.filter(|execution| execution.is_tensor_parallel());
-        let tensor_group = tensor.and_then(ParallelExecutionContext::group);
-        let (partition_input, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                eredu_architectures::qwen::hybrid::TargetPartitionInput::Tokens(
-                    crate::composition::tensor_ref(tokens),
-                ),
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => (
-                eredu_architectures::qwen::hybrid::TargetPartitionInput::Hidden(
-                    crate::MlxTensor::from_array(payload.hidden.clone()),
-                ),
-                payload.auxiliary.clone(),
-            ),
-        };
-        let offset = pipeline_state_offset("Qwen hybrid", caches)?;
-        let mut forward = self
-            .architecture
-            .begin_routed_target_partition(
-                partition_input,
-                crate::composition::tensor_opt(explicit_mask),
-                step.sequence_length,
-                offset,
-                tensor_group,
-                stream,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?;
         if let Some(assignment) = self.expert_assignment.as_ref() {
             validate_pipeline_expert_dispatch(
                 assignment,
@@ -18827,16 +17970,8 @@ impl QwenHybridPipelinePartition {
         let global_args = self.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
-        let state_layout = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("Qwen hybrid partition has no state".into()))?
-            .layout()
-            .clone();
         let decoder_range = self.range();
-        let decoder_group =
-            architecture_decoder_group::<_, PipelineRangeState<'_>>(&self.architecture)?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Qwen hybrid external experts have no assignment".into())
             })?;
@@ -18858,66 +17993,38 @@ impl QwenHybridPipelinePartition {
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
             let mut provider = ExpertExecutorProvider::new(&mut execute);
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
+            )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_neutral_routed_partition_group(
+            execute_routed_layered_partition(
                 &mut self.architecture,
-                decoder_group,
-                decoder_range.clone(),
+                &self.partition,
+                decoder_range,
                 &mut self.layers,
                 self.dense_layers.as_ref(),
+                input,
                 step,
+                explicit_mask,
                 caches,
-                &state_layout,
-                &mut forward,
+                execution,
                 pass,
                 &mut provider,
-                tensor_group,
                 stream,
-            )?
-        };
-        if self.partition.ownership().owns_output() {
-            let mtp_hidden = hidden.clone();
-            let logits = match tensor {
-                Some(execution) => self
-                    .architecture
-                    .finish_partition_target_parallel(
-                        crate::composition::tensor_ref(&hidden),
-                        execution.group().ok_or_else(|| {
-                            Error::Parallel("Qwen hybrid TP group is missing".into())
-                        })?,
-                        stream,
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None => self
-                    .architecture
-                    .finish_partition_target(crate::composition::tensor_ref(&hidden), stream)
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-            };
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: logits.into_array(),
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
+            )
         }
     }
 

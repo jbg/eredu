@@ -21,6 +21,8 @@ use eredu_runtime::{
 pub enum ExecutionGroupKind {
     /// Ordered text decoder blocks.
     Decoder,
+    /// Output-owner embedded prediction blocks.
+    Prediction,
     /// Ordered visual encoder blocks.
     VisionEncoder,
     /// Ordered audio encoder blocks.

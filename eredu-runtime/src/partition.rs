@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
 use crate::{
     ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, LayeredForwardState,
-    LayeredPartitionInput, ParameterGroupSpec, PartitionedLayeredArchitecture, RuntimeState,
-    StateLayout,
+    LayeredPartitionInput, LayeredPartitionOutput, ParameterGroupSpec,
+    PartitionedLayeredArchitecture, RuntimeState, StateLayout,
 };
 
 /// Architecture-owned location of one neutral parameter group.
@@ -1075,13 +1075,14 @@ impl LayeredPartitionDriver {
     /// Validates a canonical partition against its concrete unit storage.
     pub fn new<G, A>(
         partition: &ArchitecturePartition<G, A>,
+        group_index: usize,
         storage_range: Range<usize>,
     ) -> Result<Self, LayeredPartitionError> {
-        let [group] = partition.groups() else {
-            return Err(LayeredPartitionError::GroupCount {
-                actual: partition.groups().len(),
-            });
-        };
+        let group = partition
+            .groups()
+            .iter()
+            .find(|group| group.group_index() == group_index)
+            .ok_or(LayeredPartitionError::GroupNotOwned { group: group_index })?;
         let range = group.global_units();
         if storage_range != range {
             return Err(LayeredPartitionError::StorageRange {
@@ -1092,7 +1093,7 @@ impl LayeredPartitionDriver {
         let state = partition
             .state()
             .ok_or(LayeredPartitionError::MissingState)?;
-        if state.global_layers() != range {
+        if state.global_layers().start > range.start || state.global_layers().end < range.end {
             return Err(LayeredPartitionError::StateRange {
                 state: state.global_layers(),
                 partition: range,
@@ -1123,18 +1124,15 @@ impl LayeredPartitionDriver {
     }
 
     /// Validates input form against architecture boundary ownership.
-    pub fn input<'a, T>(
+    pub fn input<'a, T, A>(
         &self,
-        input: LayeredPartitionInput<'a, T>,
-    ) -> Result<LayeredPartitionInput<'a, T>, LayeredPartitionError> {
+        input: LayeredPartitionInput<'a, T, A>,
+    ) -> Result<LayeredPartitionInput<'a, T, A>, LayeredPartitionError> {
         match (&input, self.owns_input) {
             (LayeredPartitionInput::Tokens(_), true)
-            | (LayeredPartitionInput::Hidden(_), false) => Ok(input),
+            | (LayeredPartitionInput::Hidden { .. }, _) => Ok(input),
             (LayeredPartitionInput::Tokens(_), false) => {
                 Err(LayeredPartitionError::TokensOnNonInputOwner)
-            }
-            (LayeredPartitionInput::Hidden(_), true) => {
-                Err(LayeredPartitionError::HiddenOnInputOwner)
             }
         }
     }
@@ -1144,7 +1142,11 @@ impl LayeredPartitionDriver {
     pub fn begin<'a, B, S, M>(
         &self,
         architecture: &mut M,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
         mask: Option<&B::Tensor>,
         state: &mut S,
         parallel: Option<&B::ParallelContext>,
@@ -1174,25 +1176,14 @@ impl LayeredPartitionDriver {
                 context,
             ),
         }?;
-        forward.hidden = match parallel {
-            Some(parallel) => architecture.begin_execution_group_parallel(
-                self.group,
-                &forward.hidden,
-                &[],
-                state,
-                &mut forward.context,
-                parallel,
-                context,
-            ),
-            None => architecture.begin_execution_group(
-                self.group,
-                &forward.hidden,
-                &[],
-                state,
-                &mut forward.context,
-                context,
-            ),
-        }?;
+        forward.hidden = architecture.enter_partition_group(
+            self.group,
+            &forward.hidden,
+            state,
+            &mut forward.context,
+            parallel,
+            context,
+        )?;
         Ok(forward)
     }
 
@@ -1206,51 +1197,32 @@ impl LayeredPartitionDriver {
         forward: &mut M::ForwardContext,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<LayeredPartitionOutput<B::Tensor>, M::Error>
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        M::Error,
+    >
     where
         B: eredu_nn::NeuralBackend,
         S: RuntimeState<B>,
         M: PartitionedLayeredArchitecture<B, S>,
     {
-        let hidden = match parallel {
-            Some(parallel) => architecture.complete_execution_group_parallel(
-                self.group, hidden, state, forward, parallel, context,
-            ),
-            None => {
-                architecture.complete_execution_group(self.group, hidden, state, forward, context)
-            }
-        }?;
-        if self.owns_output {
-            let output = match parallel {
-                Some(parallel) => {
-                    architecture.finish_forward_parallel(&hidden, state, forward, parallel, context)
-                }
-                None => architecture.finish_forward(&hidden, state, forward, context),
-            }?;
-            Ok(LayeredPartitionOutput::Output(output))
-        } else {
-            Ok(LayeredPartitionOutput::Hidden(hidden))
-        }
+        let hidden = architecture
+            .leave_partition_group(self.group, hidden, state, forward, parallel, context)?;
+        architecture.finish_partition(&hidden, state, forward, self.owns_output, parallel, context)
     }
-}
-
-/// Output of one rank-local partition lifecycle.
-#[derive(Debug, Clone)]
-pub enum LayeredPartitionOutput<T> {
-    /// Complete architecture output produced by the output owner.
-    Output(T),
-    /// Hidden state to transport to the next pipeline owner.
-    Hidden(T),
 }
 
 /// Invalid concrete realization or boundary use of a layered partition.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum LayeredPartitionError {
-    /// Partition execution currently requires exactly one owned group.
-    #[error("layered partition owns {actual} execution groups, expected exactly one")]
-    GroupCount {
-        /// Number of groups owned by the partition.
-        actual: usize,
+    /// The selected architecture execution group is not owned by this partition.
+    #[error("layered partition does not own execution group {group}")]
+    GroupNotOwned {
+        /// Canonical architecture group index.
+        group: usize,
     },
     /// Concrete unit storage does not match canonical ownership.
     #[error("partition storage range {storage:?} disagrees with canonical range {partition:?}")]
@@ -1274,9 +1246,6 @@ pub enum LayeredPartitionError {
     /// Token ids were supplied after the architecture input boundary.
     #[error("non-input partition received token ids")]
     TokensOnNonInputOwner,
-    /// Hidden state was supplied to the architecture input boundary.
-    #[error("input-owning partition received upstream hidden state")]
-    HiddenOnInputOwner,
 }
 
 fn canonical_architecture_layout<B, S, M>(
@@ -2019,9 +1988,9 @@ mod tests {
     #[test]
     fn layered_driver_rejects_storage_and_state_range_drift() {
         let partition = layered_partition(1..3, true);
-        assert!(LayeredPartitionDriver::new(&partition, 1..3).is_ok());
+        assert!(LayeredPartitionDriver::new(&partition, 0, 1..3).is_ok());
         assert_eq!(
-            LayeredPartitionDriver::new(&partition, 0..2).unwrap_err(),
+            LayeredPartitionDriver::new(&partition, 0, 0..2).unwrap_err(),
             LayeredPartitionError::StorageRange {
                 storage: 0..2,
                 partition: 1..3,
@@ -2030,7 +1999,7 @@ mod tests {
 
         let partition = layered_partition(0..2, true);
         assert_eq!(
-            LayeredPartitionDriver::new(&partition, 1..3).unwrap_err(),
+            LayeredPartitionDriver::new(&partition, 0, 1..3).unwrap_err(),
             LayeredPartitionError::StateRange {
                 state: 0..2,
                 partition: 1..3,
@@ -2039,31 +2008,45 @@ mod tests {
     }
 
     #[test]
-    fn layered_driver_enforces_partition_boundary_ownership() {
+    fn layered_driver_restricts_tokens_but_accepts_architecture_prepared_hidden() {
         let input_owner =
-            LayeredPartitionDriver::new(&layered_partition(1..3, true), 1..3).unwrap();
+            LayeredPartitionDriver::new(&layered_partition(1..3, true), 0, 1..3).unwrap();
         assert!(matches!(
-            input_owner.input(LayeredPartitionInput::Tokens(&7)),
+            input_owner.input(LayeredPartitionInput::<i32, NoAuxiliaryBoundary>::Tokens(
+                &7
+            )),
             Ok(LayeredPartitionInput::Tokens(7))
         ));
-        assert_eq!(
-            input_owner
-                .input(LayeredPartitionInput::Hidden(7))
-                .unwrap_err(),
-            LayeredPartitionError::HiddenOnInputOwner
-        );
+        assert!(matches!(
+            input_owner.input(LayeredPartitionInput::Hidden {
+                hidden: 7,
+                auxiliary: NoAuxiliaryBoundary,
+            }),
+            Ok(LayeredPartitionInput::Hidden {
+                hidden: 7,
+                auxiliary: NoAuxiliaryBoundary,
+            })
+        ));
 
         let hidden_owner =
-            LayeredPartitionDriver::new(&layered_partition(1..3, false), 1..3).unwrap();
+            LayeredPartitionDriver::new(&layered_partition(1..3, false), 0, 1..3).unwrap();
         assert_eq!(
             hidden_owner
-                .input(LayeredPartitionInput::Tokens(&7))
+                .input(LayeredPartitionInput::<i32, NoAuxiliaryBoundary>::Tokens(
+                    &7
+                ))
                 .unwrap_err(),
             LayeredPartitionError::TokensOnNonInputOwner
         );
         assert!(matches!(
-            hidden_owner.input(LayeredPartitionInput::Hidden(7)),
-            Ok(LayeredPartitionInput::Hidden(7))
+            hidden_owner.input(LayeredPartitionInput::Hidden {
+                hidden: 7,
+                auxiliary: NoAuxiliaryBoundary,
+            }),
+            Ok(LayeredPartitionInput::Hidden {
+                hidden: 7,
+                auxiliary: NoAuxiliaryBoundary,
+            })
         ));
     }
 }

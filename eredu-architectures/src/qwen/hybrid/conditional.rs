@@ -7,8 +7,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, PartitionedLayeredArchitecture,
     ResidentExpertProvider, RoutedExpertProvider, RoutedLayeredArchitecture,
     RuntimeStateComponents, StateLayout,
 };
@@ -381,6 +382,58 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
 }
 
 impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
+    #[allow(clippy::too_many_arguments)]
+    fn begin_distributed_partition<S>(
+        &mut self,
+        input: LayeredPartitionInput<'_, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "conditional Qwen partition state layout mismatch",
+            ));
+        }
+        let (input, batch, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => (
+                ConditionalPartitionInput::Tokens {
+                    tokens,
+                    offset: state
+                        .layer(first_state_ordinal)
+                        .map_err(Error::backend)?
+                        .position(),
+                },
+                tokens.dim(0),
+                tokens.dim(1),
+            ),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
+                let batch = hidden.dim(0);
+                let sequence = hidden.dim(1);
+                (
+                    ConditionalPartitionInput::Hidden {
+                        hidden,
+                        boundary: auxiliary,
+                    },
+                    batch,
+                    sequence,
+                )
+            }
+        };
+        let offset = state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .position();
+        self.begin_routed_target_partition(input, mask, batch, sequence, offset, parallel, context)
+    }
+
     /// Prepares one routed target decoder partition with architecture-owned
     /// shape validation and causal-mask construction.
     #[allow(clippy::too_many_arguments)]
@@ -1977,6 +2030,101 @@ where
                 parallel,
                 context,
             ),
+        }
+    }
+}
+
+impl<B, S> PartitionedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    type Boundary = ConditionalPipelineBoundarySchema;
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_distributed_partition(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            None,
+            context,
+        )
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_distributed_partition(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            Some(parallel),
+            context,
+        )
+    }
+
+    fn enter_partition_group(
+        &mut self,
+        _group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(initial.clone())
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        LayeredPartitionOutput<B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
+        Self::Error,
+    > {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish_forward(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: Some(hidden.clone()),
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: ConditionalPipelineBoundary {
+                    deepstack: forward.deepstack.clone(),
+                },
+            })
         }
     }
 }
