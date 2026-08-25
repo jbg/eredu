@@ -497,8 +497,8 @@ ordered forced-frame plan. A concrete backend only slices and materializes
 native arrays from that plan and enqueues the resulting frames; it does not
 redeclare PersonaPlex application policy. Realtime model identity is likewise
 architecture-owned: backend models return the Moshi architecture's
-`EffectiveModelType` directly, and backend adapters may re-export that type but
-must not wrap it in a backend-specific family enum.
+`EffectiveModelType` directly. Backend adapters must not re-export or wrap that
+type; direct consumers import it from `eredu_architectures::moshi`.
 
 Realtime artifact loading also crosses the backend boundary as a neutral
 architecture preparation. Moshi inspection parses optional native defaults or

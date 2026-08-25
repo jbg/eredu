@@ -1,4 +1,4 @@
-//! SafeMLX realization of backend-neutral token-sampling primitives.
+//! MLX realization of backend-neutral token-sampling primitives.
 
 use std::collections::HashMap;
 
@@ -15,7 +15,7 @@ use crate::backend::nn::tensor::validate_token_domain;
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
 
-/// SafeMLX token-sampling capability implementation.
+/// MLX token-sampling capability implementation.
 #[derive(Debug, Clone, Copy)]
 pub struct MlxSamplingBackend;
 

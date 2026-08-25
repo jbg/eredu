@@ -1,7 +1,5 @@
 //! Curated application-facing MLX adapter API.
 
-pub use eredu_architectures::moshi::EffectiveModelType;
-
 pub use crate::backend::error::Error as MlxError;
 pub use crate::backend::runtime::checkpoint::quantization::{
     quantize_checkpoint, CheckpointQuantizationOptions, CheckpointQuantizationReport,

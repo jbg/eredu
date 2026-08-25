@@ -307,7 +307,7 @@ pub fn neutral_parameter_states<M: Parameterized<MlxTensor>>(module: &M) -> Vec<
     collector.states
 }
 
-/// SafeMLX module view over any backend-neutral parameterized value.
+/// MLX module view over any backend-neutral parameterized value.
 ///
 /// Architecture types retain their neutral parameter identities while MLX
 /// loading utilities traverse the same native slots without rebuilding a
@@ -381,10 +381,11 @@ impl<M: Parameterized<MlxTensor>> ModuleParameters for MlxModule<M> {
     }
 }
 
-/// Borrowed SafeMLX parameter view over a backend-neutral module.
+/// Borrowed MLX parameter view over a backend-neutral module.
 ///
 /// This lets residency/loading policy populate one architecture-owned static
-/// component without cloning it or giving the architecture a SafeMLX trait.
+/// component without cloning it or giving the architecture a backend-native
+/// trait.
 pub struct MlxModuleRef<'a, M> {
     inner: &'a mut M,
 }

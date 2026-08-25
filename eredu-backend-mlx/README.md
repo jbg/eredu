@@ -57,7 +57,7 @@ execution, distributed, and model-composition support.
 | `image` | Image/video decoding primitives; implies `media` |
 | `audio` | Audio preprocessing; implies `media` |
 | `codec` | MLX Mimi integration and codec examples; implies `audio` |
-| `cuda` | SafeMLX CUDA execution |
+| `cuda` | CUDA execution for native MLX operations |
 | `nccl` | NCCL collectives; implies `cuda` |
 
 The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and

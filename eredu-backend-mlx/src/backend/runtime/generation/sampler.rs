@@ -1,4 +1,4 @@
-//! Backend-neutral sampling policies specialized to SafeMLX primitives.
+//! Backend-neutral sampling policies specialized to MLX primitives.
 
 use eredu_runtime::{
     Sampler as RuntimeSampler, SamplingBackend, SpeculativeSampler as RuntimeSpeculativeSampler,
@@ -9,7 +9,7 @@ pub use super::backend::MlxSamplingBackend;
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
 
-/// SafeMLX-specialized token selection policy.
+/// MLX-specialized token selection policy.
 pub trait Sampler {
     /// Whether loaded checkpoint defaults should wrap this policy.
     fn uses_checkpoint_defaults(&self) -> bool {
@@ -52,7 +52,7 @@ where
     }
 }
 
-/// SafeMLX-specialized lossless speculative sampling policy.
+/// MLX-specialized lossless speculative sampling policy.
 pub trait SpeculativeSampler {
     /// Whether loaded checkpoint defaults should wrap this policy.
     fn uses_checkpoint_defaults(&self) -> bool {

@@ -1,4 +1,4 @@
-//! SafeMLX realization of the backend-neutral layerwise unit policy.
+//! MLX realization of the backend-neutral layerwise unit policy.
 
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{
