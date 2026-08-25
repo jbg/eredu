@@ -138,6 +138,22 @@ pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
     ]))
 }
 
+/// Returns rank-local recipes for one flat Qwen3-VL text execution unit.
+pub fn rank_local_unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+    flat: usize,
+    expert_ids: &[usize],
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let vision_layers = args.vision.layer_count();
+    if flat < vision_layers {
+        return Err(format!(
+            "Qwen3-VL unit {flat} is a vision unit and has no expert bank"
+        ));
+    }
+    qwen::rank_local_expert_recipes(catalog, &args.text, flat - vision_layers, expert_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -305,5 +321,13 @@ mod tests {
         let decoder = unit_recipes(&catalog, &args, 1).unwrap();
         assert!(decoder.contains_key(&format!("{root}.gate_up_proj")));
         assert!(decoder.contains_key(&format!("{root}.down_proj")));
+        let local = rank_local_unit_recipes(&catalog, &args, 1, &[3, 1]).unwrap();
+        assert_eq!(
+            local[&format!("{root}.gate_up_proj")]
+                .infer(&catalog)
+                .unwrap()
+                .shape(),
+            &[2, 32, 32]
+        );
     }
 }

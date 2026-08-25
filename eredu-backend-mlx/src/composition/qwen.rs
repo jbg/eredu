@@ -28,7 +28,8 @@ use crate::{
     backend::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::runtime::cache::state::MlxKeyValueState,
     backend::runtime::checkpoint::binding::{
-        binding_bytes, build_module_binding_plan_with_recipes_excluding, build_module_bindings,
+        apply_rank_local_parameter_recipes, binding_bytes,
+        build_module_binding_plan_with_recipes_excluding, build_module_bindings,
         build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
         parameter_role_targets, populate_module_from_lease_excluding,
     },
@@ -1524,10 +1525,9 @@ impl QwenPipelineBindings {
         } else {
             qwen_unit_recipes(store, architecture.args(), index)?
         };
-        // Checkpoint recipes describe the global bank. Build their initial
-        // bindings against global geometry, then apply EP selection and TP
-        // sharding before the result is populated into the local block.
-        let mut bindings = build_module_binding_plan_with_recipes_excluding(
+        // Build against canonical bank recipes first. Architecture-produced
+        // rank-local recipes then lower EP identity before generic TP sharding.
+        let bindings = build_module_binding_plan_with_recipes_excluding(
             global_layer,
             "",
             store,
@@ -1535,28 +1535,20 @@ impl QwenPipelineBindings {
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?
         .build_bindings(store)?;
-        if let Some(assignment) = assignment {
-            let indices = assignment.local_global_expert_ids().to_vec();
-            bindings = bindings
-                .into_iter()
-                .map(|binding| {
-                    let target = binding.logical_target().unwrap_or_else(|| binding.name());
-                    if parameter_name_in_targets(target, &expert_targets) {
-                        binding
-                            .select_bounded_output(
-                                store,
-                                eredu_checkpoint::store::TensorSelection::Indices {
-                                    axis: 0,
-                                    indices: indices.clone(),
-                                },
-                            )
-                            .map_err(Error::from)
-                    } else {
-                        Ok(binding)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
+        let bindings = match assignment {
+            Some(assignment) if !self.external_experts => apply_rank_local_parameter_recipes(
+                bindings,
+                store,
+                eredu_architectures::qwen::rank_local_expert_recipes(
+                    store,
+                    architecture.args(),
+                    index,
+                    assignment.local_global_expert_ids(),
+                )
+                .map_err(Error::ArchitectureModel)?,
+            )?,
+            _ => bindings,
+        };
         match layout {
             Some(layout) => shard_layer_bindings(
                 bindings,

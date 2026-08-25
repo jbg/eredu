@@ -1,12 +1,14 @@
 //! Pure checkpoint schemas, name translation, and expert normalization for GPT-OSS.
 
+use std::collections::BTreeMap;
+
 use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
     expert::{
         canonical_gated_expert_projection_family_recipes, ExpertProjectionFamilyNames,
         GatedExpertProjectionFamilyNames, GatedExpertProjectionFamilyRecipes,
     },
-    recipe::RecipeCatalog,
+    recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::{
         matrix_for_linear_format, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
         GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
@@ -377,6 +379,22 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     let root = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     canonical_gated_expert_projection_family_recipes(catalog, &expert_names(&root))
         .map_err(|error| error.to_string())
+}
+
+/// Returns architecture-owned recipes for one rank-local GPT-OSS expert bank.
+pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+    layer: usize,
+    expert_ids: &[usize],
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let experts = dimension(args.num_local_experts, "expert count")?;
+    let outputs = expert_recipes(catalog, args, layer)?
+        .into_outputs()
+        .into_outputs();
+    crate::expert_residency::select_rank_local_expert_recipes(
+        catalog, experts, 0, expert_ids, outputs,
+    )
 }
 
 /// Builds the complete architecture-owned schedule for independently resident experts.
@@ -905,6 +923,14 @@ mod tests {
             residency.units()[1].identity(),
             eredu_runtime::ExpertIdentity::new(0, 1)
         );
+
+        let local = rank_local_expert_recipes(&catalog, &args(), 0, &[1]).unwrap();
+        assert_eq!(local.len(), 6);
+        assert!(local.values().all(|recipe| {
+            recipe
+                .infer(&catalog)
+                .is_ok_and(|metadata| metadata.shape[0] == 1)
+        }));
     }
 
     #[test]

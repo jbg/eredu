@@ -7,7 +7,7 @@ use std::{
 };
 
 use eredu_architectures::gpt_oss::ModelArgs;
-use eredu_checkpoint::{store::CheckpointSource, store::TensorSelection, WeightQuantization};
+use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_nn::{
     ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
 };
@@ -29,10 +29,10 @@ use crate::backend::{
         },
         checkpoint::{
             binding::{
-                binding_bytes, build_module_binding_plan_with_recipes_excluding,
-                build_module_bindings, build_module_bindings_with_recipes_excluding,
-                parameter_name_in_targets, parameter_role_targets,
-                populate_module_from_lease_excluding,
+                apply_rank_local_parameter_recipes, binding_bytes,
+                build_module_binding_plan_with_recipes_excluding, build_module_bindings,
+                build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+                parameter_role_targets, populate_module_from_lease_excluding,
             },
             load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
@@ -730,7 +730,7 @@ impl GptOssPipelineBindings {
         } else {
             unit_recipes(store, architecture.args(), index)?
         };
-        let mut bindings = build_module_binding_plan_with_recipes_excluding(
+        let bindings = build_module_binding_plan_with_recipes_excluding(
             global_layer,
             "",
             store,
@@ -738,28 +738,20 @@ impl GptOssPipelineBindings {
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?
         .build_bindings(store)?;
-        if let Some(assignment) = assignment {
-            let indices = assignment.local_global_expert_ids().to_vec();
-            bindings = bindings
-                .into_iter()
-                .map(|binding| {
-                    let target = binding.logical_target().unwrap_or_else(|| binding.name());
-                    if parameter_name_in_targets(target, &expert_targets) {
-                        binding
-                            .select_bounded_output(
-                                store,
-                                TensorSelection::Indices {
-                                    axis: 0,
-                                    indices: indices.clone(),
-                                },
-                            )
-                            .map_err(Error::from)
-                    } else {
-                        Ok(binding)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
+        let bindings = match assignment {
+            Some(assignment) if !self.external_experts => apply_rank_local_parameter_recipes(
+                bindings,
+                store,
+                eredu_architectures::gpt_oss::rank_local_expert_recipes(
+                    store,
+                    architecture.args(),
+                    index,
+                    assignment.local_global_expert_ids(),
+                )
+                .map_err(Error::ArchitectureModel)?,
+            )?,
+            _ => bindings,
+        };
         match layout {
             Some(layout) => shard_layer_bindings(
                 bindings,

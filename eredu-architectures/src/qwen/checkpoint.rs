@@ -268,6 +268,47 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
 }
 
+/// Returns architecture-owned recipes for one rank-local Qwen expert bank.
+///
+/// Expert identity is resolved through canonical per-expert recipes and then
+/// assembled in rank order, preserving packed companions and adapting to
+/// packed, split, or independently stored sources.
+pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+    layer: usize,
+    expert_ids: &[usize],
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    if expert_ids.is_empty() {
+        return Err("rank-local Qwen expert recipes require at least one expert".into());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    let mut grouped = BTreeMap::<String, Vec<DerivedWeightRecipe>>::new();
+    for &expert in expert_ids {
+        if !unique.insert(expert) {
+            return Err(format!(
+                "rank-local Qwen expert recipe contains duplicate expert {expert}"
+            ));
+        }
+        for (binding, recipe) in expert_unit_recipes(catalog, args, layer, expert)? {
+            grouped.entry(binding).or_default().push(recipe);
+        }
+    }
+    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+    grouped
+        .into_iter()
+        .map(|(binding, mut inputs)| {
+            let recipe = if inputs.len() == 1 {
+                inputs.pop().expect("one rank-local expert recipe")
+            } else {
+                DerivedWeightRecipe::Concatenate { axis: 0, inputs }
+            };
+            recipe.infer(catalog).map_err(|error| error.to_string())?;
+            Ok((format!("{prefix}.{binding}"), recipe))
+        })
+        .collect()
+}
+
 fn recipe_source_key<C: RecipeCatalog + ?Sized>(catalog: &C, base: &str) -> Option<String> {
     if catalog.tensor_metadata(base).is_ok() {
         return Some(base.to_owned());
@@ -1170,6 +1211,24 @@ mod tests {
             unit["down_proj"].infer(&catalog).unwrap().shape(),
             &[1, 16, 8]
         );
+
+        let local = rank_local_expert_recipes(&catalog, &args, 0, &[3, 1]).unwrap();
+        assert_eq!(
+            local[&format!("{prefix}.gate_up_proj")]
+                .infer(&catalog)
+                .unwrap()
+                .shape(),
+            &[2, 16, 16]
+        );
+        assert_eq!(
+            local[&format!("{prefix}.gate_up_proj")].source_keys(),
+            [
+                "model.layers.0.mlp.experts.1.gate_proj.weight",
+                "model.layers.0.mlp.experts.1.up_proj.weight",
+                "model.layers.0.mlp.experts.3.gate_proj.weight",
+                "model.layers.0.mlp.experts.3.up_proj.weight",
+            ]
+        );
     }
 
     #[test]
@@ -1200,6 +1259,37 @@ mod tests {
             recipes["gate_up_proj"].infer(&catalog).unwrap().shape(),
             &[1, 16, 16]
         );
+    }
+
+    #[test]
+    fn rank_local_recipes_include_every_packed_companion() {
+        let args = args("qwen3_moe", false);
+        let prefix = "model.layers.0.mlp.experts";
+        let catalog = Catalog(
+            [
+                ("gate_up_proj", vec![4, 16, 16]),
+                ("gate_up_proj_scales", vec![4, 16, 1]),
+                ("gate_up_proj_biases", vec![4, 16]),
+                ("down_proj", vec![4, 16, 8]),
+                ("down_proj_scales", vec![4, 16, 1]),
+                ("down_proj_biases", vec![4, 16]),
+            ]
+            .into_iter()
+            .map(|(name, shape)| {
+                let name = format!("{prefix}.{name}");
+                (name.clone(), metadata(&name, shape))
+            })
+            .collect(),
+        );
+
+        let local = rank_local_expert_recipes(&catalog, &args, 0, &[3, 1]).unwrap();
+
+        assert_eq!(local.len(), 6);
+        assert!(local.values().all(|recipe| {
+            recipe
+                .infer(&catalog)
+                .is_ok_and(|metadata| metadata.shape[0] == 2)
+        }));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::{
 
 use eredu_architectures::qwen::{self, vl};
 use eredu_checkpoint::{
-    store::{CheckpointSource, CompositeCheckpointSource, TensorSelection},
+    store::{CheckpointSource, CompositeCheckpointSource},
     WeightQuantization,
 };
 use eredu_runtime::{
@@ -68,9 +68,9 @@ use crate::backend::{
             state::MlxHybridState,
         },
         checkpoint::binding::{
-            build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-            parameter_name_in_targets, parameter_role_targets,
-            populate_module_from_lease_excluding,
+            apply_rank_local_parameter_recipes, build_module_bindings_with_recipes,
+            build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+            parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::{
             load::gguf_quantization_configs,
@@ -386,7 +386,7 @@ impl QwenVlPipelineBindings {
                     )
                         .map_err(Error::ArchitectureModel)?
                 };
-                let mut bindings = build_module_bindings_with_recipes_excluding(
+                let bindings = build_module_bindings_with_recipes_excluding(
                     global_layer,
                     "",
                     store,
@@ -395,28 +395,22 @@ impl QwenVlPipelineBindings {
                         self.external_experts && parameter_name_in_targets(name, &expert_targets)
                     },
                 )?;
-                if let Some(assignment) = assignment {
-                    let indices = assignment.local_global_expert_ids().to_vec();
-                    bindings = bindings
-                        .into_iter()
-                        .map(|binding| {
-                            let target = binding.logical_target().unwrap_or_else(|| binding.name());
-                            if parameter_name_in_targets(target, &expert_targets) {
-                                binding
-                                    .select_bounded_output(
-                                        store,
-                                        TensorSelection::Indices {
-                                            axis: 0,
-                                            indices: indices.clone(),
-                                        },
-                                    )
-                                    .map_err(Error::from)
-                            } else {
-                                Ok(binding)
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                }
+                let bindings = match assignment {
+                    Some(assignment) if !self.external_experts => {
+                        apply_rank_local_parameter_recipes(
+                            bindings,
+                            store,
+                            vl::rank_local_unit_recipes(
+                                store,
+                                architecture.args(),
+                                unit_ordinal(architecture, group, index)?,
+                                assignment.local_global_expert_ids(),
+                            )
+                            .map_err(Error::ArchitectureModel)?,
+                        )?
+                    }
+                    _ => bindings,
+                };
                 match layout {
                     Some(layout) => {
                         crate::backend::runtime::execution::layerwise::shard_layer_bindings(

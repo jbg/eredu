@@ -244,6 +244,12 @@ families: each architecture checkpoint module emits its complete
 `ExpertResidencyCatalog`, including compact acquired-bank names and every
 per-expert or rank-local selection recipe. Backend family adapters may request
 and filter that catalog, but do not calculate a parallel expert topology.
+Resident rank-local expert banks follow the same rule: architecture checkpoint
+APIs select canonical parameter outputs for the assigned global expert IDs and
+push those selections through their derived recipes. Backend composition only
+matches the resulting recipes to exact logical targets before applying generic
+tensor-parallel placement; it does not choose an expert axis or reconstruct
+selection geometry from the physical checkpoint layout.
 Hybrid target/MTP families additionally declare the execution group, physical
 MTP unit, checkpoint root, and cache identity of every sparse unit in this
 catalog; backend adapters filter catalog units against the realized partition

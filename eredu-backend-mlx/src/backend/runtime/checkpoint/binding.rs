@@ -201,6 +201,39 @@ pub fn localize_module_bindings(
         .collect()
 }
 
+/// Replaces global binding sources with architecture-produced rank-local recipes.
+///
+/// Recipe keys are exact architecture-logical parameter targets. This lowering
+/// knows nothing about family expert axes or physical checkpoint layouts; those
+/// have already been expressed by the recipes.
+pub fn apply_rank_local_parameter_recipes(
+    bindings: Vec<WeightBinding>,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+    let bindings = bindings
+        .into_iter()
+        .map(|binding| {
+            let Some(target) = binding.logical_target() else {
+                return Ok(binding);
+            };
+            let Some(recipe) = recipes.remove(target) else {
+                return Ok(binding);
+            };
+            let bytes = recipe.infer(store)?.byte_len();
+            binding
+                .with_source_recipe(recipe, bytes)
+                .map_err(ModuleBindingError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !recipes.is_empty() {
+        return Err(ModuleBindingError::UnknownRecipeParameters {
+            parameters: recipes.into_keys().collect(),
+        });
+    }
+    Ok(bindings)
+}
+
 /// A declarative module binding plan plus fully qualified logical targets.
 pub struct ModuleBindingPlan {
     plan: BindingPlan,
@@ -954,6 +987,45 @@ pub enum ModuleBindingError {
     /// Residency binding or lookup failed.
     #[error(transparent)]
     Residency(#[from] crate::backend::runtime::residency::manager::ResidencyError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eredu_checkpoint::store::MemoryWeightStore;
+
+    #[test]
+    fn rank_local_recipes_replace_sources_by_exact_logical_target() {
+        let store = MemoryWeightStore::from_safetensors([(
+            "physical.experts".to_owned(),
+            safetensors::Dtype::F32,
+            vec![4, 2],
+            vec![0; 4 * 2 * size_of::<f32>()],
+        )])
+        .unwrap();
+        let global = DerivedWeightRecipe::source("physical.experts", TensorSelection::Full);
+        let binding = WeightBinding::from_recipe("local.experts", global, 32)
+            .unwrap()
+            .with_logical_target("model.experts")
+            .unwrap();
+        let local = DerivedWeightRecipe::source(
+            "physical.experts",
+            TensorSelection::Indices {
+                axis: 0,
+                indices: vec![3, 1],
+            },
+        );
+
+        let bindings = apply_rank_local_parameter_recipes(
+            vec![binding],
+            &store,
+            BTreeMap::from([("model.experts".into(), local.clone())]),
+        )
+        .unwrap();
+
+        assert_eq!(bindings[0].source_recipe(), local);
+        assert_eq!(bindings[0].expected_bytes(), 16);
+    }
 }
 
 impl From<BindingPlanError> for ModuleBindingError {
