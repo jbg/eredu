@@ -27,7 +27,9 @@ backend or composition module tree. Backend-internal fixtures and composition
 tests are crate-private unit tests; published crates expose no test-support
 feature or fixture namespace. The facade does not directly depend on `eredu-nn`
 in production; facade tests that exercise neutral neural contracts use it as a
-development dependency.
+development dependency. Direct MLX backend users enable `image` and `audio`;
+the facade forwards its `mlx-image` and `mlx-audio` features to those backend
+features. Backend feature diagnostics name both active public spellings.
 
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same

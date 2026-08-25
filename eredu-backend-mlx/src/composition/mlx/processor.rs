@@ -35,6 +35,14 @@ enum ProcessorKind {
     Qwen(qwen::QwenProcessor),
 }
 
+#[cfg(any(not(feature = "image"), not(feature = "audio")))]
+fn missing_media_feature(modality: &str, backend_feature: &str, facade_feature: &str) -> Error {
+    Error::Processor(format!(
+        "MLX {modality} preparation requires feature `{backend_feature}` on `eredu-backend-mlx` \
+         (or feature `{facade_feature}` on the `eredu` facade)"
+    ))
+}
+
 enum PortableMediaView<'a> {
     #[cfg(feature = "image")]
     Image(RgbImageView<'a>),
@@ -68,9 +76,7 @@ impl<'a> PortableMediaView<'a> {
                 #[cfg(not(feature = "image"))]
                 {
                     let _ = image;
-                    Err(Error::Processor(
-                        "MLX image preparation requires the mlx-image feature".into(),
-                    ))
+                    Err(missing_media_feature("image", "image", "mlx-image"))
                 }
             }
             PortableMedia::Video(video) => {
@@ -92,9 +98,7 @@ impl<'a> PortableMediaView<'a> {
                 #[cfg(not(feature = "image"))]
                 {
                     let _ = video;
-                    Err(Error::Processor(
-                        "MLX video preparation requires the mlx-image feature".into(),
-                    ))
+                    Err(missing_media_feature("video", "image", "mlx-image"))
                 }
             }
             PortableMedia::Audio(audio) => {
@@ -108,9 +112,7 @@ impl<'a> PortableMediaView<'a> {
                 #[cfg(not(feature = "audio"))]
                 {
                     let _ = audio;
-                    Err(Error::Processor(
-                        "MLX audio preparation requires the mlx-audio feature".into(),
-                    ))
+                    Err(missing_media_feature("audio", "audio", "mlx-audio"))
                 }
             }
         }
@@ -223,6 +225,41 @@ impl ModelProcessor {
             .collect::<Result<Vec<_>, Error>>()?;
         debug_assert!(media.next().is_none());
         self.prepare_input(&input, encode_text)
+    }
+}
+
+#[cfg(all(test, any(not(feature = "image"), not(feature = "audio"))))]
+mod feature_diagnostic_tests {
+    #[cfg(not(feature = "audio"))]
+    use eredu_core::Audio;
+    use eredu_core::Media;
+    #[cfg(not(feature = "image"))]
+    use eredu_core::RgbImage;
+
+    use super::PortableMediaView;
+
+    #[cfg(not(feature = "image"))]
+    #[test]
+    fn missing_image_diagnostic_names_backend_and_facade_features() {
+        let media = Media::Image(RgbImage::new(vec![0, 0, 0], 1, 1).unwrap());
+        let image = PortableMediaView::new(&media)
+            .err()
+            .expect("image feature is disabled")
+            .to_string();
+        assert!(image.contains("feature `image` on `eredu-backend-mlx`"));
+        assert!(image.contains("feature `mlx-image` on the `eredu` facade"));
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[test]
+    fn missing_audio_diagnostic_names_backend_and_facade_features() {
+        let media = Media::Audio(Audio::new(vec![0.0], 16_000).unwrap());
+        let audio = PortableMediaView::new(&media)
+            .err()
+            .expect("audio feature is disabled")
+            .to_string();
+        assert!(audio.contains("feature `audio` on `eredu-backend-mlx`"));
+        assert!(audio.contains("feature `mlx-audio` on the `eredu` facade"));
     }
 }
 
