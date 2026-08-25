@@ -130,7 +130,7 @@ use eredu_runtime::ExecutionGroupReadySet;
 use eredu_runtime::ResidentLayerGroup;
 use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
-    PagedCacheOptions, WeightResidency,
+    PagedCacheOptions,
 };
 
 use safemlx::ops::indexing::TryIndexOp;
@@ -13356,36 +13356,22 @@ pub fn load_pipeline_model_with_options(
         ModelArtifact::Gguf {
             path: _,
             configuration: _,
-            checkpoint,
-            mut companions,
+            validated,
             ..
         } => {
-            let mut structural_options = options;
-            // The explicit distributed-stage loader has already validated its
-            // topology; complete-model structural policy must not reject a
-            // non-replicated coordinate.
-            structural_options.parallel = None;
-            // Stage-local residency and bounded materialization are validated by
-            // the pipeline planner below. Whole-model GGUF policy must therefore
-            // validate the artifact geometry without reapplying the standalone
-            // nonresident-loader restriction.
-            structural_options.weight_residency = WeightResidency::fully_resident();
             let architecture = architecture_plan.gguf_architecture().ok_or_else(|| {
                 Error::ArchitectureModel(
                     "GGUF preparation omitted its architecture-owned GGUF identity".into(),
                 )
             })?;
-            let checkpoint = GgufCheckpoint::from_portable(checkpoint);
+            let (admitted, mut companions) =
+                crate::composition::mlx::structural::AdmittedGguf::from_admission(
+                    architecture,
+                    validated,
+                );
             let projector = companions
                 .remove(&eredu_core::GgufCompanionRole::MediaProjector)
                 .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
-            let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-            let admitted = crate::composition::mlx::structural::admit_gguf(
-                architecture,
-                checkpoint,
-                metadata,
-                structural_options,
-            )?;
             let architecture = admitted.architecture();
             let checkpoint = admitted.checkpoint().clone();
             let metadata = admitted.metadata().clone();

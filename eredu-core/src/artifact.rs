@@ -250,6 +250,16 @@ impl ValidatedGguf {
     ) -> impl Iterator<Item = (&GgufCompanionRole, &ValidatedGgufCompanion)> {
         self.companions.iter()
     }
+
+    /// Consumes the admission proof into its exact primary and companion handles.
+    pub fn into_parts(
+        self,
+    ) -> (
+        GgufCheckpoint,
+        BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>,
+    ) {
+        (self.checkpoint, self.companions)
+    }
 }
 
 impl<P> ArtifactInspection<P> {
@@ -364,8 +374,7 @@ impl<P> ModelPreparationPlan<P> {
                 path: self.inspection.path,
                 configuration: self.inspection.configuration,
                 tensors: self.inspection.tensors,
-                checkpoint: validated.checkpoint,
-                companions: validated.companions,
+                validated,
             },
             None => ModelArtifact::SafeTensors {
                 path: self.inspection.path,
@@ -402,10 +411,8 @@ pub enum ModelArtifact {
         configuration: ModelConfiguration,
         /// Header-only tensor catalog.
         tensors: TensorCatalog,
-        /// Pure-Rust checkpoint handle used by backend materialization.
-        checkpoint: GgufCheckpoint,
-        /// Exact sibling checkpoints selected during portable inspection.
-        companions: BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>,
+        /// Portable admission proof containing the exact primary and companions.
+        validated: ValidatedGguf,
     },
 }
 
@@ -1283,7 +1290,7 @@ mod tests {
         let (artifact, architecture_plan, _, _) = plan.into_parts();
         let ModelArtifact::Gguf {
             configuration,
-            checkpoint,
+            validated,
             ..
         } = artifact
         else {
@@ -1291,7 +1298,7 @@ mod tests {
         };
         assert_eq!(architecture_plan.format, Some(ArtifactFormat::Gguf));
         assert_eq!(configuration.family, "llama");
-        assert_eq!(checkpoint.physical_tensor_count(), 1);
+        assert_eq!(validated.checkpoint().physical_tensor_count(), 1);
     }
 
     #[test]
@@ -1358,7 +1365,7 @@ mod tests {
                 .path(),
             projector
         );
-        let ModelArtifact::Gguf { companions, .. } =
+        let ModelArtifact::Gguf { validated, .. } =
             plan_model_preparation(inspection, PreparationPolicy::default())
                 .unwrap()
                 .into_parts()
@@ -1367,8 +1374,8 @@ mod tests {
             panic!("expected GGUF preparation artifact");
         };
         assert_eq!(
-            companions
-                .get(&GgufCompanionRole::MediaProjector)
+            validated
+                .companion(&GgufCompanionRole::MediaProjector)
                 .unwrap()
                 .path(),
             projector

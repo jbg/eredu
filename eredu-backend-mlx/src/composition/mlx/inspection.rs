@@ -147,20 +147,19 @@ fn record_embedded_drafting(
     );
 }
 
-fn resolve_projector(
-    model: &Path,
-    architecture: GgufArchitecture,
-) -> Result<Option<(PathBuf, GgufCheckpoint, HashMap<String, GgufMetadataValue>)>, Error> {
-    let requirements =
-        eredu_architectures::configuration::gguf_companion_requirements(architecture)?;
-    let mut companions = eredu_core::resolve_gguf_companions(model, &requirements)?;
-    let Some(companion) = companions.remove(&eredu_core::GgufCompanionRole::MediaProjector) else {
-        return Ok(None);
-    };
+fn prepared_projector(
+    validated: &eredu_core::ValidatedGguf,
+) -> Option<(PathBuf, GgufCheckpoint, HashMap<String, GgufMetadataValue>)> {
+    let companion = validated.companion(&eredu_core::GgufCompanionRole::MediaProjector)?;
     let path = companion.path().to_owned();
     let checkpoint = GgufCheckpoint::from_portable(companion.checkpoint().clone());
     let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    Ok(Some((path, checkpoint, metadata)))
+    Some((path, checkpoint, metadata))
+}
+
+fn mark_portable_gguf_admitted(report: &mut ModelInspectionReport) {
+    report.structural_binding = InspectionReadiness::Ready;
+    report.model_loadability = InspectionReadiness::Ready;
 }
 
 fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
@@ -364,6 +363,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     report.model_family = Some(gguf_architecture.model_kind().canonical_name().into());
     report.architecture = Some(gguf_architecture.metadata_name().into());
     report.architecture_support = InspectionReadiness::Ready;
+    mark_portable_gguf_admitted(&mut report);
     report.checkpoint_shards = Some(checkpoint.catalog().shards().len());
     report.tensor_count = Some(checkpoint.catalog().logical_outputs().count());
     report.gguf_versions = Some(
@@ -420,11 +420,6 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         Ok(capabilities) => {
             capabilities_valid = true;
             record_embedded_drafting(&mut report, capabilities);
-            apply_structural_validation(
-                &mut report,
-                structural::validate_gguf(gguf_architecture, &checkpoint, options.load),
-                path,
-            );
         }
         Err(error) => {
             report.structural_binding = InspectionReadiness::Invalid;
@@ -448,8 +443,14 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         },
         Err(error) => reject_load_policy(&mut report, &error),
     }
-    let composition =
-        inspect_gguf_projector(&mut report, path, gguf_architecture, &checkpoint, &metadata);
+    let composition = inspect_gguf_projector(
+        &mut report,
+        path,
+        gguf_architecture,
+        validated,
+        &checkpoint,
+        &metadata,
+    );
     if capabilities_valid {
         report.expected_modalities =
             artifact_modalities(composite_plan.input_modalities(composition));
@@ -602,6 +603,7 @@ fn inspect_gguf_projector(
     report: &mut ModelInspectionReport,
     path: &Path,
     architecture: GgufArchitecture,
+    validated: &eredu_core::ValidatedGguf,
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
 ) -> eredu_architectures::preparation::GgufArtifactComposition {
@@ -610,8 +612,8 @@ fn inspect_gguf_projector(
     let mut composition = GgufArtifactComposition::ModelOnly;
     match architecture {
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            match resolve_projector(path, architecture) {
-                Ok(Some((projector, checkpoint, metadata))) => {
+            match prepared_projector(validated) {
+                Some((projector, checkpoint, metadata)) => {
                     let validation = structural::validate_qwen3_vl_projector_gguf(
                         architecture,
                         model_checkpoint,
@@ -646,18 +648,17 @@ fn inspect_gguf_projector(
                         path: Some(projector),
                     });
                 }
-                Ok(None) => reject_projector(
+                None => reject_projector(
                     report,
                     path.to_path_buf(),
                     "Qwen3-VL preparation omitted its required media projector".into(),
                     true,
                 ),
-                Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
             }
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
-            match resolve_projector(path, architecture) {
-                Ok(Some((projector_path, checkpoint, metadata))) => {
+            match prepared_projector(validated) {
+                Some((projector_path, checkpoint, metadata)) => {
                     let validation = structural::validate_qwen35_projector_gguf(
                         model_checkpoint,
                         model_metadata,
@@ -691,7 +692,7 @@ fn inspect_gguf_projector(
                         path: Some(projector_path),
                     });
                 }
-                Ok(None) => {
+                None => {
                     report.multimodal = InspectionReadiness::Missing;
                     report.requirements.push(InspectionRequirement {
                         code: InspectionIssueCode::MissingMediaProjector,
@@ -706,13 +707,11 @@ fn inspect_gguf_projector(
                         Some(path.to_path_buf()),
                     );
                 }
-                Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
             }
         }
-        GgufArchitecture::Inkling => match resolve_projector(path, architecture) {
-            Ok(Some((projector_path, checkpoint, metadata))) => {
+        GgufArchitecture::Inkling => match prepared_projector(validated) {
+            Some((projector_path, checkpoint, metadata)) => {
                 let validation = structural::validate_inkling_mmproj_gguf(
-                    model_checkpoint,
                     model_metadata,
                     &checkpoint,
                     &metadata,
@@ -730,7 +729,7 @@ fn inspect_gguf_projector(
                     InspectionReadiness::Unsupported
                 };
             }
-            Ok(None) => {
+            None => {
                 report.multimodal = InspectionReadiness::Missing;
                 report.requirements.push(InspectionRequirement {
                     code: InspectionIssueCode::MissingMediaProjector,
@@ -745,10 +744,9 @@ fn inspect_gguf_projector(
                     Some(path.to_path_buf()),
                 );
             }
-            Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
-        GgufArchitecture::Gemma4 => match resolve_projector(path, architecture) {
-            Ok(Some((projector_path, checkpoint, metadata))) => {
+        GgufArchitecture::Gemma4 => match prepared_projector(validated) {
+            Some((projector_path, checkpoint, metadata)) => {
                 let validation = structural::validate_gemma4_mmproj_gguf(
                     model_checkpoint,
                     model_metadata,
@@ -782,7 +780,7 @@ fn inspect_gguf_projector(
                     path: Some(projector_path),
                 });
             }
-            Ok(None) => {
+            None => {
                 report.multimodal = InspectionReadiness::Missing;
                 report.requirements.push(InspectionRequirement {
                     code: InspectionIssueCode::MissingMediaProjector,
@@ -797,10 +795,9 @@ fn inspect_gguf_projector(
                     Some(path.to_path_buf()),
                 );
             }
-            Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
-        GgufArchitecture::MuseGlimmer => match resolve_projector(path, architecture) {
-            Ok(Some((projector_path, checkpoint, metadata))) => {
+        GgufArchitecture::MuseGlimmer => match prepared_projector(validated) {
+            Some((projector_path, checkpoint, metadata)) => {
                 let validation = structural::validate_muse_glimmer_projector_gguf(
                     model_checkpoint,
                     model_metadata,
@@ -834,7 +831,7 @@ fn inspect_gguf_projector(
                     path: Some(projector_path),
                 });
             }
-            Ok(None) => {
+            None => {
                 report.multimodal = InspectionReadiness::Missing;
                 report.requirements.push(InspectionRequirement {
                         code: InspectionIssueCode::MissingMediaProjector,
@@ -849,7 +846,6 @@ fn inspect_gguf_projector(
                     Some(path.to_path_buf()),
                 );
             }
-            Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), false),
         },
         _ => report.multimodal = InspectionReadiness::NotApplicable,
     }

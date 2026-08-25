@@ -452,11 +452,9 @@ fn validate_gguf_structure(
         .map_err(gguf_validation_error)
 }
 
-/// Parses and validates the complete architecture-owned GGUF checkpoint schema.
-///
-/// This is the portable admission boundary used by the configuration resolver
-/// and by concrete backends that need to validate an already inspected GGUF.
-pub fn validate_gguf_checkpoint(
+/// Parses and validates the complete architecture-owned GGUF checkpoint schema
+/// at the portable configuration-resolution boundary.
+fn validate_gguf_checkpoint(
     architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
 ) -> CheckpointValidation {

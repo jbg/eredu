@@ -1560,7 +1560,7 @@ pub(crate) struct PreparedGptOssGguf {
     pub args: ModelArgs,
 }
 
-/// Validates and normalizes portable GGUF metadata without reading payloads.
+/// Normalizes backend-native GGUF encoding metadata without reading payloads.
 pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGptOssGguf, Error> {
@@ -1574,14 +1574,6 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     let metadata = source.metadata();
     let mut args = eredu_architectures::gpt_oss::model_args_from_gguf_catalog(metadata)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    match eredu_architectures::gpt_oss::validate_gguf(checkpoint, &args) {
-        eredu_checkpoint::validation::CheckpointValidation::Exact => {}
-        validation => {
-            return Err(Error::ArchitectureModel(format!(
-                "GPT-OSS GGUF checkpoint contract did not resolve: {validation:?}"
-            )))
-        }
-    }
     let translate = eredu_architectures::gpt_oss::translate_gguf_weight_name;
     checkpoint
         .catalog()

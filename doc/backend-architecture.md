@@ -441,7 +441,10 @@ Family composition does not reopen `config.json`, rediscover checkpoint shards,
 or select a second catalog after admission. Every admitted artifact plan
 retains the normalized `ModelKind`; SafeTensors plans additionally retain typed
 family geometry and the checkpoint schema, while GGUF plans retain the exact
-`GgufArchitecture`. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
+`GgufArchitecture`. Core keeps the corresponding `ValidatedGguf` proof intact
+inside `ModelArtifact` until the selected backend consumes it; materializers do
+not downgrade that proof to an unvalidated checkpoint handle and rerun the
+architecture schema. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
 also parses and retains the family processor plan from the admitted model,
 projector, and SafeTensors processor sidecars. Materialization consumes that
 snapshot directly and neither resolves family identity again nor rereads
@@ -546,10 +549,10 @@ metadata, and embedding floors using the submitted metadata prefix. The
 selected architecture registry resolves the family spelling, applies
 family-specific structural admission, and declares composite requirements.
 The handoff contains the primary plus the exact resolved companion checkpoint
-handles. Backends may wrap those portable handles and add architecture or
-device compatibility checks, but do not rescan directories, select companions,
-repeat either portable admission layer, or parse facade-owned tokenizer and EOS
-metadata.
+handles. Backends may wrap those portable handles and add native encoding,
+operator, or device compatibility checks, but do not rescan directories, select
+companions, repeat either portable admission layer, or parse facade-owned
+tokenizer and EOS metadata.
 
 `ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
 including distributed stage loaders, consume its inspected configuration,
@@ -804,8 +807,9 @@ composition:
   exposes parsers for physical family checkpoint names;
 - GGUF family selection and portable family-specific structural admission are
   architecture-registry concerns. MLX composition resolves the already
-  admitted spelling through the same registry, validates native checkpoint
-  compatibility once, and passes an admitted source to resident,
+  admitted spelling through the same registry, trusts the retained portable
+  schema proof, validates only native encoding and operator compatibility, and
+  passes an admitted source to resident,
   tensor-parallel, pipeline, or expert family loaders. Reusable backend runtime
   modules neither parse `general.architecture` nor invoke family composition;
 - generic layerwise policy construction derives its execution graph and unit

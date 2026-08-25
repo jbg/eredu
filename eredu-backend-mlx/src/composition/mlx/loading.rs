@@ -700,8 +700,7 @@ fn materialize_gguf_artifact(
     let ModelArtifact::Gguf {
         path: _,
         configuration: _,
-        checkpoint,
-        mut companions,
+        validated,
         ..
     } = artifact
     else {
@@ -709,13 +708,12 @@ fn materialize_gguf_artifact(
             "MLX GGUF materializer received a SafeTensors plan".into(),
         ));
     };
-    let checkpoint = safemlx::ops::GgufCheckpoint::from_portable(checkpoint);
+    let architecture = prepared_gguf_architecture(&architecture_plan)?;
+    let (source, mut companions) =
+        structural::AdmittedGguf::from_admission(architecture, validated);
     let projector = companions
         .remove(&eredu_core::GgufCompanionRole::MediaProjector)
         .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
-    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    let architecture = prepared_gguf_architecture(&architecture_plan)?;
-    let source = structural::admit_gguf(architecture, checkpoint, metadata, options)?;
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;

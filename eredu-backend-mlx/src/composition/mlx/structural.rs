@@ -22,10 +22,10 @@ pub(crate) trait StructuralSafetensorsCatalog: SafetensorsCatalog + RecipeCatalo
 
 impl<T> StructuralSafetensorsCatalog for T where T: SafetensorsCatalog + RecipeCatalog + ?Sized {}
 
-/// Native GGUF source admitted by composition-level structural validation.
+/// Native view of the GGUF source admitted by portable inspection.
 ///
-/// Family composition consumes this type instead of reparsing architecture
-/// metadata or reaching upward from reusable backend runtime code.
+/// Family composition consumes this type instead of repeating architecture
+/// admission or reaching upward from reusable backend runtime code.
 pub(crate) struct AdmittedGguf {
     architecture: GgufArchitecture,
     checkpoint: GgufCheckpoint,
@@ -33,6 +33,29 @@ pub(crate) struct AdmittedGguf {
 }
 
 impl AdmittedGguf {
+    pub(crate) fn from_admission(
+        architecture: GgufArchitecture,
+        validated: eredu_core::ValidatedGguf,
+    ) -> (
+        Self,
+        std::collections::BTreeMap<
+            eredu_core::GgufCompanionRole,
+            eredu_core::ValidatedGgufCompanion,
+        >,
+    ) {
+        let (checkpoint, companions) = validated.into_parts();
+        let checkpoint = GgufCheckpoint::from_portable(checkpoint);
+        let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        (
+            Self {
+                architecture,
+                checkpoint,
+                metadata,
+            },
+            companions,
+        )
+    }
+
     pub(crate) const fn architecture(&self) -> GgufArchitecture {
         self.architecture
     }
@@ -44,20 +67,6 @@ impl AdmittedGguf {
     pub(crate) fn metadata(&self) -> &HashMap<String, GgufMetadataValue> {
         &self.metadata
     }
-}
-
-pub(crate) fn admit_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    options: ModelLoadOptions,
-) -> Result<AdmittedGguf, Error> {
-    validate_gguf(architecture, &checkpoint, options).into_loader_result()?;
-    Ok(AdmittedGguf {
-        architecture,
-        checkpoint,
-        metadata,
-    })
 }
 
 const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {
@@ -342,15 +351,6 @@ pub(crate) fn validate_inspected_preparation(
     validate_preparation_capability_intersection(kind, inspection.format(), policy, capabilities)
 }
 
-fn validate_gguf_load_policy(
-    architecture: GgufArchitecture,
-    options: ModelLoadOptions,
-) -> Result<(), Error> {
-    let policy = options.preparation_policy()?;
-    eredu_core::validate_preparation_policy(architecture.model_kind().loading_protocol(), policy)?;
-    Ok(())
-}
-
 pub fn validate_safetensors(
     plan: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: &(impl StructuralSafetensorsCatalog + ?Sized),
@@ -374,17 +374,6 @@ pub fn validate_safetensors(
     validation.with_strict_catalog(options.weight_residency.strict_loading())
 }
 
-pub fn validate_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    if let Err(error) = validate_gguf_load_policy(architecture, options) {
-        return invalid_geometry(error.to_string());
-    }
-    eredu_architectures::configuration::validate_gguf_checkpoint(architecture, checkpoint.catalog())
-}
-
 struct NeutralMuseGlimmerGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl eredu_architectures::muse_glimmer::GgufTensorCatalog for NeutralMuseGlimmerGgufCatalog<'_> {
@@ -402,7 +391,6 @@ impl eredu_architectures::qwen::GgufTensorCatalog for NeutralQwenGgufCatalog<'_>
 }
 
 pub fn validate_inkling_mmproj_gguf(
-    model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
@@ -423,13 +411,6 @@ pub fn validate_inkling_mmproj_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let primary = eredu_architectures::configuration::validate_gguf_checkpoint(
-        GgufArchitecture::Inkling,
-        model_checkpoint.catalog(),
-    );
-    if !matches!(primary, StructuralValidation::Exact) {
-        return primary;
-    }
     let plan = match eredu_architectures::inkling::mmproj_gguf_plan(&args) {
         Ok(plan) => plan,
         Err(error) => return invalid_geometry(error),
@@ -462,13 +443,6 @@ pub fn validate_gemma4_mmproj_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let primary = eredu_architectures::configuration::validate_gguf_checkpoint(
-        GgufArchitecture::Gemma4,
-        model_checkpoint.catalog(),
-    );
-    if !matches!(primary, StructuralValidation::Exact) {
-        return primary;
-    }
     let plan = match eredu_architectures::gemma4::mmproj_gguf_plan(&family) {
         Ok(plan) => plan,
         Err(error) => return invalid_geometry(error),
@@ -498,13 +472,6 @@ pub fn validate_muse_glimmer_projector_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let primary = eredu_architectures::configuration::validate_gguf_checkpoint(
-        GgufArchitecture::MuseGlimmer,
-        model_checkpoint.catalog(),
-    );
-    if !matches!(primary, StructuralValidation::Exact) {
-        return primary;
-    }
     let plan = match eredu_architectures::muse_glimmer::projector_gguf_plan(&args) {
         Ok(plan) => plan,
         Err(error) => return invalid_geometry(error),
