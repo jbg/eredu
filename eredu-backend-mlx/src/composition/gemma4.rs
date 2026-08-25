@@ -1,10 +1,6 @@
 //! Neutral Gemma 4 binding to MLX storage, state, and residency policy.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use eredu_architectures::gemma4::{
     AudioIngressBatchPlan, AudioIngressPartPlan, AudioInput, DecoderInputPart, FamilyConfig,
@@ -1529,29 +1525,9 @@ fn load_store(
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
     let external_expert_source_keys = if external_experts {
-        let mut keys = BTreeSet::new();
-        for layer in 0..args.text.num_hidden_layers() {
-            if args.text.layer_policy(layer).is_none_or(|policy| {
-                policy.feed_forward
-                    != eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
-            }) {
-                continue;
-            }
-            let resolved =
-                eredu_architectures::gemma4::expert_recipes(store.as_ref(), &args.text, layer)
-                    .map_err(Error::ArchitectureModel)?;
-            keys.extend(
-                resolved
-                    .gate_up
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned),
-            );
-            keys.extend(resolved.down.source_keys().into_iter().map(str::to_owned));
-        }
-        keys
+        crate::composition::gemma4_expert::checkpoint_keys(&args.text, store.as_ref())?
     } else {
-        BTreeSet::new()
+        Default::default()
     };
     let binding_args = args.clone();
     let binding_expert_targets = Arc::clone(&expert_targets);

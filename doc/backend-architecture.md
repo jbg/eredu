@@ -276,7 +276,10 @@ identity is not an ownership address and must not be flattened back into one.
 Backends consume the remaining declaration directly and never infer eligibility
 or companion identity from binding spelling, dtype, or rank. Family code owns
 sparse-layer selection, routed versus shared-bank scheduling, expert counts,
-and cache-layer numbering.
+and cache-layer numbering. Physical checkpoint keys excluded from ordinary
+layer residency while experts are independently resident are projected from
+the complete architecture catalog; backend composition does not rediscover
+them by walking family layer policies or rebuilding per-layer recipes.
 This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, LFM2,
 Kimi Linear, and later
 families: each architecture checkpoint module emits its complete
