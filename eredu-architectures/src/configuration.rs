@@ -117,8 +117,28 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 })?;
                 let projector = validated
                     .companion(&GgufCompanionRole::MediaProjector)
-                    .map(|companion| companion.checkpoint().metadata());
-                resolved_plan.with_gguf_processors(validated.checkpoint().metadata(), projector)
+                    .map(|companion| companion.checkpoint());
+                let media_projector = projector
+                    .map(|projector| {
+                        crate::gguf_companion::resolve_media_projector(
+                            resolved_plan.gguf_plan().ok_or_else(|| {
+                                ArtifactError::InvalidArchitecturePlan(
+                                    "GGUF companion admission requires a resolved architecture plan"
+                                        .into(),
+                                )
+                            })?,
+                            validated.checkpoint(),
+                            projector,
+                        )
+                        .map_err(ArtifactError::InvalidArchitecturePlan)
+                    })
+                    .transpose()?;
+                resolved_plan
+                    .with_gguf_media_projector(media_projector)
+                    .with_gguf_processors(
+                        validated.checkpoint().metadata(),
+                        projector.map(GgufCheckpoint::metadata),
+                    )
             }
         };
         plan.map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))

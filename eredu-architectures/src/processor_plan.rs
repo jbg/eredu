@@ -445,6 +445,7 @@ enum NormalizedProcessorPlan {
 #[derive(Debug, Clone)]
 pub struct ArtifactArchitecturePlan {
     family: ArtifactFamilyPlan,
+    media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     processor: Option<NormalizedProcessorPlan>,
 }
 
@@ -453,6 +454,7 @@ impl ArtifactArchitecturePlan {
     pub(crate) fn from_safetensors_architecture(architecture: SafetensorsArchitecturePlan) -> Self {
         Self {
             family: ArtifactFamilyPlan::Safetensors(architecture),
+            media_projector: None,
             processor: None,
         }
     }
@@ -463,8 +465,17 @@ impl ArtifactArchitecturePlan {
     ) -> Self {
         Self {
             family: ArtifactFamilyPlan::Gguf(architecture),
+            media_projector: None,
             processor: None,
         }
+    }
+
+    pub(crate) fn with_gguf_media_projector(
+        mut self,
+        media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
+    ) -> Self {
+        self.media_projector = media_projector;
+        self
     }
 
     /// Normalizes one SafeTensors family and its processor sidecars.
@@ -576,6 +587,13 @@ impl ArtifactArchitecturePlan {
             ArtifactFamilyPlan::Gguf(plan) => Some(plan),
             ArtifactFamilyPlan::Safetensors(_) => None,
         }
+    }
+
+    /// Returns the typed, structurally validated GGUF media-projector plan.
+    pub const fn gguf_media_projector(
+        &self,
+    ) -> Option<&crate::gguf_companion::GgufMediaProjectorPlan> {
+        self.media_projector.as_ref()
     }
 
     /// Whether authoritative artifact inspection admitted a media processor.

@@ -449,11 +449,16 @@ architecture parser or regenerate the main checkpoint schema. Backend
 composition may enrich a clone of retained geometry with native encoding
 descriptors, and composite families may derive a separate companion schema from
 admitted companion geometry; neither operation replaces the retained main
-artifact plan. For Gemma 4, Inkling, Muse-Glimmer, and Qwen, inspection
-also parses and retains the family processor plan from the admitted model,
-projector, and SafeTensors processor sidecars. Materialization consumes that
-snapshot directly and neither resolves family identity again nor rereads
-processor sidecars or GGUF metadata to reconstruct preprocessing policy.
+artifact plan. Portable architecture admission derives that companion geometry,
+validates the companion against its exact family-owned GGUF schema, and retains
+both the typed composite configuration and schema in the artifact architecture
+plan. A concrete backend consumes this proof and does not repeat companion
+family parsing or schema admission. For Gemma 4, Inkling, Muse-Glimmer, and
+Qwen, inspection also parses and retains the family processor plan from the
+admitted model, projector, and SafeTensors processor sidecars. Materialization
+consumes that snapshot directly and neither resolves family identity again nor
+rereads processor sidecars or GGUF metadata to reconstruct preprocessing
+policy.
 The catalog-bound store revalidates tensor metadata when leases are
 acquired so later header changes cannot silently replace the admitted catalog.
 For composite GGUF artifacts, the architecture additionally owns required
@@ -461,10 +466,14 @@ versus optional companion roles, filename matching scope, search depth, and
 dense-only versus dense-preferred admission. Portable inspection resolves
 those declarations once, classifies dense and quantized candidates from their
 GGUF tensor catalogs rather than filename substrings, and retains the exact
-path and checkpoint handle in `ValidatedGguf`. The architecture also owns the
-plan that maps a structurally validated sibling media projector to resulting
-input modalities. Inspection applies that plan to the same resolved artifact,
-so expected modalities and multimodal readiness describe one composition.
+path and checkpoint handle in `ValidatedGguf`. After resolution, the
+architecture registry reconstructs the composite family from the already
+admitted primary geometry and companion header, validates the companion's exact
+tensor schema, and retains that typed companion plan alongside the primary plan.
+The architecture also owns the plan that maps a structurally validated sibling
+media projector to resulting input modalities. Inspection applies that plan to
+the same resolved artifact, so expected modalities and multimodal readiness
+describe one composition.
 
 Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released
@@ -554,12 +563,14 @@ For GGUF artifacts, `ArtifactInspection::validated_gguf` is the authoritative
 handoff from stage 1. Core validates format-generic tensor-count, required
 metadata, and embedding floors using the submitted metadata prefix. The
 selected architecture registry resolves the family spelling, applies
-family-specific structural admission, and declares composite requirements.
-The handoff contains the primary plus the exact resolved companion checkpoint
-handles. Backends may wrap those portable handles and add native encoding,
-operator, or device compatibility checks, but do not rescan directories, select
-companions, repeat either portable admission layer, or parse facade-owned
-tokenizer and EOS metadata.
+family-specific structural admission, declares composite requirements, and
+validates each resolved companion's family identity, shared geometry, translated
+tensor names, and exact checkpoint schema. The handoff contains the primary plus
+the exact resolved companion checkpoint handles and an architecture plan with
+typed companion geometry and schema. Backends may wrap those portable handles
+and add native encoding, operator, or device compatibility checks, but do not
+rescan directories, select companions, repeat either portable admission layer,
+or parse facade-owned tokenizer and EOS metadata.
 
 `ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
 including distributed stage loaders, consume its inspected configuration,

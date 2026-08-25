@@ -27,6 +27,8 @@ pub use external_assistant::{
     Gemma4AssistantPreparationPlan, MuseGlimmerAssistantPreparationPlan,
 };
 mod gguf_admission;
+/// Backend-neutral family and checkpoint admission for sibling GGUF projectors.
+pub mod gguf_companion;
 mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;

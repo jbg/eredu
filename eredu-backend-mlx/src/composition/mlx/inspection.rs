@@ -1,7 +1,7 @@
 //! Side-effect-free MLX model artifact compatibility inspection.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -13,7 +13,6 @@ use eredu_core::{
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
     ModelInspectionReport, Observed,
 };
-use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::ops::GgufCheckpoint;
 
 use super::*;
@@ -147,14 +146,9 @@ fn record_embedded_drafting(
     );
 }
 
-fn prepared_projector(
-    validated: &eredu_core::ValidatedGguf,
-) -> Option<(PathBuf, GgufCheckpoint, HashMap<String, GgufMetadataValue>)> {
+fn prepared_projector(validated: &eredu_core::ValidatedGguf) -> Option<PathBuf> {
     let companion = validated.companion(&eredu_core::GgufCompanionRole::MediaProjector)?;
-    let path = companion.path().to_owned();
-    let checkpoint = GgufCheckpoint::from_portable(companion.checkpoint().clone());
-    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    Some((path, checkpoint, metadata))
+    Some(companion.path().to_owned())
 }
 
 fn mark_portable_gguf_admitted(report: &mut ModelInspectionReport) {
@@ -432,14 +426,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         },
         Err(error) => reject_load_policy(&mut report, &error),
     }
-    let composition = inspect_gguf_projector(
-        &mut report,
-        path,
-        gguf_architecture,
-        validated,
-        &checkpoint,
-        &metadata,
-    );
+    let composition = inspect_gguf_projector(&mut report, path, gguf_architecture, validated);
     report.expected_modalities = artifact_modalities(composite_plan.input_modalities(composition));
 
     report
@@ -590,8 +577,6 @@ fn inspect_gguf_projector(
     path: &Path,
     architecture: GgufArchitecture,
     validated: &eredu_core::ValidatedGguf,
-    model_checkpoint: &GgufCheckpoint,
-    model_metadata: &HashMap<String, GgufMetadataValue>,
 ) -> eredu_architectures::preparation::GgufArtifactComposition {
     use eredu_architectures::preparation::GgufArtifactComposition;
 
@@ -599,38 +584,17 @@ fn inspect_gguf_projector(
     match architecture {
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             match prepared_projector(validated) {
-                Some((projector, checkpoint, metadata)) => {
-                    let validation = structural::validate_qwen3_vl_projector_gguf(
-                        architecture,
-                        model_checkpoint,
-                        model_metadata,
-                        &checkpoint,
-                        &metadata,
-                    );
-                    let exact = matches!(validation, structural::StructuralValidation::Exact);
-                    if exact {
-                        composition = GgufArtifactComposition::ValidatedMediaProjector;
-                    }
-                    apply_structural_validation(report, validation, &projector);
-                    report.multimodal = if !exact {
-                        InspectionReadiness::Invalid
-                    } else if cfg!(feature = "image") {
+                Some(projector) => {
+                    composition = GgufArtifactComposition::ValidatedMediaProjector;
+                    report.multimodal = if cfg!(feature = "image") {
                         InspectionReadiness::Ready
                     } else {
                         InspectionReadiness::Unsupported
                     };
                     report.requirements.push(InspectionRequirement {
                         code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: if exact {
-                            InspectionReadiness::Ready
-                        } else {
-                            InspectionReadiness::Invalid
-                        },
-                        detail: if exact {
-                            "validated qwen3vl vision projector".into()
-                        } else {
-                            "qwen3vl vision projector is structurally incompatible".into()
-                        },
+                        readiness: InspectionReadiness::Ready,
+                        detail: "portable admission validated the qwen3vl vision projector".into(),
                         path: Some(projector),
                     });
                 }
@@ -644,37 +608,17 @@ fn inspect_gguf_projector(
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
             match prepared_projector(validated) {
-                Some((projector_path, checkpoint, metadata)) => {
-                    let validation = structural::validate_qwen35_projector_gguf(
-                        model_checkpoint,
-                        model_metadata,
-                        &checkpoint,
-                        &metadata,
-                    );
-                    let exact = matches!(validation, structural::StructuralValidation::Exact);
-                    if exact {
-                        composition = GgufArtifactComposition::ValidatedMediaProjector;
-                    }
-                    apply_structural_validation(report, validation, &projector_path);
-                    report.multimodal = if !exact {
-                        InspectionReadiness::Invalid
-                    } else if cfg!(feature = "image") {
+                Some(projector_path) => {
+                    composition = GgufArtifactComposition::ValidatedMediaProjector;
+                    report.multimodal = if cfg!(feature = "image") {
                         InspectionReadiness::Ready
                     } else {
                         InspectionReadiness::Unsupported
                     };
                     report.requirements.push(InspectionRequirement {
                         code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: if exact {
-                            InspectionReadiness::Ready
-                        } else {
-                            InspectionReadiness::Invalid
-                        },
-                        detail: if exact {
-                            "validated Qwen3.5 vision projector".into()
-                        } else {
-                            "Qwen3.5 vision projector is structurally incompatible".into()
-                        },
+                        readiness: InspectionReadiness::Ready,
+                        detail: "portable admission validated the Qwen3.5 vision projector".into(),
                         path: Some(projector_path),
                     });
                 }
@@ -696,20 +640,9 @@ fn inspect_gguf_projector(
             }
         }
         GgufArchitecture::Inkling => match prepared_projector(validated) {
-            Some((projector_path, checkpoint, metadata)) => {
-                let validation = structural::validate_inkling_mmproj_gguf(
-                    model_metadata,
-                    &checkpoint,
-                    &metadata,
-                );
-                let exact = matches!(validation, structural::StructuralValidation::Exact);
-                if exact {
-                    composition = GgufArtifactComposition::ValidatedMediaProjector;
-                }
-                apply_structural_validation(report, validation, &projector_path);
-                report.multimodal = if !exact {
-                    InspectionReadiness::Invalid
-                } else if cfg!(all(feature = "image", feature = "audio")) {
+            Some(_projector_path) => {
+                composition = GgufArtifactComposition::ValidatedMediaProjector;
+                report.multimodal = if cfg!(all(feature = "image", feature = "audio")) {
                     InspectionReadiness::Ready
                 } else {
                     InspectionReadiness::Unsupported
@@ -732,37 +665,18 @@ fn inspect_gguf_projector(
             }
         },
         GgufArchitecture::Gemma4 => match prepared_projector(validated) {
-            Some((projector_path, checkpoint, metadata)) => {
-                let validation = structural::validate_gemma4_mmproj_gguf(
-                    model_checkpoint,
-                    model_metadata,
-                    &checkpoint,
-                    &metadata,
-                );
-                let exact = matches!(validation, structural::StructuralValidation::Exact);
-                if exact {
-                    composition = GgufArtifactComposition::ValidatedMediaProjector;
-                }
-                apply_structural_validation(report, validation, &projector_path);
-                report.multimodal = if !exact {
-                    InspectionReadiness::Invalid
-                } else if cfg!(any(feature = "image", feature = "audio")) {
+            Some(projector_path) => {
+                composition = GgufArtifactComposition::ValidatedMediaProjector;
+                report.multimodal = if cfg!(any(feature = "image", feature = "audio")) {
                     InspectionReadiness::Ready
                 } else {
                     InspectionReadiness::Unsupported
                 };
                 report.requirements.push(InspectionRequirement {
                     code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: if exact {
-                        InspectionReadiness::Ready
-                    } else {
-                        InspectionReadiness::Invalid
-                    },
-                    detail: if exact {
-                        "validated Gemma 4 vision/audio projector".into()
-                    } else {
-                        "Gemma 4 media projector is structurally incompatible".into()
-                    },
+                    readiness: InspectionReadiness::Ready,
+                    detail: "portable admission validated the Gemma 4 vision/audio projector"
+                        .into(),
                     path: Some(projector_path),
                 });
             }
@@ -783,37 +697,18 @@ fn inspect_gguf_projector(
             }
         },
         GgufArchitecture::MuseGlimmer => match prepared_projector(validated) {
-            Some((projector_path, checkpoint, metadata)) => {
-                let validation = structural::validate_muse_glimmer_projector_gguf(
-                    model_checkpoint,
-                    model_metadata,
-                    &checkpoint,
-                    &metadata,
-                );
-                let exact = matches!(validation, structural::StructuralValidation::Exact);
-                if exact {
-                    composition = GgufArtifactComposition::ValidatedMediaProjector;
-                }
-                apply_structural_validation(report, validation, &projector_path);
-                report.multimodal = if !exact {
-                    InspectionReadiness::Invalid
-                } else if cfg!(feature = "image") {
+            Some(projector_path) => {
+                composition = GgufArtifactComposition::ValidatedMediaProjector;
+                report.multimodal = if cfg!(feature = "image") {
                     InspectionReadiness::Ready
                 } else {
                     InspectionReadiness::Unsupported
                 };
                 report.requirements.push(InspectionRequirement {
                     code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: if exact {
-                        InspectionReadiness::Ready
-                    } else {
-                        InspectionReadiness::Invalid
-                    },
-                    detail: if exact {
-                        "validated image-only Muse-Glimmer projector".into()
-                    } else {
-                        "Muse-Glimmer projector is structurally incompatible".into()
-                    },
+                    readiness: InspectionReadiness::Ready,
+                    detail: "portable admission validated the image-only Muse-Glimmer projector"
+                        .into(),
                     path: Some(projector_path),
                 });
             }
