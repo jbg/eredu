@@ -646,9 +646,13 @@ adapter only reads the small metadata tensor and materializes the returned token
 array. Qwen3-VL also exposes one input-part admission plan used by both prefill
 and capability preflight: text token IDs and projected text embeddings occupy
 text positions, native image/video tensors use the vision plan, and projected
-non-text embeddings are rejected. Inkling execution likewise consumes an
-architecture ingress plan for its exact hMLP and dMel geometry, placeholder
-token, valid audio prefix, and decoder span. Muse-Glimmer execution consumes the
+non-text embeddings are rejected. Conditional Qwen3.5 uses its own shared
+input-part plan across resident prefill, pipeline prefill, and capability
+preflight: projected text, image, and video embeddings must be batch-one at
+decoder width, while native image/video tensors use the vision ingress plan.
+Inkling execution likewise consumes an architecture ingress plan for its exact
+hMLP and dMel geometry, placeholder token, valid audio prefix, and decoder span.
+Muse-Glimmer execution consumes the
 architecture-returned placeholder span and validated grid, including the
 checkpoint-convention video policy; MLX does not reconstruct spatial merging or
 artifact modality rules.

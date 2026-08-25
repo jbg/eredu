@@ -4,7 +4,7 @@ use std::num::NonZeroU8;
 
 use eredu_architectures::media_plan::{
     self, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality, PreparedInputPart,
-    PreparedInputPayload, PreparedMediaInput, QwenVlInputPartPlan,
+    PreparedInputPayload, PreparedMediaInput, QwenHybridInputPartPlan, QwenVlInputPartPlan,
 };
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
@@ -262,6 +262,25 @@ impl Model {
             }),
         }
     }
+
+    pub(super) fn qwen_hybrid_input_part_plan(
+        &self,
+        input: &PreparedInputPart,
+    ) -> Result<QwenHybridInputPartPlan, CapabilityError> {
+        match self {
+            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => {
+                if model.vision_config().is_some() {
+                    media_plan::qwen_hybrid_input_part(model.parsed_args(), input)
+                } else {
+                    media_plan::qwen_hybrid_text_input_part(model.args(), input)
+                }
+            }
+            _ => Err(CapabilityError::UnsupportedInput {
+                architecture: self.effective_model_type().into(),
+                reason: "Qwen hybrid input admission requested for another architecture".into(),
+            }),
+        }
+    }
 }
 fn prepared_media_accounting(
     session: &MlxModelSession<'_>,
@@ -324,18 +343,59 @@ pub fn count_prepared_input(
     let mut media_positions = 0u64;
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
-    let qwen_vl = matches!(
-        session.model_family(),
-        eredu_architectures::ModelKind::Qwen3Vl | eredu_architectures::ModelKind::Qwen3VlMoe
-    );
+    let model_family = session.model_family();
     for &part in prepared.parts {
-        if qwen_vl {
+        if matches!(
+            model_family,
+            eredu_architectures::ModelKind::Qwen3Vl | eredu_architectures::ModelKind::Qwen3VlMoe
+        ) {
             match session.qwen_vl_input_part_plan(&prepared_input_part(part)?)? {
                 QwenVlInputPartPlan::TextTokens { positions }
                 | QwenVlInputPartPlan::ProjectedText { positions } => {
                     text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
                 }
                 QwenVlInputPartPlan::Media { shape, .. } => {
+                    let InputPayload::Tensor(tensor) = part.payload else {
+                        unreachable!()
+                    };
+                    let (positions, workspace_bytes) =
+                        prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
+                    media_positions =
+                        checked_add(media_positions, positions, "prepared media-position total")?;
+                    media_execution_workspace_bytes = checked_add(
+                        media_execution_workspace_bytes,
+                        workspace_bytes,
+                        "prepared media-workspace total",
+                    )?;
+                    media_execution_workspace_kind = ObservationKind::Conservative;
+                }
+            }
+            continue;
+        }
+        if matches!(
+            model_family,
+            eredu_architectures::ModelKind::Qwen3Next | eredu_architectures::ModelKind::Qwen35
+        ) {
+            match session.qwen_hybrid_input_part_plan(&prepared_input_part(part)?)? {
+                QwenHybridInputPartPlan::TextTokens { positions } => {
+                    text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
+                }
+                QwenHybridInputPartPlan::Projected {
+                    modality,
+                    positions,
+                } => {
+                    if modality == PreparedInputModality::Text {
+                        text_tokens =
+                            checked_add(text_tokens, positions, "prepared text-token total")?;
+                    } else {
+                        media_positions = checked_add(
+                            media_positions,
+                            positions,
+                            "prepared media-position total",
+                        )?;
+                    }
+                }
+                QwenHybridInputPartPlan::Media { shape, .. } => {
                     let InputPayload::Tensor(tensor) = part.payload else {
                         unreachable!()
                     };

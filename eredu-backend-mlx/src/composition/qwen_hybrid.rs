@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
+use eredu_architectures::media_plan::QwenHybridInputPartPlan;
 use eredu_architectures::qwen::{
     hybrid::{
         self, ConditionalInput, ConditionalLayeredModel, ConditionalUnit, EmbeddedInput,
@@ -47,6 +48,15 @@ fn neutral_input_parts<'a>(
             },
         })
         .collect()
+}
+
+fn qwen_hybrid_input_plan(
+    args: &ParsedHybridConfig,
+    part: input::InputPart<'_>,
+) -> Result<QwenHybridInputPartPlan, safemlx::error::Exception> {
+    let prepared = input::prepared_input_part(part)?;
+    eredu_architectures::media_plan::qwen_hybrid_input_part(args, &prepared)
+        .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
 }
 
 use crate::backend::{
@@ -279,58 +289,40 @@ impl QwenConditionalPipelineBindings {
             Video(usize, usize),
         }
         let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().enumerate() {
-            match (part.modality, part.payload) {
-                (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+        for (original, part) in typed.parts.iter().copied().enumerate() {
+            match qwen_hybrid_input_plan(&parsed, part)? {
+                QwenHybridInputPartPlan::TextTokens { .. } => {
+                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                        unreachable!()
+                    };
                     token_storage.push(tokens.clone());
                     kinds.push(Kind::Text(token_storage.len() - 1));
                 }
-                (input::Modality::Text, input::InputPayload::Embeddings(embeddings)) => {
+                QwenHybridInputPartPlan::Projected { .. } => {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                        unreachable!()
+                    };
                     token_storage.push(input::token_ids_array(
                         &vec![0; usize::try_from(embeddings.dim(1)).unwrap_or_default()],
                         stream,
                     )?);
                     kinds.push(Kind::Projected(token_storage.len() - 1, original));
                 }
-                (
-                    modality @ (input::Modality::Image | input::Modality::Video),
-                    input::InputPayload::Tensor(tensor),
-                ) => {
-                    let ingress = super::qwen_media_ingress(
-                        modality,
-                        tensor,
-                        part.metadata,
-                        stream,
-                        |input| {
-                            eredu_architectures::media_plan::qwen_hybrid_ingress(&parsed, input)
-                        },
-                    )?;
+                QwenHybridInputPartPlan::Media { ingress, .. } => {
+                    let input::InputPayload::Tensor(tensor) = part.payload else {
+                        unreachable!()
+                    };
+                    let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
                     token_storage.push(ingress.tokens);
                     grids.push(ingress.patch_grid);
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if modality == input::Modality::Image {
+                    kinds.push(if part.modality == input::Modality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
                     });
-                }
-                (
-                    input::Modality::Image | input::Modality::Video,
-                    input::InputPayload::Embeddings(embeddings),
-                ) => {
-                    token_storage.push(input::token_ids_array(
-                        &vec![0; usize::try_from(embeddings.dim(1)).unwrap_or_default()],
-                        stream,
-                    )?);
-                    kinds.push(Kind::Projected(token_storage.len() - 1, original));
-                }
-                (modality, _) => {
-                    return Err(Error::Parallel(format!(
-                        "Qwen3.5 does not support this {} payload",
-                        modality.as_str()
-                    )))
                 }
             }
         }
@@ -1245,51 +1237,40 @@ impl QwenHybridModel {
             Video(usize, usize),
         }
         let mut kinds = Vec::new();
-        for part in typed.parts {
-            match (part.modality, part.payload) {
-                (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+        for (original, part) in typed.parts.iter().copied().enumerate() {
+            match qwen_hybrid_input_plan(&self.parsed, part)? {
+                QwenHybridInputPartPlan::TextTokens { .. } => {
+                    let input::InputPayload::TokenIds(tokens) = part.payload else {
+                        unreachable!()
+                    };
                     token_storage.push(tokens.clone());
                     kinds.push(Kind::Text(token_storage.len() - 1));
                 }
-                (input::Modality::Text, input::InputPayload::Embeddings(embeddings)) => {
+                QwenHybridInputPartPlan::Projected { .. } => {
+                    let input::InputPayload::Embeddings(embeddings) = part.payload else {
+                        unreachable!()
+                    };
                     token_storage.push(input::token_ids_array(
                         &vec![0; usize::try_from(embeddings.dim(1)).unwrap_or_default()],
                         stream,
                     )?);
-                    kinds.push(Kind::Projected(token_storage.len() - 1, kinds.len()));
+                    kinds.push(Kind::Projected(token_storage.len() - 1, original));
                 }
-                (
-                    modality @ (input::Modality::Image | input::Modality::Video),
-                    input::InputPayload::Tensor(tensor),
-                ) => {
-                    let ingress = super::qwen_media_ingress(
-                        modality,
-                        tensor,
-                        part.metadata,
-                        stream,
-                        |input| {
-                            eredu_architectures::media_plan::qwen_hybrid_ingress(
-                                &self.parsed,
-                                input,
-                            )
-                        },
-                    )?;
+                QwenHybridInputPartPlan::Media { ingress, .. } => {
+                    let input::InputPayload::Tensor(tensor) = part.payload else {
+                        unreachable!()
+                    };
+                    let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
                     token_storage.push(ingress.tokens);
                     grids.push(ingress.patch_grid);
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if modality == input::Modality::Image {
+                    kinds.push(if part.modality == input::Modality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
                     });
-                }
-                (modality, _) => {
-                    return Err(Exception::custom(format!(
-                        "Qwen3.5 does not support this {} payload",
-                        modality.as_str()
-                    )))
                 }
             }
         }

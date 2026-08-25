@@ -2888,6 +2888,17 @@ trait PipelinePartitionMetadata {
         })
     }
 
+    fn qwen_hybrid_input_part_plan(
+        &self,
+        _input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    {
+        Err(eredu_core::CapabilityError::UnsupportedInput {
+            architecture: self.model_kind().canonical_name().into(),
+            reason: "Qwen hybrid input admission requested for another architecture".into(),
+        })
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         eredu_runtime::NoAuxiliaryBoundary
             .wire_schema()
@@ -8704,6 +8715,14 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         )
     }
 
+    fn qwen_hybrid_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::qwen_hybrid_input_part(self.args(), input)
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
             .auxiliary_boundary()
@@ -9933,6 +9952,14 @@ impl PipelineModel {
     ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
     {
         self.stage.qwen_vl_input_part_plan(input)
+    }
+
+    pub(in crate::composition::mlx) fn qwen_hybrid_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    {
+        self.stage.qwen_hybrid_input_part_plan(input)
     }
 
     /// Returns stage-local disk-stream observations when enabled.
@@ -19040,6 +19067,14 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
         eredu_architectures::capability::qwen_hybrid_text(self.args())
+    }
+
+    fn qwen_hybrid_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::qwen_hybrid_text_input_part(self.args(), input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {

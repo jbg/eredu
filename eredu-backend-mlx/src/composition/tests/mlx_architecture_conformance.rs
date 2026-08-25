@@ -612,10 +612,22 @@ fn neutral_qwen35_conditional_forward_executes_on_mlx() {
     .unwrap();
     let text_tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
     let image_tokens = MlxTensor::from_array(Array::from_slice(&[30_u32], &[1, 1]));
+    let projected_image_tokens = MlxTensor::from_array(Array::from_slice(&[0_u32], &[1, 1]));
+    let projected_image = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 16], &[1, 1, 16]));
+    let projected_video_tokens = MlxTensor::from_array(Array::from_slice(&[0_u32], &[1, 1]));
+    let projected_video = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 16], &[1, 1, 16]));
     let grid = [(1, 2, 2)];
     let pixels = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 96], &[4, 24]));
     let parts = [
         eredu_architectures::qwen::vl::InputPart::Text(&text_tokens),
+        eredu_architectures::qwen::vl::InputPart::Projected {
+            tokens: &projected_image_tokens,
+            embeddings: &projected_image,
+        },
+        eredu_architectures::qwen::vl::InputPart::Projected {
+            tokens: &projected_video_tokens,
+            embeddings: &projected_video,
+        },
         eredu_architectures::qwen::vl::InputPart::Image {
             tokens: &image_tokens,
             grid: &grid,
@@ -631,7 +643,7 @@ fn neutral_qwen35_conditional_forward_executes_on_mlx() {
             pixels: Some(&pixels),
             mask: None,
         },
-        &[1, 3, 32],
+        &[1, 5, 32],
         stream
     );
 }

@@ -777,6 +777,17 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    pub(super) fn qwen_hybrid_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenHybridInputPartPlan, eredu_core::CapabilityError>
+    {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.qwen_hybrid_input_part_plan(input),
+            MlxSessionKind::Pipeline(model, _) => model.qwen_hybrid_input_part_plan(input),
+        }
+    }
+
     pub(super) fn speculative_parts_mut(
         &mut self,
     ) -> Result<MlxSpeculativeSessionParts<'_, 'a>, Error> {

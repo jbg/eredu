@@ -12,10 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::{
-    media_plan::{MediaMetadata, MediaModality, PreparedMediaInput, QwenVisionIngressPlan},
-    qwen::ModelArgs,
-};
+use eredu_architectures::{media_plan::QwenVisionIngressPlan, qwen::ModelArgs};
 use eredu_nn::RoutedNeuralBackend;
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, ops::GgufCheckpoint, Array, Stream};
 
@@ -65,56 +62,6 @@ fn materialize_qwen_media_ingress(
         tokens,
         patch_grid: plan.patch_grid,
     })
-}
-
-fn qwen_media_ingress(
-    modality: input::Modality,
-    tensor: &Array,
-    metadata: input::InputMetadata<'_>,
-    stream: &Stream,
-    plan: impl FnOnce(&PreparedMediaInput) -> Result<QwenVisionIngressPlan, eredu_core::CapabilityError>,
-) -> Result<MaterializedQwenIngress, Exception> {
-    let modality = match modality {
-        input::Modality::Image => MediaModality::Image,
-        input::Modality::Video => MediaModality::Video,
-        input::Modality::Text | input::Modality::Audio => {
-            return Err(Exception::custom(
-                "Qwen vision ingress requires image or video input",
-            ))
-        }
-    };
-    let array_shape = |array: &Array| {
-        array
-            .shape()
-            .iter()
-            .map(|dimension| {
-                u64::try_from(*dimension)
-                    .map_err(|_| Exception::custom("prepared Qwen media dimension is negative"))
-            })
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let patch_grid = metadata
-        .patch_grid
-        .map(|array| {
-            let evaluated = array.evaluated()?;
-            let values = evaluated
-                .try_as_slice::<i32>()
-                .map_err(|error| Exception::custom(error.to_string()))?;
-            Ok::<_, Exception>(MediaMetadata {
-                shape: array_shape(array)?,
-                values: values.to_vec(),
-            })
-        })
-        .transpose()?;
-    let input = PreparedMediaInput {
-        modality,
-        payload_shape: array_shape(tensor)?,
-        patch_grid,
-        patch_positions: None,
-        audio_mask: None,
-    };
-    let plan = plan(&input).map_err(|error| Exception::custom(error.to_string()))?;
-    materialize_qwen_media_ingress(plan, stream)
 }
 
 pub mod expert {

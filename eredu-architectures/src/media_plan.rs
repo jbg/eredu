@@ -7,7 +7,7 @@
 use eredu_core::CapabilityError;
 
 use crate::qwen::{
-    hybrid::ParsedHybridConfig,
+    hybrid::{HybridConfig, ParsedHybridConfig},
     vision::{VisionAttentionPolicy, VisionConfig},
     vl::ModelArgs as QwenVlModelArgs,
 };
@@ -146,6 +146,30 @@ pub enum QwenVlInputPartPlan {
     },
     /// Decoder-width text embeddings supplied directly by the caller.
     ProjectedText {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Model-native image or video input.
+    Media {
+        /// Validated placeholder and patch-grid ingress.
+        ingress: QwenVisionIngressPlan,
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+}
+
+/// Qwen3.5/Qwen3-Next admission and execution plan for one prepared input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QwenHybridInputPartPlan {
+    /// Ordinary text token IDs.
+    TextTokens {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Decoder-width embeddings supplied directly by the caller.
+    Projected {
+        /// Semantic modality retained for capability accounting.
+        modality: PreparedInputModality,
         /// Decoder positions occupied by the part.
         positions: u64,
     },
@@ -581,7 +605,7 @@ pub fn qwen_vl_ingress(
     )
 }
 
-fn qwen_vl_sequence(
+fn qwen_batch_one_sequence(
     shape: &[u64],
     rank: usize,
     name: &str,
@@ -605,11 +629,11 @@ pub fn qwen_vl_input_part(
     match (&input.modality, &input.payload) {
         (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
             Ok(QwenVlInputPartPlan::TextTokens {
-                positions: qwen_vl_sequence(shape, 2, "text token IDs", &args.model_type)?,
+                positions: qwen_batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
             })
         }
         (PreparedInputModality::Text, PreparedInputPayload::Embeddings(shape)) => {
-            let positions = qwen_vl_sequence(shape, 3, "text embeddings", &args.model_type)?;
+            let positions = qwen_batch_one_sequence(shape, 3, "text embeddings", &args.model_type)?;
             let hidden = positive(args.text.hidden_size, "Qwen3-VL hidden size")?;
             if shape[2] != hidden {
                 return Err(unsupported(
@@ -659,19 +683,118 @@ pub fn qwen_vl_input_part(
     }
 }
 
-/// Validates prepared conditional Qwen3.5 media and derives its execution
-/// ingress policy.
-pub fn qwen_hybrid_ingress(
+fn qwen_hybrid_input_part_with_policy(
+    text: &HybridConfig,
+    vision: Option<&VisionConfig>,
+    image_token_id: Option<i32>,
+    video_token_id: Option<i32>,
+    input: &PreparedInputPart,
+) -> Result<QwenHybridInputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(QwenHybridInputPartPlan::TextTokens {
+                positions: qwen_batch_one_sequence(shape, 2, "text token IDs", &text.model_type)?,
+            })
+        }
+        (
+            modality @ (PreparedInputModality::Text
+            | PreparedInputModality::Image
+            | PreparedInputModality::Video),
+            PreparedInputPayload::Embeddings(shape),
+        ) => {
+            let positions = qwen_batch_one_sequence(
+                shape,
+                3,
+                &format!("{} embeddings", modality.as_str()),
+                &text.model_type,
+            )?;
+            let hidden = positive(text.hidden_size, "Qwen hybrid hidden size")?;
+            if shape[2] != hidden {
+                return Err(unsupported(
+                    &text.model_type,
+                    format!(
+                        "prepared {} embeddings must have hidden width {hidden}, got {shape:?}",
+                        modality.as_str()
+                    ),
+                ));
+            }
+            Ok(QwenHybridInputPartPlan::Projected {
+                modality: *modality,
+                positions,
+            })
+        }
+        (
+            PreparedInputModality::Image | PreparedInputModality::Video,
+            PreparedInputPayload::Tensor {
+                media: Some(media), ..
+            },
+        ) => {
+            let expected = if input.modality == PreparedInputModality::Image {
+                MediaModality::Image
+            } else {
+                MediaModality::Video
+            };
+            if media.modality != expected {
+                return Err(unsupported(
+                    &text.model_type,
+                    "prepared input modality disagrees with its media metadata",
+                ));
+            }
+            let (ingress, shape) = qwen_vision_ingress_with_shape(
+                vision,
+                image_token_id,
+                video_token_id,
+                media,
+                &text.model_type,
+            )?;
+            Ok(QwenHybridInputPartPlan::Media { ingress, shape })
+        }
+        (modality, payload) => Err(unsupported(
+            &text.model_type,
+            format!(
+                "Qwen hybrid does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
+}
+
+/// Validates one prepared conditional Qwen3.5 input part and derives the exact
+/// prefill and capability-accounting plan consumed by a concrete backend.
+pub fn qwen_hybrid_input_part(
     args: &ParsedHybridConfig,
-    input: &PreparedMediaInput,
-) -> Result<QwenVisionIngressPlan, CapabilityError> {
-    qwen_vision_ingress(
+    input: &PreparedInputPart,
+) -> Result<QwenHybridInputPartPlan, CapabilityError> {
+    qwen_hybrid_input_part_with_policy(
+        &args.text,
         args.vision.as_ref(),
         args.image_token_id,
         args.video_token_id,
         input,
-        &args.text.model_type,
     )
+}
+
+/// Validates one prepared text-only Qwen3.5/Qwen3-Next input part.
+pub fn qwen_hybrid_text_input_part(
+    args: &HybridConfig,
+    input: &PreparedInputPart,
+) -> Result<QwenHybridInputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(QwenHybridInputPartPlan::TextTokens {
+                positions: qwen_batch_one_sequence(shape, 2, "text token IDs", &args.model_type)?,
+            })
+        }
+        (modality, payload) => Err(unsupported(
+            &args.model_type,
+            format!(
+                "text-only Qwen hybrid does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
 }
 
 fn gemma_valid_patch_count(
@@ -1297,6 +1420,28 @@ mod tests {
         .unwrap()
     }
 
+    fn qwen_hybrid_args() -> ParsedHybridConfig {
+        crate::qwen::hybrid::model_args_from_config_value(&json!({
+            "model_type":"qwen3_5","image_token_id":30,"video_token_id":31,
+            "text_config":{
+                "model_type":"qwen3_5_text","vocab_size":32,"hidden_size":16,
+                "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+                "head_dim":4,"max_position_embeddings":64,"intermediate_size":32,
+                "linear_conv_kernel_dim":2,"linear_key_head_dim":4,
+                "linear_value_head_dim":4,"linear_num_key_heads":2,
+                "linear_num_value_heads":4,
+                "layer_types":["linear_attention","full_attention"],
+                "tie_word_embeddings":false
+            },
+            "vision_config":{
+                "depth":1,"hidden_size":8,"intermediate_size":16,"num_heads":2,
+                "num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":16
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn qwen_vl_admission_accepts_only_text_projected_embeddings() {
         let args = qwen_vl_args();
@@ -1315,6 +1460,55 @@ mod tests {
         };
         assert!(matches!(
             qwen_vl_input_part(&args, &non_text),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+    }
+
+    #[test]
+    fn qwen_hybrid_admission_accepts_projected_text_image_and_video() {
+        let args = qwen_hybrid_args();
+        for modality in [
+            PreparedInputModality::Text,
+            PreparedInputModality::Image,
+            PreparedInputModality::Video,
+        ] {
+            let projected = PreparedInputPart {
+                modality,
+                payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+            };
+            assert_eq!(
+                qwen_hybrid_input_part(&args, &projected).unwrap(),
+                QwenHybridInputPartPlan::Projected {
+                    modality,
+                    positions: 4,
+                }
+            );
+        }
+
+        let wrong_width = PreparedInputPart {
+            modality: PreparedInputModality::Image,
+            payload: PreparedInputPayload::Embeddings(vec![1, 4, 8]),
+        };
+        assert!(matches!(
+            qwen_hybrid_input_part(&args, &wrong_width),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+
+        let audio = PreparedInputPart {
+            modality: PreparedInputModality::Audio,
+            payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+        };
+        assert!(matches!(
+            qwen_hybrid_input_part(&args, &audio),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+
+        let projected_text = PreparedInputPart {
+            modality: PreparedInputModality::Text,
+            payload: PreparedInputPayload::Embeddings(vec![1, 4, 16]),
+        };
+        assert!(matches!(
+            qwen_hybrid_text_input_part(&args.text, &projected_text),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
     }
