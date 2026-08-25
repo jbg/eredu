@@ -41,7 +41,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::KimiLinear(kind, loaded)
+            Model::kimi_linear(kind, loaded)?
         }
         GgufArchitecture::DeepSeek2 => {
             let loaded = crate::composition::deepseek::load_gguf(
@@ -50,7 +50,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::DeepSeek(kind, Box::new(loaded))
+            Model::deepseek(kind, Box::new(loaded))?
         }
         GgufArchitecture::DeepSeek4 => {
             let loaded = crate::composition::deepseek::load_gguf(
@@ -59,7 +59,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::DeepSeek(kind, Box::new(loaded))
+            Model::deepseek(kind, Box::new(loaded))?
         }
         GgufArchitecture::GptOss => {
             let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_layerwise_model(
@@ -69,7 +69,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::GptOss(kind, loaded)
+            Model::gpt_oss(kind, loaded)?
         }
         GgufArchitecture::Inkling => {
             let loaded = crate::composition::inkling::load_gguf(
@@ -79,7 +79,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::Inkling(kind, loaded)
+            Model::inkling(kind, loaded)?
         }
         GgufArchitecture::Gemma4 => {
             let loaded = crate::composition::gemma4::load_gguf(
@@ -89,7 +89,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::Gemma4(kind, loaded)
+            Model::gemma4(kind, loaded)?
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let loaded = crate::composition::llama::load_llama_gguf_model(
@@ -99,7 +99,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::Llama(kind, loaded)
+            Model::llama(kind, loaded)?
         }
         GgufArchitecture::MuseGlimmer => {
             let projector = projector.ok_or_else(|| {
@@ -114,7 +114,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::MuseGlimmer(kind, loaded)
+            Model::muse_glimmer(kind, loaded)?
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let loaded = crate::composition::lfm2::load_lfm2_gguf_model(
@@ -124,7 +124,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::Lfm2(kind, loaded)
+            Model::lfm2(kind, loaded)?
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let loaded = crate::composition::nemotron_h::load_nemotron_h_gguf_model(
@@ -134,7 +134,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::NemotronH(kind, loaded)
+            Model::nemotron_h(kind, loaded)?
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let loaded = crate::composition::qwen::load_qwen_gguf_model(
@@ -144,7 +144,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            Model::Qwen(kind, loaded)
+            Model::qwen(kind, loaded)?
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let projector = projector.ok_or_else(|| {
@@ -161,9 +161,9 @@ fn materialize_gguf_model(
                 weights_stream,
             )?;
             let variant = if source.architecture() == GgufArchitecture::Qwen3VlMoe {
-                Model::Qwen3VlMoe(kind, loaded)
+                Model::qwen3_vl_moe(kind, loaded)?
             } else {
-                Model::Qwen3Vl(kind, loaded)
+                Model::qwen3_vl(kind, loaded)?
             };
             variant
         }
@@ -177,9 +177,9 @@ fn materialize_gguf_model(
                 weights_stream,
             )?;
             let model = if source.architecture() == GgufArchitecture::Qwen3Next {
-                Model::Qwen3Next(kind, loaded)
+                Model::qwen3_next(kind, loaded)?
             } else {
-                Model::Qwen35(kind, loaded)
+                Model::qwen35(kind, loaded)?
             };
             model
         }
@@ -553,7 +553,7 @@ fn materialize_tensor_parallel(
         ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Err(Error::Parallel(
             "DeepSeek tensor parallelism requires distributed-stage materialization".into(),
         )),
-        ModelKind::Gemma4 => Ok(Model::Gemma4(
+        ModelKind::Gemma4 => Ok(Model::gemma4(
             kind,
             crate::composition::gemma4::load_safetensors_tensor_parallel(
                 artifact,
@@ -562,8 +562,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::GptOss => Ok(Model::GptOss(
+        )?),
+        ModelKind::GptOss => Ok(Model::gpt_oss(
             kind,
             crate::composition::gpt_oss::load_gpt_oss_tensor_parallel_model(
                 artifact,
@@ -572,8 +572,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Inkling => Ok(Model::Inkling(
+        )?),
+        ModelKind::Inkling => Ok(Model::inkling(
             kind,
             crate::composition::inkling::load_safetensors_tensor_parallel(
                 artifact,
@@ -582,8 +582,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::KimiLinear => Ok(Model::KimiLinear(
+        )?),
+        ModelKind::KimiLinear => Ok(Model::kimi_linear(
             kind,
             crate::composition::kimi_linear::load_kimi_linear_tensor_parallel_model(
                 artifact,
@@ -592,8 +592,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Llama => Ok(Model::Llama(
+        )?),
+        ModelKind::Llama => Ok(Model::llama(
             kind,
             crate::composition::llama::load_llama_tensor_parallel_model(
                 artifact,
@@ -602,8 +602,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
+        )?),
+        ModelKind::MuseGlimmer => Ok(Model::muse_glimmer(
             kind,
             crate::composition::muse_glimmer::load_safetensors_tensor_parallel(
                 artifact,
@@ -612,8 +612,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Lfm2 => Ok(Model::Lfm2(
+        )?),
+        ModelKind::Lfm2 => Ok(Model::lfm2(
             kind,
             crate::composition::lfm2::load_lfm2_tensor_parallel_model(
                 artifact,
@@ -622,8 +622,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::NemotronH => Ok(Model::NemotronH(
+        )?),
+        ModelKind::NemotronH => Ok(Model::nemotron_h(
             kind,
             crate::composition::nemotron_h::load_nemotron_h_tensor_parallel_model(
                 artifact,
@@ -632,8 +632,8 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::Qwen(
+        )?),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::qwen(
             kind,
             crate::composition::qwen::load_qwen_tensor_parallel_model(
                 artifact,
@@ -642,7 +642,7 @@ fn materialize_tensor_parallel(
                 stream,
                 weights_stream,
             )?,
-        )),
+        )?),
         ModelKind::Qwen3Next => Err(Error::ArchitectureModel(
             "neutral Qwen hybrid tensor-parallel binding is not initialized".into(),
         )),
@@ -755,7 +755,7 @@ fn materialize_gguf_tensor_parallel(
                     stream,
                     weights_stream,
                 )?;
-            Ok(Model::KimiLinear(kind, model))
+            Model::kimi_linear(kind, model)
         }
         GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => Err(Error::Parallel(
             "DeepSeek GGUF tensor parallelism requires distributed-stage materialization".into(),
@@ -768,7 +768,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::GptOss(kind, model))
+            Model::gpt_oss(kind, model)
         }
         GgufArchitecture::Inkling => {
             let model = crate::composition::inkling::load_gguf_tensor_parallel(
@@ -779,7 +779,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::Inkling(kind, model))
+            Model::inkling(kind, model)
         }
         GgufArchitecture::Gemma4 => {
             let model = crate::composition::gemma4::load_gguf_tensor_parallel(
@@ -790,7 +790,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::Gemma4(kind, model))
+            Model::gemma4(kind, model)
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let model = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
@@ -800,7 +800,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::Llama(kind, model))
+            Model::llama(kind, model)
         }
         GgufArchitecture::MuseGlimmer => {
             let projector = projector.ok_or_else(|| {
@@ -816,7 +816,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::MuseGlimmer(kind, model))
+            Model::muse_glimmer(kind, model)
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let model = crate::composition::lfm2::load_lfm2_gguf_tensor_parallel_model(
@@ -826,7 +826,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::Lfm2(kind, model))
+            Model::lfm2(kind, model)
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let model = crate::composition::nemotron_h::load_nemotron_h_gguf_tensor_parallel_model(
@@ -836,7 +836,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::NemotronH(kind, model))
+            Model::nemotron_h(kind, model)
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let model = crate::composition::qwen::load_qwen_gguf_tensor_parallel_model(
@@ -846,7 +846,7 @@ fn materialize_gguf_tensor_parallel(
                 stream,
                 weights_stream,
             )?;
-            Ok(Model::Qwen(kind, model))
+            Model::qwen(kind, model)
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => Err(Error::ArchitectureModel(
             "neutral Qwen3-VL GGUF tensor-parallel binding is not initialized".into(),
@@ -924,7 +924,7 @@ pub(super) fn materialize_safetensors(
         options.weight_residency.non_experts(),
     ) {
         return match kind {
-            ModelKind::KimiLinear => Ok(Model::KimiLinear(kind,
+            ModelKind::KimiLinear => Ok(Model::kimi_linear(kind,
                 crate::composition::kimi_linear::load_kimi_linear_model(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -935,9 +935,9 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
+            )?),
             ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => {
-                Ok(Model::DeepSeek(kind, Box::new(
+                Ok(Model::deepseek(kind, Box::new(
                     crate::composition::deepseek::load_safetensors(
                         artifact,
                         eredu_runtime::WeightResidency::with_expert_cache(
@@ -948,14 +948,14 @@ pub(super) fn materialize_safetensors(
                         stream,
                         weights_stream,
                     )?,
-                )))
+                ))?)
             }
-            ModelKind::GptOss => Ok(Model::GptOss(kind,
+            ModelKind::GptOss => Ok(Model::gpt_oss(kind,
                 crate::composition::gpt_oss::load_gpt_oss_expert_cache_model(
                     artifact, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
-            )),
-            ModelKind::Gemma4 => Ok(Model::Gemma4(kind,
+            )?),
+            ModelKind::Gemma4 => Ok(Model::gemma4(kind,
                 crate::composition::gemma4::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -966,8 +966,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::Inkling => Ok(Model::Inkling(kind,
+            )?),
+            ModelKind::Inkling => Ok(Model::inkling(kind,
                 crate::composition::inkling::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -978,8 +978,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2(kind,
+            )?),
+            ModelKind::Lfm2 => Ok(Model::lfm2(kind,
                 crate::composition::lfm2::load_lfm2_model(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
@@ -987,8 +987,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(kind,
+            )?),
+            ModelKind::MuseGlimmer => Ok(Model::muse_glimmer(kind,
                 crate::composition::muse_glimmer::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -999,8 +999,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::NemotronH => Ok(Model::NemotronH(kind,
+            )?),
+            ModelKind::NemotronH => Ok(Model::nemotron_h(kind,
                 crate::composition::nemotron_h::load_nemotron_h_model(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
@@ -1008,11 +1008,11 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
+            )?),
             ModelKind::Qwen2 => Err(Error::ArchitectureModel(
                 "Qwen2 is dense and does not support sparse expert-cache residency".into(),
             )),
-            ModelKind::Qwen3 => Ok(Model::Qwen(kind,
+            ModelKind::Qwen3 => Ok(Model::qwen(kind,
                 crate::composition::qwen::load_qwen_safetensors_mlx(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
@@ -1020,8 +1020,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(kind,
+            )?),
+            ModelKind::Qwen3Next => Ok(Model::qwen3_next(kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -1032,8 +1032,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(kind,
+            )?),
+            ModelKind::Qwen3VlMoe => Ok(Model::qwen3_vl_moe(kind,
                 crate::composition::qwen::vl::load_safetensors_with_residency(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -1044,8 +1044,8 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
-            ModelKind::Qwen35 => Ok(Model::Qwen35(kind,
+            )?),
+            ModelKind::Qwen35 => Ok(Model::qwen35(kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(
@@ -1056,7 +1056,7 @@ pub(super) fn materialize_safetensors(
                     stream,
                     weights_stream,
                 )?,
-            )),
+            )?),
             _ => Err(Error::ArchitectureModel(format!(
                 "independent expert caching requires a supported safetensors MoE architecture, not {}",
                 kind.canonical_name()
@@ -1068,7 +1068,7 @@ pub(super) fn materialize_safetensors(
         quantization.validate()?;
     }
     match kind {
-        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Ok(Model::DeepSeek(
+        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Ok(Model::deepseek(
             kind,
             Box::new(crate::composition::deepseek::load_safetensors(
                 artifact,
@@ -1077,8 +1077,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?),
-        )),
-        ModelKind::Gemma4 => Ok(Model::Gemma4(
+        )?),
+        ModelKind::Gemma4 => Ok(Model::gemma4(
             kind,
             crate::composition::gemma4::load_safetensors(
                 artifact,
@@ -1087,8 +1087,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Inkling => Ok(Model::Inkling(
+        )?),
+        ModelKind::Inkling => Ok(Model::inkling(
             kind,
             crate::composition::inkling::load_safetensors(
                 artifact,
@@ -1097,8 +1097,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::KimiLinear => Ok(Model::KimiLinear(
+        )?),
+        ModelKind::KimiLinear => Ok(Model::kimi_linear(
             kind,
             crate::composition::kimi_linear::load_kimi_linear_model(
                 artifact,
@@ -1107,8 +1107,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Llama => Ok(Model::Llama(
+        )?),
+        ModelKind::Llama => Ok(Model::llama(
             kind,
             crate::composition::llama::load_llama_safetensors_mlx(
                 artifact,
@@ -1117,8 +1117,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
+        )?),
+        ModelKind::MuseGlimmer => Ok(Model::muse_glimmer(
             kind,
             crate::composition::muse_glimmer::load_safetensors(
                 artifact,
@@ -1127,8 +1127,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::Qwen(
+        )?),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::qwen(
             kind,
             crate::composition::qwen::load_qwen_safetensors_mlx(
                 artifact,
@@ -1137,8 +1137,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::GptOss => Ok(Model::GptOss(
+        )?),
+        ModelKind::GptOss => Ok(Model::gpt_oss(
             kind,
             crate::composition::gpt_oss::load_gpt_oss_layerwise_model(
                 artifact,
@@ -1147,8 +1147,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Lfm2 => Ok(Model::Lfm2(
+        )?),
+        ModelKind::Lfm2 => Ok(Model::lfm2(
             kind,
             crate::composition::lfm2::load_lfm2_model(
                 artifact,
@@ -1157,8 +1157,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::NemotronH => Ok(Model::NemotronH(
+        )?),
+        ModelKind::NemotronH => Ok(Model::nemotron_h(
             kind,
             crate::composition::nemotron_h::load_nemotron_h_model(
                 artifact,
@@ -1167,8 +1167,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
+        )?),
+        ModelKind::Qwen3Next => Ok(Model::qwen3_next(
             kind,
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
@@ -1177,8 +1177,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
+        )?),
+        ModelKind::Qwen3Vl => Ok(Model::qwen3_vl(
             kind,
             crate::composition::qwen::vl::load_safetensors(
                 artifact,
@@ -1187,8 +1187,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
+        )?),
+        ModelKind::Qwen3VlMoe => Ok(Model::qwen3_vl_moe(
             kind,
             crate::composition::qwen::vl::load_safetensors(
                 artifact,
@@ -1197,8 +1197,8 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
-        ModelKind::Qwen35 => Ok(Model::Qwen35(
+        )?),
+        ModelKind::Qwen35 => Ok(Model::qwen35(
             kind,
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
@@ -1207,7 +1207,7 @@ pub(super) fn materialize_safetensors(
                 stream,
                 weights_stream,
             )?,
-        )),
+        )?),
         ModelKind::Moshi => Err(Error::ArchitectureModel(
             "Moshi-family bounded layer residency is selected through the realtime loader".into(),
         )),
