@@ -1644,13 +1644,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_v4_uniform_arrays_and_compression_schedule_from_gguf() {
+    fn v4_gguf_retains_compression_and_embedded_draft_depth() {
         let metadata = HashMap::from([
             (
                 "general.architecture".into(),
                 MetadataValue::String("deepseek4".into()),
             ),
             ("deepseek4.block_count".into(), MetadataValue::Uint32(3)),
+            (
+                "deepseek4.nextn_predict_layers".into(),
+                MetadataValue::Uint32(1),
+            ),
             (
                 "deepseek4.attention.compress_ratios".into(),
                 MetadataValue::Array(MetadataArray::Int32(vec![0, 4, 0])),
@@ -1771,11 +1775,30 @@ mod tests {
             ),
         ]);
         let args = parse_v4_gguf(&metadata).unwrap();
+        assert_eq!(args.num_hidden_layers, 2);
+        assert_eq!(args.num_nextn_predict_layers, 1);
         assert_eq!(
             args.attention_policy(1),
             Some(V4AttentionPolicy::Compressed { ratio: 4 })
         );
         assert_eq!(args.expert_format, ExpertFormat::MxFp4);
         assert_eq!(args.swiglu_limit.unwrap().gate_upper_bound(), Some(7.0));
+
+        let checkpoint = eredu_checkpoint::schema::GgufCheckpointPlan::new(
+            "validated test checkpoint",
+            Vec::new(),
+            Vec::new(),
+            eredu_checkpoint::schema::CatalogPolicy::strict(),
+        )
+        .unwrap();
+        let plan = crate::configuration::GgufArchitecturePlan::new(
+            crate::GgufArchitecture::DeepSeek4,
+            crate::configuration::GgufModelConfig::DeepSeekV4(args),
+            checkpoint,
+        );
+        assert_eq!(
+            crate::preparation::prepared_gguf_capabilities(&plan).embedded_draft_layers(),
+            Some(1)
+        );
     }
 }
