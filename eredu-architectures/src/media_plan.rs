@@ -57,6 +57,65 @@ pub struct PreparedMediaInput {
     pub audio_mask: Option<MediaMetadata<bool>>,
 }
 
+/// Modality of one prepared model-input part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedInputModality {
+    /// Token or projected text input.
+    Text,
+    /// Still-image input.
+    Image,
+    /// Audio input.
+    Audio,
+    /// Video input.
+    Video,
+}
+
+impl PreparedInputModality {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+/// Backend-neutral payload facts for one prepared model-input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedInputPayload {
+    /// Token IDs with their logical shape.
+    TokenIds(Vec<u64>),
+    /// Already-projected embeddings with their logical shape.
+    Embeddings(Vec<u64>),
+    /// A model-native tensor and any available media metadata.
+    Tensor {
+        /// Logical tensor shape.
+        shape: Vec<u64>,
+        /// Media geometry for a non-text modality.
+        media: Option<PreparedMediaInput>,
+    },
+}
+
+impl PreparedInputPayload {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::TokenIds(_) => "token-ID",
+            Self::Embeddings(_) => "embedding",
+            Self::Tensor { .. } => "tensor",
+        }
+    }
+}
+
+/// Backend-neutral description of one prepared model-input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedInputPart {
+    /// Semantic modality attached to the part.
+    pub modality: PreparedInputModality,
+    /// Payload representation and logical shape or metadata.
+    pub payload: PreparedInputPayload,
+}
+
 /// Architecture-derived geometry and conservative execution workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaShapePlan {
@@ -75,6 +134,28 @@ pub struct QwenVisionIngressPlan {
     pub placeholder_count: u64,
     /// Validated `(time, height, width)` rows consumed by Qwen position policy.
     pub patch_grid: Vec<(i32, i32, i32)>,
+}
+
+/// Qwen3-VL admission and execution plan for one prepared input part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QwenVlInputPartPlan {
+    /// Ordinary text token IDs.
+    TextTokens {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Decoder-width text embeddings supplied directly by the caller.
+    ProjectedText {
+        /// Decoder positions occupied by the part.
+        positions: u64,
+    },
+    /// Model-native image or video input.
+    Media {
+        /// Validated placeholder and patch-grid ingress.
+        ingress: QwenVisionIngressPlan,
+        /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
 }
 
 /// Architecture-owned Inkling ingress policy for one prepared tensor.
@@ -437,13 +518,13 @@ pub fn qwen_hybrid_vision(
         .and_then(|config| qwen_vision(config, input, architecture))
 }
 
-fn qwen_vision_ingress(
+fn qwen_vision_ingress_with_shape(
     config: Option<&VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     input: &PreparedMediaInput,
     architecture: &str,
-) -> Result<QwenVisionIngressPlan, CapabilityError> {
+) -> Result<(QwenVisionIngressPlan, MediaShapePlan), CapabilityError> {
     let shape = qwen_hybrid_vision(config, input, architecture)?;
     let token_id = match input.modality {
         MediaModality::Image => image_token_id,
@@ -465,11 +546,25 @@ fn qwen_vision_ingress(
         .chunks_exact(3)
         .map(|row| (row[0], row[1], row[2]))
         .collect();
-    Ok(QwenVisionIngressPlan {
-        placeholder_token_id,
-        placeholder_count: shape.decoder_positions,
-        patch_grid,
-    })
+    Ok((
+        QwenVisionIngressPlan {
+            placeholder_token_id,
+            placeholder_count: shape.decoder_positions,
+            patch_grid,
+        },
+        shape,
+    ))
+}
+
+fn qwen_vision_ingress(
+    config: Option<&VisionConfig>,
+    image_token_id: Option<i32>,
+    video_token_id: Option<i32>,
+    input: &PreparedMediaInput,
+    architecture: &str,
+) -> Result<QwenVisionIngressPlan, CapabilityError> {
+    qwen_vision_ingress_with_shape(config, image_token_id, video_token_id, input, architecture)
+        .map(|(ingress, _)| ingress)
 }
 
 /// Validates prepared Qwen3-VL media and derives its execution ingress policy.
@@ -484,6 +579,84 @@ pub fn qwen_vl_ingress(
         input,
         &args.model_type,
     )
+}
+
+fn qwen_vl_sequence(
+    shape: &[u64],
+    rank: usize,
+    name: &str,
+    architecture: &str,
+) -> Result<u64, CapabilityError> {
+    if shape.len() != rank || shape.first() != Some(&1) || shape.get(1).copied().unwrap_or(0) == 0 {
+        return Err(unsupported(
+            architecture,
+            format!("prepared {name} must be batch-one with rank {rank}, got {shape:?}"),
+        ));
+    }
+    Ok(shape[1])
+}
+
+/// Validates one prepared Qwen3-VL part and derives the exact prefill and
+/// capability-accounting plan consumed by a concrete backend.
+pub fn qwen_vl_input_part(
+    args: &QwenVlModelArgs,
+    input: &PreparedInputPart,
+) -> Result<QwenVlInputPartPlan, CapabilityError> {
+    match (&input.modality, &input.payload) {
+        (PreparedInputModality::Text, PreparedInputPayload::TokenIds(shape)) => {
+            Ok(QwenVlInputPartPlan::TextTokens {
+                positions: qwen_vl_sequence(shape, 2, "text token IDs", &args.model_type)?,
+            })
+        }
+        (PreparedInputModality::Text, PreparedInputPayload::Embeddings(shape)) => {
+            let positions = qwen_vl_sequence(shape, 3, "text embeddings", &args.model_type)?;
+            let hidden = positive(args.text.hidden_size, "Qwen3-VL hidden size")?;
+            if shape[2] != hidden {
+                return Err(unsupported(
+                    &args.model_type,
+                    format!(
+                        "prepared text embeddings must have hidden width {hidden}, got {:?}",
+                        shape
+                    ),
+                ));
+            }
+            Ok(QwenVlInputPartPlan::ProjectedText { positions })
+        }
+        (
+            PreparedInputModality::Image | PreparedInputModality::Video,
+            PreparedInputPayload::Tensor {
+                media: Some(media), ..
+            },
+        ) => {
+            let expected = if input.modality == PreparedInputModality::Image {
+                MediaModality::Image
+            } else {
+                MediaModality::Video
+            };
+            if media.modality != expected {
+                return Err(unsupported(
+                    &args.model_type,
+                    "prepared input modality disagrees with its media metadata",
+                ));
+            }
+            let (ingress, shape) = qwen_vision_ingress_with_shape(
+                Some(&args.vision),
+                Some(args.image_token_id),
+                Some(args.video_token_id),
+                media,
+                &args.model_type,
+            )?;
+            Ok(QwenVlInputPartPlan::Media { ingress, shape })
+        }
+        (modality, payload) => Err(unsupported(
+            &args.model_type,
+            format!(
+                "Qwen3-VL does not support a {} {} payload",
+                modality.as_str(),
+                payload.as_str()
+            ),
+        )),
+    }
 }
 
 /// Validates prepared conditional Qwen3.5 media and derives its execution
@@ -1106,6 +1279,44 @@ mod tests {
             patch_positions: None,
             audio_mask: None,
         }
+    }
+
+    fn qwen_vl_args() -> QwenVlModelArgs {
+        crate::qwen::vl::model_args_from_config_value(&json!({
+            "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
+            "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":64, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.000001,
+                "vocab_size":64, "max_position_embeddings":128, "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}},
+            "vision_config":{"depth":1,"hidden_size":16,"intermediate_size":24,
+                "num_heads":4,"num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn qwen_vl_admission_accepts_only_text_projected_embeddings() {
+        let args = qwen_vl_args();
+        let projected = PreparedInputPart {
+            modality: PreparedInputModality::Text,
+            payload: PreparedInputPayload::Embeddings(vec![1, 4, 32]),
+        };
+        assert_eq!(
+            qwen_vl_input_part(&args, &projected).unwrap(),
+            QwenVlInputPartPlan::ProjectedText { positions: 4 }
+        );
+
+        let non_text = PreparedInputPart {
+            modality: PreparedInputModality::Image,
+            payload: PreparedInputPayload::Embeddings(vec![1, 4, 32]),
+        };
+        assert!(matches!(
+            qwen_vl_input_part(&args, &non_text),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
     }
 
     #[test]

@@ -325,6 +325,47 @@ pub fn prepared_media_input(
     })
 }
 
+/// Extracts the portable payload facts used by architecture input admission.
+pub fn prepared_input_part(
+    part: InputPart<'_>,
+) -> Result<eredu_architectures::media_plan::PreparedInputPart, Exception> {
+    use eredu_architectures::media_plan::{
+        PreparedInputModality, PreparedInputPart, PreparedInputPayload,
+    };
+
+    let shape = |array: &Array| {
+        array
+            .shape()
+            .iter()
+            .map(|dimension| {
+                u64::try_from(*dimension)
+                    .map_err(|_| Exception::custom("prepared input dimension is negative"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let modality = match part.modality {
+        Modality::Text => PreparedInputModality::Text,
+        Modality::Image => PreparedInputModality::Image,
+        Modality::Audio => PreparedInputModality::Audio,
+        Modality::Video => PreparedInputModality::Video,
+    };
+    let payload = match part.payload {
+        InputPayload::TokenIds(tokens) => PreparedInputPayload::TokenIds(shape(tokens)?),
+        InputPayload::Embeddings(embeddings) => {
+            PreparedInputPayload::Embeddings(shape(embeddings)?)
+        }
+        InputPayload::Tensor(tensor) => PreparedInputPayload::Tensor {
+            shape: shape(tensor)?,
+            media: if part.modality == Modality::Text {
+                None
+            } else {
+                Some(prepared_media_input(part.modality, tensor, part.metadata)?)
+            },
+        },
+    };
+    Ok(PreparedInputPart { modality, payload })
+}
+
 fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Exception> {
     if parts.is_empty() {
         return Err(Exception::custom("text input must contain token ids"));

@@ -2877,6 +2877,17 @@ trait PipelinePartitionMetadata {
         eredu_architectures::media_plan::text_only(self.model_kind().canonical_name(), input)
     }
 
+    fn qwen_vl_input_part_plan(
+        &self,
+        _input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
+    {
+        Err(eredu_core::CapabilityError::UnsupportedInput {
+            architecture: self.model_kind().canonical_name().into(),
+            reason: "Qwen3-VL input admission requested for another architecture".into(),
+        })
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         eredu_runtime::NoAuxiliaryBoundary
             .wire_schema()
@@ -7985,6 +7996,14 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         )
     }
 
+    fn qwen_vl_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
+    {
+        eredu_architectures::media_plan::qwen_vl_input_part(self.args(), input)
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
             .auxiliary_boundary()
@@ -9960,6 +9979,14 @@ impl PipelineModel {
         input: &eredu_architectures::media_plan::PreparedMediaInput,
     ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
         self.stage.prepared_media_plan(input)
+    }
+
+    pub(in crate::composition::mlx) fn qwen_vl_input_part_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedInputPart,
+    ) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, eredu_core::CapabilityError>
+    {
+        self.stage.qwen_vl_input_part_plan(input)
     }
 
     /// Returns stage-local disk-stream observations when enabled.

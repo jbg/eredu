@@ -53,6 +53,20 @@ struct MaterializedQwenIngress {
     patch_grid: Vec<(i32, i32, i32)>,
 }
 
+fn materialize_qwen_media_ingress(
+    plan: QwenVisionIngressPlan,
+    stream: &Stream,
+) -> Result<MaterializedQwenIngress, Exception> {
+    let placeholder_count = usize::try_from(plan.placeholder_count)
+        .map_err(|_| Exception::custom("Qwen media placeholder span exceeds host capacity"))?;
+    let tokens =
+        input::token_ids_array(&vec![plan.placeholder_token_id; placeholder_count], stream)?;
+    Ok(MaterializedQwenIngress {
+        tokens,
+        patch_grid: plan.patch_grid,
+    })
+}
+
 fn qwen_media_ingress(
     modality: input::Modality,
     tensor: &Array,
@@ -100,14 +114,7 @@ fn qwen_media_ingress(
         audio_mask: None,
     };
     let plan = plan(&input).map_err(|error| Exception::custom(error.to_string()))?;
-    let placeholder_count = usize::try_from(plan.placeholder_count)
-        .map_err(|_| Exception::custom("Qwen media placeholder span exceeds host capacity"))?;
-    let tokens =
-        input::token_ids_array(&vec![plan.placeholder_token_id; placeholder_count], stream)?;
-    Ok(MaterializedQwenIngress {
-        tokens,
-        patch_grid: plan.patch_grid,
-    })
+    materialize_qwen_media_ingress(plan, stream)
 }
 
 pub mod expert {

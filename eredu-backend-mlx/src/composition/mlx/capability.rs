@@ -3,7 +3,8 @@
 use std::num::NonZeroU8;
 
 use eredu_architectures::media_plan::{
-    self, MediaMetadata, MediaModality, MediaShapePlan, PreparedMediaInput,
+    self, MediaMetadata, MediaModality, MediaShapePlan, PreparedInputModality, PreparedInputPart,
+    PreparedInputPayload, PreparedMediaInput, QwenVlInputPartPlan,
 };
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
@@ -188,6 +189,30 @@ fn prepared_media_input(
     })
 }
 
+fn prepared_input_part(part: input::InputPart<'_>) -> Result<PreparedInputPart, CapabilityError> {
+    let modality = match part.modality {
+        Modality::Text => PreparedInputModality::Text,
+        Modality::Image => PreparedInputModality::Image,
+        Modality::Audio => PreparedInputModality::Audio,
+        Modality::Video => PreparedInputModality::Video,
+    };
+    let payload = match part.payload {
+        InputPayload::TokenIds(tokens) => PreparedInputPayload::TokenIds(array_shape(tokens)?),
+        InputPayload::Embeddings(embeddings) => {
+            PreparedInputPayload::Embeddings(array_shape(embeddings)?)
+        }
+        InputPayload::Tensor(tensor) => PreparedInputPayload::Tensor {
+            shape: array_shape(tensor)?,
+            media: if part.modality == Modality::Text {
+                None
+            } else {
+                Some(prepared_media_input(part.modality, tensor, part.metadata)?)
+            },
+        },
+    };
+    Ok(PreparedInputPart { modality, payload })
+}
+
 fn array_bytes(array: &Array, operation: &'static str) -> Result<u64, CapabilityError> {
     u64::try_from(array.nbytes()).map_err(|_| CapabilityError::ArithmeticOverflow { operation })
 }
@@ -222,6 +247,21 @@ impl Model {
             | Self::Qwen(_, _) => media_plan::text_only(self.effective_model_type(), input),
         }
     }
+
+    pub(super) fn qwen_vl_input_part_plan(
+        &self,
+        input: &PreparedInputPart,
+    ) -> Result<QwenVlInputPartPlan, CapabilityError> {
+        match self {
+            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
+                media_plan::qwen_vl_input_part(model.args(), input)
+            }
+            _ => Err(CapabilityError::UnsupportedInput {
+                architecture: self.effective_model_type().into(),
+                reason: "Qwen3-VL input admission requested for another architecture".into(),
+            }),
+        }
+    }
 }
 fn prepared_media_accounting(
     session: &MlxModelSession<'_>,
@@ -231,6 +271,14 @@ fn prepared_media_accounting(
 ) -> Result<(u64, u64), CapabilityError> {
     let input = prepared_media_input(modality, payload, metadata)?;
     let plan = session.prepared_media_plan(&input)?;
+    prepared_media_accounting_with_plan(payload, metadata, &plan)
+}
+
+fn prepared_media_accounting_with_plan(
+    payload: &Array,
+    metadata: input::InputMetadata<'_>,
+    plan: &MediaShapePlan,
+) -> Result<(u64, u64), CapabilityError> {
     let mut input_bytes = array_bytes(payload, "prepared media payload bytes")?;
     for array in [
         metadata.patch_grid,
@@ -276,7 +324,35 @@ pub fn count_prepared_input(
     let mut media_positions = 0u64;
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
-    for part in prepared.parts {
+    let qwen_vl = matches!(
+        session.model_family(),
+        eredu_architectures::ModelKind::Qwen3Vl | eredu_architectures::ModelKind::Qwen3VlMoe
+    );
+    for &part in prepared.parts {
+        if qwen_vl {
+            match session.qwen_vl_input_part_plan(&prepared_input_part(part)?)? {
+                QwenVlInputPartPlan::TextTokens { positions }
+                | QwenVlInputPartPlan::ProjectedText { positions } => {
+                    text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
+                }
+                QwenVlInputPartPlan::Media { shape, .. } => {
+                    let InputPayload::Tensor(tensor) = part.payload else {
+                        unreachable!()
+                    };
+                    let (positions, workspace_bytes) =
+                        prepared_media_accounting_with_plan(tensor, part.metadata, &shape)?;
+                    media_positions =
+                        checked_add(media_positions, positions, "prepared media-position total")?;
+                    media_execution_workspace_bytes = checked_add(
+                        media_execution_workspace_bytes,
+                        workspace_bytes,
+                        "prepared media-workspace total",
+                    )?;
+                    media_execution_workspace_kind = ObservationKind::Conservative;
+                }
+            }
+            continue;
+        }
         match (part.modality, part.payload) {
             (Modality::Text, InputPayload::TokenIds(tokens)) => {
                 if tokens.ndim() != 2 || tokens.dim(0) != 1 {
