@@ -13,7 +13,7 @@ use eredu_checkpoint::{
         StoredDtypeConstraint, TensorOperation,
     },
     validation::{validate_gguf_plan, validate_matching_gguf_encodings, CheckpointValidation},
-    LinearFormat, StoredDtype,
+    LinearFormat, StoredDtype, WeightQuantization,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 
@@ -21,6 +21,20 @@ use super::config::ModelArgs;
 
 const MXFP4_GROUP_SIZE: usize = 32;
 const MXFP4_BLOCK_BYTES: usize = 16;
+
+/// Derives a GPT-OSS configuration whose ordinary dense matrix formats
+/// reflect load-time quantization while preserving native MXFP4 experts.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.quantization = Some(quantization);
+    target.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
 
 /// Builds the exact published GPT-OSS SafeTensors catalog.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
@@ -688,6 +702,23 @@ mod tests {
             "swiglu_limit": 7.0
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn load_time_quantization_replaces_dense_checkpoint_formats_only() {
+        let mut source = args();
+        source.quantized_weight_configs = Some(HashMap::from([(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            WeightQuantization::Affine(AffineQuantization::new(32, 8).unwrap()),
+        )]));
+        let requested = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
+
+        let target = load_time_quantization(&source, requested).unwrap();
+
+        assert_eq!(target.quantization, Some(requested));
+        assert_eq!(target.quantized_weight_configs, None);
+        assert_eq!(target.quantization_config.quant_method, "mxfp4");
+        assert!(source.quantized_weight_configs.is_some());
     }
 
     #[test]

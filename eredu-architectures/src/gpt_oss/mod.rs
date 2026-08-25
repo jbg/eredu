@@ -10,7 +10,8 @@ pub mod parallel;
 pub use block::{new_block, GptOssBlockFactory, TransformerBlock};
 pub use checkpoint::{
     expert_recipes, expert_residency_catalog, gguf_expert_quantization_targets, gguf_plan,
-    safetensors_expert_tensors, safetensors_plan, translate_gguf_weight_name, validate_gguf,
+    load_time_quantization, safetensors_expert_tensors, safetensors_plan,
+    translate_gguf_weight_name, validate_gguf,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,

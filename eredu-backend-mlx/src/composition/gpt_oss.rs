@@ -561,8 +561,9 @@ pub fn quantize_neutral_store(
     ),
     Error,
 > {
-    let mut target_args = source_args.clone();
-    target_args.quantization = Some(quantization);
+    let target_args =
+        eredu_architectures::gpt_oss::load_time_quantization(source_args, quantization)
+            .map_err(Error::ArchitectureModel)?;
     let source = eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(
         source_args.clone(),
         stream,

@@ -1468,20 +1468,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = source.clone();
-    target.text.weight_quantization = Some(quantization);
-    target.text.quantized_weights = None;
-    target.text.quantized_weight_configs = None;
-    if let Some(vision) = target.vision.as_mut() {
-        vision.weight_quantization = Some(quantization);
-        vision.quantized_weights = None;
-        vision.quantized_weight_configs = None;
-    }
-    if let Some(audio) = target.audio.as_mut() {
-        audio.weight_quantization = Some(quantization);
-        audio.quantized_weights = None;
-        audio.quantized_weight_configs = None;
-    }
+    let target = eredu_architectures::gemma4::load_time_quantization(source, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source_architecture = NeutralArchitecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)

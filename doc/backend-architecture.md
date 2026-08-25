@@ -266,6 +266,9 @@ than synthesizing family layer prefixes. Catalog policies declare any
 admitted checkpoint-only names by exact key, prefix, or suffix, and composite
 checkpoint schemas partition canonical projector formats by architecture-owned
 component identity; backend composition does not repeat those naming rules.
+Gemma 4 and GPT-OSS expose the same complete load-time target-configuration
+derivation as Qwen, so replicated and pipeline composition consume identical
+format replacement policy while GPT-OSS native expert formats remain intact.
 Catalog-dependent configuration normalization likewise receives a neutral
 physical tensor-name catalog: the architecture owns exact-name probes and the
 semantic configuration choices they control, while concrete backends only

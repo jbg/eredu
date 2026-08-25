@@ -17030,11 +17030,13 @@ fn load_gpt_oss_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
-        target_args.quantized_weight_configs = None;
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::gpt_oss::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     // Native expert banks remain checkpoint MXFP4. A load-time request applies
     // only to ordinary dense matrices selected by the neutral block schema.
     let expert_quantization = None;
@@ -21146,22 +21148,13 @@ fn load_neutral_gemma4_pipeline(
         .transpose()?
         .flatten();
     let expert_quantization = quantize_on_load;
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.text.weight_quantization = Some(quantization);
-        target_args.text.quantized_weights = None;
-        target_args.text.quantized_weight_configs = None;
-        if let Some(vision) = target_args.vision.as_mut() {
-            vision.weight_quantization = Some(quantization);
-            vision.quantized_weights = None;
-            vision.quantized_weight_configs = None;
-        }
-        if let Some(audio) = target_args.audio.as_mut() {
-            audio.weight_quantization = Some(quantization);
-            audio.quantized_weights = None;
-            audio.quantized_weight_configs = None;
-        }
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::gemma4::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let target_binding_adapter = Gemma4Bindings::new(external_experts);
     let ranges = source_args
         .text

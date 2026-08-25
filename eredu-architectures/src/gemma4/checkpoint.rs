@@ -18,12 +18,38 @@ use eredu_checkpoint::{
         GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
         SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation, TensorRequirement,
     },
+    WeightQuantization,
 };
 use eredu_nn::AttentionValueSource;
 
 use super::{FamilyConfig, FeedForwardPolicy, ModelArgs};
 
 const RELEASED_LAYER_ROOT: &str = "model.language_model.layers";
+
+/// Derives a Gemma 4 family configuration whose text and aligned media
+/// matrix formats reflect load-time quantization.
+pub fn load_time_quantization(
+    config: &FamilyConfig,
+    quantization: WeightQuantization,
+) -> Result<FamilyConfig, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = config.clone();
+    target.text.weight_quantization = Some(quantization);
+    target.text.quantized_weights = None;
+    target.text.quantized_weight_configs = None;
+    if let Some(vision) = target.vision.as_mut() {
+        vision.weight_quantization = Some(quantization);
+        vision.quantized_weights = None;
+        vision.quantized_weight_configs = None;
+    }
+    if let Some(audio) = target.audio.as_mut() {
+        audio.weight_quantization = Some(quantization);
+        audio.quantized_weights = None;
+        audio.quantized_weight_configs = None;
+    }
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
 
 fn released_layer_path(layer: usize) -> String {
     format!("{RELEASED_LAYER_ROOT}.{layer}")
@@ -1245,7 +1271,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use eredu_checkpoint::{
         expert::GatedProductExpertStorageLayout,
@@ -1331,6 +1357,59 @@ mod tests {
             projector: true,
             assistant: true,
         }
+    }
+
+    #[test]
+    fn load_time_quantization_replaces_all_family_checkpoint_formats() {
+        let mut source = sparse_family();
+        let checkpoint_quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 8).unwrap());
+        source.text.quantized_weights = Some(HashSet::from(["text.weight".into()]));
+        source.text.quantized_weight_configs = Some(HashMap::from([(
+            "text.weight".into(),
+            checkpoint_quantization,
+        )]));
+        let vision = source.vision.as_mut().unwrap();
+        vision.quantized_weights = Some(HashSet::from(["vision.weight".into()]));
+        vision.quantized_weight_configs = Some(HashMap::from([(
+            "vision.weight".into(),
+            checkpoint_quantization,
+        )]));
+        let audio = source.audio.as_mut().unwrap();
+        audio.quantized_weights = Some(HashSet::from(["audio.weight".into()]));
+        audio.quantized_weight_configs = Some(HashMap::from([(
+            "audio.weight".into(),
+            checkpoint_quantization,
+        )]));
+
+        let requested =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let target = load_time_quantization(&source, requested).unwrap();
+
+        assert_eq!(target.text.weight_quantization, Some(requested));
+        assert_eq!(target.text.quantized_weights, None);
+        assert_eq!(target.text.quantized_weight_configs, None);
+        let vision = target.vision.unwrap();
+        assert_eq!(vision.weight_quantization, Some(requested));
+        assert_eq!(vision.quantized_weights, None);
+        assert_eq!(vision.quantized_weight_configs, None);
+        let audio = target.audio.unwrap();
+        assert_eq!(audio.weight_quantization, Some(requested));
+        assert_eq!(audio.quantized_weights, None);
+        assert_eq!(audio.quantized_weight_configs, None);
+        assert!(source.text.quantized_weight_configs.is_some());
+        assert!(source
+            .vision
+            .as_ref()
+            .unwrap()
+            .quantized_weight_configs
+            .is_some());
+        assert!(source
+            .audio
+            .as_ref()
+            .unwrap()
+            .quantized_weight_configs
+            .is_some());
     }
 
     #[test]
