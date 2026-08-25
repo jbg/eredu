@@ -1337,6 +1337,17 @@ mod tests {
     }
 
     #[test]
+    fn v4_boundary_plan_owns_flattened_transport_width() {
+        let mut args = v4_args();
+        let boundary = v4::TargetBoundarySchema::from_args(&args).unwrap();
+        assert_eq!(boundary.activation_hidden_size(), 16);
+
+        args.hidden_size = i32::MAX;
+        args.hc_mult = 2;
+        assert!(v4::TargetBoundarySchema::from_args(&args).is_err());
+    }
+
+    #[test]
     fn v3_geometry_uses_one_plan_for_units_vocabulary_and_state() {
         let args = v3_args();
         let mut layout = LocalModelLayout::default();

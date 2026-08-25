@@ -182,19 +182,31 @@ pub struct ForwardContext<T> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TargetBoundarySchema {
     hidden_size: i32,
+    activation_hidden_size: i32,
     capture_count: usize,
 }
 
 impl TargetBoundarySchema {
     /// Derives the schema for the configured DSpark target captures.
-    pub fn from_args(args: &V4Args) -> Self {
-        Self {
+    pub fn from_args(args: &V4Args) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        let activation_hidden_size = args
+            .hidden_size
+            .checked_mul(args.hc_mult)
+            .ok_or_else(|| Error::backend("V4 transport activation width overflowed"))?;
+        Ok(Self {
             hidden_size: args.hidden_size,
+            activation_hidden_size,
             capture_count: args
                 .dspark
                 .as_ref()
                 .map_or(0, |config| config.target_layer_ids.len()),
-        }
+        })
+    }
+
+    /// Returns the flattened hyper-stream width transported between partitions.
+    pub const fn activation_hidden_size(self) -> i32 {
+        self.activation_hidden_size
     }
 
     /// Returns the number of configured capture tensors.
@@ -3103,8 +3115,10 @@ mod boundary_tests {
     fn configured_capture_count_owns_wire_cardinality() {
         let schema = TargetBoundarySchema {
             hidden_size: 24,
+            activation_hidden_size: 72,
             capture_count: 2,
         };
+        assert_eq!(schema.activation_hidden_size(), 72);
         let tensors = schema.wire_schema().unwrap().resolve(1, 5).unwrap();
         assert_eq!(tensors.len(), 3);
         assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Uint32);

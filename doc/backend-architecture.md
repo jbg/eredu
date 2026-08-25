@@ -449,7 +449,10 @@ preserves the named segment ranges in prompt-cache model identity, descriptor,
 and manifest data while expanding their frontier offsets per layer. Segment
 selection validates the architecture-declared ID and rebases its exact range;
 contiguous partition slices preserve and rebase the intersecting segment
-metadata.
+metadata. When separately materialized prediction state follows target state,
+the architecture's rank-local geometry publishes its `PartitionState`, including
+the architecture-global offset; a backend does not recover that offset from a
+family layer-count field.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
@@ -893,11 +896,13 @@ the decoder boundary and prediction runs only in its explicit phase.
 The partition also carries an architecture-owned boundary schema. That schema
 declares every auxiliary tensor's stable role, canonical order, symbolic shape,
 logical dtype, and configuration-dependent cardinality, and it owns conversion
-to and from the family's typed boundary value. `eredu-runtime` validates and
-resolves batch and sequence dimensions. A concrete backend only maps the
-logical activation or exact integer dtype to its native dtype, allocates the
-declared receive buffers, validates produced tensors, and transports them. It
-must not reconstruct boundary geometry from model-family arguments.
+to and from the family's typed boundary value. When the evolving activation's
+transport width differs from the ordinary hidden width, that derived width is
+also part of the family boundary plan. `eredu-runtime` validates and resolves
+batch and sequence dimensions. A concrete backend only maps the logical
+activation or exact integer dtype to its native dtype, allocates the declared
+receive buffers, validates produced tensors, and transports them. It must not
+reconstruct boundary geometry from model-family arguments.
 Distributed placement dependency routes consume that same schema directly. A
 concrete backend must reject inactive dependency routes with tensors and active
 routes whose exact cardinality, ordered shapes, or physical dtypes differ from

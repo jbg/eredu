@@ -7076,15 +7076,13 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))?;
-        let prediction = if inkling_partition_owns_prediction_state(self.partition.ownership()) {
-            eredu_architectures::inkling::mtp_state_layout(self.args())
-                .map_err(|error| Error::Parallel(error.to_string()))?
-        } else {
-            None
-        };
+        let prediction = inkling_partition_owns_prediction_state(self.partition.ownership())
+            .then(|| self.partition.local_geometry().prediction_state())
+            .flatten()
+            .map(eredu_runtime::PartitionState::layout);
         let state_layout = eredu_architectures::inkling::composite_state_layout(
             partition_state.layout(),
-            prediction.as_ref(),
+            prediction,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         eredu_architectures::inkling::state_identity(
@@ -7247,12 +7245,15 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = eredu_architectures::inkling::mtp_state_layout(self.args())
-            .map_err(|error| Error::Parallel(error.to_string()))?
+        let state = self
+            .partition
+            .local_geometry()
+            .prediction_state()
             .ok_or_else(|| {
                 Error::ArchitectureModel("Inkling checkpoint has no embedded MTP predictor".into())
             })?;
-        let global_layer_start = self.args().text_config.num_hidden_layers as usize;
+        let layout = state.layout().clone();
+        let global_layer_start = state.global_layer_offset();
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged_with_global_layer_start(
                 layout,
@@ -21265,10 +21266,6 @@ fn load_neutral_deepseek_v4_pipeline(
         model_kind,
         args.hidden_size,
     );
-    info.activation_hidden_size = args
-        .hidden_size
-        .checked_mul(args.hc_mult)
-        .ok_or_else(|| Error::Parallel("neutral DeepSeek V4 activation width overflowed".into()))?;
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -21282,6 +21279,8 @@ fn load_neutral_deepseek_v4_pipeline(
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
+    let boundary = eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info.placement.realize_architecture_partition::<
         MlxNeuralBackend,
         eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
@@ -21293,7 +21292,7 @@ fn load_neutral_deepseek_v4_pipeline(
         info.pipeline_stage,
         Some((local_state.clone(), range.start)),
         geometry.clone(),
-        eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args),
+        boundary,
         std::iter::empty(),
     )?;
     let local_parameter_groups =
@@ -21309,9 +21308,10 @@ fn load_neutral_deepseek_v4_pipeline(
         info.pipeline_stage,
         Some((local_state, range.start)),
         geometry,
-        eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args),
+        boundary,
         local_parameter_groups,
     )?;
+    info.activation_hidden_size = partition.auxiliary_boundary().activation_hidden_size();
     let static_roles = parameter_description.select_static_roles(&partition);
     let static_units = split_static_binding_units_by_owner(
         partition.parameter_bindings(),

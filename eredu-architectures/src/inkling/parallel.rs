@@ -7,7 +7,7 @@ use eredu_nn::{NeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     expand_linear_format_parameter_groups, module_parameter_group, LocalModelLayout,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    StateLayout, TensorPlacement,
+    PartitionState, StateLayout, TensorPlacement,
 };
 
 use crate::linear_format::standard_parallel_linear_format;
@@ -21,6 +21,7 @@ pub struct LocalGeometry {
     embedding_range: VocabularyParallelRange,
     output_range: VocabularyParallelRange,
     state_layout: StateLayout,
+    prediction_state: Option<PartitionState>,
     vision_layers: usize,
     architecture_fingerprint: String,
 }
@@ -49,6 +50,11 @@ impl LocalGeometry {
     /// Returns the authoritative rank-local decoder state layout.
     pub const fn state_layout(&self) -> &StateLayout {
         &self.state_layout
+    }
+
+    /// Returns the architecture-global state placement for embedded prediction.
+    pub const fn prediction_state(&self) -> Option<&PartitionState> {
+        self.prediction_state.as_ref()
     }
 
     /// Returns the number of neutral vision units owned by this realization.
@@ -84,6 +90,12 @@ impl LocalGeometry {
                 "rank-local Inkling state layout drifted from text geometry",
             ));
         }
+        let expected_prediction = prediction_state(args, self.state_layout.len())?;
+        if expected_prediction != self.prediction_state {
+            return Err(invalid(
+                "rank-local Inkling prediction state drifted from composite state geometry",
+            ));
+        }
         Ok(())
     }
 }
@@ -98,12 +110,14 @@ pub fn local_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = super::parallel_state_layout(args, &text_layers)
         .map_err(|error| invalid(error.to_string()))?;
+    let prediction_state = prediction_state(args, state_layout.len())?;
     let vocabulary = dim(args.text_config.vocab_size)?;
     let geometry = LocalGeometry {
         text_layers,
         embedding_range: vocabulary_range(layout, "model.embed_tokens", vocabulary)?,
         output_range: vocabulary_range(layout, "lm_head", vocabulary)?,
         state_layout,
+        prediction_state,
         vision_layers: args
             .vision_config
             .as_ref()
@@ -112,6 +126,18 @@ pub fn local_geometry(
     };
     geometry.validate_for(args)?;
     Ok(geometry)
+}
+
+fn prediction_state(
+    args: &ModelArgs,
+    target_layers: usize,
+) -> Result<Option<PartitionState>, ParallelPlanError> {
+    super::mtp_state_layout(args)
+        .map_err(|error| invalid(error.to_string()))?
+        .map(|layout| {
+            PartitionState::new(layout, target_layers).map_err(|error| invalid(error.to_string()))
+        })
+        .transpose()
 }
 
 fn vocabulary_range(
@@ -863,6 +889,17 @@ mod tests {
             Some(1)
         );
         assert_eq!(geometry.state_layout().len(), 2);
+        assert!(geometry.prediction_state().is_none());
+    }
+
+    #[test]
+    fn aggregate_geometry_places_prediction_state_after_target_state() {
+        let mut args = args();
+        args.mtp_config = mtp_args().mtp_config;
+        let geometry = local_geometry(&args, &local_geometry_layout()).unwrap();
+        let prediction = geometry.prediction_state().expect("prediction state plan");
+        assert_eq!(prediction.global_layers(), 2..4);
+        assert_eq!(prediction.layout().len(), 2);
     }
 
     #[test]
