@@ -846,16 +846,6 @@ fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
             InspectionIssueCode::UnsupportedResidencyPolicy,
             detail.clone(),
         ),
-        Error::ArchitectureModel(detail)
-            if detail.contains("residency")
-                || detail.contains("stream")
-                || detail.contains("expert cach") =>
-        {
-            (
-                InspectionIssueCode::UnsupportedResidencyPolicy,
-                detail.clone(),
-            )
-        }
         _ => (
             InspectionIssueCode::UnsupportedArchitecture,
             error.to_string(),
@@ -1018,6 +1008,37 @@ mod tests {
         assert_eq!(report.multimodal, InspectionReadiness::NotApplicable);
         assert!(report.requirements.is_empty());
         assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn load_policy_issue_code_uses_the_typed_error_variant() {
+        let mut architecture_report =
+            ModelInspectionReport::unverified(Path::new("unused"), ArtifactFormat::SafeTensors);
+        reject_load_policy(
+            &mut architecture_report,
+            &Error::ArchitectureModel(
+                "diagnostic wording mentions residency, stream, and expert cache".into(),
+            ),
+        );
+        assert_eq!(
+            architecture_report.issues[0].code,
+            InspectionIssueCode::UnsupportedArchitecture
+        );
+
+        let mut residency_report =
+            ModelInspectionReport::unverified(Path::new("unused"), ArtifactFormat::SafeTensors);
+        reject_load_policy(
+            &mut residency_report,
+            &Error::Artifact(
+                eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(
+                    "diagnostic wording does not name the rejected policy".into(),
+                ),
+            ),
+        );
+        assert_eq!(
+            residency_report.issues[0].code,
+            InspectionIssueCode::UnsupportedResidencyPolicy
+        );
     }
 
     #[test]
