@@ -20,7 +20,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint},
+    ops::{concatenate_axis, indexing::TryIndexOp},
     Array, Stream,
 };
 
@@ -40,7 +40,7 @@ use crate::backend::{
                 parameter_name_in_targets, parameter_role_targets,
                 populate_module_from_lease_excluding,
             },
-            load::{gguf_metadata, gguf_quantization_configs},
+            load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
         },
         execution::{
@@ -1558,7 +1558,7 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
 
 pub fn prepare_gguf_pipeline_source(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
     open_gguf_store(source, projector, max_cached_readers)
@@ -1952,7 +1952,7 @@ pub fn load_safetensors_tensor_parallel(
 /// Loads an Inkling GGUF checkpoint through the same neutral TP binder.
 pub fn load_gguf_tensor_parallel(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     layer_policy: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
@@ -2030,7 +2030,7 @@ pub fn load_safetensors(
 /// Loads the text GGUF and optional sibling media artifact into one neutral model.
 pub fn load_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2055,17 +2055,29 @@ pub fn load_gguf(
 
 fn open_gguf_store(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let eredu_architectures::configuration::GgufModelConfig::Inkling(args) = source.model() else {
+    let eredu_architectures::configuration::GgufModelConfig::Inkling(primary_args) = source.model()
+    else {
         return Err(Error::ArchitectureModel(
             "Inkling GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut args = args.clone();
+    let mut args = match projector {
+        Some(projector) => {
+            let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Inkling(args) =
+                projector.model()
+            else {
+                return Err(Error::ArchitectureModel(
+                    "Inkling GGUF loader received a mismatched media-projector plan".into(),
+                ));
+            };
+            args.clone()
+        }
+        None => primary_args.clone(),
+    };
     let translation_args = args.clone();
     let mut text_formats = gguf_quantization_configs(checkpoint, |name| {
         eredu_architectures::inkling::translate_gguf_weight_name_for_model(name, &translation_args)
@@ -2073,16 +2085,6 @@ fn open_gguf_store(
     eredu_architectures::inkling::normalize_gguf_weight_formats(&args, &mut text_formats)
         .map_err(Error::Quantization)?;
     args.text_config.quantized_weight_configs = (!text_formats.is_empty()).then_some(text_formats);
-    let projector_metadata = projector.map(gguf_metadata);
-    if let (Some(projector), Some(projector_metadata)) = (projector, &projector_metadata) {
-        let formats = gguf_quantization_configs(
-            projector,
-            eredu_architectures::inkling::translate_mmproj_weight_name,
-        )?;
-        args = args
-            .with_gguf_projector_metadata(metadata, projector_metadata, formats)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    }
     let translation_args = args.clone();
     let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
@@ -2097,11 +2099,11 @@ fn open_gguf_store(
             },
         )?;
     if let Some(projector) = projector {
-        let plan = eredu_architectures::inkling::mmproj_gguf_plan(&args)
-            .map_err(Error::ArchitectureModel)?;
-        builder = builder.add_checkpoint(projector.catalog().clone(), &plan, |name| {
-            eredu_architectures::inkling::translate_mmproj_weight_name(name)
-        })?;
+        builder = builder.add_checkpoint(
+            projector.checkpoint().catalog().clone(),
+            projector.plan().checkpoint(),
+            |name| eredu_architectures::inkling::translate_mmproj_weight_name(name),
+        )?;
     }
     let store: SharedCheckpointSource = Arc::new(builder.build()?);
     Ok((store, args))

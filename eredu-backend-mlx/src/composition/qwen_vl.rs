@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::qwen::{self, vision, vl};
+use eredu_architectures::qwen::{self, vl};
 use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource, TensorSelection},
     WeightQuantization,
@@ -19,7 +19,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint},
+    ops::{concatenate_axis, indexing::TryIndexOp},
     Array, Stream,
 };
 
@@ -135,25 +135,6 @@ impl QwenVlCheckpointTemplate {
             static_modules,
             units,
         })
-    }
-}
-
-struct VisionGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl vision::VisionGgufCatalog for VisionGgufCatalog<'_> {
-    fn shape(&self, name: &str) -> Option<Vec<usize>> {
-        self.0
-            .catalog()
-            .tensors()
-            .find(|tensor| tensor.descriptor().name == name)
-            .map(|tensor| tensor.descriptor().row_major_shape())
-            .and_then(|shape| {
-                shape
-                    .into_iter()
-                    .map(usize::try_from)
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()
-            })
     }
 }
 
@@ -973,42 +954,39 @@ fn quantize_store(
 
 pub fn prepare_gguf_pipeline(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: &GgufCheckpoint,
+    projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
     max_mapped_shards: usize,
 ) -> Result<(vl::ModelArgs, Arc<dyn CheckpointSource>), Error> {
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let eredu_architectures::configuration::GgufModelConfig::Qwen(text) = source.model() else {
+    let eredu_architectures::configuration::GgufModelConfig::Qwen(_) = source.model() else {
         return Err(Error::ArchitectureModel(
             "Qwen3-VL GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut text = text.clone();
-    let is_moe = text.is_moe();
+    let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Qwen3Vl(args) =
+        projector.model()
+    else {
+        return Err(Error::ArchitectureModel(
+            "Qwen3-VL GGUF loader received a mismatched media-projector plan".into(),
+        ));
+    };
+    let mut args = args.clone();
+    let is_moe = args.text.is_moe();
     let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
     let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
-    vl::normalize_text_weight_formats(&text, &mut text_formats);
-    text.quantized_weights = Some(text_formats.keys().cloned().collect());
-    text.quantized_weight_configs = Some(text_formats);
-    text.quantization = None;
-    let projector_metadata =
-        crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
-    let mut vision =
-        vl::vision_config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let deepstack = vision.deepstack_layers();
+    vl::normalize_text_weight_formats(&args.text, &mut text_formats);
+    args.text.quantized_weights = Some(text_formats.keys().cloned().collect());
+    args.text.quantized_weight_configs = Some(text_formats);
+    args.text.quantization = None;
+    let deepstack = args.vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
-    projector
-        .catalog()
-        .translated_outputs(translate_vision)
-        .map_err(safemlx::error::IoError::from)?;
-    vision.linear_formats = gguf_quantization_configs(&projector, translate_vision)?
-        .into_iter()
-        .map(|(name, format)| (name, format.into()))
-        .collect();
-    let args = vl::model_args_from_gguf_parts(text, metadata, vision)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let vision_plan = vl::projector_gguf_plan(&args).map_err(Error::ArchitectureModel)?;
+    args.vision.linear_formats = gguf_quantization_configs(
+        projector.checkpoint(),
+        translate_vision,
+    )?
+    .into_iter()
+    .map(|(name, format)| (name, format.into()))
+    .collect();
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
@@ -1016,8 +994,8 @@ pub fn prepare_gguf_pipeline(
         max_mapped_shards,
     )?);
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        projector.clone(),
-        &vision_plan,
+        projector.checkpoint().clone(),
+        projector.plan().checkpoint(),
         translate_vision,
         max_mapped_shards,
     )?);
@@ -1034,64 +1012,16 @@ pub fn prepare_gguf_pipeline(
 /// composite neutral checkpoint source.
 pub fn load_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: &GgufCheckpoint,
+    projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
-    let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let eredu_architectures::configuration::GgufModelConfig::Qwen(text) = source.model() else {
-        return Err(Error::ArchitectureModel(
-            "Qwen3-VL GGUF loader received a different prepared model".into(),
-        ));
-    };
-    let mut text = text.clone();
-    let is_moe = text.is_moe();
-    let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
-    let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
-    vl::normalize_text_weight_formats(&text, &mut text_formats);
-    text.quantized_weights = Some(text_formats.keys().cloned().collect());
-    text.quantized_weight_configs = Some(text_formats);
-    text.quantization = None;
-
-    let projector_metadata =
-        crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
-    let mut vision =
-        vl::vision_config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let deepstack = vision.deepstack_layers();
-    let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
-    projector
-        .catalog()
-        .translated_outputs(translate_vision)
-        .map_err(safemlx::error::IoError::from)?;
-    vision.linear_formats = gguf_quantization_configs(&projector, translate_vision)?
-        .into_iter()
-        .map(|(name, format)| (name, format.into()))
-        .collect();
-    let mut args = vl::model_args_from_gguf_parts(text, metadata, vision)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    let vision_plan = vl::projector_gguf_plan(&args).map_err(Error::ArchitectureModel)?;
-    let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        checkpoint.clone(),
-        source.plan().checkpoint(),
-        translate_text,
-        options.max_mapped_shards(),
-    )?);
-    let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        projector.clone(),
-        &vision_plan,
-        translate_vision,
-        options.max_mapped_shards(),
-    )?);
-    let store: Arc<dyn CheckpointSource> = Arc::new(CompositeCheckpointSource::new([
-        text_source,
-        vision_source,
-    ])?);
+    let (mut args, store) =
+        prepare_gguf_pipeline(source, projector, options.max_mapped_shards())?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen3-VL GGUF", None, requested)

@@ -451,13 +451,15 @@ inside `ModelArtifact` until the selected backend consumes it; materializers do
 not downgrade that proof to an unvalidated checkpoint handle and rerun the
 architecture parser or regenerate the main checkpoint schema. Backend
 composition may enrich a clone of retained geometry with native encoding
-descriptors, and composite families may derive a separate companion schema from
-admitted companion geometry; neither operation replaces the retained main
-artifact plan. Portable architecture admission derives that companion geometry,
+descriptors, while composite families retain their separately admitted companion
+schema; neither operation replaces the retained main artifact plan. Portable
+architecture admission derives that companion geometry,
 validates the companion against its exact family-owned GGUF schema, and retains
 both the typed composite configuration and schema in the artifact architecture
-plan. A concrete backend consumes this proof and does not repeat companion
-family parsing or schema admission. For Gemma 4, Inkling, Muse-Glimmer, and
+plan. A concrete backend pairs that proof with its native payload wrapper and
+passes the pair through complete, tensor-parallel, and distributed-stage
+composition. It does not repeat companion family parsing or regenerate the
+companion checkpoint schema. For Gemma 4, Inkling, Muse-Glimmer, and
 Qwen, inspection also parses and retains the family processor plan from the
 admitted model, projector, and SafeTensors processor sidecars. Materialization
 consumes that snapshot directly and neither resolves family identity again nor

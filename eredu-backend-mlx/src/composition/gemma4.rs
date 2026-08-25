@@ -1825,7 +1825,7 @@ pub fn load_safetensors_tensor_parallel(
 
 pub fn load_gguf_tensor_parallel(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
@@ -1904,7 +1904,7 @@ pub fn load_safetensors(
 /// same neutral family object.
 pub fn load_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1928,69 +1928,32 @@ pub fn load_gguf(
 
 pub fn open_pipeline_gguf_store(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, FamilyConfig), Error> {
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let projector_metadata =
-        projector.map(crate::backend::runtime::checkpoint::load::gguf_metadata);
-    if let Some(metadata) = projector_metadata.as_ref() {
-        eredu_architectures::gemma4::validate_projector_identity(metadata)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    }
     let eredu_architectures::configuration::GgufModelConfig::Gemma4(family) = source.model() else {
         return Err(Error::ArchitectureModel(
             "Gemma 4 GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut text = family.text.clone();
-    text.quantized_weight_configs = Some(gguf_quantization_configs(
+    let mut args = match projector {
+        Some(projector) => {
+            let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Gemma4(family) =
+                projector.model()
+            else {
+                return Err(Error::ArchitectureModel(
+                    "Gemma 4 GGUF loader received a mismatched media-projector plan".into(),
+                ));
+            };
+            family.clone()
+        }
+        None => family.clone(),
+    };
+    args.text.quantized_weight_configs = Some(gguf_quantization_configs(
         checkpoint,
         eredu_architectures::gemma4::translate_gguf_weight_name,
     )?);
-    let args = eredu_architectures::gemma4::family_from_gguf_metadata(
-        text,
-        metadata,
-        projector_metadata.as_ref(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    if let Some(projector) = projector {
-        let quantized = gguf_quantization_configs(
-            projector,
-            eredu_architectures::gemma4::translate_mmproj_weight_name,
-        )?;
-        if !quantized.is_empty() {
-            return Err(Error::ArchitectureModel(
-                "Gemma 4 projector GGUF admits only dense F16, BF16, or F32 tensors".into(),
-            ));
-        }
-        let tokens = [
-            args.image_token_id,
-            args.video_token_id,
-            args.audio_token_id,
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|token| u32::try_from(token).ok())
-        .collect::<std::collections::BTreeSet<_>>();
-        eredu_architectures::gemma4::Gemma4ArtifactConfig {
-            unified: args.is_unified(),
-            hidden_size: args.text.hidden_size as usize,
-            image_token_id: args.image_token_id.and_then(|token| token.try_into().ok()),
-            video_token_id: args.video_token_id.and_then(|token| token.try_into().ok()),
-            audio_token_id: args.audio_token_id.and_then(|token| token.try_into().ok()),
-            projector: true,
-            assistant: false,
-        }
-        .projector_compatibility(
-            args.model_type.clone(),
-            args.text.hidden_size as usize,
-            tokens,
-        )
-        .validate()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    }
     let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
         .add_checkpoint(
@@ -1998,12 +1961,12 @@ pub fn open_pipeline_gguf_store(
             source.plan().checkpoint(),
             |name| eredu_architectures::gemma4::translate_gguf_weight_name(name),
         )?;
-    let builder = if let Some(projector) = projector.as_ref() {
-        let plan = eredu_architectures::gemma4::mmproj_gguf_plan(&args)
-            .map_err(Error::ArchitectureModel)?;
-        builder.add_checkpoint(projector.catalog().clone(), &plan, |name| {
-            eredu_architectures::gemma4::translate_mmproj_weight_name(name)
-        })?
+    let builder = if let Some(projector) = projector {
+        builder.add_checkpoint(
+            projector.checkpoint().catalog().clone(),
+            projector.plan().checkpoint(),
+            |name| eredu_architectures::gemma4::translate_mmproj_weight_name(name),
+        )?
     } else {
         builder
     };

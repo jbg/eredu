@@ -8,7 +8,6 @@ use eredu_architectures::qwen::{
         self, ConditionalInput, ConditionalLayeredModel, ConditionalUnit, EmbeddedInput,
         HybridConfig, ParsedHybridConfig, Unit,
     },
-    vision,
     vl::InputPart,
 };
 use eredu_checkpoint::{
@@ -23,7 +22,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{indexing::TryIndexOp, GgufCheckpoint},
+    ops::indexing::TryIndexOp,
     Array, Stream,
 };
 
@@ -599,39 +598,31 @@ const fn cached_provider<'a>(
     CachedGatedProductExpertProvider::new(cache)
 }
 
-struct HybridVisionGgufCatalog<'a>(&'a GgufCheckpoint);
-
-impl vision::VisionGgufCatalog for HybridVisionGgufCatalog<'_> {
-    fn shape(&self, name: &str) -> Option<Vec<usize>> {
-        self.0
-            .catalog()
-            .tensors()
-            .find(|tensor| tensor.descriptor().name == name)
-            .map(|tensor| tensor.descriptor().row_major_shape())
-            .and_then(|shape| {
-                shape
-                    .into_iter()
-                    .map(usize::try_from)
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()
-            })
-    }
-}
-
 fn prepare_hybrid_gguf_store(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
     let checkpoint = source.checkpoint();
-    let metadata = source.metadata();
-    let eredu_architectures::configuration::GgufModelConfig::QwenHybrid(parsed) = source.model()
+    let eredu_architectures::configuration::GgufModelConfig::QwenHybrid(primary) = source.model()
     else {
         return Err(Error::ArchitectureModel(
             "Qwen hybrid GGUF loader received a different prepared model".into(),
         ));
     };
-    let mut parsed = parsed.clone();
+    let mut parsed = match projector {
+        Some(projector) => {
+            let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::Qwen35(parsed) =
+                projector.model()
+            else {
+                return Err(Error::ArchitectureModel(
+                    "Qwen hybrid GGUF loader received a mismatched media-projector plan".into(),
+                ));
+            };
+            parsed.clone()
+        }
+        None => primary.clone(),
+    };
     parsed.text.linear_formats =
         gguf_quantization_configs(checkpoint, hybrid::translate_gguf_weight_name)?
             .into_iter()
@@ -649,30 +640,22 @@ fn prepare_hybrid_gguf_store(
     let Some(projector) = projector else {
         return Ok((parsed, text));
     };
-    let projector_metadata =
-        crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
-    let mut vision = hybrid::vision_config_from_gguf_catalog(
-        &HybridVisionGgufCatalog(projector),
-        &projector_metadata,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let vision = parsed.vision.as_ref().ok_or_else(|| {
+        Error::ArchitectureModel("admitted Qwen3.5 projector omitted its vision geometry".into())
+    })?;
     let deepstack = vision.deepstack_layers();
     let translate = |name: &str| hybrid::translate_vision_gguf_weight_name(name, &deepstack);
-    projector
-        .catalog()
-        .translated_outputs(translate)
-        .map_err(safemlx::error::IoError::from)?;
-    vision.linear_formats = gguf_quantization_configs(&projector, translate)?
+    parsed
+        .vision
+        .as_mut()
+        .expect("admitted Qwen3.5 vision geometry was checked above")
+        .linear_formats = gguf_quantization_configs(projector.checkpoint(), translate)?
         .into_iter()
         .map(|(name, format)| (name, format.into()))
         .collect();
-    parsed = hybrid::with_gguf_vision_projector(parsed, metadata, vision)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let vision_plan = hybrid::conditional_projector_gguf_plan(&parsed)
-        .map_err(Error::ArchitectureModel)?;
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        projector.clone(),
-        &vision_plan,
+        projector.checkpoint().clone(),
+        projector.plan().checkpoint(),
         translate,
         max_mapped_shards,
     )?);
@@ -684,7 +667,7 @@ fn prepare_hybrid_gguf_store(
 
 pub fn prepare_gguf_pipeline(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
     prepare_hybrid_gguf_store(source, projector, max_mapped_shards)
@@ -694,7 +677,7 @@ pub fn prepare_gguf_pipeline(
 /// neutral resident/bounded execution graph as SafeTensors.
 pub(crate) fn load_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

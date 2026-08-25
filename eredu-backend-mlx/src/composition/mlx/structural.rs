@@ -31,28 +31,70 @@ pub(crate) struct AdmittedGguf {
     metadata: HashMap<String, GgufMetadataValue>,
 }
 
+/// Native projector payload paired with its architecture-owned admission proof.
+///
+/// Family composition may lower this plan into MLX checkpoint sources, but it
+/// must not reconstruct family geometry or checkpoint schemas from the payload.
+pub(crate) struct AdmittedGgufProjector {
+    plan: eredu_architectures::gguf_companion::GgufMediaProjectorPlan,
+    checkpoint: GgufCheckpoint,
+}
+
+impl AdmittedGgufProjector {
+    pub(crate) const fn plan(
+        &self,
+    ) -> &eredu_architectures::gguf_companion::GgufMediaProjectorPlan {
+        &self.plan
+    }
+
+    pub(crate) const fn model(
+        &self,
+    ) -> &eredu_architectures::gguf_companion::GgufMediaProjectorConfig {
+        self.plan.model()
+    }
+
+    pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
+        &self.checkpoint
+    }
+}
+
 impl AdmittedGguf {
     pub(crate) fn from_admission(
         plan: eredu_architectures::configuration::GgufArchitecturePlan,
+        projector_plan: Option<eredu_architectures::gguf_companion::GgufMediaProjectorPlan>,
         validated: eredu_core::ValidatedGguf,
-    ) -> (
-        Self,
-        std::collections::BTreeMap<
-            eredu_core::GgufCompanionRole,
-            eredu_core::ValidatedGgufCompanion,
-        >,
-    ) {
-        let (checkpoint, companions) = validated.into_parts();
+    ) -> Result<(Self, Option<AdmittedGgufProjector>), Error> {
+        let (checkpoint, mut companions) = validated.into_parts();
         let checkpoint = GgufCheckpoint::from_portable(checkpoint);
         let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        (
+        let projector = companions.remove(&eredu_core::GgufCompanionRole::MediaProjector);
+        let projector = match (projector_plan, projector) {
+            (Some(plan), Some(projector)) => Some(AdmittedGgufProjector {
+                plan,
+                checkpoint: GgufCheckpoint::from_portable(projector.checkpoint().clone()),
+            }),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(Error::ArchitectureModel(
+                    "GGUF preparation retained a media-projector plan without its admitted checkpoint"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::ArchitectureModel(
+                    "GGUF preparation retained a media-projector checkpoint without its typed architecture plan"
+                        .into(),
+                ));
+            }
+        };
+        Ok((
             Self {
                 plan,
                 checkpoint,
                 metadata,
             },
-            companions,
-        )
+            projector,
+        ))
     }
 
     pub(crate) const fn architecture(&self) -> GgufArchitecture {

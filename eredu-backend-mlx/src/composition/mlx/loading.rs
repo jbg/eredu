@@ -5,7 +5,6 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_architectures::processor_plan::ArtifactArchitecturePlan;
 use eredu_architectures::{GgufArchitecture, ModelKind};
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
-use safemlx::ops::GgufCheckpoint;
 use safemlx::{ops::GgufMetadataValue, Stream};
 
 #[cfg(feature = "media")]
@@ -26,7 +25,7 @@ struct MaterializedGgufModel {
 
 fn materialize_gguf_model(
     source: &structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&structural::AdmittedGgufProjector>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -691,11 +690,9 @@ fn materialize_gguf_artifact(
         ));
     };
     let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
-    let (source, mut companions) =
-        structural::AdmittedGguf::from_admission(architecture, validated);
-    let projector = companions
-        .remove(&eredu_core::GgufCompanionRole::MediaProjector)
-        .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
+    let projector_plan = architecture_plan.gguf_media_projector().cloned();
+    let (source, projector) =
+        structural::AdmittedGguf::from_admission(architecture, projector_plan, validated)?;
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;
@@ -729,7 +726,7 @@ fn materialize_gguf_artifact(
 
 fn materialize_gguf_tensor_parallel(
     source: &structural::AdmittedGguf,
-    projector: Option<&GgufCheckpoint>,
+    projector: Option<&structural::AdmittedGgufProjector>,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,

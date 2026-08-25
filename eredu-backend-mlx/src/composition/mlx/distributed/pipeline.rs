@@ -49,7 +49,6 @@ use safemlx::{
     distributed::{self, Group},
     error::Exception,
     module::ModuleParameters,
-    ops::GgufCheckpoint,
     Array, Dtype, Stream,
 };
 
@@ -13451,14 +13450,13 @@ pub fn load_pipeline_model_with_options(
                     )
                 })?
                 .clone();
-            let (admitted, mut companions) =
+            let projector_plan = architecture_plan.gguf_media_projector().cloned();
+            let (admitted, projector) =
                 crate::composition::mlx::structural::AdmittedGguf::from_admission(
                     architecture,
+                    projector_plan,
                     validated,
-                );
-            let projector = companions
-                .remove(&eredu_core::GgufCompanionRole::MediaProjector)
-                .map(|companion| GgufCheckpoint::from_portable(companion.checkpoint().clone()));
+                )?;
             let architecture = admitted.architecture();
             let checkpoint = admitted.checkpoint().clone();
             let capabilities =
