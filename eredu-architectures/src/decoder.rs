@@ -23,6 +23,9 @@ use eredu_runtime::{
     StateLayout, TensorPlacement,
 };
 
+/// Canonical execution-group identity for ordinary decoder layers.
+pub(crate) const TARGET_EXECUTION_GROUP: &str = "target";
+
 /// Canonical field segments used by one shared decoder block.
 ///
 /// Architecture families can replace checkpoint vocabulary without replacing
@@ -2422,7 +2425,11 @@ impl SequentialPredictionGroups {
         prediction_roots: impl IntoIterator<Item = String>,
     ) -> Result<Self, Error> {
         Ok(Self {
-            target: SequentialGroup::new("target", target_parameter_root, target_units)?,
+            target: SequentialGroup::new(
+                TARGET_EXECUTION_GROUP,
+                target_parameter_root,
+                target_units,
+            )?,
             prediction_paths: prediction_roots
                 .into_iter()
                 .map(|root| vec![root])
@@ -2460,7 +2467,11 @@ impl SequentialPredictionGroups {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            target: SequentialGroup::new("target", target_parameter_root, target_units)?,
+            target: SequentialGroup::new(
+                TARGET_EXECUTION_GROUP,
+                target_parameter_root,
+                target_units,
+            )?,
             prediction_paths,
         })
     }

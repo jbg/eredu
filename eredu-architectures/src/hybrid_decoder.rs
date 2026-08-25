@@ -6,6 +6,7 @@ use eredu_nn::{
 
 use crate::decoder::{
     SequentialGroup, SequentialPredictionGroups, StaticModuleSpec, StaticModules,
+    TARGET_EXECUTION_GROUP,
 };
 
 enum HybridExecutionGroups {
@@ -34,7 +35,7 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         Ok(Self {
             static_modules: StaticModules::from_spec(static_spec, context)?,
             groups: HybridExecutionGroups::Target(SequentialGroup::new(
-                "target",
+                TARGET_EXECUTION_GROUP,
                 parameter_root,
                 units,
             )?),

@@ -360,8 +360,8 @@ pub fn expert_residency_catalog(
         return Err("independent expert residency requires Kimi Linear-MoE".into());
     }
     let experts = dimension(args.num_experts, "expert count")?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
         if policy.feed_forward != FeedForwardPolicy::SparseMoe {
@@ -1447,5 +1447,10 @@ mod tests {
                 parameter.role(),
                 crate::ExpertParameterRole::QuantizableProjection { .. }
             )));
+        assert_eq!(residency.units()[0].owner_group().as_str(), "target");
+        let owned = residency
+            .into_units_selected_by_owner(|group, unit| group.as_str() == "target" && unit == 1)
+            .count();
+        assert_eq!(owned, 2);
     }
 }

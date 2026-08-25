@@ -127,7 +127,11 @@ where
         args.validate().map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
         let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
-        let group = SequentialGroup::new("target", "model.layers", layers)?;
+        let group = SequentialGroup::new(
+            crate::decoder::TARGET_EXECUTION_GROUP,
+            "model.layers",
+            layers,
+        )?;
         Ok(Self {
             args,
             static_modules,
@@ -155,7 +159,11 @@ where
             geometry.output_range().cloned(),
             context,
         )?;
-        let group = SequentialGroup::new("target", "model.layers", layers)?;
+        let group = SequentialGroup::new(
+            crate::decoder::TARGET_EXECUTION_GROUP,
+            "model.layers",
+            layers,
+        )?;
         Ok(Self {
             args,
             static_modules,
