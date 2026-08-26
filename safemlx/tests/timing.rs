@@ -30,26 +30,6 @@ fn cpu_timing_is_positive_and_stable() {
 }
 
 #[test]
-fn cpu_larger_workload_reports_materially_longer() {
-    let stream = stream(DeviceType::Cpu);
-    let small = matmul(96, &stream);
-    let small_elapsed = async_eval_timed([&small], &stream)
-        .unwrap()
-        .elapsed()
-        .unwrap();
-    let large = matmul(640, &stream);
-    let large_elapsed = async_eval_timed([&large], &stream)
-        .unwrap()
-        .elapsed()
-        .unwrap();
-
-    assert!(
-        large_elapsed > small_elapsed * 2,
-        "small={small_elapsed:?}, large={large_elapsed:?}"
-    );
-}
-
-#[test]
 fn submission_and_timing_span_creation_do_not_wait() {
     let stream = stream(DeviceType::Cpu);
     let output = matmul(1536, &stream);

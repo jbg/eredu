@@ -1366,11 +1366,11 @@ mod tests {
         }
     }
 
-    struct LoadingMock;
+    #[derive(Default)]
+    struct LoadingMock {
+        materializations: std::sync::atomic::AtomicUsize,
+    }
     struct LoadingMockSession;
-
-    static LOADING_MATERIALIZATIONS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
 
     struct LoadingConfigurationResolver;
 
@@ -1448,7 +1448,8 @@ mod tests {
             &self,
             (plan, model): Self::ModelConfig,
         ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-            LOADING_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.materializations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert_eq!(plan.inspection().configuration().family, "llama");
             Ok(PreparedModel::new(
                 model,
@@ -1784,15 +1785,15 @@ mod tests {
     fn generic_loader_inspects_plans_and_prepares_on_the_selected_backend() {
         let root = tempfile::tempdir().unwrap();
         write_loading_fixture(root.path());
-        let prepared = load_model(&LoadingMock, root.path(), 41).unwrap();
+        let prepared = load_model(&LoadingMock::default(), root.path(), 41).unwrap();
         assert_eq!(*prepared, 41);
 
-        let runtime = ModelRuntime::load(LoadingMock, root.path(), 7).unwrap();
+        let runtime = ModelRuntime::load(LoadingMock::default(), root.path(), 7).unwrap();
         assert_eq!(runtime.backend().descriptor().name, "loading-mock");
 
         let missing = root.path().join("missing");
         assert!(matches!(
-            load_model(&LoadingMock, &missing, 1),
+            load_model(&LoadingMock::default(), &missing, 1),
             Err(ModelLoadError::Artifact(ArtifactError::MissingArtifact(path)))
                 if path == missing
         ));
@@ -1802,9 +1803,9 @@ mod tests {
     fn session_requirement_is_rejected_before_materialization() {
         let root = tempfile::tempdir().unwrap();
         write_loading_fixture(root.path());
-        LOADING_MATERIALIZATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let backend = LoadingMock::default();
 
-        let error = load_model(&LoadingMock, root.path(), 99).unwrap_err();
+        let error = load_model(&backend, root.path(), 99).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1812,7 +1813,9 @@ mod tests {
                 if error.capability() == "activation_inspection"
         ));
         assert_eq!(
-            LOADING_MATERIALIZATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            backend
+                .materializations
+                .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
     }
