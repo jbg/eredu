@@ -11,7 +11,7 @@ use crate::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice,
         SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
     },
-    GgufArchitecture,
+    GgufArchitecture, ModelKind,
 };
 use eredu_core::generation::{
     resolve_generation_config, FinishReason, GenerationConfigOverrides, SemanticEvent,
@@ -2434,7 +2434,7 @@ fn inkling_real_checkpoint_template_is_recognized() {
         return;
     };
     let model_dir = std::path::PathBuf::from(model_dir);
-    let template = load_chat_template(&model_dir)
+    let template = load_chat_template(&model_dir, Some(ModelKind::Inkling))
         .unwrap()
         .expect("Inkling checkpoint must provide a chat template");
     let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&model_dir).unwrap());
@@ -3613,12 +3613,26 @@ fn load_chat_template_reads_standalone_jinja_file() {
     )
     .unwrap();
 
-    let template = load_chat_template(&dir).unwrap().unwrap();
+    let template = load_chat_template(&dir, None).unwrap().unwrap();
     assert_eq!(
         template.select(None).unwrap().template(),
         "hello {{ messages[0].role }}"
     );
     assert!(matches!(template, ModelChatTemplate::Single(_)));
+}
+
+#[test]
+fn family_template_fallback_uses_typed_architecture_identity() {
+    let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+
+    assert!(load_chat_template(&dir, Some(ModelKind::Gemma4))
+        .unwrap()
+        .is_some());
+    assert!(load_chat_template(&dir, Some(ModelKind::Llama))
+        .unwrap()
+        .is_none());
+
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -3644,7 +3658,7 @@ fn gguf_sidecar_loads_named_chat_templates() {
         chat_template_kwargs(&gguf_path).unwrap(),
         vec!["default_kw"]
     );
-    let templates = load_chat_template(&dir).unwrap().unwrap();
+    let templates = load_chat_template(&dir, None).unwrap().unwrap();
     let tools = [json!({"type": "function"})];
     let selected = templates.select(Some(&tools)).unwrap();
     assert_eq!(selected.template(), "{{ tool_kw }}");
@@ -3682,7 +3696,9 @@ fn nemotron_chat_template_matches_transformers_on_small_prompts() {
     let model_dir = std::env::var("NEMOTRON_H_PARITY_MODEL_DIR")
         .expect("set NEMOTRON_H_PARITY_MODEL_DIR to a local Nemotron-H snapshot");
     let model_dir = std::path::PathBuf::from(model_dir);
-    let template = load_chat_template(&model_dir).unwrap().unwrap();
+    let template = load_chat_template(&model_dir, Some(ModelKind::NemotronH))
+        .unwrap()
+        .unwrap();
     let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&model_dir).unwrap());
     let conversations = vec![vec![
         json!({"role": "system", "content": "You are concise."}),
