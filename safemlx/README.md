@@ -19,13 +19,6 @@ directly only when building MLX-specific operations or backend components.
 The default feature set enables Accelerate and Metal where those backends are
 available.
 
-## Installation
-
-```toml
-[dependencies]
-safemlx = "0.1.3"
-```
-
 Operations are lazy and run on an explicit stream:
 
 ```rust
