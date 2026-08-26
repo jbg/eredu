@@ -190,12 +190,12 @@ pub mod deepseek;
 pub mod deepseek_expert;
 pub mod gemma4;
 pub mod gemma4_expert;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 pub mod gemma4_processor;
 pub mod gpt_oss;
 pub mod inkling;
 pub mod inkling_expert;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 pub mod inkling_processor;
 pub mod kimi_linear;
 // MLX adapter only; the neutral family is always available from

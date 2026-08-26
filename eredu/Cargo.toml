@@ -72,7 +72,7 @@ required-features = ["_mlx"]
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
 no-default-features = true
-features = ["mlx", "mlx-image", "mlx-audio"]
+features = ["mlx", "image", "audio"]
 
 [features]
 default = ["mlx", "onig", "esaxx_fast"]
@@ -87,9 +87,8 @@ cuda = ["_mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
 nccl = ["cuda", "eredu-backend-mlx/nccl"]
-mlx-media = ["_mlx", "eredu-backend-mlx/media"]
-mlx-image = ["mlx-media", "eredu-backend-mlx/image"]
-mlx-audio = ["mlx-media", "eredu-backend-mlx/audio"]
+image = ["_mlx", "eredu-backend-mlx/image"]
+audio = ["_mlx", "eredu-backend-mlx/audio"]
 
 [dependencies]
 # Local dependencies

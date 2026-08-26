@@ -36,10 +36,10 @@ enum ProcessorKind {
 }
 
 #[cfg(any(not(feature = "image"), not(feature = "audio")))]
-fn missing_media_feature(modality: &str, backend_feature: &str, facade_feature: &str) -> Error {
+fn missing_media_feature(modality: &str, feature: &str) -> Error {
     Error::Processor(format!(
-        "MLX {modality} preparation requires feature `{backend_feature}` on `eredu-backend-mlx` \
-         (or feature `{facade_feature}` on the `eredu` facade)"
+        "MLX {modality} preparation requires feature `{feature}` on `eredu-backend-mlx` \
+         (or feature `{feature}` on the `eredu` facade)"
     ))
 }
 
@@ -76,7 +76,7 @@ impl<'a> PortableMediaView<'a> {
                 #[cfg(not(feature = "image"))]
                 {
                     let _ = image;
-                    Err(missing_media_feature("image", "image", "mlx-image"))
+                    Err(missing_media_feature("image", "image"))
                 }
             }
             PortableMedia::Video(video) => {
@@ -98,7 +98,7 @@ impl<'a> PortableMediaView<'a> {
                 #[cfg(not(feature = "image"))]
                 {
                     let _ = video;
-                    Err(missing_media_feature("video", "image", "mlx-image"))
+                    Err(missing_media_feature("video", "image"))
                 }
             }
             PortableMedia::Audio(audio) => {
@@ -112,7 +112,7 @@ impl<'a> PortableMediaView<'a> {
                 #[cfg(not(feature = "audio"))]
                 {
                     let _ = audio;
-                    Err(missing_media_feature("audio", "audio", "mlx-audio"))
+                    Err(missing_media_feature("audio", "audio"))
                 }
             }
         }
@@ -247,7 +247,7 @@ mod feature_diagnostic_tests {
             .expect("image feature is disabled")
             .to_string();
         assert!(image.contains("feature `image` on `eredu-backend-mlx`"));
-        assert!(image.contains("feature `mlx-image` on the `eredu` facade"));
+        assert!(image.contains("feature `image` on the `eredu` facade"));
     }
 
     #[cfg(not(feature = "audio"))]
@@ -259,7 +259,7 @@ mod feature_diagnostic_tests {
             .expect("audio feature is disabled")
             .to_string();
         assert!(audio.contains("feature `audio` on `eredu-backend-mlx`"));
-        assert!(audio.contains("feature `mlx-audio` on the `eredu` facade"));
+        assert!(audio.contains("feature `audio` on the `eredu` facade"));
     }
 }
 

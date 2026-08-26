@@ -7,7 +7,7 @@ use eredu_architectures::{GgufArchitecture, ModelKind};
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
 use safemlx::{ops::GgufMetadataValue, Stream};
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 use crate::composition::mlx::ModelProcessor;
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
 /// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
 struct MaterializedGgufModel {
     model: Model,
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
 
@@ -201,7 +201,7 @@ pub fn materialize_model_plan(
     {
         let kind = prepared_model_kind(plan.inspection().architecture_plan());
         if structural::requires_distributed_stage_loader(kind, topology.topology()) {
-            #[cfg(feature = "media")]
+            #[cfg(any(feature = "image", feature = "audio"))]
             let processor = ModelProcessor::from_plan(plan.inspection().architecture_plan());
             let model =
                 crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
@@ -211,7 +211,7 @@ pub fn materialize_model_plan(
                     weights_stream,
                 )
                 .map(|model| MlxModel::pipeline(model, runtime_state_dtype_bytes))?;
-            #[cfg(feature = "media")]
+            #[cfg(any(feature = "image", feature = "audio"))]
             let model = model.with_processor(processor);
             return Ok(model);
         }
@@ -575,11 +575,11 @@ fn attach_processor(
     model: MlxModel,
     architecture_plan: &ArtifactArchitecturePlan,
 ) -> Result<MlxModel, Error> {
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     {
         Ok(model.with_processor(ModelProcessor::from_plan(architecture_plan)))
     }
-    #[cfg(not(feature = "media"))]
+    #[cfg(not(any(feature = "image", feature = "audio")))]
     {
         let _ = architecture_plan;
         Ok(model)
@@ -591,7 +591,7 @@ fn complete_gguf_model(
     runtime_state_dtype_bytes: std::num::NonZeroU8,
 ) -> MlxModel {
     let model = MlxModel::complete(materialized.model, runtime_state_dtype_bytes);
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     let model = model.with_processor(materialized.processor);
     model
 }
@@ -773,7 +773,7 @@ fn materialize_gguf_artifact(
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     let processor = ModelProcessor::from_plan(&architecture_plan);
     if options
         .parallel
@@ -788,7 +788,7 @@ fn materialize_gguf_artifact(
         )?;
         return Ok(MaterializedGgufModel {
             model,
-            #[cfg(feature = "media")]
+            #[cfg(any(feature = "image", feature = "audio"))]
             processor,
         });
     }
@@ -796,7 +796,7 @@ fn materialize_gguf_artifact(
         materialize_gguf_model(&source, projector.as_ref(), options, stream, weights_stream)?;
     Ok(MaterializedGgufModel {
         model,
-        #[cfg(feature = "media")]
+        #[cfg(any(feature = "image", feature = "audio"))]
         processor,
     })
 }

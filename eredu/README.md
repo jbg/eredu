@@ -76,8 +76,8 @@ drafter described by the plan.
 ## Cargo features
 
 - `mlx`: MLX execution with Metal and Accelerate; enabled by default.
-- `mlx-image`: MLX image and video preprocessing.
-- `mlx-audio`: MLX audio preprocessing.
+- `image`: image and video preprocessing for the selected local backend.
+- `audio`: audio preprocessing for the selected local backend.
 - `cuda`: MLX CUDA execution on supported Linux and Windows hosts without
   enabling Metal or Accelerate.
 - `nccl`: NCCL distributed support for CUDA builds.

@@ -11,7 +11,7 @@ use eredu_core::{InputExtent, InputMetadataKey};
 use eredu_runtime::PreparedModelInput as RuntimePreparedModelInput;
 use safemlx::{Array, Dtype};
 
-#[cfg(any(test, feature = "media"))]
+#[cfg(any(test, feature = "image", feature = "audio"))]
 use crate::backend::runtime::media::input::{InputPayload, Modality};
 use crate::{backend::error::Error, backend::runtime::media::input::ModelInput};
 
@@ -35,7 +35,7 @@ pub use image::RgbImageView;
 
 /// One decoded media item supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 pub struct MediaInput<'a> {
     /// Declared modality of the item.
     pub modality: Modality,
@@ -43,7 +43,7 @@ pub struct MediaInput<'a> {
     pub payload: MediaPayload<'a>,
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 impl<'a> MediaInput<'a> {
     /// Creates an RGB8 image input.
     #[cfg(feature = "image")]
@@ -83,7 +83,7 @@ impl<'a> MediaInput<'a> {
 
 /// One ordered input segment supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 pub enum ProcessorInput<'a> {
     /// Already-tokenized text IDs.
     TokenIds(&'a [u32]),
@@ -105,7 +105,7 @@ pub struct VideoFrames<'a> {
 
 /// Decoded data accepted by media processors.
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 pub enum MediaPayload<'a> {
     /// Decoded RGB8 image pixels.
     #[cfg(feature = "image")]
@@ -121,7 +121,7 @@ pub enum MediaPayload<'a> {
     _Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
-#[cfg(any(test, feature = "media"))]
+#[cfg(any(test, feature = "image", feature = "audio"))]
 fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
     let width = i32::try_from(ids.len())
         .map_err(|_| Error::Processor("text input exceeds MLX dimension capacity".into()))?;
@@ -320,21 +320,21 @@ pub fn prepared_identity_wire_arrays(
 }
 
 #[derive(Debug)]
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 pub enum ProcessorPreparationError<E> {
     Backend(Error),
     #[cfg_attr(not(feature = "image"), allow(dead_code))]
     Text(E),
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 impl<E> From<Error> for ProcessorPreparationError<E> {
     fn from(error: Error) -> Self {
         Self::Backend(error)
     }
 }
 
-#[cfg(any(test, feature = "media"))]
+#[cfg(any(test, feature = "image", feature = "audio"))]
 pub fn prepared_model_input(parts: Vec<InputPart>) -> Result<PreparedModelInput, Error> {
     if parts.is_empty() {
         return Err(Error::Processor(
@@ -344,7 +344,7 @@ pub fn prepared_model_input(parts: Vec<InputPart>) -> Result<PreparedModelInput,
     PreparedModelInput::new(parts)
 }
 
-#[cfg(any(test, feature = "media"))]
+#[cfg(any(test, feature = "image", feature = "audio"))]
 pub fn push_text_token_ids(parts: &mut Vec<InputPart>, token_ids: &[u32]) -> Result<(), Error> {
     if !token_ids.is_empty() {
         parts.push(text_input_part(token_ids)?);

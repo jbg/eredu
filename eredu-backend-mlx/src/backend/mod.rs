@@ -7,7 +7,7 @@ pub mod config;
 pub mod distributed;
 /// Errors produced by MLX model loading and execution.
 pub mod error;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 mod media;
 /// Reusable MLX neural-network building blocks.
 pub mod nn;
@@ -30,7 +30,7 @@ use std::num::NonZeroU8;
 
 use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Event, Stream};
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::error::Error,
@@ -186,7 +186,7 @@ fn infer_native_device_identity(device: &Device) -> Result<MlxDeviceIdentity, Er
 pub struct MlxModel {
     inner: MlxModelKind,
     runtime_state_dtype_bytes: NonZeroU8,
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
 
@@ -200,7 +200,7 @@ impl MlxModel {
         Self {
             inner: MlxModelKind::Complete(model),
             runtime_state_dtype_bytes,
-            #[cfg(feature = "media")]
+            #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
     }
@@ -212,7 +212,7 @@ impl MlxModel {
         Self {
             inner: MlxModelKind::Pipeline(model),
             runtime_state_dtype_bytes,
-            #[cfg(feature = "media")]
+            #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
     }
@@ -240,12 +240,12 @@ impl MlxModel {
         self.inner
     }
 
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     pub(crate) fn take_processor(&mut self) -> Option<ModelProcessor> {
         self.processor.take()
     }
 
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     pub(crate) fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
         self.processor = processor;
         self

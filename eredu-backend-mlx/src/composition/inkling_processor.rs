@@ -277,7 +277,7 @@ fn mel_filters(plan: InklingAudioPlan) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     #[test]
     fn gguf_processor_resolves_media_markers_from_embedded_tokenizer() {
         use std::collections::HashMap;

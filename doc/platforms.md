@@ -160,5 +160,7 @@ and its MLX implementation layer.
 
 At the facade layer, `mlx` and `cuda` are separate platform bundles over one
 private adapter feature. Selecting `cuda` with default features disabled does
-not enable Metal or Accelerate. When adding `mlx-image` or `mlx-audio` to a
-no-default-features build, select `mlx` or `cuda` alongside it.
+not enable Metal or Accelerate. When adding `image` or `audio` to a
+no-default-features build, select `mlx` or `cuda` alongside it. The modality
+features select preprocessing support, while `mlx` and `cuda` select the
+execution platform.

@@ -30,7 +30,7 @@ use crate::{
     },
     MlxTensor,
 };
-#[cfg(feature = "media")]
+#[cfg(any(feature = "image", feature = "audio"))]
 use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use eredu_core::MtpCapability;
@@ -407,7 +407,7 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
 
 impl MlxModelInput {
     /// Converts processor-owned MLX values into an opaque backend prompt.
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     pub fn from_prepared(input: &PreparedModelInput) -> Self {
         input.with_model_input(|input| Self::from(input))
     }
@@ -426,7 +426,7 @@ pub struct MlxModelSession<'a> {
     inner: MlxSessionKind,
     runtime_state_dtype_bytes: std::num::NonZeroU8,
     distributed: Option<MlxDistributedSession<'a>>,
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
 
@@ -476,9 +476,9 @@ impl<'a> MlxModelSession<'a> {
                 )))
             }
         }
-        #[cfg(feature = "media")]
+        #[cfg(any(feature = "image", feature = "audio"))]
         let mut model = model;
-        #[cfg(feature = "media")]
+        #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
         let inner = match model.into_kind() {
             MlxModelKind::Complete(model) => {
@@ -494,7 +494,7 @@ impl<'a> MlxModelSession<'a> {
             inner,
             runtime_state_dtype_bytes,
             distributed,
-            #[cfg(feature = "media")]
+            #[cfg(any(feature = "image", feature = "audio"))]
             processor,
         })
     }
@@ -503,7 +503,7 @@ impl<'a> MlxModelSession<'a> {
         self.runtime_state_dtype_bytes
     }
 
-    #[cfg(feature = "media")]
+    #[cfg(any(feature = "image", feature = "audio"))]
     pub(crate) fn processor(&self) -> Option<&ModelProcessor> {
         self.processor.as_ref()
     }
