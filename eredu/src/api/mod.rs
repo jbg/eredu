@@ -2,6 +2,25 @@
 //!
 //! This module is available without an execution backend. Enabling the
 //! `mlx` or `cuda` feature adds the selected local execution adapter.
+//!
+//! Backend implementation traits are imported from `eredu-core`, not this
+//! facade namespace:
+//!
+//! ```compile_fail
+//! use eredu::api::AutomaticPlanningBackend;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::api::ModelCapabilityBackend;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::api::MultimodalPreparationBackend;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::api::SpeculativeGenerationBackend;
+//! ```
 
 mod media;
 mod metadata;
@@ -38,18 +57,17 @@ pub use eredu_architectures::ModelKind;
 pub use eredu_core::{
     Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
     ArtifactModality, ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError, AvailableMemory,
-    BackendId, CacheStateStrategy, CapabilityError, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    DurationSeconds, EstimationCompleteness, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
-    InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
-    InspectionRequirement, InspectionSeverity, Media, MediaBinding, MediaRequestError,
-    ModelCapabilities, ModelCapabilityBackend, ModelInspectionReport, ModelResourceProfile,
-    MtpTelemetry, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
+    AutomaticPlannerPolicy, AutomaticPlanningError, AvailableMemory, BackendId, CacheStateStrategy,
+    CapabilityError, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
+    EstimationCompleteness, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity, Media,
+    MediaBinding, MediaRequestError, ModelCapabilities, ModelInspectionReport,
+    ModelResourceProfile, MtpTelemetry, MultimodalPreparationFailure, MultimodalRequest,
     MultimodalSegment, ObservationKind, Observed, PhysicalMemorySemantics, PlanExplanation,
     PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, RgbImage,
-    RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft, SpeculativeGenerationBackend,
+    RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, StateMemoryAssumptions,
     StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
     TransferTelemetry, Video, VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
