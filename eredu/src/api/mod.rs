@@ -3,8 +3,8 @@
 //! This module is available without an execution backend. Enabling the
 //! `mlx` or `cuda` feature adds the selected local execution adapter.
 //!
-//! Backend implementation traits are imported from `eredu-core`, not this
-//! facade namespace:
+//! Backend implementation traits and their errors are imported from
+//! `eredu-core`, not this facade namespace:
 //!
 //! ```compile_fail
 //! use eredu::api::AutomaticPlanningBackend;
@@ -16,6 +16,10 @@
 //!
 //! ```compile_fail
 //! use eredu::api::MultimodalPreparationBackend;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::api::MultimodalPreparationFailure;
 //! ```
 //!
 //! ```compile_fail
@@ -64,13 +68,13 @@ pub use eredu_core::{
     HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, InspectionIssue,
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity, Media,
     MediaBinding, MediaRequestError, ModelCapabilities, ModelInspectionReport,
-    ModelResourceProfile, MtpTelemetry, MultimodalPreparationFailure, MultimodalRequest,
-    MultimodalSegment, ObservationKind, Observed, PhysicalMemorySemantics, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, RgbImage,
-    RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, StateMemoryAssumptions,
-    StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
-    TransferTelemetry, Video, VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    ModelResourceProfile, MtpTelemetry, MultimodalRequest, MultimodalSegment, ObservationKind,
+    Observed, PhysicalMemorySemantics, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount,
+    SpeculativeDraft, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
+    StateMemoryAssumptions, StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest,
+    TokenizedMultimodalSegment, TransferTelemetry, Video, VideoSampling, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 pub use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 pub use portable::{

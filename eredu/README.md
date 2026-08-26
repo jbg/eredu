@@ -35,11 +35,11 @@ generation methods work for every backend:
 
 ```rust,ignore
 use eredu::{
-    api::{LoadedModel, LocalBackendFactory},
-    DevicePlan, ExecutionPlan,
+    api::{local_device_plan, LoadedModel, LocalBackendFactory, LocalDevice},
+    ExecutionPlan,
 };
 
-let device = DevicePlan::new("mlx", "metal:0")?;
+let device = local_device_plan(LocalDevice::Accelerator(0))?;
 let plan = ExecutionPlan::fully_resident(device);
 let factory = LocalBackendFactory::default();
 let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
