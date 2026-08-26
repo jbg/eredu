@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod automatic;
 mod capability;
 pub mod distributed;
+mod execution;
 mod inspection;
 pub mod loading;
 mod model;
@@ -15,12 +16,12 @@ mod session;
 pub mod speculative;
 pub mod structural;
 
+pub use execution::{submit_decode, submit_prefill};
 pub use inspection::{inspect_model, MlxInspectionOptions};
 pub use loading::validate_gguf_quantization_source;
-pub use model::{Model, ModelCache};
+pub use model::Executable;
 #[cfg(any(feature = "image", feature = "audio"))]
 pub(crate) use processor::ModelProcessor;
-pub use session::{submit_decode_with_cache, submit_prefill_with_cache};
 pub use session::{MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion};
 
 pub use crate::backend::{

@@ -497,9 +497,11 @@ family layer-count field.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
-If a backend model and cache representation do not match, dispatch rejects that
-pair before descriptor validation rather than synthesizing a model identity for
-the invalid pairing.
+Architecture-erased backend executables own their concrete model and correctly
+typed mutable state in the same exhaustive variant. Model state is not exposed
+as a second extensible erased enum: prefill, decode, inspection, prompt-cache,
+residency, parallel, and speculative hooks dispatch on the executable, so a new
+family makes every operation site non-exhaustive until its behavior is defined.
 Draft commit and pipeline prompt-cache persistence likewise select the
 architecture's named prediction segment; family configuration layer counts are
 not commit-range metadata.

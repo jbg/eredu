@@ -34,7 +34,7 @@ use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Even
 use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::error::Error,
-    composition::mlx::{distributed::pipeline::PipelineModel, MlxModelSession, Model},
+    composition::mlx::{distributed::pipeline::PipelineModel, Executable, MlxModelSession},
 };
 
 fn device_capabilities(has_world: bool) -> DeviceCapabilities {
@@ -188,12 +188,12 @@ pub struct MlxModel {
 }
 
 pub(crate) enum MlxModelKind {
-    Complete(Model),
+    Complete(Executable),
     Pipeline(PipelineModel),
 }
 
 impl MlxModel {
-    pub(crate) const fn complete(model: Model, runtime_state_dtype_bytes: NonZeroU8) -> Self {
+    pub(crate) const fn complete(model: Executable, runtime_state_dtype_bytes: NonZeroU8) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
             runtime_state_dtype_bytes,
@@ -216,7 +216,10 @@ impl MlxModel {
 
     /// Wraps a directly constructed replicated model for backend integration tests.
     #[cfg(test)]
-    pub const fn complete_for_test(model: Model, runtime_state_dtype_bytes: NonZeroU8) -> Self {
+    pub const fn complete_for_test(
+        model: Executable,
+        runtime_state_dtype_bytes: NonZeroU8,
+    ) -> Self {
         Self::complete(model, runtime_state_dtype_bytes)
     }
 
@@ -249,7 +252,7 @@ impl MlxModel {
     }
 
     #[cfg(test)]
-    pub fn into_complete(self) -> Result<Model, Error> {
+    pub fn into_complete(self) -> Result<Executable, Error> {
         match self.inner {
             MlxModelKind::Complete(model) => Ok(model),
             MlxModelKind::Pipeline(_) => Err(Error::Parallel(

@@ -1574,13 +1574,11 @@ fn resident_reference_quantized(
         .into_inner()
         .into_complete()
         .unwrap();
-    let mut cache = model.new_cache();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [text_input_part(&prompt)];
     let prefill = model
         .submit_prefill(
             crate::backend::runtime::media::input::ModelInput::new(&parts),
-            &mut cache,
             stream,
         )
         .unwrap()
@@ -1592,7 +1590,7 @@ fn resident_reference_quantized(
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
     let decode = model
-        .submit_decode(token, &mut cache, stream)
+        .submit_decode(token, stream)
         .unwrap()
         .wait()
         .unwrap()
@@ -1614,12 +1612,10 @@ fn resident_reference_for_prepared(
         .into_inner()
         .into_complete()
         .unwrap();
-    let mut cache = model.new_cache();
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
             crate::backend::runtime::media::input::ModelInput::new(&parts),
-            &mut cache,
             stream,
         )
         .unwrap()
@@ -1631,7 +1627,7 @@ fn resident_reference_for_prepared(
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
     let decode = model
-        .submit_decode(token, &mut cache, stream)
+        .submit_decode(token, stream)
         .unwrap()
         .wait()
         .unwrap()
@@ -1725,13 +1721,11 @@ fn multimodal_resident_reference(
         .into_inner()
         .into_complete()
         .unwrap();
-    let mut cache = model.new_cache();
     let prepared = multimodal_prepared_input(family);
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
             crate::backend::runtime::media::input::ModelInput::new(&parts),
-            &mut cache,
             stream,
         )
         .unwrap()
@@ -1743,7 +1737,7 @@ fn multimodal_resident_reference(
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
     let decode = model
-        .submit_decode(token, &mut cache, stream)
+        .submit_decode(token, stream)
         .unwrap()
         .wait()
         .unwrap()
