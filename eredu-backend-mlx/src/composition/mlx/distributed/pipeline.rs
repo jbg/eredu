@@ -12101,12 +12101,6 @@ where
     architecture_transport_placement(architecture, pipeline_stages)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn owns_embedding_weight(info: &PipelineStageInfo, tied: bool) -> bool {
-    info.owns_input || (tied && info.owns_output)
-}
-
 fn validate_stage_input(
     info: &PipelineStageInfo,
     input: &PipelineStageInput<'_>,

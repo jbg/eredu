@@ -219,18 +219,6 @@ pub struct DenseTransferWindow {
 }
 
 impl DenseTransferWindow {
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn has_ready(&self) -> bool {
-        self.schedule.has_ready()
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn is_exhausted(&self) -> bool {
-        self.schedule.is_exhausted()
-    }
-
     /// Takes the next transfer after ordering `consumer` behind its event.
     pub fn next(&mut self, consumer: &Stream) -> Result<DensePreparedTransfer, Error> {
         let (index, transfer) = self.schedule.pop_ready().ok_or({
@@ -1321,25 +1309,6 @@ mod validate_unused_tests {
         let consumed = BTreeSet::from(["claimed.weight".into()]);
         validate_unused(&ResolvedTestSource, &consumed, |_| false).unwrap();
     }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {
-    let mut largest = 0u64;
-    for start in 0..layer_bytes.len() {
-        let mut current = 0u64;
-        for bytes in layer_bytes.iter().skip(start).take(depth) {
-            current =
-                current
-                    .checked_add(*bytes)
-                    .ok_or(LayerwiseModelError::ArithmeticOverflow {
-                        context: "device layer window byte total",
-                    })?;
-        }
-        largest = largest.max(current);
-    }
-    Ok(largest)
 }
 
 pub fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Error> {
