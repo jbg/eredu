@@ -296,7 +296,10 @@ Backend operators expose architecture parameter identities through their
 neutral `Parameterized` topology, including when native storage uses private
 module slots. Generic binding, residency, and distributed-planning utilities
 consume those exact identities and never normalize path segments; private
-native topology must not widen or rewrite the checkpoint contract.
+native topology must not widen or rewrite the checkpoint contract. Backend
+loading likewise resolves an exact declared parameter identity before mapping
+a canonical weight identity to a private native slot; it never rejects a name
+because one of its path segments is spelled `inner`.
 
 These catalogs are model-wide and configuration-derived. Backend adapters may
 filter their outputs to the parameters present in a static module, execution

@@ -244,20 +244,16 @@ fn quantize_safetensors_for_test<M: ModuleParameters>(
     })
 }
 
-/// Strict-loads one canonically named checkpoint tensor into a module.
+/// Strict-loads one architecture-named checkpoint tensor into a module.
 ///
-/// Canonical `weight` keys may target a private MLX `inner.weight` slot.
-/// Legacy checkpoint keys that expose that private slot are rejected.
+/// Exact parameter identities take precedence. A canonical `weight` key is
+/// mapped to a private MLX `inner.weight` slot only when no exact slot exists.
 pub fn load_array_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
     value: Array,
     report: &mut StrictLoadReport,
 ) {
-    if is_legacy_inner_weight_name(&key) {
-        report.record_unused(key);
-        return;
-    }
     let parameter_key = if params.contains_key(key.as_str()) {
         key.clone()
     } else {
@@ -321,10 +317,6 @@ fn load_array_for_parameter_strict(
     }
 }
 
-fn is_legacy_inner_weight_name(key: &str) -> bool {
-    key == "inner.weight" || key.ends_with(".inner.weight")
-}
-
 fn wrapped_weight_parameter_name(key: &str) -> Option<String> {
     if key == "weight" {
         Some("inner.weight".into())
@@ -334,14 +326,43 @@ fn wrapped_weight_parameter_name(key: &str) -> Option<String> {
     }
 }
 
+fn quantization_companion_names(weight_key: &str) -> (String, String) {
+    let (prefix, underscore_companions) = if let Some(prefix) = weight_key.strip_suffix(".weight") {
+        (prefix, false)
+    } else if weight_key == "weight" {
+        ("", false)
+    } else {
+        (weight_key, true)
+    };
+    if prefix.is_empty() {
+        ("scales".into(), "biases".into())
+    } else if underscore_companions {
+        (format!("{prefix}_scales"), format!("{prefix}_biases"))
+    } else {
+        (format!("{prefix}.scales"), format!("{prefix}.biases"))
+    }
+}
+
+fn wrapped_weight_companion_names(parameter_key: &str) -> Option<(String, String)> {
+    let prefix = if parameter_key == "inner.weight" {
+        ""
+    } else {
+        parameter_key.strip_suffix(".inner.weight")?
+    };
+    Some(if prefix.is_empty() {
+        ("scales".into(), "biases".into())
+    } else {
+        (format!("{prefix}.scales"), format!("{prefix}.biases"))
+    })
+}
+
 /// Strict-loads a dense safetensors file into a model whose selected parameters
 /// use the standard MLX affine quantized layout.
 ///
 /// Dense matrices are quantized and materialized one at a time as they are
-/// read, bounding the lazy graph and active allocation peak. Checkpoint keys
-/// use canonical `weight` names; this helper privately maps them to a wrapped
-/// MLX `inner.weight` parameter or a packed `weight` with quantization
-/// companions. Legacy `inner.weight` checkpoint keys are left unused.
+/// read, bounding the lazy graph and active allocation peak. Exact checkpoint
+/// identities and companion slots take precedence; canonical `weight` names
+/// are mapped to wrapped MLX `inner.weight` storage only when necessary.
 pub fn load_array_quantized_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
@@ -352,32 +373,6 @@ pub fn load_array_quantized_strict(
 ) -> Result<(), Error> {
     {
         let weight_key = key.clone();
-        if is_legacy_inner_weight_name(&weight_key) {
-            report.record_unused(weight_key);
-            return Ok(());
-        }
-        let (prefix, underscore_companions) =
-            if let Some(prefix) = weight_key.strip_suffix(".weight") {
-                (prefix.to_string(), false)
-            } else if weight_key == "weight" {
-                (String::new(), false)
-            } else {
-                (weight_key.clone(), true)
-            };
-        let scales_key = if prefix.is_empty() {
-            "scales".to_string()
-        } else if underscore_companions {
-            format!("{prefix}_scales")
-        } else {
-            format!("{prefix}.scales")
-        };
-        let biases_key = if prefix.is_empty() {
-            "biases".to_string()
-        } else if underscore_companions {
-            format!("{prefix}_biases")
-        } else {
-            format!("{prefix}.biases")
-        };
         let parameter_key = if params.contains_key(weight_key.as_str()) {
             weight_key.clone()
         } else {
@@ -385,16 +380,27 @@ pub fn load_array_quantized_strict(
                 .filter(|candidate| params.contains_key(candidate.as_str()))
                 .unwrap_or_else(|| weight_key.clone())
         };
-        let has_quantized_parameters = params.contains_key(parameter_key.as_str())
-            && params.contains_key(scales_key.as_str())
-            && (!quantization.has_biases() || params.contains_key(biases_key.as_str()));
+        let exact_companions = quantization_companion_names(&weight_key);
+        let companions = std::iter::once(exact_companions.clone())
+            .chain(
+                wrapped_weight_companion_names(&parameter_key)
+                    .filter(|candidate| candidate != &exact_companions),
+            )
+            .find(|(scales_key, biases_key)| {
+                params.contains_key(scales_key.as_str())
+                    && (!quantization.has_biases() || params.contains_key(biases_key.as_str()))
+            });
         let wrapped_weight = parameter_key != weight_key;
         let packed_direct_weight = !wrapped_weight
             && params
                 .get(parameter_key.as_str())
                 .is_some_and(|target| target.shape() != value.shape());
-        let target = (has_quantized_parameters && (wrapped_weight || packed_direct_weight))
-            .then_some((weight_key, parameter_key, scales_key, biases_key));
+        let target = companions
+            .filter(|_| {
+                params.contains_key(parameter_key.as_str())
+                    && (wrapped_weight || packed_direct_weight)
+            })
+            .map(|(scales_key, biases_key)| (weight_key, parameter_key, scales_key, biases_key));
 
         if let Some((weight_key, parameter_key, scales_key, biases_key)) = target {
             let quantized = quantize_tensor(&value, quantization, quantization_stream)?;
@@ -466,8 +472,10 @@ mod tests {
     use eredu_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use safemlx::{
-        macros::ModuleParameters, module::Param, quantization::MaybeQuantized, Array, Device,
-        DeviceType, Dtype, ExecutionContext,
+        macros::ModuleParameters,
+        module::{ModuleParameters as _, Param},
+        quantization::MaybeQuantized,
+        Array, Device, DeviceType, Dtype, ExecutionContext,
     };
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -478,7 +486,10 @@ mod tests {
 
     use super::gguf_quantization_configs;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use super::{load_arrays_quantized_strict, quantize_safetensors_for_test, StrictLoadReport};
+    use super::{
+        load_array_strict, load_arrays_quantized_strict, quantize_safetensors_for_test,
+        StrictLoadReport,
+    };
 
     #[test]
     fn gguf_runtime_configs_preserve_every_native_affine_format() {
@@ -571,6 +582,58 @@ mod tests {
         experts_scales: Param<Option<Array>>,
         #[param]
         experts_biases: Param<Option<Array>>,
+    }
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[derive(Debug, Clone, ModuleParameters)]
+    struct ExactInnerWeight {
+        #[param]
+        projection: ExactInnerProjection,
+    }
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[derive(Debug, Clone, ModuleParameters)]
+    struct ExactInnerProjection {
+        #[param]
+        inner: ExactPackedLinear,
+    }
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[derive(Debug, Clone, ModuleParameters)]
+    struct ExactPackedLinear {
+        #[param]
+        weight: Param<Array>,
+        #[param]
+        scales: Param<Array>,
+        #[param]
+        biases: Param<Option<Array>>,
+    }
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn strict_load_accepts_exact_inner_weight_identity() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut model = ExactInnerWeight {
+            projection: ExactInnerProjection {
+                inner: ExactPackedLinear {
+                    weight: Param::<Array>::unloaded(&[8, 64], Dtype::Float32, stream).unwrap(),
+                    scales: Param::<Array>::unloaded(&[8, 2], Dtype::Float32, stream).unwrap(),
+                    biases: Param::new(None),
+                },
+            },
+        };
+        let value = Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]);
+        let mut report = StrictLoadReport::default();
+        load_array_strict(
+            &mut model.parameters_mut().flatten(),
+            "projection.inner.weight".into(),
+            value,
+            &mut report,
+        );
+        report
+            .finish_excluding(&model, |name| name != "projection.inner.weight")
+            .unwrap();
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -686,19 +749,19 @@ mod tests {
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
-    fn quantized_strict_load_rejects_legacy_inner_weight_source_names() {
+    fn quantized_strict_load_preserves_exact_inner_weight_and_companions() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let quantization = AffineQuantization::default();
-        let mut model = QuantizedLinear {
-            projection: unloaded_maybe_quantized_linear(
-                64,
-                8,
-                false,
-                Some(quantization.into()),
-                stream,
-            )
-            .unwrap(),
+        let mut model = ExactInnerWeight {
+            projection: ExactInnerProjection {
+                inner: ExactPackedLinear {
+                    weight: Param::<Array>::unloaded(&[8, 8], Dtype::Uint32, stream).unwrap(),
+                    scales: Param::<Array>::unloaded(&[8, 1], Dtype::Uint8, stream).unwrap(),
+                    biases: Param::<Option<Array>>::unloaded_some(&[8, 1], Dtype::Float32, stream)
+                        .unwrap(),
+                },
+            },
         };
         let dense = Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]);
         let mut report = StrictLoadReport::default();
@@ -710,13 +773,21 @@ mod tests {
             &mut report,
         )
         .unwrap();
+        report.finish(&model).unwrap();
 
-        let error = report.finish(&model).unwrap_err();
-        let crate::backend::error::Error::StrictLoadValidation { missing, unused } = error else {
-            panic!("legacy source name should fail strict load validation")
-        };
-        assert!(missing.iter().any(|name| name == "projection.inner.weight"));
-        assert_eq!(unused, ["projection.inner.weight"]);
+        assert_eq!(model.projection.inner.weight.shape(), &[8, 8]);
+        assert_eq!(model.projection.inner.scales.shape(), &[8, 1]);
+        assert_eq!(
+            model
+                .projection
+                .inner
+                .biases
+                .value
+                .as_ref()
+                .unwrap()
+                .shape(),
+            &[8, 1]
+        );
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
