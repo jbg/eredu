@@ -278,6 +278,12 @@ impl TextArgs {
     pub fn layer_policy(&self, layer: usize) -> Option<LayerPolicy> {
         self.layer_schedule.get(layer).copied()
     }
+    /// Returns whether any normalized decoder layer uses routed experts.
+    pub fn has_sparse_moe_layers(&self) -> bool {
+        self.layer_schedule
+            .iter()
+            .any(|policy| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+    }
     /// Returns local or global query heads.
     pub fn query_heads(&self, local: bool) -> i32 {
         if local {

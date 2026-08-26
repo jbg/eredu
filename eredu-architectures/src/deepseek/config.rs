@@ -366,6 +366,15 @@ impl V3Source {
 }
 
 impl V3Args {
+    /// Returns whether any normalized decoder layer uses routed experts.
+    pub fn has_sparse_moe_layers(&self) -> bool {
+        self.num_nextn_predict_layers > 0
+            || self
+                .layer_schedule
+                .iter()
+                .any(|policy| *policy == LayerPolicy::SparseMoe)
+    }
+
     /// Resolves one canonical matrix's physical encoding.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
         self.linear_formats

@@ -536,8 +536,11 @@ architecture's named prediction segment; family configuration layer counts are
 not commit-range metadata.
 
 Pre-materialization capabilities follow the same rule. The normalized
-architecture reports whether independently addressable routed experts exist;
-the selected backend intersects that fact with its expert-cache
+architecture derives whether independently addressable routed experts exist
+from its exact target and prediction layer schedule; a completely all-dense
+schedule reports neither expert residency nor expert-parallel support even when
+the family also admits routed variants. The selected backend intersects that
+fact with its expert-cache
 materializers. Core selects the neutral expert-cache route but does not infer
 support from a family name, because one family may contain both dense and MoE
 variants. Nonresident SafeTensors load-time quantization follows the same

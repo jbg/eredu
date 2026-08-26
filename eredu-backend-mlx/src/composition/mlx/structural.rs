@@ -430,6 +430,39 @@ mod admission_policy_tests {
         })
     }
 
+    fn dense_deepseek_v3_config() -> Value {
+        serde_json::json!({
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "vocab_size": 128,
+            "max_position_embeddings": 4096,
+            "q_lora_rank": 4,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 6,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 8,
+            "first_k_dense_replace": 4,
+            "moe_layer_freq": 2,
+            "n_routed_experts": 8,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 2,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "tie_word_embeddings": false,
+            "attention_dropout": 0.0,
+            "hidden_act": "silu"
+        })
+    }
+
     #[test]
     fn expert_cache_admits_normalized_gemma4_and_muse_glimmer_moe() {
         let options = expert_cache_options();
@@ -550,6 +583,7 @@ mod admission_policy_tests {
     fn expert_cache_rejects_dense_variants_of_mixed_families() {
         let options = expert_cache_options();
         for (kind, config) in [
+            (ModelKind::DeepSeekV3, dense_deepseek_v3_config()),
             (ModelKind::Gemma4, gemma4_config(false)),
             (ModelKind::MuseGlimmer, muse_glimmer_config(false)),
             (ModelKind::Qwen3, dense_qwen3_config()),

@@ -391,12 +391,11 @@ pub fn prepared_safetensors_capabilities(
 
     let (parallel, independently_addressable_experts, input_modalities, embedded_draft_layers) =
         match architecture.model() {
-            SafetensorsModelConfig::DeepSeekV3(args) => (
-                ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
-                true,
-                InputModalities::TEXT,
-                usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
-            ),
+            SafetensorsModelConfig::DeepSeekV3(args) => {
+                let mut capabilities = routed_text(args.has_sparse_moe_layers());
+                capabilities.3 = usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?;
+                capabilities
+            }
             SafetensorsModelConfig::DeepSeekV4(args) => (
                 ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
                 true,
@@ -423,9 +422,7 @@ pub fn prepared_safetensors_capabilities(
                 0,
             ),
             SafetensorsModelConfig::Inkling(args) => {
-                let routed = args.text_config.layer_schedule.iter().any(|policy| {
-                    policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe
-                });
+                let routed = args.text_config.has_sparse_moe_layers();
                 let embedded = args
                     .mtp_config
                     .as_ref()
@@ -551,11 +548,10 @@ pub fn prepared_gguf_capabilities(
     let routed = match plan.model() {
         GgufModelConfig::Gemma4(family) => family.text.num_experts.is_some(),
         GgufModelConfig::MuseGlimmer(args) => args.is_moe(),
-        GgufModelConfig::DeepSeekV3(_)
-        | GgufModelConfig::DeepSeekV4(_)
-        | GgufModelConfig::GptOss(_)
-        | GgufModelConfig::Inkling(_)
-        | GgufModelConfig::KimiLinear(_) => true,
+        GgufModelConfig::DeepSeekV3(args) => args.has_sparse_moe_layers(),
+        GgufModelConfig::DeepSeekV4(_) | GgufModelConfig::GptOss(_) => true,
+        GgufModelConfig::Inkling(args) => args.text_config.has_sparse_moe_layers(),
+        GgufModelConfig::KimiLinear(args) => args.has_sparse_moe_layers(),
         GgufModelConfig::Lfm2(args) => args.has_sparse_moe_layers(),
         GgufModelConfig::NemotronH(args) => args.has_sparse_moe_layers(),
         GgufModelConfig::Qwen(args) => args.is_moe(),
@@ -645,6 +641,69 @@ mod tests {
         })
     }
 
+    fn deepseek_v3_config(first_k_dense_replace: i32) -> Value {
+        serde_json::json!({
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "vocab_size": 128,
+            "max_position_embeddings": 4096,
+            "q_lora_rank": 4,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 6,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 8,
+            "first_k_dense_replace": first_k_dense_replace,
+            "moe_layer_freq": 2,
+            "n_routed_experts": 8,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 2,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "tie_word_embeddings": false,
+            "attention_dropout": 0.0,
+            "hidden_act": "silu"
+        })
+    }
+
+    fn kimi_linear_config(first_k_dense_replace: i32) -> Value {
+        serde_json::json!({
+            "model_type":"kimi_linear","vocab_size":16,"hidden_size":12,
+            "num_hidden_layers":2,"num_attention_heads":3,"num_key_value_heads":3,
+            "intermediate_size":17,"head_dim":4,"model_max_length":64,
+            "linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],
+                "num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2,"moe_intermediate_size":9,"kv_lora_rank":6,
+            "qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,
+            "routed_scaling_factor":1.0,"first_k_dense_replace":first_k_dense_replace,
+            "num_expert_group":1,"topk_group":1
+        })
+    }
+
+    fn inkling_config(mlp_layer_types: &[&str]) -> Value {
+        serde_json::json!({
+            "model_type":"inkling_mm_model","image_token_id":60,"audio_token_id":61,
+            "text_config":{
+                "hidden_size":16,"num_hidden_layers":3,"vocab_size":64,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "sliding_window_size":8,
+                "layer_types":["sliding_attention","full_attention","sliding_attention"],
+                "mlp_layer_types":mlp_layer_types,"sconv_kernel_size":4,
+                "d_rel":2,"rel_extent":16,"intermediate_size":32,
+                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1
+            }
+        })
+    }
+
     fn safetensors_plan(config: &Value) -> crate::configuration::SafetensorsArchitecturePlan {
         crate::configuration::resolve_model_config(config)
             .unwrap()
@@ -683,6 +742,65 @@ mod tests {
         assert!(!realtime.parallel_plan().pipeline_parallel());
         assert!(!realtime.parallel_plan().expert_parallel());
         assert!(!realtime.independently_addressable_experts());
+    }
+
+    fn assert_dense_capabilities(capabilities: ArchitectureCapabilities) {
+        assert!(!capabilities.parallel_plan().expert_parallel());
+        assert!(!capabilities.independently_addressable_experts());
+    }
+
+    #[test]
+    fn dense_deepseek_v3_capabilities_follow_the_schedule_in_both_formats() {
+        let config = deepseek_v3_config(4);
+        let safetensors = safetensors_plan(&config);
+        assert_dense_capabilities(prepared_safetensors_capabilities(&safetensors).unwrap());
+
+        let args = crate::deepseek::parse_v3_config(&config).unwrap();
+        assert!(!args.has_sparse_moe_layers());
+        let checkpoint = crate::deepseek::v3_gguf_plan(&args).unwrap();
+        let gguf = crate::configuration::GgufArchitecturePlan::new(
+            GgufArchitecture::DeepSeek2,
+            crate::configuration::GgufModelConfig::DeepSeekV3(args),
+            checkpoint,
+        );
+        assert_dense_capabilities(prepared_gguf_capabilities(&gguf));
+    }
+
+    #[test]
+    fn deepseek_v3_prediction_layers_retain_routed_capabilities() {
+        let mut config = deepseek_v3_config(4);
+        config["num_nextn_predict_layers"] = 1.into();
+        let safetensors = safetensors_plan(&config);
+        let capabilities = prepared_safetensors_capabilities(&safetensors).unwrap();
+
+        assert!(capabilities.parallel_plan().expert_parallel());
+        assert!(capabilities.independently_addressable_experts());
+    }
+
+    #[test]
+    fn dense_kimi_linear_and_inkling_gguf_capabilities_follow_their_schedules() {
+        let kimi =
+            crate::kimi_linear::model_args_from_config_value(&kimi_linear_config(2)).unwrap();
+        assert!(!kimi.has_sparse_moe_layers());
+        let checkpoint = crate::kimi_linear::gguf_plan(&kimi).unwrap();
+        let plan = crate::configuration::GgufArchitecturePlan::new(
+            GgufArchitecture::KimiLinear,
+            crate::configuration::GgufModelConfig::KimiLinear(kimi),
+            checkpoint,
+        );
+        assert_dense_capabilities(prepared_gguf_capabilities(&plan));
+
+        let config = inkling_config(&["dense", "dense", "dense"]);
+        let inkling =
+            crate::inkling::ModelArgs::from_hf_json(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!inkling.text_config.has_sparse_moe_layers());
+        let checkpoint = crate::inkling::gguf_plan(&inkling).unwrap();
+        let plan = crate::configuration::GgufArchitecturePlan::new(
+            GgufArchitecture::Inkling,
+            crate::configuration::GgufModelConfig::Inkling(inkling),
+            checkpoint,
+        );
+        assert_dense_capabilities(prepared_gguf_capabilities(&plan));
     }
 
     #[test]
@@ -784,14 +902,7 @@ mod tests {
 
     #[test]
     fn kimi_linear_declares_nonresident_load_time_quantization() {
-        let config = serde_json::json!({
-            "model_type":"kimi_linear","vocab_size":16,"hidden_size":12,"num_hidden_layers":2,
-            "num_attention_heads":3,"num_key_value_heads":3,"intermediate_size":17,"head_dim":4,
-            "model_max_length":64,"linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
-            "num_experts":2,"moe_intermediate_size":9,"kv_lora_rank":6,"qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
-            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,"routed_scaling_factor":1.0,
-            "first_k_dense_replace":1,"num_expert_group":1,"topk_group":1
-        });
+        let config = kimi_linear_config(1);
         let plan = safetensors_plan(&config);
         let capabilities = prepared_safetensors_capabilities(&plan).unwrap();
         assert!(capabilities.nonresident_safetensors_quantization());
