@@ -48,6 +48,14 @@ pub enum LocalDevice {
     Accelerator(u32),
 }
 
+/// Failure to map a facade device choice to the selected local backend.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub enum LocalDevicePlanError {
+    /// This build contains the MLX adapter but no native accelerator family.
+    #[error("no local accelerator family is compiled for this target")]
+    AcceleratorNotCompiled,
+}
+
 /// Factory for local realtime model loading and execution.
 ///
 /// The created backend is intentionally opaque: applications operate it
@@ -86,7 +94,9 @@ impl LocalRealtimeBackendFactory {
         >,
         LocalBackendError,
     > {
-        eredu_backend_mlx::create_realtime_backend(&local_device_plan(self.device))
+        let device = local_device_plan(self.device)
+            .map_err(|error| LocalBackendError::AutomaticPlanning(error.to_string()))?;
+        eredu_backend_mlx::create_realtime_backend(&device)
     }
 }
 
@@ -137,20 +147,27 @@ pub fn configure_local_runtime(
 }
 
 /// Creates a portable plan device for the selected local backend.
-pub fn local_device_plan(device: LocalDevice) -> crate::DevicePlan {
+pub fn local_device_plan(device: LocalDevice) -> Result<crate::DevicePlan, LocalDevicePlanError> {
     let device = match device {
         LocalDevice::Cpu => "cpu:0".to_owned(),
         LocalDevice::Accelerator(index) => {
-            let family = if cfg!(feature = "cuda") {
-                "cuda"
-            } else {
-                "metal"
-            };
+            let family = compiled_accelerator_family()
+                .ok_or(LocalDevicePlanError::AcceleratorNotCompiled)?;
             format!("{family}:{index}")
         }
     };
-    crate::DevicePlan::new("mlx", device)
-        .expect("the selected local backend and generated device identifier are non-empty")
+    Ok(crate::DevicePlan::new("mlx", device)
+        .expect("the selected local backend and generated device identifier are non-empty"))
+}
+
+const fn compiled_accelerator_family() -> Option<&'static str> {
+    if cfg!(feature = "cuda") {
+        Some("cuda")
+    } else if cfg!(all(feature = "mlx", target_vendor = "apple")) {
+        Some("metal")
+    } else {
+        None
+    }
 }
 
 /// Waits for work submitted to the selected local backend.
@@ -387,7 +404,7 @@ pub fn benchmark_local_expert_cache(
 mod tests {
     use super::{
         local_device_plan, validate_expert_cache_benchmark_prompt, LocalDevice,
-        LocalExpertCacheBenchmarkError,
+        LocalDevicePlanError, LocalExpertCacheBenchmarkError,
     };
 
     #[test]
@@ -402,11 +419,12 @@ mod tests {
     #[test]
     fn local_accelerator_plan_names_the_compiled_family() {
         let plan = local_device_plan(LocalDevice::Accelerator(3));
-        let expected = if cfg!(feature = "cuda") {
-            "cuda:3"
+        if cfg!(feature = "cuda") {
+            assert_eq!(plan.unwrap().device, "cuda:3");
+        } else if cfg!(all(feature = "mlx", target_vendor = "apple")) {
+            assert_eq!(plan.unwrap().device, "metal:3");
         } else {
-            "metal:3"
-        };
-        assert_eq!(plan.device, expected);
+            assert_eq!(plan, Err(LocalDevicePlanError::AcceleratorNotCompiled));
+        }
     }
 }

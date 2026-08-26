@@ -1358,7 +1358,7 @@ fn choose_automatic_residency(
 
 fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
     let hardware = discover_local_hardware();
-    let selected_device = device_plan(device);
+    let selected_device = device_plan(device)?;
     validate_automatic_device(&hardware, &selected_device)?;
     let resources = inspect_local_model(model_path, LocalInspectionOptions::default())?.resources;
     Ok(ExecutionPlanReport {
@@ -1405,7 +1405,7 @@ fn automatic_plan(
     device: CliDevice,
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<ExecutionPlanReport> {
-    let request = AutomaticPlanRequest::new(model_path, device_plan(device))
+    let request = AutomaticPlanRequest::new(model_path, device_plan(device)?)
         .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
         .plan(&LocalBackendFactory::default(), &request)
@@ -1896,7 +1896,7 @@ fn apply_automatic_report(
     let embedded_mtp = draft_model_path.is_none()
         && args.mtp_draft_tokens > 0
         && model_advertises_embedded_mtp(model_path);
-    report.plan = cli_execution_plan(args, draft_model_path, embedded_mtp);
+    report.plan = cli_execution_plan(args, draft_model_path, embedded_mtp)?;
     if !overrides.is_empty() {
         report.explanation.entries.push(PlanExplanationEntry {
             level: PlanExplanationLevel::Decision,
@@ -1948,7 +1948,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
             let plan: ExecutionPlan = serde_json::from_slice(&bytes)
                 .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
-            if plan.device != device_plan(args.device) {
+            if plan.device != device_plan(args.device)? {
                 bail!(
                     "exact trial plan device {}:{} does not match --device {}",
                     plan.device.backend,
@@ -2066,10 +2066,10 @@ fn main() -> Result<()> {
     let configured_embedded_mtp = draft_model_path.is_none()
         && args.mtp_draft_tokens > 0
         && model_advertises_embedded_mtp(&model_path);
-    let execution_plan = automatic_report.as_ref().map_or_else(
-        || cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp),
-        |report| report.plan.clone(),
-    );
+    let execution_plan = match automatic_report.as_ref() {
+        Some(report) => report.plan.clone(),
+        None => cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp)?,
+    };
 
     if args.verbose {
         eprintln!("--- Eredu MLX diagnostics (stderr) ---");
@@ -2635,11 +2635,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn device_plan(device: CliDevice) -> DevicePlan {
-    local_device_plan(device.local())
+fn device_plan(device: CliDevice) -> Result<DevicePlan> {
+    local_device_plan(device.local()).map_err(Into::into)
 }
 
-fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool) -> ExecutionPlan {
+fn cli_execution_plan(
+    args: &Cli,
+    draft_model: Option<&Path>,
+    embedded_mtp: bool,
+) -> Result<ExecutionPlan> {
     let residency = if args.dense_disk_stream {
         let defaults = DenseDiskStreamLoadOptions::default();
         ResidencyPlan::DenseDiskStream {
@@ -2663,7 +2667,7 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
         let placement = match args.mtp_draft_device {
             MtpDraftDevice::Target => DraftPlacementPlan::Target,
             MtpDraftDevice::Device(device) => DraftPlacementPlan::Device {
-                device: device_plan(device),
+                device: device_plan(device)?,
             },
         };
         DraftingPlan::External {
@@ -2682,9 +2686,9 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
     } else {
         DraftingPlan::Disabled
     };
-    ExecutionPlan {
+    Ok(ExecutionPlan {
         schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
-        device: device_plan(args.device),
+        device: device_plan(args.device)?,
         topology: eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
             .expect("the singleton topology is valid"),
         residency,
@@ -2709,7 +2713,7 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
             exact_completion: true,
             ..eredu::BackendCapabilities::default()
         },
-    }
+    })
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -3493,7 +3497,7 @@ mod tests {
         let cache_path = directory.path().join("plans.json");
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
-        let device = device_plan(CliDevice::Cpu);
+        let device = device_plan(CliDevice::Cpu).unwrap();
         let hardware = discover_local_hardware();
         let resources = eredu::ModelResourceProfile {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
@@ -3569,7 +3573,7 @@ mod tests {
         assert!(!overrides.contains("quantization_group_size"));
         let original = Cli::from_arg_matches(&matches).unwrap();
         let mut applied = original.clone();
-        let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu));
+        let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap());
         apply_automatic_plan(&mut applied, &plan).unwrap();
         overrides.restore(&mut applied, &original);
         assert!(!applied.layerwise_host);
@@ -3611,7 +3615,7 @@ mod tests {
         let mut args =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
-        let device = device_plan(CliDevice::Cpu);
+        let device = device_plan(CliDevice::Cpu).unwrap();
         let mut plan = base_automatic_candidates(device, 1 << 30, 2 << 30)[1].clone();
         plan.expert_cache = Some(super::ExpertCachePlan {
             device_budget_bytes: Some(256 << 20),
@@ -3645,7 +3649,7 @@ mod tests {
         let mut args =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
-        let mut plan = eredu::ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu));
+        let mut plan = eredu::ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap());
         plan.weight_transformation = WeightTransformationPlan::Affine {
             bits: 4,
             group_size: 128,
@@ -3725,7 +3729,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.telemetry_json.as_deref(), Some(Path::new("run.json")));
 
-        let plan = cli_execution_plan(&args, None, false);
+        let plan = cli_execution_plan(&args, None, false).unwrap();
         assert_eq!(plan.device.backend.as_str(), "mlx");
         assert_eq!(plan.device.device, "cpu:0");
         assert!(matches!(

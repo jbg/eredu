@@ -24,12 +24,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: native_tool_calling TARGET [DRAFTER]")?;
     let drafter_path = arguments.next();
 
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     if let Some(path) = &drafter_path {
         plan.drafting = DraftingPlan::External {
             model: path.clone(),
             placement: DraftPlacementPlan::Device {
-                device: local_device_plan(LocalDevice::Cpu),
+                device: local_device_plan(LocalDevice::Cpu)?,
             },
             max_draft_tokens: 3,
             lookahead: true,

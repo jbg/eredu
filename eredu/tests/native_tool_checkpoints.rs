@@ -27,7 +27,10 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
 }
 
 fn accelerator_plan() -> ExecutionPlan {
-    ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)))
+    ExecutionPlan::fully_resident(
+        local_device_plan(LocalDevice::Accelerator(0))
+            .expect("native checkpoint smoke tests require a compiled accelerator"),
+    )
 }
 
 fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: ExecutionPlan) {

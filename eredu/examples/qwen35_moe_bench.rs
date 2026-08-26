@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     println!("decode_tokens={decode_tokens}");
     println!("quantize_on_load={quantize_on_load}");
 
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     if quantize_on_load {
         plan.weight_transformation = WeightTransformationPlan::Affine {
             bits: 4,

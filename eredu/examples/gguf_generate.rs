@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
         .transpose()?
         .unwrap_or(0.0);
 
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
         LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &gguf_file, &plan)?;
     let (mut model, _) = planned.into_parts();

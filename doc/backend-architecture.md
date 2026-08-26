@@ -718,10 +718,12 @@ receive a raw assistant path, reopen configuration or metadata for dispatch, or
 duplicate assistant admission.
 
 `eredu::api::local_device_plan` maps the facade's CPU or accelerator choice to
-the currently selected local backend. `LocalRuntimeConfiguration` applies any
-process-global allocator or embedded accelerator-library configuration before
-the factory realizes that plan. Platform applications therefore do not need a
-concrete backend crate merely to create and complete a model session.
+the currently selected local backend and rejects accelerator choices when that
+build contains no native accelerator family. `LocalRuntimeConfiguration`
+applies any process-global allocator or embedded accelerator-library
+configuration before the factory realizes that plan. Platform applications
+therefore do not need a concrete backend crate merely to create and complete a
+model session.
 
 Architecture inspection also reports embedded-draft depth from the normalized
 family configuration in `ModelResourceProfile`. The neutral automatic planner

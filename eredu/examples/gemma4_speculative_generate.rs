@@ -71,7 +71,7 @@ struct GenerationResult {
 }
 
 fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<PreparedChat> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
         LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
@@ -92,7 +92,7 @@ fn run_greedy(
     prompt: &str,
     max_tokens: usize,
 ) -> anyhow::Result<GenerationResult> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
         LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
@@ -133,7 +133,7 @@ fn run_mtp(
     prepared: &PreparedChat,
     max_tokens: usize,
 ) -> anyhow::Result<GenerationResult> {
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     plan.drafting = DraftingPlan::External {
         model: assistant_dir.display().to_string(),
         placement: DraftPlacementPlan::Target,

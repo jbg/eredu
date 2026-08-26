@@ -165,7 +165,9 @@ fn worker_main(
             &LocalRuntimeConfiguration::default().with_accelerator_library(metallib_path),
         )
         .map_err(|error| error.to_string())?;
-        let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+        let plan = ExecutionPlan::fully_resident(
+            local_device_plan(LocalDevice::Accelerator(0)).map_err(|error| error.to_string())?,
+        );
         let planned =
             LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_path, &plan)
                 .map_err(|error| error.to_string())?;
