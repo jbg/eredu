@@ -1107,7 +1107,7 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
     };
     let ownership = PartitionOwnership::new(true, false, ["embedding"]).expect("valid ownership");
     let partition =
-        ArchitecturePartition::<(), eredu_runtime::NoAuxiliaryBoundary>::from_architecture::<
+        ArchitecturePartition::<(), eredu_runtime::NoAuxiliaryBoundarySchema>::from_architecture::<
             FakeBackend,
             FixtureState,
             _,
@@ -1118,7 +1118,7 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
             ownership,
             None,
             (),
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             std::iter::empty(),
         )
         .expect("partition derives its canonical graph");

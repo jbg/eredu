@@ -754,7 +754,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
-    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
+
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            self.args().hidden_size,
+        ))
+    }
 
     fn begin_partition<'a>(
         &mut self,

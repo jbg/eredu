@@ -229,7 +229,11 @@ impl eredu_runtime::ArchitectureBoundary for ConditionalPipelineBoundarySchema {
 
     const IDENTITY: &'static str = "qwen_conditional.decoder";
 
-    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+    fn primary_tensor_spec(&self) -> eredu_runtime::BoundaryTensorSpec {
+        eredu_runtime::BoundaryTensorSpec::primary_activation(self.hidden_size)
+    }
+
+    fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
         (0..self.deepstack_count)
             .map(|index| {
@@ -1781,9 +1785,10 @@ mod transport_tests {
             deepstack_count: 3,
         };
         let tensors = schema.wire_schema().unwrap().resolve(2, 4).unwrap();
-        assert_eq!(tensors.len(), 3);
-        assert_eq!(tensors[0].role(), "deepstack.0");
-        assert_eq!(tensors[2].shape(), [2, 4, 48]);
+        assert_eq!(tensors.primary().shape(), [2, 4, 48]);
+        assert_eq!(tensors.auxiliary().len(), 3);
+        assert_eq!(tensors.auxiliary()[0].role(), "deepstack.0");
+        assert_eq!(tensors.auxiliary()[2].shape(), [2, 4, 48]);
     }
 
     #[test]
@@ -2041,6 +2046,10 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Boundary = ConditionalPipelineBoundarySchema;
+
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(self.pipeline_boundary_schema())
+    }
 
     fn begin_partition<'a>(
         &mut self,

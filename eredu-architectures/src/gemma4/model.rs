@@ -68,6 +68,13 @@ where
 {
     type Boundary = TextBoundarySchema;
 
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        let geometry = self
+            .parallel_geometry()
+            .ok_or_else(|| Error::backend("Gemma pipeline boundary requires parallel geometry"))?;
+        Ok(TextBoundarySchema::from_args(&self.args().text, geometry))
+    }
+
     fn begin_partition<'a>(
         &mut self,
         input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
@@ -193,18 +200,24 @@ mod ownership_tests {
     #[test]
     fn optional_per_layer_input_owns_complete_wire_geometry() {
         let present = TextBoundarySchema {
+            hidden_size: 16,
             per_layer_geometry: Some((4, 8)),
         };
         let tensors = present.wire_schema().unwrap().resolve(2, 3).unwrap();
-        assert_eq!(tensors.len(), 1);
-        assert_eq!(tensors[0].role(), "per_layer_input");
-        assert_eq!(tensors[0].shape(), [2, 3, 4, 8]);
-        assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Activation);
+        assert_eq!(tensors.primary().shape(), [2, 3, 16]);
+        assert_eq!(tensors.auxiliary().len(), 1);
+        assert_eq!(tensors.auxiliary()[0].role(), "per_layer_input");
+        assert_eq!(tensors.auxiliary()[0].shape(), [2, 3, 4, 8]);
+        assert_eq!(
+            tensors.auxiliary()[0].dtype(),
+            BoundaryTensorDtype::Activation
+        );
 
         let absent = TextBoundarySchema {
+            hidden_size: 16,
             per_layer_geometry: None,
         };
-        assert!(absent.wire_schema().unwrap().tensors().is_empty());
+        assert!(absent.wire_schema().unwrap().auxiliary().is_empty());
     }
 
     #[test]
@@ -411,6 +424,7 @@ impl<T> ForwardContext<T> {
 /// Family-owned schema for decoder-wide per-layer input transport.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TextBoundarySchema {
+    hidden_size: i32,
     per_layer_geometry: Option<(i32, i32)>,
 }
 
@@ -418,6 +432,7 @@ impl TextBoundarySchema {
     /// Derives the schema from normalized text and rank-local geometry.
     pub fn from_args(args: &super::ModelArgs, geometry: &LocalGeometry) -> Self {
         Self {
+            hidden_size: args.hidden_size,
             per_layer_geometry: (args.hidden_size_per_layer_input > 0)
                 .then(|| (args.num_hidden_layers() as i32, geometry.per_layer_width())),
         }
@@ -429,7 +444,11 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
 
     const IDENTITY: &'static str = "gemma4.text";
 
-    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+    fn primary_tensor_spec(&self) -> eredu_runtime::BoundaryTensorSpec {
+        eredu_runtime::BoundaryTensorSpec::primary_activation(self.hidden_size)
+    }
+
+    fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
         self.per_layer_geometry
             .map(|(layers, width)| {

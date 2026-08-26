@@ -540,8 +540,6 @@ pub struct PipelineStageInfo {
     pub successor_rank: Option<usize>,
     /// Architecture adapter used by the stage.
     pub model_kind: ModelKind,
-    /// Flattened hidden width transferred between pipeline stages.
-    pub activation_hidden_size: i32,
     /// Backend-neutral contract used for transferred hidden activations.
     pub wire_contract: eredu_runtime::PipelineWireContract,
     /// Checkpoint tensors selected for this rank.
@@ -896,12 +894,6 @@ impl InklingPipelinePartition {
             hidden: output.hidden,
             tokens: output.tokens,
         })
-    }
-}
-
-impl PipelineStep {
-    fn activation_shape(self, hidden_size: i32) -> [i32; 3] {
-        [self.batch_size, self.sequence_length, hidden_size]
     }
 }
 
@@ -1935,7 +1927,7 @@ impl Gemma4PipelinePartition {
             hidden: hidden.into_array(),
             auxiliary: PipelineAuxiliaryState::new(
                 self.partition
-                    .auxiliary_boundary()
+                    .boundary_schema()
                     .encode(eredu_architectures::gemma4::TextBoundary::new(
                         per_layer_inputs,
                     ))
@@ -2478,8 +2470,10 @@ impl eredu_nn::AuxiliaryConvolutionState<crate::MlxTensor> for PipelineHybridLay
 /// Rank-local storage over one backend-neutral layered decoder architecture.
 struct DecoderPipelineRealization<A, G, C, L> {
     architecture: A,
-    partition:
-        eredu_runtime::ArchitecturePartition<Option<Arc<G>>, eredu_runtime::NoAuxiliaryBoundary>,
+    partition: eredu_runtime::ArchitecturePartition<
+        Option<Arc<G>>,
+        eredu_runtime::NoAuxiliaryBoundarySchema,
+    >,
     bindings: C,
     layers: Vec<L>,
     dense_layers: Option<PipelineLayerStorage>,
@@ -2504,7 +2498,7 @@ impl<A, G, C, L> DecoderPipelineBuilder<A, G, C, L> {
         self,
         partition: eredu_runtime::ArchitecturePartition<
             Option<Arc<G>>,
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
     ) -> DecoderPipelineRealization<A, G, C, L> {
         DecoderPipelineRealization {
@@ -2687,7 +2681,7 @@ type MuseGlimmerPipelinePartition = MediaPipelineRealization<
     muse_glimmer::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Option<Arc<muse_glimmer::LocalGeometry>>,
-        eredu_runtime::NoAuxiliaryBoundary,
+        eredu_runtime::NoAuxiliaryBoundarySchema,
     >,
     (),
     MuseGlimmerPipelineUnit,
@@ -2749,7 +2743,7 @@ struct PipelineRealization<A, G, B, U> {
 type Lfm2PipelinePartition = PipelineRealization<
     eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>,
     Arc<eredu_architectures::lfm2::LocalGeometry>,
-    eredu_runtime::NoAuxiliaryBoundary,
+    eredu_runtime::NoAuxiliaryBoundarySchema,
     MlxModule<eredu_architectures::lfm2::Block<MlxNeuralBackend>>,
 >;
 
@@ -2787,7 +2781,7 @@ type QwenHybridPipelinePartition = GroupedPredictionPipelineRealization<
     eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Option<Arc<eredu_architectures::qwen::hybrid::LocalGeometry>>,
-        eredu_runtime::NoAuxiliaryBoundary,
+        eredu_runtime::NoAuxiliaryBoundarySchema,
     >,
     MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxNeuralBackend>>,
 >;
@@ -2808,7 +2802,7 @@ impl<A, P, U> GroupedPredictionPipelineRealization<A, P, U> {
 type KimiLinearPipelinePartition = PipelineRealization<
     eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>,
     Arc<eredu_architectures::kimi_linear::LocalGeometry>,
-    eredu_runtime::NoAuxiliaryBoundary,
+    eredu_runtime::NoAuxiliaryBoundarySchema,
     MlxModule<eredu_architectures::kimi_linear::Block<MlxNeuralBackend>>,
 >;
 
@@ -2834,7 +2828,7 @@ type InklingPipelinePartition = MediaPipelineRealization<
     eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Arc<eredu_architectures::inkling::LocalGeometry>,
-        eredu_runtime::NoAuxiliaryBoundary,
+        eredu_runtime::NoAuxiliaryBoundarySchema,
     >,
     (),
     InklingPipelineUnit,
@@ -2857,11 +2851,7 @@ trait PipelinePartitionMetadata {
         input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>;
 
-    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
-        eredu_runtime::NoAuxiliaryBoundary
-            .wire_schema()
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error>;
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage>;
 
@@ -4500,7 +4490,7 @@ where
         }
         PipelineStageInput::Hidden(payload) => {
             let auxiliary = partition
-                .auxiliary_boundary()
+                .boundary_schema()
                 .decode(
                     payload
                         .auxiliary
@@ -4571,7 +4561,7 @@ where
         },
         eredu_runtime::LayeredPartitionOutput::Boundary { hidden, auxiliary } => {
             let auxiliary = partition
-                .auxiliary_boundary()
+                .boundary_schema()
                 .encode(auxiliary)
                 .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
@@ -4639,7 +4629,7 @@ where
         }
         PipelineStageInput::Hidden(payload) => {
             let auxiliary = partition
-                .auxiliary_boundary()
+                .boundary_schema()
                 .decode(
                     payload
                         .auxiliary
@@ -4712,7 +4702,7 @@ where
         },
         eredu_runtime::LayeredPartitionOutput::Boundary { hidden, auxiliary } => {
             let auxiliary = partition
-                .auxiliary_boundary()
+                .boundary_schema()
                 .encode(auxiliary)
                 .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
@@ -5306,6 +5296,13 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         )
     }
 
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -5511,7 +5508,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -5921,7 +5918,7 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -6453,7 +6450,7 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -6651,6 +6648,13 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         )
     }
 
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -6800,6 +6804,13 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
             &crate::backend::runtime::media::input::MlxInputInspector,
         )
         .map(Into::into)
+    }
+
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7061,6 +7072,13 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             &crate::backend::runtime::media::input::MlxInputInspector,
         )
         .map(Into::into)
+    }
+
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7399,7 +7417,7 @@ impl QwenVlPipelinePartition {
     fn boundary_schema(
         &self,
     ) -> Result<eredu_architectures::qwen::vl::PipelineBoundarySchema, Error> {
-        Ok(*self.partition.auxiliary_boundary())
+        Ok(*self.partition.boundary_schema())
     }
 
     fn new(
@@ -7670,7 +7688,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -7931,7 +7949,7 @@ impl QwenConditionalPipelinePartition {
     fn boundary_schema(
         &self,
     ) -> Result<eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema, Error> {
-        Ok(*self.partition.auxiliary_boundary())
+        Ok(*self.partition.boundary_schema())
     }
 
     fn new(
@@ -8297,7 +8315,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -8646,6 +8664,13 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         )
     }
 
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -8794,6 +8819,13 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
             input,
             &crate::backend::runtime::media::input::MlxInputInspector,
         )
+    }
+
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8948,7 +8980,7 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -9180,6 +9212,13 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
             input,
             &crate::backend::runtime::media::input::MlxInputInspector,
         )
+    }
+
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9504,10 +9543,10 @@ impl PipelineModel {
         })
     }
 
-    fn resolved_boundary_specs(
+    fn resolved_boundary_schema(
         &self,
         step: PipelineStep,
-    ) -> Result<Vec<eredu_runtime::ResolvedBoundaryTensorSpec>, Error> {
+    ) -> Result<eredu_runtime::ResolvedBoundaryWireSchema, Error> {
         self.stage
             .boundary_wire_schema()?
             .resolve(step.batch_size, step.sequence_length)
@@ -10205,7 +10244,7 @@ impl PipelineModel {
     ) -> Result<Option<PipelinePayload>, Error> {
         let placement = Arc::clone(&self.info.placement);
         let boundary_schema = self.stage.boundary_wire_schema()?;
-        let auxiliary_specs = boundary_schema
+        let resolved_boundary = boundary_schema
             .resolve(step.batch_size, step.sequence_length)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         if self.info.pipeline_stage == 0 {
@@ -10367,16 +10406,14 @@ impl PipelineModel {
                             let payload = normalize_pipeline_payload_for_wire(
                                 self.stage.finish_placed_ingress(tensor, execution_stream)?,
                                 self.info.activation_dtype(),
-                                &auxiliary_specs,
+                                &resolved_boundary,
                                 execution_stream,
                             )?;
                             let arrays = payload.clone().into_arrays();
                             validate_pipeline_payload_arrays(
                                 &self.info,
                                 &arrays,
-                                step,
-                                boundary_schema.identity(),
-                                &auxiliary_specs,
+                                &resolved_boundary,
                                 &format!("placed decoder payload for {:?}", placed.id),
                             )?;
                             decoder_payload = Some(payload);
@@ -10686,6 +10723,7 @@ impl PipelineModel {
             }
         }
         let mut received_payload = None;
+        let resolved_boundary = self.resolved_boundary_schema(step)?;
         let stage_input = if self.info.is_first {
             Some(
                 ingress
@@ -10694,7 +10732,7 @@ impl PipelineModel {
         } else {
             let peer = predecessor.expect("non-first predecessor");
             let received = distributed::recv(
-                &step.activation_shape(self.info.activation_hidden_size),
+                resolved_boundary.primary().shape(),
                 self.info.activation_dtype(),
                 peer,
                 group,
@@ -10704,31 +10742,25 @@ impl PipelineModel {
                 Error::Parallel(format!(
                     "stage {} failed to receive {:?} {:?} activations from rank {peer}: {error}",
                     self.info.pipeline_stage,
-                    step.activation_shape(self.info.activation_hidden_size),
+                    resolved_boundary.primary().shape(),
                     self.info.activation_dtype()
                 ))
             })?;
-            let received_auxiliary = self
-                    .resolved_boundary_specs(step)?
-                    .into_iter()
-                    .map(|spec| {
-                        let dtype = mlx_boundary_dtype(spec.dtype(), self.info.activation_dtype());
-                        let value = distributed::recv(
-                            spec.shape(),
-                            dtype,
-                            peer,
-                            group,
-                            stream,
-                        )
+            let received_auxiliary = resolved_boundary
+                .auxiliary()
+                .iter()
+                .map(|spec| {
+                    let dtype = mlx_boundary_dtype(spec.dtype(), self.info.activation_dtype());
+                    let value = distributed::recv(spec.shape(), dtype, peer, group, stream)
                         .map_err(|error| {
                             Error::Parallel(format!(
                                 "stage {} failed to receive auxiliary {:?} {:?} from rank {peer}: {error}",
                                 self.info.pipeline_stage, spec.shape(), dtype
                             ))
                         })?;
-                        Ok(value)
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
+                    Ok(value)
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
             received_payload = Some(PipelinePayload {
                 hidden: received,
                 auxiliary: PipelineAuxiliaryState::new(received_auxiliary),
@@ -10747,12 +10779,7 @@ impl PipelineModel {
             match stage_input.expect("first stage ingress") {
                 PipelineIngress::Tokens(tokens) => {
                     let input = PipelineStageInput::Tokens(tokens);
-                    validate_stage_input(
-                        &self.info,
-                        &input,
-                        step,
-                        &self.resolved_boundary_specs(step)?,
-                    )?;
+                    validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
                     self.stage.forward_with_execution(
                         input,
                         step,
@@ -10794,12 +10821,7 @@ impl PipelineModel {
                     .as_ref()
                     .expect("non-first stage received payload"),
             );
-            validate_stage_input(
-                &self.info,
-                &input,
-                step,
-                &self.resolved_boundary_specs(step)?,
-            )?;
+            validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
             self.stage.forward_with_execution(
                 input,
                 step,
@@ -10819,15 +10841,14 @@ impl PipelineModel {
         retained.extend(placed_retained);
         match output {
             PipelineStageOutput::Hidden(payload) => {
-                let auxiliary_specs = self.resolved_boundary_specs(step)?;
                 let payload = normalize_pipeline_payload_for_wire(
                     payload,
                     self.info.activation_dtype(),
-                    &auxiliary_specs,
+                    &resolved_boundary,
                     stream,
                 )?;
                 let hidden = &payload.hidden;
-                let expected = step.activation_shape(self.info.activation_hidden_size);
+                let expected = resolved_boundary.primary().shape();
                 if hidden.shape() != expected || hidden.dtype() != self.info.activation_dtype() {
                     return Err(Error::Parallel(format!(
                         "stage {} produced activations shaped {:?} with {:?}, expected {expected:?} with {:?}",
@@ -10840,7 +10861,7 @@ impl PipelineModel {
                 validate_auxiliary_tensors(
                     &self.info,
                     payload.auxiliary.tensors(),
-                    &auxiliary_specs,
+                    resolved_boundary.auxiliary(),
                 )?;
                 let peer = successor.expect("non-final successor");
                 let sent = distributed::send(hidden, peer, group, stream).map_err(|error| {
@@ -11382,7 +11403,6 @@ fn base_info(
     range: Range<usize>,
     placement: Arc<PlacedExecutionDag>,
     model_kind: ModelKind,
-    hidden_size: i32,
 ) -> PipelineStageInfo {
     let stage = topology.pipeline_parallel_rank;
     let last = topology.pipeline_parallel_size - 1;
@@ -11414,7 +11434,6 @@ fn base_info(
             .pipeline_successor()
             .expect("validated topology has valid pipeline successor geometry"),
         model_kind,
-        activation_hidden_size: hidden_size,
         wire_contract,
         owned_tensors: Vec::new(),
         local_parameter_bytes: 0,
@@ -11552,7 +11571,7 @@ fn validate_stage_input(
     info: &PipelineStageInfo,
     input: &PipelineStageInput<'_>,
     step: PipelineStep,
-    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    boundary: &eredu_runtime::ResolvedBoundaryWireSchema,
 ) -> Result<(), Error> {
     match (info.is_first, input) {
         (true, PipelineStageInput::Tokens(tokens)) => {
@@ -11566,8 +11585,13 @@ fn validate_stage_input(
             }
         }
         (false, PipelineStageInput::Hidden(payload)) => {
-            validate_hidden_metadata(info, payload.hidden.shape(), payload.hidden.dtype(), step)?;
-            validate_auxiliary_tensors(info, payload.auxiliary.tensors(), auxiliary_specs)?;
+            validate_hidden_metadata(
+                info,
+                payload.hidden.shape(),
+                payload.hidden.dtype(),
+                boundary,
+            )?;
+            validate_auxiliary_tensors(info, payload.auxiliary.tensors(), boundary.auxiliary())?;
         }
         (true, PipelineStageInput::Hidden(_)) => {
             return Err(Error::Parallel(
@@ -11587,9 +11611,7 @@ fn validate_stage_input(
 fn validate_pipeline_payload_arrays(
     info: &PipelineStageInfo,
     arrays: &[Array],
-    step: PipelineStep,
-    boundary_identity: &str,
-    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    boundary: &eredu_runtime::ResolvedBoundaryWireSchema,
     context: &str,
 ) -> Result<(), Error> {
     let metadata = arrays
@@ -11599,26 +11621,24 @@ fn validate_pipeline_payload_arrays(
             dtype: array.dtype(),
         })
         .collect::<Vec<_>>();
-    validate_pipeline_payload_metadata(
-        &step.activation_shape(info.activation_hidden_size),
-        info.activation_dtype(),
-        &metadata,
-        boundary_identity,
-        auxiliary_specs,
-        context,
-    )
+    validate_pipeline_payload_metadata(info.activation_dtype(), &metadata, boundary, context)
 }
 
 fn normalize_pipeline_payload_for_wire(
     mut payload: PipelinePayload,
     activation_dtype: Dtype,
-    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    boundary: &eredu_runtime::ResolvedBoundaryWireSchema,
     stream: &Stream,
 ) -> Result<PipelinePayload, Error> {
     if payload.hidden.dtype().is_float() && payload.hidden.dtype() != activation_dtype {
         payload.hidden = payload.hidden.as_dtype(activation_dtype, stream)?;
     }
-    for (value, spec) in payload.auxiliary.tensors.iter_mut().zip(auxiliary_specs) {
+    for (value, spec) in payload
+        .auxiliary
+        .tensors
+        .iter_mut()
+        .zip(boundary.auxiliary())
+    {
         let expected = mlx_boundary_dtype(spec.dtype(), activation_dtype);
         if spec.dtype() == eredu_runtime::BoundaryTensorDtype::Activation
             && value.dtype().is_float()
@@ -11637,33 +11657,35 @@ struct PipelinePayloadTensorMetadata<'a> {
 }
 
 fn validate_pipeline_payload_metadata(
-    expected_hidden_shape: &[i32],
     activation_dtype: Dtype,
     tensors: &[PipelinePayloadTensorMetadata<'_>],
-    boundary_identity: &str,
-    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    boundary: &eredu_runtime::ResolvedBoundaryWireSchema,
     context: &str,
 ) -> Result<(), Error> {
+    let auxiliary_specs = boundary.auxiliary();
     let expected = auxiliary_specs.len() + 1;
     if tensors.len() != expected {
         return Err(Error::Parallel(format!(
-            "{context} violates architecture boundary {boundary_identity:?}: expected exactly {expected} tensors (hidden plus {} auxiliary), got {}",
+            "{context} violates architecture boundary {:?}: expected exactly {expected} tensors (hidden plus {} auxiliary), got {}",
+            boundary.identity(),
             auxiliary_specs.len(),
             tensors.len()
         )));
     }
     let hidden = tensors[0];
-    if hidden.shape != expected_hidden_shape || hidden.dtype != activation_dtype {
+    let primary = boundary.primary();
+    if hidden.shape != primary.shape() || hidden.dtype != activation_dtype {
         return Err(Error::Parallel(format!(
-            "{context} violates architecture boundary {boundary_identity:?}: hidden tensor has shape {:?} and {:?}, expected {:?} and {:?}",
-            hidden.shape, hidden.dtype, expected_hidden_shape, activation_dtype
+            "{context} violates architecture boundary {:?}: primary tensor ({:?}) has shape {:?} and {:?}, expected {:?} and {:?}",
+            boundary.identity(), primary.role(), hidden.shape, hidden.dtype, primary.shape(), activation_dtype
         )));
     }
     for (index, (tensor, spec)) in tensors[1..].iter().zip(auxiliary_specs).enumerate() {
         let expected_dtype = mlx_boundary_dtype(spec.dtype(), activation_dtype);
         if tensor.shape != spec.shape() || tensor.dtype != expected_dtype {
             return Err(Error::Parallel(format!(
-                "{context} violates architecture boundary {boundary_identity:?}: auxiliary tensor {index} ({:?}) has shape {:?} and {:?}, expected {:?} and {:?}",
+                "{context} violates architecture boundary {:?}: auxiliary tensor {index} ({:?}) has shape {:?} and {:?}, expected {:?} and {:?}",
+                boundary.identity(),
                 spec.role(),
                 tensor.shape,
                 tensor.dtype,
@@ -11709,9 +11731,9 @@ fn validate_hidden_metadata(
     info: &PipelineStageInfo,
     shape: &[i32],
     dtype: Dtype,
-    step: PipelineStep,
+    boundary: &eredu_runtime::ResolvedBoundaryWireSchema,
 ) -> Result<(), Error> {
-    let expected = step.activation_shape(info.activation_hidden_size);
+    let expected = boundary.primary().shape();
     if shape != expected {
         return Err(Error::Parallel(format!(
             "stage {} expected hidden activations shaped {expected:?}, got {shape:?}",
@@ -12399,10 +12421,11 @@ mod binding_authority_tests {
     }
 
     #[test]
-    fn mixed_auxiliary_wire_specs_preserve_integer_boundary_dtypes() {
+    fn boundary_schema_drives_primary_geometry_and_auxiliary_dtypes() {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Kind};
         let schema = eredu_runtime::BoundaryWireSchema::new(
             "test.boundary",
+            eredu_runtime::BoundaryTensorSpec::primary_activation(8),
             [
                 eredu_runtime::BoundaryTensorSpec::new(
                     "tokens",
@@ -12423,23 +12446,24 @@ mod binding_authority_tests {
         )
         .unwrap();
         let specs = schema.resolve(2, 3).unwrap();
-        assert_eq!(specs.len(), 3);
-        assert_eq!(specs[0].shape(), [2, 3]);
+        assert_eq!(specs.primary().shape(), [2, 3, 8]);
+        assert_eq!(specs.auxiliary().len(), 3);
+        assert_eq!(specs.auxiliary()[0].shape(), [2, 3]);
         assert_eq!(
-            mlx_boundary_dtype(specs[0].dtype(), Dtype::Float16),
+            mlx_boundary_dtype(specs.auxiliary()[0].dtype(), Dtype::Float16),
             Dtype::Uint32
         );
         assert_ne!(
-            mlx_boundary_dtype(specs[0].dtype(), Dtype::Float16),
+            mlx_boundary_dtype(specs.auxiliary()[0].dtype(), Dtype::Float16),
             Dtype::Float32
         );
-        assert_eq!(specs[1].shape(), [2, 3, 16]);
+        assert_eq!(specs.auxiliary()[1].shape(), [2, 3, 16]);
         assert_eq!(
-            mlx_boundary_dtype(specs[1].dtype(), Dtype::Float16),
+            mlx_boundary_dtype(specs.auxiliary()[1].dtype(), Dtype::Float16),
             Dtype::Float16
         );
         assert_eq!(
-            mlx_boundary_dtype(specs[2].dtype(), Dtype::Bfloat16),
+            mlx_boundary_dtype(specs.auxiliary()[2].dtype(), Dtype::Bfloat16),
             Dtype::Int32
         );
 
@@ -12465,25 +12489,23 @@ mod binding_authority_tests {
                 dtype: Dtype::Int32,
             },
         ];
-        validate_pipeline_payload_metadata(
-            &hidden_shape,
-            Dtype::Float16,
-            &valid,
-            schema.identity(),
-            &specs,
-            "test payload",
-        )
-        .unwrap();
+        validate_pipeline_payload_metadata(Dtype::Float16, &valid, &specs, "test payload").unwrap();
 
-        let cardinality = validate_pipeline_payload_metadata(
-            &hidden_shape,
+        let wrong_hidden_shape = [2, 3, 9];
+        let mut wrong_hidden = valid.clone();
+        wrong_hidden[0].shape = &wrong_hidden_shape;
+        let primary = validate_pipeline_payload_metadata(
             Dtype::Float16,
-            &valid[..3],
-            schema.identity(),
+            &wrong_hidden,
             &specs,
             "test payload",
         )
         .unwrap_err();
+        assert!(primary.to_string().contains("primary tensor"));
+
+        let cardinality =
+            validate_pipeline_payload_metadata(Dtype::Float16, &valid[..3], &specs, "test payload")
+                .unwrap_err();
         assert!(cardinality
             .to_string()
             .contains("expected exactly 4 tensors"));
@@ -12492,10 +12514,8 @@ mod binding_authority_tests {
         let mut wrong_shape = valid.clone();
         wrong_shape[2].shape = &wrong_capture_shape;
         let shape = validate_pipeline_payload_metadata(
-            &hidden_shape,
             Dtype::Float16,
             &wrong_shape,
-            schema.identity(),
             &specs,
             "test payload",
         )
@@ -12505,10 +12525,8 @@ mod binding_authority_tests {
         let mut wrong_dtype = valid;
         wrong_dtype[1].dtype = Dtype::Int32;
         let dtype = validate_pipeline_payload_metadata(
-            &hidden_shape,
             Dtype::Float16,
             &wrong_dtype,
-            schema.identity(),
             &specs,
             "test payload",
         )
@@ -13727,7 +13745,6 @@ fn load_llama_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let complete_state = architecture
         .state_layout()
@@ -13741,7 +13758,6 @@ fn load_llama_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let parameter_description = architecture
@@ -13756,7 +13772,6 @@ fn load_llama_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_runtime::NoAuxiliaryBoundary,
             local_bindings,
         )?;
     let layers = range
@@ -14003,7 +14018,6 @@ fn load_qwen_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let expert_assignment = binding_adapter
         .expert_parallel_assignment(stage.architecture.as_ref().unwrap(), topology)?;
@@ -14031,7 +14045,6 @@ fn load_qwen_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let parameter_description = stage
@@ -14049,7 +14062,6 @@ fn load_qwen_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_runtime::NoAuxiliaryBoundary,
             local_bindings,
         )?;
     let mut stage = stage.finish(partition);
@@ -14358,7 +14370,6 @@ fn load_muse_glimmer_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let complete_state = architecture
         .state_layout()
@@ -14372,7 +14383,6 @@ fn load_muse_glimmer_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let parameter_description = architecture
@@ -14387,7 +14397,6 @@ fn load_muse_glimmer_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_runtime::NoAuxiliaryBoundary,
             local_bindings,
         )?;
     let vision_group = architecture_group_by_kind::<_, MlxKeyValueState>(
@@ -14795,7 +14804,6 @@ fn load_neutral_qwen_vl_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.text.hidden_size,
     );
     let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
     if let Some(assignment) = expert_assignment.as_ref() {
@@ -14812,7 +14820,6 @@ fn load_neutral_qwen_vl_pipeline(
             info.pipeline_stage,
             None,
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::vl::PipelineBoundarySchema::from_args(&target_args),
             std::iter::empty(),
         )?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
@@ -14828,7 +14835,6 @@ fn load_neutral_qwen_vl_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::vl::PipelineBoundarySchema::from_args(&target_args),
             local_parameter_groups,
         )?;
     let mut stage = QwenVlPipelinePartition::new(architecture, partition, external_experts)?;
@@ -15706,7 +15712,7 @@ impl InklingPipelinePartition {
         architecture: eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::inkling::LocalGeometry>,
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -16491,7 +16497,6 @@ fn load_gpt_oss_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let expert_assignment = binding_adapter
         .expert_parallel_assignment(stage.architecture.as_ref().unwrap(), topology)?;
@@ -16519,7 +16524,6 @@ fn load_gpt_oss_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let parameter_description = stage
@@ -16536,7 +16540,6 @@ fn load_gpt_oss_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_runtime::NoAuxiliaryBoundary,
             bindings,
         )?;
     let mut stage = stage.finish(partition);
@@ -16995,7 +16998,6 @@ fn load_lfm2_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let runtime_state = architecture
         .state_layout()
@@ -17007,7 +17009,6 @@ fn load_lfm2_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let local_state = decoder_partition_state_layout(&runtime_state, range.clone())?;
@@ -17023,7 +17024,6 @@ fn load_lfm2_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_runtime::NoAuxiliaryBoundary,
             local_parameter_groups,
         )?;
     let mut stage =
@@ -17379,7 +17379,7 @@ impl Lfm2PipelinePartition {
         architecture: eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::lfm2::LocalGeometry>,
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
         external_experts: bool,
     ) -> Result<Self, Error> {
@@ -17512,7 +17512,6 @@ fn load_nemotron_h_pipeline(
         range.clone(),
         Arc::clone(&neutral_placement),
         model_kind,
-        source_args.hidden_size,
     );
     let ownership_probe = neutral_placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -17520,7 +17519,6 @@ fn load_nemotron_h_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_architectures::nemotron_h::TargetBoundarySchema::from_args(&target_args),
             std::iter::empty(),
         )?;
     let owned_state_end = if range.end == target_units {
@@ -17540,7 +17538,6 @@ fn load_nemotron_h_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_architectures::nemotron_h::TargetBoundarySchema::from_args(&target_args),
             local_parameter_groups,
         )?;
     let mut stage = NemotronHPipelinePartition::new(architecture, partition, external_experts)?;
@@ -18085,7 +18082,7 @@ impl QwenHybridPipelinePartition {
         architecture: eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Option<Arc<eredu_architectures::qwen::hybrid::LocalGeometry>>,
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
         external_experts: bool,
     ) -> Result<Self, Error> {
@@ -18305,6 +18302,13 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
             &crate::backend::runtime::media::input::MlxInputInspector,
         )
         .map(Into::into)
+    }
+
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .boundary_schema()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -18569,7 +18573,6 @@ fn load_neutral_qwen_hybrid_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
     if let Some(assignment) = expert_assignment.as_ref() {
@@ -18588,7 +18591,6 @@ fn load_neutral_qwen_hybrid_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let parameter_description = architecture
@@ -18603,7 +18605,6 @@ fn load_neutral_qwen_hybrid_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_runtime::NoAuxiliaryBoundary,
             local_bindings,
         )?;
     let mut stage = QwenHybridPipelinePartition::new(architecture, partition, external_experts)?;
@@ -19015,7 +19016,6 @@ fn load_neutral_qwen_conditional_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source.text.hidden_size,
     );
     let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
     if let Some(assignment) = expert_assignment.as_ref() {
@@ -19025,7 +19025,6 @@ fn load_neutral_qwen_conditional_pipeline(
     let complete_state = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let boundary_schema = architecture.pipeline_boundary_schema();
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -19033,7 +19032,6 @@ fn load_neutral_qwen_conditional_pipeline(
             info.pipeline_stage,
             None,
             architecture.shared_parallel_geometry(),
-            boundary_schema,
             std::iter::empty(),
         )?;
     let state_end = if ownership_probe.ownership().owns_output() {
@@ -19054,7 +19052,6 @@ fn load_neutral_qwen_conditional_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             architecture.shared_parallel_geometry(),
-            boundary_schema,
             local_parameter_groups,
         )?;
     let mut stage =
@@ -19511,7 +19508,6 @@ fn load_kimi_linear_pipeline(
         range.clone(),
         placement,
         model_kind,
-        source_args.hidden_size,
     );
     let runtime_state = architecture
         .state_layout()
@@ -19523,7 +19519,6 @@ fn load_kimi_linear_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let local_state = decoder_partition_state_layout(&runtime_state, range.clone())?;
@@ -19539,7 +19534,6 @@ fn load_kimi_linear_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_runtime::NoAuxiliaryBoundary,
             local_parameter_groups,
         )?;
     let mut stage =
@@ -19910,7 +19904,7 @@ impl KimiLinearPipelinePartition {
         architecture: eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::kimi_linear::LocalGeometry>,
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
         external_experts: bool,
     ) -> Result<Self, Error> {
@@ -20045,7 +20039,6 @@ fn load_neutral_inkling_pipeline(
         range.clone(),
         Arc::clone(&neutral_placement),
         model_kind,
-        source_args.text_config.hidden_size,
     );
     let ownership_probe = neutral_placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -20053,7 +20046,6 @@ fn load_neutral_inkling_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )?;
     let ownership = ownership_probe.ownership();
@@ -20074,7 +20066,6 @@ fn load_neutral_inkling_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_runtime::NoAuxiliaryBoundary,
             local_parameter_groups,
         )?;
     let mut stage = InklingPipelinePartition::new(architecture, partition)?;
@@ -20458,7 +20449,6 @@ fn load_neutral_gemma4_pipeline(
         range.clone(),
         Arc::clone(&neutral_placement),
         model_kind,
-        source_args.text.hidden_size,
     );
     let ownership_probe = neutral_placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -20466,10 +20456,6 @@ fn load_neutral_gemma4_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_architectures::gemma4::TextBoundarySchema::from_args(
-                &target_args.text,
-                &geometry,
-            ),
             std::iter::empty(),
         )?;
     let local_state = decoder_partition_state_layout(&runtime_state, range.clone())?;
@@ -20484,10 +20470,6 @@ fn load_neutral_gemma4_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_architectures::gemma4::TextBoundarySchema::from_args(
-                &target_args.text,
-                &geometry,
-            ),
             local_parameter_groups,
         )?;
     let mut stage = Gemma4PipelinePartition::new(architecture, partition)?;
@@ -20977,7 +20959,6 @@ fn load_neutral_deepseek_v3_pipeline(
         range.clone(),
         placement,
         model_kind,
-        args.hidden_size,
     );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
@@ -20999,7 +20980,6 @@ fn load_neutral_deepseek_v3_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_architectures::deepseek::v3::TargetBoundarySchema::from_args(&args),
             std::iter::empty(),
         )?;
     let local_parameter_groups =
@@ -21011,7 +20991,6 @@ fn load_neutral_deepseek_v3_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_architectures::deepseek::v3::TargetBoundarySchema::from_args(&args),
             local_parameter_groups,
         )?;
     let static_roles = parameter_description.select_static_roles(&partition);
@@ -21390,7 +21369,6 @@ fn load_neutral_deepseek_v4_pipeline(
         range.clone(),
         placement,
         model_kind,
-        args.hidden_size,
     );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
@@ -21405,8 +21383,6 @@ fn load_neutral_deepseek_v4_pipeline(
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
-    let boundary = eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info.placement.realize_architecture_partition::<
         MlxNeuralBackend,
         eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
@@ -21418,7 +21394,6 @@ fn load_neutral_deepseek_v4_pipeline(
         info.pipeline_stage,
         Some((local_state.clone(), range.start)),
         geometry.clone(),
-        boundary,
         std::iter::empty(),
     )?;
     let local_parameter_groups =
@@ -21434,10 +21409,8 @@ fn load_neutral_deepseek_v4_pipeline(
         info.pipeline_stage,
         Some((local_state, range.start)),
         geometry,
-        boundary,
         local_parameter_groups,
     )?;
-    info.activation_hidden_size = partition.auxiliary_boundary().activation_hidden_size();
     let static_roles = parameter_description.select_static_roles(&partition);
     let static_units = split_static_binding_units_by_owner(
         partition.parameter_bindings(),

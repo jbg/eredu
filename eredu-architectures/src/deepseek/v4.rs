@@ -220,7 +220,11 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
 
     const IDENTITY: &'static str = "deepseek_v4.target";
 
-    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+    fn primary_tensor_spec(&self) -> eredu_runtime::BoundaryTensorSpec {
+        eredu_runtime::BoundaryTensorSpec::primary_activation(self.activation_hidden_size)
+    }
+
+    fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
         let mut specs = vec![eredu_runtime::BoundaryTensorSpec::new(
             "tokens",
@@ -2787,6 +2791,10 @@ where
 {
     type Boundary = TargetBoundarySchema;
 
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        TargetBoundarySchema::from_args(self.args())
+    }
+
     fn begin_partition<'a>(
         &mut self,
         input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
@@ -3120,11 +3128,12 @@ mod boundary_tests {
         };
         assert_eq!(schema.activation_hidden_size(), 72);
         let tensors = schema.wire_schema().unwrap().resolve(1, 5).unwrap();
-        assert_eq!(tensors.len(), 3);
-        assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Uint32);
-        assert_eq!(tensors[1].role(), "capture.0");
-        assert_eq!(tensors[1].shape(), [1, 5, 24]);
-        assert_eq!(tensors[2].role(), "capture.1");
+        assert_eq!(tensors.primary().shape(), [1, 5, 72]);
+        assert_eq!(tensors.auxiliary().len(), 3);
+        assert_eq!(tensors.auxiliary()[0].dtype(), BoundaryTensorDtype::Uint32);
+        assert_eq!(tensors.auxiliary()[1].role(), "capture.0");
+        assert_eq!(tensors.auxiliary()[1].shape(), [1, 5, 24]);
+        assert_eq!(tensors.auxiliary()[2].role(), "capture.1");
     }
 
     #[test]

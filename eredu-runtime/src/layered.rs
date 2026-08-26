@@ -612,8 +612,11 @@ where
     B: NeuralBackend,
     S: RuntimeState<B>,
 {
-    /// Architecture-owned schema for auxiliary partition transport.
+    /// Architecture-owned schema for primary and auxiliary partition transport.
     type Boundary: crate::ArchitectureBoundary;
+
+    /// Derives the complete transport schema from the normalized architecture.
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error>;
 
     /// Prepares a replicated partition from tokens or upstream hidden state.
     fn begin_partition<'a>(

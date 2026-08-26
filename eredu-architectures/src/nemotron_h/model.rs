@@ -151,7 +151,11 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
 
     const IDENTITY: &'static str = "nemotron_h.target";
 
-    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+    fn primary_tensor_spec(&self) -> eredu_runtime::BoundaryTensorSpec {
+        eredu_runtime::BoundaryTensorSpec::primary_activation(self.hidden_size)
+    }
+
+    fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
         vec![
             eredu_runtime::BoundaryTensorSpec::new(
@@ -1203,9 +1207,10 @@ mod transport_tests {
     fn target_boundary_declares_tokens_and_retained_embeddings() {
         let schema = TargetBoundarySchema { hidden_size: 32 };
         let tensors = schema.wire_schema().unwrap().resolve(2, 7).unwrap();
-        assert_eq!(tensors.len(), 2);
-        assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Uint32);
-        assert_eq!(tensors[1].shape(), [2, 7, 32]);
+        assert_eq!(tensors.primary().shape(), [2, 7, 32]);
+        assert_eq!(tensors.auxiliary().len(), 2);
+        assert_eq!(tensors.auxiliary()[0].dtype(), BoundaryTensorDtype::Uint32);
+        assert_eq!(tensors.auxiliary()[1].shape(), [2, 7, 32]);
     }
 
     #[test]
@@ -1331,6 +1336,10 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Boundary = TargetBoundarySchema;
+
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(TargetBoundarySchema::from_args(self.args()))
+    }
 
     fn begin_partition<'a>(
         &mut self,

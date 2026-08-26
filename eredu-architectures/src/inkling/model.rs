@@ -1664,7 +1664,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
 {
-    type Boundary = eredu_runtime::NoAuxiliaryBoundary;
+    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
+
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            self.args().text_config.hidden_size,
+        ))
+    }
 
     fn begin_partition<'a>(
         &mut self,

@@ -401,7 +401,36 @@ impl PlacedExecutionDag {
         pp_rank: usize,
         state: Option<(StateLayout, usize)>,
         local_geometry: G,
-        auxiliary_boundary: A,
+        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+    ) -> Result<ArchitecturePartition<G, A>, Error>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: eredu_runtime::RuntimeState<B>,
+        M: eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = A>,
+        M::Error: std::fmt::Display,
+        A: eredu_runtime::ArchitectureBoundary,
+    {
+        let boundary_schema = architecture
+            .boundary_schema()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        self.realize_architecture_partition_with_boundary::<B, S, M, G, A>(
+            architecture,
+            pp_rank,
+            state,
+            local_geometry,
+            boundary_schema,
+            parameter_bindings,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn realize_architecture_partition_with_boundary<B, S, M, G, A>(
+        &self,
+        architecture: &M,
+        pp_rank: usize,
+        state: Option<(StateLayout, usize)>,
+        local_geometry: G,
+        boundary_schema: A,
         parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<ArchitecturePartition<G, A>, Error>
     where
@@ -447,7 +476,7 @@ impl PlacedExecutionDag {
             ownership,
             state,
             local_geometry,
-            auxiliary_boundary,
+            boundary_schema,
             parameter_bindings,
         )
         .map_err(placement_partition_error)
@@ -838,15 +867,21 @@ mod tests {
         pp_rank: usize,
         state: Option<(StateLayout, usize)>,
         local_geometry: G,
-        auxiliary_boundary: A,
+        boundary_schema: A,
         parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<ArchitecturePartition<G, A>, Error> {
-        placed.realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
+        placed.realize_architecture_partition_with_boundary::<
+            MlxNeuralBackend,
+            MlxHybridState,
+            _,
+            _,
+            _,
+        >(
             &FixtureArchitecture::new(placed),
             pp_rank,
             state,
             local_geometry,
-            auxiliary_boundary,
+            boundary_schema,
             parameter_bindings,
         )
     }
@@ -930,7 +965,7 @@ mod tests {
             1,
             Some((state_layout(2), 7)),
             Geometry("family-local"),
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             [OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(ExecutionGroupId::new("text").unwrap(), 0),
                 parameter("text.layer", "model.layers.0.weight"),
@@ -963,10 +998,10 @@ mod tests {
         assert_eq!(partition.state().unwrap().global_layers(), 7..9);
         assert_eq!(partition.local_geometry(), &Geometry("family-local"));
         assert!(partition
-            .auxiliary_boundary()
+            .boundary_schema()
             .wire_schema()
             .unwrap()
-            .tensors()
+            .auxiliary()
             .is_empty());
         assert_eq!(partition.parameter_bindings().len(), 1);
         assert_eq!(
@@ -979,7 +1014,7 @@ mod tests {
             0,
             None,
             (),
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             std::iter::empty(),
         )
         .unwrap();
@@ -1018,7 +1053,7 @@ mod tests {
             1,
             None,
             (),
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             [embedding.clone()],
         )
         .unwrap();
@@ -1043,7 +1078,7 @@ mod tests {
                 1,
                 None,
                 (),
-                eredu_runtime::NoAuxiliaryBoundary,
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
                 [embedding]
             ),
             Err(Error::Parallel(message)) if message.contains("non-local parameter owner")
@@ -1057,8 +1092,8 @@ mod tests {
             &placed,
             1,
             Some((state_layout(2), usize::MAX)),
-            eredu_runtime::NoAuxiliaryBoundary,
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             std::iter::empty(),
         )
         .unwrap_err();
@@ -1074,7 +1109,7 @@ mod tests {
             1,
             None,
             (),
-            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             [
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::static_role("text.input"),

@@ -260,7 +260,11 @@ impl eredu_runtime::ArchitectureBoundary for PipelineBoundarySchema {
 
     const IDENTITY: &'static str = "qwen_vl.decoder";
 
-    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+    fn primary_tensor_spec(&self) -> eredu_runtime::BoundaryTensorSpec {
+        eredu_runtime::BoundaryTensorSpec::primary_activation(self.hidden_size)
+    }
+
+    fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
         let mut specs = vec![
             eredu_runtime::BoundaryTensorSpec::new(
@@ -2074,6 +2078,10 @@ where
 {
     type Boundary = PipelineBoundarySchema;
 
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(PipelineBoundarySchema::from_args(self.args()))
+    }
+
     fn begin_partition<'a>(
         &mut self,
         input: LayeredPartitionInput<'a, B::Tensor, PipelineBoundary<B::Tensor>>,
@@ -2174,10 +2182,11 @@ mod boundary_tests {
             deepstack_count: 2,
         };
         let tensors = schema.wire_schema().unwrap().resolve(2, 5).unwrap();
-        assert_eq!(tensors.len(), 5);
-        assert_eq!(tensors[0].shape(), [1, 5, 8]);
-        assert_eq!(tensors[2].dtype(), BoundaryTensorDtype::Int32);
-        assert_eq!(tensors[3].role(), "deepstack.0");
-        assert_eq!(tensors[3].shape(), [2, 5, 32]);
+        assert_eq!(tensors.primary().shape(), [2, 5, 32]);
+        assert_eq!(tensors.auxiliary().len(), 5);
+        assert_eq!(tensors.auxiliary()[0].shape(), [1, 5, 8]);
+        assert_eq!(tensors.auxiliary()[2].dtype(), BoundaryTensorDtype::Int32);
+        assert_eq!(tensors.auxiliary()[3].role(), "deepstack.0");
+        assert_eq!(tensors.auxiliary()[3].shape(), [2, 5, 32]);
     }
 }

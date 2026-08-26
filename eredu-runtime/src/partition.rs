@@ -436,6 +436,19 @@ impl BoundaryTensorSpec {
         }
     }
 
+    /// Declares the standard evolving batch/sequence/hidden activation.
+    pub fn primary_activation(hidden_size: i32) -> Self {
+        Self::new(
+            "hidden",
+            [
+                BoundaryTensorDimension::Batch,
+                BoundaryTensorDimension::Sequence,
+                BoundaryTensorDimension::Fixed(hidden_size),
+            ],
+            BoundaryTensorDtype::Activation,
+        )
+    }
+
     /// Returns the stable semantic role.
     pub fn role(&self) -> &str {
         &self.role
@@ -477,25 +490,30 @@ impl ResolvedBoundaryTensorSpec {
     }
 }
 
-/// Complete ordered auxiliary wire schema for one architecture boundary.
+/// Complete primary and ordered auxiliary wire schema for one architecture boundary.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct BoundaryWireSchema {
     identity: &'static str,
-    tensors: Vec<BoundaryTensorSpec>,
+    primary: BoundaryTensorSpec,
+    auxiliary: Vec<BoundaryTensorSpec>,
 }
 
 impl BoundaryWireSchema {
     /// Creates and validates an architecture-owned wire schema.
     pub fn new(
         identity: &'static str,
-        tensors: impl IntoIterator<Item = BoundaryTensorSpec>,
+        primary: BoundaryTensorSpec,
+        auxiliary: impl IntoIterator<Item = BoundaryTensorSpec>,
     ) -> Result<Self, ArchitectureBoundaryError> {
         if identity.trim().is_empty() {
             return Err(ArchitectureBoundaryError::EmptyIdentity);
         }
-        let tensors = tensors.into_iter().collect::<Vec<_>>();
+        if primary.dtype != BoundaryTensorDtype::Activation {
+            return Err(ArchitectureBoundaryError::InvalidPrimaryDtype { boundary: identity });
+        }
+        let auxiliary = auxiliary.into_iter().collect::<Vec<_>>();
         let mut roles = BTreeSet::new();
-        for tensor in &tensors {
+        for tensor in std::iter::once(&primary).chain(&auxiliary) {
             if tensor.role.trim().is_empty() {
                 return Err(ArchitectureBoundaryError::EmptyTensorRole { boundary: identity });
             }
@@ -522,7 +540,11 @@ impl BoundaryWireSchema {
                 });
             }
         }
-        Ok(Self { identity, tensors })
+        Ok(Self {
+            identity,
+            primary,
+            auxiliary,
+        })
     }
 
     /// Returns the stable schema identity.
@@ -530,9 +552,14 @@ impl BoundaryWireSchema {
         self.identity
     }
 
-    /// Returns tensor declarations in canonical transport order.
-    pub fn tensors(&self) -> &[BoundaryTensorSpec] {
-        &self.tensors
+    /// Returns the primary evolving activation declaration.
+    pub const fn primary(&self) -> &BoundaryTensorSpec {
+        &self.primary
+    }
+
+    /// Returns auxiliary tensor declarations in canonical transport order.
+    pub fn auxiliary(&self) -> &[BoundaryTensorSpec] {
+        &self.auxiliary
     }
 
     /// Resolves invocation-dependent dimensions without backend family logic.
@@ -540,7 +567,7 @@ impl BoundaryWireSchema {
         &self,
         batch_size: i32,
         sequence_length: i32,
-    ) -> Result<Vec<ResolvedBoundaryTensorSpec>, ArchitectureBoundaryError> {
+    ) -> Result<ResolvedBoundaryWireSchema, ArchitectureBoundaryError> {
         if batch_size <= 0 || sequence_length <= 0 {
             return Err(ArchitectureBoundaryError::InvalidInvocationGeometry {
                 boundary: self.identity,
@@ -548,23 +575,49 @@ impl BoundaryWireSchema {
                 sequence_length,
             });
         }
-        Ok(self
-            .tensors
-            .iter()
-            .map(|tensor| ResolvedBoundaryTensorSpec {
-                role: tensor.role.clone(),
-                shape: tensor
-                    .shape
-                    .iter()
-                    .map(|dimension| match dimension {
-                        BoundaryTensorDimension::Batch => batch_size,
-                        BoundaryTensorDimension::Sequence => sequence_length,
-                        BoundaryTensorDimension::Fixed(value) => *value,
-                    })
-                    .collect(),
-                dtype: tensor.dtype,
-            })
-            .collect())
+        let resolve = |tensor: &BoundaryTensorSpec| ResolvedBoundaryTensorSpec {
+            role: tensor.role.clone(),
+            shape: tensor
+                .shape
+                .iter()
+                .map(|dimension| match dimension {
+                    BoundaryTensorDimension::Batch => batch_size,
+                    BoundaryTensorDimension::Sequence => sequence_length,
+                    BoundaryTensorDimension::Fixed(value) => *value,
+                })
+                .collect(),
+            dtype: tensor.dtype,
+        };
+        Ok(ResolvedBoundaryWireSchema {
+            identity: self.identity,
+            primary: resolve(&self.primary),
+            auxiliary: self.auxiliary.iter().map(resolve).collect(),
+        })
+    }
+}
+
+/// One architecture boundary after invocation-dependent dimensions are resolved.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct ResolvedBoundaryWireSchema {
+    identity: &'static str,
+    primary: ResolvedBoundaryTensorSpec,
+    auxiliary: Vec<ResolvedBoundaryTensorSpec>,
+}
+
+impl ResolvedBoundaryWireSchema {
+    /// Returns the stable schema identity.
+    pub const fn identity(&self) -> &'static str {
+        self.identity
+    }
+
+    /// Returns the resolved primary evolving activation declaration.
+    pub const fn primary(&self) -> &ResolvedBoundaryTensorSpec {
+        &self.primary
+    }
+
+    /// Returns resolved auxiliary declarations in canonical transport order.
+    pub fn auxiliary(&self) -> &[ResolvedBoundaryTensorSpec] {
+        &self.auxiliary
     }
 }
 
@@ -582,8 +635,11 @@ pub trait ArchitectureBoundary: Sized {
     /// validation.
     const IDENTITY: &'static str;
 
-    /// Tensor declarations in exact encoded order.
-    fn tensor_specs(&self) -> Vec<BoundaryTensorSpec>;
+    /// Primary evolving activation declaration.
+    fn primary_tensor_spec(&self) -> BoundaryTensorSpec;
+
+    /// Auxiliary tensor declarations in exact encoded order.
+    fn auxiliary_tensor_specs(&self) -> Vec<BoundaryTensorSpec>;
 
     /// Consumes this typed value into transport-order tensors.
     fn encode<T>(&self, boundary: Self::Boundary<T>) -> Result<Vec<T>, ArchitectureBoundaryError>;
@@ -593,7 +649,11 @@ pub trait ArchitectureBoundary: Sized {
 
     /// Returns the validated backend-neutral wire schema.
     fn wire_schema(&self) -> Result<BoundaryWireSchema, ArchitectureBoundaryError> {
-        BoundaryWireSchema::new(Self::IDENTITY, self.tensor_specs())
+        BoundaryWireSchema::new(
+            Self::IDENTITY,
+            self.primary_tensor_spec(),
+            self.auxiliary_tensor_specs(),
+        )
     }
 }
 
@@ -605,12 +665,29 @@ pub trait ArchitectureBoundary: Sized {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct NoAuxiliaryBoundary;
 
-impl ArchitectureBoundary for NoAuxiliaryBoundary {
+/// Schema for an evolving decoder activation with no auxiliary tensors.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct NoAuxiliaryBoundarySchema {
+    hidden_size: i32,
+}
+
+impl NoAuxiliaryBoundarySchema {
+    /// Declares a standard batch/sequence/hidden activation boundary.
+    pub const fn new(hidden_size: i32) -> Self {
+        Self { hidden_size }
+    }
+}
+
+impl ArchitectureBoundary for NoAuxiliaryBoundarySchema {
     type Boundary<T> = NoAuxiliaryBoundary;
 
     const IDENTITY: &'static str = "none";
 
-    fn tensor_specs(&self) -> Vec<BoundaryTensorSpec> {
+    fn primary_tensor_spec(&self) -> BoundaryTensorSpec {
+        BoundaryTensorSpec::primary_activation(self.hidden_size)
+    }
+
+    fn auxiliary_tensor_specs(&self) -> Vec<BoundaryTensorSpec> {
         Vec::new()
     }
 
@@ -620,7 +697,7 @@ impl ArchitectureBoundary for NoAuxiliaryBoundary {
 
     fn decode<T>(&self, tensors: Vec<T>) -> Result<Self::Boundary<T>, ArchitectureBoundaryError> {
         validate_boundary_tensor_count(self, &tensors)?;
-        Ok(Self)
+        Ok(NoAuxiliaryBoundary)
     }
 }
 
@@ -633,7 +710,7 @@ pub fn validate_boundary_tensor_count<B, T>(
 where
     B: ArchitectureBoundary,
 {
-    let expected = boundary.wire_schema()?.tensors().len();
+    let expected = boundary.wire_schema()?.auxiliary().len();
     let actual = tensors.len();
     if actual != expected {
         return Err(ArchitectureBoundaryError::TensorCount {
@@ -651,6 +728,12 @@ pub enum ArchitectureBoundaryError {
     /// A family boundary omitted its stable identity.
     #[error("architecture boundary identity must not be empty")]
     EmptyIdentity,
+    /// A family boundary assigned a non-activation dtype to its primary tensor.
+    #[error("architecture boundary {boundary:?} primary tensor must use activation dtype")]
+    InvalidPrimaryDtype {
+        /// Stable boundary identity.
+        boundary: &'static str,
+    },
     /// A family boundary declared an empty tensor role.
     #[error("architecture boundary {boundary:?} contains an empty tensor role")]
     EmptyTensorRole {
@@ -844,7 +927,7 @@ impl PartitionGroup {
 /// Complete backend-neutral realization of one rank's architecture ownership.
 ///
 /// `G` is family-owned local construction geometry. `A` is the family-owned
-/// auxiliary wire schema carried by the partition realization.
+/// primary and auxiliary wire schema carried by the partition realization.
 #[derive(Debug, Clone)]
 pub struct ArchitecturePartition<G, A> {
     graph: ExecutionGraph,
@@ -853,7 +936,7 @@ pub struct ArchitecturePartition<G, A> {
     ownership: PartitionOwnership,
     state: Option<PartitionState>,
     local_geometry: G,
-    auxiliary_boundary: A,
+    boundary_schema: A,
     parameter_bindings: Vec<OwnedParameterGroupSpec>,
 }
 
@@ -872,7 +955,7 @@ impl<G, A> ArchitecturePartition<G, A> {
         ownership: PartitionOwnership,
         state: Option<PartitionState>,
         local_geometry: G,
-        auxiliary_boundary: A,
+        boundary_schema: A,
         parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<Self, ArchitecturePartitionError>
     where
@@ -884,7 +967,7 @@ impl<G, A> ArchitecturePartition<G, A> {
         A: ArchitectureBoundary,
     {
         let (graph, unit_layout) = canonical_architecture_layout::<B, S, M>(architecture)?;
-        auxiliary_boundary.wire_schema()?;
+        boundary_schema.wire_schema()?;
         Self::new(
             graph,
             unit_layout,
@@ -892,7 +975,7 @@ impl<G, A> ArchitecturePartition<G, A> {
             ownership,
             state,
             local_geometry,
-            auxiliary_boundary,
+            boundary_schema,
             parameter_bindings,
         )
     }
@@ -907,7 +990,7 @@ impl<G, A> ArchitecturePartition<G, A> {
         ownership: PartitionOwnership,
         state: Option<PartitionState>,
         local_geometry: G,
-        auxiliary_boundary: A,
+        boundary_schema: A,
         parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<Self, ArchitecturePartitionError>
     where
@@ -979,7 +1062,7 @@ impl<G, A> ArchitecturePartition<G, A> {
             ownership,
             state,
             local_geometry,
-            auxiliary_boundary,
+            boundary_schema,
             parameter_bindings,
         })
     }
@@ -1038,14 +1121,14 @@ impl<G, A> ArchitecturePartition<G, A> {
         &self.local_geometry
     }
 
-    /// Returns the family-owned auxiliary boundary schema.
-    pub const fn auxiliary_boundary(&self) -> &A {
-        &self.auxiliary_boundary
+    /// Returns the family-owned primary and auxiliary boundary schema.
+    pub const fn boundary_schema(&self) -> &A {
+        &self.boundary_schema
     }
 
-    /// Mutably returns the family-owned auxiliary boundary schema.
-    pub fn auxiliary_boundary_mut(&mut self) -> &mut A {
-        &mut self.auxiliary_boundary
+    /// Mutably returns the family-owned primary and auxiliary boundary schema.
+    pub fn boundary_schema_mut(&mut self) -> &mut A {
+        &mut self.boundary_schema
     }
 
     /// Returns neutral semantic parameter bindings owned by this rank.
@@ -1466,7 +1549,11 @@ mod tests {
 
         const IDENTITY: &'static str = "fixture.target";
 
-        fn tensor_specs(&self) -> Vec<BoundaryTensorSpec> {
+        fn primary_tensor_spec(&self) -> BoundaryTensorSpec {
+            BoundaryTensorSpec::primary_activation(8)
+        }
+
+        fn auxiliary_tensor_specs(&self) -> Vec<BoundaryTensorSpec> {
             vec![
                 BoundaryTensorSpec::new(
                     "tokens",
@@ -1783,8 +1870,8 @@ mod tests {
         );
         assert_eq!(partition.state().unwrap().global_layers(), 7..9);
         assert_eq!(partition.local_geometry(), &Geometry("local"));
-        partition.auxiliary_boundary_mut().route = 5;
-        assert_eq!(partition.auxiliary_boundary().route, 5);
+        partition.boundary_schema_mut().route = 5;
+        assert_eq!(partition.boundary_schema().route, 5);
         assert_eq!(partition.parameter_bindings().len(), 2);
     }
 
@@ -1805,10 +1892,15 @@ mod tests {
             }
         );
         let resolved = schema.wire_schema().unwrap().resolve(2, 3).unwrap();
-        assert_eq!(resolved[0].shape(), [2, 3]);
-        assert_eq!(resolved[0].dtype(), BoundaryTensorDtype::Uint32);
-        assert_eq!(resolved[1].shape(), [2, 3, 16]);
-        assert_eq!(resolved[1].dtype(), BoundaryTensorDtype::Activation);
+        assert_eq!(resolved.primary().shape(), [2, 3, 8]);
+        assert_eq!(resolved.primary().dtype(), BoundaryTensorDtype::Activation);
+        assert_eq!(resolved.auxiliary()[0].shape(), [2, 3]);
+        assert_eq!(resolved.auxiliary()[0].dtype(), BoundaryTensorDtype::Uint32);
+        assert_eq!(resolved.auxiliary()[1].shape(), [2, 3, 16]);
+        assert_eq!(
+            resolved.auxiliary()[1].dtype(),
+            BoundaryTensorDtype::Activation
+        );
         assert_eq!(
             schema.decode(vec![3]).unwrap_err(),
             ArchitectureBoundaryError::TensorCount {
@@ -1821,8 +1913,26 @@ mod tests {
 
     #[test]
     fn boundary_schema_rejects_role_and_geometry_drift_before_transport() {
+        let invalid_primary = BoundaryWireSchema::new(
+            "fixture.invalid",
+            BoundaryTensorSpec::new(
+                "hidden",
+                [BoundaryTensorDimension::Fixed(8)],
+                BoundaryTensorDtype::Uint32,
+            ),
+            [],
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_primary,
+            ArchitectureBoundaryError::InvalidPrimaryDtype {
+                boundary: "fixture.invalid",
+            }
+        );
+
         let duplicate = BoundaryWireSchema::new(
             "fixture.invalid",
+            BoundaryTensorSpec::primary_activation(8),
             [
                 BoundaryTensorSpec::new(
                     "state",
@@ -1847,6 +1957,7 @@ mod tests {
 
         let invalid = BoundaryWireSchema::new(
             "fixture.invalid",
+            BoundaryTensorSpec::primary_activation(8),
             [BoundaryTensorSpec::new(
                 "state",
                 [BoundaryTensorDimension::Fixed(0)],

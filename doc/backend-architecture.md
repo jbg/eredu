@@ -913,23 +913,24 @@ prediction groups have distinct semantic kinds, so multimodal ingress ends at
 the decoder boundary and prediction runs only in its explicit phase.
 
 The partition also carries an architecture-owned boundary schema. That schema
-declares every auxiliary tensor's stable role, canonical order, symbolic shape,
-logical dtype, and configuration-dependent cardinality, and it owns conversion
-to and from the family's typed boundary value. When the evolving activation's
-transport width differs from the ordinary hidden width, that derived width is
-also part of the family boundary plan. `eredu-runtime` validates and resolves
-batch and sequence dimensions. A concrete backend only maps the logical
-activation or exact integer dtype to its native dtype, allocates the declared
-receive buffers, validates produced tensors, and transports them. It must not
-reconstruct boundary geometry from model-family arguments.
+declares the primary evolving activation and every auxiliary tensor, including
+their stable roles, canonical order, symbolic shapes, logical dtypes, and
+configuration-dependent cardinality. It also owns conversion of auxiliaries to
+and from the family's typed boundary value. The architecture derives the whole
+schema from its normalized configuration, including a primary transport width
+that differs from the ordinary hidden width. `eredu-runtime` validates and
+resolves batch and sequence dimensions. A concrete backend only maps the
+logical activation or exact integer dtype to its native dtype, allocates the
+declared receive buffers, validates produced tensors, and transports them. It
+must not extract or override boundary geometry from model-family arguments.
 
-The evolving hidden activation has a separate backend-neutral
-`PipelineWireContract`. Distributed load configuration must select that
-contract explicitly and provide the same value to every stage. Its activation
-dtype also resolves auxiliary tensors declared with the logical `Activation`
-dtype. Backends normalize outgoing floating activations to the contract before
-validation and transport; checkpoint parameter dtypes, rank-local loading
-order, quantization encodings, and stage ownership never select the wire dtype.
+The physical dtype of tensors declared with the logical `Activation` dtype is
+selected by the separate backend-neutral `PipelineWireContract`. Distributed
+load configuration must select that contract explicitly and provide the same
+value to every stage. Backends normalize outgoing floating activations to the
+contract before validation and transport; checkpoint parameter dtypes,
+rank-local loading order, quantization encodings, and stage ownership never
+select the wire dtype.
 Distributed placement dependency routes consume that same schema directly. A
 concrete backend must reject inactive dependency routes with tensors and active
 routes whose exact cardinality, ordered shapes, or physical dtypes differ from
