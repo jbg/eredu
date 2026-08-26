@@ -1466,6 +1466,32 @@ fn pipeline_ring_worker() {
     }
 }
 
+#[test]
+fn complete_qwen3_vl_variants_accept_paged_cache() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    for (expected_family, moe) in [(ModelKind::Qwen3Vl, false), (ModelKind::Qwen3VlMoe, true)] {
+        let checkpoint = tempfile::tempdir().unwrap();
+        write_qwen3_vl_fixture(checkpoint.path(), moe);
+        let backend = crate::native::backend(&stream, &stream);
+        let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
+        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        assert_eq!(runtime.session().model_family(), expected_family);
+
+        let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
+            .unwrap()
+            .with_full_attention(true);
+        runtime
+            .session_mut()
+            .configure_cache(CacheResidencyPolicy::Paged(paged))
+            .unwrap();
+        assert!(runtime
+            .session()
+            .cache_residency_report()
+            .unwrap()
+            .is_some());
+    }
+}
+
 fn resident_reference(checkpoint: &Path, stream: &Stream) -> (Vec<f32>, Vec<f32>) {
     resident_reference_quantized(checkpoint, None, stream)
 }

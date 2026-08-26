@@ -585,14 +585,18 @@ impl Model {
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::Qwen3Next)
                     .map_err(|error| Exception::custom(error.to_string())),
+                Self::Qwen3Vl(_, model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::Qwen3Vl)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::Qwen3VlMoe(_, model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::Qwen3VlMoe)
+                    .map_err(|error| Exception::custom(error.to_string())),
                 Self::Qwen35(_, model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::Qwen35)
                     .map_err(|error| Exception::custom(error.to_string())),
-                _ => Err(Exception::custom(format!(
-                    "paged cache residency is unsupported for model type {}",
-                    self.effective_model_type()
-                ))),
             },
         }
     }
