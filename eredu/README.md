@@ -5,7 +5,7 @@ The `eredu` crate is its main application API, covering model inspection,
 loading, planning, chat preparation, generation, and telemetry. The default
 features include the MLX execution implementation.
 
-Use the [model support guide](../doc/model-support.md) to check supported model
+Use the [model support guide](https://github.com/jbg/eredu/blob/main/doc/model-support.md) to check supported model
 families, checkpoint formats, modalities, and execution capabilities.
 
 ## Features
@@ -102,13 +102,13 @@ values.
 
 ## Documentation
 
-- [Model loading, quantization, and memory](../doc/model-loading.md)
-- [Backend architecture](../doc/backend-architecture.md)
-- [Speculative decoding and MTP](../doc/speculative-decoding.md)
-- [Native tool calling](../doc/tool-calling.md)
-- [Parallel execution](../doc/parallel-execution.md)
-- [Platform setup](../doc/platforms.md)
-- [Eredu CLI](../eredu-cli/README.md)
+- [Model loading, quantization, and memory](https://github.com/jbg/eredu/blob/main/doc/model-loading.md)
+- [Backend architecture](https://github.com/jbg/eredu/blob/main/doc/backend-architecture.md)
+- [Speculative decoding and MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md)
+- [Native tool calling](https://github.com/jbg/eredu/blob/main/doc/tool-calling.md)
+- [Parallel execution](https://github.com/jbg/eredu/blob/main/doc/parallel-execution.md)
+- [Platform setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md)
+- [Eredu CLI](https://github.com/jbg/eredu/blob/main/eredu-cli/README.md)
 
 The minimum supported Rust version is 1.89.
 

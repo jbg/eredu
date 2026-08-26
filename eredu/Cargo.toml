@@ -12,6 +12,14 @@ description = "Rust runtime for local text, multimodal, and realtime language mo
 readme = "README.md"
 autotests = false
 autoexamples = false
+include = [
+    "src/**",
+    "tests/**",
+    "examples/*.rs",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [[example]]
 name = "gemma4_generate"

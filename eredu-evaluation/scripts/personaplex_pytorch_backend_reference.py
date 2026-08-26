@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate an upstream PyTorch PersonaPlex reference from eredu token fixtures.
 
-The input JSON is produced by the eredu-codec
+The input JSON is produced by the eredu-backend-mlx
 `personaplex_quantization_eval` example. Voice, text, and user-audio codec
 tokens are consumed directly so the backend comparison does not depend on
 separate tokenizer or Mimi encoder numerics.

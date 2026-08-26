@@ -11,12 +11,14 @@ This generator never creates a synthetic model or configuration. It requires:
 
 Example:
 
-  python eredu-backend-mlx/validation/personaplex_torch_fixture.py \
+  python validation/personaplex_torch_fixture.py \
     --artifact-dir /models/personaplex-7b-v1 \
     --checkpoint /models/personaplex-7b-v1 \
     --personaplex-source /src/personaplex \
     --moshi-source /src/kyutai-moshi/moshi \
     --output /fixtures/personaplex-7b-v1-greedy.safetensors
+
+Run the command from the ``eredu-backend-mlx`` crate directory.
 
 Keep ``--output`` outside ``--artifact-dir``. PersonaPlex checkpoints are
 directory-loaded, so a fixture beside model shards would be mistaken for model

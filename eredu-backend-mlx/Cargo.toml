@@ -10,6 +10,15 @@ license.workspace = true
 rust-version.workspace = true
 description = "MLX backend implementation for Eredu's neutral contracts"
 readme = "README.md"
+include = [
+    "src/**",
+    "tests/**",
+    "examples/*.rs",
+    "validation/*.py",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]

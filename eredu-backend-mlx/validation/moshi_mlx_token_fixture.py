@@ -7,8 +7,10 @@ small native-config checkpoint; it does not represent a released profile.
 
 The matching command is:
 
-  cargo run -p eredu-backend-mlx --example moshi_token_parity -- \
+  cargo run --example moshi_token_parity -- \
     MODEL_DIR OUTPUT.safetensors
+
+Run both commands from the ``eredu-backend-mlx`` crate directory.
 """
 
 import argparse

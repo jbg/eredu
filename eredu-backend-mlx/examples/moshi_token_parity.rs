@@ -1,10 +1,12 @@
 //! Compare the MLX realtime backend with a native `moshi_mlx` fixture.
 //!
+//! Run from the `eredu-backend-mlx` crate directory:
+//!
 //! ```text
-//! python eredu-backend-mlx/validation/moshi_mlx_token_fixture.py \
+//! python validation/moshi_mlx_token_fixture.py \
 //!   /models/moshi /fixtures/moshi-native.safetensors \
 //!   --require-mlx-version VERSION
-//! cargo run -p eredu-backend-mlx --example moshi_token_parity -- \
+//! cargo run --example moshi_token_parity -- \
 //!   /models/moshi /fixtures/moshi-native.safetensors
 //! ```
 //!

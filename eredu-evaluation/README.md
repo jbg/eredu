@@ -21,4 +21,4 @@ output observation and, where supported, named activation inspection through
 the neutral core contracts. Backend-specific examples may select a device and
 load artifacts, but comparisons and thresholds belong here.
 
-See [the evaluation architecture guide](../doc/evaluation.md).
+See [the evaluation architecture guide](https://github.com/jbg/eredu/blob/main/doc/evaluation.md).
