@@ -13709,12 +13709,7 @@ pub fn load_pipeline_model_with_options(
                     let (args, store) =
                         crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
                             &admitted,
-                            projector.as_ref().ok_or_else(|| {
-                                Error::ArchitectureModel(
-                                    "Muse-Glimmer preparation omitted its required media projector"
-                                        .into(),
-                                )
-                            })?,
+                            projector.as_ref(),
                             max_mapped_shards,
                         )?;
                     load_muse_glimmer_pipeline(

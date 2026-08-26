@@ -67,7 +67,7 @@ projector.
 | LFM2 / LFM2.5 | text | yes | `lfm2`, `lfm2moe` | causal-convolution/attention hybrid, dense and MoE |
 | Nemotron-H | text | yes | `nemotron_h`, `nemotron_h_moe` | Mamba, attention, dense MLP, and MoE layers |
 | Inkling | text, image, audio | yes | `inkling` + projector | multimodal hMLP ingress and dense/MoE text execution |
-| Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional projector | vision tower, mixed attention, ATEM/DFlash paths |
+| Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional image-only projector | vision tower, mixed attention, ATEM/DFlash paths |
 | Moshi | realtime codec tokens | yes | no | temporal/depth generation without a codec dependency |
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 

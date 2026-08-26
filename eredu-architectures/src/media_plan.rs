@@ -1702,6 +1702,12 @@ fn muse_glimmer(
             ),
         ));
     }
+    let vision = args.vision_config.as_ref().ok_or_else(|| {
+        unsupported(
+            &args.model_type,
+            "loaded Muse-Glimmer artifact has no vision projector",
+        )
+    })?;
     let grid = input.patch_grid.as_ref().ok_or_else(|| {
         unsupported(
             &args.model_type,
@@ -1724,7 +1730,7 @@ fn muse_glimmer(
             "Muse-Glimmer patch_grid has an incomplete row",
         ));
     }
-    let merge = nonzero_positive(args.vision_config.merge_size, "Muse vision merge size")?;
+    let merge = nonzero_positive(vision.merge_size, "Muse vision merge size")?;
     let mut patches = 0u64;
     let mut positions = 0u64;
     for entry in grid.values.chunks_exact(3) {
@@ -1770,7 +1776,7 @@ fn muse_glimmer(
     }
     let graph = checked_mul(
         patches,
-        positive(args.vision_config.hidden_size, "Muse vision hidden size")?,
+        positive(vision.hidden_size, "Muse vision hidden size")?,
         "Muse vision activation scalars",
     )?;
     Ok(MediaShapePlan {

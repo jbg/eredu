@@ -113,11 +113,6 @@ fn materialize_gguf_model(
             Executable::llama(kind, loaded)?
         }
         GgufArchitecture::MuseGlimmer => {
-            let projector = projector.ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "Muse-Glimmer preparation omitted its required media projector".into(),
-                )
-            })?;
             let loaded = crate::composition::muse_glimmer::load_gguf(
                 source,
                 projector,
@@ -900,11 +895,6 @@ fn materialize_gguf_tensor_parallel(
             Executable::llama(kind, model)
         }
         TensorParallelBinding::MuseGlimmer => {
-            let projector = projector.ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "Muse-Glimmer preparation omitted its required media projector".into(),
-                )
-            })?;
             let model = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
                 source,
                 projector,

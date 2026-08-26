@@ -56,7 +56,11 @@ impl LocalGeometry {
     pub(super) fn validate_for(&self, args: &DecoderConfig) -> Result<(), ParallelPlanError> {
         if self.architecture_fingerprint != args.architecture_fingerprint()
             || self.text_blocks.len() != args.num_hidden_layers as usize
-            || self.vision_layers != args.vision_config.layer_count()
+            || self.vision_layers
+                != args
+                    .vision_config
+                    .as_ref()
+                    .map_or(0, |vision| vision.layer_count())
         {
             return Err(invalid(
                 "rank-local Muse-Glimmer geometry belongs to a different configuration",
@@ -115,7 +119,10 @@ pub fn local_geometry(
         // Media parameters are deliberately outside the text TP plan and are
         // replicated on every rank. Keeping their unit ownership here makes
         // the canonical multimodal graph authoritative for both lifecycles.
-        vision_layers: args.vision_config.layer_count(),
+        vision_layers: args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.layer_count()),
         architecture_fingerprint: args.architecture_fingerprint(),
     };
     geometry.validate_for(args)?;
@@ -439,7 +446,9 @@ pub fn layer_parameter_groups(
 pub fn vision_parameter_groups(
     args: &DecoderConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let config = &args.vision_config;
+    let Some(config) = &args.vision_config else {
+        return Ok(Vec::new());
+    };
     let hidden = dim(config.hidden_size)?;
     let heads = dim(config.num_heads)?;
     let patch_input = dim(config.temporal_patch_size * 3 * config.patch_size * config.patch_size)?;
@@ -589,10 +598,7 @@ pub fn vision_parameter_groups(
         ],
     )?);
     expand_linear_format_parameter_groups(groups, |member| {
-        standard_parallel_linear_format(
-            member,
-            args.vision_config.linear_format_for(member.target()),
-        )
+        standard_parallel_linear_format(member, config.linear_format_for(member.target()))
     })
 }
 
@@ -600,8 +606,11 @@ pub fn vision_parameter_groups(
 pub fn vision_static_parameter_groups(
     args: &DecoderConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let Some(vision) = &args.vision_config else {
+        return Ok(Vec::new());
+    };
     let mut all = vision_parameter_groups(args)?;
-    let layer_groups = args.vision_config.layer_count() * 3;
+    let layer_groups = vision.layer_count() * 3;
     let mut tail = all.split_off(1 + layer_groups);
     all.truncate(1);
     all.append(&mut tail);
@@ -613,7 +622,10 @@ pub fn vision_layer_parameter_groups(
     args: &DecoderConfig,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let count = args.vision_config.layer_count();
+    let count = args
+        .vision_config
+        .as_ref()
+        .map_or(0, |vision| vision.layer_count());
     if layer >= count {
         return Err(invalid(format!(
             "Muse-Glimmer vision layer {layer} is outside {count} layers"

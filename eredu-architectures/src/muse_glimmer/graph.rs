@@ -10,17 +10,17 @@ use super::DecoderConfig;
 
 /// Builds the vision/assembly/decoder/output graph.
 pub fn component_graph(args: &DecoderConfig) -> Result<ComponentGraph, ComponentGraphError> {
-    let mut units = vec![
-        ComponentSpec {
-            id: "embedding".into(),
-            kind: ComponentKind::StaticText,
-            external_inputs: vec![ComponentDomain::TokenIds],
-            dependencies: vec![],
-            dependency_inputs: vec![],
-            output: ComponentDomain::HiddenStates,
-            residency: ComponentResidencyClass::Static,
-        },
-        ComponentSpec {
+    let mut units = vec![ComponentSpec {
+        id: "embedding".into(),
+        kind: ComponentKind::StaticText,
+        external_inputs: vec![ComponentDomain::TokenIds],
+        dependencies: vec![],
+        dependency_inputs: vec![],
+        output: ComponentDomain::HiddenStates,
+        residency: ComponentResidencyClass::Static,
+    }];
+    if args.vision_config.is_some() {
+        units.push(ComponentSpec {
             id: "vision".into(),
             kind: ComponentKind::Vision,
             external_inputs: vec![ComponentDomain::PatchMatrix],
@@ -28,17 +28,22 @@ pub fn component_graph(args: &DecoderConfig) -> Result<ComponentGraph, Component
             dependency_inputs: vec![],
             output: ComponentDomain::HiddenStates,
             residency: ComponentResidencyClass::Media,
-        },
-        ComponentSpec {
-            id: "assembly".into(),
-            kind: ComponentKind::Assembly,
-            external_inputs: vec![],
-            dependencies: vec!["embedding".into(), "vision".into()],
-            dependency_inputs: vec![ComponentDomain::HiddenStates; 2],
-            output: ComponentDomain::HiddenStates,
-            residency: ComponentResidencyClass::Static,
-        },
-    ];
+        });
+    }
+    units.push(ComponentSpec {
+        id: "assembly".into(),
+        kind: ComponentKind::Assembly,
+        external_inputs: vec![],
+        dependencies: std::iter::once("embedding".into())
+            .chain(args.vision_config.is_some().then(|| "vision".into()))
+            .collect(),
+        dependency_inputs: vec![
+            ComponentDomain::HiddenStates;
+            1 + usize::from(args.vision_config.is_some())
+        ],
+        output: ComponentDomain::HiddenStates,
+        residency: ComponentResidencyClass::Static,
+    });
     let mut previous = "assembly".to_owned();
     for layer in 0..args.num_hidden_layers as usize {
         let id = format!("decoder.{layer}");

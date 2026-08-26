@@ -34,8 +34,10 @@ pub fn load_time_quantization(
     target.quantization = Some(quantization);
     target.quantized_weights = None;
     target.quantized_weight_configs = None;
-    target.vision_config.weight_quantization = Some(quantization);
-    target.vision_config.quantized_weight_configs.clear();
+    if let Some(vision) = &mut target.vision_config {
+        vision.weight_quantization = Some(quantization);
+        vision.quantized_weight_configs.clear();
+    }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
 }
@@ -194,6 +196,9 @@ pub fn safetensors_parameter_names(args: &DecoderConfig) -> Vec<String> {
 }
 
 fn vision_parameter_names(args: &DecoderConfig) -> Vec<String> {
+    let Some(vision) = &args.vision_config else {
+        return Vec::new();
+    };
     let mut names = vec![
         "model.vision_tower.patch_embedder.patch_embedding.weight".into(),
         "model.vision_tower.patch_embedder.position_embedding_table.weight".into(),
@@ -205,7 +210,7 @@ fn vision_parameter_names(args: &DecoderConfig) -> Vec<String> {
         "model.vision_adapter.fc2.weight".into(),
         "model.vision_projection.weight".into(),
     ];
-    for layer in 0..args.vision_config.layer_count() {
+    for layer in 0..vision.layer_count() {
         let root = format!("model.vision_tower.layers.{layer}");
         for local in [
             "norm1.weight",
@@ -585,7 +590,9 @@ fn add_safetensors_vision(
     text_hidden: usize,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    let vision = &args.vision_config;
+    let vision = args.vision_config.as_ref().ok_or_else(|| {
+        "Muse-Glimmer SafeTensors plan requires a vision configuration".to_string()
+    })?;
     let hidden = dimension(vision.hidden_size, "vision hidden size")?;
     let intermediate = dimension(vision.intermediate_size, "vision intermediate size")?;
     let patch = dimension(vision.patch_size, "vision patch size")?;
@@ -835,7 +842,10 @@ pub fn gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, String> {
 
 /// Builds the official image-only sibling projector GGUF catalog.
 pub fn projector_gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, String> {
-    let vision = &args.vision_config;
+    let vision = args
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| "Muse-Glimmer projector plan requires vision geometry".to_string())?;
     let hidden = dimension(vision.hidden_size, "vision hidden size")?;
     let intermediate = dimension(vision.intermediate_size, "vision intermediate size")?;
     let patch = dimension(vision.patch_size, "vision patch size")?;

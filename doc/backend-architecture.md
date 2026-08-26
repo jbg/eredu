@@ -641,6 +641,9 @@ The architecture also owns the plan that maps a structurally validated sibling
 media projector to resulting input modalities. Inspection applies that plan to
 the same resolved artifact, so expected modalities and multimodal readiness
 describe one composition.
+Muse-Glimmer's base GGUF is a complete text decoder; its optional official
+image-only projector adds the vision graph, parameters, processor plan, and
+image modality without changing text checkpoint admission.
 
 Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released

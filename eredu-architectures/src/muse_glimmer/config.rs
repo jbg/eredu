@@ -192,8 +192,8 @@ pub struct DecoderConfig {
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight mixed encodings.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
-    /// Required native vision tower.
-    pub vision_config: VisionConfig,
+    /// Optional native vision tower supplied by the main artifact or a GGUF projector.
+    pub vision_config: Option<VisionConfig>,
     /// Image placeholder token.
     pub image_token_id: u32,
     /// Video placeholder token.
@@ -275,13 +275,18 @@ impl DecoderConfig {
                 ),
                 (
                     "vision",
-                    format!(
-                        "{}:{}:{}:{}:{}",
-                        self.vision_config.hidden_size,
-                        self.vision_config.layer_count(),
-                        self.vision_config.patch_size,
-                        self.vision_config.temporal_patch_size,
-                        self.vision_config.merge_size
+                    self.vision_config.as_ref().map_or_else(
+                        || "none".into(),
+                        |vision| {
+                            format!(
+                                "{}:{}:{}:{}:{}",
+                                vision.hidden_size,
+                                vision.layer_count(),
+                                vision.patch_size,
+                                vision.temporal_patch_size,
+                                vision.merge_size
+                            )
+                        },
                     ),
                 ),
                 (
@@ -299,12 +304,17 @@ impl DecoderConfig {
                 ),
                 (
                     "vision_quantization",
-                    format!(
-                        "default={:?};overrides={}",
-                        self.vision_config.weight_quantization,
-                        crate::cache_identity::debug_map(Some(
-                            &self.vision_config.quantized_weight_configs
-                        ))
+                    self.vision_config.as_ref().map_or_else(
+                        || "none".into(),
+                        |vision| {
+                            format!(
+                                "default={:?};overrides={}",
+                                vision.weight_quantization,
+                                crate::cache_identity::debug_map(Some(
+                                    &vision.quantized_weight_configs
+                                ))
+                            )
+                        },
                     ),
                 ),
             ],
@@ -410,7 +420,7 @@ impl DecoderConfig {
             video_token_id: required_u32(value, "video_token_id")?,
             vision_out_hidden_size: positive_i32(value, "out_hidden_size")?,
             projector_hidden_size,
-            vision_config: vision,
+            vision_config: Some(vision),
         };
         config.validate()?;
         Ok(config)
@@ -473,7 +483,6 @@ impl DecoderConfig {
             .collect();
         let experts = gguf_optional_i32(metadata, &key("expert_count"))?.unwrap_or(0);
         let is_moe = experts > 0;
-        let vision = official_gguf_vision(hidden_size);
         let config = Self {
             model_type: "muse_glimmer_text".into(),
             hidden_size,
@@ -519,7 +528,7 @@ impl DecoderConfig {
             quantization: None,
             quantized_weights: None,
             quantized_weight_configs: None,
-            vision_config: vision,
+            vision_config: None,
             image_token_id: gguf_optional_i32(metadata, &key("image_token_id"))?
                 .map(|value| u32::try_from(value).map_err(|_| invalid("negative image token id")))
                 .transpose()?
@@ -582,9 +591,10 @@ impl DecoderConfig {
                 "Muse-Glimmer projector layer norm epsilon must be positive",
             ));
         }
-        self.vision_config = official_gguf_vision(self.hidden_size);
-        self.vision_config.layer_norm_eps = epsilon;
-        self.vision_config.quantized_weight_configs = quantized_weight_configs;
+        let mut vision = official_gguf_vision(self.hidden_size);
+        vision.layer_norm_eps = epsilon;
+        vision.quantized_weight_configs = quantized_weight_configs;
+        self.vision_config = Some(vision);
         self.validate()?;
         Ok(self)
     }
@@ -673,10 +683,12 @@ impl DecoderConfig {
                 return Err(invalid(format!("{name} must be finite and positive")));
             }
         }
-        if self.vision_out_hidden_size != self.vision_config.hidden_size * 4 {
-            return Err(invalid(
-                "out_hidden_size must be four times the vision hidden width",
-            ));
+        if let Some(vision) = &self.vision_config {
+            if self.vision_out_hidden_size != vision.hidden_size * 4 {
+                return Err(invalid(
+                    "out_hidden_size must be four times the vision hidden width",
+                ));
+            }
         }
         if self.image_token_id >= self.vocab_size as u32
             || self.video_token_id >= self.vocab_size as u32
@@ -1143,7 +1155,10 @@ mod tests {
             AttentionPolicy::Full
         );
         assert_eq!(config.layer_uses_rope, [true, false]);
-        assert_eq!(config.vision_config.schedule, [VisionAttentionPolicy::Full]);
+        assert_eq!(
+            config.vision_config.as_ref().unwrap().schedule,
+            [VisionAttentionPolicy::Full]
+        );
     }
 
     #[test]
@@ -1159,7 +1174,11 @@ mod tests {
         assert_ne!(dense, text_quantized.architecture_fingerprint());
 
         let mut vision_quantized = args;
-        vision_quantized.vision_config.weight_quantization = Some(format);
+        vision_quantized
+            .vision_config
+            .as_mut()
+            .unwrap()
+            .weight_quantization = Some(format);
         assert_ne!(dense, vision_quantized.architecture_fingerprint());
     }
 
@@ -1320,6 +1339,7 @@ mod tests {
         );
         assert_eq!(config.layer_uses_rope, [true, false]);
         assert!(!config.tie_word_embeddings);
+        assert!(config.vision_config.is_none());
 
         let projector = HashMap::from([
             (
@@ -1366,8 +1386,9 @@ mod tests {
         let config = config
             .with_gguf_projector_metadata(&projector, HashMap::new())
             .unwrap();
-        assert_eq!(config.vision_config.layer_count(), 50);
-        assert_eq!(config.vision_config.temporal_patch_size, 1);
+        let vision = config.vision_config.as_ref().unwrap();
+        assert_eq!(vision.layer_count(), 50);
+        assert_eq!(vision.temporal_patch_size, 1);
 
         let mut invalid = projector;
         invalid.insert("clip.vision.image_size".into(), MetadataValue::Uint32(448));

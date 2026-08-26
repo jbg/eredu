@@ -168,7 +168,7 @@ pub fn gguf_companion_requirements(
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             Some((true, GgufCompanionEncoding::DensePreferred))
         }
-        GgufArchitecture::MuseGlimmer => Some((true, GgufCompanionEncoding::DensePreferred)),
+        GgufArchitecture::MuseGlimmer => Some((false, GgufCompanionEncoding::DensePreferred)),
         GgufArchitecture::Gemma4 => Some((false, GgufCompanionEncoding::DenseRequired)),
         GgufArchitecture::Inkling | GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
             Some((false, GgufCompanionEncoding::DensePreferred))
@@ -1183,9 +1183,17 @@ mod tests {
             gguf_companion_requirements(GgufArchitecture::Qwen3VlMoe).unwrap(),
             vec![required_quantized.clone()]
         );
+        let optional_quantized = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            false,
+            "mmproj",
+            1,
+            GgufCompanionEncoding::DensePreferred,
+        )
+        .unwrap();
         assert_eq!(
             gguf_companion_requirements(GgufArchitecture::MuseGlimmer).unwrap(),
-            vec![required_quantized]
+            vec![optional_quantized]
         );
         let optional_dense = GgufCompanionRequirement::new(
             GgufCompanionRole::MediaProjector,

@@ -679,17 +679,33 @@ fn inspect_gguf_projector(
                 );
             }
         },
-        GgufArchitecture::MuseGlimmer => {
-            let projector_path = prepared_projector(validated)
-                .expect("portable Muse-Glimmer admission requires a media projector");
-            composition = GgufArtifactComposition::ValidatedMediaProjector;
-            report.requirements.push(InspectionRequirement {
-                code: InspectionIssueCode::MissingMediaProjector,
-                readiness: InspectionReadiness::Ready,
-                detail: "portable admission validated the image-only Muse-Glimmer projector".into(),
-                path: Some(projector_path),
-            });
-        }
+        GgufArchitecture::MuseGlimmer => match prepared_projector(validated) {
+            Some(projector_path) => {
+                composition = GgufArtifactComposition::ValidatedMediaProjector;
+                report.requirements.push(InspectionRequirement {
+                    code: InspectionIssueCode::MissingMediaProjector,
+                    readiness: InspectionReadiness::Ready,
+                    detail: "portable admission validated the image-only Muse-Glimmer projector"
+                        .into(),
+                    path: Some(projector_path),
+                });
+            }
+            None => {
+                report.multimodal = InspectionReadiness::Missing;
+                report.requirements.push(InspectionRequirement {
+                    code: InspectionIssueCode::MissingMediaProjector,
+                    readiness: InspectionReadiness::Missing,
+                    detail: "Muse-Glimmer text loading is available, but image input requires a sibling mmproj GGUF".into(),
+                    path: None,
+                });
+                report.issue(
+                    InspectionIssueCode::MissingMediaProjector,
+                    InspectionSeverity::Warning,
+                    "Muse-Glimmer has no sibling image projector; text loading remains available",
+                    Some(path.to_path_buf()),
+                );
+            }
+        },
         _ => report.multimodal = InspectionReadiness::NotApplicable,
     }
     composition

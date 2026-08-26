@@ -1906,7 +1906,7 @@ pub fn load_safetensors_tensor_parallel(
 
 pub fn load_gguf_tensor_parallel(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: LayerWeightResidency,
     build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
@@ -1986,7 +1986,7 @@ pub fn load_safetensors(
 /// Loads split text/projector GGUF through the same neutral family object.
 pub fn load_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2010,44 +2010,53 @@ pub fn load_gguf(
 
 fn open_gguf_store(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, DecoderConfig), Error> {
     let checkpoint = source.checkpoint();
-    let eredu_architectures::configuration::GgufModelConfig::MuseGlimmer(_) = source.model() else {
+    let eredu_architectures::configuration::GgufModelConfig::MuseGlimmer(primary_args) =
+        source.model()
+    else {
         return Err(Error::ArchitectureModel(
             "Muse-Glimmer GGUF loader received a different prepared model".into(),
         ));
     };
-    let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::MuseGlimmer(args) =
-        projector.model()
-    else {
-        return Err(Error::ArchitectureModel(
-            "Muse-Glimmer GGUF loader received a mismatched media-projector plan".into(),
-        ));
+    let args = match projector {
+        Some(projector) => {
+            let eredu_architectures::gguf_companion::GgufMediaProjectorConfig::MuseGlimmer(args) =
+                projector.model()
+            else {
+                return Err(Error::ArchitectureModel(
+                    "Muse-Glimmer GGUF loader received a mismatched media-projector plan".into(),
+                ));
+            };
+            args.clone()
+        }
+        None => primary_args.clone(),
     };
-    let args = args.clone();
-    let store: SharedCheckpointSource = Arc::new(
-        eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-            .max_cached_readers(max_cached_readers)?
-            .add_checkpoint(
-                checkpoint.catalog().clone(),
-                source.plan().checkpoint(),
-                eredu_architectures::muse_glimmer::translate_text_gguf_name,
-            )?
-            .add_checkpoint(
-                projector.checkpoint().catalog().clone(),
-                projector.plan().checkpoint(),
-                eredu_architectures::muse_glimmer::translate_projector_gguf_name,
-            )?
-            .build()?,
-    );
+    let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+        .max_cached_readers(max_cached_readers)?
+        .add_checkpoint(
+            checkpoint.catalog().clone(),
+            source.plan().checkpoint(),
+            eredu_architectures::muse_glimmer::translate_text_gguf_name,
+        )?;
+    let builder = if let Some(projector) = projector {
+        builder.add_checkpoint(
+            projector.checkpoint().catalog().clone(),
+            projector.plan().checkpoint(),
+            eredu_architectures::muse_glimmer::translate_projector_gguf_name,
+        )?
+    } else {
+        builder
+    };
+    let store: SharedCheckpointSource = Arc::new(builder.build()?);
     Ok((store, args))
 }
 
 pub fn prepare_gguf_pipeline_source(
     source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
+    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     max_cached_readers: usize,
 ) -> Result<(DecoderConfig, SharedCheckpointSource), Error> {
     let (store, args) = open_gguf_store(source, projector, max_cached_readers)?;

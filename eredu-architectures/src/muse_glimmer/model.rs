@@ -63,8 +63,8 @@ pub struct ForwardContext<T> {
 pub struct StaticModules<B: RoutedNeuralBackend> {
     /// Text embedding, final norm, and output head.
     pub text: TextStaticModules<B>,
-    /// Patch/position modules, merge adapter, and language projection.
-    pub vision: VisionStatic<B>,
+    /// Optional patch/position modules, merge adapter, and language projection.
+    pub vision: Option<VisionStatic<B>>,
 }
 
 /// A streamable native-vision block or decoder block.
@@ -182,7 +182,9 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
-        visitor.visit("vision", &self.static_modules.vision)?;
+        if let Some(vision) = &self.static_modules.vision {
+            visitor.visit("vision", vision)?;
+        }
         visitor.visit("embedding", &self.static_modules.text.embeddings)?;
         visitor.visit("norm", &self.static_modules.text.final_norm)?;
         if let Some(head) = &self.static_modules.text.head {
@@ -195,7 +197,9 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
-        visitor.visit_mut("vision", &mut self.static_modules.vision)?;
+        if let Some(vision) = &mut self.static_modules.vision {
+            visitor.visit_mut("vision", vision)?;
+        }
         visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
         visitor.visit_mut("norm", &mut self.static_modules.text.final_norm)?;
         if let Some(head) = &mut self.static_modules.text.head {
@@ -253,7 +257,11 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         )?;
         let static_modules = StaticModules {
             text: TextStaticModules::new(&args, context)?,
-            vision: VisionStatic::new(args.vision_config.clone(), context)?,
+            vision: args
+                .vision_config
+                .clone()
+                .map(|vision| VisionStatic::new(vision, context))
+                .transpose()?,
         };
         Ok(Self {
             args,
@@ -275,7 +283,11 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules {
             text: TextStaticModules::new_parallel(&args, &geometry, context)?,
-            vision: VisionStatic::new(args.vision_config.clone(), context)?,
+            vision: args
+                .vision_config
+                .clone()
+                .map(|vision| VisionStatic::new(vision, context))
+                .transpose()?,
         };
         Ok(Self {
             args,
@@ -295,7 +307,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         let graph =
             ExecutionGraph::chain(["vision_encoder", "text_decoder"]).map_err(Error::backend)?;
         let counts = [
-            self.args.vision_config.layer_count(),
+            self.args
+                .vision_config
+                .as_ref()
+                .map_or(0, |vision| vision.layer_count()),
             self.args.num_hidden_layers as usize,
         ];
         let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
@@ -565,31 +580,34 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 "Muse-Glimmer parallel input has excess text embeddings",
             ));
         }
-        let hidden = match input.vision {
-            Some(vision) => {
-                if vision_blocks.len() != self.args.vision_config.layer_count() {
-                    return Err(Error::backend(
-                        "Muse-Glimmer parallel vision block count mismatch",
-                    ));
+        let hidden =
+            match input.vision {
+                Some(vision) => {
+                    let config = self.args.vision_config.as_ref().ok_or_else(|| {
+                        Error::backend("Muse-Glimmer model has no vision projector")
+                    })?;
+                    if vision_blocks.len() != config.layer_count() {
+                        return Err(Error::backend(
+                            "Muse-Glimmer parallel vision block count mismatch",
+                        ));
+                    }
+                    let vision_static = self.static_modules.vision.as_mut().ok_or_else(|| {
+                        Error::backend("Muse-Glimmer model has no vision modules")
+                    })?;
+                    let (mut hidden, vision_state) = vision_static.begin(vision, context)?;
+                    for (index, block) in vision_blocks.iter_mut().enumerate() {
+                        hidden = block.forward_scheduled(
+                            &hidden,
+                            config.schedule[index],
+                            &vision_state,
+                            context,
+                        )?;
+                    }
+                    let media = vision_static.finish(&hidden, &vision_state, context)?;
+                    self.assemble(&parts, Some(&media), context)?
                 }
-                let (mut hidden, vision_state) =
-                    self.static_modules.vision.begin(vision, context)?;
-                for (index, block) in vision_blocks.iter_mut().enumerate() {
-                    hidden = block.forward_scheduled(
-                        &hidden,
-                        self.args.vision_config.schedule[index],
-                        &vision_state,
-                        context,
-                    )?;
-                }
-                let media = self
-                    .static_modules
-                    .vision
-                    .finish(&hidden, &vision_state, context)?;
-                self.assemble(&parts, Some(&media), context)?
-            }
-            None => self.assemble(&parts, None, context)?,
-        };
+                None => self.assemble(&parts, None, context)?,
+            };
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
@@ -898,7 +916,12 @@ where
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
         match group {
             0 => Ok(self.parallel_geometry.as_ref().map_or_else(
-                || self.args.vision_config.layer_count(),
+                || {
+                    self.args
+                        .vision_config
+                        .as_ref()
+                        .map_or(0, |vision| vision.layer_count())
+                },
                 |geometry| geometry.vision_layers(),
             )),
             1 => Ok(self.args.num_hidden_layers as usize),
@@ -908,7 +931,11 @@ where
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
         let count = match group {
-            0 => self.args.vision_config.layer_count(),
+            0 => self
+                .args
+                .vision_config
+                .as_ref()
+                .map_or(0, |vision| vision.layer_count()),
             1 => self.args.num_hidden_layers as usize,
             _ => return Err(Error::backend("Muse-Glimmer has two execution groups")),
         };
@@ -938,7 +965,10 @@ where
     ) -> Result<Self::Unit, Self::Error> {
         match group {
             0 => Ok(Unit::Vision(VisionBlock::new(
-                &self.args.vision_config,
+                self.args
+                    .vision_config
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?,
                 index,
                 context,
             )?)),
@@ -994,7 +1024,12 @@ where
         let parts = self.prepare_parts(input.parts, context)?;
         let (hidden, vision) = match input.vision {
             Some(vision) => {
-                let (hidden, state) = self.static_modules.vision.begin(vision, context)?;
+                let (hidden, state) = self
+                    .static_modules
+                    .vision
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
+                    .begin(vision, context)?;
                 (hidden, Some(state))
             }
             None => (self.assemble(&parts, None, context)?, None),
@@ -1044,7 +1079,11 @@ where
         match (group, unit) {
             (0, Unit::Vision(unit)) => unit.forward_scheduled(
                 hidden,
-                self.args.vision_config.schedule[index],
+                self.args
+                    .vision_config
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
+                    .schedule[index],
                 forward
                     .vision
                     .as_ref()
@@ -1071,7 +1110,12 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match (group, forward.vision.as_ref()) {
             (0, Some(vision)) => {
-                let media = self.static_modules.vision.finish(hidden, vision, context)?;
+                let media = self
+                    .static_modules
+                    .vision
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
+                    .finish(hidden, vision, context)?;
                 self.assemble(&forward.parts, Some(&media), context)
             }
             (0, None) | (1, _) => Ok(hidden.clone()),
@@ -1140,7 +1184,12 @@ where
         let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
         let (hidden, vision) = match input.vision {
             Some(vision) => {
-                let (hidden, state) = self.static_modules.vision.begin(vision, context)?;
+                let (hidden, state) = self
+                    .static_modules
+                    .vision
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
+                    .begin(vision, context)?;
                 (hidden, Some(state))
             }
             None => (self.assemble(&parts, None, context)?, None),
@@ -1169,7 +1218,11 @@ where
         match (group, unit) {
             (0, Unit::Vision(unit)) => unit.forward_scheduled(
                 hidden,
-                self.args.vision_config.schedule[index],
+                self.args
+                    .vision_config
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
+                    .schedule[index],
                 forward
                     .vision
                     .as_ref()

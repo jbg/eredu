@@ -382,9 +382,9 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
 }
 
 #[test]
-fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
+fn neutral_muse_glimmer_text_only_forward_monomorphizes_on_mlx() {
     type Architecture = eredu_architectures::muse_glimmer::LayeredModel<MlxNeuralBackend>;
-    let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
+    let mut args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
         &serde_json::to_vec(&serde_json::json!({
             "architectures":["MuseGlimmerForConditionalGeneration"],
             "model_type":"muse_glimmer","image_token_id":30,"video_token_id":29,
@@ -408,6 +408,7 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
         .unwrap(),
     )
     .unwrap();
+    args.vision_config = None;
     let Some(execution) = mlx_execution() else {
         return;
     };
