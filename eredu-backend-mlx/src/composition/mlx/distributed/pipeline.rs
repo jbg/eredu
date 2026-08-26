@@ -14026,7 +14026,7 @@ fn load_llama_pipeline(
     }
     let static_device_bytes = loaded.finish(&mut info)?;
     let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let materialized_shards = checkpoint_diagnostics.payload_shard_paths.clone();
     if let Some(dense_stream) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_architecture = &stage.architecture;
@@ -14476,7 +14476,7 @@ fn load_qwen_pipeline(
         stage.expert_cache = Some(cache);
     }
     let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let materialized_shards = checkpoint_diagnostics.payload_shard_paths.clone();
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, stage)
@@ -16779,7 +16779,7 @@ fn load_gpt_oss_pipeline(
     }
     let static_bytes = loaded.finish(&mut info)?;
     let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let materialized_shards = checkpoint_diagnostics.payload_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
@@ -17272,7 +17272,7 @@ fn load_lfm2_pipeline(
     }
     let static_bytes = loaded.finish(&mut info)?;
     let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let materialized_shards = checkpoint_diagnostics.payload_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
@@ -17928,7 +17928,7 @@ fn load_nemotron_h_pipeline(
     } else {
         checkpoint_diagnostics_before_deferred
     };
-    info.opened_checkpoint_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    info.opened_checkpoint_shards = checkpoint_diagnostics.payload_shard_paths.clone();
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, stage)
 }
@@ -20907,7 +20907,7 @@ fn load_neutral_gemma4_pipeline(
         stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
     }
     let diagnostics = store.source_diagnostics()?;
-    info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
+    info.opened_checkpoint_shards = diagnostics.payload_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
     PipelineModel::from_adapter(topology, info, stage)
 }
@@ -21358,7 +21358,7 @@ fn load_neutral_deepseek_v3_pipeline(
         }
     }
     let diagnostics = store.source_diagnostics()?;
-    info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
+    info.opened_checkpoint_shards = diagnostics.payload_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
     let stage = DeepSeekV3PipelinePartition {
         architecture,
@@ -21770,7 +21770,7 @@ fn load_neutral_deepseek_v4_pipeline(
         }
     }
     let diagnostics = store.source_diagnostics()?;
-    info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
+    info.opened_checkpoint_shards = diagnostics.payload_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
     let stage = DeepSeekV4PipelinePartition {
         architecture,

@@ -428,6 +428,7 @@ impl WeightStore for GgufWeightStore {
                 .filter(|materializer| materializer.open_shard_path().is_some())
                 .count(),
             touched_shard_paths: readers.touched.iter().cloned().collect(),
+            payload_shard_paths: readers.touched.iter().cloned().collect(),
             physical_reads: self.inner.statistics.physical_reads.load(Ordering::Relaxed),
             physical_read_bytes: self
                 .inner

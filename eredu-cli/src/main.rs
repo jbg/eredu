@@ -2737,13 +2737,14 @@ fn format_bytes(bytes: usize) -> String {
 
 fn format_weight_store_diagnostics(diagnostics: &WeightStoreDiagnostics) -> String {
     format!(
-        "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
+        "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, payload_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
         diagnostics.backend,
         diagnostics.mapping_hits,
         diagnostics.mapping_misses,
         diagnostics.evictions,
         diagnostics.currently_mapped_shards,
         diagnostics.touched_shard_paths.len(),
+        diagnostics.payload_shard_paths.len(),
         diagnostics.physical_reads,
         diagnostics.physical_read_bytes,
         diagnostics.coalesced_group_hits,
@@ -4627,6 +4628,9 @@ mod tests {
                 Path::new("/private/checkpoint/model-00001.safetensors").into(),
                 Path::new("/tmp/quantized-00000.safetensors").into(),
             ],
+            payload_shard_paths: vec![
+                Path::new("/private/checkpoint/model-00001.safetensors").into()
+            ],
             physical_reads: 3,
             physical_read_bytes: 4096,
             coalesced_group_hits: 4,
@@ -4635,6 +4639,7 @@ mod tests {
         let formatted = format_weight_store_diagnostics(&diagnostics);
         assert!(formatted.contains("backend=Safetensors"));
         assert!(formatted.contains("touched_shards=2"));
+        assert!(formatted.contains("payload_shards=1"));
         assert!(!formatted.contains("model-00001.safetensors"));
         assert!(!formatted.contains("quantized-00000.safetensors"));
     }

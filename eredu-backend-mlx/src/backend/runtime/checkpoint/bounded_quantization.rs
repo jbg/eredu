@@ -406,6 +406,10 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
         touched.extend(transformed.touched_shard_paths);
         touched.sort();
         touched.dedup();
+        let mut payloads = source.payload_shard_paths;
+        payloads.extend(transformed.payload_shard_paths);
+        payloads.sort();
+        payloads.dedup();
         Ok(WeightStoreDiagnostics {
             backend: source.backend,
             mapping_hits: source.mapping_hits.saturating_add(transformed.mapping_hits),
@@ -417,6 +421,7 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
                 .currently_mapped_shards
                 .saturating_add(transformed.currently_mapped_shards),
             touched_shard_paths: touched,
+            payload_shard_paths: payloads,
             physical_reads: source
                 .physical_reads
                 .saturating_add(transformed.physical_reads),

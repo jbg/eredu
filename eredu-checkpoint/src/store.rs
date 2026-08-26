@@ -320,6 +320,7 @@ impl WeightStore for MemoryWeightStore {
             evictions: 0,
             currently_mapped_shards: 0,
             touched_shard_paths: Vec::new(),
+            payload_shard_paths: Vec::new(),
             physical_reads: 0,
             physical_read_bytes: 0,
             coalesced_group_hits: 0,
@@ -464,6 +465,13 @@ impl CheckpointSource for CompositeCheckpointSource {
             .into_iter()
             .collect::<Vec<_>>();
         touched.sort();
+        let mut payloads = diagnostics
+            .iter()
+            .flat_map(|value| value.payload_shard_paths.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        payloads.sort();
         Ok(WeightStoreDiagnostics {
             backend,
             mapping_hits: diagnostics.iter().map(|value| value.mapping_hits).sum(),
@@ -474,6 +482,7 @@ impl CheckpointSource for CompositeCheckpointSource {
                 .map(|value| value.currently_mapped_shards)
                 .sum(),
             touched_shard_paths: touched,
+            payload_shard_paths: payloads,
             physical_reads: diagnostics.iter().map(|value| value.physical_reads).sum(),
             physical_read_bytes: diagnostics
                 .iter()
@@ -661,6 +670,11 @@ pub struct WeightStoreDiagnostics {
     pub currently_mapped_shards: usize,
     /// Shard paths touched so far in stable order.
     pub touched_shard_paths: Vec<PathBuf>,
+    /// Shard paths selected for tensor payload access in stable order.
+    ///
+    /// Unlike `touched_shard_paths`, metadata-only catalog validation does not
+    /// add an entry here.
+    pub payload_shard_paths: Vec<PathBuf>,
     /// Physical tensor or selected-region reads.
     pub physical_reads: u64,
     /// Encoded payload bytes requested by physical reads.
@@ -803,6 +817,7 @@ struct CacheEntry {
 struct CacheState {
     entries: BTreeMap<PathBuf, CacheEntry>,
     touched: BTreeSet<PathBuf>,
+    payloads: BTreeSet<PathBuf>,
     tick: u64,
     hits: u64,
     misses: u64,
@@ -1204,6 +1219,7 @@ impl WeightStore for SafetensorsWeightStore {
             .map_or(relative_span.len(), |bytes| bytes.len());
         let mapped_span = payload_start + relative_span.start..payload_start + relative_span.end;
         let full_selection = matches!(request.selection, TensorSelection::Full);
+        self.lock_cache()?.payloads.insert(shard.path.clone());
         Ok(SafetensorsLease {
             metadata,
             selection: request.selection,
@@ -1239,6 +1255,7 @@ impl WeightStore for SafetensorsWeightStore {
             evictions: cache.evictions,
             currently_mapped_shards: cache.entries.len(),
             touched_shard_paths: cache.touched.iter().cloned().collect(),
+            payload_shard_paths: cache.payloads.iter().cloned().collect(),
             physical_reads: self.read_telemetry.physical_reads.load(Ordering::Relaxed),
             physical_read_bytes: self
                 .read_telemetry
@@ -1770,6 +1787,10 @@ mod tests {
 
         let store =
             SafetensorsWeightStore::open_with_max_mapped_shards(directory.path(), 1).unwrap();
+        store.metadata("left").unwrap();
+        let metadata_diagnostics = store.diagnostics().unwrap();
+        assert_eq!(metadata_diagnostics.touched_shard_paths, [first.clone()]);
+        assert!(metadata_diagnostics.payload_shard_paths.is_empty());
         let lease = store
             .acquire(TensorReadRequest {
                 key: "left".into(),
@@ -1786,6 +1807,7 @@ mod tests {
         assert_eq!(lease.encoded_bytes().unwrap(), &left[8..]);
         assert_eq!(lease.bounded_read_proof().length_bytes, 8);
         let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.payload_shard_paths, [first]);
         assert_eq!(diagnostics.physical_reads, 1);
         assert_eq!(diagnostics.physical_read_bytes, 8);
         assert!(matches!(

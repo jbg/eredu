@@ -309,6 +309,7 @@ mod tests {
                 evictions: 0,
                 currently_mapped_shards: 0,
                 touched_shard_paths: Vec::<PathBuf>::new(),
+                payload_shard_paths: Vec::<PathBuf>::new(),
                 physical_reads: 0,
                 physical_read_bytes: 0,
                 coalesced_group_hits: 0,
