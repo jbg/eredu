@@ -33,20 +33,8 @@ format, modality, and execution matrix.
 
 ## Quick start
 
-The minimum supported Rust version is 1.89. Add the main crate to your project:
-
-```toml
-[dependencies]
-eredu = "0.4"
-```
-
-The default features include the MLX backend. A backend-neutral build is also
-available:
-
-```toml
-[dependencies]
-eredu = { version = "0.4", default-features = false }
-```
+The minimum supported Rust version is 1.89. The default features include the
+MLX backend; the facade can also be built without a concrete backend.
 
 To run a supported model from this workspace:
 
@@ -55,8 +43,6 @@ cargo run --release -p eredu-cli -- \
   --model /path/to/model \
   "Write a Rust function that adds two integers."
 ```
-
-The CLI is also installable with `cargo install eredu-cli`.
 
 The CLI accepts local model directories, GGUF files, and model identifiers
 already present in the local Hugging Face cache. It does not download models.

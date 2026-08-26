@@ -11,8 +11,6 @@ Face cache. It does not download models.
 ## Basic use
 
 ```sh
-cargo install eredu-cli
-
 eredu --model /path/to/model \
   "Write a Rust function that adds two integers."
 ```
@@ -29,10 +27,9 @@ eredu --model /path/to/model --device cpu \
   "Tell me a short story."
 ```
 
-On supported CUDA hosts, install with
-`cargo install eredu-cli --no-default-features --features cuda`. Disabling the
-default features replaces the default Metal/Accelerate backend selection with
-CUDA instead of combining native backends.
+On supported CUDA hosts, disabling the default features and enabling `cuda`
+replaces the default Metal/Accelerate backend selection instead of combining
+native backends.
 
 The executable requires either the `mlx` or `cuda` feature. A bare
 `--no-default-features` package check is supported but intentionally does not

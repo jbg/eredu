@@ -13,13 +13,7 @@ orphan rules.
 
 Applications that use only loading, chat, and generation should normally use
 the `eredu` facade. The implementation crate is a direct dependency only for
-backend development and backend-specific low-level tooling:
-
-```toml
-[dependencies]
-eredu-core = "0.1"
-eredu-backend-mlx = "0.1"
-```
+backend development and backend-specific low-level tooling.
 
 ```rust,no_run
 use eredu_backend_mlx::{

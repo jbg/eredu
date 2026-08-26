@@ -144,16 +144,7 @@ native Unicode paths. Windows ARM CUDA and Windows NCCL are not supported.
 ## Backend feature selection
 
 Apple features are ignored on non-Apple targets, but portable applications
-should still select their intended backend explicitly. Typical dependency
-forms are:
-
-```toml
-# Apple defaults
-eredu = "0.4"
-
-# Linux or Windows CUDA
-eredu = { version = "0.4", default-features = false, features = ["cuda"] }
-```
+should still select their intended backend explicitly.
 
 The `eredu-cli` crate has its own `cuda` feature, which enables CUDA in Eredu
 and its MLX implementation layer.

@@ -11,11 +11,6 @@ capabilities through its higher-level loading and generation APIs. Use this
 crate directly when integrating the tokenizer or template layer into another
 runtime. It does not depend on `safemlx` or a native accelerator runtime.
 
-```toml
-[dependencies]
-eredu-text = "0.1"
-```
-
 The portable pure-Rust `fancy-regex` tokenizer engine is always available, so
 `--no-default-features` is a valid configuration. Default features additionally
 enable Oniguruma (which the tokenizer selects when both engines are present)

@@ -22,22 +22,6 @@ families, checkpoint formats, modalities, and execution capabilities.
 - Portable inspection, automatic execution planning, admission, and telemetry
   schemas.
 
-## Installation
-
-The default build uses MLX:
-
-```toml
-[dependencies]
-eredu = "0.4"
-```
-
-A portable facade build does not compile or link MLX:
-
-```toml
-[dependencies]
-eredu = { version = "0.4", default-features = false }
-```
-
 The portable build includes artifact inspection, tokenizer and chat metadata,
 generation orchestration, media request descriptions, execution planning, and
 application-facing backend metadata. Backend implementers import the required

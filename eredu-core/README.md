@@ -8,11 +8,6 @@ Most applications should use [`eredu`](../eredu/). Use this crate
 directly when implementing an execution backend or reusing its portable
 planning and scheduling components.
 
-```toml
-[dependencies]
-eredu-core = "0.1"
-```
-
 ## What the crate provides
 
 - Artifact inspection, resolved model configuration, tensor catalogs, and preparation plans
