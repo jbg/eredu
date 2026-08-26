@@ -37,6 +37,7 @@ use crate::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
     backend::runtime::execution::generic::{
+        architecture_execution_layout, construct_architecture_unit,
         prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
         MlxUnitPopulator,
     },
@@ -321,31 +322,39 @@ pub fn quantize_neutral_qwen_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target = NeutralArchitecture::new(target_args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let count = usize::try_from(source_args.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Qwen layer count".into()))?;
-    let source_unit_args = source_args.clone();
-    let target_unit_args = target_args.clone();
+    let source_layout = architecture_execution_layout::<_, MlxKeyValueState>(&source)?;
+    let target_layout = architecture_execution_layout::<_, MlxKeyValueState>(&target)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "Qwen quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
+    let source_static = source.static_modules().clone();
+    let target_static = target.static_modules().clone();
     let (store, report) = quantize_parameterized_store(
         store,
-        source.static_modules(),
-        target.static_modules(),
-        move |index, stream| {
-            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(
-                &source_unit_args,
-                index,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &source,
+                &source_layout,
+                ordinal,
                 stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
-        move |index, stream| {
-            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(
-                &target_unit_args,
-                index,
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &target,
+                &target_layout,
+                ordinal,
                 stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
-        count,
+        unit_count,
         quantization,
         stream,
     )?;
@@ -1206,13 +1215,12 @@ fn load_neutral_qwen_parallel(
     weights_stream: &Stream,
     external_experts: bool,
 ) -> Result<QwenModel, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Qwen layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let parameter_description = global_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    let execution_layout = parameter_description.unit_layout().clone();
     let expert_targets =
         Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
     let layout =
@@ -1235,14 +1243,21 @@ fn load_neutral_qwen_parallel(
         store.as_ref(),
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for index in 0..layer_count {
-        let unit =
-            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(&args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    for ordinal in 0..execution_layout.len() {
+        let address = execution_layout
+            .address(ordinal)
+            .expect("canonical execution ordinal");
+        let unit = construct_architecture_unit(
+            &global_architecture,
+            &execution_layout,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxKeyValueState>,
+        )?;
         let recipes = if external_experts {
             BTreeMap::new()
         } else {
-            qwen_unit_recipes(store.as_ref(), &args, index)?
+            qwen_unit_recipes(store.as_ref(), &args, address.index())?
         };
         let bytes = binding_bytes(&build_module_bindings_with_recipes_excluding(
             &MlxModule::new(unit),
@@ -1258,7 +1273,9 @@ fn load_neutral_qwen_parallel(
 
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let binding_execution_layout = execution_layout;
     let binding_layout = layout.clone();
+    let unit_binding_layout = layout.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
     let factory = QwenUnitPopulator {
@@ -1279,14 +1296,15 @@ fn load_neutral_qwen_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, store, &binding_layout)
         },
-        |_ordinal, address, _path, _local, store, stream| {
+        move |ordinal, address, _path, _local, store, stream| {
             let index = address.index();
-            let global = eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(
-                &binding_args,
-                index,
+            let global = construct_architecture_unit(
+                &global_architecture,
+                &binding_execution_layout,
+                ordinal,
                 stream,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?;
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -1299,7 +1317,7 @@ fn load_neutral_qwen_parallel(
                 recipes,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
-            shard_layer_bindings(bindings, store, &layout)
+            shard_layer_bindings(bindings, store, &unit_binding_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

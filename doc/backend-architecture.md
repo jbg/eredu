@@ -847,9 +847,13 @@ materializers derive execution graphs and per-group unit counts through
 `LayeredArchitecture` into one canonical `ExecutionUnitLayout`; quantization,
 residency, parallel planning, parameter accounting, state allocation, and unit
 construction consume that layout together with the architecture's required
-state-independent parameter contract. They do not reconstruct a family's group order,
-dependencies, layer counts, or flat-to-group mapping from configuration. This
-keeps every backend realization aligned with architecture execution.
+state-independent parameter contract. They do not reconstruct a family's group
+order, dependencies, layer counts, or flat-to-group mapping from configuration.
+This keeps every backend realization aligned with architecture execution. MLX
+composition traverses the layout's flat ordinals and resolves each unit through
+its canonical group-local address; tensor-parallel accounting uses the layout
+carried by `ArchitectureParameterDescription`, and load-time quantization
+requires its source and target layouts to match before visiting any units.
 Family output projections also own output-vocabulary policy, including removal
 of checkpoint padding after serial or tensor-parallel projection. Backend
 composition returns those architecture-produced logits without applying a

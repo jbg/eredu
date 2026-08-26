@@ -38,6 +38,7 @@ use crate::backend::{
         },
         execution::{
             generic::{
+                architecture_execution_layout, construct_architecture_unit,
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
@@ -108,12 +109,18 @@ pub struct Lfm2CheckpointTemplate {
 impl Lfm2CheckpointTemplate {
     /// Builds one neutral full-parameter template for checkpoint tooling.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let architecture = NeutralArchitecture::new(args.clone(), stream)
+        let architecture = NeutralArchitecture::new(args, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let layers = (0..args.num_hidden_layers as usize)
-            .map(|index| {
-                Block::new(&args, index, stream)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        let layout = architecture_execution_layout::<_, MlxHybridState>(&architecture)?;
+        let layers = (0..layout.len())
+            .map(|ordinal| {
+                construct_architecture_unit(
+                    &architecture,
+                    &layout,
+                    ordinal,
+                    stream,
+                    std::marker::PhantomData::<MlxHybridState>,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -441,32 +448,16 @@ fn load_neutral_parallel(
     weights_stream: &Stream,
     external_experts: bool,
 ) -> Result<Lfm2Model, Error> {
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let expert_targets = Arc::new(
-        global_architecture
-            .parameter_description(stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?
-            .targets_for_role(ParameterRole::ExpertIntermediate),
-    );
-    let mut planner = build.planner();
-    for group in eredu_architectures::lfm2::static_parallel_parameter_groups::<MlxNeuralBackend>(
-        global_architecture.static_modules(),
-    )? {
-        planner.register(group)?;
-    }
-    for layer in 0..count {
-        let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        for group in
-            eredu_architectures::lfm2::layer_parallel_parameter_groups(&block, &args, layer)?
-        {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let execution_layout = parameter_description.unit_layout().clone();
+    let expert_targets =
+        Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "LFM2 declared no tensor-parallel parameters".into(),
@@ -487,9 +478,17 @@ fn load_neutral_parallel(
     let global_static = MlxModule::new(global_architecture.static_modules().clone());
     let global_static_bindings = build_module_bindings(&global_static, "", store.as_ref())?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for layer in 0..count {
-        let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    for ordinal in 0..execution_layout.len() {
+        let address = execution_layout
+            .address(ordinal)
+            .expect("canonical execution ordinal");
+        let block = construct_architecture_unit(
+            &global_architecture,
+            &execution_layout,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxHybridState>,
+        )?;
         let bindings = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(block),
             "",
@@ -497,7 +496,7 @@ fn load_neutral_parallel(
             if external_experts {
                 BTreeMap::new()
             } else {
-                eredu_architectures::lfm2::unit_recipes(store.as_ref(), &args, layer)
+                eredu_architectures::lfm2::unit_recipes(store.as_ref(), &args, address.index())
                     .map_err(Error::ArchitectureModel)?
             },
             |name| external_experts && parameter_name_in_targets(name, &expert_targets),
@@ -512,6 +511,7 @@ fn load_neutral_parallel(
     let unit_layout = Arc::clone(&shared_layout);
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let binding_execution_layout = execution_layout;
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
@@ -528,10 +528,15 @@ fn load_neutral_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, store, &static_layout)
         },
-        move |_ordinal, address, _path, _local, store, stream| {
+        move |ordinal, address, _path, _local, store, stream| {
             let layer = address.index();
-            let global = Block::<MlxNeuralBackend>::new(&binding_args, layer, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            let global = construct_architecture_unit(
+                &global_architecture,
+                &binding_execution_layout,
+                ordinal,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
                 "",
@@ -619,22 +624,39 @@ fn quantize_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let source_args = args.clone();
-    let target_args = target.clone();
+    let source_layout = architecture_execution_layout::<_, MlxHybridState>(&source)?;
+    let target_layout = architecture_execution_layout::<_, MlxHybridState>(&destination)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "LFM2 quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
+    let source_static = source.static_modules().clone();
+    let target_static = destination.static_modules().clone();
     let (store, report) = quantize_parameterized_store(
         store,
-        source.static_modules(),
-        destination.static_modules(),
-        move |index, stream| {
-            Block::<MlxNeuralBackend>::new(&source_args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        &source_static,
+        &target_static,
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &source,
+                &source_layout,
+                ordinal,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )
         },
-        move |index, stream| {
-            Block::<MlxNeuralBackend>::new(&target_args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &destination,
+                &target_layout,
+                ordinal,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )
         },
-        usize::try_from(args.num_hidden_layers)
-            .map_err(|_| Error::ArchitectureModel("invalid LFM2 layer count".into()))?,
+        unit_count,
         quantization,
         stream,
     )?;

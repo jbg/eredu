@@ -467,13 +467,11 @@ fn load_parallel(
         ShardingPolicy::Require,
     );
     let global = Architecture::new(target_config.clone(), stream)?;
-    let mut planner = build.planner();
-    crate::composition::moshi_parallel::register_parallel_parameters(
-        &global,
-        &mut planner,
-        stream,
-    )?;
-    let (_, local_layout) = planner.finish()?;
+    let parameter_description = global
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let local_layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if local_layout.is_empty() {
         return Err(Error::Parallel(
             "Moshi declared no tensor-parallel parameters".into(),

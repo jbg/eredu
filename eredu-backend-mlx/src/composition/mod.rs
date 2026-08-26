@@ -273,7 +273,6 @@ pub mod lfm2;
 pub mod llama;
 pub mod mlx;
 pub mod moshi;
-pub mod moshi_parallel;
 pub mod muse_glimmer;
 pub mod muse_glimmer_expert;
 #[cfg(feature = "image")]

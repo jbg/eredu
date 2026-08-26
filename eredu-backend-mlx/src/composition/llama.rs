@@ -29,8 +29,8 @@ use crate::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
     backend::runtime::execution::generic::{
-        prepare_layerwise_policy, prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy,
-        MlxResidentPolicy,
+        architecture_execution_layout, construct_architecture_unit, prepare_layerwise_policy,
+        prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
     },
     backend::runtime::execution::layerwise::{quantize_parameterized_store, shard_layer_bindings},
     backend::runtime::media::input,
@@ -143,23 +143,39 @@ pub fn quantize_neutral_llama_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target = NeutralArchitecture::new(target_args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let count = usize::try_from(source_args.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Llama layer count".into()))?;
-    let source_unit_args = source_args.clone();
-    let target_unit_args = target_args.clone();
+    let source_layout = architecture_execution_layout::<_, MlxKeyValueState>(&source)?;
+    let target_layout = architecture_execution_layout::<_, MlxKeyValueState>(&target)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "Llama quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
+    let source_static = source.static_modules().clone();
+    let target_static = target.static_modules().clone();
     let (store, report) = quantize_parameterized_store(
         store,
-        source.static_modules(),
-        target.static_modules(),
-        move |index, stream| {
-            NeutralBlock::new(&source_unit_args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        &source_static,
+        &target_static,
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &source,
+                &source_layout,
+                ordinal,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )
         },
-        move |index, stream| {
-            NeutralBlock::new(&target_unit_args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &target,
+                &target_layout,
+                ordinal,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )
         },
-        count,
+        unit_count,
         quantization,
         stream,
     )?;
@@ -666,13 +682,12 @@ fn load_neutral_llama_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid Llama layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let parameter_description = global_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    let execution_layout = parameter_description.unit_layout().clone();
     let layout =
         crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
@@ -693,9 +708,14 @@ fn load_neutral_llama_parallel(
         store.as_ref(),
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for index in 0..layer_count {
-        let unit = NeutralBlock::new(&args, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    for ordinal in 0..execution_layout.len() {
+        let unit = construct_architecture_unit(
+            &global_architecture,
+            &execution_layout,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxKeyValueState>,
+        )?;
         let bytes = binding_bytes(&build_module_bindings(
             &MlxModule::new(unit),
             "",
@@ -706,9 +726,10 @@ fn load_neutral_llama_parallel(
             .ok_or_else(|| Error::Parallel("global Llama parameter bytes overflowed".into()))?;
     }
 
-    let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let binding_execution_layout = execution_layout;
     let binding_layout = layout.clone();
+    let unit_binding_layout = layout.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -723,12 +744,16 @@ fn load_neutral_llama_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, store, &binding_layout)
         },
-        |_ordinal, address, _path, _local, store, stream| {
-            let index = address.index();
-            let global = NeutralBlock::new(&binding_args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        move |ordinal, _address, _path, _local, store, stream| {
+            let global = construct_architecture_unit(
+                &global_architecture,
+                &binding_execution_layout,
+                ordinal,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?;
             let bindings = build_module_bindings(&MlxModule::new(global), "", store)?;
-            shard_layer_bindings(bindings, store, &layout)
+            shard_layer_bindings(bindings, store, &unit_binding_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

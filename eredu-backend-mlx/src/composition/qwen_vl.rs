@@ -957,14 +957,14 @@ fn quantize_store(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let source_vision = source.vision.layer_count();
-    let total = source_vision
-        .checked_add(usize::try_from(source.text.num_hidden_layers).map_err(|_| {
-            Error::ArchitectureModel("invalid Qwen3-VL text layer count".into())
-        })?)
-        .ok_or_else(|| Error::ArchitectureModel("Qwen3-VL unit count overflowed".into()))?;
     let source_layout = unit_layout(&source_architecture)?;
     let target_layout = unit_layout(&target_architecture)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "Qwen3-VL quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let total = source_layout.len();
     let source_static =
         <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &source_architecture,

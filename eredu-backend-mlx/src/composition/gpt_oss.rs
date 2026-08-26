@@ -40,6 +40,7 @@ use crate::backend::{
         },
         execution::{
             generic::{
+                architecture_execution_layout, construct_architecture_unit,
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
@@ -367,30 +368,15 @@ fn load_neutral_parallel_with_store(
     weights_stream: &Stream,
     external_experts: bool,
 ) -> Result<GptOssModel, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid GPT-OSS layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(expert_parameter_targets(&global_architecture, stream)?);
-    let mut planner = build.planner();
-    for group in eredu_architectures::gpt_oss::static_parameter_groups::<MlxNeuralBackend>(
-        global_architecture.static_modules(),
-        &args,
-    )? {
-        planner.register(group)?;
-    }
-    for layer in 0..layer_count {
-        let block =
-            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, layer, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        for group in eredu_architectures::gpt_oss::layer_parallel_parameter_groups::<
-            MlxNeuralBackend,
-        >(&block, &args, layer)?
-        {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let execution_layout = parameter_description.unit_layout().clone();
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "GPT-OSS declared no tensor-parallel parameters".into(),
@@ -411,14 +397,21 @@ fn load_neutral_parallel_with_store(
     let global_static = MlxModule::new(global_architecture.static_modules().clone());
     let mut global_parameter_bytes =
         binding_bytes(&build_module_bindings(&global_static, "", store.as_ref())?)?;
-    for layer in 0..layer_count {
-        let block =
-            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, layer, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    for ordinal in 0..execution_layout.len() {
+        let address = execution_layout
+            .address(ordinal)
+            .expect("canonical execution ordinal");
+        let block = construct_architecture_unit(
+            &global_architecture,
+            &execution_layout,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxKeyValueState>,
+        )?;
         let recipes = if external_experts {
             BTreeMap::new()
         } else {
-            unit_recipes(store.as_ref(), &args, layer)?
+            unit_recipes(store.as_ref(), &args, address.index())?
         };
         let bindings = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(block),
@@ -434,6 +427,7 @@ fn load_neutral_parallel_with_store(
 
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let binding_execution_layout = execution_layout;
     let local_layout = Arc::new(layout);
     let static_layout = Arc::clone(&local_layout);
     let unit_local_layout = Arc::clone(&local_layout);
@@ -453,14 +447,15 @@ fn load_neutral_parallel_with_store(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, store, &static_layout)
         },
-        move |_ordinal, address, _path, _local, store, stream| {
+        move |ordinal, address, _path, _local, store, stream| {
             let layer = address.index();
-            let global = eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
-                &binding_args,
-                layer,
+            let global = construct_architecture_unit(
+                &global_architecture,
+                &binding_execution_layout,
+                ordinal,
                 stream,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?;
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -565,21 +560,29 @@ pub fn quantize_neutral_store(
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_expert_targets = Arc::new(expert_parameter_targets(&source, stream)?);
     let target_expert_targets = Arc::new(expert_parameter_targets(&target, stream)?);
-    let count = usize::try_from(source_args.num_hidden_layers)
-        .map_err(|_| Error::ArchitectureModel("invalid GPT-OSS layer count".into()))?;
-    let source_unit_args = source_args.clone();
-    let target_unit_args = target_args.clone();
+    let source_layout = architecture_execution_layout::<_, MlxKeyValueState>(&source)?;
+    let target_layout = architecture_execution_layout::<_, MlxKeyValueState>(&target)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "GPT-OSS quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
+    let source_static = source.static_modules().clone();
+    let target_static = target.static_modules().clone();
     let source_unit_expert_targets = Arc::clone(&source_expert_targets);
     let target_unit_expert_targets = Arc::clone(&target_expert_targets);
     let (store, report) = quantize_parameterized_store(
         store,
-        source.static_modules(),
-        target.static_modules(),
-        move |index, stream| {
-            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
-                &source_unit_args,
-                index,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &source,
+                &source_layout,
+                ordinal,
                 stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
             )
             .map(|block| DenseUnit {
                 block,
@@ -587,11 +590,13 @@ pub fn quantize_neutral_store(
             })
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
-        move |index, stream| {
-            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
-                &target_unit_args,
-                index,
+        move |ordinal, stream| {
+            construct_architecture_unit(
+                &target,
+                &target_layout,
+                ordinal,
                 stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
             )
             .map(|block| DenseUnit {
                 block,
@@ -599,7 +604,7 @@ pub fn quantize_neutral_store(
             })
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
-        count,
+        unit_count,
         quantization,
         stream,
     )?;

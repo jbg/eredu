@@ -97,6 +97,9 @@ use crate::backend::{
     },
 };
 
+#[cfg(test)]
+use crate::backend::runtime::execution::generic::architecture_execution_layout;
+
 type Architecture = hybrid::LayeredModel<MlxNeuralBackend>;
 type Block = Unit<MlxNeuralBackend>;
 
@@ -112,20 +115,18 @@ pub struct QwenHybridCheckpointTemplate {
 #[cfg(test)]
 impl QwenHybridCheckpointTemplate {
     pub fn new(config: HybridConfig, stream: &Stream) -> Result<Self, Error> {
-        let architecture = Architecture::new(config.clone(), stream)
+        let architecture = Architecture::new(config, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target_units = config.num_hidden_layers as usize;
-        let total = target_units + config.mtp_num_hidden_layers as usize;
-        let units = (0..total)
-            .map(|flat| {
-                let (group, index) = if flat < target_units {
-                    (0, flat)
-                } else {
-                    (flat - target_units + 1, 0)
-                };
-                architecture
-                    .construct_unit(group, index, stream)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        let layout = architecture_execution_layout::<_, MlxHybridState>(&architecture)?;
+        let units = (0..layout.len())
+            .map(|ordinal| {
+                construct_architecture_unit(
+                    &architecture,
+                    &layout,
+                    ordinal,
+                    stream,
+                    std::marker::PhantomData::<MlxHybridState>,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -149,28 +150,18 @@ impl QwenConditionalCheckpointTemplate {
     pub fn new(parsed: ParsedHybridConfig, stream: &Stream) -> Result<Self, Error> {
         let architecture = ConditionalArchitecture::new(parsed, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let graph = <ConditionalArchitecture as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::execution_graph(&architecture)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let mut units = Vec::new();
-        for group in 0..graph.groups().len() {
-            let count = <ConditionalArchitecture as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::group_unit_count(&architecture, group)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            for index in 0..count {
-                units.push(
-                    <ConditionalArchitecture as LayeredArchitecture<
-                        MlxNeuralBackend,
-                        MlxHybridState,
-                    >>::build_unit(&architecture, group, index, stream)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-                );
-            }
-        }
+        let layout = architecture_execution_layout::<_, MlxHybridState>(&architecture)?;
+        let units = (0..layout.len())
+            .map(|ordinal| {
+                construct_architecture_unit(
+                    &architecture,
+                    &layout,
+                    ordinal,
+                    stream,
+                    std::marker::PhantomData::<MlxHybridState>,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             static_modules: <ConditionalArchitecture as LayeredArchitecture<
                 MlxNeuralBackend,
