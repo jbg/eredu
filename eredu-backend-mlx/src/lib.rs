@@ -9,6 +9,9 @@
     clippy::type_complexity
 )]
 
+#[cfg(all(feature = "metal", feature = "cuda"))]
+compile_error!("the `metal` and `cuda` backend features are mutually exclusive");
+
 mod adapter;
 /// Reusable MLX tensors, operators, runtime facilities, and distributed primitives.
 pub mod backend;

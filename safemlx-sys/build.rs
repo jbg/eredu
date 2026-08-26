@@ -1,5 +1,8 @@
 extern crate cmake;
 
+#[cfg(all(feature = "metal", feature = "cuda"))]
+compile_error!("the `metal` and `cuda` native backends are mutually exclusive");
+
 mod build_support;
 
 use build_support::apple_mobile_target;

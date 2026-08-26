@@ -61,6 +61,8 @@ execution, distributed, and model-composition support.
 | `cuda` | CUDA execution for native MLX operations |
 | `nccl` | NCCL collectives; implies `cuda` |
 
+The `metal` and `cuda` features are mutually exclusive.
+
 Enabling either `image` or `audio` compiles the shared multimodal processor;
 there is no standalone `media` feature.
 
