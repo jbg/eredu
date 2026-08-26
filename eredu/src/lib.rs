@@ -35,6 +35,11 @@
     clippy::type_complexity
 )]
 
+#[cfg(all(feature = "mlx", feature = "cuda"))]
+compile_error!(
+    "the `mlx` and `cuda` backend features are mutually exclusive; disable default features before enabling `cuda`"
+);
+
 /// High-level model loading, dispatch, and request APIs.
 pub mod api;
 /// Backend-independent chat and committed-generation orchestration.

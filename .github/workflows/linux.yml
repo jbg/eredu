@@ -87,17 +87,17 @@ jobs:
         # Some generated CUDA translation units are memory-intensive. Keep the
         # native build serialized so standard hosted runners do not OOM.
         run: |
-          cargo test -j 1 -p safemlx --features cuda --lib --no-run
+          cargo test -j 1 -p safemlx --no-default-features --features cuda --lib --no-run
           cargo test -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
       - name: Compile facade and MLX backend tests and residency example with CUDA
         run: |
-          cargo test -j 1 -p eredu --features cuda --lib --no-run
+          cargo test -j 1 -p eredu --no-default-features --features cuda --lib --no-run
           cargo test -j 1 -p eredu-backend-mlx --features cuda --lib --no-run
           cargo check -j 1 -p eredu-backend-mlx --features cuda --example llama_residency
       - name: Compile the CUDA codec backend
         run: cargo test -j 1 -p eredu-backend-mlx --features "cuda,codec" --test mimi_codec --no-run
       - name: Check the CUDA language-model CLI
-        run: cargo check -j 1 -p eredu-cli --features cuda
+        run: cargo check -j 1 -p eredu-cli --no-default-features --features cuda
 
   cuda-gpu-smoke:
     if: github.event_name == 'workflow_dispatch'
@@ -106,6 +106,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Run CUDA device smoke test
-        run: cargo run --release -p safemlx --features cuda --example cuda_smoke
+        run: cargo run --release -p safemlx --no-default-features --features cuda --example cuda_smoke
       - name: Run Eredu facade tests on CUDA
         run: cargo test --release -p eredu --no-default-features --features cuda

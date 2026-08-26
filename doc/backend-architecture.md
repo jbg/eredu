@@ -23,14 +23,16 @@ The `eredu` facade is also portable when built with
 `default-features = false`. A private `_mlx` feature selects the optional
 `eredu-backend-mlx` adapter. The public `mlx` bundle adds the backend crate's
 `accelerate` and `metal` features, while the sibling `cuda` bundle adds only
-its `cuda` feature. The backend crate itself has no default features and
-disables the `safemlx` defaults, so direct backend users select native
-execution support explicitly. The facade exposes a flat, application-facing
-local adapter under `eredu::api`; it does not reproduce the implementation
-crate's backend or composition module tree. Backend-internal fixtures and
-composition tests are crate-private unit tests; published crates expose no
-test-support feature or fixture namespace. The facade does not directly depend
-on `eredu-nn`. Direct MLX backend users also
+its `cuda` feature. These platform bundles are mutually exclusive. Consumers
+selecting CUDA from a package whose default is `mlx`, including `eredu-cli`,
+must disable default features while enabling `cuda`. The backend crate itself
+has no default features and disables the `safemlx` defaults, so direct backend
+users select native execution support explicitly. The facade exposes a flat,
+application-facing local adapter under `eredu::api`; it does not reproduce the
+implementation crate's backend or composition module tree. Backend-internal
+fixtures and composition tests are crate-private unit tests; published crates
+expose no test-support feature or fixture namespace. The facade does not
+directly depend on `eredu-nn`. Direct MLX backend users also
 enable `image` and `audio` as needed; the facade forwards its `mlx-image` and
 `mlx-audio` features through the private adapter without selecting either
 platform bundle. Backend feature diagnostics name both active public spellings.

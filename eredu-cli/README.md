@@ -29,7 +29,10 @@ eredu --model /path/to/model --device cpu \
   "Tell me a short story."
 ```
 
-On supported CUDA hosts, install with `cargo install eredu-cli --features cuda`.
+On supported CUDA hosts, install with
+`cargo install eredu-cli --no-default-features --features cuda`. Disabling the
+default features replaces the default Metal/Accelerate backend selection with
+CUDA instead of combining native backends.
 
 Run the command with `--help` for the complete option list.
 

@@ -135,7 +135,7 @@ jobs:
       - name: Build and final-link eredu configurations
         run: cargo test -j 1 -p eredu --no-default-features --features "cuda,mlx-image,mlx-audio" --no-run
       - name: Build the linked eredu CLI
-        run: cargo build -j 1 -p eredu-cli --features cuda
+        run: cargo build -j 1 -p eredu-cli --no-default-features --features cuda
       - name: Compile CUDA codec and integration tests
         run: |
           cargo test -j 1 -p eredu-backend-mlx --features "cuda,codec" --test mimi_codec --no-run
