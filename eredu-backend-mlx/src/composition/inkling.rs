@@ -839,20 +839,7 @@ impl InklingModel {
                 ))
             }
         };
-        let vocabulary = self
-            .args
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.args.text_config.vocab_size);
-        if vocabulary == self.args.text_config.vocab_size {
-            Ok(logits)
-        } else {
-            logits
-                .as_array()
-                .try_index_device((.., .., ..vocabulary), stream)
-                .map(crate::MlxTensor::from_array)
-                .map_err(Into::into)
-        }
+        Ok(logits)
     }
 
     pub fn prefill_tensor_parallel(
@@ -908,20 +895,7 @@ impl InklingModel {
                 ))
             }
         };
-        let vocabulary = self
-            .args
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.args.text_config.vocab_size);
-        if vocabulary == self.args.text_config.vocab_size {
-            Ok(logits)
-        } else {
-            logits
-                .as_array()
-                .try_index_device((.., .., ..vocabulary), stream)
-                .map(crate::MlxTensor::from_array)
-                .map_err(Into::into)
-        }
+        Ok(logits)
     }
 
     fn forward_input_with_capture(
@@ -995,7 +969,7 @@ impl InklingModel {
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
         }
-        let (mut logits, context) = match &mut self.execution {
+        let (logits, context) = match &mut self.execution {
             Execution::ParallelResident(runtime) => runtime
                 .forward_parallel_with_context_hook(
                     input,
@@ -1020,18 +994,6 @@ impl InklingModel {
                 ))
             }
         };
-        let vocabulary = self
-            .args
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.args.text_config.vocab_size);
-        if vocabulary != self.args.text_config.vocab_size {
-            logits = crate::MlxTensor::from_array(
-                logits
-                    .as_array()
-                    .try_index_device((.., .., ..vocabulary), stream)?,
-            );
-        }
         Ok(
             crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,

@@ -9623,12 +9623,12 @@ fn inkling_tensor_parallel_size_one_matches_replicated_multimodal_graph() {
 }
 
 #[test]
-fn inkling_tp1_tp2_ordered_vision_audio_text_match_replicated_multimodal_graph() {
+fn inkling_tp1_tp2_trim_padded_vocab_and_match_replicated_multimodal_graph() {
     let args = inkling::ModelArgs::from_hf_json(
         &serde_json::to_vec(&serde_json::json!({
           "model_type":"inkling_mm_model", "image_token_id":5, "audio_token_id":6,
           "text_config":{
-            "hidden_size":8,"num_hidden_layers":2,"vocab_size":7,
+            "hidden_size":8,"num_hidden_layers":2,"vocab_size":8,
             "num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
             "sliding_window_size":4,
             "layer_types":["sliding_attention","full_attention"],
@@ -9838,7 +9838,8 @@ fn inkling_tp1_tp2_ordered_vision_audio_text_match_replicated_multimodal_graph()
             NumericCollectiveKind::GatherVocabulary,
         ]
     );
-    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 5, 7]);
+    assert_eq!(expected.shape, [1, 5, 7]);
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 5, 8]);
 }
 
 #[test]

@@ -818,6 +818,10 @@ construction consume that layout together with the architecture's required
 state-independent parameter contract. They do not reconstruct a family's group order,
 dependencies, layer counts, or flat-to-group mapping from configuration. This
 keeps every backend realization aligned with architecture execution.
+Family output projections also own output-vocabulary policy, including removal
+of checkpoint padding after serial or tensor-parallel projection. Backend
+composition returns those architecture-produced logits without applying a
+second family-specific slice.
 
 The facade owns tokenizer and chat-template discovery. A backend may request
 tokenization of checkpoint-defined framing text through typed callbacks, but it
