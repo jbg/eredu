@@ -38,6 +38,19 @@ jobs:
           cargo test --workspace -- \
             --skip cpu_stream_creation_is_concurrent_safe \
             --skip async_eval_cpu_streams_are_concurrent_safe
+      - name: Test MLX neutral semantic operator parity
+        run: |
+          cargo test -p eredu-backend-mlx --features metal --lib \
+            backend::nn::shared::neutral_semantic_operator_tests -- \
+            --ignored
+      - name: Test Metal cache residency and prefetch regressions
+        run: |
+          cargo test -p eredu-backend-mlx --features metal --lib \
+            backend::runtime::cache::residency::tests::metal_cache_backend_preserves_ordering_persistence_and_aggregate_budgets -- \
+            --ignored --exact
+          cargo test -p eredu-backend-mlx --features metal --lib \
+            backend::runtime::cache::residency::tests::two_block_metal_prefetch_is_gpu_ordered_without_host_synchronization -- \
+            --ignored --exact
       - name: Test distributed partition lifecycles
         run: |
           cargo test -p eredu-backend-mlx --lib \
