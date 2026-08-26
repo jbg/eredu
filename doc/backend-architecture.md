@@ -39,6 +39,13 @@ media-processing infrastructure is compiled whenever either capability is
 enabled; there is no capability-less `media` feature. Backend feature
 diagnostics name the active public spelling.
 
+The `eredu-cli` executable requires its private `_backend` feature because the
+command is a native model runner, not a backend-neutral library surface. Its
+public `mlx` and `cuda` features both enable that private feature. Consequently,
+checking the package with no features omits the executable instead of compiling
+a target whose implementation cannot run, while either platform feature makes
+the executable available.
+
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
 application-facing adapter as an explicit flat root API and deliberately makes

@@ -34,6 +34,10 @@ On supported CUDA hosts, install with
 default features replaces the default Metal/Accelerate backend selection with
 CUDA instead of combining native backends.
 
+The executable requires either the `mlx` or `cuda` feature. A bare
+`--no-default-features` package check is supported but intentionally does not
+build or install an `eredu` executable.
+
 Run the command with `--help` for the complete option list.
 
 ## Input and output
