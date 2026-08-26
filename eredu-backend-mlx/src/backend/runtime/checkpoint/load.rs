@@ -8,11 +8,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use eredu_gguf::MetadataValue as GgufMetadataValue;
 use memmap2::MmapOptions;
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
     native_quantization::NativeQuantizationFormat,
-    ops::{GgufCheckpoint, GgufMetadataValue},
+    ops::GgufCheckpoint,
     transforms::async_eval_with_event,
     Array, Stream,
 };

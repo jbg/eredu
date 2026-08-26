@@ -1,18 +1,8 @@
 use crate::error::IoError;
 use crate::{Array, Dtype};
-use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read};
-use std::ops::{Deref, DerefMut};
+use eredu_gguf::{DenseTensorSpan, Endian, GgmlType, MetadataValue, TensorSelection};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-pub use eredu_gguf::{
-    DenseTensorSpan as GgufDenseTensorSpan, DenseTensorSpanPlan as GgufDenseTensorSpanPlan,
-    EncodedSpan as GgufEncodedSpan, Endian as GgufEndian, GgmlType as GgufType,
-    LogicalDtype as GgufLogicalDtype, MetadataArray as GgufMetadataArray,
-    MetadataValue as GgufMetadataValue, SelectionAlignment as GgufSelectionAlignment,
-    TensorDescriptor as GgufTensorDescriptor, TensorSelection as GgufTensorSelection,
-    TensorSelectionPlan as GgufTensorSelectionPlan,
-};
 
 /// A validated GGUF checkpoint that materializes one physical tensor at a time.
 #[derive(Debug, Clone)]
@@ -134,8 +124,8 @@ impl GgufAffineTensor {
 #[derive(Debug)]
 pub struct GgufIQuantTensor {
     physical_name: String,
-    ggml_type: GgufType,
-    endian: GgufEndian,
+    ggml_type: GgmlType,
+    endian: Endian,
     logical_shape: Vec<i32>,
     packed: GgufArray,
 }
@@ -145,11 +135,11 @@ impl GgufIQuantTensor {
         &self.physical_name
     }
 
-    pub fn ggml_type(&self) -> GgufType {
+    pub fn ggml_type(&self) -> GgmlType {
         self.ggml_type
     }
 
-    pub fn endian(&self) -> GgufEndian {
+    pub fn endian(&self) -> Endian {
         self.endian
     }
 
@@ -311,7 +301,7 @@ impl GgufCheckpoint {
     }
 
     /// Typed metadata from the first checkpoint shard.
-    pub fn metadata(&self) -> &BTreeMap<String, GgufMetadataValue> {
+    pub fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
         self.inner.metadata()
     }
 
@@ -381,7 +371,7 @@ impl GgufMaterializer {
     pub fn converted_tensor_selected(
         &mut self,
         name: &str,
-        selection: &GgufTensorSelection,
+        selection: &TensorSelection,
     ) -> Result<GgufTensor, IoError> {
         convert_tensor(
             self.inner.converted_tensor_selected(name, selection)?,
@@ -396,7 +386,7 @@ impl GgufMaterializer {
     pub fn converted_tensor_selected_host(
         &mut self,
         name: &str,
-        selection: &GgufTensorSelection,
+        selection: &TensorSelection,
     ) -> Result<GgufTensor, IoError> {
         convert_tensor(self.inner.converted_tensor_selected(name, selection)?, true)
     }
@@ -405,7 +395,7 @@ impl GgufMaterializer {
     pub fn converted_dense_tensor_span(
         &mut self,
         name: &str,
-        selection: &GgufDenseTensorSpan,
+        selection: &DenseTensorSpan,
     ) -> Result<GgufTensor, IoError> {
         convert_tensor(
             self.inner.converted_dense_tensor_span(name, selection)?,
@@ -417,7 +407,7 @@ impl GgufMaterializer {
     pub fn converted_dense_tensor_span_host(
         &mut self,
         name: &str,
-        selection: &GgufDenseTensorSpan,
+        selection: &DenseTensorSpan,
     ) -> Result<GgufTensor, IoError> {
         convert_tensor(
             self.inner.converted_dense_tensor_span(name, selection)?,
@@ -568,70 +558,4 @@ fn mlx_shape_i32(name: &str, shape: &[u64]) -> Result<Vec<i32>, IoError> {
             })
         })
         .collect()
-}
-
-/// GGUF key/value metadata parsed by the pure-Rust backend without an MLX device.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct GgufMetadata(HashMap<String, GgufMetadataValue>);
-
-impl GgufMetadata {
-    /// Parse only the header and metadata section of a GGUF file.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, IoError> {
-        let path = path.as_ref();
-        if !path.is_file() {
-            return Err(IoError::NotFile);
-        }
-        let reader = eredu_gguf::Reader::open(path)?;
-        Ok(Self(
-            reader
-                .metadata()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ))
-    }
-    /// Parse metadata from a non-seekable source. File-backed callers should
-    /// prefer [`Self::from_file`], which never buffers tensor payloads.
-    pub fn from_reader(mut reader: impl Read) -> Result<Self, IoError> {
-        const MAX_READER_BYTES: u64 = (2u64 << 30) + 1;
-        let mut bytes = Vec::new();
-        reader
-            .by_ref()
-            .take(MAX_READER_BYTES)
-            .read_to_end(&mut bytes)
-            .map_err(|_| IoError::UnableToOpenFile)?;
-        if bytes.len() as u64 == MAX_READER_BYTES {
-            return Err(IoError::InvalidGguf(
-                "reader exceeds the 2 GiB compatibility limit".into(),
-            ));
-        }
-        let parsed = eredu_gguf::Reader::new(Cursor::new(bytes))?;
-        Ok(Self(
-            parsed
-                .metadata()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ))
-    }
-    /// Consume the wrapper and return the metadata map.
-    pub fn into_inner(self) -> HashMap<String, GgufMetadataValue> {
-        self.0
-    }
-}
-impl Deref for GgufMetadata {
-    type Target = HashMap<String, GgufMetadataValue>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl DerefMut for GgufMetadata {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-impl FromIterator<(String, GgufMetadataValue)> for GgufMetadata {
-    fn from_iter<T: IntoIterator<Item = (String, GgufMetadataValue)>>(iter: T) -> Self {
-        Self(iter.into_iter().collect())
-    }
 }

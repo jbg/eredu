@@ -12,7 +12,7 @@ use std::{
 use crate::native::{
     distributed::{self, Backend},
     module::ModuleParameters,
-    ops::{indexing::TryIndexOp, stack_axis, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, stack_axis},
     Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
 };
 use crate::MlxTensor;
@@ -44,7 +44,9 @@ use eredu_core::{
     SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter, TokenFilterController,
     TokenOutput as _,
 };
-use eredu_gguf::{GgmlType, TensorInput, Writer};
+use eredu_gguf::{
+    GgmlType, MetadataArray, MetadataValue as GgufMetadataValue, TensorInput, Writer,
+};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use eredu_runtime::{
     CacheResidencyPolicy, DefaultSampler, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions,
@@ -3052,7 +3054,7 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
         (key("attention.head_count"), GgufMetadataValue::Uint32(6)),
         (
             key("attention.head_count_kv"),
-            GgufMetadataValue::Array(crate::native::ops::GgufMetadataArray::Uint32(vec![0, 3])),
+            GgufMetadataValue::Array(MetadataArray::Uint32(vec![0, 3])),
         ),
         (
             key("attention.layer_norm_rms_epsilon"),
@@ -3492,15 +3494,11 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
         (key("embedding_length"), GgufMetadataValue::Uint32(12)),
         (
             key("feed_forward_length"),
-            GgufMetadataValue::Array(crate::native::ops::GgufMetadataArray::Uint32(vec![
-                0, 17, 17, 0,
-            ])),
+            GgufMetadataValue::Array(MetadataArray::Uint32(vec![0, 17, 17, 0])),
         ),
         (
             key("attention.head_count_kv"),
-            GgufMetadataValue::Array(crate::native::ops::GgufMetadataArray::Uint32(vec![
-                0, 0, 0, 3,
-            ])),
+            GgufMetadataValue::Array(MetadataArray::Uint32(vec![0, 0, 0, 3])),
         ),
         (key("attention.head_count"), GgufMetadataValue::Uint32(6)),
         (key("attention.key_length"), GgufMetadataValue::Uint32(2)),
@@ -4387,7 +4385,6 @@ fn write_inkling_fixture_with_config(directory: &Path, config: serde_json::Value
 }
 
 fn inkling_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
-    use crate::native::ops::GgufMetadataArray;
     BTreeMap::from([
         (
             "general.architecture".into(),
@@ -4405,11 +4402,11 @@ fn inkling_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
         ),
         (
             "inkling.attention.head_count_kv".into(),
-            GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 2, 2])),
+            GgufMetadataValue::Array(MetadataArray::Uint32(vec![2, 2, 2])),
         ),
         (
             "inkling.attention.sliding_window_pattern".into(),
-            GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![false, true, false])),
+            GgufMetadataValue::Array(MetadataArray::Bool(vec![false, true, false])),
         ),
         (
             "inkling.attention.key_length".into(),
@@ -4820,7 +4817,7 @@ fn kimi_linear_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
         ),
         (
             "kimi-linear.attention.head_count_kv".into(),
-            GgufMetadataValue::Array(crate::native::ops::GgufMetadataArray::Uint32(vec![0, 1])),
+            GgufMetadataValue::Array(MetadataArray::Uint32(vec![0, 1])),
         ),
         (
             "kimi-linear.rope.dimension_count".into(),

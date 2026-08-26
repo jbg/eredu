@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use eredu_gguf::{GgmlType, TensorInput, Writer};
-use safemlx::ops::GgufMetadataValue;
+use eredu_gguf::{GgmlType, MetadataValue as GgufMetadataValue, TensorInput, Writer};
 use safemlx::{Array, Dtype};
 
 struct OwnedTensor {

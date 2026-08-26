@@ -1,7 +1,8 @@
 use std::{error::Error, path::PathBuf};
 
+use eredu_gguf::MetadataValue;
 use safemlx::{
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, GgufCheckpoint},
     Device, DeviceType, Stream,
 };
 
@@ -26,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let metadata = checkpoint.metadata();
 
     println!("file: {}", path.display());
-    if let Some(GgufMetadataValue::String(architecture)) = metadata.get("general.architecture") {
+    if let Some(MetadataValue::String(architecture)) = metadata.get("general.architecture") {
         println!("architecture: {architecture}");
     }
     println!("metadata entries: {}", metadata.len());

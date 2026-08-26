@@ -723,7 +723,9 @@ Backend modules expose only the backend-specific implementations of these
 facilities. Checkpoint recipes, checkpoint store metadata and selections,
 sampling policies, and observation contracts remain public through their
 neutral owning crates rather than compatibility re-exports under a concrete
-backend namespace.
+backend namespace. In particular, GGUF metadata, descriptors, encoded spans,
+and selection plans are imported from `eredu-gguf`; MLX GGUF APIs expose only
+their backend-owned checkpoints, materializers, and materialized tensors.
 
 Neutral contracts use associated concrete types for these values. They do not
 use `Any`, untyped pointers, string-dispatched operations, or erased calls in

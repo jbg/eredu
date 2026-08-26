@@ -40,7 +40,7 @@ use eredu_checkpoint::store::{
     WeightStoreBackend, WeightStoreDiagnostics,
 };
 #[cfg(test)]
-use safemlx::ops::GgufTensorSelection;
+use eredu_gguf::TensorSelection as GgufTensorSelection;
 
 fn safetensors_dtype(key: &str, value: &StoredDtype) -> Result<Dtype, WeightStoreError> {
     match value {

@@ -1,9 +1,9 @@
 use crate::error::IoError;
-use crate::ops::GgufMetadataValue;
 use crate::utils::guard::Guarded;
 use crate::utils::io::SafeTensors;
 use crate::utils::SUCCESS;
 use crate::{Array, Dtype, Stream};
+use eredu_gguf::MetadataValue;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::Path;
@@ -80,7 +80,7 @@ impl Array {
     /// blocks.
     pub fn save_gguf<'a, I, S, V>(
         arrays: I,
-        metadata: impl Into<Option<&'a HashMap<String, GgufMetadataValue>>>,
+        metadata: impl Into<Option<&'a HashMap<String, MetadataValue>>>,
         path: impl AsRef<Path>,
     ) -> Result<(), IoError>
     where
@@ -293,10 +293,8 @@ fn gguf_dense_bytes(
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        ops::{GgufCheckpoint, GgufMetadataValue},
-        Array,
-    };
+    use crate::{ops::GgufCheckpoint, Array};
+    use eredu_gguf::{MetadataArray, MetadataValue};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -346,16 +344,13 @@ mod tests {
         let tensor =
             Array::arange::<_, f32>(Some(tensor_value), tensor_value + 1.0, None, stream).unwrap();
         let metadata = std::collections::HashMap::from([
-            ("split.no".into(), GgufMetadataValue::Uint16(split_no)),
-            ("split.count".into(), GgufMetadataValue::Uint16(split_count)),
+            ("split.no".into(), MetadataValue::Uint16(split_no)),
+            ("split.count".into(), MetadataValue::Uint16(split_count)),
             (
                 "split.tensors.count".into(),
-                GgufMetadataValue::Int32(total_tensors),
+                MetadataValue::Int32(total_tensors),
             ),
-            (
-                "general.name".into(),
-                GgufMetadataValue::String(name.into()),
-            ),
+            ("general.name".into(), MetadataValue::String(name.into())),
         ]);
         Array::save_gguf([(tensor_name, &tensor)], Some(&metadata), path).unwrap();
     }
@@ -422,17 +417,14 @@ mod tests {
             .copy(&stream)
             .unwrap();
         let metadata = std::collections::HashMap::from([
-            ("answer".into(), GgufMetadataValue::Int32(42)),
+            ("answer".into(), MetadataValue::Int32(42)),
             (
                 "general.name".into(),
-                GgufMetadataValue::String("tiny model".into()),
+                MetadataValue::String("tiny model".into()),
             ),
             (
                 "general.tags".into(),
-                GgufMetadataValue::Array(crate::ops::GgufMetadataArray::String(vec![
-                    "one".into(),
-                    "two".into(),
-                ])),
+                MetadataValue::Array(MetadataArray::String(vec!["one".into(), "two".into()])),
             ),
         ]);
         Array::save_gguf([("tensor", &tensor)], Some(&metadata), &path).unwrap();
@@ -442,15 +434,15 @@ mod tests {
         assert_eq!(arrays["tensor"].shape(), &[2, 2]);
         assert!(arrays["tensor"].clone().try_item::<f32>(&stream).is_err());
         match &metadata["answer"] {
-            GgufMetadataValue::Int32(value) => assert_eq!(*value, 42),
+            MetadataValue::Int32(value) => assert_eq!(*value, 42),
             value => panic!("unexpected answer metadata: {value:?}"),
         }
         match &metadata["general.name"] {
-            GgufMetadataValue::String(value) => assert_eq!(value, "tiny model"),
+            MetadataValue::String(value) => assert_eq!(value, "tiny model"),
             value => panic!("unexpected name metadata: {value:?}"),
         }
         match &metadata["general.tags"] {
-            GgufMetadataValue::Array(value) => {
+            MetadataValue::Array(value) => {
                 assert_eq!(value.as_strings().unwrap(), &["one", "two"])
             }
             value => panic!("unexpected tags metadata: {value:?}"),
@@ -569,7 +561,7 @@ mod tests {
 
         let metadata = checkpoint.metadata();
         match &metadata["general.name"] {
-            GgufMetadataValue::String(value) => assert_eq!(value, "first"),
+            MetadataValue::String(value) => assert_eq!(value, "first"),
             value => panic!("unexpected name metadata: {value:?}"),
         }
     }

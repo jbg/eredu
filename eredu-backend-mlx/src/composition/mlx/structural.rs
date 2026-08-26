@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
+use eredu_gguf::MetadataValue as GgufMetadataValue;
+use safemlx::ops::GgufCheckpoint;
 #[cfg(test)]
 use serde_json::Value;
 

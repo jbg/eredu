@@ -5,7 +5,8 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_architectures::processor_plan::ArtifactArchitecturePlan;
 use eredu_architectures::{GgufArchitecture, ModelKind};
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
-use safemlx::{ops::GgufMetadataValue, Stream};
+use eredu_gguf::MetadataValue as GgufMetadataValue;
+use safemlx::Stream;
 
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::composition::mlx::ModelProcessor;
