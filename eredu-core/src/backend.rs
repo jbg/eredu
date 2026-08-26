@@ -1970,7 +1970,7 @@ mod tests {
         type Error = Infallible;
 
         fn descriptor(&self) -> DistributedSessionDescriptor {
-            self.descriptor.clone()
+            self.descriptor
         }
 
         fn capabilities(&self) -> DistributedCapabilities {
