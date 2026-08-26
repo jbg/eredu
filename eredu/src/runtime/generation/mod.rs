@@ -1,4 +1,3 @@
 //! Backend-independent committed-token streaming.
 
-/// Protocol-independent semantic streaming.
-pub mod streaming;
+pub(crate) mod streaming;
