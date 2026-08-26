@@ -1,6 +1,6 @@
 //! Fast Fourier Transform (FFT) and its inverse (IFFT) for one, two, and `N` dimensions.
 //!
-//! Like all other functions in `mlx-rs`, three variants are provided for each FFT function.
+//! Like other operations in `safemlx`, each FFT function provides three variants.
 //!
 //! The difference are explained below using `fftn` as an example:
 //!

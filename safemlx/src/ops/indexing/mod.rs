@@ -26,7 +26,7 @@
 //!
 //! # Single axis indexing
 //!
-//! | Indexing Operation | `mlx` (python) | `mlx-swift` | `mlx-rs` |
+//! | Indexing Operation | `mlx` (Python) | `mlx-swift` | `safemlx` |
 //! |--------------------|--------|-------|------|
 //! | integer | `arr[1]` | `arr[1]` | `arr.index(1)` |
 //! | range expression | `arr[1:3]` | `arr[1..<3]` | `arr.index(1..3)` |

@@ -145,7 +145,7 @@
 //! update to a container of arrays, as is commonly done when training the
 //! parameters of a [`crate::module::Module`].
 //!
-//! See mlx-rs/mlx-tests/tests/test_compile_with_state.rs for more examples.
+//! See `safemlx-tests/tests/test_compile_with_state.rs` for more examples.
 //!
 
 use std::collections::hash_map::DefaultHasher;

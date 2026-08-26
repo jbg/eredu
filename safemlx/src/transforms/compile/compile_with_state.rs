@@ -2,7 +2,7 @@
 //!
 //! # Unit tests
 //!
-//! See `mlx-rs/mlx-tests/tests/test_compile.rs` for unit tests.
+//! See `safemlx-tests/tests/test_compile_with_state.rs` for unit tests.
 
 // TODO: there's plenty boilerplate code here but it's not clear how to reduce it
 

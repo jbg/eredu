@@ -54,7 +54,7 @@ pub fn derive_module_parameters(input: TokenStream) -> TokenStream {
 /// `#[quantizable]` attribute to include it in the quantization process.
 /// Only support types `M` that `M::Quantized = Self`
 ///
-/// See `mlx-rs/mlx-tests/tests/test_quantizable.rs` for example usage.
+/// See `safemlx-tests/tests/test_quantizable.rs` for example usage.
 ///
 /// # Panics
 ///
