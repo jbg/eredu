@@ -19,9 +19,12 @@ execution-plan realization can load and validate the matching assistant.
 
 Embedded MTP is available for registered checkpoints with executable prediction
 weights, including supported DeepSeek, Inkling, Nemotron-H, Qwen3-Next, and
-Qwen3.5 variants. DeepSeek-V4 supports both ordinary embedded MTP heads and
-fused DSpark draft blocks, including persisted draft-cache continuation. The
-usable proposal depth is capped by the checkpoint's validated capability.
+Qwen3.5 variants. DeepSeek-V4 SafeTensors checkpoints support both ordinary
+embedded MTP heads and fused DSpark draft blocks, including persisted
+draft-cache continuation. A base `deepseek4` GGUF contains target weights only;
+its metadata may describe omitted companion prediction weights but does not
+advertise an embedded-draft capability. The usable proposal depth is capped by
+the checkpoint's validated capability.
 
 Applications should query `mtp_capability` or run model inspection instead of
 assuming support from a family name.

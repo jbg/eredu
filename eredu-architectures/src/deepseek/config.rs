@@ -989,9 +989,13 @@ pub fn parse_v3_gguf(
     Ok(args)
 }
 
-/// Parses strict llama.cpp `deepseek4` GGUF metadata into neutral V4
-/// arguments. Embedded MTP GGUFs remain companion artifacts and are rejected
-/// by the base-model validator.
+/// Parses strict llama.cpp `deepseek4` base-model GGUF metadata into neutral
+/// V4 arguments.
+///
+/// The GGUF `nextn_predict_layers` field describes prediction weights omitted
+/// from the base artifact. It does not extend `block_count` and cannot make the
+/// base artifact advertise embedded drafting without a separately admitted
+/// companion.
 pub fn parse_v4_gguf(metadata: &HashMap<String, MetadataValue>) -> Result<V4Args, ConfigError> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if architecture != "deepseek4" {
@@ -1000,17 +1004,9 @@ pub fn parse_v4_gguf(metadata: &HashMap<String, MetadataValue>) -> Result<V4Args
         )));
     }
     let key = |suffix: &str| format!("deepseek4.{suffix}");
-    let total_layers = gguf_i32(metadata, &key("block_count"))?;
-    let prediction_layers = gguf_optional_i64(metadata, &key("nextn_predict_layers"))?
-        .map(i32::try_from)
-        .transpose()
-        .map_err(|_| invalid_v4("GGUF prediction layer count exceeds i32"))?
-        .unwrap_or(0);
-    let target_layers = total_layers
-        .checked_sub(prediction_layers)
-        .ok_or_else(|| invalid_v4("GGUF prediction layer count exceeds block count"))?;
-    let routed_limit = gguf_uniform_f32_array(metadata, &key("swiglu_clamp_exp"), total_layers)?;
-    let shared_limit = gguf_uniform_f32_array(metadata, &key("swiglu_clamp_shexp"), total_layers)?;
+    let target_layers = gguf_i32(metadata, &key("block_count"))?;
+    let routed_limit = gguf_uniform_f32_array(metadata, &key("swiglu_clamp_exp"), target_layers)?;
+    let shared_limit = gguf_uniform_f32_array(metadata, &key("swiglu_clamp_shexp"), target_layers)?;
     if routed_limit.to_bits() != shared_limit.to_bits() {
         return Err(invalid_v4(
             "GGUF routed and shared expert SwiGLU limits disagree",
@@ -1073,7 +1069,7 @@ pub fn parse_v4_gguf(metadata: &HashMap<String, MetadataValue>) -> Result<V4Args
         norm_topk_prob: gguf_bool(metadata, &key("expert_weights_norm"))?,
         routed_scaling_factor: gguf_f32(metadata, &key("expert_weights_scale"))?,
         swiglu_limit: routed_limit,
-        num_nextn_predict_layers: prediction_layers,
+        num_nextn_predict_layers: 0,
         expert_dtype: Some("fp4".into()),
         quantization_config: None,
         tie_word_embeddings: false,
@@ -1640,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_gguf_retains_compression_and_embedded_draft_depth() {
+    fn v4_base_gguf_ignores_omitted_companion_depth() {
         let metadata = HashMap::from([
             (
                 "general.architecture".into(),
@@ -1771,8 +1767,8 @@ mod tests {
             ),
         ]);
         let args = parse_v4_gguf(&metadata).unwrap();
-        assert_eq!(args.num_hidden_layers, 2);
-        assert_eq!(args.num_nextn_predict_layers, 1);
+        assert_eq!(args.num_hidden_layers, 3);
+        assert_eq!(args.num_nextn_predict_layers, 0);
         assert_eq!(
             args.attention_policy(1),
             Some(V4AttentionPolicy::Compressed { ratio: 4 })
@@ -1780,13 +1776,7 @@ mod tests {
         assert_eq!(args.expert_format, ExpertFormat::MxFp4);
         assert_eq!(args.swiglu_limit.unwrap().gate_upper_bound(), Some(7.0));
 
-        let checkpoint = eredu_checkpoint::schema::GgufCheckpointPlan::new(
-            "validated test checkpoint",
-            Vec::new(),
-            Vec::new(),
-            eredu_checkpoint::schema::CatalogPolicy::strict(),
-        )
-        .unwrap();
+        let checkpoint = crate::deepseek::v4_gguf_plan(&args).unwrap();
         let plan = crate::configuration::GgufArchitecturePlan::new(
             crate::GgufArchitecture::DeepSeek4,
             crate::configuration::GgufModelConfig::DeepSeekV4(args),
@@ -1794,7 +1784,7 @@ mod tests {
         );
         assert_eq!(
             crate::preparation::prepared_gguf_capabilities(&plan).embedded_draft_layers(),
-            Some(1)
+            None
         );
     }
 }

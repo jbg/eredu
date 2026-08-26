@@ -802,10 +802,13 @@ configuration before the factory realizes that plan. Platform applications
 therefore do not need a concrete backend crate merely to create and complete a
 model session.
 
-Architecture inspection also reports embedded-draft depth from the normalized
-family configuration in `ModelResourceProfile`. The neutral automatic planner
-consumes that observation directly; concrete backends must not infer family
-semantics by searching raw configuration documents.
+Architecture inspection also reports embedded-draft depth from the normalized,
+admitted artifact composition in `ModelResourceProfile`. The neutral automatic
+planner consumes that observation directly; concrete backends must not infer
+family semantics by searching raw configuration documents. In particular, a
+DeepSeek-V4 base GGUF has target blocks only: its `nextn_predict_layers`
+metadata describes weights omitted into a companion artifact, so base admission
+normalizes embedded depth to zero and capability reporting does not expose it.
 
 ## Submission and completion
 

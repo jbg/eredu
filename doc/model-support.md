@@ -59,7 +59,7 @@ projector.
 | Qwen3-VL | text, image, video | yes | `qwen3vl`, `qwen3vlmoe` + projector | dense and MoE text decoders, MRoPE and DeepStack |
 | Qwen3-Next / Qwen3.5 / Qwen3.6 / Qwen3.8 | text; image/video where present | yes | `qwen3next`, `qwen35`, `qwen35moe` | shared Qwen3.5 hybrid recurrent/full-attention contract; dense and MoE, projector and embedded-MTP support; official Qwen3.6/3.8 chat and tagged-parameter tools |
 | DeepSeek-V3 / R1 | text | yes | `deepseek2` | compressed MLA, dense-to-MoE schedules, native block FP8 |
-| DeepSeek-V4 | text | yes | `deepseek4` | mHC compressed sparse attention, routed/shared experts, native FP8 and mixed FP4, embedded MTP and fused DSpark |
+| DeepSeek-V4 | text | yes | `deepseek4` | mHC compressed sparse attention, routed/shared experts, native FP8 and mixed FP4; SafeTensors embedded MTP and fused DSpark; base GGUF target only |
 | GPT-OSS | text | yes | `gpt-oss` | Harmony chat, scheduled attention, native MXFP4 experts |
 | Gemma 4 | text, image, video, audio | yes | `gemma4` + projector | dense and MoE variants, shared-KV and media towers |
 | Gemma 4 assistant | text draft model | yes | `gemma4_assistant` | external multi-token prediction |

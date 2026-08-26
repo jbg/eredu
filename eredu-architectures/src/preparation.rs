@@ -538,13 +538,6 @@ pub fn prepared_gguf_capabilities(
     use crate::configuration::GgufModelConfig;
 
     let architecture = plan.architecture();
-    let embedded_draft_layers = match plan.model() {
-        GgufModelConfig::DeepSeekV4(args) => Some(
-            usize::try_from(args.num_nextn_predict_layers)
-                .expect("validated DeepSeek-V4 GGUF prediction depth must be nonnegative"),
-        ),
-        _ => None,
-    };
     let routed = match plan.model() {
         GgufModelConfig::Gemma4(family) => family.text.num_experts.is_some(),
         GgufModelConfig::MuseGlimmer(args) => args.is_moe(),
@@ -564,7 +557,7 @@ pub fn prepared_gguf_capabilities(
         false,
         gguf_composite_artifact_plan(architecture)
             .input_modalities(GgufArtifactComposition::ModelOnly),
-        embedded_draft_layers,
+        None,
     )
 }
 
