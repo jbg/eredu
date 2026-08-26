@@ -30,4 +30,4 @@ serde_json = "1"
 sha2.workspace = true
 thiserror = "2"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-eredu-gguf = { path = "../eredu-gguf" }
+eredu-gguf.workspace = true
