@@ -238,7 +238,9 @@ it neither recognizes family strings nor exposes an exhaustive family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
 in `eredu-architectures`; core does not publish a parallel serialized model or
-artifact identity schema. Nested `text_config.model_type` normalization is
+artifact identity schema. The serialized form of every `ModelKind` is exactly
+its architecture-owned canonical family name and round-trips through
+`ModelKind::resolve_family`. Nested `text_config.model_type` normalization is
 available only to outer wrapper identities explicitly admitted by that closed
 registry; an unknown outer `model_type` is rejected even when its nested text
 identity is known. External assistant admission remains separate: its closed

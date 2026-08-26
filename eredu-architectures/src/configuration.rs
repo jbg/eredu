@@ -15,7 +15,7 @@ use eredu_core::{
     ValidatedGguf,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::{fs, path::Path};
 
@@ -190,8 +190,7 @@ pub fn gguf_companion_requirements(
 }
 
 /// Architecture family identity owned by the architecture registry.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum ModelKind {
     /// DeepSeek-V3/R1 MLA and MoE architecture.
     DeepSeekV3,
@@ -227,6 +226,25 @@ pub enum ModelKind {
     Qwen3VlMoe,
     /// Qwen3.5 dense or MoE decoder.
     Qwen35,
+}
+
+impl Serialize for ModelKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.canonical_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        Self::resolve_family(&name).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ModelKind {
@@ -1133,6 +1151,24 @@ mod tests {
                     .unwrap()
                     .canonical_name(),
                 family.canonical_name()
+            );
+        }
+    }
+
+    #[test]
+    fn model_kind_serialization_uses_resolvable_canonical_names() {
+        for kind in ModelKind::ALL {
+            let serialized = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                serialized,
+                serde_json::to_string(kind.canonical_name()).unwrap()
+            );
+
+            let family_name: String = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(ModelKind::resolve_family(&family_name).unwrap(), kind);
+            assert_eq!(
+                serde_json::from_str::<ModelKind>(&serialized).unwrap(),
+                kind
             );
         }
     }
