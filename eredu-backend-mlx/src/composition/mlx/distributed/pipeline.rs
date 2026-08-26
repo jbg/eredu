@@ -12661,15 +12661,12 @@ fn binding_target(binding: &WeightBinding) -> &str {
     binding.logical_target().unwrap_or_else(|| binding.name())
 }
 
-fn canonical_binding_target(binding: &WeightBinding) -> String {
-    crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(binding_target(binding))
+fn owned_binding_target(binding: &WeightBinding) -> String {
+    binding_target(binding).to_owned()
 }
 
 fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool {
     targets.contains(name)
-        || targets.contains(
-            &crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(name),
-        )
 }
 
 fn validate_partition_owner_bindings_excluding_roles(
@@ -12681,7 +12678,7 @@ fn validate_partition_owner_bindings_excluding_roles(
     let (expected, excluded) = owner_parameter_targets(authority, owner, excluded_roles)?;
     let actual = bindings
         .iter()
-        .map(canonical_binding_target)
+        .map(owned_binding_target)
         .collect::<BTreeSet<_>>();
     let unexpected_excluded = actual
         .iter()
@@ -12918,7 +12915,7 @@ mod binding_authority_tests {
     }
 
     #[test]
-    fn expert_role_targets_include_packed_companions_aliases_and_inner_weight() {
+    fn expert_role_targets_include_declared_companions_and_reject_private_aliases() {
         let groups = authority_with_external_expert_companions()
             .into_iter()
             .map(OwnedParameterGroupSpec::into_group)
@@ -12932,7 +12929,7 @@ mod binding_authority_tests {
         assert!(targets.contains("unit.expert_bank.biases"));
         assert!(targets.contains("unit.expert_bank.alias"));
         assert!(
-            crate::backend::runtime::checkpoint::binding::parameter_name_in_targets(
+            !crate::backend::runtime::checkpoint::binding::parameter_name_in_targets(
                 "unit.expert_bank.inner.weight",
                 &targets,
             )
@@ -13151,7 +13148,7 @@ fn select_static_binding_units_by_owner(
         let mut matches = units.iter().filter(|unit| {
             unit.bindings()
                 .iter()
-                .map(canonical_binding_target)
+                .map(owned_binding_target)
                 .collect::<BTreeSet<_>>()
                 == expected
         });
@@ -13183,7 +13180,7 @@ fn split_static_binding_units_by_owner(
             let (expected, _) = owner_parameter_targets(authority, &owner, &[])?;
             let bindings = bindings
                 .iter()
-                .filter(|binding| expected.contains(&canonical_binding_target(binding)))
+                .filter(|binding| expected.contains(&owned_binding_target(binding)))
                 .cloned()
                 .collect::<Vec<_>>();
             validate_partition_owner_bindings(authority, &owner, &bindings)?;

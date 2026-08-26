@@ -493,11 +493,8 @@ where
                     )));
                 }
             }
-            let canonical = crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                &weight_name,
-            );
             Ok(Some((
-                canonical,
+                weight_name.clone(),
                 PackedWeightCompanions {
                     weight_name,
                     scales_name,
@@ -532,9 +529,7 @@ fn collect_quantization_recipes(
         {
             continue;
         }
-        let canonical =
-            crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
-        let Some(companions) = selected.get(&canonical).cloned() else {
+        let Some(companions) = selected.get(binding.name()).cloned() else {
             continue;
         };
         let target = companions.weight_name.clone();
@@ -905,11 +900,7 @@ where
             .bindings()
             .iter()
             .filter(|binding| quantizes_static_binding(binding))
-            .map(|binding| {
-                crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                    binding.name(),
-                )
-            })
+            .map(|binding| binding.name().to_owned())
             .collect::<BTreeSet<_>>();
         let selected = static_companions
             .iter()

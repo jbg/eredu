@@ -23,9 +23,7 @@ use crate::backend::{
         cache::state::MlxKeyValueState,
         checkpoint::{
             artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
-            binding::{
-                build_neutral_module_bindings_with_recipes_excluding, canonical_checkpoint_name,
-            },
+            binding::build_neutral_module_bindings_with_recipes_excluding,
             quantization::should_quantize_on_load,
         },
         execution::{
@@ -593,10 +591,9 @@ where
     let selected = names
         .iter()
         .filter_map(|name| {
-            let canonical = canonical_checkpoint_name(name);
             recipes
                 .outputs
-                .get(&canonical)
+                .get(name)
                 .cloned()
                 .map(|recipe| (name.clone(), recipe))
         })
@@ -604,11 +601,10 @@ where
     let aliases = names
         .into_iter()
         .filter_map(|name| {
-            let canonical = canonical_checkpoint_name(&name);
             recipes
                 .aliases
-                .get(&canonical)
-                .map(|owner| (name, canonical, owner.clone()))
+                .get(&name)
+                .map(|owner| (name.clone(), name, owner.clone()))
         })
         .collect::<Vec<_>>();
     let alias_names = aliases

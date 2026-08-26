@@ -18,7 +18,6 @@ use crate::native::{
 use crate::MlxTensor;
 use crate::{
     backend::runtime::{
-        checkpoint::binding::canonical_checkpoint_name,
         execution::layerwise::open_safetensors_weight_store,
         media::{input::InputPayload, PreparedModelInput},
     },
@@ -2138,7 +2137,7 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
                 ));
             }
         } else {
-            arrays.push((canonical_checkpoint_name(&name), value));
+            arrays.push((name.to_string(), value));
         }
     }
     Array::save_safetensors(
@@ -2466,7 +2465,7 @@ fn write_qwen3_moe_gguf_fixture(path: &Path) {
     let arrays = qwen_fixture_arrays(&args, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in &arrays {
-        let runtime_name = canonical_checkpoint_name(runtime_name);
+        let runtime_name = runtime_name.to_string();
         if let Some(prefix) = runtime_name.strip_suffix(".mlp.experts.gate_up_proj") {
             let gate = value
                 .try_index_device((.., ..args.moe_intermediate_size, ..), stream)
@@ -2929,7 +2928,7 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
         .parameters()
         .flatten()
         .into_iter()
-        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
+        .map(|(name, value)| (name.to_string(), value.clone()))
         .collect::<Vec<_>>();
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
@@ -2977,7 +2976,7 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in model.parameters().flatten() {
-        let runtime_name = canonical_checkpoint_name(&runtime_name);
+        let runtime_name = runtime_name.to_string();
         let layer_name = |name: &str| {
             name.replace("model.layers.", "blk.")
                 .replace(".conv.conv.", ".shortconv.conv.")
@@ -3112,7 +3111,7 @@ fn save_parameter_fixture(
         .parameters()
         .flatten()
         .into_iter()
-        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
+        .map(|(name, value)| (name.to_string(), value.clone()))
         .collect::<Vec<_>>();
     save_indexed_pipeline_fixture(directory, &arrays, "model.layers.", 2);
     std::fs::write(
@@ -3394,7 +3393,7 @@ fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Valu
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
     for (name, value) in model.parameters().flatten() {
-        let runtime = canonical_checkpoint_name(&name);
+        let runtime = name.to_string();
         if runtime.ends_with("moe.experts.up_proj") {
             let prefix = nemotron_public_name(runtime.trim_end_matches(".up_proj"), &args);
             for expert in 0..args.n_routed_experts {
@@ -3435,7 +3434,7 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in model.parameters().flatten() {
-        let runtime_name = canonical_checkpoint_name(&runtime_name);
+        let runtime_name = runtime_name.to_string();
         let gguf_name = if runtime_name == "model.embeddings.weight" {
             "token_embd.weight".to_string()
         } else if runtime_name == "model.norm_f.weight" {
@@ -3714,7 +3713,7 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
         .flatten()
         .into_iter()
         .map(|(name, value)| {
-            let canonical = canonical_checkpoint_name(&name);
+            let canonical = name.to_string();
             let canonical = canonical
                 .strip_prefix("model.language_model.model.language_model.")
                 .map_or(canonical.clone(), |suffix| {

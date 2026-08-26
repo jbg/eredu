@@ -284,12 +284,17 @@ names; or inject compatibility metadata into `config.json`. Conversion fails
 closed when a declared source is absent or any declared output collides with
 another checkpoint tensor.
 
-Portable SafeTensors schemas use released checkpoint names directly. In
-particular, a matrix is named `*.weight`; the `*.inner.weight` spelling from an
-old safemlx module serialization is neither a portable alias nor an accepted
-architecture layout identity. Backend implementations may translate canonical
-schema names to private module slots, but that translation must not widen the
-checkpoint contract.
+Portable SafeTensors schemas use released checkpoint names directly. A private
+module spelling that inserts `inner` into an architecture name, such as
+rewriting `projection.weight` to `projection.inner.weight`, is neither a
+portable alias nor an accepted alternative layout identity. The `inner` path
+segment is not reserved, however: an architecture may itself declare
+`projection.inner.weight`, which remains distinct from `projection.weight`.
+Backend operators expose architecture parameter identities through their
+neutral `Parameterized` topology, including when native storage uses private
+module slots. Generic binding, residency, and distributed-planning utilities
+consume those exact identities and never normalize path segments; private
+native topology must not widen or rewrite the checkpoint contract.
 
 These catalogs are model-wide and configuration-derived. Backend adapters may
 filter their outputs to the parameters present in a static module, execution

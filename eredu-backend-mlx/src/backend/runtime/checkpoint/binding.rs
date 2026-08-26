@@ -38,23 +38,6 @@ use eredu_checkpoint::{
 
 const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;
 
-/// Converts a module parameter name to its canonical checkpoint spelling.
-///
-/// Quantized modules wrap their packed matrix (and ordinary biased modules
-/// wrap their bias) in an `inner` module. MLX-compatible checkpoints omit that
-/// implementation detail while retaining companion `.scales` and `.biases`
-/// tensors unchanged.
-pub fn canonical_checkpoint_name(parameter_name: &str) -> String {
-    let canonical = parameter_name
-        .replace(".inner.weight", ".weight")
-        .replace(".inner.bias", ".bias");
-    match canonical.as_str() {
-        "inner.weight" => "weight".into(),
-        "inner.bias" => "bias".into(),
-        _ => canonical,
-    }
-}
-
 /// Exact local parameter targets owned by one neutral semantic role.
 ///
 /// Targets come from the architecture parameter contract, so packed
@@ -73,7 +56,7 @@ pub fn parameter_role_targets(
 }
 
 pub fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool {
-    targets.contains(name) || targets.contains(&canonical_checkpoint_name(name))
+    targets.contains(name)
 }
 
 /// Whether a flattened module parameter has checkpoint-backed storage.
@@ -414,30 +397,13 @@ where
             .map(|(name, _)| name.to_string())
             .collect::<BTreeSet<_>>()
     };
-    let mut canonical_expected = BTreeMap::<String, Vec<String>>::new();
-    for name in &expected {
-        canonical_expected
-            .entry(canonical_checkpoint_name(name))
-            .or_default()
-            .push(name.clone());
-    }
     let mut resolved = BTreeMap::<String, &Array>::new();
     let mut unexpected = Vec::new();
     for (name, value) in arrays {
-        let target = if expected.contains(name) {
-            Some(name.clone())
+        if expected.contains(name) {
+            resolved.insert(name.clone(), value);
         } else {
-            canonical_expected
-                .get(&canonical_checkpoint_name(name))
-                .and_then(|candidates| (candidates.len() == 1).then(|| candidates[0].clone()))
-        };
-        match target {
-            Some(target) => {
-                if resolved.insert(target, value).is_some() {
-                    unexpected.push(name.clone());
-                }
-            }
-            None => unexpected.push(name.clone()),
+            unexpected.push(name.clone());
         }
     }
     let missing = expected
@@ -490,14 +456,9 @@ where
     {
         let mut parameters = module.parameters_mut().flatten();
         for (name, value) in arrays {
-            // Materialized bindings are keyed by private module destinations.
-            // Re-enter the public loader through the canonical checkpoint
-            // identity rather than treating an MLX `inner.weight` slot as a
-            // valid source name.
-            let checkpoint_name = canonical_checkpoint_name(name);
             load_array_quantized_strict(
                 &mut parameters,
-                checkpoint_name,
+                name.clone(),
                 value.clone(),
                 stream,
                 quantization,
@@ -579,11 +540,8 @@ where
             .expect("parameter name came from the same flattened tree");
         let destination = qualify(prefix, &local_name);
         logical_targets.insert(local_name.clone(), destination.clone());
-        let canonical = canonical_checkpoint_name(&destination);
         let authoritative_key = if store.is_authoritative_materialized_key(&destination) {
             Some(destination.clone())
-        } else if store.is_authoritative_materialized_key(&canonical) {
-            Some(canonical.clone())
         } else {
             None
         };
@@ -632,8 +590,6 @@ where
             authoritative_key
         } else if keys.contains(&destination) {
             destination.clone()
-        } else if keys.contains(&canonical) {
-            canonical
         } else {
             return Err(ModuleBindingError::MissingParameter { destination });
         };
@@ -931,41 +887,20 @@ pub enum ModuleBindingError {
 )]
 mod tests {
     use super::*;
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use crate::backend::nn::linear::unloaded_maybe_quantized_linear;
     use eredu_checkpoint::store::MemoryWeightStore;
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use eredu_checkpoint::AffineQuantization;
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use safemlx::{quantization::MaybeQuantized, Device, DeviceType, ExecutionContext};
 
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
-    fn materialized_private_destination_is_canonicalized_before_quantized_loading() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let quantization = AffineQuantization::default();
-        let mut module =
-            unloaded_maybe_quantized_linear(64, 8, false, Some(quantization.into()), stream)
-                .unwrap();
-        let arrays = BTreeMap::from([(
-            "inner.weight".into(),
-            Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]),
-        )]);
-
-        populate_module_from_dense_arrays_quantized_excluding(
-            &mut module,
-            &arrays,
-            quantization.into(),
-            stream,
-            |_| false,
-        )
-        .unwrap();
-
-        let MaybeQuantized::Quantized(module) = module else {
-            panic!("target module should retain affine storage")
-        };
-        assert_eq!(module.inner.weight.shape(), &[8, 8]);
+    fn architecture_inner_path_is_an_exact_parameter_identity() {
+        let targets =
+            BTreeSet::from(["projection.weight".to_owned(), "projection.bias".to_owned()]);
+        assert!(!parameter_name_in_targets(
+            "projection.inner.weight",
+            &targets
+        ));
+        assert!(!parameter_name_in_targets(
+            "projection.inner.bias",
+            &targets
+        ));
     }
 
     #[test]
