@@ -33,7 +33,7 @@ impl<'a> ModelInput<'a> {
     }
 }
 
-/// Creates a validated runtime part from MLX arrays.
+/// Creates a structurally validated runtime part from MLX arrays.
 pub fn input_part(
     modality: Modality,
     payload: InputPayload,

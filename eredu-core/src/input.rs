@@ -67,6 +67,15 @@ pub enum InputPayloadKind {
 }
 
 impl InputPayloadKind {
+    /// Returns whether this payload role is meaningful for `modality`.
+    pub const fn accepts(self, modality: InputModality) -> bool {
+        match self {
+            Self::TokenIds => matches!(modality, InputModality::Text),
+            Self::Tensor => !matches!(modality, InputModality::Text),
+            Self::Embeddings => true,
+        }
+    }
+
     const fn wire_tag(self) -> u32 {
         match self {
             Self::TokenIds => 0,
@@ -290,18 +299,11 @@ impl InputPartDescriptor {
         metadata: impl IntoIterator<Item = (InputMetadataKey, InputTensorIdentity)>,
         extents: impl IntoIterator<Item = InputExtent>,
     ) -> Result<Self, PreparedInputError> {
-        match (modality, payload_kind) {
-            (InputModality::Text, InputPayloadKind::Tensor)
-            | (
-                InputModality::Image | InputModality::Video | InputModality::Audio,
-                InputPayloadKind::TokenIds,
-            ) => {
-                return Err(PreparedInputError::IncompatiblePayload {
-                    modality,
-                    payload: payload_kind,
-                });
-            }
-            _ => {}
+        if !payload_kind.accepts(modality) {
+            return Err(PreparedInputError::IncompatiblePayload {
+                modality,
+                payload: payload_kind,
+            });
         }
         let mut typed_metadata = BTreeMap::new();
         for (key, identity) in metadata {

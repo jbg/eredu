@@ -46,7 +46,7 @@ pub struct PreparedInputPart<Tensor> {
 }
 
 impl<Tensor> PreparedInputPart<Tensor> {
-    /// Creates a part and rejects duplicate metadata keys.
+    /// Creates a part with compatible payload and unique, compatible metadata.
     pub fn new(
         modality: InputModality,
         payload: PreparedInputPayload<Tensor>,
@@ -55,15 +55,25 @@ impl<Tensor> PreparedInputPart<Tensor> {
         Self::new_with_extents(modality, payload, metadata, [])
     }
 
-    /// Creates a part with host-known execution extents.
+    /// Creates a part with compatible host-known execution extents.
     pub fn new_with_extents(
         modality: InputModality,
         payload: PreparedInputPayload<Tensor>,
         metadata: impl IntoIterator<Item = (InputMetadataKey, Tensor)>,
         extents: impl IntoIterator<Item = InputExtent>,
     ) -> Result<Self, PreparedInputError> {
+        let payload_kind = payload.kind();
+        if !payload_kind.accepts(modality) {
+            return Err(PreparedInputError::IncompatiblePayload {
+                modality,
+                payload: payload_kind,
+            });
+        }
         let mut typed_metadata = BTreeMap::new();
         for (key, value) in metadata {
+            if !key.accepts(modality) {
+                return Err(PreparedInputError::IncompatibleMetadata { modality, key });
+            }
             if typed_metadata.insert(key, value).is_some() {
                 return Err(PreparedInputError::DuplicateMetadata { key });
             }
@@ -334,6 +344,43 @@ mod tests {
                 describe
             ),
             Err(PreparedInputError::WireIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn rejects_incompatible_payload_at_part_construction() {
+        let result = PreparedInputPart::new(
+            InputModality::Text,
+            PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 2], 1)),
+            [],
+        );
+
+        assert!(matches!(
+            result,
+            Err(PreparedInputError::IncompatiblePayload {
+                modality: InputModality::Text,
+                payload: InputPayloadKind::Tensor,
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_incompatible_metadata_at_part_construction() {
+        let result = PreparedInputPart::new(
+            InputModality::Text,
+            PreparedInputPayload::TokenIds(fake(TensorDtype::U32, &[1, 2], 1)),
+            [(
+                InputMetadataKey::PatchGrid,
+                fake(TensorDtype::I32, &[1, 3], 2),
+            )],
+        );
+
+        assert!(matches!(
+            result,
+            Err(PreparedInputError::IncompatibleMetadata {
+                modality: InputModality::Text,
+                key: InputMetadataKey::PatchGrid,
+            })
         ));
     }
 }
