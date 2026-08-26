@@ -4,6 +4,7 @@ use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 
 use std::path::Path;
 
+use eredu_core::scheduler::SemanticStateTransaction;
 use eredu_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
     CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
@@ -11,8 +12,10 @@ use eredu_core::{
     ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
     HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, MtpCapability,
     MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, RealizedDrafting,
-    RealtimeModelLoadingBackend, ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend,
-    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    RealtimeBackend, RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame,
+    RealtimeSampling, RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry,
+    SpeculativeGenerationBackend, Submission, TransferTelemetry, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -55,26 +58,130 @@ impl MlxBackendFactory {
     }
 }
 
-/// Creates a single-device realtime backend from a portable device plan.
+/// Realtime MLX adapter without native device or stream accessors.
+///
+/// The facade stores this concrete adapter while applications operate it only
+/// through facade-owned model and scheduler wrappers. Backend-author tools use
+/// [`crate::native::MlxRealtimeBackend`] when they need explicit native handles.
+#[derive(Clone)]
+pub struct MlxRealtimeAdapter {
+    backend: MlxRealtimeBackend,
+}
+
+impl RealtimeModelLoadingBackend for MlxRealtimeAdapter {
+    type Preparation = eredu_architectures::moshi::RealtimePreparationPlan;
+    type LoadOptions = ModelLoadOptions;
+
+    fn materialize_realtime_model(
+        &self,
+        preparation: Self::Preparation,
+        options: Self::LoadOptions,
+    ) -> Result<Self::Model, Self::Error> {
+        self.backend
+            .materialize_realtime_model(preparation, options)
+    }
+}
+
+impl RealtimeBackend for MlxRealtimeAdapter {
+    type Model = <MlxRealtimeBackend as RealtimeBackend>::Model;
+    type ModelIdentity = <MlxRealtimeBackend as RealtimeBackend>::ModelIdentity;
+    type Input = <MlxRealtimeBackend as RealtimeBackend>::Input;
+    type Output = <MlxRealtimeBackend as RealtimeBackend>::Output;
+    type Session = <MlxRealtimeBackend as RealtimeBackend>::Session;
+    type Completion = <MlxRealtimeBackend as RealtimeBackend>::Completion;
+    type Error = Error;
+
+    fn name(&self) -> &str {
+        self.backend.name()
+    }
+
+    fn model_identity(&self, model: &Self::Model) -> Self::ModelIdentity {
+        self.backend.model_identity(model)
+    }
+
+    fn model_identity_mismatch(
+        &self,
+        expected: &Self::ModelIdentity,
+        actual: &Self::ModelIdentity,
+    ) -> Option<String> {
+        self.backend.model_identity_mismatch(expected, actual)
+    }
+
+    fn speech_config(&self, model: &Self::Model) -> RealtimeSpeechConfig {
+        self.backend.speech_config(model)
+    }
+
+    fn materialize_input(
+        &self,
+        model: &Self::Model,
+        frame: &RealtimeInputFrame,
+    ) -> Result<Self::Input, Self::Error> {
+        self.backend.materialize_input(model, frame)
+    }
+
+    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error> {
+        self.backend.observe_output(output)
+    }
+
+    fn create_session(
+        &self,
+        model: &Self::Model,
+        sampling: RealtimeSampling,
+    ) -> Result<Self::Session, Self::Error> {
+        self.backend.create_session(model, sampling)
+    }
+
+    fn validate_session(
+        &self,
+        model: &Self::Model,
+        session: &Self::Session,
+    ) -> Result<(), Self::Error> {
+        self.backend.validate_session(model, session)
+    }
+
+    fn validate_input(&self, model: &Self::Model, input: &Self::Input) -> Result<(), Self::Error> {
+        self.backend.validate_input(model, input)
+    }
+
+    fn input_batch_size(&self, input: &Self::Input) -> usize {
+        self.backend.input_batch_size(input)
+    }
+
+    fn set_sampling(
+        &self,
+        session: &mut Self::Session,
+        sampling: RealtimeSampling,
+    ) -> Result<(), Self::Error> {
+        self.backend.set_sampling(session, sampling)
+    }
+
+    fn submit_step(
+        &self,
+        model: &mut Self::Model,
+        session: &mut <Self::Session as SemanticStateTransaction>::Branch,
+        input: &Self::Input,
+    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error> {
+        self.backend.submit_step(model, session, input)
+    }
+
+    fn retained_resources(&self, completion: &Self::Completion) -> usize {
+        self.backend.retained_resources(completion)
+    }
+}
+
+/// Creates a single-device realtime adapter from a portable device plan.
 ///
 /// Application facades use this factory boundary to keep native MLX streams
 /// out of their public API. Backend-author code that needs explicit streams or
 /// collective groups constructs [`crate::native::MlxRealtimeBackend`] directly instead.
-pub fn create_realtime_backend(
-    device: &DevicePlan,
-) -> Result<
-    impl RealtimeModelLoadingBackend<
-        Preparation = eredu_architectures::moshi::RealtimePreparationPlan,
-        LoadOptions = ModelLoadOptions,
-        Error = Error,
-    >,
-    Error,
-> {
+pub fn create_realtime_backend(device: &DevicePlan) -> Result<MlxRealtimeAdapter, Error> {
     let realized =
         mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
     let stream = Stream::new_with_device(&realized.device);
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    Ok(MlxRealtimeBackend::new(&stream, &weights_stream))
+    Ok(MlxRealtimeAdapter {
+        backend: MlxRealtimeBackend::new(&stream, &weights_stream),
+    })
 }
 
 /// Discovers hardware facts visible to the MLX adapter.

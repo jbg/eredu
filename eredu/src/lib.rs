@@ -68,6 +68,10 @@ pub use eredu_core::generation::{
     GenerationConfigOverrides, MtpConfig, MtpRequestId, MtpRequestPhase, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
 };
+pub use eredu_core::scheduler::{
+    RequestId, RequestStatus, SchedulerCapabilities, SchedulerError, SchedulerLimits,
+    SchedulerReport, WorkId,
+};
 pub use eredu_core::{
     Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
     ArtifactModality, ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner,

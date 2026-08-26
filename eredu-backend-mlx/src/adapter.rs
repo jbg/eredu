@@ -12,7 +12,7 @@ pub use crate::backend::{
 };
 pub use crate::composition::mlx::automatic::{
     create_realtime_backend, discover_hardware, expert_cache_telemetry, mtp_telemetry,
-    residency_telemetry, MlxBackendFactory,
+    residency_telemetry, MlxBackendFactory, MlxRealtimeAdapter,
 };
 pub use crate::composition::mlx::speculative::MtpComponentTimingGuard;
 pub use crate::composition::mlx::{inspect_model, MlxInspectionOptions, MlxModelOutput};

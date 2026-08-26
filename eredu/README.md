@@ -57,6 +57,12 @@ application wants portable plan-to-backend realization. These entry points
 construct the selected backend and any embedded or external speculative
 drafter described by the plan.
 
+Realtime speech models use the selected facade's concrete application API.
+`prepare_realtime_model` inspects the artifact, `LocalRealtimeBackendFactory`
+loads it, and `LocalRealtimeScheduler` accepts and returns portable host token
+frames. These operations require only the `eredu` crate; native backend traits,
+streams, tensors, sessions, and completions stay behind the facade.
+
 ## Cargo features
 
 - `mlx`: MLX execution with Metal and Accelerate; enabled by default.

@@ -71,14 +71,15 @@ completion and submission primitives, and distributed execution contracts are
 likewise imported directly from `eredu-core`. The facade root retains only
 deliberately application-facing types.
 
-The selected adapter exposes the causal backend type and a facade-owned
-realtime backend factory because the neutral execution contracts have
-different model, input, output, session, and completion associated types. The
-factory returns an opaque implementation of the neutral realtime loading and
-execution traits, preventing the concrete backend's native associated types
-and handle-oriented constructors from crossing `eredu::api`. An application
-does not depend directly on the concrete backend crate merely to select local
-realtime loading and execution. Explicit native streams and distributed
+The selected adapter exposes the causal backend type and facade-owned realtime
+model, scheduler, session, and completed-step wrappers because the neutral
+execution contracts have different model, input, output, session, and
+completion associated types. The realtime factory loads an architecture-owned
+preparation directly into the facade model. The facade scheduler materializes
+portable host input frames and observes portable host output frames while the
+concrete backend's native associated types and handle-oriented constructors
+remain private. An application therefore loads and operates local realtime
+models with only an `eredu` dependency. Explicit native streams and distributed
 collective groups remain backend-author concerns.
 
 Application-only targets and platform examples can depend solely on the
@@ -91,12 +92,15 @@ random state. Direct native access remains an explicit backend-author escape
 hatch under `eredu-backend-mlx::native`; it is not an application dependency.
 Sampling functions and sampler traits whose signatures expose raw MLX arrays,
 streams, or random state are exported only through that native namespace, not
-through the flat application-facing adapter. Concrete realtime backend types,
+through the flat application-facing adapter. Native realtime backend types,
 inputs, outputs, sessions, completions, and prompt helpers follow the same
-rule; the flat realtime factory returns an opaque neutral-trait implementation.
-Concrete causal sessions, exact completion types, speculative drafters, and
-owned model inputs also live under `eredu-backend-mlx::native`; callers of the
-flat backend use their neutral trait interfaces and inferred associated types.
+rule. The backend's flat `MlxRealtimeAdapter` has no native-handle accessors and
+exists so the facade can own a concrete implementation; facade-owned wrappers
+expose only portable frames, scheduling identities, limits, lifecycle state,
+and telemetry. Concrete causal sessions, exact completion types, speculative
+drafters, and owned model inputs also live under `eredu-backend-mlx::native`;
+callers of the flat backend use their neutral trait interfaces and inferred
+associated types.
 Raw completion submission remains crate-private. The flat adapter keeps native
 borrowed model-input views private and returns model logits through the
 backend-owned `MlxTensor` handle.

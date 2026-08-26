@@ -6,7 +6,9 @@
 
 #[cfg(feature = "mlx")]
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _};
 
 /// Discovers hardware available to the selected local backend.
 pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
@@ -57,10 +59,6 @@ pub enum LocalDevicePlanError {
 }
 
 /// Factory for local realtime model loading and execution.
-///
-/// The created backend is intentionally opaque: applications operate it
-/// through the portable realtime traits, while native streams, tensors, and
-/// collective groups remain behind the selected-backend boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalRealtimeBackendFactory {
     device: LocalDevice,
@@ -72,31 +70,27 @@ impl LocalRealtimeBackendFactory {
         Self { device }
     }
 
-    /// Creates a single-device realtime backend with host-side weight loading.
-    ///
-    /// Native backend handles cannot be recovered from the returned value:
-    ///
-    /// ```compile_fail
-    /// let backend = eredu::api::LocalRealtimeBackendFactory::new(
-    ///     eredu::api::LocalDevice::Cpu,
-    /// )
-    /// .create()
-    /// .unwrap();
-    /// let _ = backend.stream();
-    /// ```
-    pub fn create(
+    /// Loads an architecture-prepared realtime model with the default policy.
+    pub fn load(
         &self,
-    ) -> Result<
-        impl eredu_core::RealtimeModelLoadingBackend<
-            Preparation = crate::RealtimePreparationPlan,
-            LoadOptions = LocalLoadOptions,
-            Error = LocalBackendError,
-        >,
-        LocalBackendError,
-    > {
+        preparation: crate::RealtimePreparationPlan,
+    ) -> Result<LocalRealtimeModel, LocalBackendError> {
+        self.load_with_options(preparation, LocalLoadOptions::default())
+    }
+
+    /// Loads an architecture-prepared realtime model with explicit policy.
+    pub fn load_with_options(
+        &self,
+        preparation: crate::RealtimePreparationPlan,
+        options: LocalLoadOptions,
+    ) -> Result<LocalRealtimeModel, LocalBackendError> {
         let device = local_device_plan(self.device)
             .map_err(|error| LocalBackendError::AutomaticPlanning(error.to_string()))?;
-        eredu_backend_mlx::create_realtime_backend(&device)
+        let backend = eredu_backend_mlx::create_realtime_backend(&device)?;
+        let model = backend.materialize_realtime_model(preparation, options)?;
+        Ok(LocalRealtimeModel {
+            inner: eredu_core::RealtimeModel::new(backend, model),
+        })
     }
 }
 
@@ -104,6 +98,249 @@ impl Default for LocalRealtimeBackendFactory {
     fn default() -> Self {
         Self::new(LocalDevice::Cpu)
     }
+}
+
+/// Realtime coordination failure from the selected local backend.
+pub type LocalRealtimeError = eredu_core::RealtimeError<LocalBackendError>;
+
+/// A selected local realtime backend and its loaded model.
+///
+/// Native models, tensors, streams, and backend traits remain private. Use a
+/// [`LocalRealtimeScheduler`] to submit portable [`crate::RealtimeInputFrame`]
+/// values and observe portable [`crate::RealtimeOutputFrame`] values.
+pub struct LocalRealtimeModel {
+    inner: eredu_core::RealtimeModel<eredu_backend_mlx::MlxRealtimeAdapter>,
+}
+
+impl LocalRealtimeModel {
+    /// Name of the selected execution backend.
+    pub fn backend_name(&self) -> &str {
+        self.inner.backend().name()
+    }
+
+    /// Portable codec-token geometry for this model.
+    pub fn speech_config(&self) -> crate::RealtimeSpeechConfig {
+        self.inner.speech_config()
+    }
+}
+
+/// Request-local selected-backend state released from a realtime scheduler.
+pub struct LocalRealtimeSession {
+    inner: eredu_core::RealtimeSession<eredu_backend_mlx::MlxRealtimeAdapter>,
+}
+
+impl LocalRealtimeSession {
+    /// Committed batch dimension, when at least one frame was accepted.
+    pub fn batch_size(&self) -> Option<usize> {
+        self.inner.batch_size()
+    }
+}
+
+/// One completed, portable realtime transition.
+pub struct LocalRealtimeCompletedStep {
+    work: crate::WorkId,
+    output: crate::RealtimeOutputFrame,
+}
+
+impl LocalRealtimeCompletedStep {
+    /// Scheduler-assigned work identity.
+    pub const fn work(&self) -> crate::WorkId {
+        self.work
+    }
+
+    /// Borrows the completed host token frame.
+    pub const fn output(&self) -> &crate::RealtimeOutputFrame {
+        &self.output
+    }
+
+    /// Consumes this completion into its work identity and host token frame.
+    pub fn into_parts(self) -> (crate::WorkId, crate::RealtimeOutputFrame) {
+        (self.work, self.output)
+    }
+}
+
+/// Fair bounded realtime scheduler for a [`LocalRealtimeModel`].
+///
+/// This facade materializes portable host token frames before execution and
+/// observes completed backend outputs before returning them to the caller.
+pub struct LocalRealtimeScheduler {
+    inner: eredu_core::RealtimeScheduler<eredu_backend_mlx::MlxRealtimeAdapter>,
+}
+
+impl LocalRealtimeScheduler {
+    /// Creates an empty scheduler bound to one loaded local model.
+    pub fn new(
+        model: &LocalRealtimeModel,
+        limits: crate::SchedulerLimits,
+    ) -> Result<Self, LocalRealtimeError> {
+        Ok(Self {
+            inner: eredu_core::RealtimeScheduler::new(&model.inner, limits)?,
+        })
+    }
+
+    /// Registers a request with fresh selected-backend state.
+    pub fn register_request(
+        &mut self,
+        model: &LocalRealtimeModel,
+        request: crate::RequestId,
+        sampling: crate::RealtimeSampling,
+    ) -> Result<(), LocalRealtimeError> {
+        self.inner.register_request(&model.inner, request, sampling)
+    }
+
+    /// Registers a previously released request session.
+    pub fn register_request_with_session(
+        &mut self,
+        model: &LocalRealtimeModel,
+        request: crate::RequestId,
+        session: LocalRealtimeSession,
+    ) -> Result<(), LocalRealtimeError> {
+        self.inner
+            .register_request_with_session(&model.inner, request, session.inner)
+    }
+
+    /// Materializes and enqueues one portable host token frame.
+    pub fn enqueue(
+        &mut self,
+        model: &LocalRealtimeModel,
+        request: crate::RequestId,
+        frame: crate::RealtimeInputFrame,
+    ) -> Result<crate::WorkId, LocalRealtimeError> {
+        self.enqueue_with_deadline(model, request, frame, None)
+    }
+
+    /// Materializes and enqueues one frame with an absolute deadline.
+    pub fn enqueue_with_deadline(
+        &mut self,
+        model: &LocalRealtimeModel,
+        request: crate::RequestId,
+        frame: crate::RealtimeInputFrame,
+        deadline: Option<Instant>,
+    ) -> Result<crate::WorkId, LocalRealtimeError> {
+        let input = model
+            .inner
+            .backend()
+            .materialize_input(model.inner.model(), &frame)
+            .map_err(eredu_core::RealtimeError::Backend)?;
+        self.inner
+            .enqueue_with_deadline(&model.inner, request, input, deadline)
+    }
+
+    /// Atomically materializes and enqueues ordered portable host token frames.
+    pub fn enqueue_batch(
+        &mut self,
+        model: &LocalRealtimeModel,
+        request: crate::RequestId,
+        frames: Vec<crate::RealtimeInputFrame>,
+    ) -> Result<Vec<crate::WorkId>, LocalRealtimeError> {
+        let inputs = frames
+            .iter()
+            .map(|frame| {
+                model
+                    .inner
+                    .backend()
+                    .materialize_input(model.inner.model(), frame)
+                    .map_err(eredu_core::RealtimeError::Backend)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.inner.enqueue_batch(&model.inner, request, inputs)
+    }
+
+    /// Advances one unbounded fair scheduling turn and observes completed frames.
+    pub fn run_queued(
+        &mut self,
+        model: &mut LocalRealtimeModel,
+    ) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
+        let completed = self.inner.run_queued(&mut model.inner)?;
+        observe_realtime_steps(model, completed)
+    }
+
+    /// Advances at most `max_frames` transitions and observes completed frames.
+    pub fn run_bounded(
+        &mut self,
+        model: &mut LocalRealtimeModel,
+        max_frames: usize,
+    ) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
+        let completed = self.inner.run_bounded(&mut model.inner, max_frames)?;
+        observe_realtime_steps(model, completed)
+    }
+
+    /// Completes one request and drops its backend session.
+    pub fn finish_request(&mut self, request: crate::RequestId) -> Result<(), LocalRealtimeError> {
+        self.inner.finish_request(request)
+    }
+
+    /// Cancels one request and discards queued frames.
+    pub fn cancel_request(&mut self, request: crate::RequestId) -> Result<(), LocalRealtimeError> {
+        self.inner.cancel_request(request)
+    }
+
+    /// Releases an idle request for persistence or resumption.
+    pub fn release_request(
+        &mut self,
+        request: crate::RequestId,
+    ) -> Result<LocalRealtimeSession, LocalRealtimeError> {
+        Ok(LocalRealtimeSession {
+            inner: self.inner.release_request(request)?,
+        })
+    }
+
+    /// Removes a terminal identity for explicit reuse.
+    pub fn forget_terminal_request(
+        &mut self,
+        request: crate::RequestId,
+    ) -> Result<crate::RequestStatus, LocalRealtimeError> {
+        self.inner.forget_terminal_request(request)
+    }
+
+    /// Lifecycle state for a known request.
+    pub fn request_status(&self, request: crate::RequestId) -> Option<crate::RequestStatus> {
+        self.inner.request_status(request)
+    }
+
+    /// Queued frame count for one request.
+    pub fn queued_for_request(&self, request: crate::RequestId) -> usize {
+        self.inner.queued_for_request(request)
+    }
+
+    /// Replaces sampling controls for an idle active request.
+    pub fn set_request_sampling(
+        &mut self,
+        model: &LocalRealtimeModel,
+        request: crate::RequestId,
+        sampling: crate::RealtimeSampling,
+    ) -> Result<(), LocalRealtimeError> {
+        self.inner
+            .set_request_sampling(&model.inner, request, sampling)
+    }
+
+    /// Generic occupancy and lifecycle telemetry.
+    pub fn report(&self) -> crate::SchedulerReport {
+        self.inner.report()
+    }
+
+    /// Configured bounds and observed backend capabilities.
+    pub fn capabilities(&self) -> crate::SchedulerCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+fn observe_realtime_steps(
+    model: &LocalRealtimeModel,
+    completed: Vec<eredu_core::RealtimeCompletedStep<eredu_backend_mlx::native::MlxRealtimeOutput>>,
+) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
+    completed
+        .into_iter()
+        .map(|step| {
+            let (work, output) = step.into_parts();
+            let output = model
+                .inner
+                .backend()
+                .observe_output(&output)
+                .map_err(eredu_core::RealtimeError::Backend)?;
+            Ok(LocalRealtimeCompletedStep { work, output })
+        })
+        .collect()
 }
 
 /// Process-global configuration for the selected local runtime.
