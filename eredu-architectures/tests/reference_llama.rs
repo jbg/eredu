@@ -1840,7 +1840,7 @@ fn execute_reference_moshi_frame(
         .collect::<Vec<_>>();
     let audio = audio_values.iter().collect::<Vec<_>>();
     clear_reference_trace();
-    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    let mut boundary = moshi::DecisionBoundary::new(config).unwrap();
     let (logits, forward) = {
         let mut hook = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
         runtime

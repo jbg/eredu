@@ -2887,14 +2887,6 @@ impl ConcatKeyValueCache {
         Ok(cache)
     }
 
-    /// Creates an empty concatenating cache that retains at most `max_size` tokens.
-    pub fn new_with_max_size(max_size: i32) -> Self {
-        Self {
-            max_size: Some(max_size),
-            ..Self::default()
-        }
-    }
-
     /// Creates a cache for exact causal sliding-window attention.
     ///
     /// A window of `N` includes the current token, so the cache retains at most

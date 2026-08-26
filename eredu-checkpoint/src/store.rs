@@ -1789,7 +1789,10 @@ mod tests {
             SafetensorsWeightStore::open_with_max_mapped_shards(directory.path(), 1).unwrap();
         store.metadata("left").unwrap();
         let metadata_diagnostics = store.diagnostics().unwrap();
-        assert_eq!(metadata_diagnostics.touched_shard_paths, [first.clone()]);
+        assert_eq!(
+            metadata_diagnostics.touched_shard_paths,
+            std::slice::from_ref(&first)
+        );
         assert!(metadata_diagnostics.payload_shard_paths.is_empty());
         let lease = store
             .acquire(TensorReadRequest {

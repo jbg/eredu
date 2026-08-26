@@ -295,24 +295,6 @@ fn validate_dimensions(
     Ok(())
 }
 
-/// Token ownership layout used by expert dispatch.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum TokenLayout {
-    /// Every EP rank has identical hidden rows and router results.
-    Replicated,
-    /// Each source rank owns disjoint hidden rows and exchanges routes.
-    Sharded,
-}
-
-/// Transport selected for expert routes.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ExpertExchangeStrategy {
-    /// Compact local routes, execute local experts, and all-sum token outputs.
-    ReplicatedInputAllSum,
-    /// Compact variable-count all-to-all over the active EP group.
-    AllToAllV,
-}
-
 /// Route transport selected for a sharded expert exchange.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum RoutedTransport {

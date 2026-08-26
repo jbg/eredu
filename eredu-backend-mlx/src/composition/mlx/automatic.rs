@@ -210,7 +210,6 @@ fn mlx_load_options(
             max_mapped_shards: plan.max_mapped_shards,
             sample_backend_memory: factory.sample_mlx_memory,
             sample_process_memory: factory.sample_process_memory,
-            ..LayerwiseLoadOptions::default()
         }),
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes,

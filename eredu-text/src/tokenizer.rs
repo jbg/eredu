@@ -390,15 +390,6 @@ pub struct Document {
     pub text: String,
 }
 
-pub enum Padding {
-    Longest,
-    MaxLength,
-}
-
-pub enum Truncation {
-    MaxLength(usize),
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub struct JsonConversation(pub Vec<serde_json::Value>);
@@ -498,22 +489,6 @@ fn invalid_chat_template(message: String) -> std::io::Error {
         std::io::ErrorKind::InvalidData,
         Error::InvalidChatTemplate(message),
     )
-}
-
-/// Returns undeclared top-level variables referenced by a chat template.
-///
-/// This is static template analysis: it identifies variables that might be
-/// looked up at render time, but it does not infer value types or defaults.
-pub fn chat_template_variables(
-    model_template: &str,
-    model_id: &str,
-) -> Result<BTreeSet<String>, Error> {
-    let mut env = Environment::new();
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    let compatible_template = normalize_chat_template(model_template);
-    env.add_template_owned(model_id.to_owned(), compatible_template)?;
-    let template = env.get_template(model_id)?;
-    Ok(template.undeclared_variables(false).into_iter().collect())
 }
 
 /// Returns likely user-provided kwargs referenced by a chat template.

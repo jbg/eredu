@@ -93,16 +93,6 @@ impl eredu_architectures::media_plan::PreparedInputInspector<Array> for MlxInput
     }
 }
 
-pub fn ensure_hidden_size(array: &Array, hidden_size: i32, name: &str) -> Result<(), Exception> {
-    let shape = array.shape();
-    if shape.len() != 3 || shape[2] != hidden_size {
-        return Err(Exception::custom(format!(
-            "{name} must be shaped [batch, sequence, {hidden_size}], got {shape:?}"
-        )));
-    }
-    Ok(())
-}
-
 /// Validates basic modality/payload compatibility.
 pub fn validate(input: ModelInput<'_>) -> Result<(), Exception> {
     if input.parts.is_empty() {

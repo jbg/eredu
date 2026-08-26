@@ -1,4 +1,8 @@
-use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
+use std::{
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use eredu::{
     api::{
@@ -128,8 +132,8 @@ fn run_greedy(
 }
 
 fn run_mtp(
-    target_dir: &PathBuf,
-    assistant_dir: &PathBuf,
+    target_dir: &Path,
+    assistant_dir: &Path,
     prepared: &PreparedChat,
     max_tokens: usize,
 ) -> anyhow::Result<GenerationResult> {

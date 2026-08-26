@@ -485,7 +485,7 @@ pub fn model_args_from_gguf_catalog_with_context(
     let layers = usize::try_from(num_hidden_layers)
         .map_err(|_| invalid(format!("invalid GGUF block count {num_hidden_layers}")))?;
     let attention_schedule = if variant == QwenVariant::Qwen2 {
-        gguf_qwen2_schedule(metadata, &architecture, layers)?
+        gguf_qwen2_schedule(metadata, architecture, layers)?
     } else {
         LayerSchedule::all_full(layers).map_err(|error| invalid(error.to_string()))?
     };
@@ -533,7 +533,7 @@ pub fn model_args_from_gguf_catalog_with_context(
         max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(1_000_000.0),
         tie_word_embeddings: !arrays.contains("output.weight"),
-        rope_scaling: gguf_rope_scaling(metadata, &architecture)?,
+        rope_scaling: gguf_rope_scaling(metadata, architecture)?,
         attention_schedule,
         moe_intermediate_size: if is_moe {
             gguf_i32(metadata, &key("expert_feed_forward_length"))?

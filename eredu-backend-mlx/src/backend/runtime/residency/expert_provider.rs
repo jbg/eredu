@@ -592,6 +592,10 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "cache-provider tests stay adjacent to provider construction"
+)]
 mod tests {
     use super::*;
     use eredu_nn::{GatedProductExpertLayout, RoutingResult};

@@ -2173,13 +2173,13 @@ pub fn open_pipeline_gguf_store(
         .add_checkpoint(
             checkpoint.catalog().clone(),
             source.plan().checkpoint(),
-            |name| eredu_architectures::gemma4::translate_gguf_weight_name(name),
+            eredu_architectures::gemma4::translate_gguf_weight_name,
         )?;
     let builder = if let Some(projector) = projector {
         builder.add_checkpoint(
             projector.checkpoint().catalog().clone(),
             projector.plan().checkpoint(),
-            |name| eredu_architectures::gemma4::translate_mmproj_weight_name(name),
+            eredu_architectures::gemma4::translate_mmproj_weight_name,
         )?
     } else {
         builder

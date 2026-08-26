@@ -3,10 +3,9 @@
 use eredu_checkpoint::{BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 
 use safemlx::{
-    builder::Builder,
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, Param},
+    module::Param,
     native_quantization::NativeQuantizedTensor,
     nn,
     ops::{matmul, quantized_matmul_with_mode, quantized_packed_dimension, QuantizationMode},
@@ -228,44 +227,12 @@ impl PhysicalLinear {
     }
 }
 
-/// Builds an initialized untied language-model head.
-pub fn build_lm_head(hidden_size: i32, vocab_size: i32) -> Result<nn::Linear, Exception> {
-    nn::LinearBuilder::new(hidden_size, vocab_size)
-        .bias(false)
-        .build()
-}
-
-/// Builds an unloaded untied language-model head.
-pub fn build_unloaded_lm_head(
-    hidden_size: i32,
-    vocab_size: i32,
-    stream: &Stream,
-) -> Result<nn::Linear, Exception> {
-    nn::Linear::unloaded(hidden_size, vocab_size, false, Dtype::Float32, stream)
-}
-
-/// Builds an initialized language-model head wrapped for optional quantization.
-pub fn build_maybe_quantized_lm_head(
-    hidden_size: i32,
-    vocab_size: i32,
-) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    Ok(MaybeQuantized::Original(build_lm_head(
-        hidden_size,
-        vocab_size,
-    )?))
-}
-
-/// Builds an unloaded language-model head wrapped for optional quantization.
-pub fn build_unloaded_maybe_quantized_lm_head(
-    hidden_size: i32,
-    vocab_size: i32,
-    stream: &Stream,
-) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    unloaded_maybe_quantized_linear(hidden_size, vocab_size, false, None, stream)
-}
-
 /// Creates an unloaded linear using the standard dense or affine parameter tree.
-pub fn unloaded_maybe_quantized_linear(
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+pub(crate) fn unloaded_maybe_quantized_linear(
     input_dims: i32,
     output_dims: i32,
     bias: bool,
@@ -283,7 +250,11 @@ pub fn unloaded_maybe_quantized_linear(
 }
 
 /// Creates an unloaded linear using the requested dense dtype or a quantized parameter tree.
-pub fn unloaded_maybe_quantized_linear_with_dtype(
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+fn unloaded_maybe_quantized_linear_with_dtype(
     input_dims: i32,
     output_dims: i32,
     bias: bool,
@@ -324,7 +295,7 @@ pub fn unloaded_maybe_quantized_linear_with_dtype(
 }
 
 /// Creates an unloaded embedding using the standard dense or affine parameter tree.
-pub fn unloaded_maybe_quantized_embedding(
+pub(crate) fn unloaded_maybe_quantized_embedding(
     embedding_count: i32,
     dimensions: i32,
     quantization: Option<WeightQuantization>,
@@ -340,7 +311,7 @@ pub fn unloaded_maybe_quantized_embedding(
 }
 
 /// Creates an unloaded embedding using the requested dense dtype or a quantized parameter tree.
-pub fn unloaded_maybe_quantized_embedding_with_dtype(
+fn unloaded_maybe_quantized_embedding_with_dtype(
     embedding_count: i32,
     dimensions: i32,
     quantization: Option<WeightQuantization>,
@@ -373,46 +344,5 @@ pub fn unloaded_maybe_quantized_embedding_with_dtype(
             dense_dtype,
             stream,
         )?)),
-    }
-}
-
-/// Builds an unloaded language-model head with optional affine quantization.
-pub fn build_unloaded_maybe_quantized_lm_head_with_quantization(
-    hidden_size: i32,
-    vocab_size: i32,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    unloaded_maybe_quantized_linear(hidden_size, vocab_size, false, quantization, stream)
-}
-
-/// Projects hidden states to logits, using tied embeddings when `lm_head` is absent.
-pub fn project_logits_maybe_quantized(
-    lm_head: &mut Option<MaybeQuantized<nn::Linear>>,
-    embed_tokens: &mut MaybeQuantized<nn::Embedding>,
-    hidden_states: &Array,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    match lm_head.as_mut() {
-        Some(lm_head) => lm_head.forward(hidden_states, stream),
-        None => match embed_tokens {
-            MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(hidden_states, stream),
-            MaybeQuantized::Quantized(q_embed_tokens) => {
-                q_embed_tokens.as_linear(hidden_states, stream)
-            }
-        },
-    }
-}
-
-/// Projects hidden states to logits for dense, non-quantized heads.
-pub fn project_logits_dense(
-    lm_head: &mut Option<nn::Linear>,
-    embed_tokens: &nn::Embedding,
-    hidden_states: &Array,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    match lm_head.as_mut() {
-        Some(lm_head) => lm_head.forward(hidden_states, stream),
-        None => embed_tokens.as_linear(hidden_states, stream),
     }
 }

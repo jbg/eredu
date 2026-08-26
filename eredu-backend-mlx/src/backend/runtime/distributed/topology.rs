@@ -401,18 +401,6 @@ impl PlacementPlan {
         }
     }
 
-    /// Adds a tensor-parallel shard using this rank's TP coordinate.
-    pub fn insert_tensor_parallel(&mut self, target: impl Into<String>, axis: usize) {
-        self.insert(
-            target,
-            TensorPlacement::Shard {
-                axis,
-                index: self.topology.tensor_parallel_rank,
-                parts: self.topology.tensor_parallel_size,
-            },
-        );
-    }
-
     /// Adds this rank's balanced tensor-parallel range on `axis`.
     pub fn insert_balanced_tensor_parallel(
         &mut self,
@@ -690,14 +678,6 @@ impl RankPartition {
     pub fn opened_shards(&self) -> &[PathBuf] {
         &self.opened_shards
     }
-
-    /// Consumes the partition and returns its locally materialized tensors.
-    ///
-    /// Pipeline stage constructors use this to move arrays directly into
-    /// stage-local modules without cloning the partition or its arrays.
-    pub fn into_tensors(self) -> HashMap<String, Array> {
-        self.tensors
-    }
 }
 
 #[derive(Default)]
@@ -773,15 +753,6 @@ pub fn load_safetensors_partition_on_streams(
 ) -> Result<RankPartition, Error> {
     let store = SafetensorsWeightStore::open(model_dir)?;
     load_partition_from_store_on_streams(&store, plan, source_stream, execution_stream)
-}
-
-/// Selectively loads a rank partition from a reusable checkpoint store.
-pub fn load_partition_from_store(
-    store: &(impl CheckpointSource + ?Sized),
-    plan: &PlacementPlan,
-    stream: &Stream,
-) -> Result<RankPartition, Error> {
-    load_partition_from_store_on_streams(store, plan, stream, stream)
 }
 
 /// Selectively loads a rank partition from a reusable checkpoint store using

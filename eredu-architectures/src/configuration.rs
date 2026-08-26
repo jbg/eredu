@@ -371,9 +371,6 @@ pub enum GgufArchitecture {
 }
 
 impl GgufArchitecture {
-    /// Accepted `general.architecture` values.
-    pub const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, deepseek4, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
-
     /// Resolves `general.architecture` through the architecture registry.
     pub fn resolve(name: &str) -> Result<Self, ArtifactError> {
         match name {

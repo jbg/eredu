@@ -107,18 +107,6 @@ fn is_native_scale_sentinel(name: &str, shape: &[i32], weight_dtype: Option<Dtyp
         && weight_dtype == Some(Dtype::Uint8)
 }
 
-/// Returns the checkpoint-backed parameter names exposed by `module` under `prefix`.
-pub fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec<String> {
-    let parameters = module.parameters().flatten();
-    let mut names = parameters
-        .iter()
-        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
-        .map(|(name, _)| qualify(prefix, name))
-        .collect::<Vec<_>>();
-    names.sort();
-    names
-}
-
 /// Builds exact full-tensor residency bindings for an unloaded module.
 ///
 /// Every module parameter must resolve to exactly one checkpoint key and have
@@ -162,43 +150,6 @@ pub fn build_module_bindings_with_recipes(
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
     build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
-}
-
-/// Readdresses fully qualified semantic bindings to one module's local
-/// parameter names while preserving their architecture-logical targets.
-pub fn localize_module_bindings(
-    module: &impl ModuleParameters,
-    bindings: Vec<WeightBinding>,
-) -> Result<Vec<WeightBinding>, ModuleBindingError> {
-    let parameters = module.parameters().flatten();
-    let local_names = parameters
-        .iter()
-        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
-        .map(|(name, _)| name.to_string())
-        .collect::<BTreeSet<_>>();
-    bindings
-        .into_iter()
-        .map(|binding| {
-            let candidates = local_names
-                .iter()
-                .filter(|local| {
-                    binding.name() == local.as_str()
-                        || binding
-                            .name()
-                            .strip_suffix(local.as_str())
-                            .is_some_and(|prefix| prefix.ends_with('.'))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if candidates.len() != 1 {
-                return Err(ModuleBindingError::LocalParameterTarget {
-                    binding: binding.name().to_owned(),
-                    candidates,
-                });
-            }
-            Ok(binding.with_name(&candidates[0])?)
-        })
-        .collect()
 }
 
 /// Replaces global binding sources with architecture-produced rank-local recipes.
@@ -268,27 +219,6 @@ pub fn build_module_binding_plan_with_recipes(
     build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, |_| false)
 }
 
-/// Builds exact checkpoint bindings from a backend-neutral parameter module.
-///
-/// Stable parameter identities are already fully qualified, so no
-/// family-specific checkpoint root is accepted here.
-pub fn build_neutral_module_bindings<M>(
-    module: &M,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<WeightBinding>, ModuleBindingError>
-where
-    M: Parameterized<crate::MlxTensor>,
-{
-    build_flattened_module_binding_plan_with_recipes_excluding(
-        neutral_parameter_refs(module, false).flatten(),
-        "",
-        store,
-        BTreeMap::new(),
-        |_| false,
-    )?
-    .build_bindings(store)
-}
-
 /// Builds exact bindings for one architecture-owned static module, consuming
 /// any architecture recipes whose destinations belong to that module.
 pub fn build_neutral_module_bindings_with_recipes<M>(
@@ -315,10 +245,7 @@ where
     F: Fn(&str) -> bool,
 {
     let parameters = neutral_parameter_refs(module, false).flatten();
-    let names = parameters
-        .iter()
-        .map(|(name, _)| name.to_owned())
-        .collect::<BTreeSet<_>>();
+    let names = parameters.keys().cloned().collect::<BTreeSet<_>>();
     let selected = recipes
         .keys()
         .filter(|name| names.contains(name.as_str()))
@@ -920,14 +847,6 @@ pub enum ModuleBindingError {
         /// Full module parameter name.
         destination: String,
     },
-    /// A semantic binding did not identify exactly one module-local parameter.
-    #[error("binding {binding:?} resolves to module-local parameters {candidates:?}, expected exactly one")]
-    LocalParameterTarget {
-        /// Fully qualified semantic binding.
-        binding: String,
-        /// Matching module-local parameter names.
-        candidates: Vec<String>,
-    },
     /// Two parameters resolved to one checkpoint tensor.
     #[error("checkpoint tensor {checkpoint_key:?} resolves to both {first:?} and {second:?}")]
     DuplicateCheckpointBinding {
@@ -1006,6 +925,10 @@ pub enum ModuleBindingError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "binding tests stay adjacent to the binding planners they exercise"
+)]
 mod tests {
     use super::*;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]

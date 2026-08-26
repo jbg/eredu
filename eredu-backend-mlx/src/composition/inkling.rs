@@ -2384,7 +2384,7 @@ fn open_gguf_store(
         builder = builder.add_checkpoint(
             projector.checkpoint().catalog().clone(),
             projector.plan().checkpoint(),
-            |name| eredu_architectures::inkling::translate_mmproj_weight_name(name),
+            eredu_architectures::inkling::translate_mmproj_weight_name,
         )?;
     }
     let store: SharedCheckpointSource = Arc::new(builder.build()?);

@@ -471,17 +471,6 @@ impl ParallelBuildContext {
     pub fn planner(self) -> ParallelPlanBuilder {
         ParallelPlanBuilder::with_policy(self.topology, self.policy)
     }
-
-    /// Returns the local width for an equal logical partition.
-    pub fn equal_local_dimension(self, name: &str, global: usize) -> Result<usize, Error> {
-        let parts = self.topology.tensor_parallel_size;
-        if parts == 0 || global == 0 || !global.is_multiple_of(parts) {
-            return Err(Error::Parallel(format!(
-                "{name} dimension {global} is not divisible by TP size {parts}"
-            )));
-        }
-        Ok(global / parts)
-    }
 }
 
 /// Borrowed execution resources for replicated or tensor-parallel primitives.

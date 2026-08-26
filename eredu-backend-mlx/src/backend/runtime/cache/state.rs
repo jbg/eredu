@@ -305,11 +305,6 @@ impl MlxPoolingAttentionCache {
         self.local_mut().finalize()
     }
 
-    /// Returns the complete local key-only snapshot for resident publication.
-    pub fn local_snapshot(&self, stream: &Stream) -> Result<Option<(Array, Array)>, Exception> {
-        self.local().snapshot_arrays(stream)
-    }
-
     /// Borrows every architecture-declared pooling component for persistence.
     pub fn prompt_cache_state_arrays(&self, global_layer: usize) -> Vec<PromptCacheStateArray<'_>> {
         let mut arrays = Vec::new();
@@ -1882,24 +1877,6 @@ impl MlxHybridState {
             current.fixed.clone_from(&previous.fixed);
             current.fixed_offset = previous.fixed_offset;
         }
-        Ok(())
-    }
-
-    /// Commits a contiguous architecture-owned execution-group state range.
-    pub fn commit_layer_range_from(
-        &mut self,
-        source: &Self,
-        start: usize,
-    ) -> Result<(), Exception> {
-        if self.layout != source.layout
-            || self.global_layer_start != source.global_layer_start
-            || start > self.layers.len()
-        {
-            return Err(Exception::custom(
-                "hybrid draft state layout does not match canonical state",
-            ));
-        }
-        self.layers[start..].clone_from_slice(&source.layers[start..]);
         Ok(())
     }
 

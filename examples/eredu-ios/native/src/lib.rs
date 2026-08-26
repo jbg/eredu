@@ -202,8 +202,13 @@ fn worker_main(
 /// Loads a model on a dedicated native thread.
 ///
 /// Returns null and sets `error_out` on failure.
+///
+/// # Safety
+///
+/// Path pointers must address valid NUL-terminated strings. When non-null,
+/// `error_out` must be writable for one pointer value.
 #[no_mangle]
-pub extern "C" fn eredu_model_create(
+pub unsafe extern "C" fn eredu_model_create(
     model_path: *const c_char,
     metallib_path: *const c_char,
     error_out: *mut *mut c_char,
@@ -249,8 +254,14 @@ pub extern "C" fn eredu_model_create(
 /// Generates one response using checkpoint defaults and streams UTF-8 fragments.
 ///
 /// Returns zero on success and sets `error_out` on failure.
+///
+/// # Safety
+///
+/// `handle` must be a live handle returned by [`eredu_model_create`], `prompt`
+/// must address a valid NUL-terminated string, and each non-null output pointer
+/// must be writable for its value type for the duration of this call.
 #[no_mangle]
-pub extern "C" fn eredu_model_generate(
+pub unsafe extern "C" fn eredu_model_generate(
     handle: *mut ModelHandle,
     prompt: *const c_char,
     callback: Option<TextCallback>,
@@ -322,8 +333,13 @@ pub extern "C" fn eredu_model_generate(
 }
 
 /// Stops the worker and releases a model handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live handle returned by [`eredu_model_create`]
+/// that has not previously been freed.
 #[no_mangle]
-pub extern "C" fn eredu_model_free(handle: *mut ModelHandle) {
+pub unsafe extern "C" fn eredu_model_free(handle: *mut ModelHandle) {
     if handle.is_null() {
         return;
     }
@@ -336,8 +352,13 @@ pub extern "C" fn eredu_model_free(handle: *mut ModelHandle) {
 }
 
 /// Releases an error string returned by this library.
+///
+/// # Safety
+///
+/// `value` must be null or an error string returned by this library that has
+/// not previously been freed.
 #[no_mangle]
-pub extern "C" fn eredu_string_free(value: *mut c_char) {
+pub unsafe extern "C" fn eredu_string_free(value: *mut c_char) {
     if !value.is_null() {
         // SAFETY: ownership was created with `CString::into_raw` by this library.
         drop(unsafe { CString::from_raw(value) });

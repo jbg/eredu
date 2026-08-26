@@ -71,7 +71,7 @@ impl MlxAcceleratorFamily {
             Self::Metal => {
                 #[cfg(all(feature = "metal", target_vendor = "apple"))]
                 {
-                    return safemlx::metal::is_available().map_err(Into::into);
+                    safemlx::metal::is_available().map_err(Into::into)
                 }
                 #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
                 {
@@ -81,7 +81,7 @@ impl MlxAcceleratorFamily {
             Self::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
-                    return safemlx::cuda::is_available().map_err(Into::into);
+                    safemlx::cuda::is_available().map_err(Into::into)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -473,6 +473,10 @@ impl<'a> BackendProvider for MlxBackend<'a> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "backend-selection tests stay adjacent to the selection implementation"
+)]
 mod tests {
     use super::{device_capabilities, MlxBackend, MlxDeviceIdentity};
     use eredu_core::BackendProvider as _;

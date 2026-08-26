@@ -2952,7 +2952,7 @@ impl NeuralBackend for NumericBackend {
                     / group_width as f32
                     + epsilon)
                     .sqrt();
-                for dimension in 0..group_width {
+                for (dimension, source_value) in source.iter().copied().enumerate() {
                     let gate = gate.data[start + dimension];
                     let scale = if weight.data.len() == width {
                         weight.data[group * group_width + dimension]
@@ -2960,7 +2960,7 @@ impl NeuralBackend for NumericBackend {
                         weight.data[dimension]
                     };
                     output.data[start + dimension] =
-                        source[dimension] / rms * scale * (gate / (1.0 + (-gate).exp()));
+                        source_value / rms * scale * (gate / (1.0 + (-gate).exp()));
                 }
             }
         }
@@ -3111,7 +3111,7 @@ impl NeuralBackend for NumericBackend {
                         1.0
                     };
                     let mut scores = vec![f32::NEG_INFINITY; keys as usize];
-                    for key in 0..keys as usize {
+                    for (key, score) in scores.iter_mut().enumerate() {
                         let distance = query_position - (input.key_offset + key as i32);
                         if distance < 0 || input.window.is_some_and(|window| distance >= window) {
                             continue;
@@ -3134,7 +3134,7 @@ impl NeuralBackend for NumericBackend {
                         } else {
                             0.0
                         };
-                        scores[key] = (dot + bias) * tau;
+                        *score = (dot + bias) * tau;
                     }
                     let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                     let denominator = scores
@@ -3143,8 +3143,8 @@ impl NeuralBackend for NumericBackend {
                         .sum::<f32>();
                     let output_base = ((b * *heads as usize + head) * *queries as usize + query)
                         * *dimensions as usize;
-                    for key in 0..keys as usize {
-                        let probability = (scores[key] - maximum).exp() / denominator;
+                    for (key, score) in scores.iter().enumerate() {
+                        let probability = (*score - maximum).exp() / denominator;
                         let value_base = ((b * key_heads as usize + key_head) * keys as usize
                             + key)
                             * *dimensions as usize;
@@ -4317,8 +4317,8 @@ impl Parameterized<NumericTensor> for NumericRelu2ExpertBank {
     where
         V: ParameterVisitorMut<'a, NumericTensor>,
     {
-        visit_mut(&mut self.up.1, &mut self.up.0, visitor);
-        visit_mut(&mut self.down.1, &mut self.down.0, visitor);
+        visit_mut(&self.up.1, &mut self.up.0, visitor);
+        visit_mut(&self.down.1, &mut self.down.0, visitor);
     }
 
     fn set_trainable(&mut self, trainable: bool) {
@@ -6204,8 +6204,7 @@ fn moshi_numeric_teacher_forced_logits_are_exact_across_continuation() {
                 &mut traversal,
             )
             .unwrap();
-        let (decisions, observations) = traversal.into_parts();
-        drop(decisions);
+        let (_, observations) = traversal.into_parts();
         (text_logits, observations)
     };
     driver.finish().unwrap();
@@ -6339,8 +6338,7 @@ fn moshi_numeric_rejects_out_of_range_tokens_before_cache_mutation() {
             &mut state,
             &context,
         )
-        .err()
-        .expect("out-of-range token must fail");
+        .expect_err("out-of-range token must fail");
     assert!(error.to_string().contains("embedding token is invalid"));
     assert_eq!(state.as_ref()[0].position(), 0);
     assert_eq!(state.as_ref()[1].position(), 0);

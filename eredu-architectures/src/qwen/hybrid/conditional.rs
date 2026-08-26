@@ -1774,6 +1774,10 @@ fn conditional_prediction_group_transport(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "the transport contract tests stay adjacent to the transport declaration"
+)]
 mod transport_tests {
     use super::{conditional_prediction_group_transport, ConditionalPipelineBoundarySchema};
     use eredu_runtime::ArchitectureBoundary;

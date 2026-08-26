@@ -22,10 +22,6 @@ use safemlx::{
 };
 
 use crate::MlxTensor;
-use crate::{
-    backend::error::Error,
-    backend::runtime::checkpoint::quantization::{quantize_tensor, QuantizedTensor},
-};
 
 use super::layers::{relu2, silu};
 
@@ -140,51 +136,6 @@ pub fn packed_grouped_linear_with_options(
         stream,
     )?
     .reshape(&[routes, out_features], stream)
-}
-
-/// Quantizes a floating-point rank-3 packed expert bank while preserving its
-/// leading expert dimension in the emitted weight, scale, and bias tensors.
-pub fn quantize_expert_bank(
-    value: &Array,
-    quantization: WeightQuantization,
-    stream: &Stream,
-) -> Result<QuantizedTensor, Error> {
-    if value.ndim() != 3 || !value.dtype().is_float() {
-        return Err(Error::Quantization(format!(
-            "expected a floating-point rank-3 expert bank, got shape {:?} and dtype {:?}",
-            value.shape(),
-            value.dtype()
-        )));
-    }
-    let shape = value.shape();
-    let experts = shape[0];
-    let output_dims = shape[1];
-    let input_dims = shape[2];
-    let matrix = value.reshape(&[experts * output_dims, input_dims], stream)?;
-    let quantized = quantize_tensor(&matrix, quantization, stream)?;
-    Ok(QuantizedTensor {
-        weight: quantized.weight.reshape(
-            &[
-                experts,
-                output_dims,
-                quantized_packed_dimension(input_dims, quantization.bits()),
-            ],
-            stream,
-        )?,
-        scales: quantized.scales.reshape(
-            &[experts, output_dims, input_dims / quantization.group_size()],
-            stream,
-        )?,
-        biases: quantized
-            .biases
-            .map(|biases| {
-                biases.reshape(
-                    &[experts, output_dims, input_dims / quantization.group_size()],
-                    stream,
-                )
-            })
-            .transpose()?,
-    })
 }
 
 /// Router score transform used before top-k expert selection.
@@ -312,20 +263,6 @@ pub struct TopKRouterOutput {
     pub scores: Array,
     /// Final routing weights after optional normalization/scaling.
     pub weights: Array,
-}
-
-/// Selects the largest router logits and normalizes only the selected values.
-/// The softmax is applied after top-k selection rather than across every
-/// candidate expert.
-pub fn top_k_softmax_routing(
-    logits: &Array,
-    top_k: i32,
-    stream: &Stream,
-) -> Result<(Array, Array), Exception> {
-    let indices =
-        argpartition_axis(logits, -top_k, -1, stream)?.try_index_device((.., -top_k..), stream)?;
-    let selected = take_along_axis(logits, &indices, -1, stream)?;
-    Ok((indices, softmax_axis(&selected, -1, true, stream)?))
 }
 
 impl TopKRouter {
@@ -571,22 +508,6 @@ impl TopKRouter {
             scores: selected_scores,
             weights: top_k_weights,
         })
-    }
-
-    /// Computes routing weights for caller-provided global expert ids.
-    ///
-    /// In hash-router form, the checkpoint's
-    /// token-id table chooses experts, while the ordinary router projection
-    /// still supplies their normalized contribution weights.
-    pub fn forward_with_routing_indices(
-        &mut self,
-        hidden_states: &Array,
-        expert_indices: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let output =
-            self.forward_routes_with_routing_indices(hidden_states, expert_indices, stream)?;
-        Ok((output.indices, output.weights))
     }
 
     /// Returns caller-selected ids, their raw transformed scores, and final

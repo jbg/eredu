@@ -271,6 +271,10 @@ pub fn expert_realization_plan<B: RoutedNeuralBackend>(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "the focused realization tests stay adjacent to the realization planner"
+)]
 mod tests {
     use super::*;
 

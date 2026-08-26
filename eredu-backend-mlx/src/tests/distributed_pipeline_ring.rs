@@ -919,7 +919,7 @@ fn pipeline_ring_worker() {
         }
         let (backend, session) = runtime.parts_mut();
         let mut output = session
-            .prefill(&backend, ModelInput::new(&parts).into())
+            .prefill(backend, ModelInput::new(&parts).into())
             .unwrap()
             .wait()
             .unwrap();
@@ -969,7 +969,7 @@ fn pipeline_ring_worker() {
         let rank_prompt_cache = prompt_cache_root.join(format!("rank-{expected_rank}"));
         session
             .save_prompt_cache(
-                &backend,
+                backend,
                 &rank_prompt_cache,
                 descriptor.clone(),
                 &prefix_tokens,
@@ -985,7 +985,7 @@ fn pipeline_ring_worker() {
                 .token
         };
         let uninterrupted = session
-            .decode(&backend, continuity_token.clone())
+            .decode(backend, continuity_token.clone())
             .unwrap()
             .wait()
             .unwrap();
@@ -1002,7 +1002,7 @@ fn pipeline_ring_worker() {
         });
         session
             .load_prompt_cache(
-                &backend,
+                backend,
                 &rank_prompt_cache,
                 &descriptor,
                 &prefix_tokens,
@@ -1012,7 +1012,7 @@ fn pipeline_ring_worker() {
             )
             .unwrap();
         output = session
-            .decode(&backend, continuity_token)
+            .decode(backend, continuity_token)
             .unwrap()
             .wait()
             .unwrap();
@@ -1034,7 +1034,7 @@ fn pipeline_ring_worker() {
                 .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
                 .unwrap()
                 .token;
-            output = session.decode(&backend, token).unwrap().wait().unwrap();
+            output = session.decode(backend, token).unwrap().wait().unwrap();
         }
         assert_eq!(
             output.logits().is_some(),
@@ -1633,7 +1633,7 @@ fn resident_reference_for_prepared(
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
-            crate::backend::runtime::media::input::ModelInput::new(&parts),
+            crate::backend::runtime::media::input::ModelInput::new(parts),
             stream,
         )
         .unwrap()
@@ -1743,7 +1743,7 @@ fn multimodal_resident_reference(
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
-            crate::backend::runtime::media::input::ModelInput::new(&parts),
+            crate::backend::runtime::media::input::ModelInput::new(parts),
             stream,
         )
         .unwrap()

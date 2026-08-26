@@ -1204,6 +1204,10 @@ fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupT
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "the transport contract tests stay adjacent to the transport declaration"
+)]
 mod transport_tests {
     use super::{prediction_group_transport, TargetBoundarySchema};
     use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};

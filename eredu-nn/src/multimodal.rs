@@ -249,43 +249,6 @@ impl PatchConvolution2dSpec {
     }
 }
 
-/// Applies a canonical NHWC two-dimensional patch convolution.
-///
-/// The backend owns the physical kernel layout. The neutral contract requires
-/// the backend-facing canonical shape `[output, kernel_height, kernel_width, input]`.
-pub fn convolve_patches_2d<T: Tensor>(
-    input: &T,
-    weight: &T,
-    spec: PatchConvolution2dSpec,
-    context: &T::Context,
-) -> Result<T, Error> {
-    spec.validate()?;
-    if input.shape().len() != 4 || weight.shape().len() != 4 {
-        return Err(Error::backend(format!(
-            "patch convolution requires NHWC input and OHWI weight, got {:?} and {:?}",
-            input.shape(),
-            weight.shape()
-        )));
-    }
-    let input_channels = input.shape()[3];
-    if input_channels % spec.groups != 0 || weight.shape()[3] * spec.groups != input_channels {
-        return Err(Error::backend(format!(
-            "patch convolution channel mismatch: input={input_channels}, weight={:?}, groups={}",
-            weight.shape(),
-            spec.groups
-        )));
-    }
-    T::conv2d(
-        input,
-        weight,
-        spec.stride,
-        spec.padding,
-        spec.dilation,
-        spec.groups,
-        context,
-    )
-}
-
 /// Arrangement of axis-specific frequencies in the final rotary feature axis.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MultiAxisRotaryLayout {
@@ -297,15 +260,6 @@ pub enum MultiAxisRotaryLayout {
     /// explicit section width; exhausted secondary sections fall back to the
     /// first axis, and the completed half is repeated.
     RoundRobinSections,
-}
-
-/// Position-encoding choice for one architecture layer.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RotaryLayerMode {
-    /// Apply configured rotary position encoding.
-    Rotary,
-    /// Leave queries and keys without positional rotation.
-    NoPositionEncoding,
 }
 
 /// One explicit position axis in a multi-axis rotary layout.

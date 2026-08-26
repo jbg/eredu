@@ -97,7 +97,6 @@ fn main() -> anyhow::Result<()> {
             max_mapped_shards: args.mapped_shards,
             sample_backend_memory: true,
             sample_process_memory: true,
-            ..LayerwiseLoadOptions::default()
         };
         WeightResidency::layerwise_host(layerwise)
     };

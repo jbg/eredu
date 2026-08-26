@@ -500,24 +500,13 @@ pub fn validate_matching_gguf_encodings(
     pairs: impl IntoIterator<Item = (String, String)>,
     label: &str,
 ) -> Vec<CheckpointIssue> {
-    validate_gguf_encoding_pairs(checkpoint, pairs, label, false)
-}
-
-/// Validates paired encodings while permitting different dense floating
-/// storage types, which share the same dense runtime operation.
-pub fn validate_dense_or_matching_gguf_encodings(
-    checkpoint: &GgufCheckpoint,
-    pairs: impl IntoIterator<Item = (String, String)>,
-    label: &str,
-) -> Vec<CheckpointIssue> {
-    validate_gguf_encoding_pairs(checkpoint, pairs, label, true)
+    validate_gguf_encoding_pairs(checkpoint, pairs, label)
 }
 
 fn validate_gguf_encoding_pairs(
     checkpoint: &GgufCheckpoint,
     pairs: impl IntoIterator<Item = (String, String)>,
     label: &str,
-    allow_mixed_dense: bool,
 ) -> Vec<CheckpointIssue> {
     let catalog = checkpoint
         .tensors()
@@ -533,11 +522,9 @@ fn validate_gguf_encoding_pairs(
         };
         let gate_type = gate.descriptor().ggml_type;
         let up_type = up.descriptor().ggml_type;
-        let dense = |encoding| matches!(encoding, GgufType::F32 | GgufType::F16 | GgufType::Bf16);
-        let compatible = (allow_mixed_dense && dense(gate_type) && dense(up_type))
-            || (gate_type == up_type
-                && gate.affine() == up.affine()
-                && gate.is_mxfp4() == up.is_mxfp4());
+        let compatible = gate_type == up_type
+            && gate.affine() == up.affine()
+            && gate.is_mxfp4() == up.is_mxfp4();
         if !compatible {
             issues.push(CheckpointIssue {
                 kind: CheckpointIssueKind::CompanionMismatch,

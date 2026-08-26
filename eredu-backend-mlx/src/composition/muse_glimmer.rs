@@ -2033,12 +2033,12 @@ fn open_gguf_store(
             .add_checkpoint(
                 checkpoint.catalog().clone(),
                 source.plan().checkpoint(),
-                |name| eredu_architectures::muse_glimmer::translate_text_gguf_name(name),
+                eredu_architectures::muse_glimmer::translate_text_gguf_name,
             )?
             .add_checkpoint(
                 projector.checkpoint().catalog().clone(),
                 projector.plan().checkpoint(),
-                |name| eredu_architectures::muse_glimmer::translate_projector_gguf_name(name),
+                eredu_architectures::muse_glimmer::translate_projector_gguf_name,
             )?
             .build()?,
     );

@@ -160,12 +160,11 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            let variant = if source.architecture() == GgufArchitecture::Qwen3VlMoe {
+            if source.architecture() == GgufArchitecture::Qwen3VlMoe {
                 Executable::qwen3_vl_moe(kind, loaded)?
             } else {
                 Executable::qwen3_vl(kind, loaded)?
-            };
-            variant
+            }
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
             let loaded = crate::composition::qwen::hybrid::load_gguf(
@@ -176,12 +175,11 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            let model = if source.architecture() == GgufArchitecture::Qwen3Next {
+            if source.architecture() == GgufArchitecture::Qwen3Next {
                 Executable::qwen3_next(kind, loaded)?
             } else {
                 Executable::qwen35(kind, loaded)?
-            };
-            model
+            }
         }
     };
     Ok(model)
@@ -314,6 +312,10 @@ fn mlx_runtime_state_dtype_bytes(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "runtime-state dtype tests stay adjacent to dtype resolution"
+)]
 mod runtime_state_dtype_tests {
     use super::{
         inspected_runtime_state_dtype_bytes, mlx_runtime_state_dtype_bytes,

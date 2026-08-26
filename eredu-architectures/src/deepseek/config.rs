@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    io::Read,
-};
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 use eredu_core::LayerSchedule;
@@ -481,11 +478,6 @@ pub fn parse_v3_config(value: &Value) -> Result<V3Args, ConfigError> {
     Ok(args)
 }
 
-/// Parses a strict DeepSeek-V3/R1 configuration reader.
-pub fn parse_v3_reader(reader: impl Read) -> Result<V3Args, ConfigError> {
-    parse_v3_config(&serde_json::from_reader(reader)?)
-}
-
 fn invalid_v4(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(format!("DeepSeek-V4 {}", message.into()))
 }
@@ -901,11 +893,6 @@ impl V4Args {
 /// Parses and validates one DeepSeek-V4 configuration value.
 pub fn parse_v4_config(value: &Value) -> Result<V4Args, ConfigError> {
     serde_json::from_value::<V4Source>(value.clone())?.normalize()
-}
-
-/// Parses and validates one DeepSeek-V4 configuration reader.
-pub fn parse_v4_reader(reader: impl Read) -> Result<V4Args, ConfigError> {
-    parse_v4_config(&serde_json::from_reader(reader)?)
 }
 
 /// Returns whether a DeepSeek2 catalog stores the MLA B projection as

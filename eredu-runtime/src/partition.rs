@@ -1305,7 +1305,11 @@ impl LayeredPartitionDriver {
     }
 
     /// Completes the canonical group and applies output projection only on its owner.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::type_complexity,
+        reason = "the signature exposes the backend and architecture boundary types explicitly"
+    )]
     pub fn finish<B, S, M>(
         &self,
         architecture: &mut M,

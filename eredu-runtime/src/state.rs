@@ -257,9 +257,10 @@ impl StateLayout {
     pub fn layer_prefix_offsets(&self) -> Vec<i32> {
         let mut offsets = Vec::with_capacity(self.len());
         for segment in &self.segments {
-            offsets.extend(
-                std::iter::repeat(segment.processed_token_offset()).take(segment.layers.len()),
-            );
+            offsets.extend(std::iter::repeat_n(
+                segment.processed_token_offset(),
+                segment.layers.len(),
+            ));
         }
         offsets
     }

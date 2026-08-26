@@ -211,17 +211,3 @@ pub enum RuntimeMetadataError {
     #[error("runtime must contain at least one execution unit")]
     EmptyExecution,
 }
-
-/// Error produced by backend-neutral runtime orchestration.
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeError {
-    /// Invalid execution-group topology or scheduling transition.
-    #[error(transparent)]
-    ExecutionGraph(#[from] ExecutionGraphError),
-    /// Invalid runtime metadata.
-    #[error(transparent)]
-    Metadata(#[from] RuntimeMetadataError),
-    /// A concrete backend capability failed.
-    #[error("runtime backend operation failed: {0}")]
-    Backend(String),
-}

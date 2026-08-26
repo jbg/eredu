@@ -11346,7 +11346,7 @@ impl PipelineModel {
                     .expect("non-input-owner partition received payload"),
             );
             validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
-            match observer.as_deref_mut() {
+            match observer {
                 Some(observer) => self.stage.forward_observed_with_execution(
                     input,
                     step,
@@ -16673,7 +16673,6 @@ fn execute_pipeline_cached_neutral_gemma4(
     Ok(returned.reduced_output)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_deepseek(
     spec: &eredu_nn::GatedProductExpertBankSpec,
