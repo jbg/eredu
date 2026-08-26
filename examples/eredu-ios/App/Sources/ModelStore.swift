@@ -6,36 +6,6 @@ struct CachedModel: Codable, Identifiable, Hashable {
     let revision: String
 
     var id: String { repoID }
-
-    init(repoID: String, revision: String) {
-        self.repoID = repoID
-        self.revision = revision
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case repoID
-        case revision
-        case snapshotPath
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        repoID = try values.decode(String.self, forKey: .repoID)
-        if let revision = try values.decodeIfPresent(String.self, forKey: .revision) {
-            self.revision = revision
-        } else {
-            // cachedModels.v1 stored an absolute app-container path. Keep it readable
-            // long enough to migrate existing installs to a stable revision identifier.
-            let snapshotPath = try values.decode(String.self, forKey: .snapshotPath)
-            revision = URL(fileURLWithPath: snapshotPath).lastPathComponent
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encode(repoID, forKey: .repoID)
-        try values.encode(revision, forKey: .revision)
-    }
 }
 
 @MainActor
@@ -55,7 +25,7 @@ final class ModelStore: ObservableObject {
     private var engine: EreduEngine?
     private var loadedSnapshotPath: String?
     private var loadedModelLoadSeconds: TimeInterval?
-    private static let recordsKey = "cachedModels.v1"
+    private static let recordsKey = "cachedModels"
     private static let downloadedFileExtensions: Set<String> = [
         "json", "safetensors", "jinja", "model", "txt",
     ]
@@ -66,7 +36,6 @@ final class ModelStore: ObservableObject {
         let huggingFaceDirectory = applicationSupport.appendingPathComponent("huggingface", isDirectory: true)
         let cacheRoot = huggingFaceDirectory.appendingPathComponent("hub", isDirectory: true)
 
-        Self.migrateLegacyCacheIfNeeded(to: huggingFaceDirectory)
         try? fileManager.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
         var resourceValues = URLResourceValues()
         resourceValues.isExcludedFromBackup = true
@@ -353,41 +322,5 @@ final class ModelStore: ObservableObject {
         let encoded = String(name.dropFirst(prefix.count))
         guard let separator = encoded.range(of: "--") else { return nil }
         return String(encoded[..<separator.lowerBound]) + "/" + String(encoded[separator.upperBound...])
-    }
-
-    private static func migrateLegacyCacheIfNeeded(to huggingFaceDirectory: URL) {
-        let fileManager = FileManager.default
-        let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let legacyDirectory = caches.appendingPathComponent("huggingface", isDirectory: true)
-        guard fileManager.fileExists(atPath: legacyDirectory.path),
-              legacyDirectory.standardizedFileURL != huggingFaceDirectory.standardizedFileURL
-        else { return }
-
-        if !fileManager.fileExists(atPath: huggingFaceDirectory.path) {
-            try? fileManager.createDirectory(
-                at: huggingFaceDirectory.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            do {
-                try fileManager.moveItem(at: legacyDirectory, to: huggingFaceDirectory)
-                return
-            } catch {
-                // Fall through to the per-repository migration. A failed whole-tree
-                // move must not hide a still-valid legacy cache from discovery.
-            }
-        }
-
-        let legacyHub = legacyDirectory.appendingPathComponent("hub", isDirectory: true)
-        let newHub = huggingFaceDirectory.appendingPathComponent("hub", isDirectory: true)
-        try? fileManager.createDirectory(at: newHub, withIntermediateDirectories: true)
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: legacyHub,
-            includingPropertiesForKeys: nil
-        ) else { return }
-        for source in entries {
-            let destination = newHub.appendingPathComponent(source.lastPathComponent)
-            guard !fileManager.fileExists(atPath: destination.path) else { continue }
-            try? fileManager.moveItem(at: source, to: destination)
-        }
     }
 }

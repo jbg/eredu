@@ -2,5 +2,5 @@
 .DS_Store
 __pycache__/
 *.pyc
-/examples/safemlx-ios/Build/
-/examples/safemlx-ios/*.xcodeproj/
+/examples/eredu-ios/Build/
+/examples/eredu-ios/*.xcodeproj/
