@@ -11,6 +11,7 @@ mod model;
 mod prepared_speculative;
 #[cfg(any(feature = "image", feature = "audio"))]
 mod processor;
+mod realization;
 pub mod realtime;
 mod session;
 pub mod speculative;

@@ -13,6 +13,8 @@ use super::ModelLoadOptions;
 use crate::backend::error::Error;
 use eredu_checkpoint::validation::SafetensorsCatalog;
 
+use super::realization::FamilyRealization;
+
 pub use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
     CheckpointValidation as StructuralValidation,
@@ -119,69 +121,11 @@ impl AdmittedGguf {
     }
 }
 
-const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {
-    matches!(
-        kind,
-        ModelKind::KimiLinear
-            | ModelKind::DeepSeekV3
-            | ModelKind::DeepSeekV4
-            | ModelKind::Gemma4
-            | ModelKind::GptOss
-            | ModelKind::Inkling
-            | ModelKind::Lfm2
-            | ModelKind::MuseGlimmer
-            | ModelKind::NemotronH
-            | ModelKind::Qwen3
-            | ModelKind::Qwen3Next
-            | ModelKind::Qwen3VlMoe
-            | ModelKind::Qwen35
-    )
-}
-
-const fn mlx_supports_safetensors_quantization(kind: ModelKind) -> bool {
-    matches!(
-        kind,
-        ModelKind::DeepSeekV3
-            | ModelKind::DeepSeekV4
-            | ModelKind::Gemma4
-            | ModelKind::GptOss
-            | ModelKind::Inkling
-            | ModelKind::KimiLinear
-            | ModelKind::Lfm2
-            | ModelKind::Llama
-            | ModelKind::MuseGlimmer
-            | ModelKind::NemotronH
-            | ModelKind::Qwen2
-            | ModelKind::Qwen3
-            | ModelKind::Qwen3Next
-            | ModelKind::Qwen3Vl
-            | ModelKind::Qwen3VlMoe
-            | ModelKind::Qwen35
-    )
-}
-
-const fn mlx_supports_complete_gguf_quantization(kind: ModelKind) -> bool {
-    matches!(
-        kind,
-        ModelKind::GptOss
-            | ModelKind::KimiLinear
-            | ModelKind::Lfm2
-            | ModelKind::Llama
-            | ModelKind::NemotronH
-            | ModelKind::Qwen2
-            | ModelKind::Qwen3
-            | ModelKind::Qwen3Next
-            | ModelKind::Qwen3Vl
-            | ModelKind::Qwen3VlMoe
-            | ModelKind::Qwen35
-    )
-}
-
 pub(crate) fn validate_complete_gguf_quantization(
     kind: ModelKind,
     requested: bool,
 ) -> Result<(), Error> {
-    if !requested || mlx_supports_complete_gguf_quantization(kind) {
+    if !requested || FamilyRealization::for_kind(kind).supports_complete_gguf_quantization() {
         return Ok(());
     }
     Err(Error::Artifact(
@@ -190,23 +134,6 @@ pub(crate) fn validate_complete_gguf_quantization(
             kind.canonical_name()
         )),
     ))
-}
-
-pub(crate) fn requires_distributed_stage_loader(
-    kind: ModelKind,
-    topology: eredu_core::ParallelTopology,
-) -> bool {
-    topology.is_axis_active(eredu_core::ParallelAxis::Pipeline)
-        || topology.is_axis_active(eredu_core::ParallelAxis::Expert)
-        || matches!(
-            kind,
-            ModelKind::DeepSeekV3
-                | ModelKind::DeepSeekV4
-                | ModelKind::Qwen3Next
-                | ModelKind::Qwen35
-                | ModelKind::Qwen3Vl
-                | ModelKind::Qwen3VlMoe
-        )
 }
 
 fn validate_quantization_capability(
@@ -219,7 +146,7 @@ fn validate_quantization_capability(
         return Ok(());
     }
     if let Some(topology) = policy.topology.filter(|topology| !topology.is_replicated()) {
-        if requires_distributed_stage_loader(kind, topology) {
+        if FamilyRealization::for_kind(kind).requires_distributed_stage(topology) {
             return Ok(());
         }
         return Err(Error::Artifact(
@@ -232,7 +159,7 @@ fn validate_quantization_capability(
     if format == eredu_core::ArtifactFormat::Gguf {
         return validate_complete_gguf_quantization(kind, true);
     }
-    let supported = mlx_supports_safetensors_quantization(kind)
+    let supported = FamilyRealization::for_kind(kind).supports_safetensors_quantization()
         && (policy.residency == eredu_core::ResidencyRequest::FullyResident
             || capabilities.nonresident_safetensors_quantization());
     if supported {
@@ -251,7 +178,9 @@ fn validate_expert_cache_capability(
     kind: ModelKind,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
-    if capabilities.independently_addressable_experts() && mlx_supports_expert_cache(kind) {
+    if capabilities.independently_addressable_experts()
+        && FamilyRealization::for_kind(kind).supports_expert_cache()
+    {
         return Ok(());
     }
     Err(Error::Artifact(

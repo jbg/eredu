@@ -758,6 +758,14 @@ configuration, checkpoint metadata, companion selection, or route.
 
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
+Each concrete backend keeps one exhaustive realization descriptor per
+normalized family for the artifact formats and backend-owned materializers it
+actually implements. The MLX descriptor binds GGUF availability, complete or
+distributed-stage tensor parallelism, independent expert-cache loading, and
+load-time quantization in one place; preflight and loader dispatch consume the
+same typed bindings. Adding a normalized family therefore requires an explicit
+MLX decision for every realization path instead of extending independent
+capability lists.
 `BackendProvider::create_session` consumes a `PreparedModel`, so an executable
 cannot be paired with a cache or session created by another backend.
 
