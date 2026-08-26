@@ -10,6 +10,8 @@ use eredu_nn::RotaryAlgorithm;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::GgufTensorCatalog;
+
 /// Invalid or unsupported DeepSeek configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -906,13 +908,6 @@ pub fn parse_v4_reader(reader: impl Read) -> Result<V4Args, ConfigError> {
     parse_v4_config(&serde_json::from_reader(reader)?)
 }
 
-/// Minimal pure tensor catalog required while normalizing DeepSeek GGUF
-/// metadata. Tensor payloads and backend arrays are intentionally absent.
-pub trait GgufTensorCatalog {
-    /// Whether one exact physical GGUF tensor is present.
-    fn contains(&self, name: &str) -> bool;
-}
-
 /// Returns whether a DeepSeek2 catalog stores the MLA B projection as
 /// separate key and value tensors rather than one fused tensor.
 pub fn v3_uses_split_kv(catalog: &impl GgufTensorCatalog) -> bool {
@@ -1316,6 +1311,10 @@ mod tests {
     impl GgufTensorCatalog for Catalog {
         fn contains(&self, name: &str) -> bool {
             self.0.iter().any(|candidate| candidate == name)
+        }
+
+        fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+            self.0.iter().map(String::as_str).any(predicate)
         }
     }
 

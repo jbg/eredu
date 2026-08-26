@@ -17,7 +17,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::qwen::vision::{VisionConfig, VisionConfigSource};
-use crate::qwen::GgufTensorCatalog;
+use crate::GgufTensorCatalog;
 
 /// Stable segment identity for target decoder state.
 pub const TARGET_STATE_SEGMENT: &str = "target";
@@ -1508,6 +1508,10 @@ mod tests {
     impl GgufTensorCatalog for Catalog {
         fn contains(&self, name: &str) -> bool {
             self.0.contains(name)
+        }
+
+        fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+            self.0.iter().map(String::as_str).any(predicate)
         }
     }
 

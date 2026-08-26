@@ -30,62 +30,6 @@ pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadat
         .collect()
 }
 
-pub trait GgufTensorNames {
-    fn contains_gguf_tensor(&self, name: &str) -> bool;
-
-    fn any_gguf_tensor<F>(&self, predicate: F) -> bool
-    where
-        F: FnMut(&str) -> bool;
-
-    fn has_affine_gguf_tensor(&self) -> bool;
-}
-
-impl GgufTensorNames for GgufCheckpoint {
-    fn contains_gguf_tensor(&self, name: &str) -> bool {
-        self.catalog()
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-
-    fn any_gguf_tensor<F>(&self, mut predicate: F) -> bool
-    where
-        F: FnMut(&str) -> bool,
-    {
-        self.catalog()
-            .tensors()
-            .any(|tensor| predicate(&tensor.descriptor().name))
-    }
-
-    fn has_affine_gguf_tensor(&self) -> bool {
-        self.catalog()
-            .tensors()
-            .any(|tensor| tensor.affine().is_some())
-    }
-}
-
-#[cfg(test)]
-impl GgufTensorNames for HashMap<String, Array> {
-    fn contains_gguf_tensor(&self, name: &str) -> bool {
-        self.contains_key(name)
-    }
-
-    fn any_gguf_tensor<F>(&self, predicate: F) -> bool
-    where
-        F: FnMut(&str) -> bool,
-    {
-        self.keys().map(String::as_str).any(predicate)
-    }
-
-    fn has_affine_gguf_tensor(&self) -> bool {
-        self.keys().any(|name| {
-            name.ends_with(".scales")
-                || name.ends_with(".biases")
-                || name.ends_with("_scales")
-                || name.ends_with("_biases")
-        })
-    }
-}
-
 pub fn gguf_affine_configs<F>(
     checkpoint: &GgufCheckpoint,
     mut translate: F,
@@ -159,23 +103,6 @@ where
         }
     }
     Ok(configs)
-}
-
-#[cfg(test)]
-pub fn load_named_array_strict<M: ModuleParameters>(
-    model: &mut M,
-    name: String,
-    value: Array,
-    quantization: Option<(WeightQuantization, &Stream)>,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let mut params = model.parameters_mut().flatten();
-    if let Some((quantization, stream)) = quantization {
-        load_array_quantized_strict(&mut params, name, value, stream, quantization, report)
-    } else {
-        load_array_strict(&mut params, name, value, report);
-        Ok(())
-    }
 }
 
 /// Accumulates strict checkpoint-loading diagnostics across one or more files.

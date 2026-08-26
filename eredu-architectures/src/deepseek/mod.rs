@@ -37,6 +37,6 @@ pub use checkpoint::{
 pub use config::{
     parse_v3_config, parse_v3_gguf, parse_v4_config, parse_v4_gguf, v3_architecture_fingerprint,
     v3_uses_split_kv, v4_architecture_fingerprint, ConfigError, DeepSeekQuantizationConfig,
-    DsparkConfig, ExpertFormat, Fp8QuantizationConfig, GgufTensorCatalog, LayerPolicy, V3Args,
-    V4Args, V4AttentionPolicy, YarnConfig,
+    DsparkConfig, ExpertFormat, Fp8QuantizationConfig, LayerPolicy, V3Args, V4Args,
+    V4AttentionPolicy, YarnConfig,
 };

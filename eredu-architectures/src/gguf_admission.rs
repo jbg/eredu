@@ -10,86 +10,6 @@ use crate::{
     GgufArchitecture,
 };
 
-struct ExactCatalog<'a>(&'a Checkpoint);
-
-impl ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-
-    fn any(&self, mut predicate: impl FnMut(&str) -> bool) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| predicate(&tensor.descriptor().name))
-    }
-}
-
-impl crate::deepseek::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-}
-
-impl crate::gemma4::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-}
-
-impl crate::kimi_linear::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
-        ExactCatalog::any(self, predicate)
-    }
-}
-
-impl crate::lfm2::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
-        ExactCatalog::any(self, predicate)
-    }
-}
-
-impl crate::llama::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-
-    fn any(&self, predicate: &mut dyn FnMut(&str) -> bool) -> bool {
-        ExactCatalog::any(self, predicate)
-    }
-}
-
-impl crate::muse_glimmer::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-}
-
-impl crate::nemotron_h::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
-        ExactCatalog::any(self, predicate)
-    }
-}
-
-impl crate::qwen::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        ExactCatalog::contains(self, name)
-    }
-}
-
 pub(crate) fn resolve(
     architecture: GgufArchitecture,
     checkpoint: &Checkpoint,
@@ -118,10 +38,9 @@ fn resolve_family(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<String, MetadataValue>>();
-    let catalog = ExactCatalog(checkpoint);
     match architecture {
         GgufArchitecture::DeepSeek2 => {
-            let args = crate::deepseek::parse_v3_gguf(&catalog, &metadata)
+            let args = crate::deepseek::parse_v3_gguf(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::deepseek::translate_v3_gguf_weight_name)?;
             let plan = crate::deepseek::v3_gguf_plan(&args)?;
@@ -161,14 +80,14 @@ fn resolve_family(
             Ok((GgufModelConfig::Inkling(args), plan, None))
         }
         GgufArchitecture::KimiLinear => {
-            let args = crate::kimi_linear::model_args_from_gguf_catalog(&catalog, &metadata)
+            let args = crate::kimi_linear::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::kimi_linear::translate_gguf_weight_name)?;
             let plan = crate::kimi_linear::gguf_plan(&args)?;
             Ok((GgufModelConfig::KimiLinear(args), plan, None))
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-            let args = crate::lfm2::model_args_from_gguf_catalog(&catalog, &metadata)
+            let args = crate::lfm2::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             let is_moe = args.has_sparse_moe_layers();
             translated(checkpoint, |name| {
@@ -178,7 +97,7 @@ fn resolve_family(
             Ok((GgufModelConfig::Lfm2(args), plan, None))
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-            let args = crate::llama::model_args_from_gguf_catalog(&catalog, &metadata)
+            let args = crate::llama::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             if args.num_hidden_layers as usize > checkpoint.physical_tensor_count() {
                 return Err(format!(
@@ -192,20 +111,20 @@ fn resolve_family(
             Ok((GgufModelConfig::Llama(args), plan, None))
         }
         GgufArchitecture::MuseGlimmer => {
-            let args = crate::muse_glimmer::DecoderConfig::from_gguf_catalog(&catalog, &metadata)
+            let args = crate::muse_glimmer::DecoderConfig::from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             let plan = crate::muse_glimmer::gguf_plan(&args)?;
             Ok((GgufModelConfig::MuseGlimmer(args), plan, None))
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-            let args = crate::nemotron_h::model_args_from_gguf_catalog(&catalog, &metadata)
+            let args = crate::nemotron_h::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::nemotron_h::translate_gguf_weight_name)?;
             let plan = crate::nemotron_h::gguf_plan(&args)?;
             Ok((GgufModelConfig::NemotronH(args), plan, None))
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-            let args = crate::qwen::model_args_from_gguf_catalog(&catalog, &metadata)
+            let args = crate::qwen::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, |name| {
                 crate::qwen::translate_gguf_weight_name(name, args.is_moe())
@@ -221,7 +140,7 @@ fn resolve_family(
                 crate::qwen::TextConfigContext::Qwen3Vl
             };
             let args = crate::qwen::model_args_from_gguf_catalog_with_context(
-                &catalog, &metadata, context,
+                checkpoint, &metadata, context,
             )
             .map_err(|error| error.to_string())?;
             if args.is_moe() != is_moe {
@@ -234,7 +153,7 @@ fn resolve_family(
             Ok((GgufModelConfig::Qwen(args), plan, None))
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            let parsed = crate::qwen::hybrid::model_args_from_gguf_catalog(&catalog, &metadata)
+            let parsed = crate::qwen::hybrid::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             translated(checkpoint, crate::qwen::hybrid::translate_gguf_weight_name)?;
             let plan = crate::qwen::hybrid::gguf_plan(&parsed.text)?;

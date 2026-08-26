@@ -19,6 +19,8 @@ use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::GgufTensorCatalog;
+
 /// Stable segment identity for target decoder state.
 pub const TARGET_STATE_SEGMENT: &str = "target";
 /// Stable segment identity for checkpoint-embedded prediction state.
@@ -450,14 +452,6 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, ConfigEr
         .map_err(|error| ConfigError::Decode(error.to_string()))?
         .normalize()
 }
-/// Minimal physical tensor catalog required by GGUF normalization.
-pub trait GgufTensorCatalog {
-    /// Whether one exact physical tensor is present.
-    fn contains(&self, name: &str) -> bool;
-    /// Whether any physical tensor name satisfies the predicate.
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool;
-}
-
 /// Normalizes model arguments from pure GGUF metadata and tensor presence.
 pub fn model_args_from_gguf_catalog(
     arrays: &impl GgufTensorCatalog,

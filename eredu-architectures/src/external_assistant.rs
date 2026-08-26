@@ -98,11 +98,9 @@ pub fn prepare_external_assistant(
                 )
                 .map_err(invalid_assistant)?,
                 ArtifactFormat::Gguf => gemma4::AssistantConfig::from_gguf_metadata(
-                    &GemmaCatalog(
-                        inspection
-                            .gguf_checkpoint()
-                            .expect("GGUF inspection has checkpoint"),
-                    ),
+                    inspection
+                        .gguf_checkpoint()
+                        .expect("GGUF inspection has checkpoint"),
                     metadata.as_ref().expect("GGUF inspection has metadata"),
                 )
                 .map_err(invalid_assistant)?,
@@ -172,16 +170,6 @@ fn gguf_metadata(checkpoint: &Checkpoint) -> HashMap<String, MetadataValue> {
         .collect()
 }
 
-struct GemmaCatalog<'a>(&'a Checkpoint);
-
-impl gemma4::GgufTensorCatalog for GemmaCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-}
-
 struct AssistantConfigurations;
 
 impl ModelConfigurationResolver for AssistantConfigurations {
@@ -229,7 +217,7 @@ impl ModelConfigurationResolver for AssistantConfigurations {
         let metadata = gguf_metadata(checkpoint);
         let family = match architecture {
             "gemma4_assistant" | "gemma4-assistant" => {
-                gemma4::AssistantConfig::from_gguf_metadata(&GemmaCatalog(checkpoint), &metadata)
+                gemma4::AssistantConfig::from_gguf_metadata(checkpoint, &metadata)
                     .map_err(invalid_assistant)?;
                 "gemma4_assistant"
             }

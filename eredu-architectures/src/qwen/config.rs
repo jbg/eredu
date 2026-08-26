@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::{
     decoder::{AttentionProjection, Config},
     rotary::RopeValue,
-    GgufArchitecture,
+    GgufArchitecture, GgufTensorCatalog,
 };
 
 /// Invalid or unsupported Qwen text configuration.
@@ -152,12 +152,6 @@ struct ModelArgsSource {
     quantization: Option<WeightQuantization>,
     #[serde(default)]
     quantization_config: Option<WeightQuantization>,
-}
-
-/// Minimal tensor-name catalog required by the pure GGUF parser.
-pub trait GgufTensorCatalog {
-    /// Whether the catalog contains one exact physical tensor.
-    fn contains(&self, name: &str) -> bool;
 }
 
 impl ModelArgs {

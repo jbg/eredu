@@ -41,38 +41,6 @@ pub fn should_quantize_on_load(
     }
 }
 
-/// Infers the exact affine layout emitted by the native GGUF converters.
-#[cfg(test)]
-pub fn gguf_affine_quantization(
-    weight_shape: &[i32],
-    scales_shape: &[i32],
-    weight_name: &str,
-) -> Result<AffineQuantization, Error> {
-    let Some((&packed_columns, &scale_columns)) = weight_shape.last().zip(scales_shape.last())
-    else {
-        return Err(Error::Quantization(format!(
-            "GGUF quantized tensor {weight_name:?} has an invalid rank"
-        )));
-    };
-    if packed_columns <= 0 || scale_columns <= 0 {
-        return Err(Error::Quantization(format!(
-            "GGUF quantized tensor {weight_name:?} has incompatible weight/scales shapes {weight_shape:?} and {scales_shape:?}"
-        )));
-    }
-
-    for (group_size, bits) in [(16, 2), (16, 3), (16, 6), (32, 4), (32, 5), (32, 8)] {
-        if i64::from(packed_columns) * 32
-            == i64::from(scale_columns) * i64::from(group_size) * i64::from(bits)
-        {
-            return Ok(AffineQuantization::new(group_size, bits)?);
-        }
-    }
-
-    Err(Error::Quantization(format!(
-        "GGUF quantized tensor {weight_name:?} has unsupported weight/scales shapes {weight_shape:?} and {scales_shape:?}"
-    )))
-}
-
 /// Architecture plan and output-sharding options for checkpoint conversion.
 #[derive(Debug, Clone)]
 pub struct CheckpointQuantizationOptions {

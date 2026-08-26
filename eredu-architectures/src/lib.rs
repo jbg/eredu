@@ -30,6 +30,8 @@ pub use external_assistant::{
 /// Backend-neutral schedules and recipes for independent expert residency.
 pub mod expert_residency;
 mod gguf_admission;
+mod gguf_catalog;
+pub use gguf_catalog::GgufTensorCatalog;
 /// Backend-neutral family and checkpoint admission for sibling GGUF projectors.
 pub mod gguf_companion;
 mod linear_format;

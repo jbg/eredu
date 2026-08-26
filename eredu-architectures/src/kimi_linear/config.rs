@@ -15,6 +15,8 @@ use eredu_runtime::StateLayout;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::GgufTensorCatalog;
+
 fn default_model_type() -> String {
     "kimi_linear".into()
 }
@@ -446,14 +448,6 @@ pub fn model_args_from_config_reader(mut reader: impl Read) -> Result<ModelArgs,
         .read_to_string(&mut data)
         .map_err(|e| invalid(e.to_string()))?;
     model_args_from_config_value(&serde_json::from_str(&data)?)
-}
-
-/// Minimal tensor-name catalog required by the pure GGUF parser.
-pub trait GgufTensorCatalog {
-    /// Whether one exact physical tensor is present.
-    fn contains(&self, name: &str) -> bool;
-    /// Whether any physical tensor satisfies a predicate.
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool;
 }
 
 /// Parses and validates Kimi geometry from pure GGUF metadata and names.

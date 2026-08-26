@@ -21,8 +21,7 @@ pub use checkpoint::{
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
     prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, ConfigError,
-    FeedForwardPolicy, GgufTensorCatalog, LayerCacheGeometry, LayerPolicy, ModelArgs,
-    OperatorPolicy, RopeConfig,
+    FeedForwardPolicy, LayerCacheGeometry, LayerPolicy, ModelArgs, OperatorPolicy, RopeConfig,
 };
 pub use moe::{DenseSwiGlu, FeedForward, RoutedGatedProduct};
 pub use parallel::{

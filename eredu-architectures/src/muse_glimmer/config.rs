@@ -9,6 +9,8 @@ use eredu_gguf::{MetadataArray, MetadataValue};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::GgufTensorCatalog;
+
 /// Invalid or unsupported Muse-Glimmer configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -22,12 +24,6 @@ pub enum ConfigError {
 
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
-}
-
-/// Minimal physical tensor-name catalog required by the portable GGUF parser.
-pub trait GgufTensorCatalog {
-    /// Whether one exact physical tensor exists.
-    fn contains(&self, name: &str) -> bool;
 }
 
 /// Checkpoint-specific norm and rotary convention.
@@ -1306,6 +1302,10 @@ mod tests {
         impl GgufTensorCatalog for Catalog {
             fn contains(&self, name: &str) -> bool {
                 self.0 && name == "output.weight"
+            }
+
+            fn any(&self, mut predicate: impl FnMut(&str) -> bool) -> bool {
+                self.0 && predicate("output.weight")
             }
         }
 

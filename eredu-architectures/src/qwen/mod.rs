@@ -16,8 +16,7 @@ pub use checkpoint::{
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
     model_args_from_gguf_catalog_with_context, model_args_from_text_config_value,
-    prompt_cache_architecture_fingerprint, ConfigError, GgufTensorCatalog, ModelArgs, QwenVariant,
-    TextConfigContext,
+    prompt_cache_architecture_fingerprint, ConfigError, ModelArgs, QwenVariant, TextConfigContext,
 };
 pub use moe::{expert_bank_spec, expert_realization_plan, FeedForward, RoutedGatedProduct};
 pub use parallel::{

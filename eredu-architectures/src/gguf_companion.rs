@@ -46,20 +46,6 @@ impl GgufMediaProjectorPlan {
 
 struct ExactCatalog<'a>(&'a Checkpoint);
 
-impl ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == name)
-    }
-}
-
-impl crate::muse_glimmer::GgufTensorCatalog for ExactCatalog<'_> {
-    fn contains(&self, name: &str) -> bool {
-        self.contains(name)
-    }
-}
-
 impl crate::qwen::vision::VisionGgufCatalog for ExactCatalog<'_> {
     fn shape(&self, name: &str) -> Option<Vec<usize>> {
         self.0
@@ -250,9 +236,13 @@ mod tests {
     fn muse_plan() -> GgufArchitecturePlan {
         struct Catalog;
 
-        impl crate::muse_glimmer::GgufTensorCatalog for Catalog {
+        impl crate::GgufTensorCatalog for Catalog {
             fn contains(&self, name: &str) -> bool {
                 name == "output.weight"
+            }
+
+            fn any(&self, mut predicate: impl FnMut(&str) -> bool) -> bool {
+                predicate("output.weight")
             }
         }
 

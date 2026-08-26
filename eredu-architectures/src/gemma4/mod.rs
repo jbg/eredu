@@ -25,7 +25,7 @@ pub use checkpoint::{
     safetensors_plan, translate_gguf_weight_name, unit_recipes, with_checkpoint_formats,
     Gemma4ArtifactConfig,
 };
-pub use config::{ConfigError, FeedForwardPolicy, GgufTensorCatalog, LayerPolicy, ModelArgs};
+pub use config::{ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs};
 pub use family::{FamilyConfig, FamilyConfigError};
 pub use graph::{component_graph, state_layout, ComponentOptions};
 pub use ingress::{

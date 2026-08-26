@@ -9,6 +9,8 @@ use eredu_nn::RotarySpec;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::GgufTensorCatalog;
+
 use super::Config;
 use crate::rotary::RopeValue;
 
@@ -198,14 +200,6 @@ pub fn model_args_from_config_reader(reader: impl Read) -> Result<ModelArgs, Con
 /// Parses and normalizes a Hugging Face configuration value.
 pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, ConfigError> {
     normalize_model_args(serde_json::from_value(config.clone())?)
-}
-
-/// Header-only GGUF tensor catalog used to infer optional architecture fields.
-pub trait GgufTensorCatalog {
-    /// Whether one exact physical tensor name is present.
-    fn contains(&self, name: &str) -> bool;
-    /// Whether any physical tensor name satisfies a predicate.
-    fn any(&self, predicate: &mut dyn FnMut(&str) -> bool) -> bool;
 }
 
 /// Parses normalized Llama/Mistral arguments from a backend-neutral GGUF catalog.
@@ -642,8 +636,8 @@ mod tests {
             self.0.iter().any(|candidate| candidate == name)
         }
 
-        fn any(&self, predicate: &mut dyn FnMut(&str) -> bool) -> bool {
-            self.0.iter().any(|name| predicate(name))
+        fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+            self.0.iter().map(String::as_str).any(predicate)
         }
     }
 

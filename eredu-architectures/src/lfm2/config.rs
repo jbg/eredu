@@ -5,7 +5,7 @@ use std::{
     io::Read,
 };
 
-use crate::rotary::RopeValue;
+use crate::{rotary::RopeValue, GgufTensorCatalog};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{
@@ -466,14 +466,6 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, ConfigE
     Ok(args)
 }
 
-/// Minimal tensor-name catalog required by the pure GGUF parser.
-pub trait GgufTensorCatalog {
-    /// Whether the catalog contains one exact physical tensor.
-    fn contains(&self, name: &str) -> bool;
-    /// Whether any physical tensor name satisfies a predicate.
-    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool;
-}
-
 /// Parses normalized LFM2 arguments from pure GGUF catalog metadata.
 pub fn model_args_from_gguf_catalog(
     arrays: &impl GgufTensorCatalog,
@@ -895,8 +887,8 @@ mod tests {
             self.0.iter().any(|candidate| candidate == name)
         }
 
-        fn any(&self, mut predicate: impl FnMut(&str) -> bool) -> bool {
-            self.0.iter().any(|name| predicate(name))
+        fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+            self.0.iter().map(String::as_str).any(predicate)
         }
     }
 

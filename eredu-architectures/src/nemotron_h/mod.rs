@@ -20,8 +20,8 @@ pub use checkpoint::{
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
     prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, ConfigError,
-    GgufTensorCatalog, LayerGeometry, LayerPolicy, ModelArgs, WeightDtype,
-    PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
+    LayerGeometry, LayerPolicy, ModelArgs, WeightDtype, PREDICTION_STATE_SEGMENT,
+    TARGET_STATE_SEGMENT,
 };
 pub use mamba::Mamba2;
 pub use mlp::{expert_bank_spec, localized_expert_bank_spec, DenseMlp, SparseMoe};

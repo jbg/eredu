@@ -207,7 +207,7 @@ impl AssistantConfig {
     }
 
     /// Parses the released assistant GGUF without depending on a backend reader.
-    pub fn from_gguf_metadata<C: super::GgufTensorCatalog + ?Sized>(
+    pub fn from_gguf_metadata<C: crate::GgufTensorCatalog + ?Sized>(
         catalog: &C,
         metadata: &HashMap<String, MetadataValue>,
     ) -> Result<Self, AssistantConfigError> {

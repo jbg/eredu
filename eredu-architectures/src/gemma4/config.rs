@@ -1,12 +1,12 @@
 //! Validated backend-neutral Gemma 4 text configuration.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     ops::Range,
 };
 
-use crate::rotary::RopeValue;
+use crate::{rotary::RopeValue, GgufTensorCatalog};
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::{
     cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, LayerSchedule,
@@ -138,18 +138,6 @@ pub struct ModelArgs {
     pub quantized_weights: Option<HashSet<String>>,
     /// Exact per-parameter encodings for mixed GGUF artifacts.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
-}
-
-/// Minimal physical tensor-name catalog required by the portable GGUF parser.
-pub trait GgufTensorCatalog {
-    /// Whether one exact physical tensor exists.
-    fn contains(&self, name: &str) -> bool;
-}
-
-impl GgufTensorCatalog for BTreeSet<String> {
-    fn contains(&self, name: &str) -> bool {
-        BTreeSet::contains(self, name)
-    }
 }
 
 impl ModelArgs {
@@ -996,12 +984,6 @@ fn gguf_optional_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    impl GgufTensorCatalog for HashSet<String> {
-        fn contains(&self, name: &str) -> bool {
-            self.contains(name)
-        }
-    }
 
     fn fixture() -> serde_json::Value {
         serde_json::json!({

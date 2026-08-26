@@ -944,10 +944,8 @@ fn reject_complete_tensor_parallel_quantization(
     Ok(())
 }
 
-pub fn validate_gguf_quantization_source<
-    S: crate::backend::runtime::checkpoint::load::GgufTensorNames,
->(
-    source: &S,
+pub fn validate_gguf_quantization_source(
+    source: &safemlx::ops::GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
 ) -> Result<(), Error> {
@@ -956,7 +954,10 @@ pub fn validate_gguf_quantization_source<
     };
     quantization.validate()?;
 
-    let has_packed_companions = source.has_affine_gguf_tensor();
+    let has_packed_companions = source
+        .catalog()
+        .tensors()
+        .any(|tensor| tensor.affine().is_some());
     if has_packed_companions {
         return Err(Error::Quantization(
             "load-time quantization accepts only unquantized F32/F16/BF16 GGUF weights; packed GGUF tensors cannot be implicitly transcoded"
