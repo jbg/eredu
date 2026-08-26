@@ -37,8 +37,8 @@ const QWEN25_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
 const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
-const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
-    include_str!("../../../eredu-text/tests/fixtures/qwen3/tokenizer_config.json");
+const QWEN3_OLDER_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/qwen3-0.6b-older-c945a4a8.jinja");
 const QWEN3_VL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
 const KIMI_LINEAR_FIXTURE: &str =
@@ -907,9 +907,9 @@ fn behavioral_recognition_survives_nonsemantic_template_refactors() {
     let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
         .strip_suffix('\n')
         .unwrap();
-    let qwen3_older_config: serde_json::Value =
-        serde_json::from_str(QWEN3_OLDER_TOKENIZER_CONFIG).unwrap();
-    let qwen3_older = qwen3_older_config["chat_template"].as_str().unwrap();
+    let qwen3_older = QWEN3_OLDER_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .unwrap();
     for (template, identity) in [
         (QWEN25_FIXTURE, "xml-tools.v1"),
         (qwen3_older, "qwen.xml-tools.reasoning.v1"),

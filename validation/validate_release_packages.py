@@ -276,6 +276,34 @@ def stage_package(
     git_commit_index(index, relative_index_path, f"Stage {name} {version}")
 
 
+def validate_packaged_unit_tests(
+    package: dict[str, Any],
+    archive: Path,
+    destination: Path,
+    config: Path,
+    environment: dict[str, str],
+) -> None:
+    library_kinds = {"lib", "proc-macro"}
+    if not any(library_kinds.intersection(target["kind"]) for target in package["targets"]):
+        return
+
+    shutil.unpack_archive(archive, destination, "gztar")
+    package_root = destination / f'{package["name"]}-{package["version"]}'
+    run(
+        [
+            "cargo",
+            "test",
+            "--no-run",
+            "--lib",
+            "--no-default-features",
+            "--config",
+            str(config),
+        ],
+        cwd=package_root,
+        env=environment,
+    )
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -367,6 +395,13 @@ def main() -> int:
                     f"{MAX_ARCHIVE_BYTES:,} bytes"
                 )
             print(f"    archive size: {size / 1024:.1f} KiB", flush=True)
+            validate_packaged_unit_tests(
+                package,
+                archive,
+                root / "unit-tests",
+                config,
+                environment,
+            )
             stage_package(package, archive, index, downloads, publishable_names)
             staged.append(package)
             write_cargo_config(config, index, staged)

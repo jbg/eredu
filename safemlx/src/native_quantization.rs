@@ -3577,8 +3577,7 @@ mod tests {
     #[test]
     fn every_iq_format_executes_direct_packed_linear_embedding_and_grouped() {
         let stream = crate::test_stream();
-        for line in include_str!("../../eredu-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
-        {
+        for line in include_str!("../tests/fixtures/llama-c0bc8591-iq.oracle").lines() {
             let mut fields = line.split('|');
             let ty = GgmlType::from_code(fields.next().unwrap().parse().unwrap());
             let all_raw = unhex(fields.next().unwrap());
@@ -3699,8 +3698,7 @@ mod tests {
     #[ignore = "requires an accessible Metal device"]
     fn every_iq_format_executes_batched_metal_kernels() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
-        for line in include_str!("../../eredu-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
-        {
+        for line in include_str!("../tests/fixtures/llama-c0bc8591-iq.oracle").lines() {
             let mut fields = line.split('|');
             let ty = GgmlType::from_code(fields.next().unwrap().parse().unwrap());
             let all_raw = unhex(fields.next().unwrap());

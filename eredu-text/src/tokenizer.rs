@@ -1050,11 +1050,10 @@ mod tests {
 
     #[test]
     fn released_muse_glimmer_template_renders_reasoning_and_atem_history() {
-        let template = include_str!(
-            "../../eredu/tests/fixtures/chat_templates/muse-glimmer-30b-97c77dff.jinja"
-        )
-        .strip_suffix('\n')
-        .expect("the fixture-only file terminator is documented");
+        let template =
+            include_str!("../tests/fixtures/chat_templates/muse-glimmer-30b-97c77dff.jinja")
+                .strip_suffix('\n')
+                .expect("the fixture-only file terminator is documented");
         let mut tokenizer = Tokenizer::from_tokenizer(tokenizers::Tokenizer::new(
             tokenizers::models::wordlevel::WordLevel::default(),
         ));
