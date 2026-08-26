@@ -55,12 +55,14 @@ execution, distributed, and model-composition support.
 | --- | --- |
 | `accelerate` | Accelerate-backed operations on Apple platforms |
 | `metal` | Metal execution on Apple platforms |
-| `media` | Typed multimodal processor and request preparation |
-| `image` | Image/video decoding primitives; implies `media` |
-| `audio` | Audio preprocessing; implies `media` |
+| `image` | Image/video decoding and shared multimodal request preparation |
+| `audio` | Audio preprocessing and shared multimodal request preparation |
 | `codec` | MLX Mimi integration and codec examples; implies `audio` |
 | `cuda` | CUDA execution for native MLX operations |
 | `nccl` | NCCL collectives; implies `cuda` |
+
+Enabling either `image` or `audio` compiles the shared multimodal processor;
+there is no standalone `media` feature.
 
 The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
 `personaplex_quantization_eval` examples require `codec`.
