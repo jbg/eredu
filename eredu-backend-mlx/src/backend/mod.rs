@@ -44,7 +44,9 @@ fn backend_capabilities(has_world: bool) -> BackendCapabilities {
         collectives: has_world,
         persistent_cache: true,
         output_observation: true,
-        activation_inspection: true,
+        // Named activation coverage depends on the loaded model and session
+        // topology, neither of which is known by this device-level report.
+        activation_inspection: false,
     }
 }
 
@@ -470,6 +472,12 @@ mod tests {
     fn collective_capability_requires_an_attached_world() {
         assert!(!backend_capabilities(false).collectives);
         assert!(backend_capabilities(true).collectives);
+    }
+
+    #[test]
+    fn activation_inspection_is_not_a_device_level_capability() {
+        assert!(!backend_capabilities(false).activation_inspection);
+        assert!(!backend_capabilities(true).activation_inspection);
     }
 
     #[test]
