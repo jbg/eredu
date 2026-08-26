@@ -6,7 +6,7 @@ use eredu_architectures::media_plan::{self, MediaShapePlan, PreparedInputPartPla
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputMetadataKey, InputModality,
     InputTokenCount, ModelCapabilities, ModelCapabilityBackend, ModelRuntime, ObservationKind,
-    Observed, PhysicalMemorySemantics, RuntimeStateEstimate, StateLayout, StaticMemoryReport,
+    Observed, PhysicalMemorySemantics, RuntimeStateEstimate, StateMemoryLayout, StaticMemoryReport,
 };
 use safemlx::{Array, Stream};
 
@@ -25,7 +25,7 @@ fn checked_mul(left: u64, right: u64, operation: &'static str) -> Result<u64, Ca
 }
 
 fn estimate_mlx_runtime_state_with_dtype(
-    layout: &StateLayout,
+    layout: &StateMemoryLayout,
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
@@ -42,7 +42,7 @@ fn estimate_mlx_runtime_state_with_dtype(
 
 #[cfg(test)]
 fn estimate_mlx_runtime_state(
-    layout: &StateLayout,
+    layout: &StateMemoryLayout,
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
@@ -599,8 +599,12 @@ mod tests {
         llama::ModelArgs as LlamaModelArgs, nemotron_h,
     };
     use eredu_core::{
-        attention::AttentionPolicy, CacheStateStrategy, EstimationCompleteness, GrowingState,
-        InputModalities, SlidingWindowLayerCount,
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::{
+            LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+            StateTensorPolicy, StateTensorRole,
+        },
+        CacheStateStrategy, EstimationCompleteness, InputModalities, SlidingWindowLayerCount,
     };
     use serde_json::json;
 
@@ -627,13 +631,12 @@ mod tests {
                 }],
             }
         );
-        assert_eq!(estimate.growing.len(), 2);
-        assert_eq!(estimate.growing[0].layers, 4);
-        assert_eq!(estimate.growing[0].window, None);
-        assert_eq!(estimate.growing[1].layers, 2);
-        assert_eq!(estimate.growing[1].window, Some(8));
-        // 2 KV heads x 4 values per head x key/value.
-        assert_eq!(estimate.growing[1].scalars_per_position, 16);
+        assert_eq!(
+            estimate.layer_layout(),
+            eredu_architectures::qwen::state_layout(&args)
+                .unwrap()
+                .layers()
+        );
     }
 
     #[test]
@@ -700,11 +703,9 @@ mod tests {
                 recurrent_layers: 2,
             }
         );
-        assert_eq!(estimate.fixed_scalars_per_batch, 64);
-        assert_eq!(estimate.growing.len(), 1);
-        assert_eq!(estimate.growing[0].layers, 1);
-        assert_eq!(estimate.growing[0].scalars_per_position, 16);
-        assert_eq!(estimate.growing[0].window, None);
+        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(1), 0, 1).unwrap();
+        assert_eq!(state.fixed_state_bytes, 64 * 4);
+        assert_eq!(state.context_state_bytes, 256 * 16 * 4);
     }
 
     #[test]
@@ -786,10 +787,7 @@ mod tests {
                 ],
             }
         );
-        assert_eq!(estimate.growing.len(), 3);
-        assert_eq!(estimate.growing[0].window, None);
-        assert_eq!(estimate.growing[1].window, Some(3));
-        assert_eq!(estimate.growing[2].window, Some(5));
+        assert_eq!(estimate.layer_layout(), state_layout.layers());
     }
 
     #[test]
@@ -824,11 +822,10 @@ mod tests {
                 recurrent_layers: 1,
             }
         );
-        assert_eq!(estimate.fixed_scalars_per_batch, 64);
-        assert_eq!(estimate.growing.len(), 1);
-        assert_eq!(estimate.growing[0].layers, 1);
-        assert_eq!(estimate.growing[0].scalars_per_position, 8);
-        assert_eq!(estimate.growing[0].window, Some(5));
+        assert_eq!(
+            estimate.layer_layout(),
+            nemotron_h::state_layout(&args).unwrap().layers()
+        );
         let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(10), 0, 2).unwrap();
         assert_eq!(state.fixed_state_bytes, 512);
         assert_eq!(state.context_state_bytes, 320);
@@ -864,10 +861,9 @@ mod tests {
                 recurrent_layers: 2,
             }
         );
-        assert_eq!(estimate.fixed_scalars_per_batch, 160);
-        assert_eq!(estimate.growing.len(), 1);
-        assert_eq!(estimate.growing[0].layers, 2);
-        assert_eq!(estimate.growing[0].scalars_per_position, 16);
+        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(1), 0, 1).unwrap();
+        assert_eq!(state.fixed_state_bytes, 160 * 4);
+        assert_eq!(state.context_state_bytes, 2 * 16 * 4);
     }
 
     fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> LlamaModelArgs {
@@ -982,19 +978,15 @@ mod tests {
     }
 
     fn estimate(
-        fixed: u64,
-        components: Vec<GrowingState>,
+        policies: Vec<LayerCachePolicy>,
         positions: u64,
         batch: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
+        let layers = LayerSchedule::new(policies.len(), policies).unwrap();
+        let offsets = vec![0; layers.len()];
         estimate_mlx_runtime_state(
-            &StateLayout {
-                fixed_scalars_per_batch: fixed,
-                growing: components,
-                hidden_size: 1,
-                allocation_granularity: 1,
-                completeness: EstimationCompleteness::Complete,
-            },
+            &StateMemoryLayout::new(layers, offsets, 1, 1, EstimationCompleteness::Complete)
+                .unwrap(),
             InputTokenCount::text(positions),
             0,
             batch,
@@ -1050,18 +1042,11 @@ mod tests {
     #[test]
     fn sliding_window_bounds_only_bounded_layers() {
         let estimate = estimate(
-            0,
             vec![
-                GrowingState {
-                    layers: 1,
-                    scalars_per_position: 16,
-                    window: None,
-                },
-                GrowingState {
-                    layers: 3,
-                    scalars_per_position: 16,
-                    window: Some(4),
-                },
+                LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap(),
+                LayerCachePolicy::key_value(AttentionPolicy::sliding(4).unwrap(), 1, 8).unwrap(),
+                LayerCachePolicy::key_value(AttentionPolicy::sliding(4).unwrap(), 1, 8).unwrap(),
+                LayerCachePolicy::key_value(AttentionPolicy::sliding(4).unwrap(), 1, 8).unwrap(),
             ],
             10,
             1,
@@ -1074,12 +1059,12 @@ mod tests {
     #[test]
     fn compressed_mla_uses_latent_plus_rotary_width() {
         let estimate = estimate(
-            0,
-            vec![GrowingState {
-                layers: 3,
-                scalars_per_position: 12 + 4,
-                window: None,
-            }],
+            (0..3)
+                .map(|_| {
+                    LayerCachePolicy::compressed_latent_rotary(AttentionPolicy::Full, 12, 4)
+                        .unwrap()
+                })
+                .collect(),
             5,
             2,
         )
@@ -1138,22 +1123,30 @@ mod tests {
             }
         );
         assert_eq!(modalities, InputModalities::TEXT);
-        assert_eq!(estimate.fixed_scalars_per_batch, 112);
-        assert_eq!(estimate.growing.len(), 1);
-        assert_eq!(estimate.growing[0].layers, 2);
-        assert_eq!(estimate.growing[0].scalars_per_position, 6);
+        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(1), 0, 1).unwrap();
+        assert_eq!(state.fixed_state_bytes, 112 * 4);
+        assert_eq!(state.bytes_per_position_per_batch, 2 * 6 * 4);
         assert_eq!(estimate.allocation_granularity, 256);
     }
 
     #[test]
     fn hybrid_fixed_and_attention_state_are_separate() {
+        let fixed = StateTensorPolicy::new(
+            StateTensorRole::Convolution { slot: 0 },
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(100).unwrap(),
+            ],
+            StateTensorDtype::Floating,
+            MutableStateResidency::AlwaysDeviceMutable,
+        )
+        .unwrap();
         let estimate = estimate(
-            100,
-            vec![GrowingState {
-                layers: 2,
-                scalars_per_position: 8,
-                window: None,
-            }],
+            vec![
+                LayerCachePolicy::fixed_only(vec![fixed]).unwrap(),
+                LayerCachePolicy::key_only(AttentionPolicy::Full, 1, 8).unwrap(),
+                LayerCachePolicy::key_only(AttentionPolicy::Full, 1, 8).unwrap(),
+            ],
             5,
             3,
         )
@@ -1263,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_shared_and_sliding_layers_use_full_chunked_kv_backing() {
+    fn gemma4_shared_and_sliding_layers_use_executable_cache_retention() {
         let modalities = InputModalities {
             text: true,
             image: true,
@@ -1295,8 +1288,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(estimate.assumptions.allocation_granularity, 256);
-        assert!(estimate.assumptions.sliding_window_bounds.is_empty());
-        assert_eq!(estimate.context_state_bytes, 3 * 2 * 2 * 4 * 256 * 4);
+        assert_eq!(estimate.assumptions.sliding_window_bounds, vec![4]);
+        assert_eq!(estimate.context_state_bytes, (256 + 2 * 4) * 2 * 4 * 2 * 4);
         assert_eq!(estimate.multimodal_embedding_bytes, 3 * 8 * 2 * 4);
         assert_eq!(estimate.media_execution_workspace_bytes, 2_048);
         assert_eq!(estimate.completeness, EstimationCompleteness::Conservative);
@@ -1354,13 +1347,8 @@ mod tests {
         args.layer_schedule = eredu_core::attention::LayerSchedule::new(4, policies).unwrap();
 
         let (_, layout) = gemma4_capability(args, InputModalities::TEXT).into_parts();
-        assert_eq!(layout.growing.len(), 2);
-        assert_eq!(layout.growing[0].layers, 2);
-        assert_eq!(layout.growing[0].scalars_per_position, 8);
-        assert_eq!(layout.growing[0].window, None);
-        assert_eq!(layout.growing[1].layers, 1);
-        assert_eq!(layout.growing[1].scalars_per_position, 16);
-        assert_eq!(layout.growing[1].window, None);
+        let estimate = estimate_mlx_runtime_state(&layout, InputTokenCount::text(1), 0, 1).unwrap();
+        assert_eq!(estimate.context_state_bytes, (16 + 8 + 256 * 8) * 4);
     }
 
     #[test]
@@ -1372,13 +1360,14 @@ mod tests {
             })
         );
 
-        let layout = StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: Vec::new(),
-            hidden_size: 1,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        };
+        let layout = StateMemoryLayout::new(
+            LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
+            vec![0],
+            1,
+            1,
+            EstimationCompleteness::Complete,
+        )
+        .unwrap();
         assert!(matches!(
             estimate_mlx_runtime_state(
                 &layout,
@@ -1421,17 +1410,18 @@ mod tests {
 
     #[test]
     fn dtype_assumption_follows_the_session_activation_width() {
-        let layout = StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: vec![GrowingState {
-                layers: 1,
-                scalars_per_position: 16,
-                window: None,
-            }],
-            hidden_size: 1,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        };
+        let layout = StateMemoryLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_only(AttentionPolicy::Full, 1, 16).unwrap()],
+            )
+            .unwrap(),
+            vec![0],
+            1,
+            1,
+            EstimationCompleteness::Complete,
+        )
+        .unwrap();
         let estimate = estimate_mlx_runtime_state_with_dtype(
             &layout,
             InputTokenCount::text(2),

@@ -502,10 +502,14 @@ not reconstruct a family path from a group or layer index.
 
 Architecture capability estimates likewise own native and effective context,
 accepted modalities, cache ownership and sharing, attention windows,
-recurrent-state geometry, and backend-neutral scalar state layouts. Concrete
-backends select the loaded architecture estimate, apply their physical state
-scalar width, and add live allocator, residency, and system-memory
-observations; they do not reconstruct family state geometry.
+and runtime-state memory metadata. Their `StateMemoryLayout` wraps the exact
+ordered `LayerCachePolicy` schedule copied from the architecture's executable
+`StateLayout`; it is not a separately summarized scalar geometry. Admission
+derives attention, recurrent, convolution, pooling, and embedded-prediction
+bytes from those policies, then applies the backend's physical floating-state
+width and the declared widths of fixed-dtype components. Concrete backends add
+live allocator, residency, and system-memory observations; they do not
+reconstruct family state geometry or maintain an independent layer count.
 The same exact estimate declares whether speculative draft weights use a
 separate checkpoint, use configured embedded prediction layers, or are absent.
 A backend maps that declaration to executable or unsupported status according
@@ -527,7 +531,10 @@ Concrete backends derive native cache objects directly from those policies;
 model-family arguments are not a second source of state geometry. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
 assembled by the architecture before a backend consumes them. Architecture
-state segments also declare their processed-token frontier offsets. Runtime
+capability construction consumes that same composite layout for admission
+accounting, so prediction segments cannot be admitted with target-only byte
+estimates. Architecture state segments also declare their processed-token
+frontier offsets. Runtime
 preserves the named segment ranges in prompt-cache model identity, descriptor,
 and manifest data while expanding their frontier offsets per layer. Segment
 selection validates the architecture-declared ID and rebases its exact range;

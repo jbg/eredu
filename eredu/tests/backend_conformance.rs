@@ -26,14 +26,14 @@ use eredu::{
     AutomaticPlanningError, BackendDescriptor, BackendId, CacheStateStrategy, CapabilityError,
     DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedCapabilities, DraftPlacementPlan,
     DraftingPlan, EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides,
-    GrowingState, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InputModalities, InputTokenCount, ModelCapabilities, ModelKind,
-    ModelResourceProfile, MtpCapability, MtpCheckpointKind, ObservationSet, ObservationValue,
-    Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, RealtimeFrameConvention,
-    RealtimeSampling, RealtimeSpeechConfig, ResidencyPlan, RuntimeStateEstimate, SemanticEvent,
-    SessionCapabilities, SpeculativeDraft, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationOutput, StaticMemoryReport, TextGenerationConfig, TokenFilter,
-    TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    InputModalities, InputTokenCount, ModelCapabilities, ModelKind, ModelResourceProfile,
+    MtpCapability, MtpCheckpointKind, ObservationSet, ObservationValue, Observed, ParallelAxis,
+    ParallelTopology, PhysicalMemorySemantics, RealtimeFrameConvention, RealtimeSampling,
+    RealtimeSpeechConfig, ResidencyPlan, RuntimeStateEstimate, SemanticEvent, SessionCapabilities,
+    SpeculativeDraft, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
+    StaticMemoryReport, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::{
     checkpoint::TensorDtype,
@@ -53,7 +53,7 @@ use eredu_core::{
     SpeculativeCallbackPublisher, SpeculativeCommit, SpeculativeExecutor,
     SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationVisitor,
     SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
-    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateLayout, Submission,
+    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout, Submission,
     TextGenerationBackend,
 };
 use tokenizers::{
@@ -455,17 +455,23 @@ impl ModelCapabilityBackend for MockBackend {
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
         eredu_core::estimate_runtime_state(
-            &StateLayout {
-                fixed_scalars_per_batch: 0,
-                growing: vec![GrowingState {
-                    layers: 1,
-                    scalars_per_position: 2,
-                    window: None,
-                }],
-                hidden_size: 1,
-                allocation_granularity: 1,
-                completeness: EstimationCompleteness::Complete,
-            },
+            &StateMemoryLayout::new(
+                eredu_core::LayerSchedule::new(
+                    1,
+                    vec![eredu_core::cache::LayerCachePolicy::key_only(
+                        eredu_core::AttentionPolicy::Full,
+                        1,
+                        2,
+                    )
+                    .unwrap()],
+                )
+                .unwrap(),
+                vec![0],
+                1,
+                1,
+                EstimationCompleteness::Complete,
+            )
+            .unwrap(),
             input,
             max_output_tokens,
             batch_size,

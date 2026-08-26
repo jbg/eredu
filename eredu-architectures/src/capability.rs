@@ -1,17 +1,18 @@
 //! Backend-neutral model capability and runtime-state estimates.
 //!
 //! Normalized architecture configurations own context limits, accepted
-//! modalities, cache/recurrent strategy, and scalar state geometry. Concrete
+//! modalities, cache/recurrent strategy, and executable state geometry. Concrete
 //! backends apply physical scalar widths and report live memory observations.
 
 use std::collections::BTreeMap;
 
 use crate::rotary::RopeValue;
 use eredu_core::{
-    CacheStateStrategy, CapabilityError, EstimationCompleteness, GrowingState, InputModalities,
+    CacheStateStrategy, CapabilityError, EstimationCompleteness, InputModalities,
     ModelCapabilities, MtpCheckpointKind, ObservationKind, Observed, SlidingWindowLayerCount,
-    StateLayout,
+    StateMemoryLayout,
 };
+use eredu_runtime::StateLayout as RuntimeStateLayout;
 
 use crate::{
     gemma4, gpt_oss, kimi_linear, lfm2,
@@ -108,15 +109,6 @@ fn plain_context(maximum: i32) -> Result<(Observed<u64>, Observed<u64>), Capabil
     context_from_rope(maximum, None)
 }
 
-fn kv_scalars(kv_heads: i32, head_dim: i32) -> Result<u64, CapabilityError> {
-    let one = checked_mul(
-        positive(kv_heads, "num_key_value_heads")?,
-        positive(head_dim, "head_dim")?,
-        "K/V heads times head dimension",
-    )?;
-    checked_mul(one, 2, "key plus value scalars")
-}
-
 fn text_modalities() -> InputModalities {
     InputModalities::TEXT
 }
@@ -128,28 +120,36 @@ fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
     })
 }
 
-fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
-    left.checked_add(right)
-        .ok_or(CapabilityError::ArithmeticOverflow { operation })
-}
-
-fn checked_mul(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
-    left.checked_mul(right)
-        .ok_or(CapabilityError::ArithmeticOverflow { operation })
-}
-
 type Spec = (
     Observed<u64>,
     Observed<u64>,
     CacheStateStrategy,
     InputModalities,
-    StateLayout,
+    StateMemoryLayout,
 );
+
+fn state_memory_layout<E: std::fmt::Display>(
+    layout: Result<RuntimeStateLayout, E>,
+    hidden_size: i32,
+    allocation_granularity: u64,
+    completeness: EstimationCompleteness,
+) -> Result<StateMemoryLayout, CapabilityError> {
+    let layout = layout.map_err(|error| CapabilityError::InvalidConfiguration {
+        field: "state_layout",
+        detail: error.to_string(),
+    })?;
+    StateMemoryLayout::new(
+        layout.layers().clone(),
+        layout.layer_prefix_offsets(),
+        positive(hidden_size, "hidden_size")?,
+        allocation_granularity,
+        completeness,
+    )
+}
 
 fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
     if args.attention_schedule.len() != layers as usize {
         return Err(CapabilityError::InvalidConfiguration {
             field: "attention_schedule",
@@ -202,24 +202,12 @@ fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, Capabilit
         } else {
             text_modalities()
         },
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: std::iter::once(GrowingState {
-                layers: full,
-                scalars_per_position: scalars,
-                window: None,
-            })
-            .filter(|state| state.layers > 0)
-            .chain(sliding.into_iter().map(|group| GrowingState {
-                layers: group.layers,
-                scalars_per_position: scalars,
-                window: Some(group.window),
-            }))
-            .collect(),
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
+        state_memory_layout(
+            crate::llama::state_layout(args),
+            args.hidden_size,
+            1,
             completeness,
-        },
+        )?,
     ))
 }
 
@@ -249,6 +237,12 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
         },
         multimodal,
     )?;
+    spec.4 = state_memory_layout(
+        crate::qwen::state_layout(args),
+        args.hidden_size,
+        1,
+        EstimationCompleteness::Complete,
+    )?;
     let full_layers = args.attention_schedule.full_layer_count() as u64;
     let sliding = args
         .attention_schedule
@@ -260,7 +254,6 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
         })
         .collect::<Vec<_>>();
     if !sliding.is_empty() {
-        let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
         spec.2 = if full_layers == 0 && sliding.len() == 1 {
             CacheStateStrategy::SlidingKv {
                 window: sliding[0].window,
@@ -271,18 +264,6 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
                 sliding: sliding.clone(),
             }
         };
-        spec.4.growing = std::iter::once(GrowingState {
-            layers: full_layers,
-            scalars_per_position: scalars,
-            window: None,
-        })
-        .filter(|state| state.layers > 0)
-        .chain(sliding.into_iter().map(|group| GrowingState {
-            layers: group.layers,
-            scalars_per_position: scalars,
-            window: Some(group.window),
-        }))
-        .collect();
     }
     Ok(spec)
 }
@@ -299,23 +280,10 @@ fn muse_glimmer_spec(args: &crate::muse_glimmer::DecoderConfig) -> Result<Spec, 
             layers: layers as u64,
         })
         .collect::<Vec<_>>();
-    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
     let state_strategy = CacheStateStrategy::MixedKv {
         full_layers,
         sliding: sliding.clone(),
     };
-    let growing = std::iter::once(GrowingState {
-        layers: full_layers,
-        scalars_per_position: scalars,
-        window: None,
-    })
-    .filter(|state| state.layers > 0)
-    .chain(sliding.into_iter().map(|group| GrowingState {
-        layers: group.layers,
-        scalars_per_position: scalars,
-        window: Some(group.window),
-    }))
-    .collect();
     Ok((
         context.0,
         context.1,
@@ -326,13 +294,12 @@ fn muse_glimmer_spec(args: &crate::muse_glimmer::DecoderConfig) -> Result<Spec, 
             audio: false,
             video: args.weight_convention == crate::muse_glimmer::WeightConvention::HuggingFace,
         },
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing,
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            crate::muse_glimmer::state_layout(args),
+            args.hidden_size,
+            1,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -349,12 +316,6 @@ fn neutral_deepseek_v3_spec(args: &crate::deepseek::V3Args) -> Result<Spec, Capa
         })
         .transpose()?
         .unwrap_or(effective);
-    let layers = u64::try_from(args.layer_schedule.len()).map_err(|_| {
-        CapabilityError::InvalidConfiguration {
-            field: "layer_schedule",
-            detail: "decoder layer count exceeds runtime-state accounting range".into(),
-        }
-    })?;
     let latent = positive(args.kv_lora_rank, "kv_lora_rank")?;
     let rotary = positive(args.qk_rope_head_dim, "qk_rope_head_dim")?;
     Ok((
@@ -373,17 +334,12 @@ fn neutral_deepseek_v3_spec(args: &crate::deepseek::V3Args) -> Result<Spec, Capa
             rotary_width: rotary,
         },
         text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: vec![GrowingState {
-                layers,
-                scalars_per_position: checked_add(latent, rotary, "MLA latent plus rotary width")?,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            crate::deepseek::v3::state_layout(args),
+            args.hidden_size,
+            256,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -411,7 +367,6 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
             )
         })
         .count() as u64;
-    let head_dim = positive(args.head_dim, "head_dim")?;
     Ok((
         Observed::Available {
             value: native,
@@ -431,24 +386,12 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
             }],
         },
         text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: vec![
-                GrowingState {
-                    layers,
-                    scalars_per_position: head_dim,
-                    window: Some(positive(args.sliding_window, "sliding_window")?),
-                },
-                GrowingState {
-                    layers: compressed,
-                    scalars_per_position: head_dim,
-                    window: None,
-                },
-            ],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 128,
-            completeness: EstimationCompleteness::Conservative,
-        },
+        state_memory_layout(
+            crate::deepseek::v4::state_layout(args),
+            args.hidden_size,
+            128,
+            EstimationCompleteness::Conservative,
+        )?,
     ))
 }
 
@@ -460,36 +403,6 @@ fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityErr
         .filter(|policy| policy.attention == kimi_linear::AttentionKind::Mla)
         .count() as u64;
     let recurrent = args.layer_schedule.len() as u64 - attention;
-    let heads = positive(args.kda_config.num_heads, "kda_config.num_heads")?;
-    let head_dim = positive(args.kda_config.head_dim, "kda_config.head_dim")?;
-    let projection = checked_mul(heads, head_dim, "KDA projected width")?;
-    let conv_state = checked_mul(
-        checked_mul(
-            positive(
-                args.kda_config.short_conv_kernel_size - 1,
-                "kda_config.short_conv_kernel_size",
-            )?,
-            projection,
-            "KDA convolution history width",
-        )?,
-        3,
-        "KDA Q/K/V convolution states",
-    )?;
-    let recurrent_state = checked_mul(
-        checked_mul(heads, head_dim, "KDA recurrent heads times key width")?,
-        head_dim,
-        "KDA recurrent state",
-    )?;
-    let fixed = checked_mul(
-        recurrent,
-        checked_add(conv_state, recurrent_state, "KDA fixed layer state")?,
-        "all KDA fixed state",
-    )?;
-    let mla_width = checked_add(
-        positive(args.kv_lora_rank, "kv_lora_rank")?,
-        positive(args.qk_rope_head_dim, "qk_rope_head_dim")?,
-        "Kimi MLA latent plus identity positional width",
-    )?;
     Ok((
         context.0,
         context.1,
@@ -499,17 +412,12 @@ fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityErr
             recurrent_layers: recurrent,
         },
         text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: mla_width,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            kimi_linear::state_layout(args),
+            args.hidden_size,
+            256,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -526,7 +434,6 @@ fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
             window: u64::from(window.get()),
         })
         .collect::<Vec<_>>();
-    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
     let state_strategy = match (full, sliding.as_slice()) {
         (_, []) => CacheStateStrategy::FullKv,
         (0, [only]) => CacheStateStrategy::SlidingKv {
@@ -542,24 +449,12 @@ fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
         context.1,
         state_strategy,
         text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: std::iter::once(GrowingState {
-                layers: full,
-                scalars_per_position: scalars,
-                window: None,
-            })
-            .filter(|state| state.layers > 0)
-            .chain(sliding.into_iter().map(|group| GrowingState {
-                layers: group.layers,
-                scalars_per_position: scalars,
-                window: Some(group.window),
-            }))
-            .collect(),
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            gpt_oss::state_layout(args),
+            args.hidden_size,
+            1,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -612,34 +507,12 @@ fn gemma4_spec(
             decoder
         },
         modalities,
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: {
-                let mut groups = BTreeMap::<u64, u64>::new();
-                for policy in args
-                    .layer_schedule
-                    .iter()
-                    .filter(|policy| policy.key_value.owns_state())
-                {
-                    let scalars = 2
-                        * u64::from(policy.num_key_value_heads.get())
-                        * u64::from(policy.head_dim.get());
-                    *groups.entry(scalars).or_default() += 1;
-                }
-                groups
-                    .into_iter()
-                    .map(|(scalars_per_position, layers)| GrowingState {
-                        layers,
-                        scalars_per_position,
-                        // Gemma masks sliding attention but retains full KV backing.
-                        window: None,
-                    })
-                    .collect()
-            },
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            gemma4::state_layout(args),
+            args.hidden_size,
+            256,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -656,7 +529,6 @@ fn inkling_spec(args: &crate::inkling::ModelArgs) -> Result<Spec, CapabilityErro
             },
         ),
     };
-    let layers = positive(text.num_hidden_layers, "num_hidden_layers")?;
     let global = text
         .layer_schedule
         .iter()
@@ -673,26 +545,6 @@ fn inkling_spec(args: &crate::inkling::ModelArgs) -> Result<Spec, CapabilityErro
         .into_iter()
         .map(|(window, layers)| SlidingWindowLayerCount { layers, window })
         .collect::<Vec<_>>();
-    let local_kv = kv_scalars(
-        text.swa_num_key_value_heads
-            .unwrap_or(text.num_key_value_heads),
-        text.swa_head_dim.unwrap_or(text.head_dim),
-    )?;
-    let global_kv = kv_scalars(text.num_key_value_heads, text.head_dim)?;
-    let conv_width = checked_mul(
-        positive(text.hidden_size, "hidden_size")?,
-        4,
-        "Inkling convolution widths",
-    )?;
-    let fixed = checked_mul(
-        checked_mul(
-            layers,
-            positive(text.sconv_kernel_size - 1, "sconv_kernel_size")?,
-            "Inkling layers times convolution state",
-        )?,
-        conv_width,
-        "Inkling fixed convolution state",
-    )?;
     let modalities = args.input_modalities();
     let decoder = match (global, sliding.as_slice()) {
         (_, []) => CacheStateStrategy::FullKv,
@@ -712,24 +564,16 @@ fn inkling_spec(args: &crate::inkling::ModelArgs) -> Result<Spec, CapabilityErro
             media_consumes_decoder_positions: true,
         },
         modalities,
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: std::iter::once(GrowingState {
-                layers: global,
-                scalars_per_position: global_kv,
-                window: None,
-            })
-            .filter(|state| state.layers > 0)
-            .chain(sliding.into_iter().map(|group| GrowingState {
-                layers: group.layers,
-                scalars_per_position: local_kv,
-                window: Some(group.window),
-            }))
-            .collect(),
-            hidden_size: positive(text.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            (|| {
+                let target = crate::inkling::state_layout(args)?;
+                let prediction = crate::inkling::mtp_state_layout(args)?;
+                crate::inkling::composite_state_layout(&target, prediction.as_ref())
+            })(),
+            text.hidden_size,
+            1,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -745,16 +589,6 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
         .iter()
         .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::CausalConvolution))
         .count() as u64;
-    let head_dim = args.hidden_size / args.num_attention_heads;
-    let fixed = checked_mul(
-        checked_mul(
-            conv,
-            positive(args.conv_l_cache - 1, "conv_L_cache")?,
-            "LFM convolution layers times history",
-        )?,
-        positive(args.hidden_size, "hidden_size")?,
-        "LFM fixed convolution state",
-    )?;
     Ok((
         context.0,
         context.1,
@@ -764,17 +598,12 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
             recurrent_layers: conv,
         },
         text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: kv_scalars(args.num_key_value_heads, head_dim)?,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            lfm2::state_layout(args),
+            args.hidden_size,
+            256,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -792,39 +621,6 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
             *attention_groups.entry(window).or_default() += 1;
         }
     }
-    let intermediate = checked_mul(
-        positive(args.mamba_num_heads, "mamba_num_heads")?,
-        positive(args.mamba_head_dim, "mamba_head_dim")?,
-        "Mamba intermediate width",
-    )?;
-    let conv_dim = checked_add(
-        intermediate,
-        checked_mul(
-            checked_mul(2, positive(args.n_groups, "n_groups")?, "Mamba B/C groups")?,
-            positive(args.ssm_state_size, "ssm_state_size")?,
-            "Mamba B/C state width",
-        )?,
-        "Mamba convolution width",
-    )?;
-    let conv_state = checked_mul(
-        positive(args.conv_kernel - 1, "conv_kernel")?,
-        conv_dim,
-        "Mamba convolution state",
-    )?;
-    let ssm_state = checked_mul(
-        checked_mul(
-            positive(args.mamba_num_heads, "mamba_num_heads")?,
-            positive(args.mamba_head_dim, "mamba_head_dim")?,
-            "Mamba heads times head dimension",
-        )?,
-        positive(args.ssm_state_size, "ssm_state_size")?,
-        "Mamba SSM state",
-    )?;
-    let fixed = checked_mul(
-        mamba,
-        checked_add(conv_state, ssm_state, "Mamba fixed layer state")?,
-        "all Mamba fixed state",
-    )?;
     let full_attention_layers = attention_groups.get(&None).copied().unwrap_or(0);
     let sliding_attention = attention_groups
         .iter()
@@ -844,22 +640,12 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
             recurrent_layers: mamba,
         },
         text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: attention_groups
-                .into_iter()
-                .map(|(window, layers)| {
-                    Ok(GrowingState {
-                        layers,
-                        scalars_per_position: kv_scalars(args.num_key_value_heads, args.head_dim)?,
-                        window,
-                    })
-                })
-                .collect::<Result<Vec<_>, CapabilityError>>()?,
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            nemotron_h::state_layout(args),
+            args.hidden_size,
+            1,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
@@ -920,40 +706,6 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
         })
         .count() as u64;
     let recurrent = layers.saturating_sub(attention);
-    let key_dim = checked_mul(
-        positive(args.linear_num_key_heads, "linear_num_key_heads")?,
-        positive(args.linear_key_head_dim, "linear_key_head_dim")?,
-        "linear key width",
-    )?;
-    let value_dim = checked_mul(
-        positive(args.linear_num_value_heads, "linear_num_value_heads")?,
-        positive(args.linear_value_head_dim, "linear_value_head_dim")?,
-        "linear value width",
-    )?;
-    let conv_dim = checked_add(
-        checked_mul(2, key_dim, "linear query/key width")?,
-        value_dim,
-        "linear convolution width",
-    )?;
-    let conv_state = checked_mul(
-        positive(args.linear_conv_kernel_dim - 1, "linear_conv_kernel_dim")?,
-        conv_dim,
-        "linear convolution state",
-    )?;
-    let recurrent_state = checked_mul(
-        checked_mul(
-            positive(args.linear_num_value_heads, "linear_num_value_heads")?,
-            positive(args.linear_key_head_dim, "linear_key_head_dim")?,
-            "linear recurrent heads times key width",
-        )?,
-        positive(args.linear_value_head_dim, "linear_value_head_dim")?,
-        "linear recurrent state",
-    )?;
-    let fixed = checked_mul(
-        recurrent,
-        checked_add(conv_state, recurrent_state, "linear fixed layer state")?,
-        "all linear-attention fixed state",
-    )?;
     let base = CacheStateStrategy::HybridRecurrent {
         full_attention_layers: attention,
         sliding_attention: Vec::new(),
@@ -984,25 +736,20 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
         } else {
             text_modalities()
         },
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: kv_scalars(args.num_key_value_heads, args.head_dim)?,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
+        state_memory_layout(
+            crate::qwen::hybrid::state_layout(args),
+            args.hidden_size,
+            1,
+            EstimationCompleteness::Complete,
+        )?,
     ))
 }
 
-/// Complete portable capability and scalar-state estimate for one architecture.
+/// Complete portable capability and runtime-state estimate for one architecture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityEstimate {
     capabilities: ModelCapabilities,
-    state_layout: StateLayout,
+    state_layout: StateMemoryLayout,
     mtp_checkpoint: Option<MtpCheckpointKind>,
 }
 
@@ -1012,8 +759,8 @@ impl CapabilityEstimate {
         &self.capabilities
     }
 
-    /// Returns backend-neutral scalar state geometry.
-    pub const fn state_layout(&self) -> &StateLayout {
+    /// Returns memory metadata around the exact executable layer schedule.
+    pub const fn state_layout(&self) -> &StateMemoryLayout {
         &self.state_layout
     }
 
@@ -1027,7 +774,7 @@ impl CapabilityEstimate {
     }
 
     /// Splits the estimate into its portable capability and state values.
-    pub fn into_parts(self) -> (ModelCapabilities, StateLayout) {
+    pub fn into_parts(self) -> (ModelCapabilities, StateMemoryLayout) {
         (self.capabilities, self.state_layout)
     }
 }
@@ -1078,10 +825,14 @@ pub fn qwen(args: &crate::qwen::ModelArgs) -> Result<CapabilityEstimate, Capabil
 
 /// Derives Qwen3-VL capabilities from its complete normalized family policy.
 pub fn qwen_vl(args: &crate::qwen::vl::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        args.model_type.clone(),
-        qwen_spec(&args.text, true)?,
-    ))
+    let mut spec = qwen_spec(&args.text, true)?;
+    spec.4 = state_memory_layout(
+        crate::qwen::vl::state_layout(args),
+        args.text.hidden_size,
+        1,
+        EstimationCompleteness::Complete,
+    )?;
+    Ok(finish(args.model_type.clone(), spec))
 }
 
 /// Derives Muse-Glimmer capabilities from normalized architecture policy.
@@ -1187,6 +938,7 @@ pub fn qwen_hybrid_text(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::num::NonZeroU8;
 
     #[test]
     fn context_scaling_distinguishes_native_and_effective_limits() {
@@ -1208,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_catalog_owns_window_grouping_and_scalar_geometry() {
+    fn qwen_accounting_uses_the_executable_layer_schedule() {
         let args = crate::qwen::model_args_from_config_value(&json!({
             "model_type": "qwen2",
             "hidden_size": 16,
@@ -1238,20 +990,136 @@ mod tests {
                 }],
             }
         );
+        let executable = crate::qwen::state_layout(&args).unwrap();
+        assert_eq!(estimate.state_layout().layer_layout(), executable.layers());
+    }
+
+    #[test]
+    fn embedded_mtp_accounting_contains_every_executable_state_layer() {
+        let v3_args = crate::deepseek::parse_v3_config(&json!({
+            "hidden_size": 8, "intermediate_size": 16, "moe_intermediate_size": 8,
+            "num_hidden_layers": 2, "num_attention_heads": 2, "vocab_size": 31,
+            "max_position_embeddings": 64, "kv_lora_rank": 4, "qk_nope_head_dim": 2,
+            "qk_rope_head_dim": 2, "v_head_dim": 2, "first_k_dense_replace": 1,
+            "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+            "n_group": 2, "topk_group": 1, "num_nextn_predict_layers": 1,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        let v3 = deepseek_v3(&v3_args).unwrap();
+        let v3_executable = crate::deepseek::v3::state_layout(&v3_args).unwrap();
+        assert_eq!(v3.state_layout().layer_layout(), v3_executable.layers());
+        assert_eq!(v3.state_layout().layer_layout().len(), 3);
+        let v3_state = eredu_core::estimate_runtime_state(
+            v3.state_layout(),
+            eredu_core::InputTokenCount::text(3),
+            0,
+            1,
+            NonZeroU8::new(2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v3_state.context_state_bytes, 3 * (4 + 2) * 256 * 2);
+        let target_only_budget = 2 * (4 + 2) * 256 * 2;
+        assert!(matches!(
+            eredu_core::apply_admission_policy(
+                v3.capabilities(),
+                eredu_core::AdmissionRequest {
+                    input: eredu_core::InputTokenCount::text(3),
+                    max_output_tokens: 0,
+                    batch_size: 1,
+                    safety_reserve_bytes: 0,
+                    application_memory_budget_bytes: Some(target_only_budget),
+                    require_complete_estimate: true,
+                },
+                v3_state,
+                None,
+            )
+            .unwrap(),
+            eredu_core::AdmissionResult::Rejected(
+                eredu_core::AdmissionRejection::MemoryBudgetExceeded { .. }
+            )
+        ));
+
+        let v4_args = crate::deepseek::parse_v4_config(&json!({
+            "hidden_size": 8, "moe_intermediate_size": 8, "num_hidden_layers": 3,
+            "num_attention_heads": 2, "head_dim": 4, "qk_rope_head_dim": 2,
+            "q_lora_rank": 4, "o_lora_rank": 2, "o_groups": 2, "vocab_size": 31,
+            "max_position_embeddings": 64, "sliding_window": 8,
+            "compress_ratios": [0, 4, 128, 0], "index_n_heads": 2,
+            "index_head_dim": 4, "index_topk": 1, "hc_mult": 2,
+            "hc_sinkhorn_iters": 2, "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
+            "norm_topk_prob": true, "num_nextn_predict_layers": 1
+        }))
+        .unwrap();
+        let v4 = deepseek_v4(&v4_args).unwrap();
         assert_eq!(
-            estimate.state_layout().growing,
-            vec![
-                GrowingState {
-                    layers: 2,
-                    scalars_per_position: 16,
-                    window: None,
-                },
-                GrowingState {
-                    layers: 2,
-                    scalars_per_position: 16,
-                    window: Some(8),
-                },
-            ]
+            v4.state_layout().layer_layout(),
+            crate::deepseek::v4::state_layout(&v4_args)
+                .unwrap()
+                .layers()
+        );
+        assert_eq!(v4.state_layout().layer_layout().len(), 4);
+
+        let inkling_args = crate::inkling::ModelArgs::from_hf_json(
+            br#"{
+              "model_type":"inkling_mm_model",
+              "text_config":{
+                "hidden_size":16,"num_hidden_layers":1,"vocab_size":64,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "sliding_window_size":8,"local_layer_ids":[0],
+                "mlp_layer_types":["dense"],"sconv_kernel_size":4,
+                "d_rel":2,"intermediate_size":12,"n_routed_experts":4,
+                "num_experts_per_tok":2,"n_shared_experts":1
+              },
+              "mtp_config":{
+                "num_nextn_predict_layers":2,"local_layer_ids":[1],
+                "chain_hidden_post_norm":true,"dense_intermediate_size":12
+              }
+            }"#,
+        )
+        .unwrap();
+        let inkling = inkling(&inkling_args).unwrap();
+        assert_eq!(inkling.state_layout().layer_layout().len(), 3);
+
+        let nemotron_args = crate::nemotron_h::model_args_from_config_value(&json!({
+            "model_type":"nemotron_h", "vocab_size":32, "hidden_size":16,
+            "intermediate_size":24, "num_hidden_layers":4,
+            "hybrid_override_pattern":"M*-E", "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":4,
+            "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+            "conv_kernel":3, "n_routed_experts":4, "n_shared_experts":1,
+            "moe_intermediate_size":8, "moe_shared_expert_intermediate_size":8,
+            "num_experts_per_tok":2, "n_group":2, "topk_group":1,
+            "num_nextn_predict_layers":1, "mtp_hybrid_override_pattern":"*E",
+            "tie_word_embeddings":false
+        }))
+        .unwrap();
+        let nemotron = nemotron_h(&nemotron_args).unwrap();
+        assert!(nemotron.state_layout().layer_layout().len() > 4);
+        assert_eq!(
+            nemotron.state_layout().layer_layout(),
+            crate::nemotron_h::state_layout(&nemotron_args)
+                .unwrap()
+                .layers()
+        );
+
+        let qwen_args = crate::qwen::hybrid::model_args_from_config_value(&json!({
+            "model_type": "qwen3_5_text", "vocab_size": 8, "hidden_size": 8,
+            "num_hidden_layers": 2, "mtp_num_hidden_layers": 2,
+            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 8,
+            "max_position_embeddings": 16, "intermediate_size": 16,
+            "num_experts": 0, "tie_word_embeddings": true,
+            "layer_types": ["full_attention", "full_attention"]
+        }))
+        .unwrap();
+        let qwen = qwen_hybrid(&qwen_args).unwrap();
+        assert_eq!(qwen.state_layout().layer_layout().len(), 4);
+        assert_eq!(
+            qwen.state_layout().layer_layout(),
+            crate::qwen::hybrid::state_layout(&qwen_args.text)
+                .unwrap()
+                .layers()
         );
     }
 }

@@ -1725,17 +1725,23 @@ mod tests {
             batch_size: u64,
         ) -> Result<RuntimeStateEstimate, CapabilityError> {
             crate::estimate_runtime_state(
-                &crate::StateLayout {
-                    fixed_scalars_per_batch: 0,
-                    growing: vec![crate::GrowingState {
-                        layers: 1,
-                        scalars_per_position: 2,
-                        window: None,
-                    }],
-                    hidden_size: 1,
-                    allocation_granularity: 1,
-                    completeness: crate::EstimationCompleteness::Complete,
-                },
+                &crate::StateMemoryLayout::new(
+                    crate::LayerSchedule::new(
+                        1,
+                        vec![crate::cache::LayerCachePolicy::key_only(
+                            crate::AttentionPolicy::Full,
+                            1,
+                            2,
+                        )
+                        .unwrap()],
+                    )
+                    .unwrap(),
+                    vec![0],
+                    1,
+                    1,
+                    crate::EstimationCompleteness::Complete,
+                )
+                .unwrap(),
                 input,
                 max_output_tokens,
                 batch_size,

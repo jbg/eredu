@@ -1,6 +1,12 @@
 //! Portable model capabilities, runtime-state accounting, and admission policy.
 
-use crate::{ObservationKind, Observed};
+use crate::{
+    cache::{
+        LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
+        StateTensorPresence, StateTensorRole,
+    },
+    AttentionPolicy, LayerSchedule, ObservationKind, Observed,
+};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
@@ -372,30 +378,92 @@ pub enum CapabilityError {
     Observation(String),
 }
 
-/// One context-growing state component in a backend-neutral state layout.
+/// Memory-accounting view of an executable runtime-state layout.
+///
+/// The ordered layer policies are copied directly from the architecture's
+/// executable [`LayerSchedule`]. They are intentionally not summarized into a
+/// second scalar geometry, so execution and admission share one semantic
+/// source for every state-bearing layer and component.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GrowingState {
-    /// Number of layers owning this component.
-    pub layers: u64,
-    /// Stored scalars per retained position and layer.
-    pub scalars_per_position: u64,
-    /// Optional exact retention bound.
-    pub window: Option<u64>,
-}
-
-/// Scalar layout needed to estimate request state independently of a tensor backend.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StateLayout {
-    /// Context-independent scalars per batch item.
-    pub fixed_scalars_per_batch: u64,
-    /// Context-growing state components.
-    pub growing: Vec<GrowingState>,
+pub struct StateMemoryLayout {
+    /// Exact ordered executable state policies.
+    layer_layout: LayerSchedule<LayerCachePolicy>,
+    /// Executable processed-token offset for every state layer.
+    layer_prefix_offsets: Vec<i32>,
     /// Model hidden width used by retained media embeddings.
     pub hidden_size: u64,
     /// Allocation granularity for unbounded caches.
     pub allocation_granularity: u64,
     /// Coverage supplied by the layout.
     pub completeness: EstimationCompleteness,
+}
+
+impl StateMemoryLayout {
+    /// Creates accounting metadata around an exact executable layer schedule.
+    pub fn new(
+        layer_layout: LayerSchedule<LayerCachePolicy>,
+        layer_prefix_offsets: Vec<i32>,
+        hidden_size: u64,
+        allocation_granularity: u64,
+        completeness: EstimationCompleteness,
+    ) -> Result<Self, CapabilityError> {
+        if layer_layout.is_empty()
+            || layer_prefix_offsets.len() != layer_layout.len()
+            || layer_prefix_offsets.iter().any(|offset| *offset > 0)
+            || hidden_size == 0
+            || allocation_granularity == 0
+        {
+            let (field, detail) = if layer_layout.is_empty() {
+                (
+                    "layer_layout",
+                    "must contain at least one executable state layer",
+                )
+            } else if layer_prefix_offsets.len() != layer_layout.len() {
+                (
+                    "layer_prefix_offsets",
+                    "must contain one entry per executable state layer",
+                )
+            } else if layer_prefix_offsets.iter().any(|offset| *offset > 0) {
+                (
+                    "layer_prefix_offsets",
+                    "must not advance beyond the request token frontier",
+                )
+            } else if hidden_size == 0 {
+                ("hidden_size", "must be positive")
+            } else {
+                ("allocation_granularity", "must be positive")
+            };
+            return Err(CapabilityError::InvalidConfiguration {
+                field,
+                detail: detail.into(),
+            });
+        }
+        for (layer, policy) in layer_layout.iter().enumerate() {
+            policy
+                .validate()
+                .map_err(|error| CapabilityError::InvalidConfiguration {
+                    field: "layer_layout",
+                    detail: format!("invalid state policy at layer {layer}: {error}"),
+                })?;
+        }
+        Ok(Self {
+            layer_layout,
+            layer_prefix_offsets,
+            hidden_size,
+            allocation_granularity,
+            completeness,
+        })
+    }
+
+    /// Borrows the exact ordered executable state policies.
+    pub const fn layer_layout(&self) -> &LayerSchedule<LayerCachePolicy> {
+        &self.layer_layout
+    }
+
+    /// Returns executable processed-token offsets in state-layer order.
+    pub fn layer_prefix_offsets(&self) -> &[i32] {
+        &self.layer_prefix_offsets
+    }
 }
 
 fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
@@ -408,21 +476,161 @@ fn checked_mul(left: u64, right: u64, operation: &'static str) -> Result<u64, Ca
         .ok_or(CapabilityError::ArithmeticOverflow { operation })
 }
 
-/// Estimates request state from a model's scalar layout.
+fn attention_scalars_per_position(policy: &LayerCachePolicy) -> Result<u64, CapabilityError> {
+    let scalars = match policy {
+        LayerCachePolicy::KeyValue {
+            num_key_value_heads,
+            head_dim,
+            ..
+        }
+        | LayerCachePolicy::KeyValueWithFixedState {
+            num_key_value_heads,
+            head_dim,
+            ..
+        } => checked_mul(
+            checked_mul(
+                u64::from(num_key_value_heads.get()),
+                u64::from(head_dim.get()),
+                "key/value heads times head dimension",
+            )?,
+            2,
+            "key plus value scalars",
+        )?,
+        LayerCachePolicy::KeyOnly {
+            num_key_heads,
+            head_dim,
+            ..
+        }
+        | LayerCachePolicy::KeyOnlyWithFixedState {
+            num_key_heads,
+            head_dim,
+            ..
+        } => checked_mul(
+            u64::from(num_key_heads.get()),
+            u64::from(head_dim.get()),
+            "key heads times head dimension",
+        )?,
+        LayerCachePolicy::CompressedLatentRotary {
+            latent_dim,
+            rotary_dim,
+            ..
+        } => checked_add(
+            u64::from(latent_dim.get()),
+            u64::from(rotary_dim.get()),
+            "compressed latent plus rotary width",
+        )?,
+        LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => 0,
+    };
+    Ok(scalars)
+}
+
+fn is_context_dependent_dimension(dimension: &StateTensorDimension) -> bool {
+    matches!(
+        dimension,
+        StateTensorDimension::PrefixTokens
+            | StateTensorDimension::PrefixTokensDiv(_)
+            | StateTensorDimension::PrefixTokensRem(_)
+    )
+}
+
+fn state_tensor_dtype_bytes(tensor: &StateTensorPolicy, scalar_bytes: u64) -> u64 {
+    match tensor.dtype {
+        StateTensorDtype::Floating => scalar_bytes,
+        StateTensorDtype::Float32 | StateTensorDtype::Int32 | StateTensorDtype::Uint32 => 4,
+    }
+}
+
+fn state_tensor_is_present(tensor: &StateTensorPolicy, prefix_tokens: usize) -> bool {
+    match tensor.presence {
+        StateTensorPresence::Required => true,
+        // Prepared prefix embeddings are accounted once through the input's
+        // authoritative media-position count below. Any other optional state
+        // is included conservatively because its request-time presence is not
+        // otherwise represented in the portable input descriptor.
+        StateTensorPresence::Optional => !matches!(tensor.role, StateTensorRole::PrefixEmbedding),
+        StateTensorPresence::PrefixRemainderNonZero(divisor) => {
+            !prefix_tokens.is_multiple_of(divisor.get() as usize)
+        }
+        StateTensorPresence::PrefixAtLeast(divisor) => prefix_tokens >= divisor.get() as usize,
+    }
+}
+
+fn state_tensor_bytes(
+    tensor: &StateTensorPolicy,
+    batch_size: usize,
+    prefix_tokens: usize,
+    scalar_bytes: u64,
+) -> Result<u64, CapabilityError> {
+    if !state_tensor_is_present(tensor, prefix_tokens) {
+        return Ok(0);
+    }
+    let shape = tensor
+        .resolved_shape(batch_size, prefix_tokens)
+        .map_err(|error| CapabilityError::InvalidConfiguration {
+            field: "layer_layout",
+            detail: error.to_string(),
+        })?;
+    let scalars = shape.into_iter().try_fold(1_u64, |scalars, dimension| {
+        checked_mul(
+            scalars,
+            u64::try_from(dimension).map_err(|_| CapabilityError::InvalidConfiguration {
+                field: "layer_layout",
+                detail: "runtime state tensor has a negative resolved dimension".into(),
+            })?,
+            "runtime state tensor scalar count",
+        )
+    })?;
+    checked_mul(
+        scalars,
+        state_tensor_dtype_bytes(tensor, scalar_bytes),
+        "runtime state tensor bytes",
+    )
+}
+
+fn state_tensor_bytes_per_position_per_batch(
+    tensor: &StateTensorPolicy,
+    scalar_bytes: u64,
+) -> Result<u64, CapabilityError> {
+    let mut scalars = 1_u64;
+    let mut divisor = 1_u64;
+    let mut unbounded = false;
+    for dimension in &tensor.shape {
+        match dimension {
+            StateTensorDimension::Batch | StateTensorDimension::Scalar => {}
+            StateTensorDimension::Fixed(value) => {
+                scalars =
+                    checked_mul(scalars, u64::from(value.get()), "state growth scalar count")?;
+            }
+            StateTensorDimension::PrefixTokens => unbounded = true,
+            StateTensorDimension::PrefixTokensDiv(value) => {
+                unbounded = true;
+                divisor = checked_mul(divisor, u64::from(value.get()), "state growth divisor")?;
+            }
+            StateTensorDimension::PrefixTokensRem(_) => return Ok(0),
+        }
+    }
+    if !unbounded {
+        return Ok(0);
+    }
+    let bytes = checked_mul(
+        scalars,
+        state_tensor_dtype_bytes(tensor, scalar_bytes),
+        "state growth bytes",
+    )?;
+    Ok(bytes.div_ceil(divisor))
+}
+
+/// Estimates request state from exact executable layer policies.
 pub fn estimate_runtime_state(
-    layout: &StateLayout,
+    layout: &StateMemoryLayout,
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
     state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
-    if batch_size == 0 || layout.allocation_granularity == 0 {
+    if batch_size == 0 {
         return Err(CapabilityError::InvalidConfiguration {
-            field: if batch_size == 0 {
-                "batch_size"
-            } else {
-                "allocation_granularity"
-            },
+            field: "batch_size",
             detail: "must be positive".into(),
         });
     }
@@ -432,51 +640,77 @@ pub fn estimate_runtime_state(
         "prompt plus output positions",
     )?;
     let scalar_bytes = u64::from(state_dtype_bytes.get());
-    let fixed_state_bytes = checked_mul(
-        checked_mul(
-            layout.fixed_scalars_per_batch,
-            batch_size,
-            "fixed state times batch",
-        )?,
-        scalar_bytes,
-        "fixed state bytes",
-    )?;
+    let batch_size_usize =
+        usize::try_from(batch_size).map_err(|_| CapabilityError::InvalidConfiguration {
+            field: "batch_size",
+            detail: "exceeds the runtime state shape range".into(),
+        })?;
+    let mut fixed_state_bytes = 0;
     let mut context_state_bytes = 0;
     let mut unbounded_per_position = 0;
     let mut sliding_window_bounds = Vec::new();
-    for component in &layout.growing {
-        let per_position = checked_mul(
-            component.layers,
-            component.scalars_per_position,
-            "component scalars per position",
-        )?;
-        let retained = match component.window {
-            Some(window) => requested_positions.min(window),
-            None => {
-                let adjustment = layout.allocation_granularity - 1;
-                checked_add(requested_positions, adjustment, "cache allocation rounding")?
-                    / layout.allocation_granularity
-                    * layout.allocation_granularity
+    for (layer, policy) in layout.layer_layout.iter().enumerate() {
+        let layer_positions = requested_positions
+            .saturating_sub(u64::from(layout.layer_prefix_offsets[layer].unsigned_abs()));
+        let layer_positions_usize = usize::try_from(layer_positions).map_err(|_| {
+            CapabilityError::InvalidConfiguration {
+                field: "requested_positions",
+                detail: "exceeds the runtime state shape range".into(),
             }
-        };
-        let bytes = checked_mul(
-            checked_mul(
-                checked_mul(per_position, retained, "component context scalars")?,
-                batch_size,
-                "component context batch",
-            )?,
-            scalar_bytes,
-            "component context bytes",
-        )?;
-        context_state_bytes = checked_add(context_state_bytes, bytes, "context state byte total")?;
-        if component.window.is_none() {
-            unbounded_per_position = checked_add(
-                unbounded_per_position,
-                checked_mul(per_position, scalar_bytes, "unbounded bytes per position")?,
-                "unbounded bytes-per-position total",
+        })?;
+        if let Some(attention) = policy.attention() {
+            let per_position = attention_scalars_per_position(policy)?;
+            let retained = match attention {
+                AttentionPolicy::Sliding { window } => {
+                    let window = u64::from(window.get());
+                    sliding_window_bounds.push(window);
+                    layer_positions.min(window)
+                }
+                AttentionPolicy::Full => {
+                    let adjustment = layout.allocation_granularity - 1;
+                    checked_add(layer_positions, adjustment, "cache allocation rounding")?
+                        / layout.allocation_granularity
+                        * layout.allocation_granularity
+                }
+            };
+            let bytes = checked_mul(
+                checked_mul(
+                    checked_mul(per_position, retained, "attention context scalars")?,
+                    batch_size,
+                    "attention context batch",
+                )?,
+                scalar_bytes,
+                "attention context bytes",
             )?;
-        } else if let Some(window) = component.window {
-            sliding_window_bounds.push(window);
+            context_state_bytes =
+                checked_add(context_state_bytes, bytes, "context state byte total")?;
+            if matches!(attention, AttentionPolicy::Full) {
+                unbounded_per_position = checked_add(
+                    unbounded_per_position,
+                    checked_mul(per_position, scalar_bytes, "unbounded bytes per position")?,
+                    "unbounded bytes-per-position total",
+                )?;
+            }
+        }
+        for tensor in policy.fixed_state() {
+            let bytes = state_tensor_bytes(
+                tensor,
+                batch_size_usize,
+                layer_positions_usize,
+                scalar_bytes,
+            )?;
+            if tensor.shape.iter().any(is_context_dependent_dimension) {
+                context_state_bytes =
+                    checked_add(context_state_bytes, bytes, "context state byte total")?;
+                unbounded_per_position = checked_add(
+                    unbounded_per_position,
+                    state_tensor_bytes_per_position_per_batch(tensor, scalar_bytes)?,
+                    "unbounded bytes-per-position total",
+                )?;
+            } else {
+                fixed_state_bytes =
+                    checked_add(fixed_state_bytes, bytes, "fixed state byte total")?;
+            }
         }
     }
     sliding_window_bounds.sort_unstable();
@@ -640,17 +874,17 @@ mod tests {
 
     #[test]
     fn state_estimation_and_admission_are_backend_independent() {
-        let layout = StateLayout {
-            fixed_scalars_per_batch: 16,
-            growing: vec![GrowingState {
-                layers: 2,
-                scalars_per_position: 8,
-                window: None,
-            }],
-            hidden_size: 32,
-            allocation_granularity: 8,
-            completeness: EstimationCompleteness::Complete,
-        };
+        let policies = (0..2)
+            .map(|_| LayerCachePolicy::key_only(AttentionPolicy::Full, 1, 8).unwrap())
+            .collect::<Vec<_>>();
+        let layout = StateMemoryLayout::new(
+            LayerSchedule::new(2, policies).unwrap(),
+            vec![0; 2],
+            32,
+            8,
+            EstimationCompleteness::Complete,
+        )
+        .unwrap();
         let input = InputTokenCount::text(5);
         let state =
             estimate_runtime_state(&layout, input, 2, 1, NonZeroU8::new(4).unwrap()).unwrap();
@@ -736,13 +970,14 @@ mod tests {
             require_complete_estimate: true,
         };
         let state = estimate_runtime_state(
-            &StateLayout {
-                fixed_scalars_per_batch: 0,
-                growing: Vec::new(),
-                hidden_size: 1,
-                allocation_granularity: 1,
-                completeness: EstimationCompleteness::Complete,
-            },
+            &StateMemoryLayout::new(
+                LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
+                vec![0],
+                1,
+                1,
+                EstimationCompleteness::Complete,
+            )
+            .unwrap(),
             request.input,
             0,
             1,

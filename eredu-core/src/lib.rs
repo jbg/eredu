@@ -80,9 +80,9 @@ pub use backend::{
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,
     AdmissionRequest, AdmissionResult, AvailableMemory, CacheStateStrategy, CapabilityError,
-    EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
-    PhysicalMemorySemantics, RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout,
-    StateMemoryAssumptions, StaticMemoryReport,
+    EstimationCompleteness, InputModalities, InputTokenCount, ModelCapabilities,
+    PhysicalMemorySemantics, RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions,
+    StateMemoryLayout, StaticMemoryReport,
 };
 pub use execution::{
     BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
