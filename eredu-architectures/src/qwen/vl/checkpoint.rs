@@ -147,12 +147,7 @@ pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
     if flat < vision_layers || !args.text.is_moe() {
         return Ok(BTreeMap::new());
     }
-    let resolved = qwen::expert_recipes(
-        catalog,
-        &args.text,
-        &args.text.parameter_root,
-        flat - vision_layers,
-    )?;
+    let resolved = qwen::expert_recipes(catalog, &args.text, flat - vision_layers)?;
     Ok(BTreeMap::from([
         (resolved.target_gate_up, resolved.gate_up),
         (resolved.target_down, resolved.down),

@@ -227,9 +227,8 @@ fn qwen_unit_recipes(
     if !args.is_moe() {
         return Ok(BTreeMap::new());
     }
-    let resolved =
-        eredu_architectures::qwen::expert_recipes(store, args, &args.parameter_root, layer)
-            .map_err(Error::ArchitectureModel)?;
+    let resolved = eredu_architectures::qwen::expert_recipes(store, args, layer)
+        .map_err(Error::ArchitectureModel)?;
     Ok(BTreeMap::from([
         (resolved.target_gate_up, resolved.gate_up),
         (resolved.target_down, resolved.down),

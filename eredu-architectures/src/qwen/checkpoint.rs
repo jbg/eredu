@@ -238,11 +238,11 @@ pub fn safetensors_plan_with_root(
     .map_err(|error| error.to_string())
 }
 
-/// Resolves packed, separate-packed, or per-expert sources into one canonical bank.
+/// Resolves packed, separate-packed, or per-expert sources into one canonical
+/// bank under the normalized configuration's checkpoint root.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &ModelArgs,
-    root: &str,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
     if !args.is_moe() {
@@ -255,7 +255,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
         ));
     }
     let count = dimension(args.num_experts, "num_experts")?;
-    let prefix = format!("{root}.layers.{layer}.mlp.experts");
+    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     let separate_suffix = if catalog
         .tensor_metadata(&format!("{prefix}.gate_proj"))
         .is_ok()
@@ -1182,7 +1182,7 @@ mod tests {
             }
         }
         let catalog = Catalog(tensors);
-        let recipes = expert_recipes(&catalog, &args, "model", 0).unwrap();
+        let recipes = expert_recipes(&catalog, &args, 0).unwrap();
         assert_eq!(recipes.layout, GatedProductExpertStorageLayout::Independent);
         assert_eq!(recipes.target_gate_up, format!("{prefix}.gate_up_proj"));
         assert_eq!(recipes.target_down, format!("{prefix}.down_proj"));
