@@ -491,14 +491,7 @@ impl MuseGlimmerPipelineBindings {
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         match layout {
-            Some(layout) => {
-                let root = <NeutralArchitecture as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxKeyValueState,
-                >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                shard_layer_bindings(bindings, &root, store, layout)
-            }
+            Some(layout) => shard_layer_bindings(bindings, store, layout),
             None => Ok(bindings),
         }
     }
@@ -1811,10 +1804,8 @@ fn load_parallel_store(
         stream,
         weights_stream,
         |_| false,
-        move |_modules, store| {
-            shard_layer_bindings(global_static_bindings, "", store, &static_layout)
-        },
-        move |_ordinal, address, path, _local, store, stream| {
+        move |_modules, store| shard_layer_bindings(global_static_bindings, store, &static_layout),
+        move |_ordinal, address, _path, _local, store, stream| {
             let global =
                 MlxModule::new(
                     <NeutralArchitecture as LayeredArchitecture<
@@ -1840,7 +1831,7 @@ fn load_parallel_store(
             if group_kind(&binding_architecture, address.group())
                 == eredu_runtime::ArchitectureGroupKind::Decoder
             {
-                shard_layer_bindings(bindings, path, store, &unit_sharding)
+                shard_layer_bindings(bindings, store, &unit_sharding)
             } else {
                 Ok(bindings)
             }

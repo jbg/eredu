@@ -211,12 +211,7 @@ impl InklingBindings {
     ) -> Result<Vec<WeightBinding>, Error> {
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         if let Some(layout) = layout {
-            let root = <NeutralArchitecture as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::unit_path(architecture, group, index)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            shard_layer_bindings(bindings, &root, store, layout)
+            shard_layer_bindings(bindings, store, layout)
         } else {
             Ok(bindings)
         }
@@ -2136,10 +2131,8 @@ fn load_parallel_store(
         stream,
         weights_stream,
         |_| false,
-        move |_modules, store| {
-            shard_layer_bindings(global_static_bindings, "", store, &static_layout)
-        },
-        move |_ordinal, address, path, _local, store, stream| {
+        move |_modules, store| shard_layer_bindings(global_static_bindings, store, &static_layout),
+        move |_ordinal, address, _path, _local, store, stream| {
             let global =
                 MlxModule::new(
                     <NeutralArchitecture as LayeredArchitecture<
@@ -2159,7 +2152,7 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(bindings, path, store, &unit_sharding)
+            shard_layer_bindings(bindings, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

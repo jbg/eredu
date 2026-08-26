@@ -12505,7 +12505,7 @@ impl StaticParameterVisitorMut<MlxNeuralBackend> for ArchitectureStaticLoader<'_
             .any(|member| !matches!(member.sharding(), eredu_runtime::MemberSharding::Replicated));
         if has_partitioned_member {
             if let Some(layout) = self.layout {
-                bindings = shard_layer_bindings(bindings, "", self.store, layout)?;
+                bindings = shard_layer_bindings(bindings, self.store, layout)?;
             }
         }
         self.loaded.load(
@@ -21415,7 +21415,7 @@ fn v3_sharded_unit_bindings(
         store,
         external_experts,
     )?;
-    shard_layer_bindings(bindings, "", store, layout)
+    shard_layer_bindings(bindings, store, layout)
 }
 
 fn v4_sharded_unit_bindings(
@@ -21434,7 +21434,7 @@ fn v4_sharded_unit_bindings(
         store,
         external_experts,
     )?;
-    shard_layer_bindings(bindings, "", store, layout)
+    shard_layer_bindings(bindings, store, layout)
 }
 
 #[allow(clippy::too_many_arguments)]

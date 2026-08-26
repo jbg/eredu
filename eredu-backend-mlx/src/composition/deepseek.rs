@@ -595,12 +595,12 @@ impl DeepSeekModel {
             move |_modules, store| {
                 let bindings =
                     build_module_bindings(&MlxModule::new(global_static.clone()), "", store)?;
-                shard_layer_bindings(bindings, "", store, &static_layout)
+                shard_layer_bindings(bindings, store, &static_layout)
             },
             move |ordinal, _address, _path, _unit, store, stream| {
                 let probe = new_v3_unit(&binding_args, ordinal, true, stream)?;
                 let bindings = v3_unit_bindings(&binding_args, ordinal, &probe, store, true)?;
-                shard_layer_bindings(bindings, "", store, &unit_layout)
+                shard_layer_bindings(bindings, store, &unit_layout)
             },
         )?;
         let execution = if options.is_fully_resident() {
@@ -667,12 +667,12 @@ impl DeepSeekModel {
             move |_modules, store| {
                 let bindings =
                     build_module_bindings(&MlxModule::new(global_static.clone()), "", store)?;
-                shard_layer_bindings(bindings, "", store, &static_layout)
+                shard_layer_bindings(bindings, store, &static_layout)
             },
             move |ordinal, _address, _path, _unit, store, stream| {
                 let probe = new_v4_unit(&binding_args, ordinal, true, stream)?;
                 let bindings = v4_unit_bindings(&binding_args, ordinal, &probe, store, true)?;
-                shard_layer_bindings(bindings, "", store, &unit_layout)
+                shard_layer_bindings(bindings, store, &unit_layout)
             },
         )?;
         let execution = if options.is_fully_resident() {

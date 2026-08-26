@@ -509,7 +509,6 @@ fn load_parallel(
         move |_modules, store| {
             shard_layer_bindings(
                 bindings(&static_module, store, static_recipes.as_ref())?,
-                "",
                 store,
                 static_sharding.as_ref(),
             )
@@ -518,7 +517,6 @@ fn load_parallel(
             let global = build_addressed_unit(&unit_config, address, stream)?;
             shard_layer_bindings(
                 bindings(&global, store, unit_recipes.as_ref())?,
-                "",
                 store,
                 unit_sharding.as_ref(),
             )

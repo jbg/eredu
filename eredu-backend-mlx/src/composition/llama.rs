@@ -6,7 +6,7 @@ pub mod checkpoint;
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     ArchitectureParameters, CausalModel, ExecutionResidency, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, RuntimeState, WeightResidency,
+    LayerwiseRuntime, RuntimeState, WeightResidency,
 };
 
 use std::{path::Path, sync::Arc};
@@ -721,14 +721,14 @@ fn load_neutral_llama_parallel(
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, "", store, &binding_layout)
+            shard_layer_bindings(bindings, store, &binding_layout)
         },
-        |_ordinal, address, path, _local, store, stream| {
+        |_ordinal, address, _path, _local, store, stream| {
             let index = address.index();
             let global = NeutralBlock::new(&binding_args, index, stream)
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = build_module_bindings(&MlxModule::new(global), "", store)?;
-            shard_layer_bindings(bindings, path, store, &layout)
+            shard_layer_bindings(bindings, store, &layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());
@@ -890,14 +890,7 @@ impl LlamaPipelineBindings {
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bindings = build_module_bindings(&global, "", store)?;
         match layout {
-            Some(layout) => {
-                let root = <NeutralArchitecture as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxKeyValueState,
-                >>::unit_path(architecture, 0, index)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                shard_layer_bindings(bindings, &root, store, layout)
-            }
+            Some(layout) => shard_layer_bindings(bindings, store, layout),
             None => Ok(bindings),
         }
     }

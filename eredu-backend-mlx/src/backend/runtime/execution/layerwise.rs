@@ -1130,7 +1130,6 @@ fn stored_tensor_selection(
 
 pub fn shard_layer_bindings(
     bindings: Vec<WeightBinding>,
-    prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
@@ -1141,49 +1140,21 @@ pub fn shard_layer_bindings(
             output.push(binding);
             continue;
         }
-        let canonical_name =
-            crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(&format!(
-                "{prefix}.{}",
-                binding.name()
-            ));
-        let logical_target = binding.logical_target().map(str::to_owned);
+        let logical_target = binding
+            .logical_target()
+            .ok_or_else(|| LayerwiseModelError::MissingParallelBindingTarget {
+                binding: binding.name().to_owned(),
+            })?
+            .to_owned();
         let quantization_companions = binding
             .quantization_companions()
             .map(|(scales, biases)| (scales.to_owned(), biases.to_owned()));
-        let tensor = logical_target
-            .as_deref()
-            .and_then(|target| layout.tensor(target))
-            .or_else(|| {
-                logical_target.as_deref().and_then(|logical| {
-                    let canonical_logical =
-                        crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                            logical,
-                        );
-                    layout.tensors().find_map(|(target, tensor)| {
-                        (crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                            target,
-                        ) == canonical_logical)
-                            .then_some(tensor)
-                    })
-                })
-            })
-            .or_else(|| layout.tensor(binding.checkpoint_key()))
-            .or_else(|| layout.tensor(&canonical_name))
-            .or_else(|| {
-                layout.tensors().find_map(|(target, tensor)| {
-                    let canonical_target =
-                        crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(
-                            target,
-                        );
-                    (canonical_target == binding.checkpoint_key()
-                        || canonical_target == canonical_name)
-                        .then_some(tensor)
-                })
-            });
-        let Some(tensor) = tensor else {
-            output.push(binding);
-            continue;
-        };
+        let tensor = layout.tensor(&logical_target).ok_or_else(|| {
+            LayerwiseModelError::UnknownParallelBindingTarget {
+                binding: binding.name().to_owned(),
+                target: logical_target.clone(),
+            }
+        })?;
         // Direct bindings created by callers can describe a logical checkpoint
         // target that is deliberately absent from this physical store. Preserve
         // that contract by deriving its selection and byte count from semantic
@@ -1214,9 +1185,7 @@ pub fn shard_layer_bindings(
                 selection,
                 expected_bytes,
             )?;
-            if let Some(target) = logical_target {
-                sharded = sharded.with_logical_target(target)?;
-            }
+            sharded = sharded.with_logical_target(logical_target)?;
             if let Some((scales, biases)) = quantization_companions {
                 sharded = sharded.with_quantization_companions(scales, biases)?;
             }
@@ -1233,15 +1202,103 @@ pub fn shard_layer_bindings(
         let recipe = recipe.select_bounded(store, selection)?;
         let expected_bytes = recipe.infer(store)?.byte_len();
         let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
-        if let Some(target) = logical_target {
-            sharded = sharded.with_logical_target(target)?;
-        }
+        sharded = sharded.with_logical_target(logical_target)?;
         if let Some((scales, biases)) = quantization_companions {
             sharded = sharded.with_quantization_companions(scales, biases)?;
         }
         output.push(sharded);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod shard_layer_bindings_tests {
+    use super::*;
+    use eredu_checkpoint::store::MemoryWeightStore;
+    use eredu_runtime::{LocalModelLayout, LocalTensorLayout, ParameterRole, TensorPlacement};
+
+    fn store() -> MemoryWeightStore {
+        MemoryWeightStore::from_safetensors([(
+            "model.weight".to_owned(),
+            safetensors::Dtype::F32,
+            vec![4, 2],
+            vec![0; 4 * 2 * size_of::<f32>()],
+        )])
+        .unwrap()
+    }
+
+    fn layout() -> LocalModelLayout {
+        let mut layout = LocalModelLayout::default();
+        layout.insert(
+            "model.weight".into(),
+            LocalTensorLayout::new(
+                "projection",
+                ParameterRole::ColumnProjection,
+                vec![4, 2],
+                vec![2, 2],
+                TensorPlacement::Shard {
+                    axis: 0,
+                    index: 0,
+                    parts: 2,
+                },
+                None,
+                None,
+                false,
+            ),
+        );
+        layout
+    }
+
+    fn binding() -> WeightBinding {
+        WeightBinding::new(
+            "weight",
+            "model.weight",
+            TensorSelection::Full,
+            (4 * 2 * size_of::<f32>()) as u64,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sharding_uses_the_exact_architecture_logical_target() {
+        let binding = binding().with_logical_target("model.weight").unwrap();
+
+        let store = store();
+        let sharded = shard_layer_bindings(vec![binding], &store, &layout()).unwrap();
+
+        assert_eq!(
+            sharded[0].source_recipe().infer(&store).unwrap().shape(),
+            [2, 2]
+        );
+        assert_eq!(sharded[0].expected_bytes(), 16);
+    }
+
+    #[test]
+    fn sharding_rejects_a_missing_architecture_logical_target() {
+        let error = shard_layer_bindings(vec![binding()], &store(), &layout()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::LayerwiseModel(LayerwiseModelError::MissingParallelBindingTarget {
+                binding,
+            }) if binding == "weight"
+        ));
+    }
+
+    #[test]
+    fn sharding_rejects_an_unmatched_architecture_logical_target() {
+        let binding = binding().with_logical_target("model.weigth").unwrap();
+
+        let error = shard_layer_bindings(vec![binding], &store(), &layout()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::LayerwiseModel(LayerwiseModelError::UnknownParallelBindingTarget {
+                binding,
+                target,
+            }) if binding == "weight" && target == "model.weigth"
+        ));
+    }
 }
 
 pub fn validate_unused<F>(
@@ -1350,6 +1407,20 @@ pub fn validate_device_budget(
 /// Structured failures produced by the generic layerwise execution engine.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwiseModelError {
+    /// A non-alias binding omitted its architecture-owned parameter identity.
+    #[error("parallel binding {binding:?} has no architecture-logical target")]
+    MissingParallelBindingTarget {
+        /// Resident-unit binding name.
+        binding: String,
+    },
+    /// A binding's exact architecture-owned identity was absent from the local layout.
+    #[error("parallel binding {binding:?} targets unknown architecture parameter {target:?}")]
+    UnknownParallelBindingTarget {
+        /// Resident-unit binding name.
+        binding: String,
+        /// Exact architecture-logical parameter identity.
+        target: String,
+    },
     /// A multi-input group did not define how to combine its dependencies.
     #[error(
         "execution group slot {group} has {inputs} dependency outputs but no merge implementation"

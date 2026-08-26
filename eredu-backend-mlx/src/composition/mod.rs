@@ -182,7 +182,6 @@ pub(crate) fn architecture_expert_units(
         .into_iter()
         .map(|unit| {
             let identity = unit.identity();
-            let unit_path = unit.unit_path().to_owned();
             let mut bindings = unit
                 .into_parameters()
                 .into_iter()
@@ -210,7 +209,7 @@ pub(crate) fn architecture_expert_units(
                 .collect::<Result<Vec<_>, Error>>()?;
             if let Some(layout) = layout {
                 bindings = crate::backend::runtime::execution::layerwise::shard_layer_bindings(
-                    bindings, &unit_path, store, layout,
+                    bindings, store, layout,
                 )?;
             }
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {

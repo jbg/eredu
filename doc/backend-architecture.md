@@ -1020,7 +1020,10 @@ composition:
   prefix stripping, prefix rewriting, unused-prefix exemptions, or implicit
   parameter-name expansion. Selective partition loading likewise requires
   exact checkpoint keys in its placement plan; neither surface invents family
-  aliases or exposes parsers for physical family checkpoint names;
+  aliases or exposes parsers for physical family checkpoint names. Distributed
+  sharding resolves each non-alias binding solely by its exact
+  architecture-logical target and rejects missing or unmatched targets during
+  admission;
 - GGUF family selection and portable family-specific structural admission are
   architecture-registry concerns. MLX composition resolves the already
   admitted spelling through the same registry, trusts the retained portable

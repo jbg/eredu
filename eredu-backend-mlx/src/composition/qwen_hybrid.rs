@@ -413,14 +413,7 @@ impl QwenConditionalPipelineBindings {
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         match layout {
-            Some(layout) => {
-                let root = <ConditionalArchitecture as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                shard_layer_bindings(bindings, &root, store, layout)
-            }
+            Some(layout) => shard_layer_bindings(bindings, store, layout),
             None => Ok(bindings),
         }
     }
@@ -564,16 +557,7 @@ impl QwenHybridPipelineBindings {
     ) -> Result<Vec<WeightBinding>, Error> {
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
-            Some(layout) => {
-                let root =
-                    <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::unit_path(
-                        architecture,
-                        group,
-                        index,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                shard_layer_bindings(bindings, &root, store, layout)
-            }
+            Some(layout) => shard_layer_bindings(bindings, store, layout),
             None => Ok(bindings),
         }
     }

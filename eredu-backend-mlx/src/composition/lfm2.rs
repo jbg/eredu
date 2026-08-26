@@ -290,14 +290,7 @@ impl Lfm2Bindings {
         self.layer_count(architecture, group)?;
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
-            Some(layout) => {
-                let root = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                shard_layer_bindings(bindings, &root, store, layout)
-            }
+            Some(layout) => shard_layer_bindings(bindings, store, layout),
             None => Ok(bindings),
         }
     }
@@ -533,9 +526,9 @@ fn load_neutral_parallel(
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, "", store, &static_layout)
+            shard_layer_bindings(bindings, store, &static_layout)
         },
-        move |_ordinal, address, path, _local, store, stream| {
+        move |_ordinal, address, _path, _local, store, stream| {
             let layer = address.index();
             let global = Block::<MlxNeuralBackend>::new(&binding_args, layer, stream)
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -551,7 +544,7 @@ fn load_neutral_parallel(
                 },
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
-            shard_layer_bindings(bindings, path, store, &unit_layout)
+            shard_layer_bindings(bindings, store, &unit_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

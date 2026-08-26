@@ -148,18 +148,6 @@ fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Re
     }
 }
 
-fn decoder_unit_path(
-    architecture: &NeutralArchitecture,
-    group: usize,
-    index: usize,
-) -> Result<String, Error> {
-    require_decoder_group(architecture, group)?;
-    <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxKeyValueState,
-    >>::unit_path(architecture, group, index)
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -463,9 +451,9 @@ fn load_neutral_parallel_with_store(
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, "", store, &static_layout)
+            shard_layer_bindings(bindings, store, &static_layout)
         },
-        move |_ordinal, address, path, _local, store, stream| {
+        move |_ordinal, address, _path, _local, store, stream| {
             let layer = address.index();
             let global = eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
                 &binding_args,
@@ -485,7 +473,7 @@ fn load_neutral_parallel_with_store(
                 recipes,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
-            shard_layer_bindings(bindings, path, store, &unit_local_layout)
+            shard_layer_bindings(bindings, store, &unit_local_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());
@@ -758,12 +746,7 @@ impl GptOssPipelineBindings {
             _ => bindings,
         };
         match layout {
-            Some(layout) => shard_layer_bindings(
-                bindings,
-                &decoder_unit_path(architecture, group, index)?,
-                store,
-                layout,
-            ),
+            Some(layout) => shard_layer_bindings(bindings, store, layout),
             None => Ok(bindings),
         }
     }

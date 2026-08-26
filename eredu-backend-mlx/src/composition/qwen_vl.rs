@@ -355,19 +355,13 @@ impl QwenVlPipelineBindings {
         layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let root = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::unit_path(
-            architecture,
-            group,
-            index,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         match (&global_layer.inner, group_kind(architecture, group)) {
             (Unit::Vision(_), eredu_runtime::ArchitectureGroupKind::VisionEncoder) => {
                 let bindings =
                     build_module_bindings_with_recipes(global_layer, "", store, BTreeMap::new())?;
                 if let Some(layout) = layout {
                     crate::backend::runtime::execution::layerwise::shard_layer_bindings(
-                        bindings, &root, store, layout,
+                        bindings, store, layout,
                     )
                 } else {
                     Ok(bindings)
@@ -413,7 +407,7 @@ impl QwenVlPipelineBindings {
                 match layout {
                     Some(layout) => {
                         crate::backend::runtime::execution::layerwise::shard_layer_bindings(
-                            bindings, &root, store, layout,
+                            bindings, store, layout,
                         )
                     }
                     None => Ok(bindings),

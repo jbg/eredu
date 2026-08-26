@@ -182,14 +182,7 @@ impl Gemma4Bindings {
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         match (is_decoder, layout) {
-            (true, Some(layout)) => {
-                let root = <NeutralArchitecture as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                shard_layer_bindings(bindings, &root, store, layout)
-            }
+            (true, Some(layout)) => shard_layer_bindings(bindings, store, layout),
             _ => Ok(bindings),
         }
     }
@@ -1951,10 +1944,8 @@ fn load_parallel_store(
         stream,
         weights_stream,
         |_| false,
-        move |_modules, store| {
-            shard_layer_bindings(global_static_bindings, "", store, &static_layout)
-        },
-        move |ordinal, address, path, local, store, stream| {
+        move |_modules, store| shard_layer_bindings(global_static_bindings, store, &static_layout),
+        move |ordinal, address, _path, local, store, stream| {
             if address.group() != decoder_group {
                 return build_module_bindings(&MlxModule::new(local.clone()), "", store)
                     .map_err(Into::into);
@@ -1975,7 +1966,7 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(bindings, path, store, &unit_sharding)
+            shard_layer_bindings(bindings, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());
