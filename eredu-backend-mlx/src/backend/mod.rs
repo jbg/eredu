@@ -23,8 +23,8 @@ pub use distributed::MlxDistributedSession;
 pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use eredu_core::backend::{
-    BackendCapabilities, BackendDescriptor, BackendProvider, Completion, DeviceDescriptor,
-    ModelLoadingBackend, PreparedModel, Submission,
+    BackendDescriptor, BackendProvider, Completion, DeviceCapabilities, DeviceDescriptor,
+    ModelLoadingBackend, PreparedModel, SessionCapabilities, Submission,
 };
 use std::num::NonZeroU8;
 
@@ -37,16 +37,11 @@ use crate::{
     composition::mlx::{distributed::pipeline::PipelineModel, MlxModelSession, Model},
 };
 
-fn backend_capabilities(has_world: bool) -> BackendCapabilities {
-    BackendCapabilities {
+fn device_capabilities(has_world: bool) -> DeviceCapabilities {
+    DeviceCapabilities {
         exact_completion: true,
         transfers: true,
         collectives: has_world,
-        persistent_cache: true,
-        output_observation: true,
-        // Named activation coverage depends on the loaded model and session
-        // topology, neither of which is known by this device-level report.
-        activation_inspection: false,
     }
 }
 
@@ -411,7 +406,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         }
     }
 
-    fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
+    fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
         let device = self.stream.get_device()?;
         let identity = match &self.realized_device {
             Some(identity) => {
@@ -422,7 +417,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         };
         Ok(vec![(
             identity.descriptor(),
-            backend_capabilities(self.world.is_some()),
+            device_capabilities(self.world.is_some()),
         )])
     }
 
@@ -430,19 +425,21 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
+        let capabilities = config.plan.admitted_session_capabilities();
         crate::composition::mlx::loading::materialize_model_plan(
             config.plan,
             config.options,
             &self.stream,
             &self.weights_stream,
         )
-        .map(PreparedModel::new)
+        .map(|model| PreparedModel::new(model, capabilities))
     }
 
     fn create_session(
         &self,
         model: PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error> {
+        let admitted = model.capabilities();
         let distributed = match model.topology() {
             Some(topology) => {
                 let world = self.world.ok_or_else(|| {
@@ -458,26 +455,30 @@ impl<'a> BackendProvider for MlxBackend<'a> {
             }
             None => None,
         };
-        MlxModelSession::from_model(model.into_inner(), distributed)
+        MlxModelSession::from_model(model.into_inner(), distributed, admitted)
+    }
+
+    fn session_capability_mismatch(
+        &self,
+        admitted: SessionCapabilities,
+        realized: SessionCapabilities,
+    ) -> Self::Error {
+        Error::ArchitectureModel(format!(
+            "realized MLX session capabilities {realized:?} do not match pre-materialization admission {admitted:?}"
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_capabilities, MlxBackend, MlxDeviceIdentity};
+    use super::{device_capabilities, MlxBackend, MlxDeviceIdentity};
     use eredu_core::BackendProvider as _;
     use safemlx::{Device, DeviceType, ExecutionContext};
 
     #[test]
     fn collective_capability_requires_an_attached_world() {
-        assert!(!backend_capabilities(false).collectives);
-        assert!(backend_capabilities(true).collectives);
-    }
-
-    #[test]
-    fn activation_inspection_is_not_a_device_level_capability() {
-        assert!(!backend_capabilities(false).activation_inspection);
-        assert!(!backend_capabilities(true).activation_inspection);
+        assert!(!device_capabilities(false).collectives);
+        assert!(device_capabilities(true).collectives);
     }
 
     #[test]
@@ -526,6 +527,16 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         policy: eredu_core::PreparationPolicy,
     ) -> Result<(), Self::Error> {
         crate::composition::mlx::structural::validate_inspected_preparation(inspection, policy)
+    }
+
+    fn session_capabilities(
+        &self,
+        inspection: &eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        policy: eredu_core::PreparationPolicy,
+    ) -> Result<SessionCapabilities, Self::Error> {
+        crate::composition::mlx::structural::inspected_session_capabilities(inspection, policy)
     }
 
     fn model_config(

@@ -3030,6 +3030,36 @@ trait PipelineForward: PipelinePartitionMetadata {
         }
         self.forward(input, step, mask, cache, stream)
     }
+
+    fn forward_observed_with_execution(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelineStageOutput, Error>;
+}
+
+macro_rules! pipeline_observed_forward {
+    () => {
+        fn forward_observed_with_execution(
+            &mut self,
+            input: PipelineStageInput<'_>,
+            step: PipelineStep,
+            mask: Option<&Array>,
+            cache: &mut [PipelineLayerCache],
+            execution: Option<&ParallelExecutionContext<'_>>,
+            expert_group: Option<&Group>,
+            stream: &Stream,
+            _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        ) -> Result<PipelineStageOutput, Error> {
+            self.forward_with_execution(input, step, mask, cache, execution, expert_group, stream)
+        }
+    };
 }
 
 trait PipelineArchitecture: PipelinePartitionMetadata + PipelineForward {
@@ -5334,6 +5364,7 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
 }
 
 impl PipelineForward for LlamaPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -5754,6 +5785,7 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
 }
 
 impl PipelineForward for DeepSeekV3PipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -6399,6 +6431,7 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
 }
 
 impl PipelineForward for DeepSeekV4PipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -6600,6 +6633,7 @@ impl PipelinePlacedIngress for Gemma4PipelinePartition {
 }
 
 impl PipelineForward for Gemma4PipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -6685,6 +6719,7 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
 }
 
 impl PipelineForward for QwenPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -7025,6 +7060,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
 }
 
 impl PipelineForward for MuseGlimmerPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -7363,6 +7399,7 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
 }
 
 impl PipelineForward for InklingPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -7903,6 +7940,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
 }
 
 impl PipelineForward for QwenVlPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -8616,6 +8654,7 @@ impl PipelineEmbeddedMtp for QwenConditionalPipelinePartition {
 }
 
 impl PipelineForward for QwenConditionalPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -8701,6 +8740,7 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
 }
 
 impl PipelineForward for GptOssPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -8858,6 +8898,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
 }
 
 impl PipelineForward for Lfm2PipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -9166,6 +9207,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
 }
 
 impl PipelineForward for NemotronHPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -9251,6 +9293,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
 }
 
 impl PipelineForward for KimiLinearPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -9961,6 +10004,18 @@ impl PipelineModel {
         cache: &mut PipelineCache,
         execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
+        self.forward_distributed_inner(tokens, step, mask, cache, execution, None)
+    }
+
+    fn forward_distributed_inner(
+        &mut self,
+        tokens: Option<&Array>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut PipelineCache,
+        execution: &crate::backend::MlxDistributedSession<'_>,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelineStageCompletion, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
                 "pipeline model topology {:?} does not match distributed session topology {:?}",
@@ -9998,6 +10053,7 @@ impl PipelineModel {
             execution.expert_group(),
             false,
             stream,
+            observer,
         )?;
         // A proper PP subgroup needs an explicit lane boundary before a later
         // world collective. When PP is the complete world, inserting a
@@ -10011,6 +10067,51 @@ impl PipelineModel {
         output.submit(token_validation_scope.finish())
     }
 
+    /// Runs the production distributed pass with rank-local observation.
+    pub fn forward_distributed_with_observer(
+        &mut self,
+        tokens: Option<&Array>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut PipelineCache,
+        execution: &crate::backend::MlxDistributedSession<'_>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelineStageCompletion, Error> {
+        let paths = self
+            .info
+            .local_execution_groups
+            .iter()
+            .flat_map(|owned| {
+                owned
+                    .global_units
+                    .clone()
+                    .map(|index| format!("{}.{}", owned.group, index))
+            })
+            .collect::<Vec<_>>();
+        let mut replacement = None;
+        if let (Some(path), Some(tokens)) = (paths.first(), tokens) {
+            observer.observe(&format!("{path}.input"), tokens)?;
+            replacement = observer.intervene(&format!("{path}.input"), tokens)?;
+        }
+        let effective_tokens = replacement.as_ref().or(tokens);
+        let completion = self.forward_distributed_inner(
+            effective_tokens,
+            step,
+            mask,
+            cache,
+            execution,
+            Some(observer),
+        )?;
+        if let Some(logits) = completion.logits() {
+            if let Some(path) = paths.last() {
+                observer.observe(&format!("{path}.output"), logits)?;
+                let _ = observer.intervene(&format!("{path}.output"), logits)?;
+            }
+            observer.observe("model.logits", logits)?;
+        }
+        Ok(completion)
+    }
+
     /// Runs typed multimodal prefill through the selected distributed session.
     pub fn prefill_distributed(
         &mut self,
@@ -10019,6 +10120,18 @@ impl PipelineModel {
         mask: Option<&Array>,
         cache: &mut PipelineCache,
         execution: &crate::backend::MlxDistributedSession<'_>,
+    ) -> Result<PipelineStageCompletion, Error> {
+        self.prefill_distributed_inner(input, step, mask, cache, execution, None)
+    }
+
+    fn prefill_distributed_inner(
+        &mut self,
+        input: Option<crate::backend::runtime::media::input::ModelInput<'_>>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut PipelineCache,
+        execution: &crate::backend::MlxDistributedSession<'_>,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageCompletion, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
@@ -10057,12 +10170,53 @@ impl PipelineModel {
             execution.expert_group(),
             true,
             stream,
+            observer,
         )?;
         if self.topology.pipeline_parallel_size < self.topology.world_size {
             let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
             output.retain(barrier);
         }
         output.submit(token_validation_scope.finish())
+    }
+
+    /// Runs typed distributed prefill with rank-local production-path observation.
+    pub fn prefill_distributed_with_observer(
+        &mut self,
+        input: Option<crate::backend::runtime::media::input::ModelInput<'_>>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut PipelineCache,
+        execution: &crate::backend::MlxDistributedSession<'_>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelineStageCompletion, Error> {
+        let observed_input = input
+            .map(|input| {
+                crate::backend::runtime::media::input::text_token_ids(input, execution.stream())
+            })
+            .transpose()?;
+        let paths = self
+            .info
+            .local_execution_groups
+            .iter()
+            .flat_map(|owned| {
+                owned
+                    .global_units
+                    .clone()
+                    .map(|index| format!("{}.{}", owned.group, index))
+            })
+            .collect::<Vec<_>>();
+        if let (Some(path), Some(value)) = (paths.first(), observed_input.as_ref()) {
+            observer.observe(&format!("{path}.input"), value)?;
+        }
+        let completion =
+            self.prefill_distributed_inner(input, step, mask, cache, execution, Some(observer))?;
+        if let Some(logits) = completion.logits() {
+            if let Some(path) = paths.last() {
+                observer.observe(&format!("{path}.output"), logits)?;
+            }
+            observer.observe("model.logits", logits)?;
+        }
+        Ok(completion)
     }
 
     /// Reports the complete pipeline's checkpoint-embedded prediction support.
@@ -10662,6 +10816,7 @@ impl PipelineModel {
         expert_group: Option<&Group>,
         typed_ingress: bool,
         stream: &Stream,
+        mut observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PendingPipelineStageCompletion, Error> {
         if typed_ingress {
             self.last_placed_ingress_schedule = PlacedIngressScheduleReport::default();
@@ -10777,28 +10932,53 @@ impl PipelineModel {
                 PipelineIngress::Tokens(tokens) => {
                     let input = PipelineStageInput::Tokens(tokens);
                     validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
-                    self.stage.forward_with_execution(
-                        input,
-                        step,
-                        mask,
-                        &mut cache.layers,
-                        tensor,
-                        expert_group,
-                        stream,
-                    )?
-                }
-                PipelineIngress::ModelInput(input) => {
-                    crate::backend::runtime::media::input::validate(input)?;
-                    if let Some(payload) = placed_payload.as_ref() {
-                        self.stage.forward_with_execution(
-                            PipelineStageInput::Hidden(payload),
+                    match observer.as_deref_mut() {
+                        Some(observer) => self.stage.forward_observed_with_execution(
+                            input,
                             step,
                             mask,
                             &mut cache.layers,
                             tensor,
                             expert_group,
                             stream,
-                        )?
+                            observer,
+                        )?,
+                        None => self.stage.forward_with_execution(
+                            input,
+                            step,
+                            mask,
+                            &mut cache.layers,
+                            tensor,
+                            expert_group,
+                            stream,
+                        )?,
+                    }
+                }
+                PipelineIngress::ModelInput(input) => {
+                    crate::backend::runtime::media::input::validate(input)?;
+                    if let Some(payload) = placed_payload.as_ref() {
+                        let input = PipelineStageInput::Hidden(payload);
+                        match observer.as_deref_mut() {
+                            Some(observer) => self.stage.forward_observed_with_execution(
+                                input,
+                                step,
+                                mask,
+                                &mut cache.layers,
+                                tensor,
+                                expert_group,
+                                stream,
+                                observer,
+                            )?,
+                            None => self.stage.forward_with_execution(
+                                input,
+                                step,
+                                mask,
+                                &mut cache.layers,
+                                tensor,
+                                expert_group,
+                                stream,
+                            )?,
+                        }
                     } else {
                         self.stage.prefill(
                             input,
@@ -10819,15 +10999,27 @@ impl PipelineModel {
                     .expect("non-first stage received payload"),
             );
             validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
-            self.stage.forward_with_execution(
-                input,
-                step,
-                mask,
-                &mut cache.layers,
-                tensor,
-                expert_group,
-                stream,
-            )?
+            match observer.as_deref_mut() {
+                Some(observer) => self.stage.forward_observed_with_execution(
+                    input,
+                    step,
+                    mask,
+                    &mut cache.layers,
+                    tensor,
+                    expert_group,
+                    stream,
+                    observer,
+                )?,
+                None => self.stage.forward_with_execution(
+                    input,
+                    step,
+                    mask,
+                    &mut cache.layers,
+                    tensor,
+                    expert_group,
+                    stream,
+                )?,
+            }
         };
         let mut retained = cache
             .layers
@@ -18455,6 +18647,7 @@ impl PipelineEmbeddedMtp for QwenHybridPipelinePartition {
 }
 
 impl PipelineForward for QwenHybridPipelinePartition {
+    pipeline_observed_forward!();
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,

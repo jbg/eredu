@@ -192,9 +192,16 @@ fn load_prepared_pipeline_model(
     stream: &Stream,
 ) -> PipelineModel {
     let inspection = eredu_architectures::configuration::inspect_artifact(checkpoint).unwrap();
-    let plan =
-        eredu_core::plan_model_preparation(inspection, options.preparation_policy().unwrap())
-            .unwrap();
+    let plan = eredu_core::plan_model_preparation(
+        inspection,
+        options.preparation_policy().unwrap(),
+        eredu_core::SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        },
+    )
+    .unwrap();
     load_pipeline_model_with_options(plan, options, stream, stream).unwrap()
 }
 
@@ -213,9 +220,16 @@ fn distributed_materialization_uses_the_planned_configuration() {
     .with_weight_residency(WeightResidency::layerwise_host(layerwise));
     let inspection =
         eredu_architectures::configuration::inspect_artifact(checkpoint.path()).unwrap();
-    let plan =
-        eredu_core::plan_model_preparation(inspection, options.preparation_policy().unwrap())
-            .unwrap();
+    let plan = eredu_core::plan_model_preparation(
+        inspection,
+        options.preparation_policy().unwrap(),
+        eredu_core::SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        },
+    )
+    .unwrap();
 
     std::fs::remove_file(checkpoint.path().join("config.json")).unwrap();
 

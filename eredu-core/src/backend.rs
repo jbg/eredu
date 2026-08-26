@@ -43,19 +43,66 @@ pub struct DeviceDescriptor {
 
 /// Fail-closed capabilities discovered from a backend and device.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BackendCapabilities {
+pub struct DeviceCapabilities {
     /// Supports exact completion observation for submissions.
     pub exact_completion: bool,
     /// Supports device-to-device transfer for backend-owned values.
     pub transfers: bool,
     /// Supports collective execution for a complete session.
     pub collectives: bool,
+}
+
+/// Fail-closed capabilities of one exact prepared model session.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionCapabilities {
     /// Supports backend-managed persistent decode caches.
     pub persistent_cache: bool,
     /// Supports explicit host observation of completed session outputs.
     pub output_observation: bool,
     /// Supports named activation inspection for instrumented session passes.
     pub activation_inspection: bool,
+}
+
+impl SessionCapabilities {
+    /// Validates fail-closed requirements against an exact available report.
+    pub fn validate(&self, available: &Self) -> Result<(), SessionCapabilityError> {
+        for (required, supported, capability) in [
+            (
+                self.persistent_cache,
+                available.persistent_cache,
+                "persistent_cache",
+            ),
+            (
+                self.output_observation,
+                available.output_observation,
+                "output_observation",
+            ),
+            (
+                self.activation_inspection,
+                available.activation_inspection,
+                "activation_inspection",
+            ),
+        ] {
+            if required && !supported {
+                return Err(SessionCapabilityError { capability });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One unavailable exact-session requirement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error("prepared session does not support required capability {capability}")]
+pub struct SessionCapabilityError {
+    capability: &'static str,
+}
+
+impl SessionCapabilityError {
+    /// Returns the stable capability name.
+    pub const fn capability(self) -> &'static str {
+        self.capability
+    }
 }
 
 /// Fail-closed distributed operations exposed by one selected session.
@@ -216,12 +263,16 @@ where
 #[derive(Debug)]
 pub struct PreparedModel<M> {
     model: M,
+    capabilities: SessionCapabilities,
 }
 
 impl<M> PreparedModel<M> {
     /// Wraps a backend-prepared model.
-    pub const fn new(model: M) -> Self {
-        Self { model }
+    pub const fn new(model: M, capabilities: SessionCapabilities) -> Self {
+        Self {
+            model,
+            capabilities,
+        }
     }
     /// Borrows the backend model.
     pub const fn get(&self) -> &M {
@@ -231,9 +282,17 @@ impl<M> PreparedModel<M> {
     pub fn get_mut(&mut self) -> &mut M {
         &mut self.model
     }
+    /// Returns the session capabilities admitted before materialization.
+    pub const fn capabilities(&self) -> SessionCapabilities {
+        self.capabilities
+    }
     /// Consumes the marker.
     pub fn into_inner(self) -> M {
         self.model
+    }
+    /// Consumes the marker into the backend model and admitted capabilities.
+    pub fn into_parts(self) -> (M, SessionCapabilities) {
+        (self.model, self.capabilities)
     }
 }
 
@@ -265,7 +324,7 @@ pub trait BackendProvider: Sized {
     /// Backend identity.
     fn descriptor(&self) -> BackendDescriptor;
     /// Discovers devices and their fail-closed capabilities.
-    fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error>;
+    fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error>;
     /// Loads, compiles, or materializes a model for this backend.
     fn prepare_model(
         &self,
@@ -280,6 +339,18 @@ pub trait BackendProvider: Sized {
         &self,
         model: PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error>;
+
+    /// Constructs an internal backend error for an admission/realization mismatch.
+    ///
+    /// Backends whose prepared and realized reports cannot differ may leave
+    /// this unreachable default in place.
+    fn session_capability_mismatch(
+        &self,
+        admitted: SessionCapabilities,
+        realized: SessionCapabilities,
+    ) -> Self::Error {
+        panic!("backend realized session capabilities {realized:?} after admitting {admitted:?}")
+    }
 }
 
 /// Artifact-loading extension for a selected whole-model backend.
@@ -318,6 +389,15 @@ pub trait ModelLoadingBackend: BackendProvider {
         policy: PreparationPolicy,
     ) -> Result<(), Self::Error>;
 
+    /// Derives exact session capabilities from header/configuration state only.
+    fn session_capabilities(
+        &self,
+        inspection: &ArtifactInspection<
+            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+        >,
+        policy: PreparationPolicy,
+    ) -> Result<SessionCapabilities, Self::Error>;
+
     /// Binds a neutral preparation plan to backend-owned materialization input.
     fn model_config(
         &self,
@@ -337,6 +417,9 @@ pub enum ModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     /// The selected backend failed policy resolution or materialization.
     #[error("selected backend failed to prepare the model: {0}")]
     Backend(#[source] E),
+    /// The inspected architecture/load-policy/topology route lacks a requirement.
+    #[error(transparent)]
+    SessionCapability(#[from] SessionCapabilityError),
 }
 
 /// Inspects, plans, and prepares one artifact on the selected backend.
@@ -371,7 +454,13 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     backend
         .validate_preparation(&inspection, policy)
         .map_err(ModelLoadError::Backend)?;
-    let plan = plan_model_preparation(inspection, policy)?;
+    let capabilities = backend
+        .session_capabilities(&inspection, policy)
+        .map_err(ModelLoadError::Backend)?;
+    policy
+        .validate_session_capabilities(&capabilities)
+        .map_err(ModelLoadError::SessionCapability)?;
+    let plan = plan_model_preparation(inspection, policy, capabilities)?;
     let config = backend
         .model_config(plan, options)
         .map_err(ModelLoadError::Backend)?;
@@ -394,6 +483,9 @@ pub trait BackendSession<B: BackendProvider> {
     type Output;
     /// Exact completion type.
     type Completion: Completion<Error = B::Error>;
+
+    /// Reports capabilities of this exact realized session.
+    fn capabilities(&self) -> SessionCapabilities;
 
     /// Submits prompt prefill against this session.
     fn prefill(
@@ -471,7 +563,12 @@ impl<B: BackendProvider> ModelRuntime<B> {
 
     /// Creates the sole execution session for an already prepared model.
     pub fn from_prepared(backend: B, model: PreparedModel<B::Model>) -> Result<Self, B::Error> {
+        let admitted = model.capabilities();
         let session = backend.create_session(model)?;
+        let realized = session.capabilities();
+        if admitted != realized {
+            return Err(backend.session_capability_mismatch(admitted, realized));
+        }
         Ok(Self { backend, session })
     }
 
@@ -493,6 +590,11 @@ impl<B: BackendProvider> ModelRuntime<B> {
     /// Borrows the selected backend and its mutable session together.
     pub fn parts_mut(&mut self) -> (&B, &mut B::Session) {
         (&self.backend, &mut self.session)
+    }
+
+    /// Reports capabilities of the exact prepared model session.
+    pub fn capabilities(&self) -> SessionCapabilities {
+        self.session.capabilities()
     }
 
     /// Submits prompt prefill through the selected backend and session.
@@ -1249,11 +1351,11 @@ mod tests {
                 version: "1".into(),
             }
         }
-        fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
+        fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
             Ok(vec![])
         }
         fn prepare_model(&self, config: u32) -> Result<PreparedModel<u32>, Self::Error> {
-            Ok(PreparedModel::new(config))
+            Ok(PreparedModel::new(config, SessionCapabilities::default()))
         }
         fn create_session(&self, model: PreparedModel<u32>) -> Result<MockSession, Self::Error> {
             Ok(MockSession {
@@ -1266,6 +1368,9 @@ mod tests {
 
     struct LoadingMock;
     struct LoadingMockSession;
+
+    static LOADING_MATERIALIZATIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     struct LoadingConfigurationResolver;
 
@@ -1335,7 +1440,7 @@ mod tests {
             }
         }
 
-        fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
+        fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
             Ok(Vec::new())
         }
 
@@ -1343,8 +1448,12 @@ mod tests {
             &self,
             (plan, model): Self::ModelConfig,
         ) -> Result<PreparedModel<Self::Model>, Self::Error> {
+            LOADING_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert_eq!(plan.inspection().configuration().family, "llama");
-            Ok(PreparedModel::new(model))
+            Ok(PreparedModel::new(
+                model,
+                plan.admitted_session_capabilities(),
+            ))
         }
 
         fn create_session(
@@ -1360,6 +1469,10 @@ mod tests {
         type DecodeInput = ();
         type Output = ();
         type Completion = LoadingDone;
+
+        fn capabilities(&self) -> SessionCapabilities {
+            SessionCapabilities::default()
+        }
 
         fn prefill(
             &mut self,
@@ -1417,9 +1530,15 @@ mod tests {
 
         fn preparation_policy(
             &self,
-            _: &Self::LoadOptions,
+            options: &Self::LoadOptions,
         ) -> Result<PreparationPolicy, Self::Error> {
-            Ok(PreparationPolicy::default())
+            Ok(PreparationPolicy {
+                required_session_capabilities: SessionCapabilities {
+                    activation_inspection: *options == 99,
+                    ..SessionCapabilities::default()
+                },
+                ..PreparationPolicy::default()
+            })
         }
 
         fn validate_preparation(
@@ -1428,6 +1547,14 @@ mod tests {
             _: PreparationPolicy,
         ) -> Result<(), Self::Error> {
             Ok(())
+        }
+
+        fn session_capabilities(
+            &self,
+            _: &ArtifactInspection,
+            _: PreparationPolicy,
+        ) -> Result<SessionCapabilities, Self::Error> {
+            Ok(SessionCapabilities::default())
         }
 
         fn model_config(
@@ -1458,6 +1585,9 @@ mod tests {
         type DecodeInput = u32;
         type Output = u32;
         type Completion = Done;
+        fn capabilities(&self) -> SessionCapabilities {
+            SessionCapabilities::default()
+        }
         fn prefill(
             &mut self,
             _: &Mock,
@@ -1666,6 +1796,25 @@ mod tests {
             Err(ModelLoadError::Artifact(ArtifactError::MissingArtifact(path)))
                 if path == missing
         ));
+    }
+
+    #[test]
+    fn session_requirement_is_rejected_before_materialization() {
+        let root = tempfile::tempdir().unwrap();
+        write_loading_fixture(root.path());
+        LOADING_MATERIALIZATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let error = load_model(&LoadingMock, root.path(), 99).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelLoadError::SessionCapability(error)
+                if error.capability() == "activation_inspection"
+        ));
+        assert_eq!(
+            LOADING_MATERIALIZATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     struct FixedController {

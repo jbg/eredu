@@ -681,7 +681,7 @@ impl QwenModel {
         let inputs = crate::MlxTensor::from_array(inputs.clone());
         let mask = mask.cloned().map(crate::MlxTensor::from_array);
         let output = match &mut self.execution {
-            QwenExecution::Resident(runtime) => runtime.forward_with_routed_observer(
+            QwenExecution::Resident(runtime) => runtime.forward_with_provider_and_observer(
                 eredu_architectures::qwen::LayeredInput {
                     tokens: &inputs,
                     mask: mask.as_ref(),
@@ -692,7 +692,7 @@ impl QwenModel {
                 stream,
                 observer,
             ),
-            QwenExecution::Layerwise(runtime) => runtime.forward_with_routed_observer(
+            QwenExecution::Layerwise(runtime) => runtime.forward_with_provider_and_observer(
                 eredu_architectures::qwen::LayeredInput {
                     tokens: &inputs,
                     mask: mask.as_ref(),
@@ -768,6 +768,100 @@ impl QwenModel {
             )),
         }?;
         Ok(output.into_array())
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        inputs: &Array,
+        cache: &mut MlxKeyValueState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
+    ) -> Result<Array, Error> {
+        self.validate_cache(cache)?;
+        let args = self.args.clone();
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let pass = if inputs.dim(1) > 1 {
+                eredu_runtime::ExpertPass::Prefill
+            } else {
+                eredu_runtime::ExpertPass::Decode
+            };
+            let inputs = crate::MlxTensor::from_array(inputs.clone());
+            let input = eredu_architectures::qwen::LayeredInput {
+                tokens: &inputs,
+                mask: None,
+            };
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            let output = match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let mut provider = expert::cached_provider(expert_cache, &args);
+                    match &mut self.execution {
+                        QwenExecution::TensorParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        QwenExecution::TensorParallelLayerwise(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "Qwen was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+                None => {
+                    let mut provider = eredu_runtime::ResidentExpertProvider;
+                    match &mut self.execution {
+                        QwenExecution::TensorParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        QwenExecution::TensorParallelLayerwise(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "Qwen was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+                .map(crate::MlxTensor::into_array)
+                .map_err(Error::from)
+        };
+        self.expert_cache = expert_cache;
+        result
     }
 
     /// Runs the neutral decoder while delegating routed experts to a runtime

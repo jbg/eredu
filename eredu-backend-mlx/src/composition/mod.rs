@@ -1,6 +1,7 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
 use ref_cast::RefCast;
+use safemlx::error::Exception;
 use safemlx::Array;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
@@ -11,6 +12,62 @@ use eredu_runtime::{
 };
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
+
+/// Adapts public MLX-array observation to the neutral tensor/error contract.
+pub(crate) struct NeutralActivationObserver<'a> {
+    inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+}
+
+impl<'a> NeutralActivationObserver<'a> {
+    pub(crate) fn new(
+        inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Self {
+        Self { inner }
+    }
+}
+
+impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
+    for NeutralActivationObserver<'_>
+{
+    fn observe(&mut self, path: &str, value: &crate::MlxTensor) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .observe(path, value.as_array())
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+
+    fn intervene(
+        &mut self,
+        path: &str,
+        value: &crate::MlxTensor,
+    ) -> Result<Option<crate::MlxTensor>, eredu_nn::Error> {
+        self.inner
+            .intervene(path, value.as_array())
+            .map(|value| value.map(crate::MlxTensor::from_array))
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+
+    fn observe_routing(
+        &mut self,
+        routing: eredu_runtime::RoutingObservation<'_, crate::MlxTensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .observe_routing(eredu_runtime::RoutingObservation {
+                path: routing.path,
+                selected_experts: routing.selected_experts.as_array(),
+                selected_scores: routing.selected_scores.as_array(),
+                route_weights: routing.route_weights.as_array(),
+                routed_output: routing.routed_output.as_array(),
+                local_routed_output: routing.local_routed_output.map(crate::MlxTensor::as_array),
+                reduced_routed_output: routing
+                    .reduced_routed_output
+                    .map(crate::MlxTensor::as_array),
+                shared_output: routing.shared_output.map(crate::MlxTensor::as_array),
+                combined_output: routing.combined_output.map(crate::MlxTensor::as_array),
+                expert_count: routing.expert_count,
+            })
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+}
 
 struct StaticBindingVisitor<'a> {
     store: &'a dyn CheckpointSource,

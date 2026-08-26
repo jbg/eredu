@@ -105,6 +105,13 @@ tensors, streams, distributed groups, caches, or checkpoint packing live as
 All selected sessions expose completed outputs through
 `BackendSession::observe_output`; backends retain native tensors internally and
 materialize portable `ObservationSet` records only when explicitly requested.
+Device discovery reports only device-scoped `DeviceCapabilities` (completion,
+transfer, and collective support). Cache, output-observation, and activation-
+inspection support belong to `SessionCapabilities` on the exact prepared
+model/session. Model loading derives that report from header inspection,
+residency policy, and topology and rejects unmet session requirements before
+checkpoint payload materialization. The admitted report is carried through the
+preparation marker and must equal the realized session report.
 Backends may additionally implement `InspectableBackendSession` by binding the
 named activation and routed-expert points already emitted by
 `eredu-runtime::ActivationObserver`. These are general diagnostics contracts
@@ -112,6 +119,10 @@ used by telemetry, inspection, observability, and evaluation rather than an
 evaluation-specific backend surface. Realtime applications likewise exchange
 portable host token frames and observations through
 `RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
+Distributed inspection is rank-local: every rank participates in the same
+production collective and point-to-point execution, each rank returns only the
+globally named units it owns, and only the logits-owning rank returns
+`model.logits`. Inspection never performs an implicit cross-rank host gather.
 
 Backend-neutral parity, distribution metrics, timing summaries, evidence, and
 evaluation drivers live in `eredu-evaluation`. Concrete backend examples only

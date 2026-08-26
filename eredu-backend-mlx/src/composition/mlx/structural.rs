@@ -386,6 +386,21 @@ pub(crate) fn validate_inspected_preparation(
     validate_preparation_capability_intersection(kind, inspection.format(), policy, capabilities)
 }
 
+/// Derives exact MLX session capabilities without opening checkpoint payloads.
+pub(crate) fn inspected_session_capabilities(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    policy: eredu_core::PreparationPolicy,
+) -> Result<eredu_core::SessionCapabilities, Error> {
+    validate_inspected_preparation(inspection, policy)?;
+    Ok(eredu_core::SessionCapabilities {
+        persistent_cache: true,
+        output_observation: true,
+        activation_inspection: true,
+    })
+}
+
 pub fn validate_safetensors(
     plan: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: &(impl StructuralSafetensorsCatalog + ?Sized),

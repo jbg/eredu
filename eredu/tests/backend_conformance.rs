@@ -23,15 +23,15 @@ use eredu::{
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, RgbImage,
     },
     AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlanningError, BackendCapabilities, BackendDescriptor, BackendId, CacheStateStrategy,
-    CapabilityError, DeviceDescriptor, DevicePlan, DistributedCapabilities, DraftPlacementPlan,
+    AutomaticPlanningError, BackendDescriptor, BackendId, CacheStateStrategy, CapabilityError,
+    DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedCapabilities, DraftPlacementPlan,
     DraftingPlan, EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides,
     GrowingState, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
     HardwareProfile, InputModalities, InputTokenCount, ModelCapabilities, ModelKind,
     ModelResourceProfile, MtpCapability, MtpCheckpointKind, ObservationSet, ObservationValue,
     Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, RealtimeFrameConvention,
     RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RuntimeStateEstimate,
-    SemanticEvent, SpeculativeDraft, SpeculativeGenerationBatchOutput,
+    SemanticEvent, SessionCapabilities, SpeculativeDraft, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, StaticMemoryReport,
     TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
@@ -143,7 +143,7 @@ impl BackendProvider for MockBackend {
         }
     }
 
-    fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
+    fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
         Ok(vec![(
             DeviceDescriptor {
                 id: "gpu:0".into(),
@@ -151,13 +151,10 @@ impl BackendProvider for MockBackend {
                 family: "mock-accelerator".into(),
                 memory_bytes: Some(8 * 1024),
             },
-            BackendCapabilities {
+            DeviceCapabilities {
                 exact_completion: true,
                 transfers: true,
                 collectives: true,
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: false,
             },
         )])
     }
@@ -166,7 +163,14 @@ impl BackendProvider for MockBackend {
         &self,
         _: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        Ok(PreparedModel::new(()))
+        Ok(PreparedModel::new(
+            (),
+            SessionCapabilities {
+                persistent_cache: true,
+                output_observation: true,
+                activation_inspection: false,
+            },
+        ))
     }
 
     fn create_session(&self, _: PreparedModel<Self::Model>) -> Result<Self::Session, Self::Error> {
@@ -187,6 +191,14 @@ impl BackendSession<MockBackend> for MockSession {
     type DecodeInput = u32;
     type Output = u32;
     type Completion = Done;
+
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: false,
+        }
+    }
 
     fn prefill(
         &mut self,
@@ -498,6 +510,20 @@ impl ModelLoadingBackend for MockBackend {
         _: eredu_core::PreparationPolicy,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn session_capabilities(
+        &self,
+        _: &eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        _: eredu_core::PreparationPolicy,
+    ) -> Result<SessionCapabilities, Self::Error> {
+        Ok(SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: false,
+        })
     }
 
     fn model_config(

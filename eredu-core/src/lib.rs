@@ -67,15 +67,15 @@ pub use automatic::{
     TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
-    load_model, prepare_inspected_model, BackendCapabilities, BackendDescriptor, BackendError,
-    BackendProvider, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
-    ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DistributedBackend,
-    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
+    load_model, prepare_inspected_model, BackendDescriptor, BackendError, BackendProvider,
+    BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
+    ControlledTextGenerationError, ControlledToken, DeviceCapabilities, DeviceDescriptor,
+    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
     InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
     ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
-    SpeculativeTokenFilterController, Submission, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenFilterController,
-    TokenFilterError, TokenOutput, ValueDescriptor,
+    SessionCapabilities, SessionCapabilityError, SpeculativeTokenFilterController, Submission,
+    TextGeneration, TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TokenFilter,
+    TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

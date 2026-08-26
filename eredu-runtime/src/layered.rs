@@ -1303,6 +1303,72 @@ where
         .map(|(output, _)| output)
     }
 
+    /// Runs the production sequential traversal with stable unit-boundary observation.
+    pub fn forward_with_observer<'a, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_unit_executor_and_observer(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                architecture.forward_unit(group, index, unit, hidden, state, forward, context)
+            },
+            observer,
+        )
+    }
+
+    /// Runs a custom production unit executor with stable boundary observation.
+    pub fn forward_with_unit_executor_and_observer<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_unit_executor(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                let path = architecture.unit_path(group, index)?;
+                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let output = execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    &input,
+                    state,
+                    forward,
+                    context,
+                )?;
+                observe_and_intervene(observer, &format!("{path}.output"), &output)
+            },
+        )
+    }
+
     /// Runs canonical provider-backed unit execution with unit-boundary and
     /// routed-expert observation.
     ///
@@ -1311,7 +1377,7 @@ where
     /// shape handling, routing, and provider dispatch therefore remain shared
     /// with ordinary execution.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_routed_observer<'a, Provider, Observer>(
+    pub fn forward_with_provider_and_observer<'a, Provider, Observer>(
         &mut self,
         input: A::Input<'a>,
         state: &mut S,
@@ -1745,6 +1811,135 @@ where
         .map(|(output, _)| output)
     }
 
+    /// Runs the production parallel traversal with stable unit-boundary observation.
+    pub fn forward_parallel_with_observer<'a, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_unit_executor_and_observer(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                architecture.forward_unit_parallel(
+                    group, index, unit, hidden, state, forward, parallel, context,
+                )
+            },
+            observer,
+        )
+    }
+
+    /// Runs a custom parallel unit executor with stable boundary observation.
+    pub fn forward_parallel_with_unit_executor_and_observer<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_unit_executor(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                let path = architecture.unit_path(group, index)?;
+                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let output = execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    &input,
+                    state,
+                    forward,
+                    parallel,
+                    context,
+                )?;
+                observe_and_intervene(observer, &format!("{path}.output"), &output)
+            },
+        )
+    }
+
+    /// Runs provider-backed parallel execution with boundary and routing observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_with_provider_and_observer<'a, Provider, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::RoutedNeuralBackend,
+        A: ParallelRoutedLayeredArchitecture<B, S>,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_unit_executor(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                let path = architecture.unit_path(group, index)?;
+                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let output = match architecture.routed_observation_point(group, index)? {
+                    Some(point) => {
+                        let mut observed = ObservedExpertProvider::new(provider, observer, point);
+                        architecture.forward_unit_parallel_with_provider(
+                            group,
+                            index,
+                            unit,
+                            &input,
+                            state,
+                            forward,
+                            pass,
+                            &mut observed,
+                            parallel,
+                            context,
+                        )
+                    }
+                    None => architecture.forward_unit_parallel_with_provider(
+                        group, index, unit, &input, state, forward, pass, provider, parallel,
+                        context,
+                    ),
+                }?;
+                observe_and_intervene(observer, &format!("{path}.output"), &output)
+            },
+        )
+    }
+
     /// Runs one parallel pass with custom unit execution and a post-unit hook.
     pub fn forward_parallel_with_unit_executor_and_context_hook<'a, E, H>(
         &mut self,
@@ -2038,208 +2233,6 @@ where
             .finish(&output)
             .map_err(LayerwiseRuntimeError::Policy)?;
         Ok((output, forward_context))
-    }
-
-    /// Runs one pass with statically dispatched unit-boundary observation and
-    /// optional causal intervention.
-    pub fn forward_with_unit_hook<'a, F>(
-        &mut self,
-        input: A::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut hook: F,
-    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
-    where
-        F: FnMut(&str, &B::Tensor, &B::Tensor) -> Result<Option<B::Tensor>, A::Error>,
-    {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                self.architecture
-                    .group_unit_count(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
-            self.executors = Some(
-                B::fork_executors(context, graph.groups().len())
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-            );
-        }
-        let executors = self
-            .executors
-            .as_ref()
-            .expect("layered runtime initialized its executor cache");
-        let forward = self
-            .architecture
-            .begin_forward(input, state, context)
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let initial_completion = (graph.groups().len() > 1)
-            .then(|| B::submit(context, [&forward.hidden]))
-            .transpose()
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
-            .map_err(LayerwiseRuntimeError::Policy)?;
-        let initial = forward.hidden;
-        let mut forward_context = forward.context;
-        let mut schedule = ExecutionGroupSchedule::new(&graph);
-        let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
-        let mut completions: Vec<Option<B::Completion>> =
-            (0..graph.groups().len()).map(|_| None).collect();
-        for &group in graph.execution_order() {
-            let executor = std::borrow::Borrow::borrow(&executors[group]);
-            let group_dependencies = schedule
-                .dependencies(group)
-                .expect("validated execution order contains a known group");
-            if group_dependencies.is_empty() {
-                if let Some(completion) = &initial_completion {
-                    B::order_after(completion, executor)
-                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-                }
-            }
-            for &dependency in group_dependencies {
-                B::order_after(
-                    completions[dependency]
-                        .as_ref()
-                        .expect("topological dependency has a completion"),
-                    executor,
-                )
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-            }
-            let dependencies = schedule
-                .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
-            let mut hidden = self
-                .architecture
-                .begin_execution_group(
-                    group,
-                    &initial,
-                    &dependency_refs,
-                    state,
-                    &mut forward_context,
-                    executor,
-                )
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            for dependency in schedule
-                .started(group)
-                .expect("topological execution starts only ready groups")
-            {
-                outputs[dependency] = None;
-            }
-            if self
-                .architecture
-                .should_execute_group(group, &forward_context)
-            {
-                for index in 0..layout
-                    .group_range(group)
-                    .expect("layout covers every graph group")
-                    .len()
-                {
-                    let ordinal = layout
-                        .ordinal(group, index)
-                        .expect("group-local unit belongs to the layout");
-                    let address = layout
-                        .address(ordinal)
-                        .expect("group-local unit has a stable policy address");
-                    let path = self
-                        .architecture
-                        .unit_path(group, index)
-                        .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let lease = policy
-                        .acquire(ordinal, address, |executor| {
-                            self.architecture.build_unit(group, index, executor)
-                        })
-                        .map_err(|error| match error {
-                            LayerwiseAcquireError::Architecture(error) => {
-                                LayerwiseRuntimeError::Architecture(error)
-                            }
-                            LayerwiseAcquireError::Policy(error) => {
-                                LayerwiseRuntimeError::Policy(error)
-                            }
-                        })?;
-                    let unit_input = hidden.clone();
-                    let output = self
-                        .architecture
-                        .forward_unit(
-                            group,
-                            index,
-                            lease,
-                            &unit_input,
-                            state,
-                            &mut forward_context,
-                            executor,
-                        )
-                        .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hidden = hook(&path, &unit_input, &output)
-                        .map_err(LayerwiseRuntimeError::Architecture)?
-                        .unwrap_or(output);
-                    let mut state_values = Vec::new();
-                    for state_ordinal in self
-                        .architecture
-                        .retained_state_ordinals(group, index, ordinal)
-                    {
-                        state_values.extend(
-                            state
-                                .retained_values(state_ordinal, address.with_index(state_ordinal))
-                                .map_err(LayerwiseRuntimeError::State)?,
-                        );
-                    }
-                    let context_values =
-                        self.architecture
-                            .retained_context_values(&forward_context, group, index);
-                    policy
-                        .complete(&hidden, state_values.into_iter(), context_values)
-                        .map_err(LayerwiseRuntimeError::Policy)?;
-                }
-            }
-            hidden = self
-                .architecture
-                .complete_execution_group(group, &hidden, state, &mut forward_context, executor)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            outputs[group] = Some(hidden);
-            if graph.groups().len() > 1 {
-                completions[group] = Some(
-                    B::submit(
-                        executor,
-                        [outputs[group]
-                            .as_ref()
-                            .expect("group output was stored before submission")],
-                    )
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-                );
-            }
-            schedule
-                .ordered(group)
-                .expect("started group can be ordered exactly once");
-        }
-        let hidden = outputs[graph.output()]
-            .take()
-            .expect("validated graph output completed");
-        if let Some(completion) = &completions[graph.output()] {
-            B::order_after(completion, context)
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        }
-        let output = self
-            .architecture
-            .finish_forward(&hidden, state, &forward_context, context)
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        policy
-            .finish(&output)
-            .map_err(LayerwiseRuntimeError::Policy)?;
-        Ok(output)
     }
 }
 

@@ -677,11 +677,75 @@ impl QwenVlModel {
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
+    fn forward_with_observer(
+        &mut self,
+        input: vl::ModelInput<'_, Array>,
+        cache: &mut MlxHybridState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        let positions = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                vl::InputPart::Text(tokens)
+                | vl::InputPart::Image { tokens, .. }
+                | vl::InputPart::Video { tokens, .. } => tokens.dim(1),
+                vl::InputPart::Projected { tokens, .. } => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let pass = if positions > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let parts = neutral_input_parts(input.parts);
+        let input = vl::ModelInput {
+            parts: &parts,
+            pixels: crate::composition::tensor_opt(input.pixels),
+            mask: crate::composition::tensor_opt(input.mask),
+        };
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.text.clone();
+                    let mut provider =
+                        crate::composition::qwen::expert::cached_provider(expert_cache, &args);
+                    match &mut self.execution {
+                        Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
+                            input, cache, pass, &mut provider, stream, &mut neutral,
+                        ),
+                        Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
+                            input, cache, pass, &mut provider, stream, &mut neutral,
+                        ),
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::Resident(runtime) => {
+                        runtime.forward_with_observer(input, cache, stream, &mut neutral)
+                    }
+                    Execution::Bounded(runtime) => {
+                        runtime.forward_with_observer(input, cache, stream, &mut neutral)
+                    }
+                },
+            }
+        };
+        self.expert_cache = expert_cache;
+        let logits = result
+            .map(crate::MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        observer.observe("model.logits", &logits)?;
+        Ok(logits)
+    }
+
     fn prepared_forward(
         &mut self,
         typed: input::ModelInput<'_>,
         cache: &mut MlxHybridState,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
         input::validate(typed)?;
         let mut token_storage = Vec::new();
@@ -764,15 +828,15 @@ impl QwenVlModel {
         } else {
             Some(concatenate_axis(&pixel_refs, 0, stream)?)
         };
-        self.forward(
-            vl::ModelInput {
-                parts: &parts,
-                pixels: pixels.as_ref(),
-                mask: None,
-            },
-            cache,
-            stream,
-        )
+        let input = vl::ModelInput {
+            parts: &parts,
+            pixels: pixels.as_ref(),
+            mask: None,
+        };
+        match observer {
+            Some(observer) => self.forward_with_observer(input, cache, stream, observer),
+            None => self.forward(input, cache, stream),
+        }
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
@@ -785,7 +849,37 @@ impl QwenVlModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        self.prepared_forward(input, cache, stream)
+        self.prepared_forward(input, cache, stream, None)
+    }
+
+    pub fn prefill_with_observer(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MlxHybridState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Exception> {
+        self.prepared_forward(input, cache, stream, Some(observer))
+    }
+
+    pub fn forward_tokens_with_observer(
+        &mut self,
+        tokens: &Array,
+        cache: &mut MlxHybridState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        let parts = [vl::InputPart::Text(tokens)];
+        self.forward_with_observer(
+            vl::ModelInput {
+                parts: &parts,
+                pixels: None,
+                mask: None,
+            },
+            cache,
+            stream,
+            observer,
+        )
     }
 
 }
@@ -801,7 +895,7 @@ impl CausalModel<MlxHybridState> for QwenVlModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Exception> {
-        self.prepared_forward(input, cache, stream)?
+        self.prepared_forward(input, cache, stream, None)?
             .try_index_device((.., -1, ..), stream)
             .map(crate::MlxTensor::from_array)
     }

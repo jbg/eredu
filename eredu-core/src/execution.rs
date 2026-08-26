@@ -1,12 +1,14 @@
 //! Portable execution-plan and telemetry schemas.
 
 use crate::{
-    backend::BackendCapabilities, residency::CacheEvictionPolicy, topology::ParallelTopology,
+    backend::{DeviceCapabilities, SessionCapabilities},
+    residency::CacheEvictionPolicy,
+    topology::ParallelTopology,
 };
 use serde::{Deserialize, Serialize};
 
 /// Schema version shared by execution-plan documents.
-pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 3;
+pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 4;
 
 /// Default bound for simultaneously open checkpoint payload sources.
 pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
@@ -219,8 +221,10 @@ pub struct ExecutionPlan {
     pub expert_cache: Option<ExpertCachePlan>,
     /// Speculative decoding configuration.
     pub drafting: DraftingPlan,
-    /// Capabilities which the selected backend must provide.
-    pub required_capabilities: BackendCapabilities,
+    /// Capabilities which the selected device must provide.
+    pub required_device_capabilities: DeviceCapabilities,
+    /// Capabilities which the exact prepared session must provide.
+    pub required_session_capabilities: SessionCapabilities,
 }
 
 impl ExecutionPlan {
@@ -235,46 +239,35 @@ impl ExecutionPlan {
             max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
             expert_cache: None,
             drafting: DraftingPlan::Disabled,
-            required_capabilities: BackendCapabilities {
+            required_device_capabilities: DeviceCapabilities {
                 exact_completion: true,
-                ..BackendCapabilities::default()
+                ..DeviceCapabilities::default()
             },
+            required_session_capabilities: SessionCapabilities::default(),
         }
     }
 
     /// Validates portable plan invariants and fail-closed capabilities.
-    pub fn validate(&self, available: &BackendCapabilities) -> Result<(), ExecutionPlanError> {
+    pub fn validate_device_capabilities(
+        &self,
+        available: &DeviceCapabilities,
+    ) -> Result<(), ExecutionPlanError> {
         self.validate_structure()?;
         for (required, supported, name) in [
             (
-                self.required_capabilities.exact_completion,
+                self.required_device_capabilities.exact_completion,
                 available.exact_completion,
                 "exact_completion",
             ),
             (
-                self.required_capabilities.transfers,
+                self.required_device_capabilities.transfers,
                 available.transfers,
                 "transfers",
             ),
             (
-                self.required_capabilities.collectives,
+                self.required_device_capabilities.collectives,
                 available.collectives,
                 "collectives",
-            ),
-            (
-                self.required_capabilities.persistent_cache,
-                available.persistent_cache,
-                "persistent_cache",
-            ),
-            (
-                self.required_capabilities.output_observation,
-                available.output_observation,
-                "output_observation",
-            ),
-            (
-                self.required_capabilities.activation_inspection,
-                available.activation_inspection,
-                "activation_inspection",
             ),
         ] {
             if required && !supported {
@@ -282,6 +275,17 @@ impl ExecutionPlan {
             }
         }
         Ok(())
+    }
+
+    /// Validates exact prepared-session requirements independently.
+    pub fn validate_session_capabilities(
+        &self,
+        available: &SessionCapabilities,
+    ) -> Result<(), ExecutionPlanError> {
+        self.validate_structure()?;
+        self.required_session_capabilities
+            .validate(available)
+            .map_err(|error| ExecutionPlanError::Capability(error.capability()))
     }
 
     /// Validates schema, topology, and portable resource invariants without a backend.
@@ -364,7 +368,7 @@ mod tests {
         let encoded = serde_json::to_vec(&plan).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&encoded).unwrap()["schema_version"],
-            3
+            4
         );
         assert_eq!(
             serde_json::from_slice::<ExecutionPlan>(&encoded).unwrap(),
@@ -374,11 +378,30 @@ mod tests {
 
     #[test]
     fn plan_capabilities_fail_closed() {
-        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0").unwrap());
+        let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0").unwrap());
         assert_eq!(
-            plan.validate(&BackendCapabilities::default()),
+            plan.validate_device_capabilities(&DeviceCapabilities::default()),
             Err(ExecutionPlanError::Capability("exact_completion"))
         );
+
+        plan.required_session_capabilities.activation_inspection = true;
+        assert_eq!(
+            plan.validate_session_capabilities(&SessionCapabilities::default()),
+            Err(ExecutionPlanError::Capability("activation_inspection"))
+        );
+        assert!(plan
+            .validate_device_capabilities(&DeviceCapabilities {
+                exact_completion: true,
+                transfers: false,
+                collectives: false,
+            })
+            .is_ok());
+        assert!(plan
+            .validate_session_capabilities(&SessionCapabilities {
+                activation_inspection: true,
+                ..SessionCapabilities::default()
+            })
+            .is_ok());
     }
 
     #[test]

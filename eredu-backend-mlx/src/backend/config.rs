@@ -16,6 +16,8 @@ pub struct ModelLoadOptions {
     parallel: Option<(MlxParallelContext, PipelineWireContract)>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub weight_residency: WeightResidency,
+    /// Capabilities required from the exact realized model session.
+    pub required_session_capabilities: eredu_core::SessionCapabilities,
 }
 
 impl ModelLoadOptions {
@@ -25,6 +27,7 @@ impl ModelLoadOptions {
             quantization: Some(quantization.into()),
             parallel: None,
             weight_residency: WeightResidency::fully_resident(),
+            required_session_capabilities: eredu_core::SessionCapabilities::default(),
         }
     }
 
@@ -50,6 +53,15 @@ impl ModelLoadOptions {
     /// Selects fully resident or bounded layer execution for checkpoint weights.
     pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
         self.weight_residency = residency;
+        self
+    }
+
+    /// Requires capabilities from the exact inspected and realized session.
+    pub fn with_required_session_capabilities(
+        mut self,
+        capabilities: eredu_core::SessionCapabilities,
+    ) -> Self {
+        self.required_session_capabilities = capabilities;
         self
     }
 
@@ -130,6 +142,7 @@ impl ModelLoadOptions {
             quantization,
             residency,
             topology: self.parallel_topology().map(MlxParallelContext::topology),
+            required_session_capabilities: self.required_session_capabilities,
         })
     }
 }

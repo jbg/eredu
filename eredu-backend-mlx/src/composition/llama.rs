@@ -390,6 +390,7 @@ impl LlamaModel {
         self.validate_cache(cache)?;
         let inputs = crate::MlxTensor::from_array(inputs.clone());
         let mask = mask.cloned().map(crate::MlxTensor::from_array);
+        let mut neutral_observer = crate::composition::NeutralActivationObserver::new(observer);
         match &mut self.execution {
             LlamaExecution::TensorParallelResident(_)
             | LlamaExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
@@ -397,25 +398,14 @@ impl LlamaModel {
             )),
             LlamaExecution::Resident(execution) => {
                 let output = execution
-                    .forward_with_unit_hook(
+                    .forward_with_observer(
                         eredu_architectures::llama::LayeredInput {
                             tokens: &inputs,
                             mask: mask.as_ref(),
                         },
                         cache,
                         stream,
-                        |path, input, output| {
-                            observer
-                                .observe(&format!("{path}.input"), input.as_array())
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-                            observer
-                                .observe(&format!("{path}.output"), output.as_array())
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-                            observer
-                                .intervene(&format!("{path}.output"), output.as_array())
-                                .map(|replacement| replacement.map(crate::MlxTensor::from_array))
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-                        },
+                        &mut neutral_observer,
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 observer.observe("model.logits", output.as_array())?;
@@ -423,25 +413,14 @@ impl LlamaModel {
             }
             LlamaExecution::Layerwise(execution) => {
                 let output = execution
-                    .forward_with_unit_hook(
+                    .forward_with_observer(
                         eredu_architectures::llama::LayeredInput {
                             tokens: &inputs,
                             mask: mask.as_ref(),
                         },
                         cache,
                         stream,
-                        |path, input, output| {
-                            observer
-                                .observe(&format!("{path}.input"), input.as_array())
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-                            observer
-                                .observe(&format!("{path}.output"), output.as_array())
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-                            observer
-                                .intervene(&format!("{path}.output"), output.as_array())
-                                .map(|replacement| replacement.map(crate::MlxTensor::from_array))
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-                        },
+                        &mut neutral_observer,
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 observer.observe("model.logits", output.as_array())?;
@@ -488,6 +467,52 @@ impl LlamaModel {
             )),
         }?;
         Ok(output.into_array())
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        inputs: &Array,
+        cache: &mut MlxKeyValueState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
+    ) -> Result<Array, Error> {
+        self.validate_cache(cache)?;
+        let inputs = crate::MlxTensor::from_array(inputs.clone());
+        let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+        let output = match &mut self.execution {
+            LlamaExecution::TensorParallelResident(runtime) => runtime
+                .forward_parallel_with_observer(
+                    eredu_architectures::llama::LayeredInput {
+                        tokens: &inputs,
+                        mask: None,
+                    },
+                    cache,
+                    group,
+                    stream,
+                    &mut neutral,
+                ),
+            LlamaExecution::TensorParallelLayerwise(runtime) => runtime
+                .forward_parallel_with_observer(
+                    eredu_architectures::llama::LayeredInput {
+                        tokens: &inputs,
+                        mask: None,
+                    },
+                    cache,
+                    group,
+                    stream,
+                    &mut neutral,
+                ),
+            LlamaExecution::Resident(_) | LlamaExecution::Layerwise(_) => {
+                return Err(Error::Parallel(
+                    "model was not loaded for tensor-parallel execution".into(),
+                ));
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Into::into)
     }
 
     /// Runs prompt prefill and returns last-token logits.

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 3;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = 4;
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -792,7 +792,7 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
                 expected_backend, plan.device.device
             ))
         })?;
-    plan.validate(capabilities)
+    plan.validate_device_capabilities(capabilities)
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
     Ok(realization)
 }

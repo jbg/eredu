@@ -334,6 +334,18 @@ pub struct PreparationPolicy {
     pub residency: ResidencyRequest,
     /// Exact parallel topology selected for materialization, when explicitly configured.
     pub topology: Option<crate::topology::ParallelTopology>,
+    /// Capabilities required from the exact prepared session.
+    pub required_session_capabilities: crate::backend::SessionCapabilities,
+}
+
+impl PreparationPolicy {
+    /// Validates exact session requirements independently from device requirements.
+    pub fn validate_session_capabilities(
+        &self,
+        available: &crate::backend::SessionCapabilities,
+    ) -> Result<(), crate::backend::SessionCapabilityError> {
+        self.required_session_capabilities.validate(available)
+    }
 }
 
 /// Canonical materialization recipe selected by the core planner.
@@ -354,6 +366,7 @@ pub struct ModelPreparationPlan<P = ()> {
     inspection: ArtifactInspection<P>,
     policy: PreparationPolicy,
     route: MaterializationRoute,
+    admitted_session_capabilities: crate::backend::SessionCapabilities,
 }
 
 impl<P> ModelPreparationPlan<P> {
@@ -368,6 +381,10 @@ impl<P> ModelPreparationPlan<P> {
     /// Canonical materialization route.
     pub const fn route(&self) -> MaterializationRoute {
         self.route
+    }
+    /// Exact session capabilities admitted before materialization.
+    pub const fn admitted_session_capabilities(&self) -> crate::backend::SessionCapabilities {
+        self.admitted_session_capabilities
     }
     /// Consume the plan into its portable artifact, architecture state, and policy.
     pub fn into_parts(self) -> (ModelArtifact, P, PreparationPolicy, MaterializationRoute) {
@@ -439,12 +456,14 @@ pub fn inspect_artifact<R: ModelConfigurationResolver>(
 pub fn plan_model_preparation<P>(
     inspection: ArtifactInspection<P>,
     policy: PreparationPolicy,
+    admitted_session_capabilities: crate::backend::SessionCapabilities,
 ) -> Result<ModelPreparationPlan<P>, ArtifactError> {
     let route = validate_preparation_policy(inspection.configuration.loading_protocol, policy)?;
     Ok(ModelPreparationPlan {
         inspection,
         policy,
         route,
+        admitted_session_capabilities,
     })
 }
 
@@ -1165,7 +1184,12 @@ mod tests {
         let inspection = inspect_artifact(root.path(), &FixtureResolver).unwrap();
         assert_eq!(inspection.configuration().family, "llama");
         assert_eq!(inspection.tensors().len(), 1);
-        let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
+        let plan = plan_model_preparation(
+            inspection,
+            PreparationPolicy::default(),
+            crate::backend::SessionCapabilities::default(),
+        )
+        .unwrap();
         assert_eq!(plan.route(), MaterializationRoute::Resident);
         let (artifact, architecture_plan, _, _) = plan.into_parts();
         assert!(matches!(artifact, ModelArtifact::SafeTensors { .. }));
@@ -1206,7 +1230,12 @@ mod tests {
             inspection.configuration().loading_protocol,
             LoadingProtocol::Model
         );
-        assert!(plan_model_preparation(inspection, PreparationPolicy::default()).is_ok());
+        assert!(plan_model_preparation(
+            inspection,
+            PreparationPolicy::default(),
+            crate::backend::SessionCapabilities::default(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1244,6 +1273,7 @@ mod tests {
         let plan = plan_model_preparation(
             inspect_artifact(root.path(), &FixtureResolver).unwrap(),
             policy,
+            crate::backend::SessionCapabilities::default(),
         )
         .unwrap();
 
@@ -1262,6 +1292,7 @@ mod tests {
                 residency: ResidencyRequest::ExpertCache,
                 ..PreparationPolicy::default()
             },
+            crate::backend::SessionCapabilities::default(),
         )
         .unwrap();
         assert_eq!(plan.route(), MaterializationRoute::ExpertCache);
@@ -1279,6 +1310,7 @@ mod tests {
         let plan = plan_model_preparation(
             inspect_artifact(root.path(), &FixtureResolver).unwrap(),
             policy,
+            crate::backend::SessionCapabilities::default(),
         )
         .unwrap();
         assert_eq!(plan.policy(), policy);
@@ -1320,7 +1352,12 @@ mod tests {
             TensorDtype::F16
         );
 
-        let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
+        let plan = plan_model_preparation(
+            inspection,
+            PreparationPolicy::default(),
+            crate::backend::SessionCapabilities::default(),
+        )
+        .unwrap();
         let (artifact, architecture_plan, _, _) = plan.into_parts();
         let ModelArtifact::Gguf {
             configuration,
@@ -1399,11 +1436,14 @@ mod tests {
                 .path(),
             projector
         );
-        let ModelArtifact::Gguf { validated, .. } =
-            plan_model_preparation(inspection, PreparationPolicy::default())
-                .unwrap()
-                .into_parts()
-                .0
+        let ModelArtifact::Gguf { validated, .. } = plan_model_preparation(
+            inspection,
+            PreparationPolicy::default(),
+            crate::backend::SessionCapabilities::default(),
+        )
+        .unwrap()
+        .into_parts()
+        .0
         else {
             panic!("expected GGUF preparation artifact");
         };

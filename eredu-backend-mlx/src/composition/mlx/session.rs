@@ -426,6 +426,7 @@ pub struct MlxModelSession<'a> {
     inner: MlxSessionKind,
     runtime_state_dtype_bytes: std::num::NonZeroU8,
     distributed: Option<MlxDistributedSession<'a>>,
+    capabilities: eredu_core::SessionCapabilities,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
@@ -453,6 +454,7 @@ impl<'a> MlxModelSession<'a> {
     pub fn from_model(
         model: MlxModel,
         distributed: Option<MlxDistributedSession<'a>>,
+        admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
         let runtime_state_dtype_bytes = model.runtime_state_dtype_bytes();
         let topology = model.topology();
@@ -490,10 +492,21 @@ impl<'a> MlxModelSession<'a> {
                 MlxSessionKind::Pipeline(model, cache)
             }
         };
+        let realized_capabilities = eredu_core::SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        };
+        if admitted_capabilities != realized_capabilities {
+            return Err(Error::ArchitectureModel(format!(
+                "realized MLX session capabilities {realized_capabilities:?} do not match pre-materialization admission {admitted_capabilities:?}"
+            )));
+        }
         Ok(Self {
             inner,
             runtime_state_dtype_bytes,
             distributed,
+            capabilities: realized_capabilities,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor,
         })
@@ -891,10 +904,65 @@ impl<'a> MlxModelSession<'a> {
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Array, Error> {
         let mut observer = ArrayObserverAdapter { inner: observer };
-        let result = match (model, cache) {
-            (Model::DeepSeek(_, model), ModelCache::DeepSeek(cache)) => model
-                .forward_with_observer(input_tokens, mask, cache, stream, &mut observer),
-            (Model::KimiLinear(_, model), ModelCache::Hybrid(cache)) => {
+        let effective_model_type = model.effective_model_type().to_owned();
+        let mismatch = || {
+            Error::ArchitectureModel(format!(
+                "activation observation cache does not match model type {effective_model_type}"
+            ))
+        };
+        let result = match model {
+            Model::DeepSeek(_, model) => {
+                let ModelCache::DeepSeek(cache) = cache else {
+                    return Err(mismatch());
+                };
+                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
+            Model::Gemma4(_, model) => {
+                let ModelCache::Hybrid(cache) = cache else {
+                    return Err(mismatch());
+                };
+                if mask.is_some() {
+                    return Err(Error::ArchitectureModel(
+                        "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state".into(),
+                    ));
+                }
+                model
+                    .forward_tokens_with_observer(
+                        MlxTensor::ref_cast(input_tokens),
+                        cache,
+                        stream,
+                        &mut observer,
+                    )
+                    .map(MlxTensor::into_array)
+            }
+            Model::GptOss(_, model) => {
+                let ModelCache::GptOss(cache) = cache else {
+                    return Err(mismatch());
+                };
+                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
+            Model::Inkling(_, model) => {
+                let ModelCache::Inkling(cache) = cache else {
+                    return Err(mismatch());
+                };
+                if mask.is_some() {
+                    return Err(Error::ArchitectureModel(
+                        "explicit Inkling observer masks are unsupported".into(),
+                    ));
+                }
+                model
+                    .forward_tokens_with_observer(
+                        MlxTensor::ref_cast(input_tokens),
+                        cache,
+                        stream,
+                        &mut observer,
+                    )
+                    .map(MlxTensor::into_array)
+            }
+            Model::KimiLinear(_, model) => {
+                let ModelCache::Hybrid(cache) = cache else {
+                    return Err(mismatch());
+                };
                 if mask.is_some() {
                     return Err(Error::ArchitectureModel(
                         "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
@@ -902,28 +970,52 @@ impl<'a> MlxModelSession<'a> {
                 }
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::Lfm2(_, model), ModelCache::Hybrid(cache)) => {
+            Model::Lfm2(_, model) => {
+                let ModelCache::Hybrid(cache) = cache else {
+                    return Err(mismatch());
+                };
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::Llama(_, model), ModelCache::Llama(cache)) => {
+            Model::Llama(_, model) => {
+                let ModelCache::Llama(cache) = cache else {
+                    return Err(mismatch());
+                };
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::Qwen(_, model), ModelCache::Qwen(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => {
+            Model::MuseGlimmer(_, model) => {
+                let ModelCache::MuseGlimmer(cache) = cache else {
+                    return Err(mismatch());
+                };
                 if mask.is_some() {
                     return Err(Error::ArchitectureModel(
-                        "explicit Muse-Glimmer observer masks are not bound yet".into(),
+                        "explicit Muse-Glimmer observer masks are unsupported".into(),
                     ));
                 }
-                let input_tokens = MlxTensor::from_array(input_tokens.clone());
-                let output = model.forward_tokens(&input_tokens, cache, stream)?;
-                observer.observe("model.logits", output.as_array())?;
-                Ok(output.into_array())
+                model
+                    .forward_tokens_with_observer(
+                        MlxTensor::ref_cast(input_tokens),
+                        cache,
+                        stream,
+                        &mut observer,
+                    )
+                    .map(MlxTensor::into_array)
             }
-            (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
-            | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
+            Model::NemotronH(_, model) => {
+                let ModelCache::Hybrid(cache) = cache else {
+                    return Err(mismatch());
+                };
+                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
+            Model::Qwen(_, model) => {
+                let ModelCache::Qwen(cache) = cache else {
+                    return Err(mismatch());
+                };
+                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
+            Model::Qwen3Next(_, model) => {
+                let ModelCache::Qwen3Next(cache) = cache else {
+                    return Err(mismatch());
+                };
                 if mask.is_some() {
                     return Err(Error::ArchitectureModel(
                         "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
@@ -931,28 +1023,38 @@ impl<'a> MlxModelSession<'a> {
                 }
                 model.forward_with_observer(input_tokens, cache, stream, &mut observer)
             }
-            (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => {
+            Model::Qwen3Vl(_, model) => {
+                let ModelCache::Qwen3Vl(cache) = cache else {
+                    return Err(mismatch());
+                };
                 if mask.is_some() {
                     return Err(Error::ArchitectureModel(
-                        "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state".into(),
+                        "explicit Qwen3-VL observer masks are unsupported".into(),
                     ));
                 }
-                let input_tokens = MlxTensor::from_array(input_tokens.clone());
-                let output = model.forward_tokens(&input_tokens, cache, stream)?;
-                observer.observe("model.logits", output.as_array())?;
-                Ok(output.into_array())
+                model.forward_tokens_with_observer(input_tokens, cache, stream, &mut observer)
             }
-            (Model::GptOss(_, model), ModelCache::GptOss(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            Model::Qwen3VlMoe(_, model) => {
+                let ModelCache::Qwen3VlMoe(cache) = cache else {
+                    return Err(mismatch());
+                };
+                if mask.is_some() {
+                    return Err(Error::ArchitectureModel(
+                        "explicit Qwen3-VL-MoE observer masks are unsupported".into(),
+                    ));
+                }
+                model.forward_tokens_with_observer(input_tokens, cache, stream, &mut observer)
             }
-            (Model::NemotronH(_, model), ModelCache::Hybrid(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            (model, _) => {
-                return Err(Error::ArchitectureModel(format!(
-                    "activation observation is unavailable for model type {} or the supplied cache does not match",
-                    model.effective_model_type()
-                )))
+            Model::Qwen35(_, model) => {
+                let ModelCache::Qwen35(cache) = cache else {
+                    return Err(mismatch());
+                };
+                if mask.is_some() {
+                    return Err(Error::ArchitectureModel(
+                        "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
+                    ));
+                }
+                model.forward_with_observer(input_tokens, cache, stream, &mut observer)
             }
         };
         result.map_err(|error| safemlx::error::Exception::custom(error.to_string()).into())
@@ -966,16 +1068,31 @@ impl<'a> MlxModelSession<'a> {
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         match &mut self.inner {
-            MlxSessionKind::Complete(model, cache) => Self::submit_complete_prefill_with_observer(
-                model,
-                input,
-                cache,
-                backend.stream(),
-                observer,
+            MlxSessionKind::Complete(model, cache) => match &self.distributed {
+                Some(distributed) => {
+                    let output = input.with_borrowed(|input| {
+                        prefill_model_tensor_parallel_with_observer(
+                            model,
+                            cache,
+                            input,
+                            distributed,
+                            backend.stream(),
+                            observer,
+                        )
+                    })?;
+                    MlxCompletion::submission(output)
+                }
+                None => Self::submit_complete_prefill_with_observer(
+                    model,
+                    input,
+                    cache,
+                    backend.stream(),
+                    observer,
+                ),
+            },
+            MlxSessionKind::Pipeline(_, _) => unreachable!(
+                "pipeline prefill inspection is dispatched through the pipeline executor"
             ),
-            MlxSessionKind::Pipeline(_, _) => Err(Error::ArchitectureModel(
-                "activation observation is unavailable for distributed MLX sessions".into(),
-            )),
         }
     }
 
@@ -986,26 +1103,192 @@ impl<'a> MlxModelSession<'a> {
         stream: &Stream,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
-        let output = input.with_borrowed(|input| match (&mut *model, &mut *cache) {
-            (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
-            | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => model
-                .prefill_input_with_observer(
-                    input,
-                    cache,
-                    stream,
-                    &mut ArrayObserverAdapter { inner: observer },
-                )
-                .map_err(|error| {
-                    Error::Exception(safemlx::error::Exception::custom(error.to_string()))
-                })?
+        let effective_model_type = model.effective_model_type().to_owned();
+        let mismatch = || {
+            Error::ArchitectureModel(format!(
+                "activation observation cache does not match model type {effective_model_type}"
+            ))
+        };
+        let output = input.with_borrowed(|input| {
+            let logits = match model {
+                Model::DeepSeek(_, family) => {
+                    let ModelCache::DeepSeek(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Gemma4(_, family) => {
+                    let ModelCache::Hybrid(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family
+                        .prefill_with_observer(
+                            input,
+                            cache,
+                            stream,
+                            &mut ArrayObserverAdapter { inner: observer },
+                        )?
+                        .into_array()
+                }
+                Model::GptOss(_, family) => {
+                    let ModelCache::GptOss(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Inkling(_, family) => {
+                    let ModelCache::Inkling(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family
+                        .forward_input_with_observer(
+                            input,
+                            cache,
+                            stream,
+                            &mut ArrayObserverAdapter { inner: observer },
+                        )?
+                        .into_array()
+                }
+                Model::KimiLinear(_, family) => {
+                    let ModelCache::Hybrid(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Lfm2(_, family) => {
+                    let ModelCache::Hybrid(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Llama(_, family) => {
+                    let ModelCache::Llama(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::MuseGlimmer(_, family) => {
+                    let ModelCache::MuseGlimmer(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family
+                        .forward_input_with_observer(
+                            input,
+                            cache,
+                            stream,
+                            &mut ArrayObserverAdapter { inner: observer },
+                        )?
+                        .into_array()
+                }
+                Model::NemotronH(_, family) => {
+                    let ModelCache::Hybrid(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Qwen(_, family) => {
+                    let ModelCache::Qwen(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Qwen3Next(_, family) => {
+                    let ModelCache::Qwen3Next(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family.prefill_input_with_observer(
+                        input,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Qwen3Vl(_, family) => {
+                    let ModelCache::Qwen3Vl(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family.prefill_with_observer(
+                        input,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Qwen3VlMoe(_, family) => {
+                    let ModelCache::Qwen3VlMoe(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family.prefill_with_observer(
+                        input,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Model::Qwen35(_, family) => {
+                    let ModelCache::Qwen35(cache) = cache else {
+                        return Err(mismatch());
+                    };
+                    family.prefill_input_with_observer(
+                        input,
+                        cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+            };
+            logits
                 .try_index_device((.., -1, ..), stream)
-                .map_err(Error::from),
-            _ => {
-                let tokens = input::text_token_ids(input, stream)?;
-                Self::forward_with_observer(model, &tokens, None, cache, stream, observer)?
-                    .try_index_device((.., -1, ..), stream)
-                    .map_err(Error::from)
-            }
+                .map_err(Error::from)
         })?;
         MlxCompletion::submission(output)
     }
@@ -1018,20 +1301,34 @@ impl<'a> MlxModelSession<'a> {
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model, cache) => {
-                let output = Self::forward_with_observer(
-                    model,
-                    &input,
-                    None,
-                    cache,
-                    backend.stream(),
-                    observer,
-                )?
+                let output = match &self.distributed {
+                    Some(distributed) => forward_model_tensor_parallel_with_observer(
+                        model,
+                        cache,
+                        &input,
+                        distributed.tensor_group().ok_or_else(|| {
+                            Error::Parallel(
+                                "tensor-parallel model session has no tensor communicator".into(),
+                            )
+                        })?,
+                        backend.stream(),
+                        observer,
+                    )?,
+                    None => Self::forward_with_observer(
+                        model,
+                        &input,
+                        None,
+                        cache,
+                        backend.stream(),
+                        observer,
+                    )?,
+                }
                 .try_index_device((.., -1, ..), backend.stream())?;
                 MlxCompletion::submission(output)
             }
-            MlxSessionKind::Pipeline(_, _) => Err(Error::ArchitectureModel(
-                "activation observation is unavailable for distributed MLX sessions".into(),
-            )),
+            MlxSessionKind::Pipeline(_, _) => unreachable!(
+                "pipeline decode inspection is dispatched through the pipeline executor"
+            ),
         }
     }
 }
@@ -1041,6 +1338,10 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     type DecodeInput = Array;
     type Output = MlxModelOutput;
     type Completion = MlxSessionCompletion;
+
+    fn capabilities(&self) -> eredu_core::SessionCapabilities {
+        self.capabilities
+    }
 
     fn prefill(
         &mut self,
@@ -1163,11 +1464,54 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<Self::Output>, Error> {
         let mut collector = InspectionCollector::new(request);
-        let submission = self.submit_prefill_with_observer(backend, input, &mut collector)?;
-        let logits = submission.wait()?;
+        let output = match &mut self.inner {
+            MlxSessionKind::Complete(_, _) => {
+                let submission =
+                    self.submit_prefill_with_observer(backend, input, &mut collector)?;
+                let logits = submission.wait()?;
+                MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
+            }
+            MlxSessionKind::Pipeline(model, cache) => {
+                let distributed = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel("pipeline model session has no communication".into())
+                })?;
+                let completion = input.with_borrowed(|borrowed| {
+                    let tokens = input::text_token_ids(borrowed, backend.stream())?;
+                    let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
+                    let multimodal = borrowed
+                        .parts
+                        .iter()
+                        .any(|part| part.modality() != InputModality::Text);
+                    let mut observer = ArrayObserverAdapter {
+                        inner: &mut collector,
+                    };
+                    if multimodal {
+                        model.prefill_distributed_with_observer(
+                            model.stage_info().is_first.then_some(borrowed),
+                            step,
+                            None,
+                            cache,
+                            distributed,
+                            &mut observer,
+                        )
+                    } else {
+                        model.forward_distributed_with_observer(
+                            model.stage_info().is_first.then_some(&tokens),
+                            step,
+                            None,
+                            cache,
+                            distributed,
+                            &mut observer,
+                        )
+                    }
+                })?;
+                completion.synchronize()?;
+                MlxModelOutput::new(completion.logits().cloned().map(MlxTensor::from_array))
+            }
+        };
         let observations = collector.materialize(backend.stream())?;
         Ok(InspectedOutput {
-            output: MlxModelOutput::new(Some(MlxTensor::from_array(logits))),
+            output,
             observations,
         })
     }
@@ -1179,11 +1523,36 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<Self::Output>, Error> {
         let mut collector = InspectionCollector::new(request);
-        let submission = self.submit_decode_with_observer(backend, input, &mut collector)?;
-        let logits = submission.wait()?;
+        let output = match &mut self.inner {
+            MlxSessionKind::Complete(_, _) => {
+                let submission =
+                    self.submit_decode_with_observer(backend, input, &mut collector)?;
+                let logits = submission.wait()?;
+                MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
+            }
+            MlxSessionKind::Pipeline(model, cache) => {
+                let distributed = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel("pipeline model session has no communication".into())
+                })?;
+                let step = PipelineStep::new(input.dim(0), input.dim(1))?;
+                let mut observer = ArrayObserverAdapter {
+                    inner: &mut collector,
+                };
+                let completion = model.forward_distributed_with_observer(
+                    model.stage_info().is_first.then_some(&input),
+                    step,
+                    None,
+                    cache,
+                    distributed,
+                    &mut observer,
+                )?;
+                completion.synchronize()?;
+                MlxModelOutput::new(completion.logits().cloned().map(MlxTensor::from_array))
+            }
+        };
         let observations = collector.materialize(backend.stream())?;
         Ok(InspectedOutput {
-            output: MlxModelOutput::new(Some(MlxTensor::from_array(logits))),
+            output,
             observations,
         })
     }
@@ -1600,6 +1969,190 @@ fn forward_model_tensor_parallel(
             "tensor-parallel MLX cache does not match model type {}",
             model.effective_model_type()
         ))),
+    }
+}
+
+fn prefill_model_tensor_parallel_with_observer(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: input::ModelInput<'_>,
+    distributed: &MlxDistributedSession<'_>,
+    stream: &Stream,
+    observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
+) -> Result<Array, Error> {
+    let group = distributed.tensor_group().ok_or_else(|| {
+        Error::Parallel("tensor-parallel model session has no tensor communicator".into())
+    })?;
+    let logits = match model {
+        Model::Gemma4(_, family) => {
+            let ModelCache::Hybrid(cache) = cache else {
+                return Err(Error::ArchitectureModel("Gemma 4 cache mismatch".into()));
+            };
+            family
+                .prefill_tensor_parallel_with_observer(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    &mut ArrayObserverAdapter { inner: observer },
+                )?
+                .into_array()
+        }
+        Model::Inkling(_, family) => {
+            let ModelCache::Inkling(cache) = cache else {
+                return Err(Error::ArchitectureModel("Inkling cache mismatch".into()));
+            };
+            family
+                .prefill_tensor_parallel_with_observer(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    &mut ArrayObserverAdapter { inner: observer },
+                )?
+                .into_array()
+        }
+        Model::MuseGlimmer(_, family) => {
+            let ModelCache::MuseGlimmer(cache) = cache else {
+                return Err(Error::ArchitectureModel(
+                    "Muse-Glimmer cache mismatch".into(),
+                ));
+            };
+            family
+                .prefill_tensor_parallel_with_observer(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    &mut ArrayObserverAdapter { inner: observer },
+                )?
+                .into_array()
+        }
+        Model::DeepSeek(_, _)
+        | Model::Qwen3Next(_, _)
+        | Model::Qwen3Vl(_, _)
+        | Model::Qwen3VlMoe(_, _)
+        | Model::Qwen35(_, _) => {
+            return Err(Error::Parallel(
+                "this architecture is materialized as a pipeline model for distributed execution"
+                    .into(),
+            ));
+        }
+        Model::GptOss(_, _)
+        | Model::KimiLinear(_, _)
+        | Model::Lfm2(_, _)
+        | Model::Llama(_, _)
+        | Model::NemotronH(_, _)
+        | Model::Qwen(_, _) => {
+            let tokens = input::text_token_ids(input, stream)?;
+            forward_model_tensor_parallel_with_observer(
+                model, cache, &tokens, group, stream, observer,
+            )?
+        }
+    };
+    last_token_logits(logits, stream)
+}
+
+fn forward_model_tensor_parallel_with_observer(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: &Array,
+    group: &safemlx::distributed::Group,
+    stream: &Stream,
+    observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
+) -> Result<Array, Error> {
+    let mut observer = ArrayObserverAdapter { inner: observer };
+    match model {
+        Model::GptOss(_, family) => {
+            let ModelCache::GptOss(cache) = cache else {
+                return Err(Error::ArchitectureModel("GPT-OSS cache mismatch".into()));
+            };
+            family.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
+        }
+        Model::Inkling(_, family) => {
+            let ModelCache::Inkling(cache) = cache else {
+                return Err(Error::ArchitectureModel("Inkling cache mismatch".into()));
+            };
+            family
+                .forward_tensor_parallel_with_observer(
+                    MlxTensor::ref_cast(input),
+                    cache,
+                    group,
+                    stream,
+                    &mut observer,
+                )
+                .map(MlxTensor::into_array)
+        }
+        Model::KimiLinear(_, family) => {
+            let ModelCache::Hybrid(cache) = cache else {
+                return Err(Error::ArchitectureModel(
+                    "Kimi Linear cache mismatch".into(),
+                ));
+            };
+            family.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
+        }
+        Model::Lfm2(_, family) => {
+            let ModelCache::Hybrid(cache) = cache else {
+                return Err(Error::ArchitectureModel("LFM2 cache mismatch".into()));
+            };
+            family.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
+        }
+        Model::Llama(_, family) => {
+            let ModelCache::Llama(cache) = cache else {
+                return Err(Error::ArchitectureModel("Llama cache mismatch".into()));
+            };
+            family.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
+        }
+        Model::NemotronH(_, family) => {
+            let ModelCache::Hybrid(cache) = cache else {
+                return Err(Error::ArchitectureModel("Nemotron-H cache mismatch".into()));
+            };
+            family.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
+        }
+        Model::Gemma4(_, family) => {
+            let ModelCache::Hybrid(cache) = cache else {
+                return Err(Error::ArchitectureModel("Gemma 4 cache mismatch".into()));
+            };
+            family
+                .forward_tensor_parallel_with_observer(
+                    MlxTensor::ref_cast(input),
+                    cache,
+                    group,
+                    stream,
+                    &mut observer,
+                )
+                .map(MlxTensor::into_array)
+        }
+        Model::Qwen(_, family) => {
+            let ModelCache::Qwen(cache) = cache else {
+                return Err(Error::ArchitectureModel("Qwen cache mismatch".into()));
+            };
+            family.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
+        }
+        Model::MuseGlimmer(_, family) => {
+            let ModelCache::MuseGlimmer(cache) = cache else {
+                return Err(Error::ArchitectureModel(
+                    "Muse-Glimmer cache mismatch".into(),
+                ));
+            };
+            family
+                .forward_tensor_parallel_with_observer(
+                    MlxTensor::ref_cast(input),
+                    cache,
+                    group,
+                    stream,
+                    &mut observer,
+                )
+                .map(MlxTensor::into_array)
+        }
+        Model::DeepSeek(_, _)
+        | Model::Qwen3Next(_, _)
+        | Model::Qwen3Vl(_, _)
+        | Model::Qwen3VlMoe(_, _)
+        | Model::Qwen35(_, _) => Err(Error::Parallel(
+            "this architecture is materialized as a pipeline model for distributed execution"
+                .into(),
+        )),
     }
 }
 

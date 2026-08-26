@@ -194,6 +194,7 @@ fn mlx_load_options(
             ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
         }
     };
+    load.required_session_capabilities = plan.required_session_capabilities;
     let residency = match &plan.residency {
         ResidencyPlan::FullyResident => NonExpertWeightResidency::FullyResident,
         ResidencyPlan::LayerwiseHost {

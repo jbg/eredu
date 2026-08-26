@@ -1045,7 +1045,7 @@ impl NemotronHModel {
             crate::composition::tensor_ref(tokens),
             None,
         );
-        match &mut self.execution {
+        let output = match &mut self.execution {
             NemotronHExecution::Resident(runtime) => runtime.forward(input, cache, stream),
             NemotronHExecution::Layerwise(runtime) => runtime.forward(input, cache, stream),
             NemotronHExecution::TensorParallelResident(_)
@@ -1056,7 +1056,8 @@ impl NemotronHModel {
             }
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(output)
     }
 
     fn forward_with_provider<P>(
@@ -1110,7 +1111,7 @@ impl NemotronHModel {
                     group, index, block, hidden, state, forward, provider, context,
                 )
             };
-        match &mut self.execution {
+        let output = match &mut self.execution {
             NemotronHExecution::Resident(runtime) => runtime
                 .forward_with_unit_executor_and_context_hook(
                     input,
@@ -1133,7 +1134,8 @@ impl NemotronHModel {
                 ))
             }
         }
-        .map_err(|error| Error::Parallel(error.to_string()))
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(output)
     }
 
     fn forward_mtp_target(
@@ -1284,7 +1286,7 @@ impl NemotronHModel {
                     group, index, unit, hidden, state, forward, provider, context,
                 )
             };
-        match &mut self.execution {
+        let output = match &mut self.execution {
             NemotronHExecution::Resident(runtime) => runtime
                 .forward_with_unit_executor_and_context_hook(
                     input,
@@ -1307,7 +1309,8 @@ impl NemotronHModel {
                 ))
             }
         }
-        .map_err(|error| Error::Parallel(error.to_string()))
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(output)
     }
 
     /// Executes a replicated neutral pass with activation intervention and
@@ -1389,7 +1392,7 @@ impl NemotronHModel {
                 )?;
                 eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)
             };
-        match &mut self.execution {
+        let output = match &mut self.execution {
             NemotronHExecution::Resident(runtime) => {
                 runtime.forward_with_unit_executor(input, cache, stream, hook)
             }
@@ -1403,8 +1406,10 @@ impl NemotronHModel {
                 ))
             }
         }
-        .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::Parallel(error.to_string()))
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_runtime::observe_and_intervene(observer, "model.logits", &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Into::into)
     }
 
     /// Runs the neutral decoder while delegating routed experts to an
@@ -1657,6 +1662,37 @@ impl NemotronHModel {
         }
         .map(crate::MlxTensor::into_array)
         .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        tokens: &Array,
+        cache: &mut MlxHybridState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        let input = eredu_architectures::nemotron_h::EmbeddedInput::target(
+            crate::composition::tensor_ref(tokens),
+            None,
+        );
+        let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+        let output =
+            match &mut self.execution {
+                NemotronHExecution::TensorParallelResident(runtime) => runtime
+                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
+                NemotronHExecution::TensorParallelLayerwise(runtime) => runtime
+                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
+                _ => {
+                    return Err(Error::Parallel(
+                        "Nemotron-H was not loaded for tensor parallelism".into(),
+                    ))
+                }
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Into::into)
     }
 }
 

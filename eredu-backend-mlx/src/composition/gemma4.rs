@@ -755,6 +755,134 @@ impl Gemma4Model {
             .map(|(logits, _, _)| logits)
     }
 
+    fn forward_with_observer(
+        &mut self,
+        input: ModelInput<'_, crate::MlxTensor>,
+        state: &mut MlxHybridState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        if state.layout() != &self.state_layout {
+            return Err(Error::ArchitectureModel(
+                "Gemma 4 cache layout mismatch".into(),
+            ));
+        }
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.text.clone();
+                    let mut provider =
+                        crate::composition::gemma4_expert::cached_provider(expert_cache, &args);
+                    let positions = input
+                        .parts
+                        .iter()
+                        .map(|part| match part {
+                            DecoderInputPart::Text(tokens)
+                            | DecoderInputPart::Image(tokens)
+                            | DecoderInputPart::Video(tokens)
+                            | DecoderInputPart::Audio(tokens) => tokens.dim(1),
+                            DecoderInputPart::Projected { tokens, .. } => tokens.dim(1),
+                        })
+                        .sum::<i32>();
+                    let pass = if positions > 1 {
+                        eredu_runtime::ExpertPass::Prefill
+                    } else {
+                        eredu_runtime::ExpertPass::Decode
+                    };
+                    match &mut self.execution {
+                        Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
+                            input,
+                            state,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
+                        ),
+                        Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
+                            input,
+                            state,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
+                        ),
+                        Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
+                            return Err(Error::Parallel(
+                                "Gemma 4 tensor-parallel observation requires its communicator"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::Resident(runtime) => {
+                        runtime.forward_with_observer(input, state, stream, &mut neutral)
+                    }
+                    Execution::Bounded(runtime) => {
+                        runtime.forward_with_observer(input, state, stream, &mut neutral)
+                    }
+                    Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
+                        return Err(Error::Parallel(
+                            "Gemma 4 tensor-parallel observation requires its communicator".into(),
+                        ));
+                    }
+                },
+            }
+        };
+        self.expert_cache = expert_cache;
+        let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        observer.observe("model.logits", logits.as_array())?;
+        Ok(logits)
+    }
+
+    pub fn forward_tokens_with_observer(
+        &mut self,
+        tokens: &crate::MlxTensor,
+        state: &mut MlxHybridState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let parts = [DecoderInputPart::Text(tokens)];
+        self.forward_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            stream,
+            observer,
+        )
+    }
+
+    pub fn prefill_with_observer(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        state: &mut MlxHybridState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        input::validate(typed)?;
+        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let parts = prepared.decoder_parts();
+        self.forward_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            stream,
+            observer,
+        )
+    }
+
     pub fn embed_mtp_token(
         &mut self,
         token: u32,
@@ -903,6 +1031,151 @@ impl Gemma4Model {
             mask: None,
         };
         self.forward_parallel_input(input, state, group, stream)
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        tokens: &crate::MlxTensor,
+        state: &mut MlxHybridState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let parts = [DecoderInputPart::Text(tokens)];
+        self.forward_parallel_input_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            group,
+            stream,
+            observer,
+        )
+    }
+
+    pub fn prefill_tensor_parallel_with_observer(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        state: &mut MlxHybridState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        input::validate(typed)?;
+        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let parts = prepared.decoder_parts();
+        self.forward_parallel_input_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            group,
+            stream,
+            observer,
+        )
+    }
+
+    fn forward_parallel_input_with_observer(
+        &mut self,
+        input: ModelInput<'_, crate::MlxTensor>,
+        state: &mut MlxHybridState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        if state.layout() != &self.state_layout {
+            return Err(Error::Parallel(
+                "Gemma 4 tensor-parallel cache layout mismatch".into(),
+            ));
+        }
+        let positions = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens)
+                | DecoderInputPart::Image(tokens)
+                | DecoderInputPart::Video(tokens)
+                | DecoderInputPart::Audio(tokens) => tokens.dim(1),
+                DecoderInputPart::Projected { tokens, .. } => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let pass = if positions > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            let output = match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.text.clone();
+                    let mut provider =
+                        crate::composition::gemma4_expert::cached_provider(expert_cache, &args);
+                    match &mut self.execution {
+                        Execution::ParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                state,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        Execution::ParallelBounded(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                state,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "Gemma 4 was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::ParallelResident(runtime) => runtime.forward_parallel_with_observer(
+                        input,
+                        state,
+                        group,
+                        stream,
+                        &mut neutral,
+                    ),
+                    Execution::ParallelBounded(runtime) => runtime.forward_parallel_with_observer(
+                        input,
+                        state,
+                        group,
+                        stream,
+                        &mut neutral,
+                    ),
+                    _ => {
+                        return Err(Error::Parallel(
+                            "Gemma 4 was not loaded for tensor parallelism".into(),
+                        ))
+                    }
+                },
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+                .map_err(Error::from)
+        };
+        self.expert_cache = expert_cache;
+        result
     }
 
     fn forward_parallel_input(

@@ -25,6 +25,14 @@ host-transfer or instrumentation overhead. The same records can be consumed by
 evaluation, telemetry exporters, debuggers, model inspectors, and observability
 tools.
 
+Activation inspection is a property of the exact prepared session, not of a
+device. Required inspection support is admitted from header-only architecture,
+residency, and topology information before tensor payload materialization.
+Instrumented execution wraps the production resident, bounded, expert-provider,
+and distributed paths rather than running a second family implementation.
+Distributed observations are rank-local; only the output-owning rank exposes
+`model.logits`.
+
 Architecture execution already emits named activation and routed-expert points
 through `eredu-runtime::ActivationObserver`. A backend inspection adapter binds
 those native tensor handles to the portable selected observations after the

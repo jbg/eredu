@@ -3,7 +3,7 @@ use eredu::api::{
     LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
 };
 use eredu::{
-    ArtifactFormat, BackendCapabilities, BackendDescriptor, DeviceDescriptor,
+    ArtifactFormat, BackendDescriptor, DeviceCapabilities, DeviceDescriptor,
     GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport, ObservationSet,
     ObservationValue, TextGenerationConfig, TokenFilter, TokenOutput,
 };
@@ -58,7 +58,7 @@ impl BackendProvider for MockBackend {
         }
     }
 
-    fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
+    fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
         Ok(Vec::new())
     }
 
@@ -66,7 +66,10 @@ impl BackendProvider for MockBackend {
         &self,
         _: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        Ok(PreparedModel::new(()))
+        Ok(PreparedModel::new(
+            (),
+            eredu::SessionCapabilities::default(),
+        ))
     }
 
     fn create_session(&self, _: PreparedModel<Self::Model>) -> Result<Self::Session, Self::Error> {
@@ -79,6 +82,10 @@ impl BackendSession<MockBackend> for MockSession {
     type DecodeInput = u32;
     type Output = u32;
     type Completion = Complete;
+
+    fn capabilities(&self) -> eredu::SessionCapabilities {
+        eredu::SessionCapabilities::default()
+    }
 
     fn prefill(
         &mut self,

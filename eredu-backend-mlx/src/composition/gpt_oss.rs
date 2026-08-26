@@ -1157,6 +1157,99 @@ impl GptOssModel {
         Ok(output.into_array())
     }
 
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        self.validate_cache(cache)?;
+        let args = self.args.clone();
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let input = eredu_architectures::gpt_oss::LayeredInput {
+                tokens: crate::composition::tensor_ref(inputs),
+                mask: None,
+            };
+            let pass = if inputs.dim(1) > 1 {
+                eredu_runtime::ExpertPass::Prefill
+            } else {
+                eredu_runtime::ExpertPass::Decode
+            };
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            let output = match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let mut provider = expert::cached_provider(expert_cache, &args);
+                    match &mut self.execution {
+                        GptOssExecution::TensorParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        GptOssExecution::TensorParallelLayerwise(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "GPT-OSS was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+                None => {
+                    let mut provider = eredu_runtime::ResidentExpertProvider;
+                    match &mut self.execution {
+                        GptOssExecution::TensorParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        GptOssExecution::TensorParallelLayerwise(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                cache,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "GPT-OSS was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+                .map(crate::MlxTensor::into_array)
+                .map_err(Error::from)
+        };
+        self.expert_cache = expert_cache;
+        result
+    }
+
     /// Runs tensor-parallel attention and provider-owned routed experts.
     pub fn forward_tensor_expert_provider<P>(
         &mut self,
@@ -1283,7 +1376,7 @@ impl GptOssModel {
         };
         let output = match &mut self.execution {
             GptOssExecution::Resident(runtime) => runtime
-                .forward_with_routed_observer(
+                .forward_with_provider_and_observer(
                     eredu_architectures::decoder::LayeredInput {
                         tokens: crate::composition::tensor_ref(inputs),
                         mask: crate::composition::tensor_opt(mask),
@@ -1296,7 +1389,7 @@ impl GptOssModel {
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             GptOssExecution::Layerwise(runtime) => runtime
-                .forward_with_routed_observer(
+                .forward_with_provider_and_observer(
                     eredu_architectures::decoder::LayeredInput {
                         tokens: crate::composition::tensor_ref(inputs),
                         mask: crate::composition::tensor_opt(mask),

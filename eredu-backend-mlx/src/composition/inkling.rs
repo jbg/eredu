@@ -789,6 +789,155 @@ impl InklingModel {
             .map(|output| output.logits)
     }
 
+    fn forward_with_observer(
+        &mut self,
+        input: ModelInput<'_, crate::MlxTensor>,
+        state: &mut InklingState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        if state.target.layout() != &self.state_layout {
+            return Err(Error::ArchitectureModel(
+                "Inkling cache layout mismatch".into(),
+            ));
+        }
+        let positions = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens)
+                | DecoderInputPart::Image(tokens)
+                | DecoderInputPart::Audio(tokens) => tokens.dim(1),
+                DecoderInputPart::Projected { tokens, .. } => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let pass = if positions > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.clone();
+                    let mut provider =
+                        crate::composition::inkling_expert::cached_provider(expert_cache, &args);
+                    match &mut self.execution {
+                        Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
+                            input,
+                            &mut state.target,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
+                        ),
+                        Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
+                            input,
+                            &mut state.target,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
+                        ),
+                        Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
+                            return Err(Error::Parallel(
+                                "Inkling tensor-parallel observation requires its communicator"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::Resident(runtime) => runtime.forward_with_observer(
+                        input,
+                        &mut state.target,
+                        stream,
+                        &mut neutral,
+                    ),
+                    Execution::Bounded(runtime) => runtime.forward_with_observer(
+                        input,
+                        &mut state.target,
+                        stream,
+                        &mut neutral,
+                    ),
+                    Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
+                        return Err(Error::Parallel(
+                            "Inkling tensor-parallel observation requires its communicator".into(),
+                        ));
+                    }
+                },
+            }
+        };
+        self.expert_cache = expert_cache;
+        let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        observer.observe("model.logits", logits.as_array())?;
+        Ok(logits)
+    }
+
+    pub fn forward_tokens_with_observer(
+        &mut self,
+        tokens: &crate::MlxTensor,
+        state: &mut InklingState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let parts = [DecoderInputPart::Text(tokens)];
+        self.forward_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision_patches: None,
+                audio: None,
+            },
+            state,
+            stream,
+            observer,
+        )
+    }
+
+    pub fn forward_input_with_observer(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        state: &mut InklingState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
+        let parts = prepared
+            .tokens
+            .iter()
+            .zip(prepared.kinds.iter().copied())
+            .zip(&prepared.projected)
+            .map(|((value, kind), projected)| match projected {
+                Some(embeddings) => DecoderInputPart::Projected {
+                    tokens: value,
+                    embeddings,
+                },
+                None => match kind {
+                    InputModality::Text => DecoderInputPart::Text(value),
+                    InputModality::Image => DecoderInputPart::Image(value),
+                    InputModality::Audio => DecoderInputPart::Audio(value),
+                    InputModality::Video => unreachable!(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
+            code_ids,
+            valid_frames: code_ids.dim(1),
+        });
+        self.forward_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision_patches: prepared.images.as_ref(),
+                audio,
+            },
+            state,
+            stream,
+            observer,
+        )
+    }
+
     pub fn forward_tokens(
         &mut self,
         tokens: &crate::MlxTensor,
@@ -896,6 +1045,166 @@ impl InklingModel {
             }
         };
         Ok(logits)
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        tokens: &crate::MlxTensor,
+        state: &mut InklingState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let parts = [DecoderInputPart::Text(tokens)];
+        self.forward_parallel_input_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision_patches: None,
+                audio: None,
+            },
+            state,
+            group,
+            stream,
+            observer,
+        )
+    }
+
+    pub fn prefill_tensor_parallel_with_observer(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        state: &mut InklingState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
+        let parts = prepared
+            .tokens
+            .iter()
+            .zip(prepared.kinds.iter().copied())
+            .zip(&prepared.projected)
+            .map(|((value, kind), projected)| match projected {
+                Some(embeddings) => DecoderInputPart::Projected {
+                    tokens: value,
+                    embeddings,
+                },
+                None => match kind {
+                    InputModality::Text => DecoderInputPart::Text(value),
+                    InputModality::Image => DecoderInputPart::Image(value),
+                    InputModality::Audio => DecoderInputPart::Audio(value),
+                    InputModality::Video => unreachable!(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
+            code_ids,
+            valid_frames: code_ids.dim(1),
+        });
+        self.forward_parallel_input_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision_patches: prepared.images.as_ref(),
+                audio,
+            },
+            state,
+            group,
+            stream,
+            observer,
+        )
+    }
+
+    fn forward_parallel_input_with_observer(
+        &mut self,
+        input: ModelInput<'_, crate::MlxTensor>,
+        state: &mut InklingState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        if state.target.layout() != &self.state_layout {
+            return Err(Error::Parallel(
+                "Inkling tensor-parallel cache layout mismatch".into(),
+            ));
+        }
+        let positions = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens)
+                | DecoderInputPart::Image(tokens)
+                | DecoderInputPart::Audio(tokens) => tokens.dim(1),
+                DecoderInputPart::Projected { tokens, .. } => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let pass = if positions > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            let output = match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.clone();
+                    let mut provider =
+                        crate::composition::inkling_expert::cached_provider(expert_cache, &args);
+                    match &mut self.execution {
+                        Execution::ParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                &mut state.target,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        Execution::ParallelBounded(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                &mut state.target,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "Inkling was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::ParallelResident(runtime) => runtime.forward_parallel_with_observer(
+                        input,
+                        &mut state.target,
+                        group,
+                        stream,
+                        &mut neutral,
+                    ),
+                    Execution::ParallelBounded(runtime) => runtime.forward_parallel_with_observer(
+                        input,
+                        &mut state.target,
+                        group,
+                        stream,
+                        &mut neutral,
+                    ),
+                    _ => {
+                        return Err(Error::Parallel(
+                            "Inkling was not loaded for tensor parallelism".into(),
+                        ))
+                    }
+                },
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+                .map_err(Error::from)
+        };
+        self.expert_cache = expert_cache;
+        result
     }
 
     fn forward_input_with_capture(

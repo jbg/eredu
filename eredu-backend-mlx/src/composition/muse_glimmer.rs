@@ -927,6 +927,141 @@ impl MuseGlimmerModel {
             .map(|output| output.logits)
     }
 
+    fn forward_with_observer(
+        &mut self,
+        input: ModelInput<'_, crate::MlxTensor>,
+        state: &mut MlxKeyValueState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        if state.layout() != &self.state_layout {
+            return Err(Error::ArchitectureModel(
+                "Muse-Glimmer cache layout mismatch".into(),
+            ));
+        }
+        let positions = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens) | DecoderInputPart::Media(tokens) => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let pass = if positions > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.clone();
+                    let mut provider = crate::composition::muse_glimmer_expert::cached_provider(
+                        expert_cache,
+                        &args,
+                    );
+                    match &mut self.execution {
+                        Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
+                            input,
+                            state,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
+                        ),
+                        Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
+                            input,
+                            state,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
+                        ),
+                        Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
+                            return Err(Error::Parallel(
+                                "Muse-Glimmer tensor-parallel observation requires its communicator".into(),
+                            ));
+                        }
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::Resident(runtime) => {
+                        runtime.forward_with_observer(input, state, stream, &mut neutral)
+                    }
+                    Execution::Bounded(runtime) => {
+                        runtime.forward_with_observer(input, state, stream, &mut neutral)
+                    }
+                    Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
+                        return Err(Error::Parallel(
+                            "Muse-Glimmer tensor-parallel observation requires its communicator"
+                                .into(),
+                        ));
+                    }
+                },
+            }
+        };
+        self.expert_cache = expert_cache;
+        let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        observer.observe("model.logits", logits.as_array())?;
+        Ok(logits)
+    }
+
+    pub fn forward_tokens_with_observer(
+        &mut self,
+        tokens: &crate::MlxTensor,
+        state: &mut MlxKeyValueState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let parts = [DecoderInputPart::Text(tokens)];
+        self.forward_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: None,
+                mask: None,
+            },
+            state,
+            stream,
+            observer,
+        )
+    }
+
+    pub fn forward_input_with_observer(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        state: &mut MlxKeyValueState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let prepared = prepare_muse_input(&self.args, typed, stream)?;
+        let parts = prepared
+            .tokens
+            .iter()
+            .zip(&prepared.media)
+            .map(|(value, media)| {
+                if *media {
+                    DecoderInputPart::Media(value)
+                } else {
+                    DecoderInputPart::Text(value)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.forward_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: prepared.pixels.as_ref().map(|pixels| VisionInput {
+                    pixels,
+                    grid: &prepared.grid,
+                }),
+                mask: None,
+            },
+            state,
+            stream,
+            observer,
+        )
+    }
+
     pub fn embed_dflash_tokens(
         &mut self,
         tokens: &crate::MlxTensor,
@@ -1049,6 +1184,158 @@ impl MuseGlimmerModel {
             mask: None,
         };
         self.forward_parallel_input(input, state, group, stream)
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        tokens: &crate::MlxTensor,
+        state: &mut MlxKeyValueState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let parts = [DecoderInputPart::Text(tokens)];
+        self.forward_parallel_input_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: None,
+                mask: None,
+            },
+            state,
+            group,
+            stream,
+            observer,
+        )
+    }
+
+    pub fn prefill_tensor_parallel_with_observer(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        state: &mut MlxKeyValueState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        let prepared = prepare_muse_input(&self.args, typed, stream)?;
+        let parts = prepared
+            .tokens
+            .iter()
+            .zip(&prepared.media)
+            .map(|(value, media)| {
+                if *media {
+                    DecoderInputPart::Media(value)
+                } else {
+                    DecoderInputPart::Text(value)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.forward_parallel_input_with_observer(
+            ModelInput {
+                parts: &parts,
+                vision: prepared.pixels.as_ref().map(|pixels| VisionInput {
+                    pixels,
+                    grid: &prepared.grid,
+                }),
+                mask: None,
+            },
+            state,
+            group,
+            stream,
+            observer,
+        )
+    }
+
+    fn forward_parallel_input_with_observer(
+        &mut self,
+        input: ModelInput<'_, crate::MlxTensor>,
+        state: &mut MlxKeyValueState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
+    ) -> Result<crate::MlxTensor, Error> {
+        if state.layout() != &self.state_layout {
+            return Err(Error::Parallel(
+                "Muse-Glimmer tensor-parallel cache layout mismatch".into(),
+            ));
+        }
+        let positions = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens) | DecoderInputPart::Media(tokens) => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let pass = if positions > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.take();
+        let result = {
+            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+            let output = match expert_cache.as_ref() {
+                Some(expert_cache) => {
+                    let args = self.args.clone();
+                    let mut provider = crate::composition::muse_glimmer_expert::cached_provider(
+                        expert_cache,
+                        &args,
+                    );
+                    match &mut self.execution {
+                        Execution::ParallelResident(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                state,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        Execution::ParallelBounded(runtime) => runtime
+                            .forward_parallel_with_provider_and_observer(
+                                input,
+                                state,
+                                pass,
+                                &mut provider,
+                                group,
+                                stream,
+                                &mut neutral,
+                            ),
+                        _ => {
+                            return Err(Error::Parallel(
+                                "Muse-Glimmer was not loaded for tensor parallelism".into(),
+                            ))
+                        }
+                    }
+                }
+                None => match &mut self.execution {
+                    Execution::ParallelResident(runtime) => runtime.forward_parallel_with_observer(
+                        input,
+                        state,
+                        group,
+                        stream,
+                        &mut neutral,
+                    ),
+                    Execution::ParallelBounded(runtime) => runtime.forward_parallel_with_observer(
+                        input,
+                        state,
+                        group,
+                        stream,
+                        &mut neutral,
+                    ),
+                    _ => {
+                        return Err(Error::Parallel(
+                            "Muse-Glimmer was not loaded for tensor parallelism".into(),
+                        ))
+                    }
+                },
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+                .map_err(Error::from)
+        };
+        self.expert_cache = expert_cache;
+        result
     }
 
     fn forward_parallel_input(

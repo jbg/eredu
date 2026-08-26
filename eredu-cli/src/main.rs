@@ -2709,10 +2709,11 @@ fn cli_execution_plan(
             eviction_policy: args.expert_cache_eviction.into(),
         }),
         drafting,
-        required_capabilities: eredu::BackendCapabilities {
+        required_device_capabilities: eredu::DeviceCapabilities {
             exact_completion: true,
-            ..eredu::BackendCapabilities::default()
+            ..eredu::DeviceCapabilities::default()
         },
+        required_session_capabilities: eredu::SessionCapabilities::default(),
     })
 }
 

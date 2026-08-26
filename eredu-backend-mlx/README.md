@@ -74,3 +74,12 @@ Completed text-session outputs are materialized through the neutral
 the architecture's named activation points to `InspectableBackendSession`.
 Parity policy and numerical comparison remain in `eredu-evaluation`; the
 backend owns only execution and host observation.
+
+MLX device enumeration reports only device capabilities. Exact session
+capabilities are derived from the inspected architecture, residency policy,
+and topology before checkpoint payloads are materialized, then verified again
+on the realized session. Activation inspection executes the production forward
+path for resident, bounded, tensor-parallel, and pipeline/Cartesian sessions.
+Distributed results are rank-local: ranks report the global activation paths
+they own, and only the final/logits-owning rank reports `model.logits`; no
+implicit host gather is performed.

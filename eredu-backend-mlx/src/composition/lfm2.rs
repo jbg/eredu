@@ -1033,8 +1033,8 @@ impl Lfm2Model {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        match &mut self.execution {
-            Lfm2Execution::Resident(runtime) => runtime.forward_with_routed_observer(
+        let output = match &mut self.execution {
+            Lfm2Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
                 eredu_architectures::decoder::LayeredInput {
                     tokens: crate::composition::tensor_ref(tokens),
                     mask: crate::composition::tensor_opt(mask),
@@ -1045,7 +1045,7 @@ impl Lfm2Model {
                 stream,
                 observer,
             ),
-            Lfm2Execution::Layerwise(runtime) => runtime.forward_with_routed_observer(
+            Lfm2Execution::Layerwise(runtime) => runtime.forward_with_provider_and_observer(
                 eredu_architectures::decoder::LayeredInput {
                     tokens: crate::composition::tensor_ref(tokens),
                     mask: crate::composition::tensor_opt(mask),
@@ -1062,8 +1062,10 @@ impl Lfm2Model {
                 ))
             }
         }
-        .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::Parallel(error.to_string()))
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_runtime::observe_and_intervene(observer, "model.logits", &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Into::into)
     }
 
     /// Runs the neutral decoder while delegating routed experts to an
@@ -1199,6 +1201,37 @@ impl Lfm2Model {
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(output.into_array())
+    }
+
+    pub fn forward_tensor_parallel_with_observer(
+        &mut self,
+        tokens: &Array,
+        cache: &mut MlxHybridState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        let input = eredu_architectures::decoder::LayeredInput {
+            tokens: crate::composition::tensor_ref(tokens),
+            mask: None,
+        };
+        let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
+        let output =
+            match &mut self.execution {
+                Lfm2Execution::TensorParallelResident(runtime) => runtime
+                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
+                Lfm2Execution::TensorParallelLayerwise(runtime) => runtime
+                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
+                _ => {
+                    return Err(Error::Parallel(
+                        "LFM2 was not loaded for tensor parallelism".into(),
+                    ))
+                }
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Into::into)
     }
 }
 

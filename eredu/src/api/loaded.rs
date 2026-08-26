@@ -58,6 +58,9 @@ pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     /// Backend materialization or session creation failed.
     #[error("selected backend failed to load the model: {0}")]
     Backend(#[source] E),
+    /// The inspected model/session route lacks a required capability.
+    #[error(transparent)]
+    SessionCapability(#[from] eredu_core::SessionCapabilityError),
     /// Portable tokenizer, chat-template, or generation sidecar loading failed.
     #[error(transparent)]
     Metadata(#[from] TextMetadataError),
@@ -649,6 +652,9 @@ where
             }
             Err(eredu_core::ModelLoadError::Backend(error)) => {
                 return Err(LoadedModelLoadError::Backend(error));
+            }
+            Err(eredu_core::ModelLoadError::SessionCapability(error)) => {
+                return Err(LoadedModelLoadError::SessionCapability(error));
             }
         };
         let runtime = eredu_core::ModelRuntime::from_prepared(backend, prepared)

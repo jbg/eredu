@@ -1133,18 +1133,7 @@ impl QwenHybridModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
-        let hook = |path: &str, input: &crate::MlxTensor, output: &crate::MlxTensor| {
-            observer
-                .observe(&format!("{path}.input"), input.as_array())
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            observer
-                .observe(&format!("{path}.output"), output.as_array())
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            observer
-                .intervene(&format!("{path}.output"), output.as_array())
-                .map(|replacement| replacement.map(crate::MlxTensor::from_array))
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-        };
+        let mut neutral_observer = crate::composition::NeutralActivationObserver::new(observer);
         if self.parsed.vision.is_some() {
             let parts = [InputPart::Text(crate::composition::tensor_ref(tokens))];
             let input = ConditionalInput::Target {
@@ -1152,30 +1141,34 @@ impl QwenHybridModel {
                 pixels: None,
                 mask: None,
             };
-            return match &mut self.execution {
+            let output = match &mut self.execution {
                 Execution::ConditionalResident(runtime) => {
-                    runtime.forward_with_unit_hook(input, cache, stream, hook)
+                    runtime.forward_with_observer(input, cache, stream, &mut neutral_observer)
                 }
                 Execution::ConditionalBounded(runtime) => {
-                    runtime.forward_with_unit_hook(input, cache, stream, hook)
+                    runtime.forward_with_observer(input, cache, stream, &mut neutral_observer)
                 }
                 _ => unreachable!("conditional policy uses conditional execution"),
             }
             .map(crate::MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()));
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            observer.observe("model.logits", &output)?;
+            return Ok(output);
         }
         let input = EmbeddedInput::target(crate::composition::tensor_ref(tokens), None);
-        match &mut self.execution {
+        let output = match &mut self.execution {
             Execution::Resident(runtime) => {
-                runtime.forward_with_unit_hook(input, cache, stream, hook)
+                runtime.forward_with_observer(input, cache, stream, &mut neutral_observer)
             }
             Execution::Bounded(runtime) => {
-                runtime.forward_with_unit_hook(input, cache, stream, hook)
+                runtime.forward_with_observer(input, cache, stream, &mut neutral_observer)
             }
             Execution::ConditionalResident(_) | Execution::ConditionalBounded(_) => unreachable!(),
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        observer.observe("model.logits", &output)?;
+        Ok(output)
     }
 
     pub fn prefill_input_with_observer(
@@ -1290,28 +1283,29 @@ impl QwenHybridModel {
         let tokens =
             crate::MlxTensor::from_array(safemlx::ops::concatenate_axis(&token_refs, 1, stream)?);
         if let Some(observer) = observer {
-            let hook = |path: &str, input: &crate::MlxTensor, output: &crate::MlxTensor| {
-                observer
-                    .observe(&format!("{path}.input"), input.as_array())
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-                observer
-                    .observe(&format!("{path}.output"), output.as_array())
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-                observer
-                    .intervene(&format!("{path}.output"), output.as_array())
-                    .map(|replacement| replacement.map(crate::MlxTensor::from_array))
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-            };
+            let mut neutral_observer =
+                crate::composition::NeutralActivationObserver::new(observer);
             let logits = match &mut self.execution {
                 Execution::ConditionalResident(runtime) => {
-                    runtime.forward_with_unit_hook(model_input, cache, stream, hook)
+                    runtime.forward_with_observer(
+                        model_input,
+                        cache,
+                        stream,
+                        &mut neutral_observer,
+                    )
                 }
                 Execution::ConditionalBounded(runtime) => {
-                    runtime.forward_with_unit_hook(model_input, cache, stream, hook)
+                    runtime.forward_with_observer(
+                        model_input,
+                        cache,
+                        stream,
+                        &mut neutral_observer,
+                    )
                 }
                 _ => return Err(Exception::custom("Qwen3.5 model is not conditional")),
             }
             .map_err(|error| Exception::custom(error.to_string()))?;
+            observer.observe("model.logits", logits.as_array())?;
             return Ok(PreparedConditionalOutput {
                 logits,
                 hidden: None,
