@@ -134,7 +134,7 @@ publishes a manifest plus bounded SafeTensors shards atomically. Loading first
 validates the entire manifest and owned layer layout, then attaches compatible
 shards as read-only disk blocks and promotes them only on demand.
 
-Schema version 5 records:
+Schema version 8 records:
 
 - model family, effective type, checkpoint identity, and an architecture
   fingerprint;
@@ -145,7 +145,7 @@ Schema version 5 records:
 - block ranges, shapes, dtypes, and payload digests; and
 - exact prefix token identity plus the caller's processed-prefix fingerprint.
 
-Load accepts schema version 5 only. Model family, architecture fingerprint,
+Load accepts schema version 8 only. Model family, architecture fingerprint,
 prefix identity, layer ownership, topology, state representation, tensor
 geometry, and payload digests must match before arrays become live. Multimodal
 applications should include media bytes and processor settings in the
