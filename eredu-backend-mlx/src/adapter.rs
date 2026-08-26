@@ -7,9 +7,7 @@ pub use crate::backend::runtime::checkpoint::quantization::{
 pub use crate::backend::runtime::residency::expert_cache::{
     ExpertCacheReport, ExpertPassStatistics, ExpertTierStatistics,
 };
-pub use crate::backend::{
-    DeviceAssignment, MlxBackend, MlxModel, MlxModelConfig, MlxParallelContext, ModelLoadOptions,
-};
+pub use crate::backend::{MlxBackend, MlxModel, MlxModelConfig, ModelLoadOptions};
 pub use crate::composition::mlx::automatic::{
     create_realtime_backend, discover_hardware, expert_cache_telemetry, mtp_telemetry,
     residency_telemetry, MlxBackendFactory, MlxRealtimeAdapter,

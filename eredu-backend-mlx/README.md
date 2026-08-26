@@ -34,11 +34,14 @@ Reusable low-level mechanics are rooted directly under
 Because this crate implements only MLX, there is no additional backend-name
 module below that root.
 
-The `native` module is a deliberate escape hatch for device, stream, allocator,
-random-state, low-level array, sampling, and platform setup needed by concrete
-MLX applications. Native sampling APIs that exchange raw arrays, streams, or
-random state are available only through this namespace. Backend-neutral APIs
-exchange `MlxTensor` instead of raw arrays.
+The `native` module is a deliberate escape hatch for device assignment,
+device-bound parallel topology, streams, allocator state, random state,
+low-level arrays, sampling, and platform setup needed by concrete MLX tooling.
+`DeviceAssignment` and `MlxParallelContext` are available from `native` and the
+reusable `backend` hierarchy, but not from the flat application-facing root.
+Native sampling APIs that exchange raw arrays, streams, or random state are
+available only through this namespace. Backend-neutral APIs exchange
+`MlxTensor` instead of raw arrays.
 
 ## Features
 

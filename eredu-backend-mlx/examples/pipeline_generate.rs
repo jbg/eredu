@@ -3,9 +3,9 @@
 use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
-    DeviceType, Stream,
+    DeviceAssignment, DeviceType, MlxParallelContext, Stream,
 };
-use eredu_backend_mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions};
+use eredu_backend_mlx::ModelLoadOptions;
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 

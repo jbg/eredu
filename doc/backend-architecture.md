@@ -94,7 +94,10 @@ Sampling functions and sampler traits whose signatures expose raw MLX arrays,
 streams, or random state are exported only through that native namespace, not
 through the flat application-facing adapter. Native realtime backend types,
 inputs, outputs, sessions, completions, and prompt helpers follow the same
-rule. The backend's flat `MlxRealtimeAdapter` has no native-handle accessors and
+rule. Device assignments and device-bound MLX parallel contexts are likewise
+available through `eredu-backend-mlx::native` and the reusable `backend`
+hierarchy, not the flat adapter root. The backend's flat `MlxRealtimeAdapter`
+has no native-handle accessors and
 exists so the facade can own a concrete implementation; facade-owned wrappers
 expose only portable frames, scheduling identities, limits, lifecycle state,
 and telemetry. Concrete causal sessions, exact completion types, speculative

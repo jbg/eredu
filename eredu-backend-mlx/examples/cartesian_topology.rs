@@ -4,9 +4,8 @@
 
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
-    DeviceType,
+    DeviceAssignment, DeviceType, MlxParallelContext,
 };
-use eredu_backend_mlx::{DeviceAssignment, MlxParallelContext};
 
 fn parse(index: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(std::env::args()

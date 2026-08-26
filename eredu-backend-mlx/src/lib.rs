@@ -52,6 +52,16 @@ pub use adapter::*;
 /// use eredu_backend_mlx::MlxSessionCompletion;
 /// ```
 ///
+/// Device-bound topology also stays behind the backend-author boundary:
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::DeviceAssignment;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxParallelContext;
+/// ```
+///
 /// Raw completion submission is internal even though the opaque completion
 /// type also participates in the public reusable backend implementation:
 ///
@@ -66,6 +76,7 @@ pub mod native {
     pub use crate::backend::nn::generation::sample;
     pub use crate::backend::runtime::generation::sampler::Sampler;
     pub use crate::backend::MlxCompletion;
+    pub use crate::backend::{DeviceAssignment, MlxParallelContext};
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
         MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
