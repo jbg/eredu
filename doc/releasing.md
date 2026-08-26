@@ -1,5 +1,12 @@
 # Releasing workspace crates
 
+There is deliberately no workspace-wide package version. Each publishable
+crate declares and advances its own version, so a crate can release without
+forcing unrelated workspace crates to release. When a crate version changes,
+update the corresponding requirement in `[workspace.dependencies]` and any
+dependent crates that need the new release; Cargo includes those requirements
+when it packages path dependencies.
+
 Every publishable crate must pass the same archive validation before a release:
 
 ```bash
