@@ -24,7 +24,7 @@ use crate::{
     transforms::eval,
     Array, Dtype, Stream,
 };
-use eredu_gguf::{Endian as GgufEndian, GgmlType};
+use eredu_gguf::{Endian as GgufEndian, GgmlType, IQuantCodebook};
 
 const Q4_K_BLOCK_VALUES: i32 = 256;
 const Q4_K_BLOCK_BYTES: i32 = 144;
@@ -3248,12 +3248,14 @@ fn iq_metal_array<T: std::fmt::LowerHex>(
     output.push_str("};\n");
 }
 
-fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String {
-    use eredu_gguf::iquant_tables::{
-        IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
-        KVALUES_IQ4NL,
-    };
+fn iq_codebook(format: NativeQuantizationFormat) -> IQuantCodebook {
+    format
+        .ggml_type()
+        .and_then(IQuantCodebook::for_type)
+        .expect("IQ native format must have a canonical GGUF codebook")
+}
 
+fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String {
     let mut header = format!(
         "constant bool BIG_ENDIAN = {};\n",
         if big_endian { "true" } else { "false" }
@@ -3299,8 +3301,19 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ2XXS => {
-            iq_metal_array(&mut header, "uchar", "IQ_SIGNS", &KSIGNS_IQ2XS);
-            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ2XXS_GRID);
+            let codebook = iq_codebook(format);
+            iq_metal_array(
+                &mut header,
+                "uchar",
+                "IQ_SIGNS",
+                codebook.signs().expect("IQ2_XXS sign codebook"),
+            );
+            iq_metal_array(
+                &mut header,
+                "ulong",
+                "IQ_GRID",
+                codebook.u64_values().expect("IQ2_XXS grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
@@ -3313,8 +3326,19 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ2XS => {
-            iq_metal_array(&mut header, "uchar", "IQ_SIGNS", &KSIGNS_IQ2XS);
-            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ2XS_GRID);
+            let codebook = iq_codebook(format);
+            iq_metal_array(
+                &mut header,
+                "uchar",
+                "IQ_SIGNS",
+                codebook.signs().expect("IQ2_XS sign codebook"),
+            );
+            iq_metal_array(
+                &mut header,
+                "ulong",
+                "IQ_GRID",
+                codebook.u64_values().expect("IQ2_XS grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
@@ -3325,7 +3349,14 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ2S => {
-            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ2S_GRID);
+            iq_metal_array(
+                &mut header,
+                "ulong",
+                "IQ_GRID",
+                iq_codebook(format)
+                    .u64_values()
+                    .expect("IQ2_S grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
@@ -3337,8 +3368,19 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ3XXS => {
-            iq_metal_array(&mut header, "uchar", "IQ_SIGNS", &KSIGNS_IQ2XS);
-            iq_metal_array(&mut header, "uint", "IQ_GRID", &IQ3XXS_GRID);
+            let codebook = iq_codebook(format);
+            iq_metal_array(
+                &mut header,
+                "uchar",
+                "IQ_SIGNS",
+                codebook.signs().expect("IQ3_XXS sign codebook"),
+            );
+            iq_metal_array(
+                &mut header,
+                "uint",
+                "IQ_GRID",
+                codebook.u32_values().expect("IQ3_XXS grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
@@ -3349,7 +3391,14 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ3S => {
-            iq_metal_array(&mut header, "uint", "IQ_GRID", &IQ3S_GRID);
+            iq_metal_array(
+                &mut header,
+                "uint",
+                "IQ_GRID",
+                iq_codebook(format)
+                    .u32_values()
+                    .expect("IQ3_S grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint pair=x/64u;uint side=(x%64u)/32u;",
@@ -3363,7 +3412,14 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ1S => {
-            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ1S_GRID);
+            iq_metal_array(
+                &mut header,
+                "ulong",
+                "IQ_GRID",
+                iq_codebook(format)
+                    .u64_values()
+                    .expect("IQ1_S grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
@@ -3374,7 +3430,14 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ1M => {
-            iq_metal_array(&mut header, "ulong", "IQ_GRID", &IQ1S_GRID);
+            iq_metal_array(
+                &mut header,
+                "ulong",
+                "IQ_GRID",
+                iq_codebook(format)
+                    .u64_values()
+                    .expect("IQ1_M grid codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint l=(x%32u)/8u;uint j=x%8u;",
@@ -3390,7 +3453,14 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ4NL => {
-            iq_metal_array(&mut header, "uchar", "IQ4", &KVALUES_IQ4NL);
+            iq_metal_array(
+                &mut header,
+                "uchar",
+                "IQ4",
+                iq_codebook(format)
+                    .i8_values()
+                    .expect("IQ4_NL value codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/32u;uint x=c%32u;uint p=r+b*18u;uint q=uint(w[p+2u+(x%16u)]);",
@@ -3398,7 +3468,14 @@ fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String
             ));
         }
         NativeQuantizationFormat::GgufIQ4XS => {
-            iq_metal_array(&mut header, "uchar", "IQ4", &KVALUES_IQ4NL);
+            iq_metal_array(
+                &mut header,
+                "uchar",
+                "IQ4",
+                iq_codebook(format)
+                    .i8_values()
+                    .expect("IQ4_XS value codebook"),
+            );
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
                 "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint z=x%32u;uint p=r+b*136u;",

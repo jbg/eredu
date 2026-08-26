@@ -4,7 +4,7 @@
 utilities for Rust language-model runtimes. It supports structured messages,
 system roles, tool metadata, Jinja chat templates, GGUF tokenizer metadata,
 Kimi-style tiktoken vocabularies, and the tokenizer backends used by
-[`eredu`](../eredu/).
+[`eredu`](https://github.com/jbg/eredu/tree/main/eredu).
 
 Most applications should depend on `eredu`, which exposes these
 capabilities through its higher-level loading and generation APIs. Use this

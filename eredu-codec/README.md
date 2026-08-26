@@ -34,7 +34,7 @@ Concrete backend integrations own executable Mimi benchmarks and PersonaPlex
 evaluation tools. The MLX integration and runnable examples live in
 `eredu-backend-mlx` behind its `codec` feature; `eredu-codec` itself has no MLX
 feature or accelerator dependency. See the [PersonaPlex quantization evaluation
-guide](../doc/personaplex-evaluation.md).
+guide](https://github.com/jbg/eredu/blob/main/doc/personaplex-evaluation.md).
 
 ## License
 

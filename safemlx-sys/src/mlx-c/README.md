@@ -5,8 +5,8 @@ MLX array framework to C and provides the native boundary for Eredu's MLX
 implementation.
 
 Eredu builds this copy through `safemlx-sys`; Rust applications should not
-configure it separately. Use [`eredu`](../../../eredu/) for the model runtime,
-[`safemlx`](../../../safemlx/) for direct MLX operations, or
+configure it separately. Use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu) for the model runtime,
+[`safemlx`](https://github.com/jbg/eredu/tree/main/safemlx) for direct MLX operations, or
 [`safemlx-sys`](../../) when binding-level access is required.
 
 The source retains its component license, code of conduct, contribution guide,

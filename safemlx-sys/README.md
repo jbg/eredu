@@ -2,7 +2,7 @@
 
 `safemlx-sys` provides low-level Rust bindings and native build integration for
 the MLX C API used by Eredu's `safemlx` implementation layer. Applications
-should use [`eredu`](../eredu/) rather than depending on this crate directly.
+should use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu) rather than depending on this crate directly.
 
 The crate vendors MLX C, the compatible MLX source archive, and its common CPU
 and Metal build dependencies, and exposes checked-in bindings. CMake verifies
@@ -22,7 +22,7 @@ packed-quantization support required by Eredu's MLX backend.
 
 Native compilers, CMake, platform libraries, CUDA/cuDNN setup, Apple deployment
 targets, and `mlx.metallib` bundling are covered in [Platform
-setup](../doc/platforms.md).
+setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md).
 
 ## Features
 

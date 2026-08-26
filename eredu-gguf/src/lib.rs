@@ -9,12 +9,12 @@
 //! conversion so runtimes can execute them without affine expansion.
 
 mod catalog;
+mod codebook;
 mod convert;
 mod error;
 mod format;
 mod iquant;
-#[doc(hidden)]
-pub mod iquant_tables;
+mod iquant_tables;
 mod reader;
 mod writer;
 
@@ -23,6 +23,7 @@ pub use catalog::{
     LogicalDtype, LogicalTensorLayout, RawCheckpointTensor, TensorMaterializer,
     TranslatedTensorLayout,
 };
+pub use codebook::IQuantCodebook;
 pub use convert::{
     convert_affine, AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor,
     MxFp4Tensor,

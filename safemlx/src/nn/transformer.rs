@@ -15,7 +15,7 @@ use safemlx_internal_macros::{generate_builder, Buildable, Builder};
 use safemlx_macros::{ModuleParameters, Quantizable};
 
 use crate::{
-    error::{MultiHeadAttentionBuildError, TransformerBulidError},
+    error::{MultiHeadAttentionBuildError, TransformerBuildError},
     nn::{Dropout, DropoutBuilder, LayerNorm, Linear, LinearBuilder, Relu},
 };
 
@@ -275,7 +275,7 @@ where
 #[builder(
     root = crate,
     build_with = build_transformer_encoder_layer,
-    err = TransformerBulidError,
+    err = TransformerBuildError,
 )]
 struct TransformerEncoderLayerBuilder {
     pub dimensions: i32,
@@ -316,7 +316,7 @@ impl TransformerEncoderLayerBuilder {
 
 fn build_transformer_encoder_layer(
     builder: TransformerEncoderLayerBuilder,
-) -> Result<TransformerEncoderLayer, TransformerBulidError> {
+) -> Result<TransformerEncoderLayer, TransformerBuildError> {
     let dimensions = builder.dimensions;
     let num_heads = builder.num_heads;
     let mlp_dimensions = builder.mlp_dimensions.unwrap_or(4 * dimensions);
@@ -483,7 +483,7 @@ where
 #[builder(
     root = crate,
     build_with = build_transformer_encoder,
-    err = TransformerBulidError,
+    err = TransformerBuildError,
 )]
 struct TransformerEncoderBuilder {
     pub layer_count: usize,
@@ -525,7 +525,7 @@ impl Clone for TransformerEncoderBuilder {
 
 fn build_transformer_encoder(
     builder: TransformerEncoderBuilder,
-) -> Result<TransformerEncoder, TransformerBulidError> {
+) -> Result<TransformerEncoder, TransformerBuildError> {
     let layer_count = builder.layer_count;
     let dimensions = builder.dimensions;
     let num_heads = builder.num_heads;
@@ -599,7 +599,7 @@ where
 #[builder(
     root = crate,
     build_with = build_transformer_decoder_layer,
-    err = TransformerBulidError,
+    err = TransformerBuildError,
 )]
 struct TransformerDecoderLayerBuilder {
     pub dimensions: i32,
@@ -635,7 +635,7 @@ impl Clone for TransformerDecoderLayerBuilder {
 
 fn build_transformer_decoder_layer(
     builder: TransformerDecoderLayerBuilder,
-) -> Result<TransformerDecoderLayer, TransformerBulidError> {
+) -> Result<TransformerDecoderLayer, TransformerBuildError> {
     let dimensions = builder.dimensions;
     let num_heads = builder.num_heads;
     let mlp_dimensions = builder.ml_dimensions.unwrap_or(4 * dimensions);
@@ -842,7 +842,7 @@ where
 #[builder(
     root = crate,
     build_with = build_transformer_decoder,
-    err = TransformerBulidError,
+    err = TransformerBuildError,
 )]
 struct TransformerDecoderBuilder {
     pub layer_count: usize,
@@ -884,7 +884,7 @@ impl Clone for TransformerDecoderBuilder {
 
 fn build_transformer_decoder(
     builder: TransformerDecoderBuilder,
-) -> Result<TransformerDecoder, TransformerBulidError> {
+) -> Result<TransformerDecoder, TransformerBuildError> {
     let layer_count = builder.layer_count;
     let dimensions = builder.dimensions;
     let num_heads = builder.num_heads;
@@ -962,7 +962,7 @@ where
 #[builder(
     root = crate,
     build_with = build_transformer,
-    err = TransformerBulidError,
+    err = TransformerBuildError,
 )]
 pub struct TransformerBuilder {
     /// number of expected features in the encoder/decoder
@@ -1019,7 +1019,7 @@ impl Clone for TransformerBuilder {
     }
 }
 
-fn build_transformer(builder: TransformerBuilder) -> Result<Transformer, TransformerBulidError> {
+fn build_transformer(builder: TransformerBuilder) -> Result<Transformer, TransformerBuildError> {
     let dimensions = builder.dimensions;
     let num_heads = builder.num_heads;
     let encoder_layer_count = builder.encoder_layer_count;

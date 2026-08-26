@@ -93,7 +93,7 @@ Supported mixture-of-experts models can use an independent expert cache. These
 policies accept explicit host and device budgets and trade transfer or I/O work
 for a smaller resident parameter set.
 
-See [Model loading, quantization, and memory](../doc/model-loading.md) for
+See [Model loading, quantization, and memory](https://github.com/jbg/eredu/blob/main/doc/model-loading.md) for
 the policy contracts and accounting model.
 
 ## Speculative generation
@@ -110,7 +110,7 @@ eredu --model /path/to/target \
 
 Speculative generation requires a recognized executable chat protocol and is
 not available with `--raw`. See [Speculative decoding and
-MTP](../doc/speculative-decoding.md) for compatibility and placement rules.
+MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md) for compatibility and placement rules.
 
 ## Native tool calls
 
@@ -125,5 +125,5 @@ eredu --model /path/to/model \
 ```
 
 Visible text and canonical tool events are written to standard output. See
-[Native tool calling](../doc/tool-calling.md) for schemas and event
+[Native tool calling](https://github.com/jbg/eredu/blob/main/doc/tool-calling.md) for schemas and event
 semantics.

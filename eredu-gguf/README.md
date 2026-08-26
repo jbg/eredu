@@ -39,7 +39,9 @@ and Q6_K.
 The canonical IQ encodings IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S,
 IQ2_S, IQ4_XS, and IQ1_M are retained as explicit packed values because their
 nonlinear codebooks cannot be represented as affine weights, scales, and
-biases. MXFP4-MoE type 39 is likewise represented explicitly.
+biases. Backends that execute those packed blocks directly obtain the canonical
+typed values through `IQuantCodebook`; the generated table modules are private
+implementation details. MXFP4-MoE type 39 is likewise represented explicitly.
 
 Names such as `UD-Q2_K_XL` describe file-level mixed-precision recipes, not new
 tensor encodings. A recipe is compatible when every tensor in the file uses a

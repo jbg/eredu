@@ -349,7 +349,7 @@ pub enum MultiHeadAttentionBuildError {
 
 /// Error with building a transformer
 #[derive(Debug, PartialEq, Error)]
-pub enum TransformerBulidError {
+pub enum TransformerBuildError {
     /// Dropout probability must be in the range [0, 1)
     #[error("Dropout probability must be in the range [0, 1)")]
     InvalidProbability,
@@ -363,7 +363,7 @@ pub enum TransformerBulidError {
     Exception(#[from] Exception),
 }
 
-impl From<DropoutBuildError> for TransformerBulidError {
+impl From<DropoutBuildError> for TransformerBuildError {
     fn from(e: DropoutBuildError) -> Self {
         match e {
             DropoutBuildError::InvalidProbability => Self::InvalidProbability,
@@ -371,7 +371,7 @@ impl From<DropoutBuildError> for TransformerBulidError {
     }
 }
 
-impl From<MultiHeadAttentionBuildError> for TransformerBulidError {
+impl From<MultiHeadAttentionBuildError> for TransformerBuildError {
     fn from(e: MultiHeadAttentionBuildError) -> Self {
         match e {
             MultiHeadAttentionBuildError::InvalidNumHeads(n) => Self::InvalidNumHeads(n),

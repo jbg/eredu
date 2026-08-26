@@ -19,6 +19,10 @@ eredu-core        eredu-checkpoint        eredu-nn
 ```
 
 The neutral crates contain no native accelerator dependency under any feature.
+`eredu-gguf` is likewise a backend-neutral storage dependency. Backends that
+execute nonlinear GGUF IQ blocks consume their canonical values through the
+typed `IQuantCodebook` API; generated table modules remain private and cannot
+serve as an undocumented cross-crate integration surface.
 The `eredu` facade is also portable when built with
 `default-features = false`. A private `_mlx` feature selects the optional
 `eredu-backend-mlx` adapter. The public `mlx` bundle adds the backend crate's

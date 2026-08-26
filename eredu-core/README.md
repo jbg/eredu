@@ -4,7 +4,7 @@
 language-model runtimes. It has no dependency on MLX, `safemlx`, Metal, CUDA, or
 another accelerator runtime.
 
-Most applications should use [`eredu`](../eredu/). Use this crate
+Most applications should use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Use this crate
 directly when implementing an execution backend or reusing its portable
 planning and scheduling components.
 
@@ -39,7 +39,7 @@ Capabilities fail closed. Optional facilities such as multimodal preparation,
 speculative decoding, realtime execution, transfers, and collectives are
 separate contracts attached to the selected backend or session.
 
-See the [backend architecture guide](../doc/backend-architecture.md) for the
+See the [backend architecture guide](https://github.com/jbg/eredu/blob/main/doc/backend-architecture.md) for the
 ownership rules and backend implementation checklist.
 
 ## License

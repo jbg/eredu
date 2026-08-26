@@ -5,7 +5,7 @@ It provides arrays and operations, lazy graph evaluation, transforms,
 neural-network modules, optimizers, quantization helpers, checkpoint I/O,
 streams, and distributed collectives.
 
-Most applications should use [`eredu`](../eredu/). Depend on this crate
+Most applications should use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Depend on this crate
 directly only when building MLX-specific operations or backend components.
 
 ## Features
@@ -48,17 +48,17 @@ evaluation, graph transforms, and I/O.
   operations, and variable-count all-to-all.
 
 See the workspace documentation for the [completion-event
-contract](../doc/completion-events.md), [asynchronous device
-timing](../doc/device-timing.md), [host-transfer
-buffers](../doc/host-transfer-buffers.md), and [platform
-setup](../doc/platforms.md).
+contract](https://github.com/jbg/eredu/blob/main/doc/completion-events.md), [asynchronous device
+timing](https://github.com/jbg/eredu/blob/main/doc/device-timing.md), [host-transfer
+buffers](https://github.com/jbg/eredu/blob/main/doc/host-transfer-buffers.md), and [platform
+setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md).
 
 ## Platforms
 
 Eredu's MLX implementation supports Apple silicon on macOS and selected Apple
 device targets, x86-64 Linux with CPU or CUDA, and native x86-64 Windows with
 CPU or CUDA. Backend prerequisites and application-bundling requirements are
-documented in [Platform setup](../doc/platforms.md).
+documented in [Platform setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md).
 
 The minimum supported Rust version is 1.89.
 
