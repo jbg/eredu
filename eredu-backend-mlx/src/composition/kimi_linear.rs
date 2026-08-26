@@ -232,25 +232,23 @@ impl KimiLinearBindings {
 
     pub fn expert_parallel_assignment(
         &self,
-        architecture: &NeutralArchitecture,
-        topology: crate::backend::MlxParallelContext,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
     ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 && !self.external_experts {
-            return Ok(None);
+        match realization {
+            None if self.external_experts => Err(Error::Parallel(
+                "Kimi Linear has no architecture expert realization".into(),
+            )),
+            None => Ok(None),
+            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
+            Some(plan) => {
+                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                    plan,
+                )
+                .map(Some)
+            }
         }
-        let args = architecture.args();
-        if !args.has_sparse_moe_layers() {
-            return Err(Error::Parallel(
-                "Kimi Linear PP+EP requires a sparse-MoE checkpoint".into(),
-            ));
-        }
-        Ok(Some(
-            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
-                args.num_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )?,
-        ))
     }
 
     #[allow(clippy::too_many_arguments)]

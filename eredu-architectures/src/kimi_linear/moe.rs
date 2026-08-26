@@ -181,6 +181,55 @@ fn expert_bank_spec_with_width(
     })
 }
 
+/// Derives complete expert ownership and rank-local bank geometry from Kimi Linear.
+pub fn expert_realization_plan<B>(
+    architecture: &super::LayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Option<crate::ExpertRealizationPlan<GatedProductExpertBankSpec>>, Error>
+where
+    B: RoutedNeuralBackend + eredu_nn::BlockwiseAttentionBackend,
+{
+    let args = architecture.args();
+    if !args.has_sparse_moe_layers() {
+        return Ok(None);
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size,
+            topology.expert_parallel_rank,
+            false,
+        )
+        .map_err(Error::backend)?
+        .len(),
+    )
+    .map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let mut unit_specs = std::collections::BTreeMap::new();
+    for layer in 0..usize::try_from(args.num_hidden_layers).map_err(Error::backend)? {
+        if args.layer_policy(layer).map(|policy| policy.feed_forward)
+            != Some(FeedForwardPolicy::SparseMoe)
+        {
+            continue;
+        }
+        let width = architecture
+            .parallel_geometry()
+            .and_then(|geometry| geometry.block(layer))
+            .map_or(args.moe_intermediate_size, |geometry| {
+                geometry.routed_intermediate
+            });
+        let mut spec = expert_bank_spec_with_width(args, layer, width)?;
+        spec.expert_count = local_experts;
+        spec.validate()?;
+        unit_specs.insert((owner_group.clone(), layer), spec);
+    }
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
+        .map_err(Error::backend)
+}
+
 /// Per-layer dense-prefix or sparse Kimi feed-forward policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]

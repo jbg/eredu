@@ -2580,25 +2580,17 @@ fn construct_gpt_oss_partition_unit(
     architecture: &eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>,
     bindings: &crate::composition::gpt_oss::GptOssPipelineBindings,
     index: usize,
+    realization: Option<
+        &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+    >,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
 ) -> Result<MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxNeuralBackend>>, Error> {
-    let local_intermediate_size = architecture
-        .shared_parallel_geometry()
-        .and_then(|geometry| geometry.block(index).map(|args| args.intermediate_size))
-        .unwrap_or(architecture.args().intermediate_size);
     let mut unit = architecture
         .construct_unit(index, stream)
         .map(MlxModule::new)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    bindings.prepare_unit_expert_residency(
-        architecture,
-        index,
-        &mut unit,
-        local_intermediate_size,
-        assignment,
-        stream,
-    )?;
+    bindings.prepare_unit_expert_residency(index, &mut unit, realization, assignment, stream)?;
     Ok(unit)
 }
 
@@ -15256,9 +15248,16 @@ fn load_neutral_qwen_vl_pipeline(
         decoder_group,
         "Qwen3-VL decoder",
     )?;
+    let seed_expert_realization = eredu_architectures::qwen::vl::expert_realization_plan(
+        &binding_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     topology.preflight(
         Some(target_units),
-        external_experts.then_some(source_args.text.num_experts as usize),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
@@ -15286,7 +15285,13 @@ fn load_neutral_qwen_vl_pipeline(
         placement,
         model_kind,
     );
-    let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
+    let expert_realization = eredu_architectures::qwen::vl::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_assignment =
+        binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     if let Some(assignment) = expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -16843,12 +16848,6 @@ fn load_gpt_oss_pipeline(
     } else {
         neutral_gpt_oss::GptOssPipelineBindings::new()
     };
-    topology.preflight(
-        Some(source_args.attention_schedule.len()),
-        expert_cache_options
-            .is_some()
-            .then_some(source_args.num_local_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -16886,6 +16885,17 @@ fn load_gpt_oss_pipeline(
         .architecture
         .take()
         .expect("GPT-OSS neutral architecture");
+    let seed_expert_realization = eredu_architectures::gpt_oss::expert_realization_plan(
+        &seed_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    topology.preflight(
+        Some(source_args.attention_schedule.len()),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
+    )?;
     let binding_parameter_description = seed_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -16917,8 +16927,13 @@ fn load_gpt_oss_pipeline(
         placement,
         model_kind,
     );
-    let expert_assignment = binding_adapter
-        .expert_parallel_assignment(stage.architecture.as_ref().unwrap(), topology)?;
+    stage.expert_realization = eredu_architectures::gpt_oss::expert_realization_plan(
+        stage.architecture.as_ref().unwrap(),
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_assignment =
+        binding_adapter.expert_parallel_assignment(stage.expert_realization.as_ref())?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -16969,6 +16984,7 @@ fn load_gpt_oss_pipeline(
                 &stage.architecture,
                 &stage.bindings,
                 global_layer,
+                stage.expert_realization.as_ref(),
                 stage.expert_assignment.as_ref(),
                 stream,
             )
@@ -17079,6 +17095,7 @@ fn load_gpt_oss_pipeline(
     let materialized_shards = checkpoint_diagnostics.payload_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
+        let streamed_realization = stage.expert_realization.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_architecture = &stage.architecture;
         let streamed_bindings = &stage.bindings;
@@ -17101,6 +17118,7 @@ fn load_gpt_oss_pipeline(
                     streamed_architecture,
                     streamed_bindings,
                     global_layer,
+                    streamed_realization.as_ref(),
                     streamed_assignment.as_ref(),
                     stream,
                 )
@@ -17394,11 +17412,16 @@ fn load_lfm2_pipeline(
         global_decoder_group,
         "LFM2 decoder",
     )?;
+    let seed_expert_realization = eredu_architectures::lfm2::expert_realization_plan(
+        &global_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     topology.preflight(
         Some(target_units),
-        expert_cache_options
-            .is_some()
-            .then_some(source_args.num_experts as usize),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
     let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
@@ -17453,8 +17476,13 @@ fn load_lfm2_pipeline(
     let mut stage =
         Lfm2PipelinePartition::new(architecture, partition, expert_cache_options.is_some())?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
+    let expert_realization = eredu_architectures::lfm2::expert_realization_plan(
+        &stage.architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_assignment =
-        binding_adapter.expert_parallel_assignment(&stage.architecture, topology)?;
+        binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -18975,9 +19003,16 @@ fn load_neutral_qwen_hybrid_pipeline(
         .group_range(decoder_group)
         .ok_or_else(|| Error::Parallel("Qwen hybrid parameter plan has no target group".into()))?
         .len();
+    let seed_expert_realization = eredu_architectures::qwen::hybrid::expert_realization_plan(
+        &binding_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     topology.preflight(
         Some(target_units),
-        external_experts.then_some(source_args.num_experts as usize),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
@@ -19006,7 +19041,13 @@ fn load_neutral_qwen_hybrid_pipeline(
         placement,
         model_kind,
     );
-    let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
+    let expert_realization = eredu_architectures::qwen::hybrid::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_assignment =
+        binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     if let Some(assignment) = expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -19421,9 +19462,17 @@ fn load_neutral_qwen_conditional_pipeline(
             Error::Parallel("conditional Qwen parameter plan has no target group".into())
         })?
         .len();
+    let seed_expert_realization =
+        eredu_architectures::qwen::hybrid::conditional_expert_realization_plan(
+            &binding_architecture,
+            topology.rank_topology(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     topology.preflight(
         Some(target_units),
-        external_experts.then_some(source.text.num_experts as usize),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
@@ -19450,7 +19499,14 @@ fn load_neutral_qwen_conditional_pipeline(
         placement,
         model_kind,
     );
-    let expert_assignment = binding_adapter.expert_parallel_assignment(&architecture, topology)?;
+    let expert_realization =
+        eredu_architectures::qwen::hybrid::conditional_expert_realization_plan(
+            &architecture,
+            topology.rank_topology(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_assignment =
+        binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     if let Some(assignment) = expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -19910,11 +19966,16 @@ fn load_kimi_linear_pipeline(
         global_decoder_group,
         "Kimi Linear decoder",
     )?;
+    let seed_expert_realization = eredu_architectures::kimi_linear::expert_realization_plan(
+        &global_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     topology.preflight(
         Some(target_units),
-        expert_cache_options
-            .is_some()
-            .then_some(source_args.num_experts as usize),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
     let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
@@ -19970,8 +20031,13 @@ fn load_kimi_linear_pipeline(
     let mut stage =
         KimiLinearPipelinePartition::new(architecture, partition, expert_cache_options.is_some())?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
+    let expert_realization = eredu_architectures::kimi_linear::expert_realization_plan(
+        &stage.architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_assignment =
-        binding_adapter.expert_parallel_assignment(&stage.architecture, topology)?;
+        binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());

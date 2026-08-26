@@ -210,6 +210,20 @@ fn expert_bank_spec_at(
     })
 }
 
+/// Returns the canonical expert bank at rank-local cardinality and width.
+pub(crate) fn localized_expert_bank_spec(
+    config: &HybridConfig,
+    layer: usize,
+    expert_count: i32,
+    intermediate_dimensions: i32,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let mut spec = expert_bank_spec(config, layer)?;
+    spec.expert_count = expert_count;
+    spec.intermediate_dimensions = intermediate_dimensions;
+    spec.validate()?;
+    Ok(spec)
+}
+
 /// Dense or routed/shared-expert feed-forward policy selected by configuration.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]

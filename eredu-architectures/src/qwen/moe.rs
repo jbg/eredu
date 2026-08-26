@@ -119,7 +119,7 @@ pub fn expert_bank_spec(
 ///
 /// Parameter identities, physical formats, and execution policy remain identical
 /// to the global bank; only placement-resolved cardinality and width are localized.
-fn localized_expert_bank_spec(
+pub(crate) fn localized_expert_bank_spec(
     args: &ModelArgs,
     layer: usize,
     expert_count: i32,

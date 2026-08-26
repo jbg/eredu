@@ -451,6 +451,13 @@ running another assignment policy. Backend composition must not pass family
 fields or a separately derived tensor-parallel width into expert-bank
 construction; the bank specification retained by this same plan is the only
 construction input.
+Qwen, Qwen3-VL, Qwen hybrid (including conditional vision and embedded MTP),
+GPT-OSS, LFM2, and Kimi Linear expose family-specific realization entry points
+over their constructed neutral architectures. These entry points select routed
+units, preserve canonical parameter formats, and apply planner-derived local
+widths before MLX sees the plan. MLX family adapters accept the plan rather
+than the family configuration or parallel topology when creating their native
+dispatch assignment.
 Distributed expert callbacks also
 carry whether the requested result is globally complete or a rank-local
 tensor-parallel contribution, so EP recombination preserves the reducible and

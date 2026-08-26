@@ -427,26 +427,24 @@ impl QwenConditionalPipelineBindings {
 
     pub fn expert_parallel_assignment(
         &self,
-        architecture: &ConditionalArchitecture,
-        topology: crate::backend::MlxParallelContext,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
     ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
     {
-        if topology.expert_parallel_size == 1 && !self.external_experts {
-            return Ok(None);
+        match realization {
+            None if self.external_experts => Err(Error::Parallel(
+                "conditional Qwen3.5 has no architecture expert realization".into(),
+            )),
+            None => Ok(None),
+            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
+            Some(plan) => {
+                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                    plan,
+                )
+                .map(Some)
+            }
         }
-        let parsed = architecture.parsed();
-        if !parsed.text.is_moe() {
-            return Err(Error::Parallel(
-                "conditional Qwen3.5 PP+EP requires a routed text checkpoint".into(),
-            ));
-        }
-        Ok(Some(
-            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
-                parsed.text.num_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )?,
-        ))
     }
 }
 
@@ -533,26 +531,24 @@ impl QwenHybridPipelineBindings {
 
     pub fn expert_parallel_assignment(
         &self,
-        architecture: &Architecture,
-        topology: crate::backend::MlxParallelContext,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
     ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
     {
-        if topology.expert_parallel_size == 1 && !self.external_experts {
-            return Ok(None);
+        match realization {
+            None if self.external_experts => Err(Error::Parallel(
+                "Qwen hybrid has no architecture expert realization".into(),
+            )),
+            None => Ok(None),
+            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
+            Some(plan) => {
+                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                    plan,
+                )
+                .map(Some)
+            }
         }
-        let config = architecture.config();
-        if !config.is_moe() {
-            return Err(Error::Parallel(
-                "Qwen hybrid PP+EP requires a sparse-MoE checkpoint".into(),
-            ));
-        }
-        Ok(Some(
-            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
-                config.num_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )?,
-        ))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -163,6 +163,50 @@ fn expert_bank_spec_with_width(
     })
 }
 
+/// Derives complete expert ownership and rank-local bank geometry from LFM2.
+pub fn expert_realization_plan<B: RoutedNeuralBackend>(
+    architecture: &super::LayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Option<crate::ExpertRealizationPlan<GatedProductExpertBankSpec>>, Error> {
+    let args = architecture.args();
+    if !args.has_sparse_moe_layers() {
+        return Ok(None);
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size,
+            topology.expert_parallel_rank,
+            false,
+        )
+        .map_err(Error::backend)?
+        .len(),
+    )
+    .map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let mut unit_specs = std::collections::BTreeMap::new();
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+            continue;
+        }
+        let width = architecture
+            .parallel_geometry()
+            .and_then(|geometry| geometry.block(layer))
+            .map_or(args.moe_intermediate_size, |geometry| {
+                geometry.expert_intermediate
+            });
+        let mut spec = expert_bank_spec_with_width(args, layer, width)?;
+        spec.expert_count = local_experts;
+        spec.validate()?;
+        unit_specs.insert((owner_group.clone(), layer), spec);
+    }
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
+        .map_err(Error::backend)
+}
+
 /// Per-layer dense or routed feed-forward policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]

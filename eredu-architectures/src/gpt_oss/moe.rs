@@ -220,7 +220,7 @@ pub fn expert_bank_spec(
 ///
 /// Parameter identities, native MXFP4 formats, biases, and gating policy remain
 /// identical to the global bank; only placement-resolved geometry is localized.
-pub fn localized_expert_bank_spec(
+pub(crate) fn localized_expert_bank_spec(
     args: &ModelArgs,
     layer: usize,
     expert_count: i32,
@@ -231,6 +231,43 @@ pub fn localized_expert_bank_spec(
     spec.intermediate_dimensions = intermediate_dimensions;
     spec.validate()?;
     Ok(spec)
+}
+
+/// Derives complete expert ownership and rank-local bank geometry from GPT-OSS.
+pub fn expert_realization_plan<B: RoutedNeuralBackend>(
+    architecture: &super::LayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Option<crate::ExpertRealizationPlan<GatedProductExpertBankSpec>>, Error> {
+    let args = architecture.args();
+    let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size,
+            topology.expert_parallel_rank,
+            false,
+        )
+        .map_err(Error::backend)?
+        .len(),
+    )
+    .map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let mut unit_specs = std::collections::BTreeMap::new();
+    for layer in 0..layers {
+        let width = architecture
+            .parallel_geometry()
+            .and_then(|geometry| geometry.block(layer))
+            .map_or(args.intermediate_size, |local| local.intermediate_size);
+        unit_specs.insert(
+            (owner_group.clone(), layer),
+            localized_expert_bank_spec(args, layer, local_experts, width)?,
+        );
+    }
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
+        .map_err(Error::backend)
 }
 
 #[cfg(test)]

@@ -37,3 +37,95 @@ pub use parallel::{
     conditional_local_geometry, local_block_config, local_geometry, local_unit_config,
     unit_parallel_parameter_groups, ConditionalLocalGeometry, LocalGeometry,
 };
+
+/// Derives complete expert ownership and local bank geometry for Qwen hybrid text/MTP units.
+pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+    architecture: &LayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<
+    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+    eredu_nn::Error,
+> {
+    let geometry = architecture.shared_parallel_geometry();
+    realization_plan(architecture.config(), geometry.as_deref(), topology)
+}
+
+/// Derives complete expert ownership and local bank geometry for conditional Qwen hybrid units.
+pub fn conditional_expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+    architecture: &ConditionalLayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<
+    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+    eredu_nn::Error,
+> {
+    let geometry = architecture.shared_parallel_geometry();
+    realization_plan(
+        &architecture.parsed().text,
+        geometry.as_deref().map(ConditionalLocalGeometry::text),
+        topology,
+    )
+}
+
+fn realization_plan(
+    config: &HybridConfig,
+    geometry: Option<&LocalGeometry>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<
+    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+    eredu_nn::Error,
+> {
+    if !config.is_moe() {
+        return Ok(None);
+    }
+    let global_experts = usize::try_from(config.num_experts).map_err(eredu_nn::Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size,
+            topology.expert_parallel_rank,
+            false,
+        )
+        .map_err(eredu_nn::Error::backend)?
+        .len(),
+    )
+    .map_err(eredu_nn::Error::backend)?;
+    let targets = usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let predictions =
+        usize::try_from(config.mtp_num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let target_group =
+        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
+    let mut unit_specs = std::collections::BTreeMap::new();
+    for layer in 0..targets {
+        let local = geometry
+            .and_then(|geometry| geometry.target(layer))
+            .unwrap_or(config);
+        unit_specs.insert(
+            (target_group.clone(), layer),
+            block::localized_expert_bank_spec(
+                config,
+                layer,
+                local_experts,
+                local.moe_intermediate_size,
+            )?,
+        );
+    }
+    for depth in 0..predictions {
+        let local = geometry
+            .and_then(|geometry| geometry.prediction(depth))
+            .unwrap_or(config);
+        let group = eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
+            .map_err(eredu_nn::Error::backend)?;
+        unit_specs.insert(
+            (group, 0),
+            block::localized_expert_bank_spec(
+                config,
+                targets + depth,
+                local_experts,
+                local.moe_intermediate_size,
+            )?,
+        );
+    }
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
+        .map_err(eredu_nn::Error::backend)
+}

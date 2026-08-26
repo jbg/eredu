@@ -655,52 +655,56 @@ impl GptOssPipelineBindings {
 
     pub fn expert_parallel_assignment(
         &self,
-        architecture: &NeutralArchitecture,
-        topology: crate::backend::MlxParallelContext,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
     ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 && !self.external_experts {
-            return Ok(None);
+        match realization {
+            None if self.external_experts => Err(Error::Parallel(
+                "GPT-OSS has no architecture expert realization".into(),
+            )),
+            None => Ok(None),
+            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
+            Some(plan) => {
+                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                    plan,
+                )
+                .map(Some)
+            }
         }
-        Ok(Some(
-            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
-                architecture.args().num_local_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )?,
-        ))
     }
 
     /// Applies rank-local expert residency to an architecture-constructed unit.
     pub fn prepare_unit_expert_residency(
         &self,
-        architecture: &NeutralArchitecture,
         index: usize,
         layer: &mut MlxModule<NeutralBlock>,
-        local_intermediate_size: i32,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
         assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let args = architecture.args();
         if let Some(assignment) = assignment {
-            let count = i32::try_from(assignment.local_global_expert_ids().len())
-                .map_err(|_| Error::Parallel("local GPT-OSS expert count exceeds i32".into()))?;
-            if count <= 0 {
+            let plan = realization.ok_or_else(|| {
+                Error::Parallel("GPT-OSS expert assignment has no architecture realization".into())
+            })?;
+            if assignment.local_global_expert_ids() != plan.local_global_expert_ids() {
                 return Err(Error::Parallel(
-                    "GPT-OSS expert-parallel rank owns no experts".into(),
+                    "GPT-OSS native assignment disagrees with architecture realization".into(),
                 ));
             }
+            let spec = plan
+                .unit_spec("text_decoder", index)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "GPT-OSS architecture realization has no expert bank for unit {index}"
+                    ))
+                })?;
             layer.inner.mlp.experts =
-                <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(
-                    eredu_architectures::gpt_oss::localized_expert_bank_spec(
-                        args,
-                        index,
-                        count,
-                        local_intermediate_size,
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                    stream,
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))?;
+                <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(spec, stream)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
         }
         Ok(())
     }

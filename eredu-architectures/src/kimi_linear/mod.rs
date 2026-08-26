@@ -27,7 +27,7 @@ pub use config::{
 };
 pub use kda::KimiDeltaAttention;
 pub use mla::KimiLatentAttention;
-pub use moe::{DenseSwiGlu, FeedForward, SparseMoe};
+pub use moe::{expert_realization_plan, DenseSwiGlu, FeedForward, SparseMoe};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
     static_parallel_parameter_groups, LocalGeometry,
