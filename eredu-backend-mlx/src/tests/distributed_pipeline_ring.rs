@@ -489,7 +489,7 @@ impl FixtureFamily {
     fn descriptor_names(self) -> (&'static str, &'static str) {
         match self {
             Self::Llama => ("llama", "llama"),
-            Self::Mistral => ("mistral", "mistral"),
+            Self::Mistral => ("llama", "mistral"),
             Self::DeepSeek | Self::DeepSeekGguf => ("deepseek_v3", "deepseek_v3"),
             Self::DeepSeekV4 => ("deepseek_v4", "deepseek_v4"),
             Self::Gemma => ("gemma4", "gemma4"),
@@ -905,20 +905,7 @@ fn pipeline_ring_worker() {
             } else {
                 outer_model_type
             };
-        let model_family = match outer_model_type {
-            "gemma4" | "gemma4_unified" => "gemma4",
-            "gpt_oss" => "gpt_oss",
-            "llama" => "llama",
-            "mistral" => "mistral",
-            "muse_glimmer" => "muse_glimmer",
-            "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
-            "qwen3_next" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
-                "qwen_hybrid"
-            }
-            "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" => "qwen3_vl",
-            "deepseek_v3" | "deepseek_v4" => "deepseek",
-            _ => "inkling",
-        };
+        let model_family = family.descriptor_names().0;
         let layer_layout = session.prompt_cache_layer_layout().unwrap();
         let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
         let state_segments = session.prompt_cache_state_segments().unwrap();
