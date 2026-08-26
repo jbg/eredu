@@ -1154,10 +1154,20 @@ impl Lfm2Model {
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         match &self.execution {
             Lfm2Execution::Resident(_) => Ok(()),
-            Lfm2Execution::Layerwise(runtime) => runtime.policy().clear_device_group("target"),
+            Lfm2Execution::Layerwise(runtime) => {
+                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
+                    runtime.architecture(),
+                    eredu_runtime::ArchitectureGroupKind::Decoder,
+                )?;
+                runtime.policy().clear_device_group(&group)
+            }
             Lfm2Execution::TensorParallelResident(_) => Ok(()),
             Lfm2Execution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().clear_device_group("target")
+                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
+                    runtime.architecture(),
+                    eredu_runtime::ArchitectureGroupKind::Decoder,
+                )?;
+                runtime.policy().clear_device_group(&group)
             }
         }
     }

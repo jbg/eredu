@@ -62,10 +62,11 @@ let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan
 let (mut model, drafting) = planned.into_parts();
 ```
 
-Native models, caches, streams, architecture modules, and reusable MLX
-infrastructure remain owned by `eredu-backend-mlx`. Application clients use
-the flat selected-local-backend adapter in `eredu::api`; backend implementers
-and backend-specific tooling import the implementation crate directly.
+Model-family architecture modules remain owned by `eredu-architectures`.
+Reusable MLX tensors, operators, caches, streams, and family composition live
+in `eredu-backend-mlx`. Application clients use the flat selected-local-backend
+adapter in `eredu::api`; backend implementers and backend-specific tooling
+import the implementation crate directly.
 
 Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` when the
 application wants portable plan-to-backend realization. These entry points

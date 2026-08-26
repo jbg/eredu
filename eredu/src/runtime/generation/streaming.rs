@@ -4,8 +4,6 @@
 //! machinery deliberately knows nothing about a model family: format profiles
 //! supply parsers and ordinary generation supplies committed tokenizer ids.
 
-#![allow(dead_code)]
-
 use eredu_core::generation::{
     FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
     TokenTerminalSignals,
@@ -90,6 +88,7 @@ impl<D> RawTokenDecoder<D>
 where
     D: TokenDecoderBackend,
 {
+    #[cfg(test)]
     pub(crate) fn new(backend: D, structural_token_ids: impl IntoIterator<Item = u32>) -> Self {
         Self {
             backend,
@@ -300,7 +299,9 @@ impl StopMatcher {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PatternKind {
     Trigger,
+    #[cfg(test)]
     Tag,
+    #[cfg(test)]
     Delimiter,
 }
 
@@ -487,6 +488,7 @@ impl JsonFragmentBuffer {
         &self.fragment
     }
 
+    #[cfg(test)]
     fn is_complete(&self) -> bool {
         self.complete
     }
@@ -514,6 +516,7 @@ impl Default for SemanticEventSink {
 }
 
 impl SemanticEventSink {
+    #[cfg(test)]
     pub(crate) fn events(&self) -> &[SemanticEvent] {
         &self.events
     }
@@ -725,6 +728,7 @@ where
         self.finished = true;
     }
 
+    #[cfg(test)]
     fn events(&self) -> &[SemanticEvent] {
         &self.sink.events
     }
@@ -746,6 +750,7 @@ impl fmt::Debug for ToolRuntimeParser {
 }
 
 impl ToolRuntimeParser {
+    #[cfg(test)]
     pub(crate) fn new<'a, 'b>(
         parser: Box<dyn ProtocolParser<Error = String>>,
         profile_stops: impl IntoIterator<Item = &'a str>,
@@ -770,6 +775,7 @@ impl ToolRuntimeParser {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn disable_tool_calls(&mut self) {
         self.stream.sink.tool_calls_enabled = false;
     }
@@ -801,6 +807,7 @@ impl ToolRuntimeParser {
     }
 
     /// Returns all semantic events emitted by this parser instance.
+    #[cfg(test)]
     pub(crate) fn events(&self) -> &[SemanticEvent] {
         self.stream.events()
     }
@@ -815,6 +822,7 @@ impl ToolRuntimeParser {
     }
 
     /// Returns whether this parser has reached a terminal condition.
+    #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
         self.stream.finished
     }
@@ -1001,29 +1009,6 @@ pub(crate) enum CommittedGenerationError<S, D> {
 /// Drives the production committed-token boundary without owning a second
 /// model loop. The source remains the architecture-dispatched iterator.
 #[allow(clippy::type_complexity)]
-pub(crate) fn drive_committed_generation<D, T>(
-    source: &mut T,
-    pipeline: &mut CommittedTokenPipeline<D>,
-    eos_token_ids: &[u32],
-    max_tokens: NonZeroUsize,
-    emit: &mut impl FnMut(SemanticEvent),
-) -> Result<(Vec<u32>, FinishReason), CommittedGenerationError<T::Error, D::Error>>
-where
-    D: TokenDecoderBackend,
-    T: CommittedTokenSource,
-{
-    drive_committed_generation_cancellable(
-        source,
-        pipeline,
-        eos_token_ids,
-        max_tokens,
-        &GenerationCancellationToken::new(),
-        emit,
-    )
-}
-
-/// Cancellation-aware committed-token driver used by high-level prepared chat.
-#[allow(clippy::type_complexity)]
 pub(crate) fn drive_committed_generation_cancellable<D, T>(
     source: &mut T,
     pipeline: &mut CommittedTokenPipeline<D>,
@@ -1092,11 +1077,11 @@ mod tests {
     use std::{cell::Cell, collections::VecDeque, convert::Infallible, num::NonZeroUsize, rc::Rc};
 
     use super::{
-        drive_committed_generation, drive_committed_generation_cancellable, CommittedTokenPipeline,
-        CommittedTokenSource, FinishReason, GenerationCancellationToken, JsonFragmentBuffer,
-        PartialPatternBuffer, PatternKind, PatternPiece, ProtocolParser, RawTokenDecoder,
-        SemanticEvent, SemanticEventSink, SemanticStream, StopMatcher, TokenDecoderBackend,
-        ToolRuntimeParser, Utf8Buffer, Utf8BufferError,
+        drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
+        FinishReason, GenerationCancellationToken, JsonFragmentBuffer, PartialPatternBuffer,
+        PatternKind, PatternPiece, ProtocolParser, RawTokenDecoder, SemanticEvent,
+        SemanticEventSink, SemanticStream, StopMatcher, TokenDecoderBackend, ToolRuntimeParser,
+        Utf8Buffer, Utf8BufferError,
     };
 
     const REASONING_START: &str = "<r>";
@@ -1665,11 +1650,12 @@ mod tests {
         let decoder = RawTokenDecoder::new(SyntheticCommittedDecoder, []);
         let mut pipeline = CommittedTokenPipeline::new(decoder, parser);
         let mut events = Vec::new();
-        let (tokens, reason) = drive_committed_generation(
+        let (tokens, reason) = drive_committed_generation_cancellable(
             &mut source,
             &mut pipeline,
             eos_token_ids,
             NonZeroUsize::new(max_tokens).unwrap(),
+            &GenerationCancellationToken::new(),
             &mut |event| events.push(event),
         )
         .unwrap();
@@ -1935,11 +1921,12 @@ mod tests {
         let decoder = RawTokenDecoder::new(SyntheticCommittedDecoder, [1000, 1001]);
         let mut pipeline = CommittedTokenPipeline::new(decoder, parser);
         let mut delivered = Vec::new();
-        let (committed, reason) = drive_committed_generation(
+        let (committed, reason) = drive_committed_generation_cancellable(
             &mut source,
             &mut pipeline,
             &[],
             NonZeroUsize::new(tokens.len()).unwrap(),
+            &GenerationCancellationToken::new(),
             &mut |event| delivered.push((calls.get(), event)),
         )
         .unwrap();

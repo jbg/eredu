@@ -1139,11 +1139,19 @@ impl KimiLinearModel {
         match &self.execution {
             KimiLinearExecution::Resident(_) => Ok(()),
             KimiLinearExecution::Layerwise(runtime) => {
-                runtime.policy().clear_device_group("target")
+                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
+                    runtime.architecture(),
+                    eredu_runtime::ArchitectureGroupKind::Decoder,
+                )?;
+                runtime.policy().clear_device_group(&group)
             }
             KimiLinearExecution::TensorParallelResident(_) => Ok(()),
             KimiLinearExecution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().clear_device_group("target")
+                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
+                    runtime.architecture(),
+                    eredu_runtime::ArchitectureGroupKind::Decoder,
+                )?;
+                runtime.policy().clear_device_group(&group)
             }
         }
     }
