@@ -325,7 +325,10 @@ using that canonical group-local owner address, without recovering placement
 from flattened cache identities, target-layer counts, or inferred MTP ownership.
 Pipeline logits and persistent prediction-state attachment likewise follow the
 realized partition's output flag and architecture-declared static roles; a
-stage's raw layer-range endpoint is not an ownership signal.
+stage's raw layer-range endpoint is not an ownership signal. Backend stage
+metadata exposes these as `owns_input` and `owns_output` from the realized
+partition; pipeline coordinates describe transport adjacency, not boundary
+ownership.
 Concrete backends lower catalog entries into native storage and may apply the
 declared unit path to a rank-local placement; they do not rebuild the schedule,
 instantiate a family block to discover expert parameters, or match parameter

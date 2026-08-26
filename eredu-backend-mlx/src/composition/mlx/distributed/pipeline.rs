@@ -502,10 +502,10 @@ pub struct PipelineStageInfo {
     pub pipeline_stage: usize,
     /// Number of pipeline stages.
     pub pipeline_stages: usize,
-    /// Whether this stage performs token embedding.
-    pub is_first: bool,
-    /// Whether this stage performs final normalization and projection.
-    pub is_last: bool,
+    /// Whether the realized partition owns model input preparation.
+    pub owns_input: bool,
+    /// Whether the realized partition owns final output production.
+    pub owns_output: bool,
     /// Whether this rank owns the checkpoint-embedded prediction module.
     pub owns_embedded_mtp: bool,
     /// Number of predictor layers owned by this rank.
@@ -1239,9 +1239,9 @@ impl PipelinePayload {
 
 /// Explicit input to stage-local execution.
 pub enum PipelineStageInput<'a> {
-    /// Integer token ids for stage zero.
+    /// Integer token ids for the input-owning partition.
     Tokens(&'a Array),
-    /// Hidden activations for every later stage.
+    /// Hidden activations for a non-input-owning partition.
     Hidden(&'a PipelinePayload),
 }
 
@@ -1256,13 +1256,13 @@ enum PipelineIngress<'a> {
 pub enum PipelineStageOutput {
     /// Hidden activations to transfer to the next stage.
     Hidden(PipelinePayload),
-    /// Vocabulary logits produced only by the final stage.
+    /// Vocabulary logits produced only by the output-owning partition.
     Logits(Array),
-    /// Final-stage logits plus the pre-normalization hidden state consumed by
+    /// Output-owner logits plus the pre-normalization hidden state consumed by
     /// an embedded predictor. Ordinary pipeline callers still receive only
     /// `logits`; the Cartesian MTP target retains `hidden` for drafting.
     EmbeddedMtpLogits {
-        /// Full vocabulary logits gathered on the final stage.
+        /// Full vocabulary logits gathered on the output owner.
         logits: Array,
         /// Decoder hidden state before final normalization.
         hidden: Array,
@@ -2757,11 +2757,56 @@ struct GroupedPredictionPipelineRealization<A, P, U> {
 
 trait GroupedPartition {
     fn groups(&self) -> &[eredu_runtime::PartitionGroup];
+    fn ownership(&self) -> &eredu_runtime::PartitionOwnership;
 }
 
 impl<G, B> GroupedPartition for eredu_runtime::ArchitecturePartition<G, B> {
     fn groups(&self) -> &[eredu_runtime::PartitionGroup] {
         self.groups()
+    }
+
+    fn ownership(&self) -> &eredu_runtime::PartitionOwnership {
+        self.ownership()
+    }
+}
+
+trait RealizedPipelinePartition {
+    fn partition_ownership(&self) -> &eredu_runtime::PartitionOwnership;
+}
+
+impl<A, G, C, L> RealizedPipelinePartition for DecoderPipelineRealization<A, G, C, L> {
+    fn partition_ownership(&self) -> &eredu_runtime::PartitionOwnership {
+        self.partition.ownership()
+    }
+}
+
+impl<A, G, B, U> RealizedPipelinePartition for PredictionPipelineRealization<A, G, B, U> {
+    fn partition_ownership(&self) -> &eredu_runtime::PartitionOwnership {
+        self.partition.ownership()
+    }
+}
+
+impl<A, P, C, U, I> RealizedPipelinePartition for MediaPipelineRealization<A, P, C, U, I>
+where
+    P: GroupedPartition,
+{
+    fn partition_ownership(&self) -> &eredu_runtime::PartitionOwnership {
+        self.partition.ownership()
+    }
+}
+
+impl<A, G, B, U> RealizedPipelinePartition for PipelineRealization<A, G, B, U> {
+    fn partition_ownership(&self) -> &eredu_runtime::PartitionOwnership {
+        self.partition.ownership()
+    }
+}
+
+impl<A, P, U> RealizedPipelinePartition for GroupedPredictionPipelineRealization<A, P, U>
+where
+    P: GroupedPartition,
+{
+    fn partition_ownership(&self) -> &eredu_runtime::PartitionOwnership {
+        self.partition.ownership()
     }
 }
 
@@ -3062,7 +3107,9 @@ macro_rules! pipeline_observed_forward {
     };
 }
 
-trait PipelineArchitecture: PipelinePartitionMetadata + PipelineForward {
+trait PipelineArchitecture:
+    PipelinePartitionMetadata + PipelineForward + RealizedPipelinePartition
+{
     fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress>;
     fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress>;
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp>;
@@ -4928,11 +4975,7 @@ fn qwen_hybrid_pipeline_prompt_cache_identity(
     ownership: &eredu_runtime::PartitionOwnership,
     complete: &eredu_runtime::StateLayout,
 ) -> Result<PromptCacheModelIdentity, Error> {
-    let state_end = if ownership.owns_output() {
-        complete.len()
-    } else {
-        range.end
-    };
+    let state_end = partition_state_end(ownership, range.end, complete.len());
     let layout = complete
         .slice(range.start..state_end)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -7127,7 +7170,7 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
-        // Predictor state is appended to the final stage's persistence
+        // Predictor state is appended to the output owner's persistence
         // identity, but it is materialized in the transactional MTP cache.
         let target_identity = identity
             .select_state_segment(eredu_architectures::inkling::TARGET_STATE_SEGMENT)
@@ -9478,6 +9521,15 @@ impl PipelineModel {
         mut info: PipelineStageInfo,
         stage: impl PipelineArchitecture + 'static,
     ) -> Result<Self, Error> {
+        let ownership = stage.partition_ownership();
+        info.owns_input = ownership.owns_input();
+        info.owns_output = ownership.owns_output();
+        if info.owns_embedded_mtp && !info.owns_output {
+            return Err(Error::Parallel(
+                "pipeline prediction state is attached to a partition that does not own output"
+                    .into(),
+            ));
+        }
         info.global_encoder_units = info
             .placement
             .groups()
@@ -9648,7 +9700,7 @@ impl PipelineModel {
             self.info.model_kind,
             self.stage.new_cache_layers(&self.cache_identity, None)?,
         );
-        if self.info.is_last
+        if self.info.owns_output
             && self
                 .stage
                 .embedded_mtp()
@@ -9683,7 +9735,7 @@ impl PipelineModel {
                     layers,
                     manager.clone(),
                 );
-                if self.info.is_last
+                if self.info.owns_output
                     && self
                         .stage
                         .embedded_mtp()
@@ -9940,7 +9992,7 @@ impl PipelineModel {
         }
         let mut cache =
             PipelineCache::with_residency_manager(self.info.model_kind, layers, manager.clone());
-        if self.info.is_last
+        if self.info.owns_output
             && self
                 .stage
                 .embedded_mtp()
@@ -10233,7 +10285,7 @@ impl PipelineModel {
     }
 
     fn ensure_embedded_mtp_cache(&self, cache: &mut PipelineCache) -> Result<(), Error> {
-        if self.info.is_last
+        if self.info.owns_output
             && self
                 .stage
                 .embedded_mtp()
@@ -10273,18 +10325,18 @@ impl PipelineModel {
                 ))
             }
         };
-        let arrays = if self.info.is_last {
+        let arrays = if self.info.owns_output {
             vec![
                 local_logits
                     .ok_or_else(|| {
                         Exception::custom(
-                            "pipeline embedded MTP final stage did not publish logits",
+                            "pipeline embedded MTP output owner did not publish logits",
                         )
                     })?
                     .as_dtype(Dtype::Float32, stream)?,
                 local_hidden.ok_or_else(|| {
                     Exception::custom(
-                        "pipeline embedded MTP final stage did not publish hidden state",
+                        "pipeline embedded MTP output owner did not publish hidden state",
                     )
                 })?,
             ]
@@ -10303,7 +10355,7 @@ impl PipelineModel {
                 arrays.len()
             )));
         }
-        if !self.info.is_first {
+        if !self.info.owns_input {
             send_array_bundle(
                 &arrays,
                 PIPELINE_MTP_OUTPUT_ROUTE,
@@ -10344,10 +10396,10 @@ impl PipelineModel {
                 ))
             }
         };
-        let arrays = if self.info.is_last {
+        let arrays = if self.info.owns_output {
             vec![Array::from_slice(
                 &[i32::from(local.ok_or_else(|| {
-                    Exception::custom("final pipeline stage omitted MTP control state")
+                    Exception::custom("pipeline output owner omitted MTP control state")
                 })?)],
                 &[1],
             )]
@@ -10365,7 +10417,7 @@ impl PipelineModel {
                 "pipeline embedded MTP control payload is malformed",
             ));
         }
-        if !self.info.is_first {
+        if !self.info.owns_input {
             send_array_bundle(
                 &arrays,
                 PIPELINE_MTP_CONTROL_ROUTE,
@@ -10700,9 +10752,9 @@ impl PipelineModel {
             }
         }
         payloads.ensure_empty()?;
-        if self.info.is_first && decoder_payload.is_none() {
+        if self.info.owns_input && decoder_payload.is_none() {
             return Err(Error::Parallel(
-                "placed execution DAG did not produce decoder ingress on stage zero".into(),
+                "placed execution DAG did not produce decoder ingress on the input owner".into(),
             ));
         }
         if schedule.maximum_in_flight_groups > 1 {
@@ -10750,9 +10802,9 @@ impl PipelineModel {
                 ))
             }
         };
-        let arrays = if self.info.is_last {
+        let arrays = if self.info.owns_output {
             let logits = logits.ok_or_else(|| {
-                Error::Parallel("final pipeline stage requires complete sampling logits".into())
+                Error::Parallel("pipeline output owner requires complete sampling logits".into())
             })?;
             if logits.dim(0) != batch_size {
                 return Err(Error::Parallel(format!(
@@ -10785,7 +10837,7 @@ impl PipelineModel {
                 "pipeline sampling produced a malformed token payload".into(),
             ));
         }
-        if !self.info.is_first {
+        if !self.info.owns_input {
             send_array_bundle(
                 &arrays,
                 PIPELINE_SAMPLE_ROUTE,
@@ -10868,7 +10920,7 @@ impl PipelineModel {
                         stream,
                         &mut placed_retained,
                     )?;
-                } else if self.info.is_first {
+                } else if self.info.owns_input {
                     self.stage.begin_placed_ingress(input, tensor, stream)?;
                     placed_payload = Some(self.stage.finish_placed_ingress(tensor, stream)?);
                 }
@@ -10876,10 +10928,10 @@ impl PipelineModel {
         }
         let mut received_payload = None;
         let resolved_boundary = self.resolved_boundary_schema(step)?;
-        let stage_input = if self.info.is_first {
+        let stage_input = if self.info.owns_input {
             Some(
                 ingress
-                    .ok_or_else(|| Error::Parallel("pipeline stage zero requires input".into()))?,
+                    .ok_or_else(|| Error::Parallel("pipeline input owner requires input".into()))?,
             )
         } else {
             let peer = predecessor.expect("non-first predecessor");
@@ -10927,8 +10979,8 @@ impl PipelineModel {
                 cache.model_kind, self.info.model_kind
             )));
         }
-        let output = if self.info.is_first {
-            match stage_input.expect("first stage ingress") {
+        let output = if self.info.owns_input {
+            match stage_input.expect("input-owner ingress") {
                 PipelineIngress::Tokens(tokens) => {
                     let input = PipelineStageInput::Tokens(tokens);
                     validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
@@ -10996,7 +11048,7 @@ impl PipelineModel {
             let input = PipelineStageInput::Hidden(
                 received_payload
                     .as_ref()
-                    .expect("non-first stage received payload"),
+                    .expect("non-input-owner partition received payload"),
             );
             validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
             match observer.as_deref_mut() {
@@ -11052,7 +11104,7 @@ impl PipelineModel {
                     payload.auxiliary.tensors(),
                     resolved_boundary.auxiliary(),
                 )?;
-                let peer = successor.expect("non-final successor");
+                let peer = successor.expect("hidden-producing partition successor");
                 let sent = distributed::send(hidden, peer, group, stream).map_err(|error| {
                     Error::Parallel(format!(
                         "stage {} failed to send {:?} {:?} activations to rank {peer}: {error}",
@@ -11168,7 +11220,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
             .map_err(|error| Exception::custom(error.to_string()))?;
         let local = if multimodal {
             self.model.prefill_distributed(
-                self.model.info.is_first.then_some(input),
+                self.model.info.owns_input.then_some(input),
                 step,
                 None,
                 cache,
@@ -11176,7 +11228,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
             )
         } else {
             self.model.forward_distributed(
-                self.model.info.is_first.then_some(&tokens),
+                self.model.info.owns_input.then_some(&tokens),
                 step,
                 None,
                 cache,
@@ -11206,7 +11258,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         let local = self
             .model
             .forward_distributed(
-                self.model.info.is_first.then_some(tokens.as_array()),
+                self.model.info.owns_input.then_some(tokens.as_array()),
                 step,
                 None,
                 cache,
@@ -11236,7 +11288,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        let handled = if self.model.info.is_last {
+        let handled = if self.model.info.owns_output {
             let handled = self
                 .model
                 .stage
@@ -11334,7 +11386,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        let handled = if self.model.info.is_last {
+        let handled = if self.model.info.owns_output {
             Some(
                 self.model
                     .stage
@@ -11381,7 +11433,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         last_token: u32,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Exception> {
-        let local = if self.model.info.is_last {
+        let local = if self.model.info.owns_output {
             self.model
                 .stage
                 .adjust_fused_embedded_mtp_logits(logits.as_array().clone(), last_token, stream)
@@ -11414,7 +11466,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
             .execution
             .tensor_context()
             .map_err(|error| Exception::custom(error.to_string()))?;
-        let local = if self.model.info.is_last {
+        let local = if self.model.info.owns_output {
             self.model.stage.fused_embedded_mtp_logits(
                 hidden,
                 last_token,
@@ -11444,7 +11496,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
                 ))
             }
         };
-        let arrays = if self.model.info.is_last {
+        let arrays = if self.model.info.owns_output {
             local
                 .map_err(|error| Exception::custom(error.to_string()))?
                 .into_iter()
@@ -11463,7 +11515,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
                 "pipeline fused MTP output contained more than one tensor",
             ));
         }
-        if !self.model.info.is_first {
+        if !self.model.info.owns_input {
             send_array_bundle(
                 &arrays,
                 PIPELINE_MTP_FUSED_ROUTE,
@@ -11484,7 +11536,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
         cache: &mut PipelineMtpCache,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
-        let local = if self.model.info.is_last {
+        let local = if self.model.info.owns_output {
             let tensor = self
                 .execution
                 .tensor_context()
@@ -11594,14 +11646,13 @@ fn base_info(
     model_kind: ModelKind,
 ) -> PipelineStageInfo {
     let stage = topology.pipeline_parallel_rank;
-    let last = topology.pipeline_parallel_size - 1;
     PipelineStageInfo {
         placement,
         topology,
         pipeline_stage: stage,
         pipeline_stages: topology.pipeline_parallel_size,
-        is_first: stage == 0,
-        is_last: stage == last,
+        owns_input: false,
+        owns_output: false,
         owns_embedded_mtp: false,
         embedded_mtp_layers: 0,
         global_embedded_mtp_layers: 0,
@@ -11753,7 +11804,7 @@ where
 #[cfg(test)]
 #[allow(dead_code)]
 fn owns_embedding_weight(info: &PipelineStageInfo, tied: bool) -> bool {
-    info.is_first || (tied && info.is_last)
+    info.owns_input || (tied && info.owns_output)
 }
 
 fn validate_stage_input(
@@ -11762,11 +11813,11 @@ fn validate_stage_input(
     step: PipelineStep,
     boundary: &eredu_runtime::ResolvedBoundaryWireSchema,
 ) -> Result<(), Error> {
-    match (info.is_first, input) {
+    match (info.owns_input, input) {
         (true, PipelineStageInput::Tokens(tokens)) => {
             if tokens.ndim() != 2 || tokens.shape() != [step.batch_size, step.sequence_length] {
                 return Err(Error::Parallel(format!(
-                    "first stage expected token ids shaped [{}, {}], got {:?}",
+                    "input-owning partition expected token ids shaped [{}, {}], got {:?}",
                     step.batch_size,
                     step.sequence_length,
                     tokens.shape()
@@ -11784,7 +11835,7 @@ fn validate_stage_input(
         }
         (true, PipelineStageInput::Hidden(_)) => {
             return Err(Error::Parallel(
-                "first stage requires token ids, not hidden states".into(),
+                "input-owning partition requires token ids, not hidden states".into(),
             ))
         }
         (false, PipelineStageInput::Tokens(_)) => {
@@ -12222,6 +12273,38 @@ fn decoder_partition_state_layout(
     complete
         .slice(layers)
         .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn partition_state_end(
+    ownership: &eredu_runtime::PartitionOwnership,
+    decoder_end: usize,
+    complete_state_len: usize,
+) -> usize {
+    if ownership.owns_output() {
+        complete_state_len
+    } else {
+        decoder_end
+    }
+}
+
+fn partition_owns_prediction_state(
+    ownership: &eredu_runtime::PartitionOwnership,
+    prediction_units: usize,
+) -> bool {
+    ownership.owns_output() && prediction_units != 0
+}
+
+#[cfg(test)]
+#[test]
+fn prediction_state_and_extent_follow_realized_output_ownership() {
+    let input_owner = eredu_runtime::PartitionOwnership::new(true, false, ["embedding"]).unwrap();
+    let output_owner = eredu_runtime::PartitionOwnership::new(false, true, ["output"]).unwrap();
+
+    assert_eq!(partition_state_end(&input_owner, 7, 11), 7);
+    assert_eq!(partition_state_end(&output_owner, 7, 11), 11);
+    assert!(!partition_owns_prediction_state(&input_owner, 2));
+    assert!(partition_owns_prediction_state(&output_owner, 2));
+    assert!(!partition_owns_prediction_state(&output_owner, 0));
 }
 
 fn local_architecture_parameter_bindings<G, A>(
@@ -17726,11 +17809,8 @@ fn load_nemotron_h_pipeline(
             Arc::clone(&geometry),
             std::iter::empty(),
         )?;
-    let owned_state_end = if range.end == target_units {
-        runtime_state.len()
-    } else {
-        range.end
-    };
+    let owned_state_end =
+        partition_state_end(ownership_probe.ownership(), range.end, runtime_state.len());
     let local_state = decoder_partition_state_layout(&runtime_state, range.start..owned_state_end)?;
     let parameter_description = architecture
         .parameter_description(stream)
@@ -17763,7 +17843,8 @@ fn load_nemotron_h_pipeline(
         .range()
         .map(|global_layer| stage.build_unit(decoder_group, global_layer, stream))
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
+    let owns_mtp =
+        partition_owns_prediction_state(stage.partition.ownership(), prediction_units.len());
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -18830,7 +18911,8 @@ fn load_neutral_qwen_hybrid_pipeline(
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
+    let owns_mtp =
+        partition_owns_prediction_state(stage.partition.ownership(), prediction_units.len());
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -19240,11 +19322,8 @@ fn load_neutral_qwen_conditional_pipeline(
             architecture.shared_parallel_geometry(),
             std::iter::empty(),
         )?;
-    let state_end = if ownership_probe.ownership().owns_output() {
-        complete_state.len()
-    } else {
-        range.end
-    };
+    let state_end =
+        partition_state_end(ownership_probe.ownership(), range.end, complete_state.len());
     let local_state = decoder_partition_state_layout(&complete_state, range.start..state_end)?;
     let parameter_description = architecture
         .parameter_description(stream)
@@ -19287,7 +19366,8 @@ fn load_neutral_qwen_conditional_pipeline(
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp = stage.partition.ownership().owns_output() && !prediction_units.is_empty();
+    let owns_mtp =
+        partition_owns_prediction_state(stage.partition.ownership(), prediction_units.len());
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -20255,11 +20335,7 @@ fn load_neutral_inkling_pipeline(
             std::iter::empty(),
         )?;
     let ownership = ownership_probe.ownership();
-    let state_end = if ownership.owns_output() {
-        runtime_state.len()
-    } else {
-        range.end
-    };
+    let state_end = partition_state_end(ownership, range.end, runtime_state.len());
     let local_state = decoder_partition_state_layout(&runtime_state, range.start..state_end)?;
     let parameter_description = architecture
         .parameter_description(stream)
@@ -21136,8 +21212,6 @@ fn load_neutral_deepseek_v3_pipeline(
             .map(ExpertAssignment::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
-    let owns_mtp = topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size
-        && !prediction_units.is_empty();
     let tensor_parallel = topology.tensor_parallel_size > 1;
     let parallel_layout = tensor_parallel
         .then(|| architecture_parallel_layout(&parameter_description, topology))
@@ -21166,8 +21240,6 @@ fn load_neutral_deepseek_v3_pipeline(
         placement,
         model_kind,
     );
-    info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -21199,6 +21271,9 @@ fn load_neutral_deepseek_v3_pipeline(
             geometry,
             local_parameter_groups,
         )?;
+    let owns_mtp = partition_owns_prediction_state(partition.ownership(), prediction_units.len());
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     let static_roles = parameter_description.select_static_roles(&partition);
     let static_units = split_static_binding_units_by_owner(
         partition.parameter_bindings(),
@@ -21543,8 +21618,6 @@ fn load_neutral_deepseek_v4_pipeline(
             .map(ExpertAssignment::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
-    let owns_mtp = topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size
-        && !prediction_units.is_empty();
     let tensor_parallel = topology.tensor_parallel_size > 1;
     let parallel_layout = tensor_parallel
         .then(|| architecture_parallel_layout(&parameter_description, topology))
@@ -21576,8 +21649,6 @@ fn load_neutral_deepseek_v4_pipeline(
         placement,
         model_kind,
     );
-    info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -21617,6 +21688,9 @@ fn load_neutral_deepseek_v4_pipeline(
         geometry,
         local_parameter_groups,
     )?;
+    let owns_mtp = partition_owns_prediction_state(partition.ownership(), prediction_units.len());
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     let static_roles = parameter_description.select_static_roles(&partition);
     let static_units = split_static_binding_units_by_owner(
         partition.parameter_bindings(),

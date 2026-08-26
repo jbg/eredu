@@ -1380,7 +1380,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         .any(|part| part.modality() != InputModality::Text);
                     if multimodal {
                         model.prefill_distributed(
-                            model.stage_info().is_first.then_some(borrowed),
+                            model.stage_info().owns_input.then_some(borrowed),
                             step,
                             None,
                             cache,
@@ -1388,7 +1388,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         )
                     } else {
                         model.forward_distributed(
-                            model.stage_info().is_first.then_some(&tokens),
+                            model.stage_info().owns_input.then_some(&tokens),
                             step,
                             None,
                             cache,
@@ -1427,7 +1427,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 })?;
                 let step = PipelineStep::new(input.dim(0), input.dim(1))?;
                 let completion = model.forward_distributed(
-                    model.stage_info().is_first.then_some(&input),
+                    model.stage_info().owns_input.then_some(&input),
                     step,
                     None,
                     cache,
@@ -1487,7 +1487,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     };
                     if multimodal {
                         model.prefill_distributed_with_observer(
-                            model.stage_info().is_first.then_some(borrowed),
+                            model.stage_info().owns_input.then_some(borrowed),
                             step,
                             None,
                             cache,
@@ -1496,7 +1496,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         )
                     } else {
                         model.forward_distributed_with_observer(
-                            model.stage_info().is_first.then_some(&tokens),
+                            model.stage_info().owns_input.then_some(&tokens),
                             step,
                             None,
                             cache,
@@ -1539,7 +1539,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     inner: &mut collector,
                 };
                 let completion = model.forward_distributed_with_observer(
-                    model.stage_info().is_first.then_some(&input),
+                    model.stage_info().owns_input.then_some(&input),
                     step,
                     None,
                     cache,

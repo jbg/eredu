@@ -1262,7 +1262,7 @@ fn pipeline_ring_worker() {
     if expert_cache {
         let report = model.expert_cache_report().unwrap();
         let predictor_expert_layers = usize::from(
-            info.is_last
+            info.owns_output
                 && matches!(
                     family,
                     FixtureFamily::DeepSeekV4
@@ -1325,7 +1325,7 @@ fn pipeline_ring_worker() {
         prepared
             .with_model_input(|input| {
                 model.prefill_distributed(
-                    model.stage_info().is_first.then_some(input),
+                    model.stage_info().owns_input.then_some(input),
                     PipelineStep::new(1, prompt_length).unwrap(),
                     None,
                     &mut cache,
