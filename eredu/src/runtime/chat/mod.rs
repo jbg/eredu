@@ -11,6 +11,7 @@ pub(crate) mod gemma;
 pub(crate) mod harmony;
 pub(crate) mod inkling;
 pub(crate) mod lfm2;
+mod tokenizer_env;
 
 use std::{
     collections::{HashMap, HashSet},

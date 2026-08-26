@@ -16,7 +16,6 @@ use llguidance::{
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use toktrie_hf_tokenizers::ByteTokenizer;
 
 use crate::{
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
@@ -425,23 +424,7 @@ impl ConstraintCompiler {
         tokenizer: &ChatTokenizer,
         eos_token_ids: &[u32],
     ) -> Result<Self, String> {
-        let serialized = tokenizer
-            .to_string(false)
-            .map_err(|error| format!("failed to serialize tokenizer: {error}"))?;
-        let mut byte_tokenizer = ByteTokenizer::from_json_bytes(serialized.as_bytes())
-            .map_err(|error| format!("failed to analyze tokenizer vocabulary: {error}"))?;
-        if !eos_token_ids.is_empty() {
-            let vocab_size = byte_tokenizer.tokrx_info().vocab_size;
-            if let Some(id) = eos_token_ids.iter().find(|&&id| id >= vocab_size) {
-                return Err(format!(
-                    "EOS token ID {id} is outside tokenizer vocabulary {vocab_size}"
-                ));
-            }
-            byte_tokenizer.set_eos_tokens(eos_token_ids);
-        }
-        let token_env = byte_tokenizer
-            .into_tok_env(Some(tokenizer.get_vocab_size(true)))
-            .map_err(|error| format!("failed to build tokenizer trie: {error}"))?;
+        let token_env = super::tokenizer_env::from_tokenizer(tokenizer, eos_token_ids)?;
         Self::from_tok_env(token_env, eos_token_ids.to_vec())
     }
 
