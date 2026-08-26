@@ -182,11 +182,13 @@ impl InputTokenCount {
     }
 }
 
-/// Dtype and request assumptions used by state estimation.
+/// Floating-dtype and request assumptions used by state estimation.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateMemoryAssumptions {
-    /// Bytes per retained state scalar.
-    pub state_dtype_bytes: NonZeroU8,
+    /// Bytes per architecture-declared generic floating-state scalar.
+    ///
+    /// Fixed-dtype tensors use their own widths from the exact state policy.
+    pub floating_state_dtype_bytes: NonZeroU8,
     /// Logical request batch size.
     pub batch_size: u64,
     /// Total requested positions, including output allowance.
@@ -533,9 +535,9 @@ fn is_context_dependent_dimension(dimension: &StateTensorDimension) -> bool {
     )
 }
 
-fn state_tensor_dtype_bytes(tensor: &StateTensorPolicy, scalar_bytes: u64) -> u64 {
+fn state_tensor_dtype_bytes(tensor: &StateTensorPolicy, floating_scalar_bytes: u64) -> u64 {
     match tensor.dtype {
-        StateTensorDtype::Floating => scalar_bytes,
+        StateTensorDtype::Floating => floating_scalar_bytes,
         StateTensorDtype::Float32 | StateTensorDtype::Int32 | StateTensorDtype::Uint32 => 4,
     }
 }
@@ -559,7 +561,7 @@ fn state_tensor_bytes(
     tensor: &StateTensorPolicy,
     batch_size: usize,
     prefix_tokens: usize,
-    scalar_bytes: u64,
+    floating_scalar_bytes: u64,
 ) -> Result<u64, CapabilityError> {
     if !state_tensor_is_present(tensor, prefix_tokens) {
         return Ok(0);
@@ -582,14 +584,14 @@ fn state_tensor_bytes(
     })?;
     checked_mul(
         scalars,
-        state_tensor_dtype_bytes(tensor, scalar_bytes),
+        state_tensor_dtype_bytes(tensor, floating_scalar_bytes),
         "runtime state tensor bytes",
     )
 }
 
 fn state_tensor_bytes_per_position_per_batch(
     tensor: &StateTensorPolicy,
-    scalar_bytes: u64,
+    floating_scalar_bytes: u64,
 ) -> Result<u64, CapabilityError> {
     let mut scalars = 1_u64;
     let mut divisor = 1_u64;
@@ -614,7 +616,7 @@ fn state_tensor_bytes_per_position_per_batch(
     }
     let bytes = checked_mul(
         scalars,
-        state_tensor_dtype_bytes(tensor, scalar_bytes),
+        state_tensor_dtype_bytes(tensor, floating_scalar_bytes),
         "state growth bytes",
     )?;
     Ok(bytes.div_ceil(divisor))
@@ -626,7 +628,7 @@ pub fn estimate_runtime_state(
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
-    state_dtype_bytes: NonZeroU8,
+    floating_state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
     if batch_size == 0 {
         return Err(CapabilityError::InvalidConfiguration {
@@ -639,7 +641,7 @@ pub fn estimate_runtime_state(
         max_output_tokens,
         "prompt plus output positions",
     )?;
-    let scalar_bytes = u64::from(state_dtype_bytes.get());
+    let floating_scalar_bytes = u64::from(floating_state_dtype_bytes.get());
     let batch_size_usize =
         usize::try_from(batch_size).map_err(|_| CapabilityError::InvalidConfiguration {
             field: "batch_size",
@@ -679,7 +681,7 @@ pub fn estimate_runtime_state(
                     batch_size,
                     "attention context batch",
                 )?,
-                scalar_bytes,
+                floating_scalar_bytes,
                 "attention context bytes",
             )?;
             context_state_bytes =
@@ -687,7 +689,11 @@ pub fn estimate_runtime_state(
             if matches!(attention, AttentionPolicy::Full) {
                 unbounded_per_position = checked_add(
                     unbounded_per_position,
-                    checked_mul(per_position, scalar_bytes, "unbounded bytes per position")?,
+                    checked_mul(
+                        per_position,
+                        floating_scalar_bytes,
+                        "unbounded bytes per position",
+                    )?,
                     "unbounded bytes-per-position total",
                 )?;
             }
@@ -697,14 +703,14 @@ pub fn estimate_runtime_state(
                 tensor,
                 batch_size_usize,
                 layer_positions_usize,
-                scalar_bytes,
+                floating_scalar_bytes,
             )?;
             if tensor.shape.iter().any(is_context_dependent_dimension) {
                 context_state_bytes =
                     checked_add(context_state_bytes, bytes, "context state byte total")?;
                 unbounded_per_position = checked_add(
                     unbounded_per_position,
-                    state_tensor_bytes_per_position_per_batch(tensor, scalar_bytes)?,
+                    state_tensor_bytes_per_position_per_batch(tensor, floating_scalar_bytes)?,
                     "unbounded bytes-per-position total",
                 )?;
             } else {
@@ -725,7 +731,7 @@ pub fn estimate_runtime_state(
             batch_size,
             "media embeddings times batch",
         )?,
-        scalar_bytes,
+        floating_scalar_bytes,
         "media embedding bytes",
     )?;
     let media_execution_workspace_bytes = checked_mul(
@@ -761,7 +767,7 @@ pub fn estimate_runtime_state(
         media_execution_workspace_bytes,
         requested_state_bytes,
         assumptions: StateMemoryAssumptions {
-            state_dtype_bytes,
+            floating_state_dtype_bytes,
             batch_size,
             requested_positions,
             sliding_window_bounds,
@@ -935,7 +941,7 @@ mod tests {
             media_execution_workspace_bytes: 0,
             requested_state_bytes: 0,
             assumptions: StateMemoryAssumptions {
-                state_dtype_bytes: NonZeroU8::new(4).unwrap(),
+                floating_state_dtype_bytes: NonZeroU8::new(4).unwrap(),
                 batch_size: 1,
                 requested_positions: 9,
                 sliding_window_bounds: Vec::new(),

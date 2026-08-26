@@ -995,6 +995,57 @@ mod tests {
     }
 
     #[test]
+    fn kimi_linear_mixed_dtype_state_uses_per_tensor_widths() {
+        let args = crate::kimi_linear::model_args_from_config_value(&json!({
+            "model_type": "kimi_linear",
+            "vocab_size": 64,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 16,
+            "head_dim": 4,
+            "model_max_length": 128,
+            "linear_attn_config": {
+                "kda_layers": [1, 3],
+                "full_attn_layers": [2, 4],
+                "num_heads": 2,
+                "head_dim": 4,
+                "short_conv_kernel_size": 2
+            },
+            "num_experts": 4,
+            "moe_intermediate_size": 8,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 2,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 2,
+            "mla_use_nope": true,
+            "num_experts_per_token": 2,
+            "routed_scaling_factor": 1.0,
+            "first_k_dense_replace": 1,
+            "num_expert_group": 1,
+            "topk_group": 1
+        }))
+        .unwrap();
+        let estimate = kimi_linear(&args).unwrap();
+        let executable = crate::kimi_linear::state_layout(&args).unwrap();
+        assert_eq!(estimate.state_layout().layer_layout(), executable.layers());
+
+        let state = eredu_core::estimate_runtime_state(
+            estimate.state_layout(),
+            eredu_core::InputTokenCount::text(1),
+            0,
+            1,
+            NonZeroU8::new(2).unwrap(),
+        )
+        .unwrap();
+
+        // Two KDA layers each retain 24 BF16 convolution scalars and 32 FP32
+        // recurrent scalars: 2 * (24 * 2 + 32 * 4) = 352 bytes.
+        assert_eq!(state.fixed_state_bytes, 352);
+    }
+
+    #[test]
     fn embedded_mtp_accounting_contains_every_executable_state_layer() {
         let v3_args = crate::deepseek::parse_v3_config(&json!({
             "hidden_size": 8, "intermediate_size": 16, "moe_intermediate_size": 8,

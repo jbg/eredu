@@ -182,7 +182,7 @@ fn infer_native_device_identity(device: &Device) -> Result<MlxDeviceIdentity, Er
 /// not exposed through the public loading API.
 pub struct MlxModel {
     inner: MlxModelKind,
-    runtime_state_dtype_bytes: NonZeroU8,
+    floating_state_dtype_bytes: NonZeroU8,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
@@ -193,10 +193,10 @@ pub(crate) enum MlxModelKind {
 }
 
 impl MlxModel {
-    pub(crate) const fn complete(model: Executable, runtime_state_dtype_bytes: NonZeroU8) -> Self {
+    pub(crate) const fn complete(model: Executable, floating_state_dtype_bytes: NonZeroU8) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
-            runtime_state_dtype_bytes,
+            floating_state_dtype_bytes,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
@@ -204,11 +204,11 @@ impl MlxModel {
 
     pub(crate) const fn pipeline(
         model: PipelineModel,
-        runtime_state_dtype_bytes: NonZeroU8,
+        floating_state_dtype_bytes: NonZeroU8,
     ) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
-            runtime_state_dtype_bytes,
+            floating_state_dtype_bytes,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
@@ -218,13 +218,13 @@ impl MlxModel {
     #[cfg(test)]
     pub const fn complete_for_test(
         model: Executable,
-        runtime_state_dtype_bytes: NonZeroU8,
+        floating_state_dtype_bytes: NonZeroU8,
     ) -> Self {
-        Self::complete(model, runtime_state_dtype_bytes)
+        Self::complete(model, floating_state_dtype_bytes)
     }
 
-    pub(crate) const fn runtime_state_dtype_bytes(&self) -> NonZeroU8 {
-        self.runtime_state_dtype_bytes
+    pub(crate) const fn floating_state_dtype_bytes(&self) -> NonZeroU8 {
+        self.floating_state_dtype_bytes
     }
 
     /// Reports speculative-weight readiness to backend integration tests.

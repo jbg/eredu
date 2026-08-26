@@ -218,16 +218,16 @@ fn invalid(error: impl Display) -> PreparationCapabilityError {
     PreparationCapabilityError(error.to_string())
 }
 
-/// Architecture-resolved source of the scalar dtype used by mutable runtime
+/// Architecture-resolved source of the dtype used by generic floating runtime
 /// state.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RuntimeStateDtypeSource {
+pub struct FloatingStateDtypeSource {
     parameter: String,
     checkpoint_tensor: String,
     dtype: TensorDtype,
 }
 
-impl RuntimeStateDtypeSource {
+impl FloatingStateDtypeSource {
     /// Architecture-declared checkpoint parameter whose loaded values establish
     /// the ordinary decoder activation dtype.
     pub fn parameter(&self) -> &str {
@@ -245,22 +245,22 @@ impl RuntimeStateDtypeSource {
     }
 }
 
-fn resolve_runtime_state_dtype_source(
+fn resolve_floating_state_dtype_source(
     plan: &SafetensorsCheckpointPlan,
     parameter: &str,
     tensors: &TensorCatalog,
-) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
     let constraint = plan
         .common_tensors
         .iter()
         .find(|constraint| constraint.key == parameter)
         .ok_or_else(|| {
             invalid(format!(
-                "architecture checkpoint plan {:?} does not declare runtime-state dtype source {parameter:?} as a common tensor",
+                "architecture checkpoint plan {:?} does not declare floating-state dtype source {parameter:?} as a common tensor",
                 plan.identity
             ))
         })?;
-    resolve_declared_runtime_state_dtype_source(
+    resolve_declared_floating_state_dtype_source(
         &plan.identity,
         parameter,
         &constraint.aliases,
@@ -268,22 +268,22 @@ fn resolve_runtime_state_dtype_source(
     )
 }
 
-fn resolve_gguf_runtime_state_dtype_source(
+fn resolve_gguf_floating_state_dtype_source(
     plan: &GgufCheckpointPlan,
     parameter: &str,
     tensors: &TensorCatalog,
-) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
     let constraint = plan
         .common_tensors
         .iter()
         .find(|constraint| constraint.key == parameter)
         .ok_or_else(|| {
             invalid(format!(
-                "architecture checkpoint plan {:?} does not declare runtime-state dtype source {parameter:?} as a common tensor",
+                "architecture checkpoint plan {:?} does not declare floating-state dtype source {parameter:?} as a common tensor",
                 plan.identity
             ))
         })?;
-    resolve_declared_runtime_state_dtype_source(
+    resolve_declared_floating_state_dtype_source(
         &plan.identity,
         parameter,
         &constraint.aliases,
@@ -291,28 +291,28 @@ fn resolve_gguf_runtime_state_dtype_source(
     )
 }
 
-fn resolve_declared_runtime_state_dtype_source(
+fn resolve_declared_floating_state_dtype_source(
     plan_identity: &str,
     parameter: &str,
     aliases: &[String],
     tensors: &TensorCatalog,
-) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
     let present = std::iter::once(parameter)
         .chain(aliases.iter().map(String::as_str))
         .filter_map(|name| tensors.get(name))
         .collect::<Vec<_>>();
     match present.as_slice() {
-        [tensor] => Ok(RuntimeStateDtypeSource {
+        [tensor] => Ok(FloatingStateDtypeSource {
             parameter: parameter.into(),
             checkpoint_tensor: tensor.name.clone(),
             dtype: tensor.dtype.clone(),
         }),
         [] => Err(invalid(format!(
-            "architecture checkpoint plan {:?} did not find runtime-state dtype source {parameter:?} or any of its declared aliases",
+            "architecture checkpoint plan {:?} did not find floating-state dtype source {parameter:?} or any of its declared aliases",
             plan_identity
         ))),
         tensors => Err(invalid(format!(
-            "architecture checkpoint plan {:?} found multiple physical aliases for runtime-state dtype source {parameter:?}: {:?}",
+            "architecture checkpoint plan {:?} found multiple physical aliases for floating-state dtype source {parameter:?}: {:?}",
             plan_identity,
             tensors
                 .iter()
@@ -322,11 +322,11 @@ fn resolve_declared_runtime_state_dtype_source(
     }
 }
 
-/// Resolves runtime-state dtype from the exact SafeTensors plan retained at admission.
-pub fn prepared_safetensors_runtime_state_dtype_source(
+/// Resolves generic floating-state dtype from the exact SafeTensors plan retained at admission.
+pub fn prepared_safetensors_floating_state_dtype_source(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
     tensors: &TensorCatalog,
-) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
     use crate::configuration::SafetensorsModelConfig;
 
     let parameter = match architecture.model() {
@@ -346,7 +346,7 @@ pub fn prepared_safetensors_runtime_state_dtype_source(
         }
         SafetensorsModelConfig::Moshi(_) => {
             return Err(invalid(
-                "Moshi runtime-state dtype belongs to the realtime loader contract",
+                "Moshi floating-state dtype belongs to the realtime loader contract",
             ));
         }
         SafetensorsModelConfig::DeepSeekV3(_)
@@ -356,14 +356,14 @@ pub fn prepared_safetensors_runtime_state_dtype_source(
         | SafetensorsModelConfig::Lfm2(_)
         | SafetensorsModelConfig::QwenHybrid(_) => "model.embed_tokens.weight".into(),
     };
-    resolve_runtime_state_dtype_source(architecture.checkpoint(), &parameter, tensors)
+    resolve_floating_state_dtype_source(architecture.checkpoint(), &parameter, tensors)
 }
 
-/// Resolves runtime-state dtype from the exact GGUF plan retained at admission.
-pub fn prepared_gguf_runtime_state_dtype_source(
+/// Resolves generic floating-state dtype from the exact GGUF plan retained at admission.
+pub fn prepared_gguf_floating_state_dtype_source(
     architecture: &crate::configuration::GgufArchitecturePlan,
     tensors: &TensorCatalog,
-) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
     use crate::configuration::GgufModelConfig;
 
     let parameter = match architecture.model() {
@@ -380,7 +380,7 @@ pub fn prepared_gguf_runtime_state_dtype_source(
         | GgufModelConfig::Qwen(_)
         | GgufModelConfig::QwenHybrid(_) => "token_embd.weight",
     };
-    resolve_gguf_runtime_state_dtype_source(architecture.checkpoint(), parameter, tensors)
+    resolve_gguf_floating_state_dtype_source(architecture.checkpoint(), parameter, tensors)
 }
 
 /// Derives preparation capabilities from the exact SafeTensors plan retained at admission.
@@ -797,10 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_dtype_source_uses_architecture_declared_aliases() {
+    fn floating_state_dtype_source_uses_architecture_declared_aliases() {
         let catalog =
             TensorCatalog::new([tensor("canonical.embedding.weight", TensorDtype::Bf16)]).unwrap();
-        let source = resolve_runtime_state_dtype_source(
+        let source = resolve_floating_state_dtype_source(
             &dtype_source_plan(),
             "released.embedding.weight",
             &catalog,
@@ -813,11 +813,11 @@ mod tests {
     }
 
     #[test]
-    fn gguf_runtime_state_dtype_source_preserves_dense_half_widths() {
+    fn gguf_floating_state_dtype_source_preserves_dense_half_widths() {
         for dtype in [TensorDtype::F16, TensorDtype::Bf16] {
             let catalog =
                 TensorCatalog::new([tensor("released_token_embd.weight", dtype.clone())]).unwrap();
-            let source = resolve_gguf_runtime_state_dtype_source(
+            let source = resolve_gguf_floating_state_dtype_source(
                 &gguf_dtype_source_plan(),
                 "token_embd.weight",
                 &catalog,
@@ -837,16 +837,16 @@ mod tests {
         let catalog =
             TensorCatalog::new([tensor("model.embed_tokens.weight", TensorDtype::F16)]).unwrap();
 
-        let source = prepared_safetensors_runtime_state_dtype_source(&plan, &catalog).unwrap();
+        let source = prepared_safetensors_floating_state_dtype_source(&plan, &catalog).unwrap();
         assert_eq!(source.parameter(), "model.embed_tokens.weight");
         assert_eq!(source.checkpoint_tensor(), "model.embed_tokens.weight");
         assert_eq!(source.dtype(), &TensorDtype::F16);
     }
 
     #[test]
-    fn runtime_state_dtype_source_rejects_missing_or_ambiguous_names() {
+    fn floating_state_dtype_source_rejects_missing_or_ambiguous_names() {
         let unknown = TensorCatalog::new([tensor("new.valid.name", TensorDtype::F16)]).unwrap();
-        let error = resolve_runtime_state_dtype_source(
+        let error = resolve_floating_state_dtype_source(
             &dtype_source_plan(),
             "released.embedding.weight",
             &unknown,
@@ -854,14 +854,14 @@ mod tests {
         .unwrap_err();
         assert!(error
             .to_string()
-            .contains("did not find runtime-state dtype source"));
+            .contains("did not find floating-state dtype source"));
 
         let ambiguous = TensorCatalog::new([
             tensor("released.embedding.weight", TensorDtype::F16),
             tensor("canonical.embedding.weight", TensorDtype::F16),
         ])
         .unwrap();
-        let error = resolve_runtime_state_dtype_source(
+        let error = resolve_floating_state_dtype_source(
             &dtype_source_plan(),
             "released.embedding.weight",
             &ambiguous,

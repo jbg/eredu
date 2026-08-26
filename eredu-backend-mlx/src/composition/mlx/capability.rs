@@ -29,14 +29,14 @@ fn estimate_mlx_runtime_state_with_dtype(
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
-    state_dtype_bytes: NonZeroU8,
+    floating_state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
     estimate_runtime_state(
         layout,
         input,
         max_output_tokens,
         batch_size,
-        state_dtype_bytes,
+        floating_state_dtype_bytes,
     )
 }
 
@@ -277,7 +277,7 @@ pub fn model_runtime_state(
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
-    state_dtype_bytes: NonZeroU8,
+    floating_state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
     let estimate = session.capability_estimate()?;
     estimate_mlx_runtime_state_with_dtype(
@@ -285,7 +285,7 @@ pub fn model_runtime_state(
         input,
         max_output_tokens,
         batch_size,
-        state_dtype_bytes,
+        floating_state_dtype_bytes,
     )
 }
 
@@ -403,7 +403,7 @@ impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
             input,
             max_output_tokens,
             batch_size,
-            runtime.session().runtime_state_dtype_bytes(),
+            runtime.session().floating_state_dtype_bytes(),
         )
     }
 
@@ -826,9 +826,16 @@ mod tests {
             estimate.layer_layout(),
             nemotron_h::state_layout(&args).unwrap().layers()
         );
-        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(10), 0, 2).unwrap();
-        assert_eq!(state.fixed_state_bytes, 512);
-        assert_eq!(state.context_state_bytes, 320);
+        let state = estimate_mlx_runtime_state_with_dtype(
+            &estimate,
+            InputTokenCount::text(10),
+            0,
+            2,
+            NonZeroU8::new(2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.fixed_state_bytes, 384);
+        assert_eq!(state.context_state_bytes, 160);
         assert_eq!(state.bytes_per_position_per_batch, 0);
         assert_eq!(state.assumptions.sliding_window_bounds, vec![5]);
     }
@@ -861,9 +868,16 @@ mod tests {
                 recurrent_layers: 2,
             }
         );
-        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(1), 0, 1).unwrap();
-        assert_eq!(state.fixed_state_bytes, 160 * 4);
-        assert_eq!(state.context_state_bytes, 2 * 16 * 4);
+        let state = estimate_mlx_runtime_state_with_dtype(
+            &estimate,
+            InputTokenCount::text(1),
+            0,
+            1,
+            NonZeroU8::new(2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.fixed_state_bytes, 448);
+        assert_eq!(state.context_state_bytes, 2 * 16 * 2);
     }
 
     fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> LlamaModelArgs {
@@ -1123,9 +1137,16 @@ mod tests {
             }
         );
         assert_eq!(modalities, InputModalities::TEXT);
-        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(1), 0, 1).unwrap();
-        assert_eq!(state.fixed_state_bytes, 112 * 4);
-        assert_eq!(state.bytes_per_position_per_batch, 2 * 6 * 4);
+        let state = estimate_mlx_runtime_state_with_dtype(
+            &estimate,
+            InputTokenCount::text(1),
+            0,
+            1,
+            NonZeroU8::new(2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.fixed_state_bytes, 352);
+        assert_eq!(state.bytes_per_position_per_batch, 2 * 6 * 2);
         assert_eq!(estimate.allocation_granularity, 256);
     }
 
@@ -1409,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn dtype_assumption_follows_the_session_activation_width() {
+    fn floating_dtype_assumption_follows_the_session_activation_width() {
         let layout = StateMemoryLayout::new(
             LayerSchedule::new(
                 1,
@@ -1430,7 +1451,7 @@ mod tests {
             NonZeroU8::new(2).unwrap(),
         )
         .unwrap();
-        assert_eq!(estimate.assumptions.state_dtype_bytes.get(), 2);
+        assert_eq!(estimate.assumptions.floating_state_dtype_bytes.get(), 2);
         assert_eq!(estimate.requested_state_bytes, 2 * 16 * 2);
     }
 

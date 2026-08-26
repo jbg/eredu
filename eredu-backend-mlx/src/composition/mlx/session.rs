@@ -427,7 +427,7 @@ impl MlxModelInput {
 /// unrelated communicator.
 pub struct MlxModelSession<'a> {
     inner: MlxSessionKind,
-    runtime_state_dtype_bytes: std::num::NonZeroU8,
+    floating_state_dtype_bytes: std::num::NonZeroU8,
     distributed: Option<MlxDistributedSession<'a>>,
     capabilities: eredu_core::SessionCapabilities,
     #[cfg(any(feature = "image", feature = "audio"))]
@@ -459,7 +459,7 @@ impl<'a> MlxModelSession<'a> {
         distributed: Option<MlxDistributedSession<'a>>,
         admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
-        let runtime_state_dtype_bytes = model.runtime_state_dtype_bytes();
+        let floating_state_dtype_bytes = model.floating_state_dtype_bytes();
         let topology = model.topology();
         match (topology, distributed.as_ref()) {
             (None, None) => {}
@@ -504,7 +504,7 @@ impl<'a> MlxModelSession<'a> {
         }
         Ok(Self {
             inner,
-            runtime_state_dtype_bytes,
+            floating_state_dtype_bytes,
             distributed,
             capabilities: realized_capabilities,
             #[cfg(any(feature = "image", feature = "audio"))]
@@ -512,8 +512,8 @@ impl<'a> MlxModelSession<'a> {
         })
     }
 
-    pub(super) const fn runtime_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
-        self.runtime_state_dtype_bytes
+    pub(super) const fn floating_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
+        self.floating_state_dtype_bytes
     }
 
     #[cfg(any(feature = "image", feature = "audio"))]

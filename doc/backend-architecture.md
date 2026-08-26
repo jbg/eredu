@@ -506,9 +506,10 @@ and runtime-state memory metadata. Their `StateMemoryLayout` wraps the exact
 ordered `LayerCachePolicy` schedule copied from the architecture's executable
 `StateLayout`; it is not a separately summarized scalar geometry. Admission
 derives attention, recurrent, convolution, pooling, and embedded-prediction
-bytes from those policies, then applies the backend's physical floating-state
-width and the declared widths of fixed-dtype components. Concrete backends add
-live allocator, residency, and system-memory observations; they do not
+bytes from those policies. Generic `Floating` tensors use the backend's
+physical floating-state width, while fixed-dtype tensors such as FP32 recurrent
+matrices use the width declared by their architecture policy. Concrete backends
+add live allocator, residency, and system-memory observations; they do not
 reconstruct family state geometry or maintain an independent layer count.
 The same exact estimate declares whether speculative draft weights use a
 separate checkpoint, use configured embedded prediction layers, or are absent.
@@ -516,8 +517,9 @@ A backend maps that declaration to executable or unsupported status according
 to its implementation; it does not maintain a family-name MTP table.
 
 For SafeTensors and GGUF materialization, architecture preparation also
-identifies the checkpoint parameter that establishes runtime-state dtype and
-resolves its schema-declared physical aliases against the inspected catalog.
+identifies the checkpoint parameter that establishes the generic floating-state
+dtype and resolves its schema-declared physical aliases against the inspected
+catalog.
 Dense GGUF scalar types remain typed in that portable catalog, so a concrete
 backend can preserve the width used by its loader; packed encodings instead map
 to their known materialized activation dtype. Generic backend composition must
@@ -580,8 +582,9 @@ raw or wrapper `model_type` values. GGUF inspection, planning, and
 materialization all validate requested preparation against the architecture
 plan retained by portable admission. A backend must not reparse the raw GGUF
 checkpoint to derive a second capability report. SafeTensors capability and
-runtime-state dtype derivation likewise accept only the typed architecture plan
-retained by admission; raw JSON is parsed once by the architecture registry.
+floating-state dtype derivation likewise accepts only the typed architecture
+plan retained by admission; raw JSON is parsed once by the architecture
+registry.
 Validated architecture parameter descriptions retain their canonical
 execution-unit layout alongside owner-tagged parameter groups. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for

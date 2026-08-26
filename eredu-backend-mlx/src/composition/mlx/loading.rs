@@ -199,7 +199,7 @@ pub fn materialize_model_plan(
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
-    let runtime_state_dtype_bytes = inspected_runtime_state_dtype_bytes(plan.inspection())?;
+    let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     if let Some(topology) = options
         .parallel_topology()
         .filter(|topology| !topology.is_replicated())
@@ -215,7 +215,7 @@ pub fn materialize_model_plan(
                     stream,
                     weights_stream,
                 )
-                .map(|model| MlxModel::pipeline(model, runtime_state_dtype_bytes))?;
+                .map(|model| MlxModel::pipeline(model, floating_state_dtype_bytes))?;
             #[cfg(any(feature = "image", feature = "audio"))]
             let model = model.with_processor(processor);
             return Ok(model);
@@ -229,7 +229,7 @@ pub fn materialize_model_plan(
                 stream,
                 weights_stream,
             )
-            .map(|model| complete_gguf_model(model, runtime_state_dtype_bytes)),
+            .map(|model| complete_gguf_model(model, floating_state_dtype_bytes)),
             ModelArtifact::SafeTensors {
                 path,
                 configuration,
@@ -243,7 +243,7 @@ pub fn materialize_model_plan(
                     options.weight_residency.max_mapped_shards(),
                 )?;
                 let model = materialize_tensor_parallel(&prepared, options, stream, weights_stream)
-                    .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
+                    .map(|model| MlxModel::complete(model, floating_state_dtype_bytes))?;
                 attach_processor(model, &architecture_plan)
             }
         };
@@ -252,7 +252,7 @@ pub fn materialize_model_plan(
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
             materialize_gguf_artifact(artifact, architecture_plan, options, stream, weights_stream)
-                .map(|model| complete_gguf_model(model, runtime_state_dtype_bytes))
+                .map(|model| complete_gguf_model(model, floating_state_dtype_bytes))
         }
         ModelArtifact::SafeTensors {
             path,
@@ -267,39 +267,39 @@ pub fn materialize_model_plan(
                 options.weight_residency.max_mapped_shards(),
             )?;
             let model = materialize_safetensors(&prepared, options, stream, weights_stream)
-                .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
+                .map(|model| MlxModel::complete(model, floating_state_dtype_bytes))?;
             attach_processor(model, &architecture_plan)
         }
     }
 }
 
-fn inspected_runtime_state_dtype_bytes(
+fn inspected_floating_state_dtype_bytes(
     inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<std::num::NonZeroU8, Error> {
     let source = match inspection.format() {
         eredu_core::ArtifactFormat::Gguf => {
-            eredu_architectures::preparation::prepared_gguf_runtime_state_dtype_source(
+            eredu_architectures::preparation::prepared_gguf_floating_state_dtype_source(
                 prepared_gguf_plan(inspection.architecture_plan())?,
                 inspection.tensors(),
             )
         }
         eredu_core::ArtifactFormat::SafeTensors => {
-            eredu_architectures::preparation::prepared_safetensors_runtime_state_dtype_source(
+            eredu_architectures::preparation::prepared_safetensors_floating_state_dtype_source(
                 prepared_safetensors_architecture(inspection.architecture_plan())?,
                 inspection.tensors(),
             )
         }
     }
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    mlx_runtime_state_dtype_bytes(source.dtype()).map_err(|dtype| {
+    mlx_floating_state_dtype_bytes(source.dtype()).map_err(|dtype| {
         Error::ArchitectureModel(format!(
-            "runtime-state dtype source {:?} has unsupported MLX activation dtype {dtype:?}",
+            "floating-state dtype source {:?} has unsupported MLX activation dtype {dtype:?}",
             source.checkpoint_tensor()
         ))
     })
 }
 
-fn mlx_runtime_state_dtype_bytes(
+fn mlx_floating_state_dtype_bytes(
     dtype: &eredu_core::checkpoint::TensorDtype,
 ) -> Result<std::num::NonZeroU8, eredu_core::checkpoint::TensorDtype> {
     use eredu_core::checkpoint::TensorDtype;
@@ -321,11 +321,11 @@ fn mlx_runtime_state_dtype_bytes(
 #[cfg(test)]
 #[allow(
     clippy::items_after_test_module,
-    reason = "runtime-state dtype tests stay adjacent to dtype resolution"
+    reason = "floating-state dtype tests stay adjacent to dtype resolution"
 )]
-mod runtime_state_dtype_tests {
+mod floating_state_dtype_tests {
     use super::{
-        inspected_runtime_state_dtype_bytes, mlx_runtime_state_dtype_bytes,
+        inspected_floating_state_dtype_bytes, mlx_floating_state_dtype_bytes,
         reject_complete_tensor_parallel_quantization,
     };
     use crate::backend::{DeviceAssignment, MlxParallelContext};
@@ -503,7 +503,7 @@ mod runtime_state_dtype_tests {
             (TensorDtype::F32, 4),
             (TensorDtype::F64, 8),
         ] {
-            assert_eq!(mlx_runtime_state_dtype_bytes(&dtype).unwrap().get(), bytes);
+            assert_eq!(mlx_floating_state_dtype_bytes(&dtype).unwrap().get(), bytes);
         }
     }
 
@@ -520,7 +520,7 @@ mod runtime_state_dtype_tests {
             .unwrap();
 
             assert_eq!(
-                inspected_runtime_state_dtype_bytes(&inspection)
+                inspected_floating_state_dtype_bytes(&inspection)
                     .unwrap()
                     .get(),
                 2
@@ -531,13 +531,13 @@ mod runtime_state_dtype_tests {
     #[test]
     fn packed_embedding_dtype_uses_known_mlx_materialization_width() {
         assert_eq!(
-            mlx_runtime_state_dtype_bytes(&TensorDtype::Encoded("F8_E4M3".into()))
+            mlx_floating_state_dtype_bytes(&TensorDtype::Encoded("F8_E4M3".into()))
                 .unwrap()
                 .get(),
             4
         );
         assert_eq!(
-            mlx_runtime_state_dtype_bytes(&TensorDtype::U32)
+            mlx_floating_state_dtype_bytes(&TensorDtype::U32)
                 .unwrap()
                 .get(),
             4
@@ -547,7 +547,7 @@ mod runtime_state_dtype_tests {
     #[test]
     fn invalid_activation_dtype_does_not_silently_default() {
         assert_eq!(
-            mlx_runtime_state_dtype_bytes(&TensorDtype::U8),
+            mlx_floating_state_dtype_bytes(&TensorDtype::U8),
             Err(TensorDtype::U8)
         );
     }
@@ -592,9 +592,9 @@ fn attach_processor(
 
 fn complete_gguf_model(
     materialized: MaterializedGgufModel,
-    runtime_state_dtype_bytes: std::num::NonZeroU8,
+    floating_state_dtype_bytes: std::num::NonZeroU8,
 ) -> MlxModel {
-    let model = MlxModel::complete(materialized.model, runtime_state_dtype_bytes);
+    let model = MlxModel::complete(materialized.model, floating_state_dtype_bytes);
     #[cfg(any(feature = "image", feature = "audio"))]
     let model = model.with_processor(materialized.processor);
     model
