@@ -670,26 +670,11 @@ fn load_neutral_llama_parallel(
         .map_err(|_| Error::ArchitectureModel("invalid Llama layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut planner = build.planner();
-    let static_modules = global_architecture.static_modules();
-    for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxNeuralBackend>(
-        &static_modules.embeddings,
-        &static_modules.norm,
-        static_modules.lm_head.as_ref(),
-        "model",
-    )? {
-        planner.register(group)?;
-    }
-    for index in 0..layer_count {
-        let unit = NeutralBlock::new(&args, index, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxNeuralBackend>(
-            &unit, &args, index,
-        )? {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "Llama declared no tensor-parallel parameters".into(),

@@ -118,6 +118,19 @@ where
     Ok(visitor.units)
 }
 
+/// Lowers the architecture-owned parameter topology into this rank's native
+/// tensor-parallel layout.
+pub(crate) fn parallel_layout_from_description(
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    description: &eredu_runtime::ArchitectureParameterDescription,
+) -> Result<eredu_runtime::LocalModelLayout, Error> {
+    let mut planner = build.planner();
+    for group in description.groups() {
+        planner.register(group.group().clone())?;
+    }
+    planner.finish().map(|(_, layout)| layout)
+}
+
 /// Resolves the stable name of the sole execution group with a semantic role.
 pub(crate) fn architecture_group_name<A, S>(
     architecture: &A,

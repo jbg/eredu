@@ -565,7 +565,8 @@ impl DeepSeekModel {
         parameter_description
             .validate_architecture::<MlxNeuralBackend, V3State, _>(&global)
             .map_err(|error| unsupported(error.to_string()))?;
-        let layout = parallel_layout_from_description(build, &parameter_description)?;
+        let layout =
+            crate::composition::parallel_layout_from_description(build, &parameter_description)?;
         let geometry = deepseek::parallel::v3_local_geometry(&args, &layout)?;
         let expert_targets =
             Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
@@ -636,7 +637,8 @@ impl DeepSeekModel {
         parameter_description
             .validate_architecture::<MlxNeuralBackend, V4State, _>(&global)
             .map_err(|error| unsupported(error.to_string()))?;
-        let layout = parallel_layout_from_description(build, &parameter_description)?;
+        let layout =
+            crate::composition::parallel_layout_from_description(build, &parameter_description)?;
         let geometry = deepseek::parallel::v4_local_geometry(&args, &layout)?;
         let expert_targets =
             Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
@@ -2625,17 +2627,6 @@ where
         .map(|group| architecture.group_unit_count(group).map_err(neutral_error))
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts).map_err(|error| unsupported(error.to_string()))
-}
-
-fn parallel_layout_from_description(
-    build: ParallelBuildContext,
-    description: &eredu_runtime::ArchitectureParameterDescription,
-) -> Result<eredu_runtime::LocalModelLayout, Error> {
-    let mut planner = build.planner();
-    for group in description.groups() {
-        planner.register(group.group().clone())?;
-    }
-    planner.finish().map(|(_, layout)| layout)
 }
 
 fn v3_unit_recipes(

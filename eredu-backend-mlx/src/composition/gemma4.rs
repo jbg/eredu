@@ -1870,17 +1870,13 @@ fn load_parallel_store(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
-    let layer_count = args.text.num_hidden_layers();
-    let mut planner = build.planner();
-    for group in eredu_architectures::gemma4::static_parameter_groups(&args.text)? {
-        planner.register(group)?;
-    }
-    for index in 0..layer_count {
-        for group in eredu_architectures::gemma4::layer_parameter_groups(&args.text, index)? {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "Gemma 4 declared no tensor-parallel parameters".into(),
@@ -1896,8 +1892,6 @@ fn load_parallel_store(
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &global_architecture,

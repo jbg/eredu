@@ -20916,11 +20916,10 @@ fn architecture_parallel_layout(
     description: &eredu_runtime::ArchitectureParameterDescription,
     topology: MlxParallelContext,
 ) -> Result<eredu_runtime::LocalModelLayout, Error> {
-    let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
-    for group in description.groups() {
-        planner.register(group.group().clone())?;
-    }
-    planner.finish().map(|(_, layout)| layout)
+    crate::composition::parallel_layout_from_description(
+        ParallelBuildContext::new(topology, ShardingPolicy::Require),
+        description,
+    )
 }
 
 fn architecture_group_unit_count(

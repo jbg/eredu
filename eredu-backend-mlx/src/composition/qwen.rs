@@ -1224,34 +1224,13 @@ fn load_neutral_qwen_parallel(
         .map_err(|_| Error::ArchitectureModel("invalid Qwen layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let expert_targets = Arc::new(
-        global_architecture
-            .parameter_description(stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?
-            .targets_for_role(ParameterRole::ExpertIntermediate),
-    );
-    let mut planner = build.planner();
-    let static_modules = global_architecture.static_modules();
-    for group in eredu_architectures::qwen::static_parallel_parameter_groups::<MlxNeuralBackend>(
-        &static_modules.embeddings,
-        &static_modules.norm,
-        static_modules.lm_head.as_ref(),
-        &args.parameter_root,
-    )? {
-        planner.register(group)?;
-    }
-    for index in 0..layer_count {
-        let unit =
-            eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(&args, index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        for group in eredu_architectures::qwen::routed_layer_parallel_parameter_groups::<
-            MlxNeuralBackend,
-        >(&unit, &args, index)?
-        {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let expert_targets =
+        Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "Qwen declared no tensor-parallel parameters".into(),
