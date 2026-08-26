@@ -9709,6 +9709,96 @@ impl std::fmt::Debug for PipelineModel {
     }
 }
 
+fn pipeline_encoder_unit_counts(
+    placement: &PlacedExecutionDag,
+    pipeline_stage: usize,
+) -> (usize, usize) {
+    let is_encoder_unit = |kind| {
+        matches!(
+            kind,
+            ExecutionGroupKind::VisionEncoder
+                | ExecutionGroupKind::AudioEncoder
+                | ExecutionGroupKind::Projector
+                | ExecutionGroupKind::Merger
+                | ExecutionGroupKind::ModalityFinalization
+        )
+    };
+    let global = placement
+        .groups()
+        .iter()
+        .filter(|group| is_encoder_unit(group.kind))
+        .map(|group| group.global_unit_range.len())
+        .sum();
+    let local = placement
+        .local_groups(pipeline_stage)
+        .filter(|(group, _)| is_encoder_unit(group.kind))
+        .map(|(_, range)| range.len())
+        .sum();
+    (global, local)
+}
+
+#[cfg(test)]
+#[test]
+fn pipeline_encoder_telemetry_excludes_prediction_units() {
+    let request = |id: &str,
+                   dependencies: &[&str],
+                   kind: ExecutionGroupKind,
+                   unit_count: usize,
+                   rank_path: &[usize]| {
+        ExecutionGroupPlacementRequest {
+            spec: if dependencies.is_empty() {
+                eredu_runtime::ExecutionGroupSpec::root(id)
+            } else {
+                eredu_runtime::ExecutionGroupSpec::with_dependencies(
+                    id,
+                    dependencies.iter().copied(),
+                )
+            },
+            kind,
+            unit_count,
+            rank_path: rank_path.to_vec(),
+            active_subgroup: match kind {
+                ExecutionGroupKind::Decoder | ExecutionGroupKind::Prediction => {
+                    ActiveParallelSubgroup::decoder()
+                }
+                _ => ActiveParallelSubgroup::tensor_sharded(),
+            },
+            first_owner_static_roles: Vec::new(),
+            last_owner_static_roles: Vec::new(),
+            merge_destination: None,
+            residency: ResidencyBinding {
+                unit_prefix: id.into(),
+                request_optional: false,
+            },
+            checkpoint_group: id.into(),
+        }
+    };
+    let placement = PlacedExecutionDag::plan(
+        2,
+        vec![
+            request("vision", &[], ExecutionGroupKind::VisionEncoder, 4, &[0, 1]),
+            request(
+                "decoder",
+                &["vision"],
+                ExecutionGroupKind::Decoder,
+                6,
+                &[0, 1],
+            ),
+            request(
+                "mtp.0",
+                &["decoder"],
+                ExecutionGroupKind::Prediction,
+                1,
+                &[1],
+            ),
+        ],
+        "mtp.0",
+    )
+    .unwrap();
+
+    assert_eq!(pipeline_encoder_unit_counts(&placement, 1), (4, 2));
+}
+
 impl PipelineModel {
     fn from_adapter(
         topology: MlxParallelContext,
@@ -9724,19 +9814,8 @@ impl PipelineModel {
                     .into(),
             ));
         }
-        info.global_encoder_units = info
-            .placement
-            .groups()
-            .iter()
-            .filter(|group| group.kind != ExecutionGroupKind::Decoder)
-            .map(|group| group.global_unit_range.len())
-            .sum();
-        info.local_encoder_units = info
-            .placement
-            .local_groups(info.pipeline_stage)
-            .filter(|(group, _)| group.kind != ExecutionGroupKind::Decoder)
-            .map(|(_, range)| range.len())
-            .sum();
+        (info.global_encoder_units, info.local_encoder_units) =
+            pipeline_encoder_unit_counts(&info.placement, info.pipeline_stage);
         info.local_execution_groups = info
             .placement
             .groups()
