@@ -900,6 +900,27 @@ pub fn expert_bank_spec(
     )
 }
 
+/// Exact routed and shared bank specifications for one localized sparse layer.
+pub(crate) fn localized_expert_bank_specs(
+    args: &ModelArgs,
+    layer: usize,
+    local: &TextArgs,
+    routed_expert_count: i32,
+) -> Result<(GatedProductExpertBankSpec, GatedProductExpertBankSpec), Error> {
+    let mut routed = expert_bank_spec(args, layer)?;
+    routed.expert_count = routed_expert_count;
+    routed.intermediate_dimensions = local.moe_intermediate_size();
+    routed.validate()?;
+    let cache_layer = usize::try_from(args.text_config.num_hidden_layers)
+        .map_err(Error::backend)?
+        .checked_add(layer)
+        .ok_or_else(|| Error::backend("Inkling shared expert layer overflowed"))?;
+    let mut shared = expert_bank_spec(args, cache_layer)?;
+    shared.intermediate_dimensions = local.moe_intermediate_size();
+    shared.validate()?;
+    Ok((routed, shared))
+}
+
 fn expert_bank_spec_at(
     args: &TextArgs,
     prefix: &str,

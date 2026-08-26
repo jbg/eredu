@@ -70,24 +70,12 @@ pub fn materialize_timing_phase<'a>(
     Ok(())
 }
 
-/// Policy used to assign global routed experts to ranks.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum ExpertAssignmentPolicy {
-    /// Balanced contiguous ranges, with lower ranks receiving any remainder.
-    BalancedContiguous,
-    /// Expert `e` is owned by rank `e % group_size`.
-    RoundRobin,
-    /// Explicit global-expert-to-owner-rank table.
-    Explicit(Vec<usize>),
-}
-
 /// Validated bidirectional mapping between checkpoint-global and owner-local ids.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExpertAssignment {
     global_expert_count: usize,
     group_size: usize,
     rank: usize,
-    policy: ExpertAssignmentPolicy,
     owners: Vec<usize>,
     owner_local: Vec<usize>,
     local_global: Vec<usize>,
@@ -98,88 +86,15 @@ impl ExpertAssignment {
     pub fn from_realization<S>(
         plan: &eredu_architectures::ExpertRealizationPlan<S>,
     ) -> Result<Self, Error> {
-        Self::explicit(
+        Self::from_owners(
             plan.owners().to_vec(),
             plan.expert_parallel_size(),
             plan.expert_parallel_rank(),
         )
     }
 
-    /// Creates the default balanced contiguous assignment.
-    pub fn balanced(global_experts: usize, group_size: usize, rank: usize) -> Result<Self, Error> {
-        Self::balanced_with_empty(global_experts, group_size, rank, false)
-    }
-
-    /// Creates a balanced assignment and optionally permits empty ranks.
-    pub fn balanced_with_empty(
-        global_experts: usize,
-        group_size: usize,
-        rank: usize,
-        allow_empty: bool,
-    ) -> Result<Self, Error> {
-        validate_dimensions(global_experts, group_size, rank, allow_empty)?;
-        let base = global_experts / group_size;
-        let extra = global_experts % group_size;
-        let mut owners = Vec::with_capacity(global_experts);
-        for owner in 0..group_size {
-            owners.extend(std::iter::repeat_n(
-                owner,
-                base + usize::from(owner < extra),
-            ));
-        }
-        Self::from_owners_impl(
-            owners,
-            group_size,
-            rank,
-            ExpertAssignmentPolicy::BalancedContiguous,
-            allow_empty,
-        )
-    }
-
-    /// Creates a deterministic round-robin assignment.
-    pub fn round_robin(
-        global_experts: usize,
-        group_size: usize,
-        rank: usize,
-    ) -> Result<Self, Error> {
-        validate_dimensions(global_experts, group_size, rank, false)?;
-        let owners = (0..global_experts)
-            .map(|expert| expert % group_size)
-            .collect();
-        Self::from_owners_impl(
-            owners,
-            group_size,
-            rank,
-            ExpertAssignmentPolicy::RoundRobin,
-            false,
-        )
-    }
-
-    /// Creates an assignment from one owner rank per global expert.
-    pub fn explicit(owners: Vec<usize>, group_size: usize, rank: usize) -> Result<Self, Error> {
-        let policy = ExpertAssignmentPolicy::Explicit(owners.clone());
-        Self::from_owners_impl(owners, group_size, rank, policy, false)
-    }
-
-    /// Creates an explicit assignment and optionally permits empty ranks.
-    pub fn explicit_with_empty(
-        owners: Vec<usize>,
-        group_size: usize,
-        rank: usize,
-        allow_empty: bool,
-    ) -> Result<Self, Error> {
-        let policy = ExpertAssignmentPolicy::Explicit(owners.clone());
-        Self::from_owners_impl(owners, group_size, rank, policy, allow_empty)
-    }
-
-    fn from_owners_impl(
-        owners: Vec<usize>,
-        group_size: usize,
-        rank: usize,
-        policy: ExpertAssignmentPolicy,
-        allow_empty: bool,
-    ) -> Result<Self, Error> {
-        validate_dimensions(owners.len(), group_size, rank, allow_empty)?;
+    fn from_owners(owners: Vec<usize>, group_size: usize, rank: usize) -> Result<Self, Error> {
+        validate_dimensions(owners.len(), group_size, rank)?;
         if let Some((expert, owner)) = owners
             .iter()
             .copied()
@@ -202,7 +117,7 @@ impl ExpertAssignment {
                 local_global.push(global);
             }
         }
-        if !allow_empty && next_local.contains(&0) {
+        if next_local.contains(&0) {
             return Err(Error::Parallel(format!(
                 "expert assignment creates an empty rank: counts {next_local:?}"
             )));
@@ -218,7 +133,6 @@ impl ExpertAssignment {
             global_expert_count: owners.len(),
             group_size,
             rank,
-            policy,
             owners,
             owner_local,
             local_global,
@@ -236,10 +150,6 @@ impl ExpertAssignment {
     /// Current rank within the EP group.
     pub const fn rank(&self) -> usize {
         self.rank
-    }
-    /// Assignment policy.
-    pub fn policy(&self) -> &ExpertAssignmentPolicy {
-        &self.policy
     }
     /// Global expert ids owned by this rank, in owner-local order.
     pub fn local_global_expert_ids(&self) -> &[usize] {
@@ -271,12 +181,7 @@ impl ExpertAssignment {
     }
 }
 
-fn validate_dimensions(
-    global_experts: usize,
-    group_size: usize,
-    rank: usize,
-    allow_empty: bool,
-) -> Result<(), Error> {
+fn validate_dimensions(global_experts: usize, group_size: usize, rank: usize) -> Result<(), Error> {
     if global_experts == 0 || group_size == 0 {
         return Err(Error::Parallel(
             "expert count and EP size must be nonzero".into(),
@@ -287,7 +192,7 @@ fn validate_dimensions(
             "EP rank {rank} is outside size {group_size}"
         )));
     }
-    if !allow_empty && global_experts < group_size {
+    if global_experts < group_size {
         return Err(Error::Parallel(format!(
             "cannot assign {global_experts} experts to {group_size} non-empty ranks"
         )));

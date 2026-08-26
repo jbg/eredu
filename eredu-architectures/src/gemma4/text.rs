@@ -790,6 +790,20 @@ pub fn expert_bank_spec(
     )
 }
 
+/// Returns the same architecture-owned bank at placement-resolved geometry.
+pub(crate) fn localized_expert_bank_spec(
+    args: &ModelArgs,
+    layer: usize,
+    expert_count: i32,
+    intermediate_dimensions: i32,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let mut spec = expert_bank_spec(args, layer)?;
+    spec.expert_count = expert_count;
+    spec.intermediate_dimensions = intermediate_dimensions;
+    spec.validate()?;
+    Ok(spec)
+}
+
 fn expert_bank_spec_at(
     args: &ModelArgs,
     experts_prefix: &str,

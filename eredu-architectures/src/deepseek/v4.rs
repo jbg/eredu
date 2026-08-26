@@ -2892,6 +2892,19 @@ pub fn expert_bank_spec(
     crate::deepseek::moe::expert_bank_spec(&moe_policy_at(args, layer, &root)?)
 }
 
+pub(crate) fn localized_expert_bank_spec(
+    args: &V4Args,
+    layer: usize,
+    expert_count: i32,
+    intermediate_dimensions: i32,
+) -> Result<eredu_nn::GatedProductExpertBankSpec, Error> {
+    let mut spec = expert_bank_spec(args, layer)?;
+    spec.expert_count = expert_count;
+    spec.intermediate_dimensions = intermediate_dimensions;
+    spec.validate()?;
+    Ok(spec)
+}
+
 pub(crate) fn moe_policy_at(args: &V4Args, layer: usize, root: &str) -> Result<MoePolicy, Error> {
     if layer
         >= usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)

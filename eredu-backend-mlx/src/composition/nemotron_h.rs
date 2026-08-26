@@ -261,25 +261,26 @@ impl NemotronHBindings {
 
     pub fn expert_parallel_assignment(
         &self,
-        architecture: &NeutralArchitecture,
-        topology: crate::backend::MlxParallelContext,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
+        >,
     ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 && !self.external_experts {
+        if !self.external_experts {
             return Ok(None);
         }
-        let args = architecture.args();
-        if !args.has_sparse_moe_layers() {
-            return Err(Error::Parallel(
-                "Nemotron-H PP+EP requires a sparse-MoE checkpoint".into(),
-            ));
-        }
-        Ok(Some(
-            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
-                args.n_routed_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )?,
-        ))
+        realization
+            .map(crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization)
+            .transpose()
+            .and_then(|assignment| {
+                assignment
+                    .ok_or_else(|| {
+                        Error::Parallel(
+                            "Nemotron-H external experts require an architecture realization"
+                                .into(),
+                        )
+                    })
+                    .map(Some)
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -362,12 +363,19 @@ pub fn expert_catalog_selected(
 fn cached_provider<'a>(
     cache: &'a ExpertCache,
     args: &'a ModelArgs,
+    realization: &'a eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
 ) -> CachedRelu2ExpertProvider<
     'a,
     impl FnMut(usize) -> Result<eredu_nn::Relu2ExpertBankSpec, Error> + 'a,
 > {
     CachedRelu2ExpertProvider::new(cache, move |layer| {
-        eredu_architectures::nemotron_h::expert_bank_spec(args, layer).map_err(Error::from)
+        eredu_architectures::nemotron_h::realized_expert_bank_spec(realization, args, layer)
+            .cloned()
+            .ok_or_else(|| {
+                Error::ArchitectureModel(format!(
+                    "Nemotron-H realization has no expert bank for identity layer {layer}"
+                ))
+            })
     })
 }
 
@@ -382,6 +390,17 @@ fn load_neutral(
 ) -> Result<NemotronHModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let replicated_topology = eredu_core::ParallelTopology::new(1, 1, 1, 1)
+        .and_then(|topology| eredu_core::ParallelRankTopology::new(topology, 0))
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
+        &architecture,
+        replicated_topology,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if let Some(realization) = expert_realization.clone() {
+        architecture.install_expert_realization(realization);
+    }
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -455,6 +474,7 @@ fn load_neutral(
         state_layout,
         metadata,
         execution,
+        expert_realization,
         expert_cache: None,
         parallel_info: None,
         parallel_rank: None,
@@ -511,6 +531,14 @@ fn load_neutral_parallel(
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
+        &architecture,
+        build.topology().rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if let Some(realization) = expert_realization.clone() {
+        architecture.install_expert_realization(realization);
+    }
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -664,6 +692,7 @@ fn load_neutral_parallel(
         state_layout,
         metadata,
         execution,
+        expert_realization,
         expert_cache: None,
         parallel_info: Some(info),
         parallel_rank: rank,
@@ -770,6 +799,8 @@ pub struct NemotronHModel {
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
     execution: NemotronHExecution,
+    expert_realization:
+        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>>,
     expert_cache: Option<ExpertCache>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
@@ -1034,8 +1065,13 @@ impl NemotronHModel {
     ) -> Result<Array, Error> {
         if let Some(expert_cache) = self.expert_cache.take() {
             let args = self.args.clone();
+            let realization = self.expert_realization.clone().ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "Nemotron-H expert cache has no architecture realization".into(),
+                )
+            })?;
             let result = {
-                let mut provider = cached_provider(&expert_cache, &args);
+                let mut provider = cached_provider(&expert_cache, &args, &realization);
                 self.forward_with_provider(tokens, None, cache, &mut provider, stream)
             };
             self.expert_cache = Some(expert_cache);
@@ -1148,7 +1184,10 @@ impl NemotronHModel {
         let result = match expert_cache.as_ref() {
             Some(cache_store) => {
                 let args = self.args.clone();
-                let mut provider = cached_provider(cache_store, &args);
+                let realization = self.expert_realization.clone().ok_or_else(|| {
+                    Exception::custom("Nemotron-H expert cache has no architecture realization")
+                })?;
+                let mut provider = cached_provider(cache_store, &args, &realization);
                 self.forward_with_provider_context(tokens, None, cache, &mut provider, stream)
             }
             None => self.forward_with_provider_context(
@@ -1191,7 +1230,10 @@ impl NemotronHModel {
         let result = match expert_cache.as_ref() {
             Some(cache_store) => {
                 let args = self.args.clone();
-                let mut provider = cached_provider(cache_store, &args);
+                let realization = self.expert_realization.clone().ok_or_else(|| {
+                    Exception::custom("Nemotron-H expert cache has no architecture realization")
+                })?;
+                let mut provider = cached_provider(cache_store, &args, &realization);
                 self.forward_input_with_provider_context(input, cache, &mut provider, stream)
             }
             None => self.forward_input_with_provider_context(
@@ -1329,7 +1371,12 @@ impl NemotronHModel {
             match expert_cache.as_ref() {
                 Some(expert_cache) => {
                     let args = self.args.clone();
-                    let mut provider = cached_provider(expert_cache, &args);
+                    let realization = self.expert_realization.clone().ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "Nemotron-H expert cache has no architecture realization".into(),
+                        )
+                    })?;
+                    let mut provider = cached_provider(expert_cache, &args, &realization);
                     self.forward_observed_with_provider(
                         tokens,
                         mask,

@@ -14973,6 +14973,11 @@ fn load_muse_glimmer_pipeline(
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let expert_realization = eredu_architectures::muse_glimmer::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut stage = MuseGlimmerPipelinePartition {
         architecture,
         partition,
@@ -14988,11 +14993,12 @@ fn load_muse_glimmer_pipeline(
         ingress_state: None,
     };
     if external_experts {
-        let assignment = ExpertAssignment::balanced(
-            source_args.num_experts as usize,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
-        )?;
+        let assignment =
+            ExpertAssignment::from_realization(expert_realization.as_ref().ok_or_else(|| {
+                Error::Parallel(
+                    "Muse-Glimmer external experts require an architecture realization".into(),
+                )
+            })?)?;
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         stage.expert_assignment = Some(assignment);
@@ -18011,7 +18017,7 @@ fn load_nemotron_h_pipeline(
         eredu_architectures::nemotron_h::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
     );
-    let architecture =
+    let mut architecture =
         eredu_architectures::nemotron_h::LayeredModel::<MlxNeuralBackend>::new_parallel(
             target_args.clone(),
             (*geometry).clone(),
@@ -18056,9 +18062,17 @@ fn load_nemotron_h_pipeline(
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
+    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if let Some(realization) = expert_realization.clone() {
+        architecture.install_expert_realization(realization);
+    }
     let mut stage = NemotronHPipelinePartition::new(architecture, partition, external_experts)?;
     let expert_assignment =
-        binding_adapter.expert_parallel_assignment(&stage.architecture, topology)?;
+        binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -18465,7 +18479,10 @@ impl NemotronHPipelinePartition {
                 stream,
                 observer,
             )
-        } else if let Some(assignment) = assignment.as_ref() {
+        } else if let Some(assignment) = assignment
+            .as_ref()
+            .filter(|_| !self.expert_storage.is_external())
+        {
             let expert_group = expert_group.ok_or_else(|| {
                 Error::Parallel("Nemotron-H expert assignment requires its EP communicator".into())
             })?;
@@ -20628,13 +20645,19 @@ fn load_neutral_inkling_pipeline(
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
+    let expert_realization = eredu_architectures::inkling::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut stage = InklingPipelinePartition::new(architecture, partition)?;
     if external_experts {
-        let assignment = ExpertAssignment::balanced(
-            source_args.text_config.n_routed_experts as usize,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
-        )?;
+        let assignment =
+            ExpertAssignment::from_realization(expert_realization.as_ref().ok_or_else(|| {
+                Error::Parallel(
+                    "Inkling external experts require an architecture realization".into(),
+                )
+            })?)?;
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         stage.expert_assignment = Some(assignment);
@@ -21032,13 +21055,19 @@ fn load_neutral_gemma4_pipeline(
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
+    let expert_realization = eredu_architectures::gemma4::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut stage = Gemma4PipelinePartition::new(architecture, partition)?;
-    if let Some(expert_count) = expert_count {
-        let assignment = ExpertAssignment::balanced(
-            expert_count,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
-        )?;
+    if expert_count.is_some() {
+        let assignment =
+            ExpertAssignment::from_realization(expert_realization.as_ref().ok_or_else(|| {
+                Error::Parallel(
+                    "Gemma 4 external experts require an architecture realization".into(),
+                )
+            })?)?;
         info.global_expert_count = Some(assignment.global_expert_count());
         if stage.range().clone().any(|layer| {
             source_args.text.layer_policy(layer).is_some_and(|policy| {
@@ -21443,15 +21472,6 @@ fn load_neutral_deepseek_v3_pipeline(
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV3], "DeepSeek-V3")?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    let expert_assignment = external_experts
-        .then(|| {
-            ExpertAssignment::balanced(
-                source_args.n_routed_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )
-        })
-        .transpose()?;
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v3_store(
@@ -21466,6 +21486,11 @@ fn load_neutral_deepseek_v3_pipeline(
     };
     let seed_architecture = NeutralV3Architecture::new(args.clone(), stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    let seed_expert_realization = eredu_architectures::deepseek::v3_expert_realization_plan(
+        &seed_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let parameter_description =
         eredu_architectures::deepseek::parallel::v3_parameter_description(&args)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21484,9 +21509,19 @@ fn load_neutral_deepseek_v3_pipeline(
     )?;
     topology.preflight(
         Some(target_units),
-        expert_assignment
-            .as_ref()
-            .map(ExpertAssignment::global_expert_count),
+        external_experts
+            .then(|| {
+                seed_expert_realization
+                    .as_ref()
+                    .map(eredu_architectures::ExpertRealizationPlan::global_expert_count)
+                    .ok_or_else(|| {
+                        Error::Parallel(
+                            "DeepSeek V3 external experts require an architecture realization"
+                                .into(),
+                        )
+                    })
+            })
+            .transpose()?,
     )?;
     let range = topology.layer_range(target_units)?;
     let tensor_parallel = topology.tensor_parallel_size > 1;
@@ -21505,6 +21540,20 @@ fn load_neutral_deepseek_v3_pipeline(
         }
         None => seed_architecture,
     };
+    let expert_realization = eredu_architectures::deepseek::v3_expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_assignment = external_experts
+        .then(|| {
+            ExpertAssignment::from_realization(expert_realization.as_ref().ok_or_else(|| {
+                Error::Parallel(
+                    "DeepSeek V3 external experts require an architecture realization".into(),
+                )
+            })?)
+        })
+        .transpose()?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&architecture)?;
     let placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
@@ -21842,15 +21891,6 @@ fn load_neutral_deepseek_v4_pipeline(
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV4], "DeepSeek-V4")?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    let expert_assignment = external_experts
-        .then(|| {
-            ExpertAssignment::balanced(
-                source_args.n_routed_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )
-        })
-        .transpose()?;
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v4_store(
@@ -21865,6 +21905,11 @@ fn load_neutral_deepseek_v4_pipeline(
     };
     let seed_architecture = NeutralV4Architecture::new(args.clone(), stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
+    let seed_expert_realization = eredu_architectures::deepseek::v4_expert_realization_plan(
+        &seed_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let parameter_description =
         eredu_architectures::deepseek::parallel::v4_parameter_description(&args)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21890,9 +21935,7 @@ fn load_neutral_deepseek_v4_pipeline(
     >(&seed_architecture, &parameter_description)?;
     topology.preflight(
         Some(target_units),
-        expert_assignment
-            .as_ref()
-            .map(ExpertAssignment::global_expert_count),
+        external_experts.then_some(seed_expert_realization.global_expert_count()),
     )?;
     let range = topology.layer_range(target_units)?;
     let tensor_parallel = topology.tensor_parallel_size > 1;
@@ -21911,6 +21954,14 @@ fn load_neutral_deepseek_v4_pipeline(
         }
         None => seed_architecture,
     };
+    let expert_realization = eredu_architectures::deepseek::v4_expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_assignment = external_experts
+        .then(|| ExpertAssignment::from_realization(&expert_realization))
+        .transpose()?;
     let decoder_group = architecture_decoder_group::<
         _,
         eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,

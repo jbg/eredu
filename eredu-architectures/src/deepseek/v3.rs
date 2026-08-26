@@ -1482,6 +1482,32 @@ pub fn moe_policy(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
     moe_policy_for_layer(args, layer)
 }
 
+/// Returns the architecture-owned routed bank specification for a target or MTP layer.
+pub fn expert_bank_spec(
+    args: &V3Args,
+    layer: usize,
+) -> Result<eredu_nn::GatedProductExpertBankSpec, Error> {
+    let policy = if layer < usize::try_from(args.num_hidden_layers).map_err(Error::backend)? {
+        moe_policy(args, layer)?
+    } else {
+        prediction_moe_policy(args, layer)?
+    };
+    crate::deepseek::moe::expert_bank_spec(&policy)
+}
+
+pub(crate) fn localized_expert_bank_spec(
+    args: &V3Args,
+    layer: usize,
+    expert_count: i32,
+    intermediate_dimensions: i32,
+) -> Result<eredu_nn::GatedProductExpertBankSpec, Error> {
+    let mut spec = expert_bank_spec(args, layer)?;
+    spec.expert_count = expert_count;
+    spec.intermediate_dimensions = intermediate_dimensions;
+    spec.validate()?;
+    Ok(spec)
+}
+
 pub(crate) fn prediction_moe_policy(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
     let start = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
     let end = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)

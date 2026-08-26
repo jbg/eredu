@@ -220,7 +220,7 @@ pub fn unit_recipes(
             }
         }
     }
-    if policy != LayerPolicy::SparseMoe || !include_experts {
+    if policy != LayerPolicy::SparseMoe {
         return Ok(recipes);
     }
     let expert_root = if group == 0 {
@@ -228,6 +228,11 @@ pub fn unit_recipes(
     } else {
         format!("{root}.mixer.experts")
     };
+    if !include_experts {
+        let expert_prefix = format!("{expert_root}.");
+        recipes.retain(|name, _| !name.starts_with(&expert_prefix));
+        return Ok(recipes);
+    }
     let split_prefix = format!("{expert_root}.");
     recipes.retain(|name, _| {
         name.strip_prefix(&split_prefix)
@@ -1603,6 +1608,10 @@ mod tests {
             units.get("model.layers.3.moe.experts.up_proj"),
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
         ));
+        let external = unit_recipes(&store, &args, 0, 3, false).unwrap();
+        assert!(external
+            .keys()
+            .all(|name| !name.starts_with("model.layers.3.moe.experts.")));
         assert_eq!(expert_recipes(&store, &args, 3, 1).unwrap().len(), 2);
     }
 

@@ -52,6 +52,64 @@ pub use vision::{
     VisionState, VisionStatic, VisionTower,
 };
 
+/// Derives complete expert ownership and rank-local bank geometry from Gemma 4.
+pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+    architecture: &LayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<
+    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+    eredu_nn::Error,
+> {
+    let args = architecture.args();
+    let sparse_layers = args
+        .text
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, policy)| {
+            (policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe).then_some(layer)
+        })
+        .collect::<Vec<_>>();
+    if sparse_layers.is_empty() {
+        return Ok(None);
+    }
+    let global_experts =
+        usize::try_from(args.text.num_experts.ok_or_else(|| {
+            eredu_nn::Error::backend("Gemma 4 sparse config has no expert count")
+        })?)
+        .map_err(eredu_nn::Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size,
+            topology.expert_parallel_rank,
+            false,
+        )
+        .map_err(eredu_nn::Error::backend)?
+        .len(),
+    )
+    .map_err(eredu_nn::Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(eredu_nn::Error::backend)?;
+    let mut unit_specs = std::collections::BTreeMap::new();
+    for layer in sparse_layers {
+        let local = architecture
+            .parallel_geometry()
+            .and_then(|geometry| geometry.text_block(layer))
+            .unwrap_or(&args.text);
+        let width = local
+            .moe_intermediate_size
+            .ok_or_else(|| eredu_nn::Error::backend("Gemma 4 sparse config has no expert width"))?;
+        unit_specs.insert(
+            (owner_group.clone(), layer),
+            text::localized_expert_bank_spec(&args.text, layer, local_experts, width)?,
+        );
+    }
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
+        .map_err(eredu_nn::Error::backend)
+}
+
 /// Declares Gemma 4 cache identity independently of concrete state storage.
 pub fn state_identity(
     args: &FamilyConfig,

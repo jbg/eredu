@@ -28,7 +28,7 @@ use crate::{
     },
 };
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
-use eredu_core::residency::OffloadConfig;
+use eredu_core::{residency::OffloadConfig, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,
 };
@@ -36,6 +36,19 @@ use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 
 const WORKER_RANK: &str = "EREDU_EXPERT_EXCHANGE_RING_WORKER";
 const PAYLOAD_FILE: &str = "EREDU_EXPERT_EXCHANGE_PAYLOAD";
+
+fn balanced_assignment(global_experts: usize, rank: usize) -> ExpertAssignment {
+    let topology = ParallelTopology::new(1, 1, 2, 1).unwrap();
+    let rank = ParallelRankTopology::new(topology, rank).unwrap();
+    let group = eredu_runtime::ExecutionGroupId::new("test").unwrap();
+    let plan = eredu_architectures::ExpertRealizationPlan::balanced(
+        global_experts,
+        rank,
+        std::collections::BTreeMap::from([((group, 0), ())]),
+    )
+    .unwrap();
+    ExpertAssignment::from_realization(&plan).unwrap()
+}
 
 fn f32_array(values: &[f32], shape: &[i32], stream: &Stream) -> Array {
     Array::from_slice(values, shape).copy(stream).unwrap()
@@ -228,7 +241,7 @@ fn expert_exchange_ring_worker() {
     assert_eq!(plan.recv_counts(), exchanged.source_counts);
     assert!(exchanged.statistics.payload_exchange_time > Duration::ZERO);
 
-    let assignment = ExpertAssignment::balanced(4, 2, expected_rank).unwrap();
+    let assignment = balanced_assignment(4, expected_rank);
     let mut relu2 = relu2_bank(&stream);
     let dispatched = dispatch_sharded(
         full_dispatch_blocks(expected_rank, &stream),
@@ -347,7 +360,7 @@ fn expert_exchange_ring_worker() {
     let expected_qwen = full_qwen
         .forward(&qwen_hidden, &qwen_ids, &qwen_weights, &stream)
         .unwrap();
-    let qwen_assignment = ExpertAssignment::round_robin(4, 2, expected_rank).unwrap();
+    let qwen_assignment = balanced_assignment(4, expected_rank);
     let store =
         Arc::new(SafetensorsWeightStore::open(std::env::var_os(PAYLOAD_FILE).unwrap()).unwrap());
     let entries = qwen_assignment

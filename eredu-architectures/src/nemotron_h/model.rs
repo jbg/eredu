@@ -14,7 +14,7 @@ use eredu_runtime::{
 
 use super::{
     state_layout, static_parallel_parameter_groups, unit_parallel_parameter_groups, Block,
-    EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, PredictionUnit, RetainedValues,
+    EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator, PredictionUnit, RetainedValues,
 };
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
 
@@ -227,6 +227,7 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     prediction_steps: usize,
     prediction_pattern: usize,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>>,
 }
 
 impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
@@ -303,6 +304,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             prediction_steps,
             prediction_pattern,
             parallel_geometry: None,
+            expert_realization: None,
         })
     }
 
@@ -340,6 +342,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             prediction_steps,
             prediction_pattern,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
+            expert_realization: None,
         })
     }
 
@@ -481,6 +484,14 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
     }
 
+    /// Installs the architecture-derived expert realization used by every unit factory.
+    pub fn install_expert_realization(
+        &mut self,
+        realization: crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
+    ) {
+        self.expert_realization = Some(realization);
+    }
+
     /// Constructs one canonical target or MTP unit from model-owned geometry.
     pub fn construct_unit(
         &self,
@@ -489,7 +500,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
         self.unit_path_inner(group, index)?;
-        if group == 0 {
+        let mut unit = if group == 0 {
             let block = match &self.parallel_geometry {
                 Some(geometry) => Block::new_with_geometry(
                     &self.args,
@@ -503,7 +514,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 )?,
                 None => Block::new(&self.args, index, context)?,
             };
-            Ok(Unit::Target(block))
+            Unit::Target(block)
         } else {
             let depth = group - 1;
             let unit = match &self.parallel_geometry {
@@ -534,8 +545,28 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 }
                 None => PredictionUnit::new(&self.args, depth, index, context)?,
             };
-            Ok(Unit::Prediction(unit))
+            Unit::Prediction(unit)
+        };
+        if let Some(realization) = &self.expert_realization {
+            let owner_group = if group == 0 {
+                "target".to_owned()
+            } else {
+                format!("mtp.{}", group - 1)
+            };
+            if let Some(spec) = realization.unit_spec(&owner_group, index) {
+                let operator = match &mut unit {
+                    Unit::Target(block) => &mut block.operator,
+                    Unit::Prediction(unit) => &mut unit.block.operator,
+                };
+                let Operator::Sparse(moe) = operator else {
+                    return Err(Error::backend(format!(
+                        "Nemotron-H realization names non-sparse unit {owner_group}.{index}"
+                    )));
+                };
+                moe.experts = B::relu2_expert_bank(spec.clone(), context)?;
+            }
         }
+        Ok(unit)
     }
 
     /// Begins a target pass from a placement-supplied token embedding.
