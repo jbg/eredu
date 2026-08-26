@@ -129,7 +129,10 @@ globally named units it owns, and only the logits-owning rank returns
 Backend-neutral parity, distribution metrics, timing summaries, evidence, and
 evaluation drivers live in `eredu-evaluation`. Concrete backend examples only
 select execution contexts and materialize model and codec artifacts; they do
-not own comparison thresholds or reference policy.
+not own comparison thresholds or reference policy. Backend-specific validation
+inputs and reference-fixture generators live with the backend that consumes
+them, so every published backend package contains the tooling required by its
+examples; they do not live under the facade.
 
 ## Ownership boundary
 

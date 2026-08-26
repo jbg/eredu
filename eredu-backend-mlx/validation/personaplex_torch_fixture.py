@@ -11,7 +11,7 @@ This generator never creates a synthetic model or configuration. It requires:
 
 Example:
 
-  python eredu/scripts/personaplex_torch_fixture.py \
+  python eredu-backend-mlx/validation/personaplex_torch_fixture.py \
     --artifact-dir /models/personaplex-7b-v1 \
     --checkpoint /models/personaplex-7b-v1 \
     --personaplex-source /src/personaplex \

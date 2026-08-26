@@ -71,6 +71,11 @@ The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
 The quantization example is a thin MLX composition entry point over the
 backend-neutral driver in `eredu-evaluation`.
 
+Backend-specific reference-fixture generators used by the Moshi and
+PersonaPlex parity examples live in `validation/` and are packaged with this
+crate. Reusable evidence schemas, comparison policy, and reports remain in
+`eredu-evaluation`.
+
 Completed text-session outputs are materialized through the neutral
 `BackendSession::observe_output` contract. Explicit instrumented passes bind
 the architecture's named activation points to `InspectableBackendSession`.
