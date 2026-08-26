@@ -64,6 +64,19 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns the unsupported GGML tensor type carried by this failure.
+    ///
+    /// Checkpoint operations add [`Error::Shard`] context around reader
+    /// failures. This accessor preserves semantic classification without
+    /// requiring callers to inspect rendered diagnostics.
+    pub fn unsupported_tensor_type_code(&self) -> Option<u32> {
+        match self {
+            Self::UnsupportedTensorType(code) => Some(*code),
+            Self::Shard { source, .. } => source.unsupported_tensor_type_code(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn tensor(name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::InvalidTensor {
             tensor: name.into(),

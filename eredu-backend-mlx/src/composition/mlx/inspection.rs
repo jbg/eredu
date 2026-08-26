@@ -466,8 +466,8 @@ fn reject_portable_gguf(
             InspectionReadiness::Invalid,
             None,
         ),
-        _ => {
-            let type_code = parse_unsupported_type_code(&detail);
+        eredu_core::artifact::ArtifactError::Gguf(error) => {
+            let type_code = error.unsupported_tensor_type_code();
             (
                 if type_code.is_some() {
                     InspectionIssueCode::UnsupportedTensorEncoding
@@ -480,6 +480,13 @@ fn reject_portable_gguf(
                 type_code,
             )
         }
+        _ => (
+            InspectionIssueCode::InvalidContainer,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Unverified,
+            InspectionReadiness::Unverified,
+            None,
+        ),
     };
     report.container = container;
     report.architecture_support = architecture;
@@ -806,16 +813,6 @@ fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
         detail,
         Some(report.path.clone()),
     );
-}
-
-fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
-    let marker = "unsupported GGML type ";
-    let start = detail.find(marker)? + marker.len();
-    detail[start..]
-        .split(|character: char| !character.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
 }
 
 #[cfg(test)]
@@ -1153,6 +1150,31 @@ mod tests {
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.architecture.as_deref(), Some("llama"));
         assert_eq!(report.tensor_count, Some(11));
+    }
+
+    #[test]
+    fn gguf_inspection_classifies_unsupported_tensor_type_structurally() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, true, None);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let name = b"token_embd.weight";
+        let name_offset = bytes
+            .windows(name.len())
+            .position(|window| window == name)
+            .unwrap();
+        let type_offset = name_offset + name.len() + 4 + 2 * 8;
+        bytes[type_offset..type_offset + 4].copy_from_slice(&999u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
+
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == InspectionIssueCode::UnsupportedTensorEncoding)
+            .unwrap();
+        assert_eq!(issue.tensor_type_code, Some(999));
     }
 
     #[test]

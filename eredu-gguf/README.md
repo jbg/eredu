@@ -47,7 +47,10 @@ supported encoding.
 
 The reader rejects duplicate names, invalid alignment, impossible block
 shapes, truncated or overlapping payloads, and arithmetic overflow before
-exposing a checkpoint as valid.
+exposing a checkpoint as valid. Reader and checkpoint errors retain structured
+classifications across shard context; callers can query unsupported tensor
+encodings with `Error::unsupported_tensor_type_code` without parsing diagnostic
+text.
 
 ## License
 

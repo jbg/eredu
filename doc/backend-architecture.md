@@ -763,6 +763,11 @@ and add native encoding, operator, or device compatibility checks, but do not
 rescan directories, select companions, repeat either portable admission layer,
 or parse facade-owned tokenizer and EOS metadata.
 
+GGUF reader failures remain typed through shard and portable artifact error
+wrappers. Backend inspection classifies unsupported encodings from the nested
+GGUF error variant and its numeric type code, never from rendered diagnostic
+text.
+
 `ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
 including distributed stage loaders, consume its inspected configuration,
 primary and companion checkpoint handles, and selected route directly. They

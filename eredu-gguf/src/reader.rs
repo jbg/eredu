@@ -753,12 +753,7 @@ impl<R: Read + Seek> Reader<R> {
                 a.checked_mul(b)
                     .ok_or(Error::Overflow("tensor element count"))
             })?;
-            let (block, bytes) = ggml_type.block_and_bytes().map_err(|e| match e {
-                Error::UnsupportedTensorType(v) => {
-                    Error::tensor(&name, format!("unsupported GGML type {v}"))
-                }
-                other => other,
-            })?;
+            let (block, bytes) = ggml_type.block_and_bytes()?;
             if elements != 0
                 && (dimensions.first().copied().unwrap_or(1) % block != 0 || elements % block != 0)
             {

@@ -1,6 +1,6 @@
 use eredu_gguf::{
-    ConvertedTensor, DenseDtype, Endian, GgmlType, Limits, MetadataArray as A, MetadataValue as V,
-    Reader, TensorInput, Writer, WriterOptions,
+    ConvertedTensor, DenseDtype, Endian, Error, GgmlType, Limits, MetadataArray as A,
+    MetadataValue as V, Reader, TensorInput, Writer, WriterOptions,
 };
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Seek, SeekFrom, Write};
@@ -360,6 +360,21 @@ fn malformed_descriptor_corpus_is_rejected_without_panics() {
         assert!(result.is_ok());
         assert!(result.unwrap().is_err());
     }
+}
+
+#[test]
+fn unsupported_tensor_type_remains_structured() {
+    let mut bytes = two_dense();
+    let first = locate(&bytes, b"aaaa");
+    bytes[first + 16..first + 20].copy_from_slice(&999u32.to_le_bytes());
+
+    let error = match Reader::new(Cursor::new(bytes)) {
+        Ok(_) => panic!("unsupported tensor type accepted"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, Error::UnsupportedTensorType(999)));
+    assert_eq!(error.unsupported_tensor_type_code(), Some(999));
 }
 
 #[test]
