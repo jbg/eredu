@@ -2464,7 +2464,7 @@ mod tests {
         assert_eq!(value.evaluated().unwrap().as_slice::<i32>(), &[7, 8, 9]);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
     fn materializes_from_cpu_to_metal_execution_stream() {
         let dir = tempfile::tempdir().unwrap();

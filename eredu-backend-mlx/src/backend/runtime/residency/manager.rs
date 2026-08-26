@@ -2859,7 +2859,7 @@ mod tests {
             .all(|unit| !unit.device_resident()));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
     fn promotes_host_buffers_to_a_real_metal_stream() {
         let (_dir, store) = fixture_store();

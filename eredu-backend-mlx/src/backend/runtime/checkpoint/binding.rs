@@ -1008,11 +1008,15 @@ pub enum ModuleBindingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use crate::backend::nn::linear::unloaded_maybe_quantized_linear;
     use eredu_checkpoint::store::MemoryWeightStore;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_checkpoint::AffineQuantization;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use safemlx::{quantization::MaybeQuantized, Device, DeviceType, ExecutionContext};
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn materialized_private_destination_is_canonicalized_before_quantized_loading() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

@@ -475,6 +475,7 @@ mod tests {
     use eredu_architectures::checkpoint_conversion::{
         SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
     };
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use safemlx::{Device, DeviceType, Dtype, ExecutionContext};
 
     use super::*;
@@ -590,6 +591,7 @@ mod tests {
         assert!(AffineQuantization::new(32, 7).is_err());
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn mxfp4_quantizes_rank_three_expert_banks() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -601,6 +603,7 @@ mod tests {
         assert!(quantized.biases.is_none());
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn saved_mxfp4_checkpoint_has_no_affine_bias_tensors() {
         let suffix = SystemTime::now()
@@ -656,6 +659,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn saved_checkpoint_matches_direct_tensor_quantization() {
         let suffix = SystemTime::now()

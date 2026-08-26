@@ -1611,7 +1611,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
     fn affine_gpu_conversion_matches_the_canonical_gpu_quantizer() {
         let (_directory, source, values) = direct_fixture();
@@ -2021,7 +2021,7 @@ mod tests {
         assert_mxfp4_outputs_match_reference(&transformed, &values, &context);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
     fn mxfp4_gpu_conversion_matches_the_canonical_gpu_quantizer() {
         let (_directory, source, values) = direct_fixture();

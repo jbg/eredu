@@ -1237,9 +1237,10 @@ const CUDA_HEADER: &str = concat!(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use super::quantize_activations;
     use super::{
-        decode_scale, grouped_linear, linear, quantize_activations, segmented_linear,
-        segmented_transposed_linear,
+        decode_scale, grouped_linear, linear, segmented_linear, segmented_transposed_linear,
     };
 
     #[test]
@@ -1385,6 +1386,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn block_fp8_dense_and_grouped_projections() {
         assert_block_fp8_dense_and_grouped_projections(DeviceType::Gpu);
@@ -1395,6 +1397,7 @@ mod tests {
         assert_block_fp8_dense_and_grouped_projections(DeviceType::Cpu);
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn dynamic_activation_quantization_matches_e4m3_and_clamped_scale() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -1461,6 +1464,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn block_fp8_dense_and_grouped_scale_block_boundaries() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

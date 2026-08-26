@@ -290,7 +290,10 @@ where
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 fn quantize_safetensors_for_test<M: ModuleParameters>(
     model: &mut M,
     path: impl AsRef<Path>,
@@ -522,27 +525,32 @@ pub fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Er
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::HashMap,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use eredu_checkpoint::AffineQuantization;
+    use eredu_checkpoint::WeightQuantization;
     use eredu_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use safemlx::{
         macros::ModuleParameters, module::Param, quantization::MaybeQuantized, Array, Device,
         DeviceType, Dtype, ExecutionContext,
     };
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use crate::{
         backend::nn::linear::unloaded_maybe_quantized_linear,
         backend::runtime::checkpoint::quantization::quantize_tensor,
     };
 
-    use super::{
-        gguf_quantization_configs, load_arrays_quantized_strict, quantize_safetensors_for_test,
-        StrictLoadReport,
-    };
+    use super::gguf_quantization_configs;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use super::{load_arrays_quantized_strict, quantize_safetensors_for_test, StrictLoadReport};
 
     #[test]
     fn gguf_runtime_configs_preserve_every_native_affine_format() {
@@ -619,12 +627,14 @@ mod tests {
         ));
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[derive(Debug, Clone, ModuleParameters)]
     struct QuantizedLinear {
         #[param]
         projection: MaybeQuantized<safemlx::nn::Linear>,
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[derive(Debug, Clone, ModuleParameters)]
     struct PackedExperts {
         #[param]
@@ -635,6 +645,7 @@ mod tests {
         experts_biases: Param<Option<Array>>,
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn named_array_quantization_packs_rank_three_experts() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -664,6 +675,7 @@ mod tests {
         assert!(model.experts_biases.value.is_none());
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn quantized_strict_load_maps_canonical_weight_names_to_private_slots() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -744,6 +756,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn quantized_strict_load_rejects_legacy_inner_weight_source_names() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -778,6 +791,7 @@ mod tests {
         assert_eq!(unused, ["projection.inner.weight"]);
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn mxfp4_strict_load_streams_weight_and_scales_without_biases() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
