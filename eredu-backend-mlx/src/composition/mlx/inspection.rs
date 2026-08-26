@@ -421,6 +421,13 @@ fn reject_portable_gguf(
     error: &eredu_core::artifact::ArtifactError,
 ) {
     let detail = error.to_string();
+    let missing_media_projector = matches!(
+        error,
+        eredu_core::artifact::ArtifactError::MissingRequiredGgufCompanion {
+            role: eredu_core::GgufCompanionRole::MediaProjector,
+            ..
+        }
+    );
     let (code, container, architecture, structural, type_code) = match error {
         eredu_core::artifact::ArtifactError::UnsupportedGgufArchitecture(name) => {
             report.architecture = Some(name.clone());
@@ -437,6 +444,16 @@ fn reject_portable_gguf(
             InspectionReadiness::Ready,
             InspectionReadiness::Invalid,
             InspectionReadiness::Invalid,
+            None,
+        ),
+        eredu_core::artifact::ArtifactError::MissingRequiredGgufCompanion {
+            role: eredu_core::GgufCompanionRole::MediaProjector,
+            ..
+        } => (
+            InspectionIssueCode::MissingMediaProjector,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Unverified,
             None,
         ),
         eredu_core::artifact::ArtifactError::InvalidArtifact(_)
@@ -467,12 +484,23 @@ fn reject_portable_gguf(
     report.container = container;
     report.architecture_support = architecture;
     report.structural_binding = structural;
-    report.model_loadability = if architecture == InspectionReadiness::Unsupported {
+    report.model_loadability = if missing_media_projector {
+        InspectionReadiness::Missing
+    } else if architecture == InspectionReadiness::Unsupported {
         InspectionReadiness::Unsupported
     } else {
         InspectionReadiness::Invalid
     };
     report.requested_load = report.model_loadability;
+    if missing_media_projector {
+        report.multimodal = InspectionReadiness::Missing;
+        report.requirements.push(InspectionRequirement {
+            code: InspectionIssueCode::MissingMediaProjector,
+            readiness: InspectionReadiness::Missing,
+            detail: detail.clone(),
+            path: None,
+        });
+    }
     report.issues.push(InspectionIssue {
         code,
         severity: InspectionSeverity::Error,
@@ -566,23 +594,15 @@ fn inspect_gguf_projector(
     let mut composition = GgufArtifactComposition::ModelOnly;
     match architecture {
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            match prepared_projector(validated) {
-                Some(projector) => {
-                    composition = GgufArtifactComposition::ValidatedMediaProjector;
-                    report.requirements.push(InspectionRequirement {
-                        code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: InspectionReadiness::Ready,
-                        detail: "portable admission validated the qwen3vl vision projector".into(),
-                        path: Some(projector),
-                    });
-                }
-                None => reject_projector(
-                    report,
-                    path.to_path_buf(),
-                    "Qwen3-VL preparation omitted its required media projector".into(),
-                    true,
-                ),
-            }
+            let projector = prepared_projector(validated)
+                .expect("portable Qwen3-VL admission requires a media projector");
+            composition = GgufArtifactComposition::ValidatedMediaProjector;
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Ready,
+                detail: "portable admission validated the qwen3vl vision projector".into(),
+                path: Some(projector),
+            });
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
             match prepared_projector(validated) {
@@ -659,65 +679,20 @@ fn inspect_gguf_projector(
                 );
             }
         },
-        GgufArchitecture::MuseGlimmer => match prepared_projector(validated) {
-            Some(projector_path) => {
-                composition = GgufArtifactComposition::ValidatedMediaProjector;
-                report.requirements.push(InspectionRequirement {
-                    code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: InspectionReadiness::Ready,
-                    detail: "portable admission validated the image-only Muse-Glimmer projector"
-                        .into(),
-                    path: Some(projector_path),
-                });
-            }
-            None => {
-                report.multimodal = InspectionReadiness::Missing;
-                report.requirements.push(InspectionRequirement {
-                        code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: InspectionReadiness::Missing,
-                        detail: "Muse-Glimmer text loading is available, but image input requires the sibling mmproj-kquant.gguf".into(),
-                        path: None,
-                    });
-                report.issue(
-                    InspectionIssueCode::MissingMediaProjector,
-                    InspectionSeverity::Warning,
-                    "Muse-Glimmer has no sibling projector; text loading remains available",
-                    Some(path.to_path_buf()),
-                );
-            }
-        },
+        GgufArchitecture::MuseGlimmer => {
+            let projector_path = prepared_projector(validated)
+                .expect("portable Muse-Glimmer admission requires a media projector");
+            composition = GgufArtifactComposition::ValidatedMediaProjector;
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Ready,
+                detail: "portable admission validated the image-only Muse-Glimmer projector".into(),
+                path: Some(projector_path),
+            });
+        }
         _ => report.multimodal = InspectionReadiness::NotApplicable,
     }
     composition
-}
-
-fn reject_projector(
-    report: &mut ModelInspectionReport,
-    path: PathBuf,
-    detail: String,
-    required_for_model: bool,
-) {
-    report.multimodal = InspectionReadiness::Missing;
-    if required_for_model {
-        report.model_loadability = InspectionReadiness::Missing;
-        report.requested_load = InspectionReadiness::Missing;
-    }
-    report.requirements.push(InspectionRequirement {
-        code: InspectionIssueCode::MissingMediaProjector,
-        readiness: InspectionReadiness::Missing,
-        detail: detail.clone(),
-        path: Some(path.clone()),
-    });
-    report.issue(
-        InspectionIssueCode::MissingMediaProjector,
-        if required_for_model {
-            InspectionSeverity::Error
-        } else {
-            InspectionSeverity::Warning
-        },
-        detail,
-        Some(path),
-    );
 }
 
 fn inspect_safetensors_media(
@@ -997,6 +972,42 @@ mod tests {
             residency_report.issues[0].code,
             InspectionIssueCode::UnsupportedResidencyPolicy
         );
+    }
+
+    #[test]
+    fn required_gguf_projector_failure_retains_missing_readiness() {
+        let path = Path::new("model.gguf");
+        let mut report = ModelInspectionReport::unverified(path, ArtifactFormat::Gguf);
+        let error = eredu_core::artifact::ArtifactError::MissingRequiredGgufCompanion {
+            role: eredu_core::GgufCompanionRole::MediaProjector,
+            filename_prefix: "mmproj".into(),
+            searched_directories: vec![PathBuf::from(".")],
+        };
+
+        reject_portable_gguf(&mut report, path, &error);
+
+        assert_eq!(report.container, InspectionReadiness::Ready);
+        assert_eq!(report.architecture_support, InspectionReadiness::Ready);
+        assert_eq!(report.multimodal, InspectionReadiness::Missing);
+        assert_eq!(report.model_loadability, InspectionReadiness::Missing);
+        assert_eq!(report.requested_load, InspectionReadiness::Missing);
+        assert_eq!(report.requirements.len(), 1);
+        assert_eq!(
+            report.requirements[0].code,
+            InspectionIssueCode::MissingMediaProjector
+        );
+        assert_eq!(
+            report.requirements[0].readiness,
+            InspectionReadiness::Missing
+        );
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::MissingMediaProjector
+                && issue.severity == InspectionSeverity::Error
+        }));
+        assert!(!report
+            .issues
+            .iter()
+            .any(|issue| issue.code == InspectionIssueCode::InvalidConfiguration));
     }
 
     #[test]

@@ -661,12 +661,11 @@ pub fn resolve_gguf_companions(
                 );
             }
             None if requirement.required => {
-                return Err(ArtifactError::InvalidArtifact(format!(
-                    "required GGUF companion {:?} matching {:?} was not found in {}",
-                    requirement.role,
-                    requirement.filename_prefix,
-                    display_directories(&directories)
-                )))
+                return Err(ArtifactError::MissingRequiredGgufCompanion {
+                    role: requirement.role.clone(),
+                    filename_prefix: requirement.filename_prefix.clone(),
+                    searched_directories: directories,
+                })
             }
             None => {}
         }
@@ -917,6 +916,19 @@ pub enum ArtifactError {
     /// GGUF architecture metadata is absent or has the wrong type.
     #[error("GGUF metadata is missing string key \"general.architecture\"")]
     MissingGgufArchitecture,
+    /// An architecture-required sibling GGUF artifact could not be found.
+    #[error(
+        "required GGUF companion {role:?} matching {filename_prefix:?} was not found in {searched}",
+        searched = display_directories(.searched_directories)
+    )]
+    MissingRequiredGgufCompanion {
+        /// Semantic role of the missing companion.
+        role: GgufCompanionRole,
+        /// Filename prefix used to discover the companion.
+        filename_prefix: String,
+        /// Directories searched in priority order.
+        searched_directories: Vec<PathBuf>,
+    },
     /// Header/catalog content is contradictory.
     #[error("invalid model artifact: {0}")]
     InvalidArtifact(String),
@@ -1140,6 +1152,32 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_gguf_companions(&primary, &[required]).is_err());
+    }
+
+    #[test]
+    fn missing_required_companion_preserves_its_semantic_role() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("model.gguf");
+        write_gguf_fixture(&primary, GgmlType::F32);
+        let requirement = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            true,
+            "mmproj",
+            0,
+            GgufCompanionEncoding::DensePreferred,
+        )
+        .unwrap();
+
+        let error = resolve_gguf_companions(&primary, &[requirement]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::MissingRequiredGgufCompanion {
+                role: GgufCompanionRole::MediaProjector,
+                filename_prefix,
+                searched_directories,
+            } if filename_prefix == "mmproj" && searched_directories == [root.path()]
+        ));
     }
 
     #[test]

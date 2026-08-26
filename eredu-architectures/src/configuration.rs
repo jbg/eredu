@@ -1180,6 +1180,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             gguf_companion_requirements(GgufArchitecture::Qwen3Vl).unwrap(),
+            vec![required_quantized.clone()]
+        );
+        assert_eq!(
+            gguf_companion_requirements(GgufArchitecture::Qwen3VlMoe).unwrap(),
+            vec![required_quantized.clone()]
+        );
+        assert_eq!(
+            gguf_companion_requirements(GgufArchitecture::MuseGlimmer).unwrap(),
             vec![required_quantized]
         );
         let optional_dense = GgufCompanionRequirement::new(
