@@ -62,17 +62,19 @@ alias neutral crates into its namespace; direct backend consumers import
 neutral contracts from their owning crates. Composition-only load validation
 helpers remain crate-private rather than becoming part of the backend API.
 
-The facade likewise does not alias `eredu-core` or re-export `eredu-runtime`
-infrastructure. Cache workers, checkpoint storage bindings, residency and
-prefetch engines, generic schedulers and work-lifecycle contracts, parameter
-plans, and other infrastructure contracts are imported from their owning
-crates. Backend providers, sessions, prepared models, runtime handles,
-completion and submission primitives, and distributed execution contracts are
-likewise imported directly from `eredu-core`. The facade root retains only
-deliberately application-facing types.
+The facade may re-export deliberately application-facing portable value types
+from neutral crates so applications can use its high-level APIs without
+reconstructing their dependency graph. That convenience does not extend to
+generic infrastructure. Cache workers, checkpoint storage bindings, residency
+and prefetch engines, generic schedulers and completions, speculative execution
+request and lane contracts, parameter plans, and other infrastructure are
+imported from their owning crates. Backend providers, sessions, prepared
+models, runtime handles, completion and submission primitives, distributed
+execution contracts, and `eredu-runtime` infrastructure likewise come directly
+from their owning crates rather than facade compatibility re-exports.
 
 The selected adapter exposes the causal backend type and facade-owned realtime
-model, scheduler, session, and completed-step wrappers because the neutral
+model, scheduler, session, completed-step, and error wrappers because the neutral
 execution contracts have different model, input, output, session, and
 completion associated types. The realtime factory loads an architecture-owned
 preparation directly into the facade model. The facade scheduler materializes

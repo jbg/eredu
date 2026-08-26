@@ -24,8 +24,10 @@ families, checkpoint formats, modalities, and execution capabilities.
 
 The portable build includes artifact inspection, tokenizer and chat metadata,
 generation orchestration, media request descriptions, execution planning, and
-application-facing backend metadata. Backend implementers import the required
-contracts directly from their owning crates.
+application-facing backend metadata. The facade re-exports selected portable
+value types used by those APIs, but generic schedulers, backend traits, and
+speculative execution transport contracts are imported from their owning
+crates.
 
 ## Loading a model
 

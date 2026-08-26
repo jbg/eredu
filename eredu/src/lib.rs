@@ -20,6 +20,30 @@
 //! ```compile_fail
 //! use eredu::Completion;
 //! ```
+//!
+//! Generic realtime scheduling and speculative execution infrastructure also
+//! comes from `eredu-core`; the facade exposes selected-backend realtime
+//! wrappers and prepared-chat speculative requests instead:
+//!
+//! ```compile_fail
+//! use eredu::RealtimeScheduler;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::RealtimeCompletedStep;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::RealtimeError;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::SpeculativeGenerationBatchRequest;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::SpeculativeGenerationLane;
+//! ```
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]
@@ -87,14 +111,13 @@ pub use eredu_core::{
     MtpCheckpointKind, MtpTelemetry, MultimodalRequest, MultimodalSegment, ObservationError,
     ObservationKind, ObservationRequest, ObservationSelector, ObservationSet, ObservationValue,
     Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, RealtimeCompletedStep, RealtimeConfigError,
-    RealtimeDecisionDiagnostics, RealtimeError, RealtimeFrameConvention, RealtimeFrameForcing,
-    RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition, RealtimeInputFrame,
-    RealtimeOutputFrame, RealtimeSampling, RealtimeScheduleError, RealtimeScheduler,
-    RealtimeSlotCoordinate, RealtimeSlotOccupancy, RealtimeSpeechConfig, RealtimeTargetDecision,
-    RealtimeTargetSource, RealtimeTemporalSource, ResidencyPlan, ResidencyTelemetry, RgbImage,
-    RuntimeStateEstimate, SessionCapabilities, SlidingWindowLayerCount, SpeculativeDraft,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
+    PlanExplanationEntry, PlanExplanationLevel, RealtimeConfigError, RealtimeDecisionDiagnostics,
+    RealtimeFrameConvention, RealtimeFrameForcing, RealtimeFrameScheduleState, RealtimeFrameSlot,
+    RealtimeFrameTransition, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
+    RealtimeScheduleError, RealtimeSlotCoordinate, RealtimeSlotOccupancy, RealtimeSpeechConfig,
+    RealtimeTargetDecision, RealtimeTargetSource, RealtimeTemporalSource, ResidencyPlan,
+    ResidencyTelemetry, RgbImage, RuntimeStateEstimate, SessionCapabilities,
+    SlidingWindowLayerCount, SpeculativeDraft, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationOutput, StateMemoryAssumptions, StaticMemoryReport, TensorObservation,
     TensorObservationData, TextGenerationConfig, TextSamplingStrategy, TimingTelemetry,
     TokenFilter, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
