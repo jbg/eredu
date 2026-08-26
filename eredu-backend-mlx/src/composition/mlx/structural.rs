@@ -526,7 +526,12 @@ mod admission_policy_tests {
         .unwrap();
         let options =
             ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
-                .with_parallel_topology(topology);
+                .with_parallel_topology(
+                    topology,
+                    eredu_runtime::PipelineWireContract::new(
+                        eredu_runtime::PipelineActivationDtype::Float32,
+                    ),
+                );
 
         let error = validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
@@ -555,7 +560,12 @@ mod admission_policy_tests {
         .unwrap();
         let options =
             ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
-                .with_parallel_topology(topology);
+                .with_parallel_topology(
+                    topology,
+                    eredu_runtime::PipelineWireContract::new(
+                        eredu_runtime::PipelineActivationDtype::Float32,
+                    ),
+                );
 
         validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
             .unwrap();
@@ -622,7 +632,12 @@ mod admission_policy_tests {
         let error = validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
             &dense_qwen3_config(),
-            ModelLoadOptions::with_parallel(topology),
+            ModelLoadOptions::with_parallel(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+            ),
         )
         .unwrap_err();
 
@@ -643,7 +658,12 @@ mod admission_policy_tests {
         validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
             &dense_qwen3_config(),
-            ModelLoadOptions::with_parallel(topology),
+            ModelLoadOptions::with_parallel(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+            ),
         )
         .unwrap();
     }

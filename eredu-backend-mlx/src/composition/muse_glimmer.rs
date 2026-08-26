@@ -246,7 +246,7 @@ pub fn load_dflash_safetensors(
         ));
     }
     if options
-        .parallel
+        .parallel_topology()
         .is_some_and(|topology| !topology.is_replicated())
     {
         return Err(Error::Parallel(
@@ -304,7 +304,7 @@ pub fn load_dflash_gguf(
         ));
     }
     if options
-        .parallel
+        .parallel_topology()
         .is_some_and(|topology| !topology.is_replicated())
     {
         return Err(Error::Parallel(

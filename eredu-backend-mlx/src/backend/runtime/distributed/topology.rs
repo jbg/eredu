@@ -998,32 +998,36 @@ mod tests {
 
     #[test]
     fn replicated_load_options_reject_distributed_session_topologies() {
+        let wire = eredu_runtime::PipelineWireContract::new(
+            eredu_runtime::PipelineActivationDtype::Float32,
+        );
         let default = crate::backend::ModelLoadOptions::default();
         assert_eq!(default.quantization, None);
-        assert_eq!(default.parallel, None);
+        assert_eq!(default.parallel_topology(), None);
         default.validate_replicated().unwrap();
 
-        let singleton = crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1));
+        let singleton = crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1), wire);
         singleton.validate_replicated().unwrap();
         let combined = crate::backend::ModelLoadOptions::with_quantization(
             eredu_checkpoint::WeightQuantization::MxFp4,
         )
-        .with_parallel_topology(topology(0, 1, 1, 1));
+        .with_parallel_topology(topology(0, 1, 1, 1), wire);
         assert_eq!(
             combined.quantization,
             Some(eredu_checkpoint::WeightQuantization::MxFp4)
         );
-        assert!(combined.parallel.unwrap().is_replicated());
+        assert!(combined.parallel_topology().unwrap().is_replicated());
 
-        let tensor_parallel = crate::backend::ModelLoadOptions::with_parallel(topology(0, 2, 1, 1));
+        let tensor_parallel =
+            crate::backend::ModelLoadOptions::with_parallel(topology(0, 2, 1, 1), wire);
         assert!(tensor_parallel.validate_replicated().is_err());
 
         let pipeline_partitioned =
-            crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 2, 1));
+            crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 2, 1), wire);
         assert!(pipeline_partitioned.validate_replicated().is_err());
 
         let expert_partitioned =
-            crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 2));
+            crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 2), wire);
         assert!(expert_partitioned.validate_replicated().is_err());
     }
 

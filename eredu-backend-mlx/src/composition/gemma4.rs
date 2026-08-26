@@ -356,7 +356,7 @@ pub fn load_assistant_safetensors(
         ));
     }
     if options
-        .parallel
+        .parallel_topology()
         .is_some_and(|topology| !topology.is_replicated())
     {
         return Err(Error::Parallel(
@@ -414,7 +414,7 @@ pub fn load_assistant_gguf(
         ));
     }
     if options
-        .parallel
+        .parallel_topology()
         .is_some_and(|topology| !topology.is_replicated())
     {
         return Err(Error::Parallel(

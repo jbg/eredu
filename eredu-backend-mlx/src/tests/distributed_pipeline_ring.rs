@@ -206,8 +206,11 @@ fn distributed_materialization_uses_the_planned_configuration() {
         MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
     let layerwise = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-    let options = ModelLoadOptions::with_parallel(topology)
-        .with_weight_residency(WeightResidency::layerwise_host(layerwise));
+    let options = ModelLoadOptions::with_parallel(
+        topology,
+        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
+    )
+    .with_weight_residency(WeightResidency::layerwise_host(layerwise));
     let inspection =
         eredu_architectures::configuration::inspect_artifact(checkpoint.path()).unwrap();
     let plan =
@@ -244,7 +247,12 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
-        ModelLoadOptions::with_parallel(topology),
+        ModelLoadOptions::with_parallel(
+            topology,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        ),
         &stream,
     );
 
@@ -259,12 +267,36 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
-        ModelLoadOptions::with_parallel(topology),
+        ModelLoadOptions::with_parallel(
+            topology,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        ),
         &stream,
     );
 
     assert_eq!(model.model_family(), ModelKind::Qwen35);
     assert_eq!(model.effective_model_type(), "qwen3_5_moe_text");
+}
+
+#[test]
+fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_fixture(checkpoint.path());
+    let topology =
+        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            .unwrap();
+    let wire_contract =
+        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Bfloat16);
+    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let model = load_prepared_pipeline_model(
+        checkpoint.path(),
+        ModelLoadOptions::with_parallel(topology, wire_contract),
+        &stream,
+    );
+
+    assert_eq!(model.stage_info().wire_contract, wire_contract);
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -614,14 +646,23 @@ fn pipeline_ring_worker() {
     if std::env::var_os(OPAQUE_SESSION).is_some() {
         let backend = crate::native::distributed_backend(&stream, &stream, &group);
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
-            ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                WeightResidency::with_expert_cache(
-                    NonExpertWeightResidency::FullyResident,
-                    ExpertCacheLoadOptions::default(),
+            ModelLoadOptions::with_parallel(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
                 ),
             )
+            .with_weight_residency(WeightResidency::with_expert_cache(
+                NonExpertWeightResidency::FullyResident,
+                ExpertCacheLoadOptions::default(),
+            ))
         } else {
-            ModelLoadOptions::with_parallel(topology)
+            ModelLoadOptions::with_parallel(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+            )
         };
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
         let expected_effective_model_type = if family == FixtureFamily::Gemma {
@@ -996,10 +1037,19 @@ fn pipeline_ring_worker() {
     };
     let base_options = || {
         if requantize {
-            ModelLoadOptions::with_quantization(requested_quantization)
-                .with_parallel_topology(topology)
+            ModelLoadOptions::with_quantization(requested_quantization).with_parallel_topology(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+            )
         } else {
-            ModelLoadOptions::with_parallel(topology)
+            ModelLoadOptions::with_parallel(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+            )
         }
     };
     let layerwise_options =

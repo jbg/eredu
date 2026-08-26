@@ -542,8 +542,8 @@ pub struct PipelineStageInfo {
     pub model_kind: ModelKind,
     /// Flattened hidden width transferred between pipeline stages.
     pub activation_hidden_size: i32,
-    /// Dtype used for transferred hidden activations.
-    pub activation_dtype: Dtype,
+    /// Backend-neutral contract used for transferred hidden activations.
+    pub wire_contract: eredu_runtime::PipelineWireContract,
     /// Checkpoint tensors selected for this rank.
     pub owned_tensors: Vec<String>,
     /// Parameter bytes materialized while loading this stage.
@@ -561,6 +561,12 @@ pub struct PipelineStageInfo {
     /// Bounded stage-local load-time materialization telemetry, when dense
     /// semantic weights were converted into a packed overlay.
     pub materialization: Option<WeightMaterializationReport>,
+}
+
+impl PipelineStageInfo {
+    fn activation_dtype(&self) -> Dtype {
+        mlx_pipeline_activation_dtype(self.wire_contract.activation_dtype())
+    }
 }
 
 /// Rank-local ownership projected from the authoritative placed DAG.
@@ -649,6 +655,14 @@ const fn mlx_boundary_dtype(kind: eredu_runtime::BoundaryTensorDtype, activation
         eredu_runtime::BoundaryTensorDtype::Activation => activation,
         eredu_runtime::BoundaryTensorDtype::Uint32 => Dtype::Uint32,
         eredu_runtime::BoundaryTensorDtype::Int32 => Dtype::Int32,
+    }
+}
+
+const fn mlx_pipeline_activation_dtype(dtype: eredu_runtime::PipelineActivationDtype) -> Dtype {
+    match dtype {
+        eredu_runtime::PipelineActivationDtype::Float16 => Dtype::Float16,
+        eredu_runtime::PipelineActivationDtype::Bfloat16 => Dtype::Bfloat16,
+        eredu_runtime::PipelineActivationDtype::Float32 => Dtype::Float32,
     }
 }
 
@@ -10350,8 +10364,12 @@ impl PipelineModel {
                                 )));
                             }
                             self.stage.merge_placed_ingress_arrays(arrays)?;
-                            let payload =
-                                self.stage.finish_placed_ingress(tensor, execution_stream)?;
+                            let payload = normalize_pipeline_payload_for_wire(
+                                self.stage.finish_placed_ingress(tensor, execution_stream)?,
+                                self.info.activation_dtype(),
+                                &auxiliary_specs,
+                                execution_stream,
+                            )?;
                             let arrays = payload.clone().into_arrays();
                             validate_pipeline_payload_arrays(
                                 &self.info,
@@ -10677,7 +10695,7 @@ impl PipelineModel {
             let peer = predecessor.expect("non-first predecessor");
             let received = distributed::recv(
                 &step.activation_shape(self.info.activation_hidden_size),
-                self.info.activation_dtype,
+                self.info.activation_dtype(),
                 peer,
                 group,
                 stream,
@@ -10687,14 +10705,14 @@ impl PipelineModel {
                     "stage {} failed to receive {:?} {:?} activations from rank {peer}: {error}",
                     self.info.pipeline_stage,
                     step.activation_shape(self.info.activation_hidden_size),
-                    self.info.activation_dtype
+                    self.info.activation_dtype()
                 ))
             })?;
             let received_auxiliary = self
                     .resolved_boundary_specs(step)?
                     .into_iter()
                     .map(|spec| {
-                        let dtype = mlx_boundary_dtype(spec.dtype(), self.info.activation_dtype);
+                        let dtype = mlx_boundary_dtype(spec.dtype(), self.info.activation_dtype());
                         let value = distributed::recv(
                             spec.shape(),
                             dtype,
@@ -10801,21 +10819,28 @@ impl PipelineModel {
         retained.extend(placed_retained);
         match output {
             PipelineStageOutput::Hidden(payload) => {
+                let auxiliary_specs = self.resolved_boundary_specs(step)?;
+                let payload = normalize_pipeline_payload_for_wire(
+                    payload,
+                    self.info.activation_dtype(),
+                    &auxiliary_specs,
+                    stream,
+                )?;
                 let hidden = &payload.hidden;
                 let expected = step.activation_shape(self.info.activation_hidden_size);
-                if hidden.shape() != expected || hidden.dtype() != self.info.activation_dtype {
+                if hidden.shape() != expected || hidden.dtype() != self.info.activation_dtype() {
                     return Err(Error::Parallel(format!(
                         "stage {} produced activations shaped {:?} with {:?}, expected {expected:?} with {:?}",
                         self.info.pipeline_stage,
                         hidden.shape(),
                         hidden.dtype(),
-                        self.info.activation_dtype
+                        self.info.activation_dtype()
                     )));
                 }
                 validate_auxiliary_tensors(
                     &self.info,
                     payload.auxiliary.tensors(),
-                    &self.resolved_boundary_specs(step)?,
+                    &auxiliary_specs,
                 )?;
                 let peer = successor.expect("non-final successor");
                 let sent = distributed::send(hidden, peer, group, stream).map_err(|error| {
@@ -11353,6 +11378,7 @@ fn pipeline_kind_validation_trusts_admission_and_checks_the_adapter() {
 
 fn base_info(
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     range: Range<usize>,
     placement: Arc<PlacedExecutionDag>,
     model_kind: ModelKind,
@@ -11389,7 +11415,7 @@ fn base_info(
             .expect("validated topology has valid pipeline successor geometry"),
         model_kind,
         activation_hidden_size: hidden_size,
-        activation_dtype: Dtype::Float32,
+        wire_contract,
         owned_tensors: Vec::new(),
         local_parameter_bytes: 0,
         planned_owned_parameter_bytes: 0,
@@ -11575,12 +11601,33 @@ fn validate_pipeline_payload_arrays(
         .collect::<Vec<_>>();
     validate_pipeline_payload_metadata(
         &step.activation_shape(info.activation_hidden_size),
-        info.activation_dtype,
+        info.activation_dtype(),
         &metadata,
         boundary_identity,
         auxiliary_specs,
         context,
     )
+}
+
+fn normalize_pipeline_payload_for_wire(
+    mut payload: PipelinePayload,
+    activation_dtype: Dtype,
+    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    stream: &Stream,
+) -> Result<PipelinePayload, Error> {
+    if payload.hidden.dtype().is_float() && payload.hidden.dtype() != activation_dtype {
+        payload.hidden = payload.hidden.as_dtype(activation_dtype, stream)?;
+    }
+    for (value, spec) in payload.auxiliary.tensors.iter_mut().zip(auxiliary_specs) {
+        let expected = mlx_boundary_dtype(spec.dtype(), activation_dtype);
+        if spec.dtype() == eredu_runtime::BoundaryTensorDtype::Activation
+            && value.dtype().is_float()
+            && value.dtype() != expected
+        {
+            *value = value.as_dtype(expected, stream)?;
+        }
+    }
+    Ok(payload)
 }
 
 #[derive(Clone, Copy)]
@@ -11642,7 +11689,7 @@ fn validate_auxiliary_tensors(
         )));
     }
     for (index, (value, spec)) in values.iter().zip(specs).enumerate() {
-        let expected_dtype = mlx_boundary_dtype(spec.dtype(), info.activation_dtype);
+        let expected_dtype = mlx_boundary_dtype(spec.dtype(), info.activation_dtype());
         if value.shape() != spec.shape() || value.dtype() != expected_dtype {
             return Err(Error::Parallel(format!(
                 "pipeline stage {} auxiliary tensor {index} ({:?}) has shape {:?} and {:?}, expected {:?} and {:?}",
@@ -11671,10 +11718,12 @@ fn validate_hidden_metadata(
             info.pipeline_stage
         )));
     }
-    if dtype != info.activation_dtype {
+    if dtype != info.activation_dtype() {
         return Err(Error::Parallel(format!(
             "stage {} expected {:?} activations, got {:?}",
-            info.pipeline_stage, info.activation_dtype, dtype
+            info.pipeline_stage,
+            info.activation_dtype(),
+            dtype
         )));
     }
     Ok(())
@@ -11687,7 +11736,7 @@ fn load_bound_module(
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
-) -> Result<(u64, Vec<String>, Option<Dtype>), Error> {
+) -> Result<(u64, Vec<String>), Error> {
     load_bound_module_excluding(
         module,
         store,
@@ -11708,12 +11757,8 @@ fn load_bound_module_excluding(
     weights_stream: &Stream,
     stream: &Stream,
     excluded: &dyn Fn(&str) -> bool,
-) -> Result<(u64, Vec<String>, Option<Dtype>), Error> {
+) -> Result<(u64, Vec<String>), Error> {
     let arrays = materialize_module_bindings(store, bindings, weights_stream, stream)?;
-    let dtype = arrays
-        .values()
-        .find(|value| value.dtype().is_float())
-        .map(Array::dtype);
     if let Some(quantization) = quantize_on_load {
         populate_module_from_dense_arrays_quantized_excluding(
             module,
@@ -11742,7 +11787,7 @@ fn load_bound_module_excluding(
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
-    Ok((bytes, names, dtype))
+    Ok((bytes, names))
 }
 
 /// Shared accounting and materialization for pipeline-owned modules.
@@ -11753,7 +11798,6 @@ struct PipelineLoadAccumulator {
     family: &'static str,
     binding_authority: Vec<eredu_runtime::OwnedParameterGroupSpec>,
     bytes: u64,
-    activation_dtype: Option<Dtype>,
     owned_tensors: Vec<String>,
 }
 
@@ -11766,7 +11810,6 @@ impl PipelineLoadAccumulator {
             family,
             binding_authority: partition.parameter_bindings().to_vec(),
             bytes: 0,
-            activation_dtype: None,
             owned_tensors: Vec::new(),
         }
     }
@@ -11782,7 +11825,7 @@ impl PipelineLoadAccumulator {
         stream: &Stream,
     ) -> Result<(), Error> {
         validate_partition_owner_bindings(&self.binding_authority, &owner, bindings)?;
-        let (bytes, names, dtype) = load_bound_module(
+        let (bytes, names) = load_bound_module(
             module,
             store,
             bindings,
@@ -11793,7 +11836,6 @@ impl PipelineLoadAccumulator {
         self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
             Error::Parallel(format!("{} pipeline byte total overflowed", self.family))
         })?;
-        self.activation_dtype = self.activation_dtype.or(dtype);
         self.owned_tensors.extend(names);
         Ok(())
     }
@@ -11818,7 +11860,7 @@ impl PipelineLoadAccumulator {
             bindings,
             excluded_roles,
         )?;
-        let (bytes, names, dtype) = load_bound_module_excluding(
+        let (bytes, names) = load_bound_module_excluding(
             module,
             store,
             bindings,
@@ -11830,21 +11872,11 @@ impl PipelineLoadAccumulator {
         self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
             Error::Parallel(format!("{} pipeline byte total overflowed", self.family))
         })?;
-        self.activation_dtype = self.activation_dtype.or(dtype);
         self.owned_tensors.extend(names);
         Ok(())
     }
 
-    fn finish(self, info: &mut PipelineStageInfo) -> Result<u64, Error> {
-        self.finish_with_default(info, Dtype::Float32)
-    }
-
-    fn finish_with_default(
-        mut self,
-        info: &mut PipelineStageInfo,
-        default_dtype: Dtype,
-    ) -> Result<u64, Error> {
-        info.activation_dtype = self.activation_dtype.unwrap_or(default_dtype);
+    fn finish(mut self, info: &mut PipelineStageInfo) -> Result<u64, Error> {
         info.local_parameter_bytes = usize::try_from(self.bytes).map_err(|_| {
             Error::Parallel(format!(
                 "{} pipeline parameter bytes exceed usize",
@@ -12482,6 +12514,26 @@ mod binding_authority_tests {
         )
         .unwrap_err();
         assert!(dtype.to_string().contains("tokens"));
+
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let normalized = normalize_pipeline_payload_for_wire(
+            PipelinePayload {
+                hidden: Array::from_slice(&[0.0_f32; 48], &hidden_shape),
+                auxiliary: PipelineAuxiliaryState::new(vec![
+                    Array::from_slice(&[0_u32; 6], &tokens_shape),
+                    Array::from_slice(&[0.0_f32; 96], &capture_shape),
+                    Array::from_slice(&[0_i32], &delta_shape),
+                ]),
+            },
+            Dtype::Bfloat16,
+            &specs,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(normalized.hidden.dtype(), Dtype::Bfloat16);
+        assert_eq!(normalized.auxiliary.tensors()[0].dtype(), Dtype::Uint32);
+        assert_eq!(normalized.auxiliary.tensors()[1].dtype(), Dtype::Bfloat16);
+        assert_eq!(normalized.auxiliary.tensors()[2].dtype(), Dtype::Int32);
     }
 }
 
@@ -12954,7 +13006,7 @@ pub fn load_pipeline_model_with_options(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     crate::composition::mlx::loading::validate_plan_options(&plan, options)?;
-    let topology = options.parallel.ok_or_else(|| {
+    let (topology, wire_contract) = options.parallel_execution().ok_or_else(|| {
         Error::Parallel("distributed stage loading requires ModelLoadOptions::parallel".into())
     })?;
     validate_distributed_stage_topology(topology)?;
@@ -13044,6 +13096,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13064,6 +13117,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         stream,
@@ -13087,6 +13141,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13113,6 +13168,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13131,6 +13187,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13158,6 +13215,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13180,6 +13238,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13200,6 +13259,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13223,6 +13283,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13244,6 +13305,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13265,6 +13327,7 @@ pub fn load_pipeline_model_with_options(
                             model_kind,
                             store,
                             topology,
+                            wire_contract,
                             options.quantization,
                             dense_stream,
                             expert_cache,
@@ -13277,6 +13340,7 @@ pub fn load_pipeline_model_with_options(
                             model_kind,
                             store,
                             topology,
+                            wire_contract,
                             options.quantization,
                             dense_stream,
                             expert_cache,
@@ -13298,6 +13362,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13316,6 +13381,7 @@ pub fn load_pipeline_model_with_options(
                         model_kind,
                         store,
                         topology,
+                        wire_contract,
                         options.quantization,
                         dense_stream,
                         expert_cache,
@@ -13366,6 +13432,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 stream,
@@ -13379,6 +13446,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13393,6 +13461,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13407,6 +13476,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13420,6 +13490,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13433,6 +13504,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13446,6 +13518,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13459,6 +13532,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13472,6 +13546,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13485,6 +13560,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13501,6 +13577,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13516,6 +13593,7 @@ pub fn load_pipeline_model_with_options(
                     model_kind,
                     store,
                     topology,
+                    wire_contract,
                     options.quantization,
                     dense_stream,
                     expert_cache,
@@ -13528,6 +13606,7 @@ pub fn load_pipeline_model_with_options(
                     model_kind,
                     store,
                     topology,
+                    wire_contract,
                     options.quantization,
                     dense_stream,
                     expert_cache,
@@ -13542,6 +13621,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13556,6 +13636,7 @@ pub fn load_pipeline_model_with_options(
                 model_kind,
                 store,
                 topology,
+                wire_contract,
                 options.quantization,
                 dense_stream,
                 expert_cache,
@@ -13574,6 +13655,7 @@ fn load_llama_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
@@ -13641,6 +13723,7 @@ fn load_llama_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -13836,6 +13919,7 @@ fn load_qwen_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -13915,6 +13999,7 @@ fn load_qwen_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -14192,6 +14277,7 @@ fn load_muse_glimmer_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -14268,6 +14354,7 @@ fn load_muse_glimmer_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -14617,6 +14704,7 @@ fn load_neutral_qwen_vl_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -14703,6 +14791,7 @@ fn load_neutral_qwen_vl_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -16314,6 +16403,7 @@ fn load_gpt_oss_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -16397,6 +16487,7 @@ fn load_gpt_oss_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -16822,6 +16913,7 @@ fn load_lfm2_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -16899,6 +16991,7 @@ fn load_lfm2_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -17329,6 +17422,7 @@ fn load_nemotron_h_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -17414,6 +17508,7 @@ fn load_nemotron_h_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         Arc::clone(&neutral_placement),
         model_kind,
@@ -18374,6 +18469,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -18469,6 +18565,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -18820,6 +18917,7 @@ fn load_neutral_qwen_conditional_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -18913,6 +19011,7 @@ fn load_neutral_qwen_conditional_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -19329,6 +19428,7 @@ fn load_kimi_linear_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -19407,6 +19507,7 @@ fn load_kimi_linear_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -19853,6 +19954,7 @@ fn load_neutral_inkling_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -19939,6 +20041,7 @@ fn load_neutral_inkling_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         Arc::clone(&neutral_placement),
         model_kind,
@@ -20251,6 +20354,7 @@ fn load_neutral_gemma4_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -20350,6 +20454,7 @@ fn load_neutral_gemma4_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         Arc::clone(&neutral_placement),
         model_kind,
@@ -20788,6 +20893,7 @@ fn load_neutral_deepseek_v3_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -20867,6 +20973,7 @@ fn load_neutral_deepseek_v3_pipeline(
     )?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,
@@ -21189,6 +21296,7 @@ fn load_neutral_deepseek_v4_pipeline(
     model_kind: ModelKind,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
+    wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -21278,6 +21386,7 @@ fn load_neutral_deepseek_v4_pipeline(
     >(&architecture, topology.pipeline_parallel_size)?);
     let mut info = base_info(
         topology,
+        wire_contract,
         range.clone(),
         placement,
         model_kind,

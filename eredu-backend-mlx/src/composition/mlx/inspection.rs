@@ -1143,7 +1143,12 @@ mod tests {
         .unwrap();
         let options = MlxInspectionOptions {
             load: ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
-                .with_parallel_topology(topology),
+                .with_parallel_topology(
+                    topology,
+                    eredu_runtime::PipelineWireContract::new(
+                        eredu_runtime::PipelineActivationDtype::Float32,
+                    ),
+                ),
         };
 
         let report = inspect_model(&path, options).unwrap();

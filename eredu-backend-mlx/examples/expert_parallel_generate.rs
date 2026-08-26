@@ -28,12 +28,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
-        WeightResidency::with_expert_cache(
-            NonExpertWeightResidency::LayerwiseHost(Default::default()),
-            ExpertCacheLoadOptions::default(),
-        ),
-    );
+    let options = ModelLoadOptions::with_parallel(
+        topology,
+        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
+    )
+    .with_weight_residency(WeightResidency::with_expert_cache(
+        NonExpertWeightResidency::LayerwiseHost(Default::default()),
+        ExpertCacheLoadOptions::default(),
+    ));
     let backend = eredu_backend_mlx::native::distributed_backend(&stream, &weights_stream, &group);
     let model = load_model(&backend, &model_dir, options)?;
     if group.rank() == 0 {

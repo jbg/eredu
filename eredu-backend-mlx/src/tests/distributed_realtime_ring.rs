@@ -235,7 +235,12 @@ fn moshi_ring_model_parity_worker() {
     let mut parallel = load_realtime_model_with_options(
         backend,
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
-        ModelLoadOptions::with_parallel(topology),
+        ModelLoadOptions::with_parallel(
+            topology,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        ),
     )
     .unwrap();
     assert_eq!(parallel.model().model_type(), expected_profile);

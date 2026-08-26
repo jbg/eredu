@@ -3,7 +3,7 @@
 use eredu_checkpoint::WeightQuantization;
 
 use crate::backend::error::Error;
-use eredu_runtime::WeightResidency;
+use eredu_runtime::{PipelineWireContract, WeightResidency};
 
 use super::MlxParallelContext;
 
@@ -12,8 +12,8 @@ use super::MlxParallelContext;
 pub struct ModelLoadOptions {
     /// Optional MLX weight encoding requested during dense checkpoint loading.
     pub quantization: Option<WeightQuantization>,
-    /// Optional validated runtime topology and process-local device assignment.
-    pub parallel: Option<MlxParallelContext>,
+    /// Validated runtime topology paired with its required wire contract.
+    parallel: Option<(MlxParallelContext, PipelineWireContract)>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub weight_residency: WeightResidency,
 }
@@ -28,15 +28,23 @@ impl ModelLoadOptions {
         }
     }
 
-    /// Adds a validated MLX parallel topology to these options.
-    pub fn with_parallel_topology(mut self, topology: MlxParallelContext) -> Self {
-        self.parallel = Some(topology);
+    /// Adds a validated MLX parallel topology and its activation wire contract.
+    pub fn with_parallel_topology(
+        mut self,
+        topology: MlxParallelContext,
+        pipeline_wire: PipelineWireContract,
+    ) -> Self {
+        self.parallel = Some((topology, pipeline_wire));
         self
     }
 
-    /// Creates load options for a validated MLX parallel topology.
-    pub fn with_parallel(topology: MlxParallelContext) -> Self {
-        Self::default().with_parallel_topology(topology)
+    /// Creates load options for a validated MLX parallel topology and
+    /// activation wire contract.
+    pub fn with_parallel(
+        topology: MlxParallelContext,
+        pipeline_wire: PipelineWireContract,
+    ) -> Self {
+        Self::default().with_parallel_topology(topology, pipeline_wire)
     }
 
     /// Selects fully resident or bounded layer execution for checkpoint weights.
@@ -45,9 +53,32 @@ impl ModelLoadOptions {
         self
     }
 
+    /// Returns the selected distributed topology, if any.
+    pub const fn parallel_topology(self) -> Option<MlxParallelContext> {
+        match self.parallel {
+            Some((topology, _)) => Some(topology),
+            None => None,
+        }
+    }
+
+    /// Returns the activation wire contract paired with the distributed
+    /// topology, if any.
+    pub const fn pipeline_wire_contract(self) -> Option<PipelineWireContract> {
+        match self.parallel {
+            Some((_, wire_contract)) => Some(wire_contract),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn parallel_execution(
+        self,
+    ) -> Option<(MlxParallelContext, PipelineWireContract)> {
+        self.parallel
+    }
+
     pub(crate) fn validate_replicated(self) -> Result<(), Error> {
         if self
-            .parallel
+            .parallel_topology()
             .is_some_and(|topology| !topology.is_replicated())
         {
             return Err(Error::Parallel(
@@ -98,7 +129,7 @@ impl ModelLoadOptions {
         Ok(eredu_core::PreparationPolicy {
             quantization,
             residency,
-            topology: self.parallel.map(MlxParallelContext::topology),
+            topology: self.parallel_topology().map(MlxParallelContext::topology),
         })
     }
 }
@@ -156,9 +187,14 @@ mod tests {
             DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
         )
         .unwrap();
-        let policy = ModelLoadOptions::with_parallel(topology)
-            .preparation_policy()
-            .unwrap();
+        let policy = ModelLoadOptions::with_parallel(
+            topology,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        )
+        .preparation_policy()
+        .unwrap();
         assert_eq!(policy.topology, Some(topology.topology()));
     }
 
@@ -167,12 +203,22 @@ mod tests {
         let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
         let tensor_pipeline = MlxParallelContext::for_rank(0, 2, 3, 1, device).unwrap();
         let tensor_expert = MlxParallelContext::for_rank(0, 2, 1, 3, device).unwrap();
-        let tensor_pipeline_policy = ModelLoadOptions::with_parallel(tensor_pipeline)
-            .preparation_policy()
-            .unwrap();
-        let tensor_expert_policy = ModelLoadOptions::with_parallel(tensor_expert)
-            .preparation_policy()
-            .unwrap();
+        let tensor_pipeline_policy = ModelLoadOptions::with_parallel(
+            tensor_pipeline,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        )
+        .preparation_policy()
+        .unwrap();
+        let tensor_expert_policy = ModelLoadOptions::with_parallel(
+            tensor_expert,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        )
+        .preparation_policy()
+        .unwrap();
 
         assert_ne!(tensor_pipeline_policy, tensor_expert_policy);
     }

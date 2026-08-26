@@ -196,7 +196,7 @@ pub fn materialize_model_plan(
     validate_plan_options(&plan, options)?;
     let runtime_state_dtype_bytes = inspected_runtime_state_dtype_bytes(plan.inspection())?;
     if let Some(topology) = options
-        .parallel
+        .parallel_topology()
         .filter(|topology| !topology.is_replicated())
     {
         let kind = prepared_model_kind(plan.inspection().architecture_plan());
@@ -603,7 +603,7 @@ fn materialize_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let kind = artifact.architecture().model_kind();
-    let topology = options.parallel.ok_or_else(|| {
+    let topology = options.parallel_topology().ok_or_else(|| {
         Error::Parallel("tensor-parallel materialization requires a topology".into())
     })?;
     if topology.tensor_parallel_size <= 1
@@ -776,7 +776,7 @@ fn materialize_gguf_artifact(
     #[cfg(any(feature = "image", feature = "audio"))]
     let processor = ModelProcessor::from_plan(&architecture_plan);
     if options
-        .parallel
+        .parallel_topology()
         .is_some_and(|topology| !topology.is_replicated())
     {
         let model = materialize_gguf_tensor_parallel(
@@ -810,7 +810,7 @@ fn materialize_gguf_tensor_parallel(
 ) -> Result<Model, Error> {
     let architecture = source.architecture();
     let kind = architecture.model_kind();
-    let topology = options.parallel.ok_or_else(|| {
+    let topology = options.parallel_topology().ok_or_else(|| {
         Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
     })?;
     reject_complete_tensor_parallel_quantization(

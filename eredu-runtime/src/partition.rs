@@ -369,6 +369,40 @@ pub enum BoundaryTensorDtype {
     Int32,
 }
 
+/// Portable floating-point dtype carried between pipeline stages.
+///
+/// This is execution transport policy, not checkpoint storage metadata. A
+/// concrete backend must lower the selected dtype to its native tensor dtype
+/// and normalize outgoing activations to it before transport.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum PipelineActivationDtype {
+    /// IEEE 16-bit floating point.
+    Float16,
+    /// Brain 16-bit floating point.
+    Bfloat16,
+    /// IEEE 32-bit floating point.
+    Float32,
+}
+
+/// Backend-neutral wire contract shared by every stage of one pipeline.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct PipelineWireContract {
+    activation_dtype: PipelineActivationDtype,
+}
+
+impl PipelineWireContract {
+    /// Declares the exact dtype used by hidden activations and auxiliary
+    /// tensors whose boundary dtype is [`BoundaryTensorDtype::Activation`].
+    pub const fn new(activation_dtype: PipelineActivationDtype) -> Self {
+        Self { activation_dtype }
+    }
+
+    /// Returns the exact floating-point dtype transported between stages.
+    pub const fn activation_dtype(self) -> PipelineActivationDtype {
+        self.activation_dtype
+    }
+}
+
 /// One symbolic dimension in an architecture-owned boundary tensor.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum BoundaryTensorDimension {

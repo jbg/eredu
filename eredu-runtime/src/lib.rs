@@ -127,7 +127,7 @@ pub use partition::{
     ArchitecturePartitionError, BoundaryTensorDimension, BoundaryTensorDtype, BoundaryTensorSpec,
     BoundaryWireSchema, LayeredPartitionDriver, LayeredPartitionError, NoAuxiliaryBoundary,
     OwnedParameterGroupSpec, ParameterGroupOwner, PartitionGroup, PartitionOwnership,
-    PartitionState, ResolvedBoundaryTensorSpec,
+    PartitionState, PipelineActivationDtype, PipelineWireContract, ResolvedBoundaryTensorSpec,
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{

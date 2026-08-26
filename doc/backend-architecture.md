@@ -922,6 +922,14 @@ batch and sequence dimensions. A concrete backend only maps the logical
 activation or exact integer dtype to its native dtype, allocates the declared
 receive buffers, validates produced tensors, and transports them. It must not
 reconstruct boundary geometry from model-family arguments.
+
+The evolving hidden activation has a separate backend-neutral
+`PipelineWireContract`. Distributed load configuration must select that
+contract explicitly and provide the same value to every stage. Its activation
+dtype also resolves auxiliary tensors declared with the logical `Activation`
+dtype. Backends normalize outgoing floating activations to the contract before
+validation and transport; checkpoint parameter dtypes, rank-local loading
+order, quantization encodings, and stage ownership never select the wire dtype.
 Distributed placement dependency routes consume that same schema directly. A
 concrete backend must reject inactive dependency routes with tensors and active
 routes whose exact cardinality, ordered shapes, or physical dtypes differ from

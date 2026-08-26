@@ -373,7 +373,7 @@ pub fn load(
     };
 
     if let Some(topology) = options
-        .parallel
+        .parallel_topology()
         .filter(|topology| !topology.is_replicated())
     {
         return load_parallel(

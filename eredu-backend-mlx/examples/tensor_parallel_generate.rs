@@ -31,7 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = load_model(
         &backend,
         &model_dir,
-        ModelLoadOptions::with_parallel(topology),
+        ModelLoadOptions::with_parallel(
+            topology,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        ),
     )?;
     let mut session = backend.create_session(model)?;
     let prompt = eredu_backend_mlx::native::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
