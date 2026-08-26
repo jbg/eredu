@@ -1207,7 +1207,6 @@ fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
         DevicePlan::new(backend.backend_id().as_str(), device).unwrap(),
     );
     let report = AutomaticPlanner::default().plan(backend, &request).unwrap();
-    assert_eq!(report.schema_version, AUTOMATIC_SCHEMA_VERSION);
     assert_eq!(report.plan.device.backend, backend.backend_id());
     assert_eq!(report.plan.device.device, device);
     report

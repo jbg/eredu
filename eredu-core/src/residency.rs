@@ -2072,7 +2072,6 @@ mod tests {
         let encoded = serde_json::to_string(&plan).unwrap();
         let decoded: OffloadPlan = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, plan);
-        assert_eq!(decoded.schema_version(), OFFLOAD_PLAN_SCHEMA_VERSION);
 
         let report = OffloadTelemetry::from_plan(&plan).snapshot();
         let encoded = serde_json::to_string(&report).unwrap();

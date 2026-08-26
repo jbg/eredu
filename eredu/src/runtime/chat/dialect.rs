@@ -1,7 +1,5 @@
 //! Internal format-dialect implementations.
 
-#![allow(dead_code)]
-
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -24,8 +22,6 @@ pub(crate) enum GenerationPromptBehavior {
     HonorRequest,
     /// Always render the checkpoint generation prompt.
     Always,
-    /// Never render the checkpoint generation prompt.
-    Never,
 }
 
 impl GenerationPromptBehavior {
@@ -33,7 +29,6 @@ impl GenerationPromptBehavior {
         match self {
             Self::HonorRequest => requested,
             Self::Always => true,
-            Self::Never => false,
         }
     }
 }
@@ -3144,7 +3139,7 @@ mod tests {
     };
 
     const DECLARATIVE_LIST_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
-        generation_prompt_behavior: GenerationPromptBehavior::Never,
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
         reasoning_template_kwarg: "enable_thinking",
         supports_tool_reasoning: true,
         output: ExactEnvelope {
@@ -4182,12 +4177,6 @@ mod tests {
             r#"<batch><json>[{"op":"one","args":{"value":1}};{"op":"one","args":{"value":2}}]</json></batch>"#
         ));
         assert_eq!(plan.auto_activation_trigger(), Some("<batch>"));
-        assert_eq!(
-            DECLARATIVE_DIALECT
-                .generation_prompt_behavior(parameters)
-                .unwrap(),
-            GenerationPromptBehavior::Never
-        );
         assert!(DECLARATIVE_DIALECT
             .required_structural_tokens(parameters)
             .unwrap()

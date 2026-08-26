@@ -411,12 +411,10 @@ pub(crate) struct ConstraintCompiler {
     schema_compilation_runs: AtomicUsize,
 }
 
-#[allow(dead_code)]
 pub(crate) struct ConstraintBlueprint {
     matcher: Matcher,
 }
 
-#[allow(dead_code)]
 pub(crate) struct GrammarState {
     matcher: Matcher,
     terminal_eos_alias_committed: bool,
@@ -654,7 +652,6 @@ impl ConstraintCompiler {
     }
 }
 
-#[allow(dead_code)]
 impl ConstraintBlueprint {
     fn state(&self) -> GrammarState {
         GrammarState {
@@ -664,7 +661,6 @@ impl ConstraintBlueprint {
     }
 }
 
-#[allow(dead_code)]
 impl GrammarState {
     pub(crate) fn fork(&self) -> Self {
         Self {
@@ -741,42 +737,12 @@ impl GrammarState {
             .map_err(|error| format!("failed to inspect grammar completion: {error}"))
     }
 
-    pub(crate) fn rollback(&mut self, token_count: usize) -> Result<(), String> {
-        let token_count = if self.terminal_eos_alias_committed && token_count > 0 {
-            self.terminal_eos_alias_committed = false;
-            token_count - 1
-        } else {
-            token_count
-        };
-        if token_count == 0 {
-            return Ok(());
-        }
-        self.matcher
-            .rollback(token_count)
-            .map_err(|error| format!("failed to roll back grammar state: {error}"))
-    }
-
     fn is_eos_token(&self, token: TokenId) -> Result<bool, String> {
         let token_env = self
             .matcher
             .tok_env()
             .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
         Ok(token_env.tok_trie().eos_tokens().contains(&token))
-    }
-
-    pub(crate) fn token_bytes(&self, token: TokenId) -> Result<Vec<u8>, String> {
-        let token_env = self
-            .matcher
-            .tok_env()
-            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
-        let trie = token_env.tok_trie();
-        if token as usize >= trie.vocab_size() {
-            return Err(format!(
-                "token {token} is outside grammar vocabulary {}",
-                trie.vocab_size()
-            ));
-        }
-        Ok(trie.token(token).to_vec())
     }
 
     pub(crate) fn token_vocabulary(&self) -> Result<Vec<Vec<u8>>, String> {
@@ -799,7 +765,6 @@ impl GenerationConstraint {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn grammar_state(&self) -> GrammarState {
         self.inner.state()
     }
@@ -1673,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn grammar_state_forks_commits_completes_and_rolls_back() {
+    fn grammar_state_forks_commits_and_completes() {
         let compiler = compiler();
         let plan = compiler
             .compile_tool_plan(
@@ -1701,9 +1666,6 @@ mod tests {
             state.commit(*byte as TokenId).unwrap();
         }
         assert!(state.is_complete().unwrap());
-        fork.commit(bytes[split] as TokenId).unwrap();
-        fork.rollback(1).unwrap();
-        assert!(!fork.is_complete().unwrap());
         for byte in &bytes[split..] {
             fork.commit(*byte as TokenId).unwrap();
         }

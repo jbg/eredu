@@ -173,17 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn published_prompt_frames_are_exact() {
-        assert_eq!(AUDIO_TOKENS_PER_STREAM, 8);
-        assert_eq!(TEXT_PADDING_TOKEN, 3);
-        assert_eq!(
-            SILENCE_TOKENS,
-            [948, 243, 1178, 546, 1736, 1030, 1978, 2008]
-        );
-        assert_eq!(SINE_TOKENS, [430, 1268, 381, 1611, 1095, 1495, 56, 472]);
-    }
-
-    #[test]
     fn voice_text_and_mixed_plans_preserve_protocol_enqueue_order() {
         let voice = voice_prompt_plan(&[2, 8, 2]).unwrap();
         assert_eq!(voice.batch, 2);

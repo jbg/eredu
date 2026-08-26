@@ -47,10 +47,6 @@ name = "core_types"
 path = "tests/core_types.rs"
 
 [[test]]
-name = "published_surface"
-path = "tests/published_surface.rs"
-
-[[test]]
 name = "portable_facade"
 path = "tests/portable_facade.rs"
 

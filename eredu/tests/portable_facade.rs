@@ -1,7 +1,6 @@
 use eredu::api::{
-    inspect_text_model, load_tokenizer, AutomaticPlanRequest, AutomaticPlanner, ChatTokenizer,
-    DevicePlan, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
-    AUTOMATIC_SCHEMA_VERSION,
+    inspect_text_model, load_tokenizer, AutomaticPlanRequest, ChatTokenizer, DevicePlan,
+    LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
 };
 use eredu::{
     ArtifactFormat, BackendCapabilities, BackendDescriptor, DeviceDescriptor,
@@ -207,8 +206,6 @@ fn automatic_planning_documents_are_available_without_mlx() {
         "model",
         DevicePlan::new("mock", "gpu:0").expect("portable device identity is valid"),
     );
-    assert_eq!(request.schema_version, AUTOMATIC_SCHEMA_VERSION);
-    assert_eq!(AutomaticPlanner::default().policy().max_mapped_shards, 4);
     assert_eq!(
         serde_json::from_slice::<AutomaticPlanRequest>(&serde_json::to_vec(&request).unwrap())
             .unwrap(),

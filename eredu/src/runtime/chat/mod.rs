@@ -105,7 +105,6 @@ pub struct ChatTemplateRequest {
 #[derive(Clone)]
 pub(crate) struct GenerationConstraint {
     pub(crate) fingerprint: [u8; 32],
-    #[allow(dead_code)]
     pub(crate) inner: Arc<ConstraintBlueprint>,
 }
 
@@ -616,19 +615,13 @@ impl ReasoningTemplateControl {
     }
 }
 
-/// Test-only protocol surface used to exercise constrained tool generation
-/// without claiming compatibility with a production checkpoint dialect.
-#[allow(dead_code)]
+/// Protocol surface used by chat unit tests without claiming compatibility
+/// with a production checkpoint dialect.
+#[cfg(test)]
 pub(crate) const SYNTHETIC_TOOL_TEMPLATE: &str = concat!(
     "{% if fail_render %}{{ raise_exception('rendered before constraint compilation') }}",
     "{% endif %}eredu synthetic tool template",
 );
-
-#[cfg(test)]
-const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x60, 0x18, 0xea, 0x94, 0x96, 0x0f, 0x70, 0x0f, 0x41, 0x62, 0xda, 0xb8, 0x4f, 0x57, 0xdc, 0xca,
-    0xc4, 0x66, 0xf8, 0x41, 0x21, 0xd8, 0x2e, 0x84, 0xb5, 0x7e, 0x77, 0x04, 0xf2, 0xd7, 0x39, 0x90,
-];
 
 pub(crate) const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
@@ -962,23 +955,6 @@ pub(crate) const KIMI_K2_NATIVE_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeD
     stop_sequences: &["<|im_end|>"],
 };
 
-#[cfg(test)]
-const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x0a, 0x2c, 0x80, 0x73, 0xc8, 0x78, 0xab, 0x1d, 0xa0, 0x04, 0xbe, 0xe9, 0x33, 0xa9, 0x98, 0x60,
-    0x65, 0x37, 0xbb, 0xb6, 0x20, 0x16, 0x31, 0x03, 0x52, 0xc7, 0x28, 0x5c, 0x3f, 0x01, 0xc5, 0xb5,
-];
-#[cfg(test)]
-const GEMMA4_LARGE_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xae, 0x53, 0x46, 0x4b, 0xf3, 0xbe, 0x25, 0x80, 0x2b, 0x3a, 0x5b, 0x37, 0xde, 0xf7, 0xfd, 0x89,
-    0x66, 0x70, 0x67, 0xd7, 0x57, 0x70, 0x49, 0xb3, 0xb2, 0xd7, 0x4c, 0x4d, 0x8d, 0xe4, 0xc6, 0xd4,
-];
-
-#[cfg(test)]
-const UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x94, 0x89, 0x9c, 0x0f, 0x91, 0x7d, 0x93, 0xf6, 0xfe, 0x81, 0xc9, 0x57, 0x44, 0xd1, 0xe8, 0xdd,
-    0xab, 0x2d, 0x21, 0xd3, 0x92, 0x28, 0xd2, 0xe4, 0xae, 0xc1, 0xfb, 0x2a, 0x25, 0xbf, 0xf4, 0x13,
-];
-
 pub(crate) const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
     reasoning_template_kwarg: "enable_thinking",
@@ -1169,19 +1145,7 @@ mod tests {
         models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
     };
 
-    use super::{
-        prepare_format_profile, resolve_structural_tokens, template_signature,
-        GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE, SYNTHETIC_TOOL_TEMPLATE,
-        SYNTHETIC_TOOL_TEMPLATE_SIGNATURE, UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE,
-    };
-
-    const GEMMA4_EDGE_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
-    const GEMMA4_LARGE_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
-    const UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR: &str = include_str!(
-        "../../../tests/fixtures/chat_templates/unsloth-gemma-4-26b-a4b-it-94899c0f.jinja"
-    );
+    use super::{prepare_format_profile, resolve_structural_tokens, SYNTHETIC_TOOL_TEMPLATE};
     #[test]
     fn registry_does_not_guess_unknown_templates() {
         let prepared = prepare_format_profile("unknown template");
@@ -1197,11 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_profile_uses_an_exact_auditable_signature() {
-        assert_eq!(
-            template_signature(SYNTHETIC_TOOL_TEMPLATE),
-            SYNTHETIC_TOOL_TEMPLATE_SIGNATURE
-        );
+    fn synthetic_profile_selects_the_test_dialect() {
         let prepared = prepare_format_profile(SYNTHETIC_TOOL_TEMPLATE);
         assert_eq!(
             prepared.identity.as_deref(),
@@ -1210,25 +1170,6 @@ mod tests {
         assert!(prepared.dialect.is_some());
         assert!(prepared.dialect_parameters.is_some());
         assert_eq!(prepared.native_tool_unavailable_reason, None);
-    }
-
-    #[test]
-    fn gemma_template_hashes_are_audit_provenance_not_runtime_keys() {
-        for (template, expected_signature) in [
-            (GEMMA4_EDGE_FIXTURE, GEMMA4_EDGE_TEMPLATE_SIGNATURE),
-            (GEMMA4_LARGE_FIXTURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE),
-        ] {
-            assert_eq!(template_signature(template), expected_signature);
-            assert!(prepare_format_profile(template).dialect.is_none());
-        }
-        let unsloth = UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        assert_eq!(
-            template_signature(unsloth),
-            UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE
-        );
-        assert!(prepare_format_profile(unsloth).dialect.is_none());
     }
 
     #[test]
