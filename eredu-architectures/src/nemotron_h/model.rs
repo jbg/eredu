@@ -380,6 +380,11 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         &self.args
     }
 
+    /// Returns the prediction depth count declared by the execution graph.
+    pub fn mtp_len(&self) -> usize {
+        self.groups.prediction_count()
+    }
+
     /// Describes target and patterned prediction parameters with explicit
     /// canonical execution-unit ownership.
     fn parameter_description_impl(

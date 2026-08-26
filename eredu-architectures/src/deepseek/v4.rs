@@ -654,6 +654,11 @@ where
         &self.args
     }
 
+    /// Returns the prediction depth count declared by the execution graph.
+    pub fn mtp_len(&self) -> usize {
+        self.groups.prediction_count()
+    }
+
     /// Borrows pinned modules for checkpoint binding.
     pub const fn static_modules(&self) -> &StaticModules<B> {
         &self.static_modules

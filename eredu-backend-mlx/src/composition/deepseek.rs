@@ -1914,8 +1914,14 @@ impl DeepSeekModel {
     /// Returns the number of embedded prediction units.
     pub fn mtp_len(&self) -> usize {
         match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => args.num_nextn_predict_layers.max(0) as usize,
-            DeepSeekModelInner::V4 { args, .. } => args.num_nextn_predict_layers.max(0) as usize,
+            DeepSeekModelInner::V3 { execution, .. } => match execution {
+                V3Execution::Resident(runtime) => runtime.architecture().mtp_len(),
+                V3Execution::Layerwise(runtime) => runtime.architecture().mtp_len(),
+            },
+            DeepSeekModelInner::V4 { execution, .. } => match execution {
+                V4Execution::Resident(runtime) => runtime.architecture().mtp_len(),
+                V4Execution::Layerwise(runtime) => runtime.architecture().mtp_len(),
+            },
         }
     }
 

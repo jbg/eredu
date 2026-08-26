@@ -9029,7 +9029,7 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
 
 impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
     fn embedded_mtp_len(&self) -> usize {
-        self.args().num_nextn_predict_layers as usize
+        self.architecture.mtp_len()
     }
 
     fn embedded_mtp_state_segment(&self) -> Option<&'static str> {

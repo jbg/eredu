@@ -805,7 +805,14 @@ impl NemotronHModel {
 
     /// Returns the number of embedded prediction depths.
     pub fn mtp_len(&self) -> usize {
-        usize::try_from(self.args.num_nextn_predict_layers).unwrap_or(0)
+        match &self.execution {
+            NemotronHExecution::Resident(runtime) => runtime.architecture().mtp_len(),
+            NemotronHExecution::Layerwise(runtime) => runtime.architecture().mtp_len(),
+            NemotronHExecution::TensorParallelResident(runtime) => runtime.architecture().mtp_len(),
+            NemotronHExecution::TensorParallelLayerwise(runtime) => {
+                runtime.architecture().mtp_len()
+            }
+        }
     }
 
     /// Returns canonical residency metadata.
