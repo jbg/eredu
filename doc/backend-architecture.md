@@ -514,7 +514,10 @@ reconstruct family state geometry or maintain an independent layer count.
 The same exact estimate declares whether speculative draft weights use a
 separate checkpoint, use configured embedded prediction layers, or are absent.
 A backend maps that declaration to executable or unsupported status according
-to its implementation; it does not maintain a family-name MTP table.
+to its implementation; it does not maintain a family-name MTP table. Pipeline
+sessions therefore report architecture-declared separate draft weights as
+unsupported while external drafting remains unavailable for pipeline
+execution; only an absent architecture declaration reports unavailable.
 
 For SafeTensors and GGUF materialization, architecture preparation also
 identifies the checkpoint parameter that establishes the generic floating-state

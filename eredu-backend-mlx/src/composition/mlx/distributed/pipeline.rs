@@ -9658,6 +9658,61 @@ pub struct PipelineModel {
     last_placed_ingress_schedule: PlacedIngressScheduleReport,
 }
 
+fn pipeline_mtp_capability(
+    checkpoint: Option<MtpCheckpointKind>,
+    global_embedded_mtp_layers: usize,
+    model_kind: ModelKind,
+) -> MtpCapability {
+    match checkpoint {
+        Some(MtpCheckpointKind::Embedded) if global_embedded_mtp_layers > 0 => {
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            }
+        }
+        Some(checkpoint) => MtpCapability::Unsupported {
+            checkpoint,
+            architecture: model_kind.canonical_name().into(),
+        },
+        None => MtpCapability::Unavailable,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pipeline_mtp_capability_distinguishes_unsupported_weights_from_absence() {
+    assert_eq!(
+        pipeline_mtp_capability(Some(MtpCheckpointKind::Separate), 0, ModelKind::Gemma4),
+        MtpCapability::Unsupported {
+            checkpoint: MtpCheckpointKind::Separate,
+            architecture: "gemma4".into(),
+        }
+    );
+    assert_eq!(
+        pipeline_mtp_capability(Some(MtpCheckpointKind::Separate), 0, ModelKind::MuseGlimmer),
+        MtpCapability::Unsupported {
+            checkpoint: MtpCheckpointKind::Separate,
+            architecture: "muse_glimmer".into(),
+        }
+    );
+    assert_eq!(
+        pipeline_mtp_capability(None, 0, ModelKind::Llama),
+        MtpCapability::Unavailable
+    );
+    assert_eq!(
+        pipeline_mtp_capability(Some(MtpCheckpointKind::Embedded), 0, ModelKind::Inkling),
+        MtpCapability::Unsupported {
+            checkpoint: MtpCheckpointKind::Embedded,
+            architecture: "inkling".into(),
+        }
+    );
+    assert_eq!(
+        pipeline_mtp_capability(Some(MtpCheckpointKind::Embedded), 1, ModelKind::Inkling),
+        MtpCapability::Ready {
+            checkpoint: MtpCheckpointKind::Embedded,
+        }
+    );
+}
+
 pub(in crate::composition::mlx) struct PipelineEmbeddedMtpTarget<'session, 'world> {
     model: &'session mut PipelineModel,
     execution: &'session crate::backend::MlxDistributedSession<'world>,
@@ -10544,17 +10599,18 @@ impl PipelineModel {
         Ok(completion)
     }
 
-    /// Reports the complete pipeline's checkpoint-embedded prediction support.
+    /// Reports the complete pipeline's prediction support.
     /// Predictor weights remain stage-local, but every rank must advertise the
     /// same capability because speculative execution is a collective session.
     pub fn mtp_capability(&self) -> MtpCapability {
-        if self.info.global_embedded_mtp_layers > 0 {
-            MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            }
-        } else {
-            MtpCapability::Unavailable
-        }
+        pipeline_mtp_capability(
+            self.stage
+                .capability_estimate()
+                .ok()
+                .and_then(|estimate| estimate.mtp_checkpoint_kind()),
+            self.info.global_embedded_mtp_layers,
+            self.info.model_kind,
+        )
     }
 
     fn ensure_embedded_mtp_cache(&self, cache: &mut PipelineCache) -> Result<(), Error> {

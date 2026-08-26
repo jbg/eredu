@@ -1546,6 +1546,14 @@ fn pipeline_ring_worker() {
             usize::from(pipeline_rank == 1)
         );
         assert_eq!(model.stage_info().global_embedded_mtp_layers, 1);
+    } else if matches!(family, FixtureFamily::Gemma | FixtureFamily::MuseGlimmer) {
+        assert_eq!(
+            model.mtp_capability(),
+            MtpCapability::Unsupported {
+                checkpoint: MtpCheckpointKind::Separate,
+                architecture: model.model_family().canonical_name().into(),
+            }
+        );
     }
 }
 
