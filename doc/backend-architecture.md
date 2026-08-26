@@ -418,6 +418,16 @@ descriptor from model arguments. Architecture APIs derive localized
 expert-bank specifications for placement-resolved expert counts and projection
 widths while preserving canonical parameter identities and physical formats;
 backend composition only materializes those returned specifications.
+Ownership and localized construction are published together as an
+`ExpertRealizationPlan`. The plan contains the checkpoint-global expert count,
+the complete global-expert-to-owner map, the current rank's global expert IDs,
+and the exact rank-local bank specification for every routed execution unit.
+Distributed preflight consumes the plan's global count, and a concrete backend
+lowers the declared owner map into its native dispatch representation without
+running another assignment policy. Backend composition must not pass family
+fields or a separately derived tensor-parallel width into expert-bank
+construction; the bank specification retained by this same plan is the only
+construction input.
 Distributed expert callbacks also
 carry whether the requested result is globally complete or a rank-local
 tensor-parallel contribution, so EP recombination preserves the reducible and

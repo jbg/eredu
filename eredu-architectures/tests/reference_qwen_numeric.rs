@@ -9,7 +9,7 @@ use eredu_architectures::{
     nemotron_h, qwen,
 };
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
-use eredu_core::{Completion, LayerSchedule, TokenFilter};
+use eredu_core::{Completion, LayerSchedule, ParallelRankTopology, ParallelTopology, TokenFilter};
 use eredu_nn::{
     reference_gated_delta_scan, reference_selective_state_space_scan, validate_parameter_topology,
     AttentionCache, AttentionMask, AttentionRequest, BlockwiseAttentionBackend,
@@ -6653,6 +6653,44 @@ fn dense_qwen_construction_rejects_moe_configuration() {
             .to_string()
             .contains("dense Qwen construction does not accept a routed MoE configuration"));
     }
+}
+
+#[test]
+fn qwen_expert_realization_owns_assignment_and_tp_local_bank_geometry() {
+    let mut value = config("qwen3_moe", false);
+    value["num_attention_heads"] = 4.into();
+    value["num_key_value_heads"] = 2.into();
+    value["head_dim"] = 2.into();
+    let args = qwen::model_args_from_config_value(&value).unwrap();
+    let context = NumericContext::default();
+    let seed = qwen::RoutedLayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = qwen::static_parallel_parameter_groups::<NumericBackend>(
+        &seed.static_modules().embeddings,
+        &seed.static_modules().norm,
+        seed.static_modules().lm_head.as_ref(),
+        &args.parameter_root,
+    )
+    .unwrap();
+    let unit = seed.construct_unit(0, &context).unwrap();
+    groups.extend(qwen::routed_layer_parallel_parameter_groups(&unit, &args, 0).unwrap());
+    let layout = numeric_local_layout(&groups, 2, 1).unwrap();
+    let geometry = qwen::local_geometry(&args, &layout).unwrap();
+    let local_context = NumericContext::with_local_layout(layout);
+    let architecture =
+        qwen::RoutedLayeredModel::<NumericBackend>::new_parallel(args, geometry, &local_context)
+            .unwrap();
+    let topology = ParallelTopology::new(2, 1, 2, 1).unwrap();
+    let rank = ParallelRankTopology::new(topology, 3).unwrap();
+    let plan = qwen::expert_realization_plan(&architecture, rank)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(plan.global_expert_count(), 4);
+    assert_eq!(plan.owners(), [0, 0, 1, 1]);
+    assert_eq!(plan.local_global_expert_ids(), [2, 3]);
+    let bank = plan.unit_spec("text_decoder", 0).unwrap();
+    assert_eq!(bank.expert_count, 2);
+    assert_eq!(bank.intermediate_dimensions, 3);
 }
 
 #[test]

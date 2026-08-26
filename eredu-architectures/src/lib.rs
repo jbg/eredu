@@ -46,8 +46,9 @@ pub mod rotary;
 mod static_parameters;
 mod transport;
 pub use expert_residency::{
-    ExpertParameterRecipe, ExpertParameterRole, ExpertResidencyCatalog,
-    ExpertResidencyCatalogError, ExpertResidencyDistribution, ExpertResidencyUnit,
+    ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertRealizationPlanError,
+    ExpertResidencyCatalog, ExpertResidencyCatalogError, ExpertResidencyDistribution,
+    ExpertResidencyUnit,
 };
 
 /// Shared decoder mechanics used by backend-neutral text architectures.

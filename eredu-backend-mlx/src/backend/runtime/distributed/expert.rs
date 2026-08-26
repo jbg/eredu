@@ -94,6 +94,17 @@ pub struct ExpertAssignment {
 }
 
 impl ExpertAssignment {
+    /// Lowers an architecture-derived realization without recomputing ownership.
+    pub fn from_realization<S>(
+        plan: &eredu_architectures::ExpertRealizationPlan<S>,
+    ) -> Result<Self, Error> {
+        Self::explicit(
+            plan.owners().to_vec(),
+            plan.expert_parallel_size(),
+            plan.expert_parallel_rank(),
+        )
+    }
+
     /// Creates the default balanced contiguous assignment.
     pub fn balanced(global_experts: usize, group_size: usize, rank: usize) -> Result<Self, Error> {
         Self::balanced_with_empty(global_experts, group_size, rank, false)
@@ -1404,4 +1415,37 @@ pub fn dispatch_sharded(
     }
     statistics.total_time = total_started.elapsed();
     Ok(ShardedReturnedRoutes { output, statistics })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use eredu_core::{ParallelRankTopology, ParallelTopology};
+    use eredu_runtime::ExecutionGroupId;
+
+    use super::*;
+
+    #[test]
+    fn native_assignment_lowers_architecture_owner_map_verbatim() {
+        let topology = ParallelTopology::new(1, 1, 2, 1).unwrap();
+        let rank = ParallelRankTopology::new(topology, 1).unwrap();
+        let decoder = ExecutionGroupId::new("text_decoder").unwrap();
+        let plan = eredu_architectures::ExpertRealizationPlan::balanced(
+            5,
+            rank,
+            BTreeMap::from([((decoder, 0), ())]),
+        )
+        .unwrap();
+
+        let assignment = ExpertAssignment::from_realization(&plan).unwrap();
+        assert_eq!(assignment.global_expert_count(), 5);
+        assert_eq!(assignment.local_global_expert_ids(), [3, 4]);
+        assert_eq!(
+            (0..5)
+                .map(|expert| assignment.owner(expert).unwrap())
+                .collect::<Vec<_>>(),
+            plan.owners()
+        );
+    }
 }

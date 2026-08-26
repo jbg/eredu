@@ -4,7 +4,117 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::recipe::DerivedWeightRecipe;
 use eredu_checkpoint::{recipe::RecipeCatalog, store::TensorSelection};
+use eredu_core::{balanced_contiguous_range, ParallelRankTopology};
 use eredu_runtime::{ExecutionGroupId, ExpertIdentity};
+
+/// Complete architecture-derived ownership and rank-local bank construction plan.
+///
+/// The plan is deliberately independent of a concrete collective runtime. It
+/// fixes the global-to-owner mapping once and carries the architecture's exact
+/// rank-local construction specification for every routed execution unit.
+#[derive(Debug, Clone)]
+pub struct ExpertRealizationPlan<S> {
+    global_expert_count: usize,
+    expert_parallel_size: usize,
+    expert_parallel_rank: usize,
+    owners: Vec<usize>,
+    local_global_expert_ids: Vec<usize>,
+    unit_specs: BTreeMap<(ExecutionGroupId, usize), S>,
+}
+
+impl<S> ExpertRealizationPlan<S> {
+    /// Creates a balanced contiguous realization for one architecture rank.
+    pub fn balanced(
+        global_expert_count: usize,
+        topology: ParallelRankTopology,
+        unit_specs: BTreeMap<(ExecutionGroupId, usize), S>,
+    ) -> Result<Self, ExpertRealizationPlanError> {
+        if global_expert_count == 0 {
+            return Err(ExpertRealizationPlanError::EmptyExpertBank);
+        }
+        if unit_specs.is_empty() {
+            return Err(ExpertRealizationPlanError::EmptyUnitSchedule);
+        }
+        let mut owners = vec![0; global_expert_count];
+        for owner in 0..topology.expert_parallel_size {
+            let range = balanced_contiguous_range(
+                global_expert_count,
+                topology.expert_parallel_size,
+                owner,
+                false,
+            )
+            .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
+            owners[range].fill(owner);
+        }
+        let local = balanced_contiguous_range(
+            global_expert_count,
+            topology.expert_parallel_size,
+            topology.expert_parallel_rank,
+            false,
+        )
+        .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
+        Ok(Self {
+            global_expert_count,
+            expert_parallel_size: topology.expert_parallel_size,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            owners,
+            local_global_expert_ids: local.collect(),
+            unit_specs,
+        })
+    }
+
+    /// Returns the checkpoint-global routed expert count used by preflight.
+    pub const fn global_expert_count(&self) -> usize {
+        self.global_expert_count
+    }
+
+    /// Returns the expert-axis rank count used to derive ownership.
+    pub const fn expert_parallel_size(&self) -> usize {
+        self.expert_parallel_size
+    }
+
+    /// Returns this rank's coordinate on the expert axis.
+    pub const fn expert_parallel_rank(&self) -> usize {
+        self.expert_parallel_rank
+    }
+
+    /// Returns one owner rank for every checkpoint-global expert identity.
+    pub fn owners(&self) -> &[usize] {
+        &self.owners
+    }
+
+    /// Returns this rank's global expert identities in owner-local order.
+    pub fn local_global_expert_ids(&self) -> &[usize] {
+        &self.local_global_expert_ids
+    }
+
+    /// Returns the exact rank-local bank specification for an execution unit.
+    pub fn unit_spec(&self, owner_group: &str, owner_unit: usize) -> Option<&S> {
+        self.unit_specs
+            .iter()
+            .find(|((group, unit), _)| group.as_str() == owner_group && *unit == owner_unit)
+            .map(|(_, spec)| spec)
+    }
+
+    /// Returns every routed execution unit and its rank-local bank specification.
+    pub fn unit_specs(&self) -> &BTreeMap<(ExecutionGroupId, usize), S> {
+        &self.unit_specs
+    }
+}
+
+/// Invalid architecture-derived expert realization.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ExpertRealizationPlanError {
+    /// The architecture declared no routed experts.
+    #[error("expert realization requires at least one routed expert")]
+    EmptyExpertBank,
+    /// The architecture declared no routed execution units.
+    #[error("expert realization requires at least one routed execution unit")]
+    EmptyUnitSchedule,
+    /// The requested rank topology cannot own a non-empty expert partition.
+    #[error("invalid expert realization topology: {0}")]
+    InvalidTopology(String),
+}
 
 /// Placement of one expert relative to an expert-parallel axis.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -422,4 +532,53 @@ pub enum ExpertResidencyCatalogError {
     /// Two units use the same router/cache identity.
     #[error("architecture repeats expert residency identity {0:?}")]
     DuplicateIdentity(ExpertIdentity),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eredu_core::ParallelTopology;
+
+    #[test]
+    fn expert_realization_is_the_complete_balanced_owner_map() {
+        let topology = ParallelTopology::new(1, 1, 3, 1).unwrap();
+        let plans = (0..3)
+            .map(|rank| {
+                let decoder = ExecutionGroupId::new("text_decoder").unwrap();
+                ExpertRealizationPlan::balanced(
+                    8,
+                    ParallelRankTopology::new(topology, rank).unwrap(),
+                    BTreeMap::from([((decoder, 4), format!("rank-{rank}-bank"))]),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(plans[0].owners(), [0, 0, 0, 1, 1, 1, 2, 2]);
+        assert_eq!(plans[0].local_global_expert_ids(), [0, 1, 2]);
+        assert_eq!(plans[1].local_global_expert_ids(), [3, 4, 5]);
+        assert_eq!(plans[2].local_global_expert_ids(), [6, 7]);
+        assert_eq!(
+            plans[2].unit_spec("text_decoder", 4).map(String::as_str),
+            Some("rank-2-bank")
+        );
+    }
+
+    #[test]
+    fn expert_realization_rejects_empty_ranks_and_unit_schedules() {
+        let rank =
+            ParallelRankTopology::new(ParallelTopology::new(1, 1, 3, 1).unwrap(), 0).unwrap();
+        assert!(matches!(
+            ExpertRealizationPlan::<()>::balanced(
+                2,
+                rank,
+                BTreeMap::from([((ExecutionGroupId::new("decoder").unwrap(), 0), ())])
+            ),
+            Err(ExpertRealizationPlanError::InvalidTopology(_))
+        ));
+        assert!(matches!(
+            ExpertRealizationPlan::<()>::balanced(3, rank, BTreeMap::new()),
+            Err(ExpertRealizationPlanError::EmptyUnitSchedule)
+        ));
+    }
 }

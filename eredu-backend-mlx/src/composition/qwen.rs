@@ -1471,32 +1471,36 @@ impl QwenPipelineBindings {
     /// Applies rank-local expert residency to an architecture-constructed unit.
     pub fn prepare_unit_expert_residency(
         &self,
-        architecture: &NeutralArchitecture,
         index: usize,
         layer: &mut MlxModule<NeutralBlock>,
-        local_intermediate_size: i32,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
         assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let args = architecture.args();
         if let (Some(assignment), eredu_architectures::qwen::FeedForward::Routed(moe)) =
             (assignment, &mut layer.inner.mlp)
         {
-            let count = i32::try_from(assignment.local_global_expert_ids().len())
-                .map_err(|_| Error::Parallel("local Qwen expert count exceeds i32".into()))?;
-            if count > 0 {
-                moe.experts = <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(
-                    eredu_architectures::qwen::localized_expert_bank_spec(
-                        args,
-                        index,
-                        count,
-                        local_intermediate_size,
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                    stream,
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))?;
+            let plan = realization.ok_or_else(|| {
+                Error::Parallel("Qwen expert assignment has no architecture realization".into())
+            })?;
+            if assignment.local_global_expert_ids() != plan.local_global_expert_ids() {
+                return Err(Error::Parallel(
+                    "Qwen native assignment disagrees with architecture realization".into(),
+                ));
             }
+            let spec = plan
+                .unit_spec("text_decoder", index)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Qwen architecture realization has no expert bank for unit {index}"
+                    ))
+                })?;
+            moe.experts =
+                <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(spec, stream)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
         }
         Ok(())
     }
@@ -1564,25 +1568,23 @@ impl QwenPipelineBindings {
 
     pub fn expert_parallel_assignment(
         &self,
-        architecture: &NeutralArchitecture,
-        topology: crate::backend::MlxParallelContext,
+        realization: Option<
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        >,
     ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 && !self.external_experts {
-            return Ok(None);
+        match realization {
+            None if self.external_experts => Err(Error::Parallel(
+                "Qwen has no architecture expert realization".into(),
+            )),
+            None => Ok(None),
+            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
+            Some(plan) => {
+                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                    plan,
+                )
+                .map(Some)
+            }
         }
-        let args = architecture.args();
-        if !args.is_moe() {
-            return Err(Error::Parallel(
-                "Qwen has no routed experts for expert-parallel ownership".into(),
-            ));
-        }
-        Ok(Some(
-            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
-                args.num_experts as usize,
-                topology.expert_parallel_size,
-                topology.expert_parallel_rank,
-            )?,
-        ))
     }
 
     pub fn layer_bindings(

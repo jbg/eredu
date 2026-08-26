@@ -2477,6 +2477,8 @@ struct DecoderPipelineRealization<A, G, C, L> {
     bindings: C,
     layers: Vec<L>,
     dense_layers: Option<PipelineLayerStorage>,
+    expert_realization:
+        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
@@ -2487,6 +2489,8 @@ struct DecoderPipelineBuilder<A, G, C, L> {
     bindings: C,
     layers: Vec<L>,
     dense_layers: Option<PipelineLayerStorage>,
+    expert_realization:
+        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
@@ -2507,6 +2511,7 @@ impl<A, G, C, L> DecoderPipelineBuilder<A, G, C, L> {
             bindings: self.bindings,
             layers: self.layers,
             dense_layers: self.dense_layers,
+            expert_realization: self.expert_realization,
             expert_assignment: self.expert_assignment,
             expert_cache: self.expert_cache,
             routing_statistics: self.routing_statistics,
@@ -2545,25 +2550,17 @@ fn construct_qwen_partition_unit(
     architecture: &eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>,
     bindings: &crate::composition::qwen::QwenPipelineBindings,
     index: usize,
+    realization: Option<
+        &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+    >,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
 ) -> Result<MlxModule<eredu_architectures::qwen::RoutedTransformerBlock<MlxNeuralBackend>>, Error> {
-    let local_intermediate_size = architecture
-        .shared_parallel_geometry()
-        .and_then(|geometry| geometry.block(index).map(|args| args.moe_intermediate_size))
-        .unwrap_or(architecture.args().moe_intermediate_size);
     let mut unit = architecture
         .construct_unit(index, stream)
         .map(MlxModule::new)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    bindings.prepare_unit_expert_residency(
-        architecture,
-        index,
-        &mut unit,
-        local_intermediate_size,
-        assignment,
-        stream,
-    )?;
+    bindings.prepare_unit_expert_residency(index, &mut unit, realization, assignment, stream)?;
     Ok(unit)
 }
 
@@ -13789,6 +13786,7 @@ fn load_llama_pipeline(
         bindings: binding_adapter,
         layers,
         dense_layers: None,
+        expert_realization: None,
         expert_assignment: None,
         expert_cache: None,
         routing_statistics: RoutingStatistics::default(),
@@ -13952,12 +13950,6 @@ fn load_qwen_pipeline(
     } else {
         crate::composition::qwen::QwenPipelineBindings::new()
     };
-    topology.preflight(
-        Some(source_args.attention_schedule.len()),
-        expert_cache_options
-            .is_some()
-            .then_some(source_args.num_experts as usize),
-    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -13988,6 +13980,17 @@ fn load_qwen_pipeline(
         .architecture
         .take()
         .expect("Qwen partition constructor owns a neutral architecture");
+    let seed_expert_realization = eredu_architectures::qwen::expert_realization_plan(
+        &seed_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    topology.preflight(
+        Some(source_args.attention_schedule.len()),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
+    )?;
     let binding_parameter_description = seed_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -14008,6 +14011,11 @@ fn load_qwen_pipeline(
         stage.architecture = Some(seed_architecture);
         None
     };
+    stage.expert_realization = eredu_architectures::qwen::expert_realization_plan(
+        stage.architecture.as_ref().unwrap(),
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let placement = Arc::new(decoder_architecture_transport::<_, PipelineRangeState<'_>>(
         stage.architecture.as_ref().unwrap(),
         topology.pipeline_parallel_size,
@@ -14019,8 +14027,8 @@ fn load_qwen_pipeline(
         placement,
         model_kind,
     );
-    let expert_assignment = binding_adapter
-        .expert_parallel_assignment(stage.architecture.as_ref().unwrap(), topology)?;
+    let expert_assignment =
+        binding_adapter.expert_parallel_assignment(stage.expert_realization.as_ref())?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -14072,6 +14080,7 @@ fn load_qwen_pipeline(
                 &stage.architecture,
                 &stage.bindings,
                 global_layer,
+                stage.expert_realization.as_ref(),
                 stage.expert_assignment.as_ref(),
                 stream,
             )
@@ -14192,6 +14201,7 @@ fn load_qwen_pipeline(
     let static_bytes = loaded.finish(&mut info)?;
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
+        let streamed_realization = stage.expert_realization.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let architecture = &stage.architecture;
         let bindings = &stage.bindings;
@@ -14214,6 +14224,7 @@ fn load_qwen_pipeline(
                     architecture,
                     bindings,
                     global_layer,
+                    streamed_realization.as_ref(),
                     streamed_assignment.as_ref(),
                     stream,
                 )
@@ -15175,6 +15186,7 @@ impl QwenPipelinePartition {
             bindings,
             layers,
             dense_layers: None,
+            expert_realization: None,
             expert_assignment: None,
             expert_cache: None,
             routing_statistics: RoutingStatistics::default(),
@@ -16902,6 +16914,7 @@ impl GptOssPipelinePartition {
             bindings,
             layers,
             dense_layers: None,
+            expert_realization: None,
             expert_assignment: None,
             expert_cache: None,
             routing_statistics: RoutingStatistics::default(),

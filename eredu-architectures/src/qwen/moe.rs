@@ -1,5 +1,7 @@
 //! Qwen dense and routed gated-product feed-forward policy.
 
+use std::collections::BTreeMap;
+
 use eredu_nn::{
     Error, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec, Parameterized,
     RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
@@ -117,7 +119,7 @@ pub fn expert_bank_spec(
 ///
 /// Parameter identities, physical formats, and execution policy remain identical
 /// to the global bank; only placement-resolved cardinality and width are localized.
-pub fn localized_expert_bank_spec(
+fn localized_expert_bank_spec(
     args: &ModelArgs,
     layer: usize,
     expert_count: i32,
@@ -128,6 +130,51 @@ pub fn localized_expert_bank_spec(
     spec.intermediate_dimensions = intermediate_dimensions;
     spec.validate()?;
     Ok(spec)
+}
+
+/// Derives complete expert ownership and rank-local bank geometry from Qwen.
+///
+/// The normalized architecture and its optional planner-derived geometry are
+/// the only inputs that may determine expert cardinality or localized width.
+pub fn expert_realization_plan<B: RoutedNeuralBackend>(
+    architecture: &super::RoutedLayeredModel<B>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Option<crate::ExpertRealizationPlan<GatedProductExpertBankSpec>>, Error> {
+    let args = architecture.args();
+    if !args.is_moe() {
+        return Ok(None);
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let local_range = eredu_core::balanced_contiguous_range(
+        global_experts,
+        topology.expert_parallel_size,
+        topology.expert_parallel_rank,
+        false,
+    )
+    .map_err(Error::backend)?;
+    let local_experts = i32::try_from(local_range.len()).map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let mut unit_specs = BTreeMap::new();
+    for layer in 0..layers {
+        let local_args = architecture
+            .parallel_geometry()
+            .and_then(|geometry| geometry.block(layer))
+            .unwrap_or(args);
+        unit_specs.insert(
+            (owner_group.clone(), layer),
+            localized_expert_bank_spec(
+                args,
+                layer,
+                local_experts,
+                local_args.moe_intermediate_size,
+            )?,
+        );
+    }
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
+        .map_err(Error::backend)
 }
 
 #[cfg(test)]
