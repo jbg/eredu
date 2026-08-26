@@ -100,6 +100,19 @@ enum CliDevice {
     Gpu(i32),
 }
 
+impl Default for CliDevice {
+    fn default() -> Self {
+        if cfg!(any(
+            feature = "cuda",
+            all(feature = "mlx", target_vendor = "apple")
+        )) {
+            Self::Gpu(0)
+        } else {
+            Self::Cpu
+        }
+    }
+}
+
 impl CliDevice {
     fn local(self) -> LocalDevice {
         match self {
@@ -252,7 +265,7 @@ struct Cli {
     draft_model: Option<String>,
 
     /// Main model execution device: `cpu` or `gpu:N`.
-    #[arg(long, default_value = "gpu:0", value_name = "DEVICE")]
+    #[arg(long, default_value_t = CliDevice::default(), value_name = "DEVICE")]
     device: CliDevice,
 
     /// Process-global MLX allocator-cache limit in bytes; zero disables caching.
@@ -4195,7 +4208,16 @@ mod tests {
         );
 
         let defaults = Cli::try_parse_from(["eredu", "--model", "model-id", "prompt"]).unwrap();
-        assert_eq!(defaults.device, CliDevice::Gpu(0));
+        let expected_default = if cfg!(any(
+            feature = "cuda",
+            all(feature = "mlx", target_vendor = "apple")
+        )) {
+            CliDevice::Gpu(0)
+        } else {
+            CliDevice::Cpu
+        };
+        assert_eq!(defaults.device, expected_default);
+        assert!(device_plan(defaults.device).is_ok());
         assert_eq!(defaults.mtp_draft_device, MtpDraftDevice::Target);
 
         let cpu_target =

@@ -18,8 +18,9 @@ eredu --model /path/to/model \
 From a workspace checkout, use `cargo run --release -p eredu-cli --` in place
 of `eredu`.
 
-The default device is `gpu:0`. Select another device and sampling policy with
-command-line options:
+The default device is `gpu:0` when the executable is built with CUDA or Apple
+MLX, and `cpu` for CPU-only MLX builds on Linux and Windows. Pin a device and
+select a sampling policy with command-line options:
 
 ```sh
 eredu --model /path/to/model --device cpu \
@@ -65,7 +66,7 @@ expert caching, and supported embedded drafting.
 Inspect the selected plan without loading the model:
 
 ```sh
-eredu --model /path/to/model --device gpu:0 --auto plan > plan.json
+eredu --model /path/to/model --auto plan > plan.json
 ```
 
 Use `--auto benchmark` to evaluate admitted candidates in isolated child

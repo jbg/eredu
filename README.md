@@ -44,6 +44,10 @@ cargo run --release -p eredu-cli -- \
   "Write a Rust function that adds two integers."
 ```
 
+The CLI defaults to `gpu:0` when the build includes CUDA or Apple MLX, and to
+`cpu` for CPU-only MLX builds on Linux and Windows. Pass `--device cpu` or
+`--device gpu:N` to override that selection.
+
 The CLI accepts local model directories, GGUF files, and model identifiers
 already present in the local Hugging Face cache. It does not download models.
 See the [CLI guide](eredu-cli/README.md) for automatic
