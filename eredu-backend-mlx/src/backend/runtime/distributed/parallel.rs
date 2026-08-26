@@ -4,11 +4,9 @@
 //! members. This module converts those descriptions into rank-local placement
 //! and shape information without inspecting checkpoint-name substrings.
 
-#[cfg(test)]
-use eredu_runtime::ParameterRole;
 use eredu_runtime::{
     LocalModelLayout, LocalTensorLayout, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
-    ShardingPolicy, TensorPlacement,
+    ParameterRole, ShardingPolicy, TensorPlacement,
 };
 
 use safemlx::{
@@ -388,6 +386,52 @@ impl ParallelPlanBuilder {
             }
         }
     }
+}
+
+/// Returns the planner-owned source-channel range for one routed expert bank.
+///
+/// Quantized plans may partition in blocks rather than individual channels, so
+/// callers must not reconstruct this range from the rank-local tensor width.
+pub(crate) fn routed_expert_intermediate_range(
+    layout: &LocalModelLayout<TensorPlacement>,
+    global_experts: usize,
+    global_width: usize,
+) -> Result<std::ops::Range<usize>, Error> {
+    let mut selected = None;
+    for (target, tensor) in layout.tensors().filter(|(_, tensor)| {
+        tensor.role() == ParameterRole::ExpertIntermediate
+            && tensor.global_shape().len() == 3
+            && tensor.global_shape().first().copied() == Some(global_experts)
+    }) {
+        let units = tensor.logical_units().ok_or_else(|| {
+            Error::Parallel(format!(
+                "routed expert tensor {target:?} has no logical partition domain"
+            ))
+        })?;
+        let logical = tensor.logical_range().ok_or_else(|| {
+            Error::Parallel(format!(
+                "routed expert tensor {target:?} has no local logical range"
+            ))
+        })?;
+        if units == 0 || !global_width.is_multiple_of(units) {
+            return Err(Error::Parallel(format!(
+                "routed expert tensor {target:?} partitions width {global_width} into {units} incompatible units"
+            )));
+        }
+        let channels_per_unit = global_width / units;
+        let range = (logical.start * channels_per_unit)..(logical.end * channels_per_unit);
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(Error::Parallel(
+                "routed expert tensors have inconsistent intermediate ranges".into(),
+            ));
+        }
+        selected = Some(range);
+    }
+    selected.ok_or_else(|| {
+        Error::Parallel(format!(
+            "parallel plan has no routed expert bank with {global_experts} experts"
+        ))
+    })
 }
 
 fn checked_axis(member: &ParameterMemberSpec, axis: usize) -> Result<usize, String> {
@@ -838,5 +882,44 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn routed_expert_range_preserves_uneven_balanced_slice() {
+        let expected = [0..3, 3..5];
+        for (rank, expected) in expected.into_iter().enumerate() {
+            let mut planner = ParallelPlanBuilder::new(topology(rank, 2));
+            planner
+                .register(
+                    ParameterGroupSpec::partitioned(
+                        "experts.intermediate",
+                        ParameterRole::ExpertIntermediate,
+                        5,
+                        [
+                            ParameterMemberSpec::new(
+                                "experts.gate_up",
+                                [4, 10, 8],
+                                MemberSharding::PartitionedSegments {
+                                    axis: 1,
+                                    segments: vec![0..5, 5..10],
+                                },
+                            ),
+                            ParameterMemberSpec::new(
+                                "experts.down",
+                                [4, 8, 5],
+                                MemberSharding::Partitioned { axis: 2 },
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let (_, local) = planner.finish().unwrap();
+
+            assert_eq!(
+                routed_expert_intermediate_range(&local, 4, 5).unwrap(),
+                expected
+            );
+        }
     }
 }

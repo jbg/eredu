@@ -76,7 +76,9 @@ use crate::{
         dispatch_local_with, dispatch_replicated, dispatch_replicated_tensor_parallel,
         dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
-    backend::runtime::distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
+    backend::runtime::distributed::parallel::{
+        routed_expert_intermediate_range, ParallelBuildContext, ParallelExecutionContext,
+    },
     backend::runtime::execution::layerwise::{
         packed_weight_companions, quantize_pipeline_stage_store_with, shard_layer_bindings,
         DenseStreamController, DenseTransferWindow, PackedWeightCompanions,
@@ -20923,9 +20925,6 @@ fn load_neutral_deepseek_v3_pipeline(
         weights_stream,
         stream,
     )?;
-    let unit_args = architecture
-        .shared_parallel_geometry()
-        .map_or_else(|| args.clone(), |geometry| geometry.args().clone());
     let mut layers = range
         .clone()
         .map(|layer| {
@@ -21125,16 +21124,17 @@ fn load_neutral_deepseek_v3_pipeline(
             .as_ref()
             .expect("external expert assignment");
         let catalog = match &parallel_layout {
-            Some(_) => {
-                let width = usize::try_from(unit_args.moe_intermediate_size)
-                    .map_err(|_| Error::Parallel("invalid local V3 expert width".into()))?;
-                let start = topology
-                    .tensor_parallel_rank
-                    .checked_mul(width)
-                    .ok_or_else(|| Error::Parallel("local V3 expert range overflowed".into()))?;
+            Some(layout) => {
+                let intermediate = routed_expert_intermediate_range(
+                    layout,
+                    usize::try_from(args.n_routed_experts)
+                        .map_err(|_| Error::Parallel("invalid V3 expert count".into()))?,
+                    usize::try_from(args.moe_intermediate_size)
+                        .map_err(|_| Error::Parallel("invalid V3 expert width".into()))?,
+                )?;
                 crate::composition::deepseek_expert::v3_parallel_catalog_selected(
                     &args,
-                    start..start + width,
+                    intermediate,
                     store.as_ref(),
                     |group, unit| partition.owns_unit(group.as_str(), unit),
                 )?
@@ -21347,9 +21347,6 @@ fn load_neutral_deepseek_v4_pipeline(
         weights_stream,
         stream,
     )?;
-    let unit_args = architecture
-        .shared_parallel_geometry()
-        .map_or_else(|| args.clone(), |geometry| geometry.args().clone());
     let mut layers = range
         .clone()
         .map(|layer| {
@@ -21544,16 +21541,17 @@ fn load_neutral_deepseek_v4_pipeline(
             .as_ref()
             .expect("external expert assignment");
         let catalog = match &parallel_layout {
-            Some(_) => {
-                let width = usize::try_from(unit_args.moe_intermediate_size)
-                    .map_err(|_| Error::Parallel("invalid local V4 expert width".into()))?;
-                let start = topology
-                    .tensor_parallel_rank
-                    .checked_mul(width)
-                    .ok_or_else(|| Error::Parallel("local V4 expert range overflowed".into()))?;
+            Some(layout) => {
+                let intermediate = routed_expert_intermediate_range(
+                    layout,
+                    usize::try_from(args.n_routed_experts)
+                        .map_err(|_| Error::Parallel("invalid V4 expert count".into()))?,
+                    usize::try_from(args.moe_intermediate_size)
+                        .map_err(|_| Error::Parallel("invalid V4 expert width".into()))?,
+                )?;
                 crate::composition::deepseek_expert::v4_parallel_catalog_selected(
                     &args,
-                    start..start + width,
+                    intermediate,
                     store.as_ref(),
                     |group, unit| partition.owns_unit(group.as_str(), unit),
                 )?
