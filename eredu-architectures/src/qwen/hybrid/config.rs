@@ -1458,7 +1458,7 @@ mod tests {
     #[test]
     fn parses_qwen38_fixture_without_backend_types() {
         let value: Value = serde_json::from_str(include_str!(
-            "../../../../eredu/tests/fixtures/configs/qwen3.8-27b-1d4bf0f2.json"
+            "../../../tests/fixtures/configs/qwen3.8-27b-1d4bf0f2.json"
         ))
         .unwrap();
         let parsed = model_args_from_config_value(&value).unwrap();
