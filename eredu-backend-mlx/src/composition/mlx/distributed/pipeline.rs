@@ -89,7 +89,8 @@ use crate::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
     },
     backend::runtime::residency::expert_provider::{
-        ExpertExecutorProvider, ResidentExpertExecutorProvider,
+        GatedProductExpertExecution, GatedProductExpertExecutorProvider, Relu2ExpertExecution,
+        Relu2ExpertExecutorProvider, ResidentExpertExecutorProvider,
     },
     backend::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
@@ -5483,11 +5484,6 @@ impl DeepSeekV3PipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let unit_args = self
-            .architecture
-            .shared_parallel_geometry()
-            .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
-        let args = &unit_args;
         let expert_cache = self.expert_storage.cache();
         let assignment = self.expert_assignment.as_ref();
         let statistics = &mut self.routing_statistics;
@@ -5495,27 +5491,24 @@ impl DeepSeekV3PipelinePartition {
             let assignment = assignment.ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V3 external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer, routed_hidden: &Array, ids: &Array, weights: &Array, context: &Stream| {
-                    let original_shape = routed_hidden.shape().to_vec();
-                    let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                    execute_pipeline_cached_neutral_deepseek_v3(
-                        args,
-                        layer,
-                        &flattened,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        statistics,
-                        context,
-                    )
-                    .and_then(|output| output.reshape(&original_shape, context).map_err(Into::into))
-                    .map_err(|error: Error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+                execute_pipeline_cached_neutral_deepseek(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    statistics,
+                    context,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -5677,10 +5670,6 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
             .ok_or_else(|| {
                 Error::Parallel(format!("V3 parameter layout has no MTP depth {depth}"))
             })?;
-        let unit_args = self
-            .architecture
-            .shared_parallel_geometry()
-            .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
         let unit = self.mtp_layers.get_mut(depth).ok_or_else(|| {
             Error::Parallel(format!(
                 "neutral DeepSeek V3 MTP depth {depth} is unavailable"
@@ -5695,20 +5684,13 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V3 MTP experts have no assignment".into())
             })?;
-            let args = &unit_args;
-            let mut execute = |requested_layer,
-                               routed_hidden: &Array,
-                               ids: &Array,
-                               weights: &Array,
-                               context: &Stream| {
-                let original_shape = routed_hidden.shape().to_vec();
-                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                execute_pipeline_cached_neutral_deepseek_v3(
-                    args,
-                    requested_layer,
-                    &flattened,
-                    ids,
-                    weights,
+            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+                execute_pipeline_cached_neutral_deepseek(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
                     ExpertPass::Decode,
                     expert_cache,
                     assignment,
@@ -5716,13 +5698,10 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
                     &mut self.routing_statistics,
                     context,
                 )
-                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider =
-                crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                    &mut execute,
-                );
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             match tensor_group {
                 Some(group) => self
                     .architecture
@@ -5894,11 +5873,6 @@ impl DeepSeekV4PipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let unit_args = self
-            .architecture
-            .shared_parallel_geometry()
-            .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
-        let args = &unit_args;
         let expert_cache = self.expert_storage.cache();
         let assignment = self.expert_assignment.as_ref();
         let statistics = &mut self.routing_statistics;
@@ -5906,27 +5880,24 @@ impl DeepSeekV4PipelinePartition {
             let assignment = assignment.ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V4 external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer, routed_hidden: &Array, ids: &Array, weights: &Array, context: &Stream| {
-                    let original_shape = routed_hidden.shape().to_vec();
-                    let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                    execute_pipeline_cached_neutral_deepseek_v4(
-                        args,
-                        layer,
-                        &flattened,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        statistics,
-                        context,
-                    )
-                    .and_then(|output| output.reshape(&original_shape, context).map_err(Into::into))
-                    .map_err(|error: Error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+                execute_pipeline_cached_neutral_deepseek(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    statistics,
+                    context,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -6142,10 +6113,6 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
             .ok_or_else(|| {
                 Error::Parallel(format!("V4 parameter layout has no MTP depth {depth}"))
             })?;
-        let unit_args = self
-            .architecture
-            .shared_parallel_geometry()
-            .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
         let unit = self.mtp_layers.get_mut(depth).ok_or_else(|| {
             Error::Parallel(format!(
                 "neutral DeepSeek V4 MTP depth {depth} is unavailable"
@@ -6164,20 +6131,13 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V4 MTP experts have no assignment".into())
             })?;
-            let args = &unit_args;
-            let mut execute = |requested_layer,
-                               routed_hidden: &Array,
-                               ids: &Array,
-                               weights: &Array,
-                               context: &Stream| {
-                let original_shape = routed_hidden.shape().to_vec();
-                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                execute_pipeline_cached_neutral_deepseek_v4(
-                    args,
-                    requested_layer,
-                    &flattened,
-                    ids,
-                    weights,
+            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+                execute_pipeline_cached_neutral_deepseek(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
                     ExpertPass::Decode,
                     expert_cache,
                     assignment,
@@ -6185,13 +6145,10 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
                     &mut self.routing_statistics,
                     context,
                 )
-                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider =
-                crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                    &mut execute,
-                );
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             match tensor_group {
                 Some(group) => self
                     .architecture
@@ -6340,24 +6297,13 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("neutral DSpark experts have no assignment".into())
             })?;
-            let unit_args = self
-                .architecture
-                .shared_parallel_geometry()
-                .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
-            let args = &unit_args;
-            let mut execute = |requested_layer,
-                               routed_hidden: &Array,
-                               ids: &Array,
-                               weights: &Array,
-                               context: &Stream| {
-                let original_shape = routed_hidden.shape().to_vec();
-                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                execute_pipeline_cached_neutral_deepseek_v4(
-                    args,
-                    requested_layer,
-                    &flattened,
-                    ids,
-                    weights,
+            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+                execute_pipeline_cached_neutral_deepseek(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
                     ExpertPass::Decode,
                     expert_cache,
                     assignment,
@@ -6365,13 +6311,10 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
                     &mut self.routing_statistics,
                     context,
                 )
-                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider =
-                crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                    &mut execute,
-                );
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             match tensor_group {
                 Some(group) => self
                     .architecture
@@ -7680,33 +7623,25 @@ impl QwenVlPipelinePartition {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Qwen3-VL external experts have no assignment".into())
             })?;
-            let args = self.args().text.clone();
-            let geometry = self.architecture.shared_parallel_geometry();
-            let mut execute =
-                |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    let expert_args = qwen_pipeline_local_expert_args(
-                        &args,
-                        geometry.as_deref().map(|geometry| geometry.text()),
-                        layer,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))?;
-                    execute_pipeline_cached_qwen3(
-                        &expert_args,
-                        layer,
-                        hidden,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        tensor_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_qwen3(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    tensor_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -8216,36 +8151,24 @@ impl QwenConditionalPipelinePartition {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("conditional Qwen external experts have no assignment".into())
             })?;
-            let args = self.args().text.clone();
-            let geometry = self.architecture.shared_parallel_geometry();
-            let mut execute =
-                |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    let expert_args = match geometry.as_ref() {
-                        Some(geometry) => {
-                            geometry.text().target(layer).cloned().ok_or_else(|| {
-                                Exception::custom(format!(
-                                    "conditional Qwen local geometry has no target layer {layer}"
-                                ))
-                            })?
-                        }
-                        None => args.clone(),
-                    };
-                    execute_pipeline_cached_neutral_qwen_hybrid(
-                        &expert_args,
-                        layer,
-                        hidden,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_neutral_qwen_hybrid(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -8293,51 +8216,41 @@ impl QwenConditionalPipelinePartition {
         let tensor_group = execution
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
-        let expert_args = match self.architecture.shared_parallel_geometry() {
-            Some(geometry) => geometry.text().prediction(depth).cloned().ok_or_else(|| {
-                Error::Parallel(format!(
-                    "conditional Qwen local geometry has no prediction depth {depth}"
-                ))
-            })?,
-            None => self.args().text.clone(),
-        };
         let units = self.prediction_layers.get_mut(depth).ok_or_else(|| {
             Error::Parallel(format!("conditional Qwen3.5 has no MTP depth {depth}"))
         })?;
         let prediction_group =
             architecture_prediction_group::<_, MlxHybridState>(&self.architecture, depth)?;
-        let mut execute =
-            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                let cache = self.expert_storage.cache().ok_or_else(|| {
-                    Exception::custom(
-                        "conditional Qwen3.5 MTP external expert cache is unavailable",
-                    )
-                })?;
-                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                    Exception::custom("conditional Qwen3.5 MTP external experts have no assignment")
-                })?;
-                execute_pipeline_cached_neutral_qwen_hybrid(
-                    &expert_args,
-                    layer,
-                    hidden,
-                    ids,
-                    weights,
-                    ExpertPass::Decode,
-                    cache,
-                    assignment,
-                    expert_group,
-                    &mut self.routing_statistics,
-                    stream,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
+        let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+            let cache = self.expert_storage.cache().ok_or_else(|| {
+                Exception::custom("conditional Qwen3.5 MTP external expert cache is unavailable")
+            })?;
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Exception::custom("conditional Qwen3.5 MTP external experts have no assignment")
+            })?;
+            execute_pipeline_cached_neutral_qwen_hybrid(
+                &execution.spec,
+                execution.layer,
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                ExpertPass::Decode,
+                cache,
+                assignment,
+                expert_group,
+                &mut self.routing_statistics,
+                stream,
+            )
+            .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
         let input = eredu_architectures::qwen::hybrid::ConditionalInput::Draft {
             tokens: crate::composition::tensor_ref(tokens),
             hidden: crate::composition::tensor_ref(prior),
             depth,
         };
         let (logits, hidden) = if self.expert_storage.cache().is_some() {
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
                 input,
@@ -9164,25 +9077,23 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
             let PipelineExpertStorage::External(expert_cache) = storage else {
                 unreachable!("checked external Nemotron-H expert storage")
             };
-            let args = self.args().clone();
             let mut statistics = std::mem::take(&mut self.routing_statistics);
-            let mut execute =
-                |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_nemotron_h(
-                        &args,
-                        layer,
-                        hidden,
-                        ids,
-                        weights,
-                        ExpertPass::Decode,
-                        expert_cache.as_ref(),
-                        &assignment,
-                        expert_group,
-                        &mut statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
+            let mut execute = |execution: Relu2ExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_nemotron_h(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    ExpertPass::Decode,
+                    expert_cache.as_ref(),
+                    &assignment,
+                    expert_group,
+                    &mut statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
             let result = self.forward_mtp_draft_neutral(
                 hidden,
                 tokens,
@@ -9202,7 +9113,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
             ));
         }
         self.forward_mtp_draft_neutral::<
-                    fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+                    fn(Relu2ExpertExecution, &Stream) -> Result<Array, Exception>,
                 >(hidden, tokens, depth, cache, execution, None, stream)
     }
 
@@ -15699,7 +15610,6 @@ impl MuseGlimmerPipelinePartition {
             &self.architecture.args().attention_schedule,
             caches,
         )?;
-        let args = self.architecture.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
         if let Some(assignment) = assignment.as_ref() {
@@ -15724,24 +15634,24 @@ impl MuseGlimmerPipelinePartition {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Muse-Glimmer external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer: usize, routed: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_muse_glimmer(
-                        &args,
-                        layer,
-                        routed,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_muse_glimmer(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -15933,31 +15843,30 @@ impl Gemma4PipelinePartition {
         };
         self.routing_statistics = RoutingStatistics::default();
         let expert_cache = self.expert_storage.cache();
-        let expert_args = self.args().text.clone();
         let decoder_range = self.range();
         let statistics = &mut self.routing_statistics;
         if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Gemma 4 external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer: usize, routed: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_neutral_gemma4(
-                        &expert_args,
-                        layer,
-                        routed,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_neutral_gemma4(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    statistics,
+                    stream,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -16095,7 +16004,6 @@ impl InklingPipelinePartition {
                 self.range().len()
             )));
         }
-        let args = self.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
         if let Some(assignment) = assignment.as_ref() {
@@ -16116,24 +16024,24 @@ impl InklingPipelinePartition {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Inkling external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer: usize, routed: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_neutral_inkling(
-                        &args,
-                        layer,
-                        routed,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_neutral_inkling(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -16247,7 +16155,6 @@ impl QwenPipelinePartition {
             .expert_cache
             .take()
             .ok_or_else(|| Error::Parallel("external Qwen expert cache is unavailable".into()))?;
-        let args = self.args().clone();
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
@@ -16257,25 +16164,25 @@ impl QwenPipelinePartition {
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
         let mut statistics = std::mem::take(&mut self.routing_statistics);
-        let mut execute =
-            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, context: &Stream| {
-                execute_pipeline_cached_qwen3(
-                    &args,
-                    layer,
-                    hidden,
-                    ids,
-                    weights,
-                    pass,
-                    &cache,
-                    &assignment,
-                    expert_group,
-                    tensor_group,
-                    &mut statistics,
-                    context,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
-        let mut provider = ExpertExecutorProvider::new(&mut execute);
+        let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            execute_pipeline_cached_qwen3(
+                &execution.spec,
+                execution.layer,
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                pass,
+                &cache,
+                &assignment,
+                expert_group,
+                tensor_group,
+                &mut statistics,
+                context,
+            )
+            .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
         let result = execute_neutral_routed_decoder_partition(
             self,
             input,
@@ -16290,20 +16197,6 @@ impl QwenPipelinePartition {
         self.routing_statistics = statistics;
         self.expert_cache = Some(cache);
         result
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn qwen_pipeline_local_expert_args(
-    args: &eredu_architectures::qwen::ModelArgs,
-    geometry: Option<&eredu_architectures::qwen::LocalGeometry>,
-    global_layer: usize,
-) -> Result<eredu_architectures::qwen::ModelArgs, Error> {
-    match geometry {
-        Some(geometry) => geometry.block(global_layer).cloned().ok_or_else(|| {
-            Error::Parallel(format!("Qwen local geometry has no block {global_layer}"))
-        }),
-        None => Ok(args.clone()),
     }
 }
 
@@ -16341,7 +16234,7 @@ fn validate_pipeline_expert_dispatch(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_qwen3(
-    args: &eredu_architectures::qwen::ModelArgs,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16357,7 +16250,7 @@ fn execute_pipeline_cached_qwen3(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_neutral_qwen3(args, global_layer, routes, pass, cache, stream)
+        super::expert::execute_cached_neutral_qwen3(spec, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -16371,7 +16264,7 @@ fn execute_pipeline_cached_qwen3(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_gemma4(
-    args: &eredu_architectures::gemma4::ModelArgs,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16387,7 +16280,7 @@ fn execute_pipeline_cached_neutral_gemma4(
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_neutral_gemma4(
-            args,
+            spec,
             global_layer,
             routes,
             pass,
@@ -16406,66 +16299,9 @@ fn execute_pipeline_cached_neutral_gemma4(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_pipeline_cached_neutral_deepseek_v3(
-    args: &eredu_architectures::deepseek::V3Args,
-    global_layer: usize,
-    hidden: &Array,
-    expert_ids: &Array,
-    weights: &Array,
-    pass: ExpertPass,
-    cache: &ExpertCache,
-    assignment: &ExpertAssignment,
-    expert_group: Option<&Group>,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    execute_pipeline_cached_neutral_deepseek(
-        crate::composition::deepseek_expert::v3_spec(args, global_layer)?,
-        global_layer,
-        hidden,
-        expert_ids,
-        weights,
-        pass,
-        cache,
-        assignment,
-        expert_group,
-        statistics,
-        stream,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_pipeline_cached_neutral_deepseek_v4(
-    args: &eredu_architectures::deepseek::V4Args,
-    global_layer: usize,
-    hidden: &Array,
-    expert_ids: &Array,
-    weights: &Array,
-    pass: ExpertPass,
-    cache: &ExpertCache,
-    assignment: &ExpertAssignment,
-    expert_group: Option<&Group>,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    execute_pipeline_cached_neutral_deepseek(
-        crate::composition::deepseek_expert::v4_spec(args, global_layer)?,
-        global_layer,
-        hidden,
-        expert_ids,
-        weights,
-        pass,
-        cache,
-        assignment,
-        expert_group,
-        statistics,
-        stream,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_deepseek(
-    spec: eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16482,7 +16318,7 @@ fn execute_pipeline_cached_neutral_deepseek(
                    stream: &Stream| {
         crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
-            &spec,
+            spec,
             global_layer,
             &routes.hidden,
             &routes.global_expert_ids,
@@ -16502,7 +16338,7 @@ fn execute_pipeline_cached_neutral_deepseek(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_lfm2(
-    args: &eredu_architectures::lfm2::ModelArgs,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16517,7 +16353,7 @@ fn execute_pipeline_cached_lfm2(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_lfm2(args, global_layer, routes, pass, cache, stream)
+        super::expert::execute_cached_lfm2(spec, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -16531,7 +16367,7 @@ fn execute_pipeline_cached_lfm2(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_muse_glimmer(
-    args: &eredu_architectures::muse_glimmer::DecoderConfig,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16546,7 +16382,7 @@ fn execute_pipeline_cached_muse_glimmer(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_muse_glimmer(args, global_layer, routes, pass, cache, stream)
+        super::expert::execute_cached_muse_glimmer(spec, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -16560,7 +16396,7 @@ fn execute_pipeline_cached_muse_glimmer(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_qwen_hybrid(
-    args: &eredu_architectures::qwen::hybrid::HybridConfig,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16573,12 +16409,11 @@ fn execute_pipeline_cached_neutral_qwen_hybrid(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let spec = eredu_architectures::qwen::hybrid::expert_bank_spec(args, global_layer)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
-            &spec,
+            spec,
             global_layer,
             &routes.hidden,
             &routes.global_expert_ids,
@@ -16598,7 +16433,7 @@ fn execute_pipeline_cached_neutral_qwen_hybrid(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_kimi_linear(
-    args: &eredu_architectures::kimi_linear::ModelArgs,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16613,7 +16448,7 @@ fn execute_pipeline_cached_kimi_linear(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_kimi_linear(args, global_layer, routes, pass, cache, stream)
+        super::expert::execute_cached_kimi_linear(spec, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -16627,7 +16462,7 @@ fn execute_pipeline_cached_kimi_linear(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_inkling(
-    args: &eredu_architectures::inkling::ModelArgs,
+    spec: &eredu_nn::GatedProductExpertBankSpec,
     cache_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16643,7 +16478,7 @@ fn execute_pipeline_cached_neutral_inkling(
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_neutral_inkling(
-            args,
+            spec,
             cache_layer,
             routes,
             pass,
@@ -16663,7 +16498,7 @@ fn execute_pipeline_cached_neutral_inkling(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_nemotron_h(
-    args: &eredu_architectures::nemotron_h::ModelArgs,
+    spec: &eredu_nn::Relu2ExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -16678,7 +16513,7 @@ fn execute_pipeline_cached_nemotron_h(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_nemotron_h(args, global_layer, routes, pass, cache, stream)
+        super::expert::execute_cached_nemotron_h(spec, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -17622,31 +17457,30 @@ impl Lfm2PipelinePartition {
                 "external LFM2 expert cache is unavailable".into(),
             ));
         };
-        let args = self.args().clone();
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
             ExpertPass::Decode
         };
         let mut statistics = std::mem::take(&mut self.routing_statistics);
-        let mut execute =
-            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, context: &Stream| {
-                execute_pipeline_cached_lfm2(
-                    &args,
-                    layer,
-                    hidden,
-                    ids,
-                    weights,
-                    pass,
-                    &cache,
-                    &assignment,
-                    expert_group,
-                    &mut statistics,
-                    context,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
-        let mut provider = ExpertExecutorProvider::new(&mut execute);
+        let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            execute_pipeline_cached_lfm2(
+                &execution.spec,
+                execution.layer,
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                pass,
+                &cache,
+                &assignment,
+                expert_group,
+                &mut statistics,
+                context,
+            )
+            .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
         let result = execute_neutral_routed_lfm2_partition(
             self,
             input,
@@ -18194,31 +18028,29 @@ impl NemotronHPipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let args = self.args().clone();
         let expert_cache = self.expert_storage.cache();
         let decoder_range = self.range();
         if let Some(expert_cache) = expert_cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Nemotron-H external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_nemotron_h(
-                        &args,
-                        layer,
-                        hidden,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: Relu2ExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_nemotron_h(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = Relu2ExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -18305,7 +18137,7 @@ impl NemotronHPipelinePartition {
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Error>
     where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+        F: FnMut(Relu2ExpertExecution, &Stream) -> Result<Array, Exception>,
     {
         let tensor_group = execution
             .filter(|execution| execution.is_tensor_parallel())
@@ -18326,7 +18158,7 @@ impl NemotronHPipelinePartition {
             depth,
         };
         let (logits, hidden) = if let Some(execute) = execute {
-            let mut provider = ExpertExecutorProvider::new(execute);
+            let mut provider = Relu2ExpertExecutorProvider::new(execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
                 input,
@@ -18418,7 +18250,6 @@ impl QwenHybridPipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let global_args = self.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
         let decoder_range = self.range();
@@ -18426,24 +18257,24 @@ impl QwenHybridPipelinePartition {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Qwen hybrid external experts have no assignment".into())
             })?;
-            let mut execute =
-                |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_neutral_qwen_hybrid(
-                        &global_args,
-                        layer,
-                        hidden,
-                        ids,
-                        weights,
-                        pass,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+                execute_pipeline_cached_neutral_qwen_hybrid(
+                    &execution.spec,
+                    execution.layer,
+                    &execution.hidden,
+                    &execution.expert_ids,
+                    &execution.route_weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_routed_layered_partition(
                 &mut self.architecture,
                 &self.partition,
@@ -18493,50 +18324,42 @@ impl QwenHybridPipelinePartition {
         let tensor_group = execution
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
-        let expert_args = match self.architecture.shared_parallel_geometry() {
-            Some(geometry) => geometry.prediction(depth).cloned().ok_or_else(|| {
-                Error::Parallel(format!(
-                    "Qwen hybrid local geometry has no prediction depth {depth}"
-                ))
-            })?,
-            None => self.args().clone(),
-        };
         let units = self
             .prediction_layers
             .get_mut(depth)
             .ok_or_else(|| Error::Parallel(format!("Qwen hybrid has no MTP depth {depth}")))?;
         let prediction_group =
             architecture_prediction_group::<_, MlxHybridState>(&self.architecture, depth)?;
-        let mut execute =
-            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                let cache = self.expert_storage.cache().ok_or_else(|| {
-                    Exception::custom("Qwen hybrid MTP external expert cache is unavailable")
-                })?;
-                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                    Exception::custom("Qwen hybrid MTP external experts have no assignment")
-                })?;
-                execute_pipeline_cached_neutral_qwen_hybrid(
-                    &expert_args,
-                    layer,
-                    hidden,
-                    ids,
-                    weights,
-                    ExpertPass::Decode,
-                    cache,
-                    assignment,
-                    expert_group,
-                    &mut self.routing_statistics,
-                    stream,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
+        let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+            let cache = self.expert_storage.cache().ok_or_else(|| {
+                Exception::custom("Qwen hybrid MTP external expert cache is unavailable")
+            })?;
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Exception::custom("Qwen hybrid MTP external experts have no assignment")
+            })?;
+            execute_pipeline_cached_neutral_qwen_hybrid(
+                &execution.spec,
+                execution.layer,
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                ExpertPass::Decode,
+                cache,
+                assignment,
+                expert_group,
+                &mut self.routing_statistics,
+                stream,
+            )
+            .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
         let input = eredu_architectures::qwen::hybrid::EmbeddedInput::Draft {
             tokens: crate::composition::tensor_ref(tokens),
             hidden: crate::composition::tensor_ref(prior),
             depth,
         };
         let (logits, hidden) = if self.expert_storage.cache().is_some() {
-            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
                 input,
@@ -20145,31 +19968,30 @@ impl KimiLinearPipelinePartition {
                 "external Kimi expert cache is unavailable".into(),
             ));
         };
-        let args = self.args().clone();
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
             ExpertPass::Decode
         };
         let mut statistics = std::mem::take(&mut self.routing_statistics);
-        let mut execute =
-            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, context: &Stream| {
-                execute_pipeline_cached_kimi_linear(
-                    &args,
-                    layer,
-                    hidden,
-                    ids,
-                    weights,
-                    pass,
-                    &cache,
-                    &assignment,
-                    expert_group,
-                    &mut statistics,
-                    context,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
-        let mut provider = ExpertExecutorProvider::new(&mut execute);
+        let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            execute_pipeline_cached_kimi_linear(
+                &execution.spec,
+                execution.layer,
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                pass,
+                &cache,
+                &assignment,
+                expert_group,
+                &mut statistics,
+                context,
+            )
+            .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
         let result = execute_neutral_routed_kimi_partition(
             self,
             input,

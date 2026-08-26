@@ -436,6 +436,9 @@ descriptor from model arguments. Architecture APIs derive localized
 expert-bank specifications for placement-resolved expert counts and projection
 widths while preserving canonical parameter identities and physical formats;
 backend composition only materializes those returned specifications.
+Cache-backed distributed callbacks receive the specification from the resident
+unit bank itself, including for ReLU-squared banks and appended prediction
+units; they never rebuild it from a family configuration and layer index.
 Ownership and localized construction are published together as an
 `ExpertRealizationPlan`. The plan contains the checkpoint-global expert count,
 the complete global-expert-to-owner map, the current rank's global expert IDs,

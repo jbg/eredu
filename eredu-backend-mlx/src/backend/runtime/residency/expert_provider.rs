@@ -407,6 +407,112 @@ where
     }
 }
 
+/// Architecture-owned geometry and tensors supplied to a ReLU2 expert callback.
+pub struct Relu2ExpertExecution {
+    /// Global decoder or prediction layer requesting expert execution.
+    pub layer: usize,
+    /// Rank-local bank specification retained by the architecture module.
+    pub spec: Relu2ExpertBankSpec,
+    /// Flattened token rows submitted to the selected experts.
+    pub hidden: Array,
+    /// Selected global expert identities.
+    pub expert_ids: Array,
+    /// Route weights aligned with `expert_ids`.
+    pub route_weights: Array,
+}
+
+/// Adapts a distributed ReLU2 callback that consumes the resident unit spec.
+pub struct Relu2ExpertExecutorProvider<'a, F> {
+    execute: &'a mut F,
+}
+
+impl<'a, F> Relu2ExpertExecutorProvider<'a, F> {
+    pub const fn new(execute: &'a mut F) -> Self {
+        Self { execute }
+    }
+}
+
+fn execute_relu2_callback<F>(
+    execute: &mut F,
+    resident_bank: &<MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+    request: RoutedExpertRequest<'_, MlxTensor>,
+    stream: &Stream,
+) -> Result<MlxTensor, safemlx::error::Exception>
+where
+    F: FnMut(Relu2ExpertExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
+{
+    if request.input.as_array().ndim() < 2 {
+        return Err(safemlx::error::Exception::custom(format!(
+            "routed expert input must have a hidden dimension, got {:?}",
+            request.input.as_array().shape()
+        )));
+    }
+    let original_shape = request.input.as_array().shape().to_vec();
+    let hidden = request
+        .input
+        .as_array()
+        .reshape(&[-1, request.input.as_array().dim(-1)], stream)?;
+    let expert_ids = request
+        .routes
+        .expert_ids
+        .as_array()
+        .reshape(&[-1, request.routes.expert_ids.as_array().dim(-1)], stream)?;
+    let route_weights = request.routes.route_weights.as_array().reshape(
+        &[-1, request.routes.route_weights.as_array().dim(-1)],
+        stream,
+    )?;
+    execute(
+        Relu2ExpertExecution {
+            layer: request.layer,
+            spec: resident_bank.spec().clone(),
+            hidden,
+            expert_ids,
+            route_weights,
+        },
+        stream,
+    )?
+    .reshape(&original_shape, stream)
+    .map(MlxTensor::from_array)
+}
+
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for Relu2ExpertExecutorProvider<'_, F>
+where
+    F: FnMut(Relu2ExpertExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
+{
+    type Error = safemlx::error::Exception;
+
+    fn forward_routed(
+        &mut self,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        _request: RoutedExpertRequest<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        Err(safemlx::error::Exception::custom(
+            "a ReLU2 expert executor cannot execute a gated-product expert bank",
+        ))
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        execute_relu2_callback(self.execute, resident_bank, request, stream)
+    }
+
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, MlxTensor>,
+        _partitions: usize,
+        stream: &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
+        execute_relu2_callback(self.execute, resident_bank, request, stream)
+            .map(RoutedExpertTensorParallelOutput::Complete)
+    }
+}
+
 /// Adapts a distributed callback that consumes the resident rank-local bank.
 pub struct ResidentExpertExecutorProvider<'a, F> {
     execute: &'a mut F,
@@ -482,6 +588,131 @@ where
         Err(safemlx::error::Exception::custom(
             "a resident gated-product executor cannot execute a ReLU2 expert bank",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eredu_nn::{GatedProductExpertLayout, RoutingResult};
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    fn localized_qwen_spec() -> GatedProductExpertBankSpec {
+        let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
+            "model_type": "qwen3_moe",
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "intermediate_size": 0,
+            "moe_intermediate_size": 8,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "rms_norm_eps": 0.000001,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        let mut spec = eredu_architectures::qwen::expert_bank_spec(&args, 0).unwrap();
+        spec.expert_count = 2;
+        spec.intermediate_dimensions = 4;
+        spec
+    }
+
+    fn test_routes() -> (MlxTensor, RoutingResult<MlxTensor>) {
+        let hidden = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 16], &[1, 16]));
+        let expert_ids = MlxTensor::from_array(Array::from_slice(&[0_i32], &[1, 1]));
+        let weights = MlxTensor::from_array(Array::from_slice(&[1.0_f32], &[1, 1]));
+        let selected_scores = weights.clone();
+        let routes = RoutingResult {
+            expert_ids,
+            selected_scores,
+            route_weights: weights,
+        };
+        (hidden, routes)
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn distributed_callbacks_receive_resident_unit_specs() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let gated_spec = localized_qwen_spec();
+        let mut gated_bank =
+            <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::gated_product_expert_bank(
+                gated_spec.clone(),
+                stream,
+            )
+            .unwrap();
+        let (hidden, routes) = test_routes();
+        let mut gated_observed = false;
+        let mut execute = |execution: GatedProductExpertExecution, _stream: &Stream| {
+            assert_eq!(execution.spec.expert_count, gated_spec.expert_count);
+            assert_eq!(
+                execution.spec.intermediate_dimensions,
+                gated_spec.intermediate_dimensions
+            );
+            gated_observed = true;
+            Ok(RoutedExpertTensorParallelOutput::Complete(execution.hidden))
+        };
+        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+        provider
+            .forward_routed(
+                &mut gated_bank,
+                RoutedExpertRequest {
+                    layer: 0,
+                    input: &hidden,
+                    routes: &routes,
+                    pass: ExpertPass::Decode,
+                },
+                stream,
+            )
+            .unwrap();
+        assert!(gated_observed);
+
+        let GatedProductExpertLayout::Packed { gate_up, down } = gated_spec.layout else {
+            panic!("Qwen test specification must use packed experts")
+        };
+        let relu_spec = Relu2ExpertBankSpec {
+            expert_count: 2,
+            hidden_dimensions: 16,
+            intermediate_dimensions: 4,
+            up: gate_up,
+            down,
+        };
+        let mut relu_bank = <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::relu2_expert_bank(
+            relu_spec.clone(),
+            stream,
+        )
+        .unwrap();
+        let (hidden, routes) = test_routes();
+        let mut relu_observed = false;
+        let mut execute = |execution: Relu2ExpertExecution, _stream: &Stream| {
+            assert_eq!(execution.spec.expert_count, relu_spec.expert_count);
+            assert_eq!(
+                execution.spec.intermediate_dimensions,
+                relu_spec.intermediate_dimensions
+            );
+            relu_observed = true;
+            Ok(execution.hidden)
+        };
+        let mut provider = Relu2ExpertExecutorProvider::new(&mut execute);
+        provider
+            .forward_relu2_routed(
+                &mut relu_bank,
+                RoutedExpertRequest {
+                    layer: 1,
+                    input: &hidden,
+                    routes: &routes,
+                    pass: ExpertPass::Decode,
+                },
+                stream,
+            )
+            .unwrap();
+        assert!(relu_observed);
     }
 }
 

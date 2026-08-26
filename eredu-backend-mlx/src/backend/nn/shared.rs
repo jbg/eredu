@@ -1114,7 +1114,15 @@ impl GatedProductExpertBankOperator<MlxTensor> for MlxGatedProductExpertBank {
 /// MLX packed execution bank for backend-neutral routed ReLU2 experts.
 #[derive(Debug, Clone)]
 pub struct MlxRelu2ExpertBank {
+    spec: Relu2ExpertBankSpec,
     module: MlxNamedModule<common::moe::PackedRelu2Experts>,
+}
+
+impl MlxRelu2ExpertBank {
+    /// Returns the architecture-owned specification used to realize this bank.
+    pub const fn spec(&self) -> &Relu2ExpertBankSpec {
+        &self.spec
+    }
 }
 
 impl Parameterized<MlxTensor> for MlxRelu2ExpertBank {
@@ -2779,6 +2787,7 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             ));
         }
         Ok(MlxRelu2ExpertBank {
+            spec,
             module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }

@@ -1,6 +1,7 @@
 // MLX residency adapter for neutral Qwen routed-expert checkpoint contracts.
 
 use eredu_architectures::qwen::ModelArgs;
+use eredu_nn::GatedProductExpertBankSpec;
 use eredu_runtime::ExpertPass;
 use safemlx::{Array, Stream};
 
@@ -30,17 +31,16 @@ pub const fn cached_provider<'a>(
 
 pub fn execute_cached_dispatched(
     cache: &ExpertCache,
-    args: &ModelArgs,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     global_expert_ids: &Array,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let spec = eredu_architectures::qwen::expert_bank_spec(args, layer)?;
     execute_cached_gated_product_dispatched(
         cache,
-        &spec,
+        spec,
         layer,
         hidden,
         global_expert_ids,

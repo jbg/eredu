@@ -3,7 +3,6 @@
 use std::{collections::BTreeSet, ops::Range};
 
 use eredu_architectures::deepseek::{self, V3Args, V4Args};
-use eredu_nn::GatedProductExpertBankSpec;
 
 use crate::backend::{
     error::Error,
@@ -128,15 +127,6 @@ pub const fn v4_provider<'a>(
     _args: &V4Args,
 ) -> CachedGatedProductExpertProvider<'a> {
     CachedGatedProductExpertProvider::new(cache)
-}
-
-pub fn v3_spec(args: &V3Args, layer: usize) -> Result<GatedProductExpertBankSpec, Error> {
-    let policy = deepseek::v3::moe_policy(args, layer)?;
-    Ok(deepseek::moe::expert_bank_spec(&policy)?)
-}
-
-pub fn v4_spec(args: &V4Args, layer: usize) -> Result<GatedProductExpertBankSpec, Error> {
-    Ok(deepseek::v4::expert_bank_spec(args, layer)?)
 }
 
 #[cfg(test)]
