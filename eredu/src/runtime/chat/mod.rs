@@ -5,7 +5,7 @@
 //! model architecture metadata is deliberately not a fallback.
 
 pub(crate) mod atem;
-pub mod constraints;
+pub(crate) mod constraints;
 pub(crate) mod dialect;
 pub(crate) mod gemma;
 pub(crate) mod harmony;

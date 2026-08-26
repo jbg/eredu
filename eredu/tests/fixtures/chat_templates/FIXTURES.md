@@ -1,8 +1,8 @@
 # Chat-template fixtures
 
-These Jinja files test rendering and behavioral protocol recognition across the
-supported chat-template families. Whitespace is significant, and filenames
-identify source snapshots where applicable.
+Every Jinja file in this directory is referenced by a rendering or behavioral
+protocol test. Whitespace is significant, and filenames identify source
+snapshots where applicable.
 
 Runtime capability is determined from rendered behavior and tokenizer special
 tokens, not filenames or body hashes. Tests cover message framing, reasoning,

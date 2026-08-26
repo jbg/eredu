@@ -627,9 +627,6 @@ fn materialize_tensor_parallel(
         eredu_runtime::ShardingPolicy::Require,
     );
     match kind {
-        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Err(Error::Parallel(
-            "DeepSeek tensor parallelism requires distributed-stage materialization".into(),
-        )),
         ModelKind::Gemma4 => Ok(Model::gemma4(
             kind,
             crate::composition::gemma4::load_safetensors_tensor_parallel(
@@ -720,18 +717,18 @@ fn materialize_tensor_parallel(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Qwen3Next => Err(Error::ArchitectureModel(
-            "neutral Qwen hybrid tensor-parallel binding is not initialized".into(),
-        )),
-        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => Err(Error::ArchitectureModel(
-            "neutral Qwen3-VL tensor-parallel binding is not initialized".into(),
-        )),
-        ModelKind::Qwen35 => Err(Error::ArchitectureModel(
-            "neutral Qwen3.5 tensor-parallel binding is not initialized".into(),
-        )),
         ModelKind::Moshi => Err(Error::ArchitectureModel(
             "Moshi-family models do not use the text Model tensor-parallel session".into(),
         )),
+        ModelKind::DeepSeekV3
+        | ModelKind::DeepSeekV4
+        | ModelKind::Qwen3Next
+        | ModelKind::Qwen35
+        | ModelKind::Qwen3Vl
+        | ModelKind::Qwen3VlMoe => unreachable!(
+            "distributed-stage-only {} reached complete tensor-parallel materialization",
+            kind.canonical_name()
+        ),
     }
 }
 
@@ -834,9 +831,6 @@ fn materialize_gguf_tensor_parallel(
                 )?;
             Model::kimi_linear(kind, model)
         }
-        GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => Err(Error::Parallel(
-            "DeepSeek GGUF tensor parallelism requires distributed-stage materialization".into(),
-        )),
         GgufArchitecture::GptOss => {
             let model = crate::composition::gpt_oss::load_gpt_oss_gguf_tensor_parallel_model(
                 source,
@@ -925,14 +919,16 @@ fn materialize_gguf_tensor_parallel(
             )?;
             Model::qwen(kind, model)
         }
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => Err(Error::ArchitectureModel(
-            "neutral Qwen3-VL GGUF tensor-parallel binding is not initialized".into(),
-        )),
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            Err(Error::ArchitectureModel(
-                "neutral Qwen hybrid GGUF tensor-parallel binding is not initialized".into(),
-            ))
-        }
+        GgufArchitecture::DeepSeek2
+        | GgufArchitecture::DeepSeek4
+        | GgufArchitecture::Qwen3Vl
+        | GgufArchitecture::Qwen3VlMoe
+        | GgufArchitecture::Qwen35
+        | GgufArchitecture::Qwen35Moe
+        | GgufArchitecture::Qwen3Next => unreachable!(
+            "distributed-stage-only {} reached complete GGUF tensor-parallel materialization",
+            architecture.metadata_name()
+        ),
     }
 }
 
