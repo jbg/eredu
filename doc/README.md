@@ -48,6 +48,8 @@ execution or implementing backend components.
 
 - [Adding a native tool protocol](tool-protocol-development.md): evidence,
   fixtures, recognizers, constraints, and validation for a new wire format.
+- [Releasing workspace crates](releasing.md): package validation and the
+  dependency-ordered publication sequence.
 
 API-level documentation is provided by each crate's Rustdoc. The guides here
 focus on contracts and choices that span multiple APIs or crates.

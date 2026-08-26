@@ -1,0 +1,40 @@
+name: Release package validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release-packages.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "LICENSE-*"
+      - "rust-toolchain.toml"
+      - "validation/validate_release_packages.py"
+      - "doc/README.md"
+      - "doc/releasing.md"
+      - "eredu/**"
+      - "eredu-*/**"
+      - "safemlx/**"
+      - "safemlx-*/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package publishable crates
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
+          python3 -m pip install --user "cmake>=3.25"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build release archives in publication order
+        run: python3 validation/validate_release_packages.py
