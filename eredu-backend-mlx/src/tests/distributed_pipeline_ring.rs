@@ -63,6 +63,7 @@ const CARTESIAN_AXES: &str = "EREDU_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "EREDU_PIPELINE_EXPERT_CACHE";
 const REQUANTIZE: &str = "EREDU_PIPELINE_REQUANTIZE";
 const OPAQUE_SESSION: &str = "EREDU_PIPELINE_OPAQUE_SESSION";
+const OPAQUE_INSPECTION: &str = "EREDU_PIPELINE_OPAQUE_INSPECTION";
 const OPAQUE_TEXT_GENERATION: &str = "EREDU_PIPELINE_OPAQUE_TEXT_GENERATION";
 const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
@@ -861,6 +862,36 @@ fn pipeline_ring_worker() {
         } else {
             family.comparison_tolerance()
         };
+        if std::env::var_os(OPAQUE_INSPECTION).is_some() {
+            let local_layers = runtime.session().prompt_cache_global_layer_range().unwrap();
+            let layer_root = if family == FixtureFamily::Gemma {
+                "model.language_model.layers"
+            } else {
+                "model.layers"
+            };
+            let expected = format!("{layer_root}.{}.output", local_layers.start);
+            let inspected = runtime
+                .inspect_prefill(ModelInput::new(&parts).into(), &ObservationRequest::all())
+                .unwrap();
+            assert!(
+                inspected.observations.get(&expected).is_some(),
+                "rank {expected_rank} missing canonical {expected:?} in {:?}",
+                inspected.observations
+            );
+            assert!(
+                inspected
+                    .observations
+                    .iter()
+                    .all(|(path, _)| !path.starts_with("text_decoder.")),
+                "rank {expected_rank} returned a synthetic group/index path: {:?}",
+                inspected.observations
+            );
+            assert_eq!(
+                inspected.observations.get("model.logits").is_some(),
+                pipeline_rank + 1 == pipeline_parallel_size
+            );
+            return;
+        }
         if inkling_mtp_mode {
             let layer_prefix_offsets = runtime
                 .session()
@@ -4954,6 +4985,12 @@ fn ring_two_process_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Llama);
 }
 
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_pipeline_inspection_uses_canonical_paths() {
+    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueInspection);
+}
+
 /// Runs backend-generic text generation across a pipeline whose non-output
 /// rank legitimately produces no local logits.
 #[test]
@@ -6247,6 +6284,23 @@ fn ring_two_process_gemma4_multimodal_tensor_parallel_opaque_session() {
     );
 }
 
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic untied Gemma 4 Unified media fixture"]
+fn ring_two_process_gemma4_multimodal_inspection_uses_canonical_paths() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma4_multimodal_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueGemma4MediaInspection,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
 /// Compares tied Gemma 4 Unified image/audio prefill and decode with the
 /// single-rank resident model while the TP path projects through embeddings.
 #[test]
@@ -6687,12 +6741,14 @@ enum WorkerMode {
     ExpertCacheRequantize,
     Requantize,
     OpaqueSession,
+    OpaqueInspection,
     OpaqueTextGeneration,
     OpaqueSessionExpertCache,
     OpaqueMuseImage,
     OpaqueInklingMedia,
     OpaqueInklingMtp,
     OpaqueGemma4Media,
+    OpaqueGemma4MediaInspection,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -6877,6 +6933,10 @@ fn run_ring_pipeline_processes(
             WorkerMode::OpaqueSession => {
                 command.env(OPAQUE_SESSION, "1");
             }
+            WorkerMode::OpaqueInspection => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_INSPECTION, "1");
+            }
             WorkerMode::OpaqueTextGeneration => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_TEXT_GENERATION, "1");
@@ -6900,6 +6960,11 @@ fn run_ring_pipeline_processes(
             WorkerMode::OpaqueGemma4Media => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_GEMMA4_MEDIA, "1");
+            }
+            WorkerMode::OpaqueGemma4MediaInspection => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_GEMMA4_MEDIA, "1");
+                command.env(OPAQUE_INSPECTION, "1");
             }
         }
         children.children.push(command.spawn().unwrap());

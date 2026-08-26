@@ -1254,13 +1254,12 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     Error::Parallel("pipeline model session has no communication".into())
                 })?;
                 let completion = input.with_borrowed(|borrowed| {
-                    let tokens = input::text_token_ids(borrowed, backend.stream())?;
-                    let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
                     let multimodal = borrowed
                         .parts
                         .iter()
                         .any(|part| part.modality() != InputModality::Text);
                     if multimodal {
+                        let step = model.prepared_input_step(borrowed)?;
                         model.prefill_distributed(
                             model.stage_info().owns_input.then_some(borrowed),
                             step,
@@ -1269,6 +1268,8 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                             distributed,
                         )
                     } else {
+                        let tokens = input::text_token_ids(borrowed, backend.stream())?;
+                        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
                         model.forward_distributed(
                             model.stage_info().owns_input.then_some(&tokens),
                             step,
@@ -1354,8 +1355,6 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     Error::Parallel("pipeline model session has no communication".into())
                 })?;
                 let completion = input.with_borrowed(|borrowed| {
-                    let tokens = input::text_token_ids(borrowed, backend.stream())?;
-                    let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
                     let multimodal = borrowed
                         .parts
                         .iter()
@@ -1364,6 +1363,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         inner: &mut collector,
                     };
                     if multimodal {
+                        let step = model.prepared_input_step(borrowed)?;
                         model.prefill_distributed_with_observer(
                             model.stage_info().owns_input.then_some(borrowed),
                             step,
@@ -1373,6 +1373,8 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                             &mut observer,
                         )
                     } else {
+                        let tokens = input::text_token_ids(borrowed, backend.stream())?;
+                        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
                         model.forward_distributed_with_observer(
                             model.stage_info().owns_input.then_some(&tokens),
                             step,

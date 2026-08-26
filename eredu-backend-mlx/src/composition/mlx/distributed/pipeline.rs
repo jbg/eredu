@@ -1579,6 +1579,11 @@ impl Gemma4PipelinePartition {
             .ok_or_else(|| Error::Parallel("Gemma 4 partition has no runtime state".into()))
     }
 
+    fn ingress_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
+        eredu_architectures::gemma4::state_layout(&self.args().text)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn static_modules(&self) -> &eredu_architectures::gemma4::StaticModules<MlxNeuralBackend> {
         <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
             MlxNeuralBackend,
@@ -1714,7 +1719,13 @@ impl Gemma4PipelinePartition {
         crate::backend::runtime::media::input::validate(typed)?;
         let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
         let parts = prepared.decoder_parts();
-        let mut state = MlxHybridState::device(self.state_layout()?)?;
+        let mut state = MlxHybridState::device(
+            if execution.is_some_and(ParallelExecutionContext::is_tensor_parallel) {
+                self.state_layout()?
+            } else {
+                self.ingress_state_layout()?
+            },
+        )?;
         let input = eredu_architectures::gemma4::ModelInput {
             parts: &parts,
             vision: prepared.vision_input(),
@@ -1819,7 +1830,7 @@ impl Gemma4PipelinePartition {
             .map(|input| input.valid_subsampled_frames.to_vec());
         Ok(Gemma4IngressState {
             forward: None,
-            state: MlxHybridState::device(self.state_layout()?)?,
+            state: MlxHybridState::device(self.ingress_state_layout()?)?,
             vision_hidden,
             vision_state,
             audio_hidden,
@@ -2990,6 +3001,7 @@ trait PipelinePlacedIngress {
         _execution: Option<&ParallelExecutionContext<'_>>,
         _expert_group: Option<&Group>,
         _stream: &Stream,
+        _observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error>;
 }
 
@@ -3068,14 +3080,8 @@ trait PipelineForward: PipelinePartitionMetadata {
         execution: Option<&ParallelExecutionContext<'_>>,
         _expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if execution.is_some_and(ParallelExecutionContext::is_tensor_parallel) {
-            return Err(Error::Parallel(
-                "pipeline architecture has no tensor-sharded stage implementation".into(),
-            ));
-        }
-        self.forward(input, step, mask, cache, stream)
-    }
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelineStageOutput, Error>;
 
     fn forward_observed_with_execution(
         &mut self,
@@ -3101,9 +3107,18 @@ macro_rules! pipeline_observed_forward {
             execution: Option<&ParallelExecutionContext<'_>>,
             expert_group: Option<&Group>,
             stream: &Stream,
-            _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+            observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
         ) -> Result<PipelineStageOutput, Error> {
-            self.forward_with_execution(input, step, mask, cache, execution, expert_group, stream)
+            self.forward_with_execution(
+                input,
+                step,
+                mask,
+                cache,
+                execution,
+                expert_group,
+                stream,
+                Some(observer),
+            )
         }
     };
 }
@@ -3199,6 +3214,7 @@ impl dyn PipelineArchitecture {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         self.placed_ingress_mut()
             .ok_or_else(|| {
@@ -3206,7 +3222,16 @@ impl dyn PipelineArchitecture {
                     "pipeline stage does not accept typed multimodal ingress".into(),
                 )
             })?
-            .prefill(input, step, mask, cache, execution, expert_group, stream)
+            .prefill(
+                input,
+                step,
+                mask,
+                cache,
+                execution,
+                expert_group,
+                stream,
+                observer,
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3831,6 +3856,7 @@ fn execute_neutral_partition_group<A, U, F>(
     forward: &mut eredu_runtime::LayeredForwardState<crate::MlxTensor, F>,
     parallel: Option<&Group>,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<Array, Error>
 where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
@@ -3844,12 +3870,13 @@ where
     for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
         std::fmt::Display,
 {
-    struct Owner<'a, A, F> {
+    struct Owner<'a, 'observer, A, F> {
         architecture: &'a mut A,
         forward: &'a mut F,
         state_layout: &'a eredu_runtime::StateLayout,
         group_index: usize,
         parallel: Option<&'a Group>,
+        observer: Option<&'observer mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     }
     let mut owner = Owner {
         architecture,
@@ -3857,6 +3884,7 @@ where
         state_layout,
         group_index,
         parallel,
+        observer,
     };
     execute_pipeline_layer_range_with(
         PipelineLayerExecution {
@@ -3878,6 +3906,19 @@ where
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         |owner, global_layer, layer, hidden, cache, stream| {
+            let path =
+                <A as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
+                    PipelineRangeState<'_>,
+                >>::unit_path(owner.architecture, owner.group_index, global_layer)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            let input = match owner.observer.as_deref_mut() {
+                Some(observer) => {
+                    eredu_runtime::observe_and_intervene(observer, &format!("{path}.input"), hidden)
+                        .map_err(Error::from)?
+                }
+                None => hidden.clone(),
+            };
             let mut state = PipelineRangeState::new(
                 owner.state_layout.clone(),
                 global_layer..global_layer + 1,
@@ -3892,7 +3933,7 @@ where
                     owner.group_index,
                     global_layer,
                     &mut layer.inner,
-                    crate::composition::tensor_ref(hidden),
+                    crate::composition::tensor_ref(&input),
                     &mut state,
                     owner.forward,
                     parallel,
@@ -3906,7 +3947,7 @@ where
                     owner.group_index,
                     global_layer,
                     &mut layer.inner,
-                    crate::composition::tensor_ref(hidden),
+                    crate::composition::tensor_ref(&input),
                     &mut state,
                     owner.forward,
                     stream,
@@ -3927,8 +3968,18 @@ where
             .cloned()
             .map(crate::MlxTensor::into_array)
             .collect();
+            let output = output.into_array();
+            let output = match owner.observer.as_deref_mut() {
+                Some(observer) => eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{path}.output"),
+                    &output,
+                )
+                .map_err(Error::from)?,
+                None => output,
+            };
             Ok(PipelineLayerForward {
-                hidden: output.into_array(),
+                hidden: output,
                 retained,
             })
         },
@@ -3982,6 +4033,7 @@ fn execute_neutral_routed_partition_group<A, U, F, P>(
     provider: &mut P,
     parallel: Option<&Group>,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<Array, Error>
 where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
@@ -4000,7 +4052,7 @@ where
     for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
         std::fmt::Display,
 {
-    struct Owner<'a, A, F, P> {
+    struct Owner<'a, 'observer, A, F, P> {
         architecture: &'a mut A,
         forward: &'a mut F,
         provider: &'a mut P,
@@ -4008,6 +4060,7 @@ where
         group_index: usize,
         pass: ExpertPass,
         parallel: Option<&'a Group>,
+        observer: Option<&'observer mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     }
     let mut owner = Owner {
         architecture,
@@ -4017,6 +4070,7 @@ where
         group_index,
         pass,
         parallel,
+        observer,
     };
     execute_pipeline_layer_range_with(
         PipelineLayerExecution {
@@ -4038,43 +4092,114 @@ where
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         |owner, global_layer, layer, hidden, cache, stream| {
+            let path =
+                <A as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
+                    PipelineRangeState<'_>,
+                >>::unit_path(owner.architecture, owner.group_index, global_layer)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            let input = match owner.observer.as_deref_mut() {
+                Some(observer) => {
+                    eredu_runtime::observe_and_intervene(observer, &format!("{path}.input"), hidden)
+                        .map_err(Error::from)?
+                }
+                None => hidden.clone(),
+            };
             let mut state = PipelineRangeState::new(
                 owner.state_layout.clone(),
                 global_layer..global_layer + 1,
                 std::slice::from_mut(cache),
             )?;
-            let output = match owner.parallel {
-                Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
+            let point = if owner.observer.is_some() {
+                <A as eredu_runtime::RoutedLayeredArchitecture<
                     MlxNeuralBackend,
                     PipelineRangeState<'_>,
-                >>::forward_unit_parallel_with_provider(
-                    owner.architecture,
-                    owner.group_index,
-                    global_layer,
-                    &mut layer.inner,
-                    crate::composition::tensor_ref(hidden),
-                    &mut state,
-                    owner.forward,
-                    owner.pass,
+                >>::routed_observation_point(
+                    owner.architecture, owner.group_index, global_layer
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            } else {
+                None
+            };
+            let output = if let Some(point) = point {
+                let mut observer = crate::composition::NeutralActivationObserver::new(
+                    owner
+                        .observer
+                        .as_deref_mut()
+                        .expect("routing observation requires an observer"),
+                );
+                let mut provider = eredu_runtime::ObservedExpertProvider::new(
                     owner.provider,
-                    parallel,
-                    stream,
-                ),
-                None => <A as eredu_runtime::RoutedLayeredArchitecture<
-                    MlxNeuralBackend,
-                    PipelineRangeState<'_>,
-                >>::forward_unit_with_provider(
-                    owner.architecture,
-                    owner.group_index,
-                    global_layer,
-                    &mut layer.inner,
-                    crate::composition::tensor_ref(hidden),
-                    &mut state,
-                    owner.forward,
-                    owner.pass,
-                    owner.provider,
-                    stream,
-                ),
+                    &mut observer,
+                    point,
+                );
+                match owner.parallel {
+                    Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
+                        MlxNeuralBackend,
+                        PipelineRangeState<'_>,
+                    >>::forward_unit_parallel_with_provider(
+                        owner.architecture,
+                        owner.group_index,
+                        global_layer,
+                        &mut layer.inner,
+                        crate::composition::tensor_ref(&input),
+                        &mut state,
+                        owner.forward,
+                        owner.pass,
+                        &mut provider,
+                        parallel,
+                        stream,
+                    ),
+                    None => <A as eredu_runtime::RoutedLayeredArchitecture<
+                        MlxNeuralBackend,
+                        PipelineRangeState<'_>,
+                    >>::forward_unit_with_provider(
+                        owner.architecture,
+                        owner.group_index,
+                        global_layer,
+                        &mut layer.inner,
+                        crate::composition::tensor_ref(&input),
+                        &mut state,
+                        owner.forward,
+                        owner.pass,
+                        &mut provider,
+                        stream,
+                    ),
+                }
+            } else {
+                match owner.parallel {
+                    Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
+                        MlxNeuralBackend,
+                        PipelineRangeState<'_>,
+                    >>::forward_unit_parallel_with_provider(
+                        owner.architecture,
+                        owner.group_index,
+                        global_layer,
+                        &mut layer.inner,
+                        crate::composition::tensor_ref(&input),
+                        &mut state,
+                        owner.forward,
+                        owner.pass,
+                        owner.provider,
+                        parallel,
+                        stream,
+                    ),
+                    None => <A as eredu_runtime::RoutedLayeredArchitecture<
+                        MlxNeuralBackend,
+                        PipelineRangeState<'_>,
+                    >>::forward_unit_with_provider(
+                        owner.architecture,
+                        owner.group_index,
+                        global_layer,
+                        &mut layer.inner,
+                        crate::composition::tensor_ref(&input),
+                        &mut state,
+                        owner.forward,
+                        owner.pass,
+                        owner.provider,
+                        stream,
+                    ),
+                }
             }
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             drop(state);
@@ -4091,8 +4216,18 @@ where
             .cloned()
             .map(crate::MlxTensor::into_array)
             .collect();
+            let output = output.into_array();
+            let output = match owner.observer.as_deref_mut() {
+                Some(observer) => eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{path}.output"),
+                    &output,
+                )
+                .map_err(Error::from)?,
+                None => output,
+            };
             Ok(PipelineLayerForward {
-                hidden: output.into_array(),
+                hidden: output,
                 retained,
             })
         },
@@ -4520,7 +4655,7 @@ where
 /// residency leases and transport payloads; embedding, masking, unit math, and
 /// output projection remain methods of the neutral architecture.
 #[allow(clippy::too_many_arguments)]
-fn execute_layered_partition<A, U, F, G, Boundary>(
+fn execute_layered_partition_observed<A, U, F, G, Boundary>(
     architecture: &mut A,
     partition: &eredu_runtime::ArchitecturePartition<G, Boundary>,
     storage_range: Range<usize>,
@@ -4532,6 +4667,7 @@ fn execute_layered_partition<A, U, F, G, Boundary>(
     caches: &mut [PipelineLayerCache],
     execution: Option<&ParallelExecutionContext<'_>>,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
@@ -4612,6 +4748,7 @@ where
         &mut forward,
         parallel,
         execution_stream,
+        observer,
     )?;
     let output = {
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
@@ -4651,7 +4788,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_routed_layered_partition<A, U, F, G, Boundary, P>(
+fn execute_routed_layered_partition_observed<A, U, F, G, Boundary, P>(
     architecture: &mut A,
     partition: &eredu_runtime::ArchitecturePartition<G, Boundary>,
     storage_range: Range<usize>,
@@ -4665,6 +4802,7 @@ fn execute_routed_layered_partition<A, U, F, G, Boundary, P>(
     pass: ExpertPass,
     provider: &mut P,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
@@ -4753,6 +4891,7 @@ where
         provider,
         parallel,
         execution_stream,
+        observer,
     )?;
     let output = {
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
@@ -4791,7 +4930,7 @@ where
     })
 }
 
-fn execute_neutral_decoder_partition<C, P, Bindings>(
+fn execute_neutral_decoder_partition_observed<C, P, Bindings>(
     stage: &mut DecoderPipelineRealization<
         eredu_architectures::decoder::LayeredModel<MlxNeuralBackend, C, P>,
         eredu_architectures::decoder::LocalGeometry<C>,
@@ -4804,6 +4943,7 @@ fn execute_neutral_decoder_partition<C, P, Bindings>(
     caches: &mut [PipelineLayerCache],
     execution: Option<&ParallelExecutionContext<'_>>,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
     C: eredu_architectures::decoder::Config,
@@ -4812,7 +4952,7 @@ where
         eredu_nn::Parameterized<crate::MlxTensor>,
 {
     let storage_range = stage.range();
-    execute_layered_partition(
+    execute_layered_partition_observed(
         &mut stage.architecture,
         &stage.partition,
         storage_range,
@@ -4824,12 +4964,13 @@ where
         caches,
         execution,
         stream,
+        observer,
     )
 }
 
 /// Runs one routed shared-decoder partition through the same neutral lifecycle.
 #[allow(clippy::too_many_arguments)]
-fn execute_neutral_routed_decoder_partition<C, BF, Bindings, P>(
+fn execute_neutral_routed_decoder_partition_observed<C, BF, Bindings, P>(
     stage: &mut DecoderPipelineRealization<
         eredu_architectures::decoder::LayeredModel<MlxNeuralBackend, C, BF>,
         eredu_architectures::decoder::LocalGeometry<C>,
@@ -4846,6 +4987,7 @@ fn execute_neutral_routed_decoder_partition<C, BF, Bindings, P>(
     pass: ExpertPass,
     provider: &mut P,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
     C: eredu_architectures::decoder::Config,
@@ -4857,7 +4999,7 @@ where
     P::Error: std::fmt::Display,
 {
     let storage_range = stage.range();
-    execute_routed_layered_partition(
+    execute_routed_layered_partition_observed(
         &mut stage.architecture,
         &stage.partition,
         storage_range,
@@ -4871,12 +5013,13 @@ where
         pass,
         provider,
         stream,
+        observer,
     )
 }
 
 /// Executes an LFM2 partition through its neutral hybrid architecture.
 #[allow(clippy::too_many_arguments)]
-fn execute_neutral_lfm2_partition(
+fn execute_neutral_lfm2_partition_observed(
     stage: &mut Lfm2PipelinePartition,
     input: PipelineStageInput<'_>,
     step: PipelineStep,
@@ -4884,9 +5027,10 @@ fn execute_neutral_lfm2_partition(
     caches: &mut [PipelineLayerCache],
     execution: Option<&ParallelExecutionContext<'_>>,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error> {
     let storage_range = stage.range();
-    execute_layered_partition(
+    execute_layered_partition_observed(
         &mut stage.architecture,
         &stage.partition,
         storage_range,
@@ -4898,11 +5042,12 @@ fn execute_neutral_lfm2_partition(
         caches,
         execution,
         stream,
+        observer,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_neutral_routed_lfm2_partition<P>(
+fn execute_neutral_routed_lfm2_partition_observed<P>(
     stage: &mut Lfm2PipelinePartition,
     input: PipelineStageInput<'_>,
     step: PipelineStep,
@@ -4912,13 +5057,14 @@ fn execute_neutral_routed_lfm2_partition<P>(
     pass: ExpertPass,
     provider: &mut P,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let storage_range = stage.range();
-    execute_routed_layered_partition(
+    execute_routed_layered_partition_observed(
         &mut stage.architecture,
         &stage.partition,
         storage_range,
@@ -4932,11 +5078,12 @@ where
         pass,
         provider,
         stream,
+        observer,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_neutral_routed_kimi_partition<P>(
+fn execute_neutral_routed_kimi_partition_observed<P>(
     stage: &mut KimiLinearPipelinePartition,
     input: PipelineStageInput<'_>,
     step: PipelineStep,
@@ -4946,13 +5093,14 @@ fn execute_neutral_routed_kimi_partition<P>(
     pass: ExpertPass,
     provider: &mut P,
     stream: &Stream,
+    observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let storage_range = stage.range();
-    execute_routed_layered_partition(
+    execute_routed_layered_partition_observed(
         &mut stage.architecture,
         &stage.partition,
         storage_range,
@@ -4966,6 +5114,7 @@ where
         pass,
         provider,
         stream,
+        observer,
     )
 }
 
@@ -5417,7 +5566,9 @@ impl PipelineForward for LlamaPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        LlamaPipelinePartition::forward(self, input, step, mask, cache, stream)
+        execute_neutral_decoder_partition_observed(
+            self, input, step, mask, cache, None, stream, None,
+        )
     }
 
     fn forward_with_execution(
@@ -5429,18 +5580,16 @@ impl PipelineForward for LlamaPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if expert_group.is_some() {
             return Err(Error::Parallel(
                 "Llama/Mistral pipeline stages do not contain routed experts".into(),
             ));
         }
-        match execution {
-            Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
-            }
-            _ => self.forward(input, step, mask, cache, stream),
-        }
+        execute_neutral_decoder_partition_observed(
+            self, input, step, mask, cache, execution, stream, observer,
+        )
     }
 }
 
@@ -5469,6 +5618,7 @@ impl DeepSeekV3PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
@@ -5509,7 +5659,7 @@ impl DeepSeekV3PipelinePartition {
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -5523,6 +5673,7 @@ impl DeepSeekV3PipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             if expert_group.is_some() {
@@ -5531,7 +5682,7 @@ impl DeepSeekV3PipelinePartition {
                 ));
             }
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -5545,6 +5696,7 @@ impl DeepSeekV3PipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -5816,7 +5968,7 @@ impl PipelineForward for DeepSeekV3PipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_stage(input, step, mask, cache, None, None, stream)
+        self.forward_stage(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -5828,8 +5980,18 @@ impl PipelineForward for DeepSeekV3PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_stage(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_stage(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -5858,6 +6020,7 @@ impl DeepSeekV4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
@@ -5898,7 +6061,7 @@ impl DeepSeekV4PipelinePartition {
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -5912,6 +6075,7 @@ impl DeepSeekV4PipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             if expert_group.is_some() {
@@ -5920,7 +6084,7 @@ impl DeepSeekV4PipelinePartition {
                 ));
             }
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -5934,6 +6098,7 @@ impl DeepSeekV4PipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -6426,7 +6591,7 @@ impl PipelineForward for DeepSeekV4PipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_stage(input, step, mask, cache, None, None, stream)
+        self.forward_stage(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -6438,8 +6603,18 @@ impl PipelineForward for DeepSeekV4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_stage(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_stage(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -6586,6 +6761,7 @@ impl PipelinePlacedIngress for Gemma4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, execution, stream)?;
         let graph = self.canonical_graph()?;
@@ -6614,6 +6790,7 @@ impl PipelinePlacedIngress for Gemma4PipelinePartition {
             execution,
             expert_group,
             stream,
+            observer,
         )
     }
 }
@@ -6628,7 +6805,7 @@ impl PipelineForward for Gemma4PipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, None, None, stream)
+        self.forward_decoder(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -6640,8 +6817,18 @@ impl PipelineForward for Gemma4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_decoder(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -6715,9 +6902,13 @@ impl PipelineForward for QwenPipelinePartition {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if self.expert_cache.is_none() && self.expert_assignment.is_none() {
-            execute_neutral_decoder_partition(self, input, step, mask, cache, None, stream)
+            execute_neutral_decoder_partition_observed(
+                self, input, step, mask, cache, None, stream, None,
+            )
         } else if self.expert_cache.is_some() {
-            self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
+            self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, None,
+            )
         } else {
             Err(Error::Parallel(
                 "resident Qwen expert parallelism requires its EP communicator".into(),
@@ -6734,6 +6925,7 @@ impl PipelineForward for QwenPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
             if self.expert_cache.is_some() {
@@ -6745,10 +6937,11 @@ impl PipelineForward for QwenPipelinePartition {
                     execution,
                     Some(group),
                     stream,
+                    observer,
                 );
             }
             return self.forward_resident_experts_neutral(
-                input, step, mask, cache, execution, group, stream,
+                input, step, mask, cache, execution, group, stream, observer,
             );
         }
         if self.expert_assignment.is_some() {
@@ -6762,7 +6955,7 @@ impl PipelineForward for QwenPipelinePartition {
                     && self.expert_cache.is_none()
                     && self.expert_assignment.is_none() =>
             {
-                execute_neutral_decoder_partition(
+                execute_neutral_decoder_partition_observed(
                     self,
                     input,
                     step,
@@ -6770,6 +6963,7 @@ impl PipelineForward for QwenPipelinePartition {
                     cache,
                     Some(execution),
                     execution.stream(),
+                    observer,
                 )
             }
             Some(execution) if execution.is_tensor_parallel() => {
@@ -6782,9 +6976,10 @@ impl PipelineForward for QwenPipelinePartition {
                         Some(execution),
                         None,
                         execution.stream(),
+                        observer,
                     )
                 } else {
-                    execute_neutral_decoder_partition(
+                    execute_neutral_decoder_partition_observed(
                         self,
                         input,
                         step,
@@ -6792,13 +6987,16 @@ impl PipelineForward for QwenPipelinePartition {
                         cache,
                         Some(execution),
                         execution.stream(),
+                        observer,
                     )
                 }
             }
-            _ if self.expert_cache.is_some() => {
-                self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
-            }
-            _ => execute_neutral_decoder_partition(self, input, step, mask, cache, None, stream),
+            _ if self.expert_cache.is_some() => self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, observer,
+            ),
+            _ => execute_neutral_decoder_partition_observed(
+                self, input, step, mask, cache, None, stream, observer,
+            ),
         }
     }
 }
@@ -7002,6 +7200,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut ingress = self.begin_placed_input(input, execution, stream)?;
         self.execute_placed_vision(&mut ingress, execution, stream)?;
@@ -7041,6 +7240,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
             execution,
             expert_group,
             stream,
+            observer,
         )
     }
 }
@@ -7055,7 +7255,7 @@ impl PipelineForward for MuseGlimmerPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, None, None, stream)
+        self.forward_decoder(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -7067,8 +7267,18 @@ impl PipelineForward for MuseGlimmerPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_decoder(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -7246,6 +7456,7 @@ impl PipelinePlacedIngress for InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if mask.is_some() {
             return Err(Error::Parallel(
@@ -7276,6 +7487,7 @@ impl PipelinePlacedIngress for InklingPipelinePartition {
             execution,
             expert_group,
             stream,
+            observer,
         )
     }
 
@@ -7399,7 +7611,7 @@ impl PipelineForward for InklingPipelinePartition {
                 "Inkling relative attention does not accept an additive mask".into(),
             ));
         }
-        self.forward_decoder(input, step, cache, None, None, stream)
+        self.forward_decoder(input, step, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -7411,13 +7623,22 @@ impl PipelineForward for InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if mask.is_some() {
             return Err(Error::Parallel(
                 "Inkling relative attention does not accept an additive mask".into(),
             ));
         }
-        self.forward_decoder(input, step, cache, execution, expert_group, stream)
+        self.forward_decoder(
+            input,
+            step,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -7592,6 +7813,7 @@ impl QwenVlPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.range().len() {
             return Err(Error::Parallel(format!(
@@ -7642,7 +7864,7 @@ impl QwenVlPipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -7656,9 +7878,10 @@ impl QwenVlPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -7672,6 +7895,7 @@ impl QwenVlPipelinePartition {
                 pass,
                 &mut eredu_runtime::ResidentExpertProvider,
                 stream,
+                observer,
             )
         }
     }
@@ -7878,6 +8102,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, 0, None, execution, stream)?;
         let group = execution
@@ -7913,6 +8138,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
             execution,
             expert_group,
             stream,
+            observer,
         )
     }
 }
@@ -7927,7 +8153,7 @@ impl PipelineForward for QwenVlPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, None, None, stream)
+        self.forward_decoder(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -7939,8 +8165,18 @@ impl PipelineForward for QwenVlPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_decoder(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -8123,6 +8359,7 @@ impl QwenConditionalPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.range().len() {
             return Err(Error::Parallel(format!(
@@ -8169,7 +8406,7 @@ impl QwenConditionalPipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -8183,9 +8420,10 @@ impl QwenConditionalPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -8199,6 +8437,7 @@ impl QwenConditionalPipelinePartition {
                 pass,
                 &mut eredu_runtime::ResidentExpertProvider,
                 stream,
+                observer,
             )
         }
     }
@@ -8476,6 +8715,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, 0, execution, stream)?;
         let group = execution
@@ -8512,6 +8752,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
             execution,
             expert_group,
             stream,
+            observer,
         )
     }
 }
@@ -8619,7 +8860,7 @@ impl PipelineForward for QwenConditionalPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, None, None, stream)
+        self.forward_decoder(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -8631,8 +8872,18 @@ impl PipelineForward for QwenConditionalPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_decoder(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -8706,9 +8957,13 @@ impl PipelineForward for GptOssPipelinePartition {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if self.expert_cache.is_none() && self.expert_assignment.is_none() {
-            execute_neutral_decoder_partition(self, input, step, mask, cache, None, stream)
+            execute_neutral_decoder_partition_observed(
+                self, input, step, mask, cache, None, stream, None,
+            )
         } else if self.expert_cache.is_some() {
-            self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
+            self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, None,
+            )
         } else {
             Err(Error::Parallel(
                 "resident GPT-OSS expert parallelism requires its EP communicator".into(),
@@ -8725,6 +8980,7 @@ impl PipelineForward for GptOssPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
             if self.expert_cache.is_some() {
@@ -8736,10 +8992,11 @@ impl PipelineForward for GptOssPipelinePartition {
                     execution,
                     Some(group),
                     stream,
+                    observer,
                 );
             }
             return self.forward_resident_experts_neutral(
-                input, step, mask, cache, execution, group, stream,
+                input, step, mask, cache, execution, group, stream, observer,
             );
         }
         if self.expert_assignment.is_some() {
@@ -8753,7 +9010,7 @@ impl PipelineForward for GptOssPipelinePartition {
                     && self.expert_cache.is_none()
                     && self.expert_assignment.is_none() =>
             {
-                execute_neutral_decoder_partition(
+                execute_neutral_decoder_partition_observed(
                     self,
                     input,
                     step,
@@ -8761,6 +9018,7 @@ impl PipelineForward for GptOssPipelinePartition {
                     cache,
                     Some(execution),
                     execution.stream(),
+                    observer,
                 )
             }
             Some(execution) if execution.is_tensor_parallel() => {
@@ -8773,9 +9031,10 @@ impl PipelineForward for GptOssPipelinePartition {
                         Some(execution),
                         None,
                         execution.stream(),
+                        observer,
                     )
                 } else {
-                    execute_neutral_decoder_partition(
+                    execute_neutral_decoder_partition_observed(
                         self,
                         input,
                         step,
@@ -8783,13 +9042,16 @@ impl PipelineForward for GptOssPipelinePartition {
                         cache,
                         Some(execution),
                         execution.stream(),
+                        observer,
                     )
                 }
             }
-            _ if self.expert_cache.is_some() => {
-                self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
-            }
-            _ => execute_neutral_decoder_partition(self, input, step, mask, cache, None, stream),
+            _ if self.expert_cache.is_some() => self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, observer,
+            ),
+            _ => execute_neutral_decoder_partition_observed(
+                self, input, step, mask, cache, None, stream, observer,
+            ),
         }
     }
 }
@@ -8864,9 +9126,13 @@ impl PipelineForward for Lfm2PipelinePartition {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if !self.expert_storage.is_external() && self.expert_assignment.is_none() {
-            execute_neutral_lfm2_partition(self, input, step, mask, cache, None, stream)
+            execute_neutral_lfm2_partition_observed(
+                self, input, step, mask, cache, None, stream, None,
+            )
         } else if self.expert_storage.is_external() {
-            self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
+            self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, None,
+            )
         } else {
             Err(Error::Parallel(
                 "resident LFM2 expert parallelism requires its EP communicator".into(),
@@ -8883,6 +9149,7 @@ impl PipelineForward for Lfm2PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
             if self.expert_storage.cache().is_some() {
@@ -8894,10 +9161,11 @@ impl PipelineForward for Lfm2PipelinePartition {
                     execution,
                     Some(group),
                     stream,
+                    observer,
                 );
             }
             return self.forward_resident_experts_neutral(
-                input, step, mask, cache, execution, group, stream,
+                input, step, mask, cache, execution, group, stream, observer,
             );
         }
         if self.expert_assignment.is_some() {
@@ -8911,7 +9179,7 @@ impl PipelineForward for Lfm2PipelinePartition {
                     && !self.expert_storage.is_external()
                     && self.expert_assignment.is_none() =>
             {
-                execute_neutral_lfm2_partition(
+                execute_neutral_lfm2_partition_observed(
                     self,
                     input,
                     step,
@@ -8919,6 +9187,7 @@ impl PipelineForward for Lfm2PipelinePartition {
                     cache,
                     Some(execution),
                     execution.stream(),
+                    observer,
                 )
             }
             Some(execution) if execution.is_tensor_parallel() => {
@@ -8931,9 +9200,10 @@ impl PipelineForward for Lfm2PipelinePartition {
                         Some(execution),
                         None,
                         execution.stream(),
+                        observer,
                     )
                 } else {
-                    execute_neutral_lfm2_partition(
+                    execute_neutral_lfm2_partition_observed(
                         self,
                         input,
                         step,
@@ -8941,13 +9211,16 @@ impl PipelineForward for Lfm2PipelinePartition {
                         cache,
                         Some(execution),
                         execution.stream(),
+                        observer,
                     )
                 }
             }
-            _ if self.expert_storage.is_external() => {
-                self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
-            }
-            _ => execute_neutral_lfm2_partition(self, input, step, mask, cache, None, stream),
+            _ if self.expert_storage.is_external() => self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, observer,
+            ),
+            _ => execute_neutral_lfm2_partition_observed(
+                self, input, step, mask, cache, None, stream, observer,
+            ),
         }
     }
 }
@@ -9170,7 +9443,7 @@ impl PipelineForward for NemotronHPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_target(input, step, mask, cache, None, None, stream)
+        self.forward_target(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -9182,8 +9455,18 @@ impl PipelineForward for NemotronHPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_target(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_target(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -9257,14 +9540,16 @@ impl PipelineForward for KimiLinearPipelinePartition {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if self.expert_storage.is_external() {
-            self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
+            self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, None,
+            )
         } else {
             let pass = if step.sequence_length > 1 {
                 ExpertPass::Prefill
             } else {
                 ExpertPass::Decode
             };
-            execute_neutral_routed_kimi_partition(
+            execute_neutral_routed_kimi_partition_observed(
                 self,
                 input,
                 step,
@@ -9274,6 +9559,7 @@ impl PipelineForward for KimiLinearPipelinePartition {
                 pass,
                 &mut eredu_runtime::ResidentExpertProvider,
                 stream,
+                None,
             )
         }
     }
@@ -9287,6 +9573,7 @@ impl PipelineForward for KimiLinearPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
             if self.expert_storage.cache().is_some() {
@@ -9298,10 +9585,11 @@ impl PipelineForward for KimiLinearPipelinePartition {
                     execution,
                     Some(group),
                     stream,
+                    observer,
                 );
             }
             return self.forward_resident_experts_neutral(
-                input, step, mask, cache, execution, group, stream,
+                input, step, mask, cache, execution, group, stream, observer,
             );
         }
         if self.expert_assignment.is_some() {
@@ -9320,6 +9608,7 @@ impl PipelineForward for KimiLinearPipelinePartition {
                         Some(execution),
                         None,
                         execution.stream(),
+                        observer,
                     )
                 } else {
                     let pass = if step.sequence_length > 1 {
@@ -9327,7 +9616,7 @@ impl PipelineForward for KimiLinearPipelinePartition {
                     } else {
                         ExpertPass::Decode
                     };
-                    execute_neutral_routed_kimi_partition(
+                    execute_neutral_routed_kimi_partition_observed(
                         self,
                         input,
                         step,
@@ -9337,19 +9626,20 @@ impl PipelineForward for KimiLinearPipelinePartition {
                         pass,
                         &mut eredu_runtime::ResidentExpertProvider,
                         execution.stream(),
+                        observer,
                     )
                 }
             }
-            _ if self.expert_storage.is_external() => {
-                self.forward_external_experts_neutral(input, step, mask, cache, None, None, stream)
-            }
+            _ if self.expert_storage.is_external() => self.forward_external_experts_neutral(
+                input, step, mask, cache, None, None, stream, observer,
+            ),
             _ => {
                 let pass = if step.sequence_length > 1 {
                     ExpertPass::Prefill
                 } else {
                     ExpertPass::Decode
                 };
-                execute_neutral_routed_kimi_partition(
+                execute_neutral_routed_kimi_partition_observed(
                     self,
                     input,
                     step,
@@ -9359,6 +9649,7 @@ impl PipelineForward for KimiLinearPipelinePartition {
                     pass,
                     &mut eredu_runtime::ResidentExpertProvider,
                     stream,
+                    observer,
                 )
             }
         }
@@ -9584,6 +9875,55 @@ impl PipelineModel {
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
         self.stage.prepared_input_part_plan(input)
+    }
+
+    pub(in crate::composition::mlx) fn prepared_input_step(
+        &self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+    ) -> Result<PipelineStep, Error> {
+        use crate::backend::runtime::media::input::InputPayload;
+        use eredu_architectures::media_plan::PreparedInputPartPlan;
+
+        crate::backend::runtime::media::input::validate(input)?;
+        let mut batch = None;
+        let mut sequence = 0_u64;
+        for part in input.parts {
+            if part.modality() == eredu_core::InputModality::Text {
+                let value = match part.payload() {
+                    InputPayload::TokenIds(value) | InputPayload::Embeddings(value) => value,
+                    InputPayload::Tensor(_) => unreachable!("validated text payload"),
+                };
+                let part_batch = value.shape()[0];
+                if let Some(expected) = batch {
+                    if expected != part_batch {
+                        return Err(Error::Parallel(format!(
+                            "prepared text parts disagree on batch size: {expected} and {part_batch}"
+                        )));
+                    }
+                }
+                batch = Some(part_batch);
+            }
+            let positions = match self
+                .prepared_input_part_plan(part)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            {
+                PreparedInputPartPlan::Text { positions }
+                | PreparedInputPartPlan::Projected { positions, .. } => positions,
+                PreparedInputPartPlan::Media { shape } => shape.decoder_positions,
+            };
+            sequence = sequence.checked_add(positions).ok_or_else(|| {
+                Error::Parallel("prepared pipeline sequence length overflowed u64".into())
+            })?;
+        }
+        let batch = batch.ok_or_else(|| {
+            Error::Parallel("prepared pipeline input has no text batch dimension".into())
+        })?;
+        let sequence = i32::try_from(sequence).map_err(|_| {
+            Error::Parallel(format!(
+                "prepared pipeline sequence length {sequence} exceeds i32"
+            ))
+        })?;
+        PipelineStep::new(batch, sequence)
     }
 
     /// Returns stage-local disk-stream observations when enabled.
@@ -10040,36 +10380,9 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<PipelineStageCompletion, Error> {
-        let paths = self
-            .info
-            .local_execution_groups
-            .iter()
-            .flat_map(|owned| {
-                owned
-                    .global_units
-                    .clone()
-                    .map(|index| format!("{}.{}", owned.group, index))
-            })
-            .collect::<Vec<_>>();
-        let mut replacement = None;
-        if let (Some(path), Some(tokens)) = (paths.first(), tokens) {
-            observer.observe(&format!("{path}.input"), tokens)?;
-            replacement = observer.intervene(&format!("{path}.input"), tokens)?;
-        }
-        let effective_tokens = replacement.as_ref().or(tokens);
-        let completion = self.forward_distributed_inner(
-            effective_tokens,
-            step,
-            mask,
-            cache,
-            execution,
-            Some(observer),
-        )?;
+        let completion =
+            self.forward_distributed_inner(tokens, step, mask, cache, execution, Some(observer))?;
         if let Some(logits) = completion.logits() {
-            if let Some(path) = paths.last() {
-                observer.observe(&format!("{path}.output"), logits)?;
-                let _ = observer.intervene(&format!("{path}.output"), logits)?;
-            }
             observer.observe("model.logits", logits)?;
         }
         Ok(completion)
@@ -10152,31 +10465,9 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<PipelineStageCompletion, Error> {
-        let observed_input = input
-            .map(|input| {
-                crate::backend::runtime::media::input::text_token_ids(input, execution.stream())
-            })
-            .transpose()?;
-        let paths = self
-            .info
-            .local_execution_groups
-            .iter()
-            .flat_map(|owned| {
-                owned
-                    .global_units
-                    .clone()
-                    .map(|index| format!("{}.{}", owned.group, index))
-            })
-            .collect::<Vec<_>>();
-        if let (Some(path), Some(value)) = (paths.first(), observed_input.as_ref()) {
-            observer.observe(&format!("{path}.input"), value)?;
-        }
         let completion =
             self.prefill_distributed_inner(input, step, mask, cache, execution, Some(observer))?;
         if let Some(logits) = completion.logits() {
-            if let Some(path) = paths.last() {
-                observer.observe(&format!("{path}.output"), logits)?;
-            }
             observer.observe("model.logits", logits)?;
         }
         Ok(completion)
@@ -10906,6 +11197,10 @@ impl PipelineModel {
                             stream,
                             observer,
                         )?,
+                        None if tensor.is_none() && expert_group.is_none() => {
+                            self.stage
+                                .forward(input, step, mask, &mut cache.layers, stream)?
+                        }
                         None => self.stage.forward_with_execution(
                             input,
                             step,
@@ -10914,6 +11209,7 @@ impl PipelineModel {
                             tensor,
                             expert_group,
                             stream,
+                            None,
                         )?,
                     }
                 }
@@ -10932,6 +11228,9 @@ impl PipelineModel {
                                 stream,
                                 observer,
                             )?,
+                            None if tensor.is_none() && expert_group.is_none() => self
+                                .stage
+                                .forward(input, step, mask, &mut cache.layers, stream)?,
                             None => self.stage.forward_with_execution(
                                 input,
                                 step,
@@ -10940,18 +11239,32 @@ impl PipelineModel {
                                 tensor,
                                 expert_group,
                                 stream,
+                                None,
                             )?,
                         }
                     } else {
-                        self.stage.prefill(
-                            input,
-                            step,
-                            mask,
-                            &mut cache.layers,
-                            tensor,
-                            expert_group,
-                            stream,
-                        )?
+                        match observer.as_deref_mut() {
+                            Some(observer) => self.stage.prefill(
+                                input,
+                                step,
+                                mask,
+                                &mut cache.layers,
+                                tensor,
+                                expert_group,
+                                stream,
+                                Some(observer),
+                            )?,
+                            None => self.stage.prefill(
+                                input,
+                                step,
+                                mask,
+                                &mut cache.layers,
+                                tensor,
+                                expert_group,
+                                stream,
+                                None,
+                            )?,
+                        }
                     }
                 }
             }
@@ -10973,6 +11286,10 @@ impl PipelineModel {
                     stream,
                     observer,
                 )?,
+                None if tensor.is_none() && expert_group.is_none() => {
+                    self.stage
+                        .forward(input, step, mask, &mut cache.layers, stream)?
+                }
                 None => self.stage.forward_with_execution(
                     input,
                     step,
@@ -10981,6 +11298,7 @@ impl PipelineModel {
                     tensor,
                     expert_group,
                     stream,
+                    None,
                 )?,
             }
         };
@@ -14078,40 +14396,6 @@ fn load_llama_pipeline(
     PipelineModel::from_adapter(topology, info, stage)
 }
 
-impl LlamaPipelinePartition {
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        execute_neutral_decoder_partition(self, input, step, explicit_mask, caches, None, stream)
-    }
-}
-
-impl LlamaPipelinePartition {
-    fn forward_tensor_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        execution: &ParallelExecutionContext<'_>,
-    ) -> Result<PipelineStageOutput, Error> {
-        execute_neutral_decoder_partition(
-            self,
-            input,
-            step,
-            explicit_mask,
-            caches,
-            Some(execution),
-            execution.stream(),
-        )
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn load_qwen_pipeline(
     source_args: eredu_architectures::qwen::ModelArgs,
@@ -15603,6 +15887,7 @@ impl MuseGlimmerPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         validate_scheduled_pipeline_kv_cache(
             "Muse-Glimmer",
@@ -15652,7 +15937,7 @@ impl MuseGlimmerPipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -15666,10 +15951,11 @@ impl MuseGlimmerPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -15683,6 +15969,7 @@ impl MuseGlimmerPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -15820,6 +16107,7 @@ impl Gemma4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.range().len() {
             return Err(Error::Parallel(format!(
@@ -15867,7 +16155,7 @@ impl Gemma4PipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -15881,10 +16169,11 @@ impl Gemma4PipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -15898,6 +16187,7 @@ impl Gemma4PipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -15996,6 +16286,7 @@ impl InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.range().len() {
             return Err(Error::Parallel(format!(
@@ -16042,7 +16333,7 @@ impl InklingPipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -16056,10 +16347,11 @@ impl InklingPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -16073,6 +16365,7 @@ impl InklingPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -16089,6 +16382,7 @@ impl QwenPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: &Group,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.clone().ok_or_else(|| {
             Error::Parallel("resident Qwen experts have no rank-local assignment".into())
@@ -16120,7 +16414,7 @@ impl QwenPipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let result = execute_neutral_routed_decoder_partition(
+        let result = execute_neutral_routed_decoder_partition_observed(
             self,
             input,
             step,
@@ -16130,6 +16424,7 @@ impl QwenPipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         drop(provider);
         self.routing_statistics = statistics;
@@ -16146,6 +16441,7 @@ impl QwenPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.clone().ok_or_else(|| {
             Error::Parallel("external Qwen experts have no rank-local assignment".into())
@@ -16183,7 +16479,7 @@ impl QwenPipelinePartition {
             .map_err(|error| Exception::custom(error.to_string()))
         };
         let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-        let result = execute_neutral_routed_decoder_partition(
+        let result = execute_neutral_routed_decoder_partition_observed(
             self,
             input,
             step,
@@ -16193,6 +16489,7 @@ impl QwenPipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         self.routing_statistics = statistics;
         self.expert_cache = Some(cache);
@@ -16888,6 +17185,7 @@ impl GptOssPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: &Group,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.clone().ok_or_else(|| {
             Error::Parallel("resident GPT-OSS experts have no rank-local assignment".into())
@@ -16919,7 +17217,7 @@ impl GptOssPipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let result = execute_neutral_routed_decoder_partition(
+        let result = execute_neutral_routed_decoder_partition_observed(
             self,
             input,
             step,
@@ -16929,6 +17227,7 @@ impl GptOssPipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         drop(provider);
         self.routing_statistics = statistics;
@@ -16945,6 +17244,7 @@ impl GptOssPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self
             .expert_assignment
@@ -16972,7 +17272,7 @@ impl GptOssPipelinePartition {
             &cache,
             &mut statistics,
         );
-        let result = execute_neutral_routed_decoder_partition(
+        let result = execute_neutral_routed_decoder_partition_observed(
             self,
             input,
             step,
@@ -16982,6 +17282,7 @@ impl GptOssPipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         drop(provider);
         self.routing_statistics = statistics;
@@ -17384,6 +17685,7 @@ impl Lfm2PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: &Group,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.clone().ok_or_else(|| {
             Error::Parallel("resident LFM2 experts have no rank-local assignment".into())
@@ -17415,7 +17717,7 @@ impl Lfm2PipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let result = execute_neutral_routed_lfm2_partition(
+        let result = execute_neutral_routed_lfm2_partition_observed(
             self,
             input,
             step,
@@ -17425,6 +17727,7 @@ impl Lfm2PipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         drop(provider);
         self.routing_statistics = statistics;
@@ -17441,6 +17744,7 @@ impl Lfm2PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self
             .expert_assignment
@@ -17481,7 +17785,7 @@ impl Lfm2PipelinePartition {
             .map_err(|error| Exception::custom(error.to_string()))
         };
         let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-        let result = execute_neutral_routed_lfm2_partition(
+        let result = execute_neutral_routed_lfm2_partition_observed(
             self,
             input,
             step,
@@ -17491,6 +17795,7 @@ impl Lfm2PipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         self.routing_statistics = statistics;
         self.expert_storage = PipelineExpertStorage::External(cache);
@@ -18006,6 +18311,7 @@ impl NemotronHPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
@@ -18051,7 +18357,7 @@ impl NemotronHPipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = Relu2ExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -18065,6 +18371,7 @@ impl NemotronHPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else if let Some(assignment) = assignment.as_ref() {
             let expert_group = expert_group.ok_or_else(|| {
@@ -18090,7 +18397,7 @@ impl NemotronHPipelinePartition {
                     )
                 };
             let mut provider = ResidentExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -18104,10 +18411,11 @@ impl NemotronHPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -18121,6 +18429,7 @@ impl NemotronHPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -18229,6 +18538,7 @@ impl QwenHybridPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
@@ -18275,7 +18585,7 @@ impl QwenHybridPipelinePartition {
                 .map_err(|error| Exception::custom(error.to_string()))
             };
             let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -18289,10 +18599,11 @@ impl QwenHybridPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         } else {
             let mut provider = eredu_runtime::ResidentExpertProvider;
-            execute_routed_layered_partition(
+            execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
                 decoder_range,
@@ -18306,6 +18617,7 @@ impl QwenHybridPipelinePartition {
                 pass,
                 &mut provider,
                 stream,
+                observer,
             )
         }
     }
@@ -18560,7 +18872,7 @@ impl PipelineForward for QwenHybridPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_target(input, step, mask, cache, None, None, stream)
+        self.forward_target(input, step, mask, cache, None, None, stream, None)
     }
 
     fn forward_with_execution(
@@ -18572,8 +18884,18 @@ impl PipelineForward for QwenHybridPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_target(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_target(
+            input,
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+            observer,
+        )
     }
 }
 
@@ -19895,6 +20217,7 @@ impl KimiLinearPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: &Group,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.clone().ok_or_else(|| {
             Error::Parallel("resident Kimi experts have no rank-local assignment".into())
@@ -19926,7 +20249,7 @@ impl KimiLinearPipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let result = execute_neutral_routed_kimi_partition(
+        let result = execute_neutral_routed_kimi_partition_observed(
             self,
             input,
             step,
@@ -19936,6 +20259,7 @@ impl KimiLinearPipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         drop(provider);
         self.routing_statistics = statistics;
@@ -19952,6 +20276,7 @@ impl KimiLinearPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self
             .expert_assignment
@@ -19992,7 +20317,7 @@ impl KimiLinearPipelinePartition {
             .map_err(|error| Exception::custom(error.to_string()))
         };
         let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
-        let result = execute_neutral_routed_kimi_partition(
+        let result = execute_neutral_routed_kimi_partition_observed(
             self,
             input,
             step,
@@ -20002,6 +20327,7 @@ impl KimiLinearPipelinePartition {
             pass,
             &mut provider,
             stream,
+            observer,
         );
         self.routing_statistics = statistics;
         self.expert_storage = PipelineExpertStorage::External(cache);

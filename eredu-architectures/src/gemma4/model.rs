@@ -80,8 +80,8 @@ where
         input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        _expected: &StateLayout,
-        _first_state_ordinal: usize,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         match input {
@@ -99,9 +99,14 @@ where
                     context,
                 )
             }
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
-                self.resume_pipeline_text(hidden, mask.cloned(), auxiliary.per_layer_input, state)
-            }
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_text(
+                hidden,
+                mask.cloned(),
+                auxiliary.per_layer_input,
+                state,
+                expected,
+                first_state_ordinal,
+            ),
         }
     }
 
@@ -110,8 +115,8 @@ where
         input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        _expected: &StateLayout,
-        _first_state_ordinal: usize,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
@@ -131,9 +136,14 @@ where
                     context,
                 )
             }
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
-                self.resume_pipeline_text(hidden, mask.cloned(), auxiliary.per_layer_input, state)
-            }
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_text(
+                hidden,
+                mask.cloned(),
+                auxiliary.per_layer_input,
+                state,
+                expected,
+                first_state_ordinal,
+            ),
         }
     }
 
@@ -957,15 +967,25 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         mask: Option<B::Tensor>,
         per_layer_inputs: Option<B::Tensor>,
         state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        if state.layout().len() != self.args.text.num_hidden_layers() {
+        if state.layout() != expected {
             return Err(Error::backend("Gemma 4 pipeline state layout mismatch"));
         }
         let mut position_offset = 0;
-        for (layer, policy) in self.args.text.layer_schedule.iter().enumerate() {
+        for (layer, policy) in self
+            .args
+            .text
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .skip(first_state_ordinal)
+            .take(expected.len())
+        {
             if policy.key_value.owns_state() {
                 position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
                     state.layer(layer).map_err(Error::backend)?,
