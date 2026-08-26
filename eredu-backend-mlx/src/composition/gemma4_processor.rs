@@ -18,8 +18,6 @@ use crate::backend::runtime::media::image::{
     rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, NormalizedImage,
     RgbImage, RgbImageView,
 };
-#[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::runtime::media::input::Modality;
 #[cfg(feature = "image")]
 use crate::backend::runtime::media::video::validate_rgb_frames;
 #[cfg(any(feature = "image", feature = "audio"))]
@@ -30,6 +28,8 @@ use crate::backend::runtime::media::{
     media_input_part, prepared_model_input, push_text_token_ids, InputPart, MediaInput,
     PreparedModelInput, ProcessorInput, ProcessorPreparationError,
 };
+#[cfg(any(feature = "image", feature = "audio"))]
+use eredu_core::InputModality;
 
 #[derive(Debug, Clone)]
 pub struct Gemma4Processor {
@@ -74,7 +74,7 @@ impl Gemma4Processor {
         let _ = &parts;
         match (item.modality, item.payload) {
             #[cfg(feature = "image")]
-            (Modality::Image, MediaPayload::Rgb8(image)) => {
+            (InputModality::Image, MediaPayload::Rgb8(image)) => {
                 let plan = self
                     .plan
                     .image(image.height() as usize, image.width() as usize)
@@ -85,12 +85,12 @@ impl Gemma4Processor {
                 Ok(())
             }
             #[cfg(feature = "image")]
-            (Modality::Video, MediaPayload::VideoFrames(video)) => {
+            (InputModality::Video, MediaPayload::VideoFrames(video)) => {
                 parts.extend(self.process_video(video, encode_text)?);
                 Ok(())
             }
             #[cfg(feature = "audio")]
-            (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
+            (InputModality::Audio, MediaPayload::AudioF32(waveform)) => {
                 let plan = self.plan.audio().map_err(processor_error)?;
                 push_text_token_ids(parts, &[plan.framing.start_token_id])?;
                 parts.push(self.process_audio(waveform, &plan)?);
@@ -121,7 +121,7 @@ impl Gemma4Processor {
         let (patches, positions, grid, extent) =
             pack_patches(&normalized, plan.patch_size, plan.max_patches)?;
         media_input_part(
-            Modality::Image,
+            InputModality::Image,
             patches,
             [
                 (InputMetadataKey::PatchGrid, grid),
@@ -179,7 +179,7 @@ impl Gemma4Processor {
             let (patches, positions, grid, extent) =
                 pack_patches(&normalized, plan.patch_size, plan.max_patches)?;
             replacement.push(media_input_part(
-                Modality::Video,
+                InputModality::Video,
                 patches,
                 [
                     (InputMetadataKey::PatchGrid, grid),
@@ -224,7 +224,7 @@ impl Gemma4Processor {
         let valid_frames = features.mask.iter().filter(|valid| **valid).count();
         let mask = Array::from_slice(&features.mask, &[1, features.frames as i32]);
         media_input_part(
-            Modality::Audio,
+            InputModality::Audio,
             tensor,
             [(InputMetadataKey::AudioMask, mask)],
             [InputExtent::AudioValidFrames(valid_frames)],
@@ -301,12 +301,12 @@ mod tests {
     use std::collections::HashMap;
 
     use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
-    use eredu_core::{InputMetadataKey, VideoSampling};
+    use eredu_core::{InputMetadataKey, InputModality, VideoSampling};
     use eredu_gguf::MetadataValue;
 
     use super::Gemma4Processor;
     use crate::{
-        backend::runtime::media::input::{InputPayload, Modality},
+        backend::runtime::media::input::InputPayload,
         backend::runtime::media::{MediaInput, ProcessorInput, RgbImageView},
     };
 
@@ -370,7 +370,7 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2].modality(), Modality::Image);
+        assert_eq!(parts[2].modality(), InputModality::Image);
         assert!(matches!(parts[2].payload(), InputPayload::Tensor(_)));
         assert!(parts[2]
             .metadata_value(InputMetadataKey::PatchPositions)
@@ -406,7 +406,7 @@ mod tests {
         let parts = prepared.input_parts();
         let video_parts = parts
             .iter()
-            .filter(|part| part.modality() == Modality::Video)
+            .filter(|part| part.modality() == InputModality::Video)
             .collect::<Vec<_>>();
         assert_eq!(video_parts.len(), 2);
         assert!(video_parts.iter().all(|part| part
@@ -419,11 +419,11 @@ mod tests {
 #[cfg(all(test, feature = "audio"))]
 mod audio_tests {
     use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
-    use eredu_core::InputMetadataKey;
+    use eredu_core::{InputMetadataKey, InputModality};
 
     use super::Gemma4Processor;
     use crate::{
-        backend::runtime::media::input::{InputPayload, Modality},
+        backend::runtime::media::input::InputPayload,
         backend::runtime::media::{MediaInput, ProcessorInput},
     };
 
@@ -451,7 +451,7 @@ mod audio_tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2].modality(), Modality::Audio);
+        assert_eq!(parts[2].modality(), InputModality::Audio);
         assert!(matches!(parts[2].payload(), InputPayload::Tensor(_)));
         assert!(parts[2]
             .metadata_value(InputMetadataKey::AudioMask)

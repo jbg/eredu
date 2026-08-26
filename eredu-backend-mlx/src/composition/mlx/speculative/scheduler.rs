@@ -29,16 +29,16 @@ use crate::composition::mlx::{
 #[cfg(test)]
 use crate::{
     backend::runtime::generation::sampler::SpeculativeSampler,
-    backend::runtime::media::input::{InputPayload, Modality, ModelInput},
+    backend::runtime::media::input::{InputPayload, ModelInput},
     composition::mlx::speculative::MlxSpeculativeSampling,
 };
-#[cfg(test)]
-use eredu_core::generation::MtpRequestId;
 #[cfg(test)]
 use eredu_core::generation::{
     FinishReason, GenerationCancellationToken, GenerationSequence, MtpConfig, MtpSchedulerOptions,
     SemanticEvent,
 };
+#[cfg(test)]
+use eredu_core::{generation::MtpRequestId, InputModality};
 
 /// Component timings accumulated by an architecture-specific MTP backend.
 #[derive(Debug, Clone, Copy, Default)]
@@ -526,7 +526,7 @@ fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
     if input
         .parts
         .iter()
-        .all(|part| part.modality() == Modality::Text)
+        .all(|part| part.modality() == InputModality::Text)
     {
         let mut tokens = 0i32;
         for part in input.parts {
@@ -568,7 +568,7 @@ mod tests {
     impl TestInputPart for InputPart {
         fn text_token_ids(tokens: &Array) -> Self {
             crate::backend::runtime::media::input::input_part(
-                crate::backend::runtime::media::input::Modality::Text,
+                eredu_core::InputModality::Text,
                 crate::backend::runtime::media::input::InputPayload::TokenIds(tokens.clone()),
                 [],
                 [],

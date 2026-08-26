@@ -1,10 +1,10 @@
 //! Architecture-erased MLX model-session execution.
 
 use eredu_core::{
-    BackendSession, Completion, InspectableBackendSession, InspectedOutput, ModelRuntime,
-    ObservationRequest, ObservationSet, ObservationValue, Submission, TensorObservation,
-    TensorObservationData, TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy,
-    TokenFilter, TokenOutput,
+    BackendSession, Completion, InputModality, InspectableBackendSession, InspectedOutput,
+    ModelRuntime, ObservationRequest, ObservationSet, ObservationValue, Submission,
+    TensorObservation, TensorObservationData, TextGenerationBackend, TextGenerationConfig,
+    TextSamplingStrategy, TokenFilter, TokenOutput,
 };
 use eredu_nn::Tensor as _;
 use eredu_runtime::{
@@ -1076,7 +1076,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     let multimodal = borrowed
                         .parts
                         .iter()
-                        .any(|part| part.modality() != input::Modality::Text);
+                        .any(|part| part.modality() != InputModality::Text);
                     if multimodal {
                         model.prefill_distributed(
                             model.stage_info().is_first.then_some(borrowed),
@@ -1244,7 +1244,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         let tokens =
             Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, backend.stream())?;
         let parts = [input::input_part(
-            input::Modality::Text,
+            InputModality::Text,
             input::InputPayload::TokenIds(tokens),
             [],
             [],
@@ -1618,14 +1618,14 @@ mod tests {
         let grid = Array::from_slice(&[1_i32, 2, 2], &[1, 3]);
         let parts = [
             input::input_part(
-                input::Modality::Text,
+                InputModality::Text,
                 input::InputPayload::TokenIds(tokens),
                 [],
                 [],
             )
             .unwrap(),
             input::input_part(
-                input::Modality::Image,
+                InputModality::Image,
                 input::InputPayload::Tensor(image),
                 [(eredu_core::InputMetadataKey::PatchGrid, grid)],
                 [],
@@ -1636,8 +1636,8 @@ mod tests {
         let owned = MlxModelInput::from(input::ModelInput::new(&parts));
         owned.with_borrowed(|borrowed| {
             assert_eq!(borrowed.parts.len(), 2);
-            assert_eq!(borrowed.parts[0].modality(), input::Modality::Text);
-            assert_eq!(borrowed.parts[1].modality(), input::Modality::Image);
+            assert_eq!(borrowed.parts[0].modality(), InputModality::Text);
+            assert_eq!(borrowed.parts[1].modality(), InputModality::Image);
             assert_eq!(
                 borrowed.parts[1]
                     .metadata_value(eredu_core::InputMetadataKey::PatchGrid)

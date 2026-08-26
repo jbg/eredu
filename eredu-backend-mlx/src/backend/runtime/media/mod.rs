@@ -3,16 +3,18 @@
 /// Typed runtime inputs for model prefill.
 pub mod input;
 
+#[cfg(all(test, not(any(feature = "image", feature = "audio"))))]
+use eredu_core::InputModality;
 #[cfg(feature = "image")]
 use eredu_core::VideoSampling;
 use eredu_core::{checkpoint::TensorDtype, InputTensorIdentity, PreparedInputIdentity};
 #[cfg(any(feature = "image", feature = "audio"))]
-use eredu_core::{InputExtent, InputMetadataKey};
+use eredu_core::{InputExtent, InputMetadataKey, InputModality};
 use eredu_runtime::PreparedModelInput as RuntimePreparedModelInput;
 use safemlx::{Array, Dtype};
 
 #[cfg(any(test, feature = "image", feature = "audio"))]
-use crate::backend::runtime::media::input::{InputPayload, Modality};
+use crate::backend::runtime::media::input::InputPayload;
 use crate::{backend::error::Error, backend::runtime::media::input::ModelInput};
 
 /// Backend-neutral runtime input part specialized to MLX arrays.
@@ -38,7 +40,7 @@ pub use image::RgbImageView;
 #[cfg(any(feature = "image", feature = "audio"))]
 pub struct MediaInput<'a> {
     /// Declared modality of the item.
-    pub modality: Modality,
+    pub modality: InputModality,
     /// Decoded media payload.
     pub payload: MediaPayload<'a>,
 }
@@ -49,7 +51,7 @@ impl<'a> MediaInput<'a> {
     #[cfg(feature = "image")]
     pub fn image_rgb8(image: RgbImageView<'a>) -> Self {
         Self {
-            modality: Modality::Image,
+            modality: InputModality::Image,
             payload: MediaPayload::Rgb8(image),
         }
     }
@@ -62,7 +64,7 @@ impl<'a> MediaInput<'a> {
         sampling: VideoSampling,
     ) -> Self {
         Self {
-            modality: Modality::Video,
+            modality: InputModality::Video,
             payload: MediaPayload::VideoFrames(VideoFrames {
                 frames,
                 source_fps,
@@ -75,7 +77,7 @@ impl<'a> MediaInput<'a> {
     #[cfg(feature = "audio")]
     pub fn audio_f32(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
         Ok(Self {
-            modality: Modality::Audio,
+            modality: InputModality::Audio,
             payload: MediaPayload::AudioF32(AudioWaveform::new(samples, sample_rate)?),
         })
     }
@@ -126,7 +128,7 @@ fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
     let width = i32::try_from(ids.len())
         .map_err(|_| Error::Processor("text input exceeds MLX dimension capacity".into()))?;
     input::input_part(
-        Modality::Text,
+        InputModality::Text,
         InputPayload::TokenIds(Array::from_slice(ids, &[1, width])),
         [],
         [],
@@ -136,7 +138,7 @@ fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
 
 #[cfg(any(feature = "image", feature = "audio"))]
 pub fn media_input_part(
-    modality: Modality,
+    modality: InputModality,
     tensor: Array,
     metadata: impl IntoIterator<Item = (InputMetadataKey, Array)>,
     extents: impl IntoIterator<Item = InputExtent>,
@@ -355,10 +357,10 @@ pub fn push_text_token_ids(parts: &mut Vec<InputPart>, token_ids: &[u32]) -> Res
 #[cfg(test)]
 mod prepared_input_identity_tests {
     use super::{
-        input::{input_part, InputPayload, Modality, ModelInput},
+        input::{input_part, InputPayload, ModelInput},
         PreparedModelInput,
     };
-    use eredu_core::InputMetadataKey;
+    use eredu_core::{InputMetadataKey, InputModality};
     use safemlx::Array;
 
     fn descriptor(input: ModelInput<'_>) -> Vec<u32> {
@@ -377,28 +379,28 @@ mod prepared_input_identity_tests {
         let other_grid = Array::from_slice(&[1_i32, 1, 2], &[3, 1]);
 
         let image_part = [input_part(
-            Modality::Image,
+            InputModality::Image,
             InputPayload::Tensor(image.clone()),
             [(InputMetadataKey::PatchGrid, grid.clone())],
             [],
         )
         .unwrap()];
         let video_part = [input_part(
-            Modality::Video,
+            InputModality::Video,
             InputPayload::Tensor(image.clone()),
             [(InputMetadataKey::PatchGrid, grid.clone())],
             [],
         )
         .unwrap()];
         let shaped_part = [input_part(
-            Modality::Image,
+            InputModality::Image,
             InputPayload::Tensor(differently_shaped),
             [(InputMetadataKey::PatchGrid, grid)],
             [],
         )
         .unwrap()];
         let metadata_part = [input_part(
-            Modality::Image,
+            InputModality::Image,
             InputPayload::Tensor(image),
             [(InputMetadataKey::PatchGrid, other_grid)],
             [],
@@ -417,9 +419,9 @@ mod prepared_input_identity_tests {
         let embeddings = Array::from_slice(&[0.0_f32; 12], &[1, 2, 6]);
         let positions = Array::from_slice(&[0_i32, 1, 2, 3], &[1, 2, 2]);
         let parts = [
-            input_part(Modality::Text, InputPayload::TokenIds(tokens), [], []).unwrap(),
+            input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap(),
             input_part(
-                Modality::Image,
+                InputModality::Image,
                 InputPayload::Embeddings(embeddings),
                 [(InputMetadataKey::PatchPositions, positions)],
                 [],

@@ -272,7 +272,7 @@ mod tests {
     use eredu_gguf::MetadataValue;
 
     use super::{ModelProcessor, ProcessorKind};
-    use crate::backend::runtime::media::input::Modality;
+    use eredu_core::InputModality;
 
     #[test]
     fn mlx_processor_materializes_the_portable_ordered_request() {
@@ -313,6 +313,6 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2].modality(), Modality::Image);
+        assert_eq!(parts[2].modality(), InputModality::Image);
     }
 }

@@ -17,7 +17,7 @@ use safemlx::Array;
 
 use crate::backend::error::Error;
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::runtime::media::input::Modality;
+use eredu_core::InputModality;
 
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::backend::runtime::media::MediaPayload;
@@ -54,7 +54,7 @@ impl InklingProcessor {
     fn push_media(&self, _parts: &mut Vec<InputPart>, media: MediaInput<'_>) -> Result<(), Error> {
         match (media.modality, media.payload) {
             #[cfg(feature = "image")]
-            (Modality::Image, MediaPayload::Rgb8(image)) => {
+            (InputModality::Image, MediaPayload::Rgb8(image)) => {
                 let plan = self
                     .plan
                     .image(image.height() as usize, image.width() as usize)
@@ -64,7 +64,7 @@ impl InklingProcessor {
                 Ok(())
             }
             #[cfg(feature = "audio")]
-            (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
+            (InputModality::Audio, MediaPayload::AudioF32(waveform)) => {
                 let plan = self.plan.audio();
                 push_text_token_ids(_parts, &[plan.start_token_id])?;
                 _parts.push(self.process_audio(waveform, plan)?);
@@ -106,7 +106,7 @@ impl InklingProcessor {
         let tensor = Array::from_slice(&ids, &[1, frames as i32, plan.mel_bins as i32]);
         let mask = Array::from_slice(&vec![true; frames], &[1, frames as i32]);
         media_input_part(
-            Modality::Audio,
+            InputModality::Audio,
             tensor,
             [(InputMetadataKey::AudioMask, mask)],
             [InputExtent::AudioValidFrames(frames)],
@@ -156,7 +156,7 @@ fn process_image(
         }
     }
     media_input_part(
-        Modality::Image,
+        InputModality::Image,
         Array::from_slice(
             &output,
             &[

@@ -11,6 +11,7 @@ use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource},
     WeightQuantization,
 };
+use eredu_core::InputModality;
 use eredu_runtime::{
     ArchitectureParameters,
     CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
@@ -234,7 +235,7 @@ impl QwenVlPipelineBindings {
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if part.modality() == input::Modality::Image {
+                    kinds.push(if part.modality() == InputModality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
@@ -725,7 +726,7 @@ impl QwenVlModel {
                     pixels.push(tensor.clone());
                     let token_index = token_storage.len() - 1;
                     let grid_index = grids.len() - 1;
-                    kinds.push(if part.modality() == input::Modality::Image {
+                    kinds.push(if part.modality() == InputModality::Image {
                         Kind::Image(token_index, grid_index)
                     } else {
                         Kind::Video(token_index, grid_index)

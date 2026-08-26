@@ -703,16 +703,16 @@ impl InklingPipelinePartition {
                     eredu_architectures::inkling::DecoderInputPart::Projected { tokens, embeddings }
                 }
                 None => match kind {
-                    crate::backend::runtime::media::input::Modality::Text => {
+                    eredu_core::InputModality::Text => {
                         eredu_architectures::inkling::DecoderInputPart::Text(tokens)
                     }
-                    crate::backend::runtime::media::input::Modality::Image => {
+                    eredu_core::InputModality::Image => {
                         eredu_architectures::inkling::DecoderInputPart::Image(tokens)
                     }
-                    crate::backend::runtime::media::input::Modality::Audio => {
+                    eredu_core::InputModality::Audio => {
                         eredu_architectures::inkling::DecoderInputPart::Audio(tokens)
                     }
-                    crate::backend::runtime::media::input::Modality::Video => unreachable!(),
+                    eredu_core::InputModality::Video => unreachable!(),
                 },
             })
             .collect::<Vec<_>>();
@@ -9352,12 +9352,12 @@ fn pipeline_mtp_token_identity(
         .iter()
         .filter_map(|part| match (part.modality(), part.payload()) {
             (
-                crate::backend::runtime::media::input::Modality::Text,
+                eredu_core::InputModality::Text,
                 crate::backend::runtime::media::input::InputPayload::TokenIds(tokens),
             ) => Some(Ok(tokens.clone())),
-            (crate::backend::runtime::media::input::Modality::Text, _) => Some(Err(
-                Exception::custom("pipeline embedded MTP requires token-id text ingress"),
-            )),
+            (eredu_core::InputModality::Text, _) => Some(Err(Exception::custom(
+                "pipeline embedded MTP requires token-id text ingress",
+            ))),
             _ => None,
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -10646,7 +10646,7 @@ impl PipelineModel {
         if let Some(PipelineIngress::ModelInput(input)) = ingress {
             if self.info.placement.groups().len() > 1 {
                 let has_media_tensor = input.parts.iter().any(|part| {
-                    part.modality() != crate::backend::runtime::media::input::Modality::Text
+                    part.modality() != eredu_core::InputModality::Text
                         && matches!(
                             part.payload(),
                             crate::backend::runtime::media::input::InputPayload::Tensor(_)
@@ -10922,7 +10922,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         let multimodal = input
             .parts
             .iter()
-            .any(|part| part.modality() != crate::backend::runtime::media::input::Modality::Text);
+            .any(|part| part.modality() != eredu_core::InputModality::Text);
         cache
             .reset()
             .map_err(|error| Exception::custom(error.to_string()))?;

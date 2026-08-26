@@ -12,6 +12,7 @@ use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
 };
+use eredu_core::InputModality;
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
@@ -878,10 +879,10 @@ impl InklingModel {
                     embeddings,
                 },
                 None => match kind {
-                    input::Modality::Text => DecoderInputPart::Text(value),
-                    input::Modality::Image => DecoderInputPart::Image(value),
-                    input::Modality::Audio => DecoderInputPart::Audio(value),
-                    input::Modality::Video => unreachable!(),
+                    InputModality::Text => DecoderInputPart::Text(value),
+                    InputModality::Image => DecoderInputPart::Image(value),
+                    InputModality::Audio => DecoderInputPart::Audio(value),
+                    InputModality::Video => unreachable!(),
                 },
             })
             .collect::<Vec<_>>();
@@ -941,10 +942,10 @@ impl InklingModel {
                     embeddings,
                 },
                 None => match kind {
-                    input::Modality::Text => DecoderInputPart::Text(value),
-                    input::Modality::Image => DecoderInputPart::Image(value),
-                    input::Modality::Audio => DecoderInputPart::Audio(value),
-                    input::Modality::Video => unreachable!(),
+                    InputModality::Text => DecoderInputPart::Text(value),
+                    InputModality::Image => DecoderInputPart::Image(value),
+                    InputModality::Audio => DecoderInputPart::Audio(value),
+                    InputModality::Video => unreachable!(),
                 },
             })
             .collect::<Vec<_>>();
@@ -1061,10 +1062,10 @@ impl InklingModel {
                     embeddings,
                 },
                 None => match kind {
-                    input::Modality::Text => DecoderInputPart::Text(value),
-                    input::Modality::Image => DecoderInputPart::Image(value),
-                    input::Modality::Audio => DecoderInputPart::Audio(value),
-                    input::Modality::Video => unreachable!(),
+                    InputModality::Text => DecoderInputPart::Text(value),
+                    InputModality::Image => DecoderInputPart::Image(value),
+                    InputModality::Audio => DecoderInputPart::Audio(value),
+                    InputModality::Video => unreachable!(),
                 },
             })
             .collect::<Vec<_>>();
@@ -1164,7 +1165,7 @@ impl InklingModel {
 
 pub struct PreparedInklingInput {
     pub tokens: Vec<crate::MlxTensor>,
-    pub kinds: Vec<input::Modality>,
+    pub kinds: Vec<InputModality>,
     pub projected: Vec<Option<crate::MlxTensor>>,
     pub images: Option<crate::MlxTensor>,
     pub audio: Option<crate::MlxTensor>,
@@ -1191,12 +1192,12 @@ impl PreparedInklingInput {
                     input::InputPayload::TokenIds(value),
                 ) => {
                     tokens.push(crate::MlxTensor::from_array(value.clone()));
-                    kinds.push(input::Modality::Text);
+                    kinds.push(InputModality::Text);
                     projected.push(None);
                 }
                 (
                     media_plan::InklingInputPartPlan::Media {
-                        modality: input::Modality::Image,
+                        modality: InputModality::Image,
                         ingress,
                         ..
                     },
@@ -1211,13 +1212,13 @@ impl PreparedInklingInput {
                         &vec![ingress.placeholder_token_id; count],
                         stream,
                     )?));
-                    kinds.push(input::Modality::Image);
+                    kinds.push(InputModality::Image);
                     projected.push(None);
                     images.push(value.clone());
                 }
                 (
                     media_plan::InklingInputPartPlan::Media {
-                        modality: input::Modality::Audio,
+                        modality: InputModality::Audio,
                         ingress,
                         ..
                     },
@@ -1238,7 +1239,7 @@ impl PreparedInklingInput {
                         &vec![ingress.placeholder_token_id; count],
                         stream,
                     )?));
-                    kinds.push(input::Modality::Audio);
+                    kinds.push(InputModality::Audio);
                     projected.push(None);
                     audio.push(value.try_index_device((.., ..retained_frames, ..), stream)?);
                 }
@@ -1260,9 +1261,9 @@ impl PreparedInklingInput {
                         stream,
                     )?));
                     kinds.push(match modality {
-                        input::Modality::Image => input::Modality::Image,
-                        input::Modality::Audio => input::Modality::Audio,
-                        input::Modality::Text | input::Modality::Video => unreachable!(),
+                        InputModality::Image => InputModality::Image,
+                        InputModality::Audio => InputModality::Audio,
+                        InputModality::Text | InputModality::Video => unreachable!(),
                     });
                     projected.push(Some(crate::MlxTensor::from_array(value.clone())));
                 }

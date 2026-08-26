@@ -4,7 +4,7 @@ use eredu_architectures::processor_plan::{
     ProcessorPlanError, QwenImagePlan, QwenPatchPlan, QwenProcessorPlan, QwenVideoPlan,
     RgbResample, RgbTransformPlan,
 };
-use eredu_core::InputMetadataKey;
+use eredu_core::{InputMetadataKey, InputModality};
 use safemlx::Array;
 
 use crate::backend::runtime::media::video::validate_rgb_frames;
@@ -16,7 +16,7 @@ use crate::backend::runtime::media::{
     media_input_part, prepared_model_input, push_text_token_ids, MediaInput, MediaPayload,
     InputPart, PreparedModelInput, ProcessorInput, ProcessorPreparationError, VideoFrames,
 };
-use crate::{backend::error::Error, backend::runtime::media::input::Modality};
+use crate::backend::error::Error;
 
 #[derive(Debug, Clone)]
 pub struct QwenProcessor {
@@ -54,7 +54,7 @@ impl QwenProcessor {
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
         match (item.modality, item.payload) {
-            (Modality::Image, MediaPayload::Rgb8(image)) => {
+            (InputModality::Image, MediaPayload::Rgb8(image)) => {
                 let plan = self
                     .plan
                     .image(image.height() as usize, image.width() as usize)
@@ -63,7 +63,7 @@ impl QwenProcessor {
                 parts.push(self.process_image(image, &plan)?);
                 push_text_token_ids(parts, &[plan.framing.end_token_id])?;
             }
-            (Modality::Video, MediaPayload::VideoFrames(video)) => {
+            (InputModality::Video, MediaPayload::VideoFrames(video)) => {
                 parts.extend(self.process_video(video, encode_text)?);
             }
             (modality, _) => {
@@ -91,7 +91,7 @@ impl QwenProcessor {
         )?;
         let (patches, grid_thw) = pack_image_patches(&normalized, plan.patches)?;
         media_input_part(
-            Modality::Image,
+            InputModality::Image,
             patches,
             [(InputMetadataKey::PatchGrid, grid_thw)],
             [],
@@ -141,7 +141,7 @@ impl QwenProcessor {
             }
             let (patches, grid_thw) = pack_video_patches(&frames, plan.patches)?;
             parts.push(media_input_part(
-                Modality::Video,
+                InputModality::Video,
                 patches,
                 [(InputMetadataKey::PatchGrid, grid_thw)],
                 [],
@@ -294,11 +294,11 @@ fn pack_video_patches(
 #[cfg(test)]
 mod tests {
     use eredu_architectures::processor_plan::{QwenPatchPlan, QwenProcessorPlan};
-    use eredu_core::{InputMetadataKey, VideoSampling};
+    use eredu_core::{InputMetadataKey, InputModality, VideoSampling};
 
     use super::{pack_image_patches, QwenProcessor};
     use crate::{
-        backend::runtime::media::input::{InputPayload, Modality},
+        backend::runtime::media::input::InputPayload,
         backend::runtime::media::{
             image::{rescale_and_normalize_rgb8, RgbImageView},
             MediaInput, ProcessorInput,
@@ -364,9 +364,9 @@ mod tests {
             .unwrap();
         let parts = prepared.input_parts();
         assert_eq!(parts.len(), 5);
-        assert_eq!(parts[0].modality(), Modality::Text);
-        assert_eq!(parts[2].modality(), Modality::Image);
-        assert_eq!(parts[4].modality(), Modality::Text);
+        assert_eq!(parts[0].modality(), InputModality::Text);
+        assert_eq!(parts[2].modality(), InputModality::Image);
+        assert_eq!(parts[4].modality(), InputModality::Text);
         let InputPayload::TokenIds(start) = parts[1].payload() else {
             panic!("expected vision-start token");
         };
@@ -421,8 +421,8 @@ mod tests {
         let parts = prepared.input_parts();
         assert_eq!(timestamp_text, vec!["<0.2 seconds>", "<1.2 seconds>"]);
         assert_eq!(parts.len(), 8);
-        assert_eq!(parts[2].modality(), Modality::Video);
-        assert_eq!(parts[5].modality(), Modality::Video);
+        assert_eq!(parts[2].modality(), InputModality::Video);
+        assert_eq!(parts[5].modality(), InputModality::Video);
         let InputPayload::TokenIds(replacement) = parts[1].payload() else {
             panic!("expected timestamp replacement tokens");
         };

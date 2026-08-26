@@ -14,6 +14,7 @@ use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource},
     WeightQuantization,
 };
+use eredu_core::InputModality;
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters,
@@ -321,7 +322,7 @@ impl QwenConditionalPipelineBindings {
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if part.modality() == input::Modality::Image {
+                    kinds.push(if part.modality() == InputModality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)
@@ -1241,7 +1242,7 @@ impl QwenHybridModel {
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
-                    kinds.push(if part.modality() == input::Modality::Image {
+                    kinds.push(if part.modality() == InputModality::Image {
                         Kind::Image(token, grid)
                     } else {
                         Kind::Video(token, grid)

@@ -670,7 +670,7 @@ fn pipeline_ring_worker() {
             <MlxBackend<'_> as eredu_core::SpeculativeGenerationBackend>::mtp_capability(&runtime),
             expected_mtp_capability
         );
-        use crate::backend::runtime::media::input::{InputPayload, Modality, ModelInput};
+        use crate::backend::runtime::media::input::{InputPayload, ModelInput};
         let capability_tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
         let capability_parts = [text_input_part(&capability_tokens)];
         let capability_input = ModelInput::new(&capability_parts).into();
@@ -735,7 +735,7 @@ fn pipeline_ring_worker() {
             vec![
                 text_input_part(&text_before),
                 input_part(
-                    Modality::Image,
+                    InputModality::Image,
                     InputPayload::Tensor(image_pixels.clone()),
                     [(InputMetadataKey::PatchGrid, image_grid.clone())],
                     [],
@@ -746,13 +746,13 @@ fn pipeline_ring_worker() {
             vec![
                 text_input_part(&prompt),
                 input_part(
-                    Modality::Image,
+                    InputModality::Image,
                     InputPayload::Embeddings(inkling_image.clone()),
                     [],
                     [],
                 ),
                 input_part(
-                    Modality::Audio,
+                    InputModality::Audio,
                     InputPayload::Tensor(inkling_audio.clone()),
                     [],
                     [],
@@ -762,7 +762,7 @@ fn pipeline_ring_worker() {
             vec![
                 text_input_part(&prompt),
                 input_part(
-                    Modality::Image,
+                    InputModality::Image,
                     InputPayload::Tensor(gemma4_patches.clone()),
                     [
                         (InputMetadataKey::PatchGrid, gemma4_grid.clone()),
@@ -775,7 +775,7 @@ fn pipeline_ring_worker() {
                     }],
                 ),
                 input_part(
-                    Modality::Audio,
+                    InputModality::Audio,
                     InputPayload::Tensor(gemma4_audio.clone()),
                     [(InputMetadataKey::AudioMask, gemma4_audio_mask.clone())],
                     [InputExtent::AudioValidFrames(4)],
@@ -1579,7 +1579,7 @@ fn resident_reference_for_prepared(
 }
 
 fn inkling_multimodal_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::{Modality, ModelInput};
+    use crate::backend::runtime::media::input::ModelInput;
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
@@ -1587,9 +1587,14 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
     let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
     let parts = [
         text_input_part(&text),
-        input_part(Modality::Image, InputPayload::Embeddings(image), [], []),
         input_part(
-            Modality::Audio,
+            InputModality::Image,
+            InputPayload::Embeddings(image),
+            [],
+            [],
+        ),
+        input_part(
+            InputModality::Audio,
             InputPayload::Tensor(audio),
             [(InputMetadataKey::AudioMask, audio_mask)],
             [InputExtent::AudioValidFrames(2)],
@@ -1599,7 +1604,7 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
 }
 
 fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::{Modality, ModelInput};
+    use crate::backend::runtime::media::input::ModelInput;
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
@@ -1607,7 +1612,7 @@ fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
     let parts = [
         text_input_part(&text),
         input_part(
-            Modality::Image,
+            InputModality::Image,
             InputPayload::Tensor(pixels),
             [(InputMetadataKey::PatchGrid, grid)],
             [],
@@ -1617,7 +1622,7 @@ fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
 }
 
 fn qwen3_vl_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::{Modality, ModelInput};
+    use crate::backend::runtime::media::input::ModelInput;
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
@@ -1625,7 +1630,7 @@ fn qwen3_vl_prepared_input() -> PreparedModelInput {
     let parts = [
         text_input_part(&text),
         input_part(
-            Modality::Image,
+            InputModality::Image,
             InputPayload::Tensor(pixels),
             [(InputMetadataKey::PatchGrid, grid)],
             [],

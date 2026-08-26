@@ -6,10 +6,9 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-pub use eredu_core::InputModality as Modality;
 use eredu_core::{
-    checkpoint::TensorDtype, CapabilityError, InputExtent, InputMetadataKey, InputTensorIdentity,
-    PreparedInputError,
+    checkpoint::TensorDtype, CapabilityError, InputExtent, InputMetadataKey, InputModality,
+    InputTensorIdentity, PreparedInputError,
 };
 use eredu_runtime::{PreparedInputPart as RuntimeInputPart, PreparedInputPayload};
 
@@ -35,7 +34,7 @@ impl<'a> ModelInput<'a> {
 
 /// Creates a structurally validated runtime part from MLX arrays.
 pub fn input_part(
-    modality: Modality,
+    modality: InputModality,
     payload: InputPayload,
     metadata: impl IntoIterator<Item = (InputMetadataKey, Array)>,
     extents: impl IntoIterator<Item = InputExtent>,
@@ -47,7 +46,7 @@ pub fn input_part(
 /// Clones a token array handle into a validated text input part.
 pub fn token_ids_part(token_ids: &Array) -> Result<InputPart, Exception> {
     input_part(
-        Modality::Text,
+        InputModality::Text,
         InputPayload::TokenIds(token_ids.clone()),
         [],
         [],
@@ -113,23 +112,29 @@ pub fn validate(input: ModelInput<'_>) -> Result<(), Exception> {
     }
     for part in input.parts {
         match (part.modality(), part.payload()) {
-            (Modality::Text, InputPayload::TokenIds(tokens)) => validate_token_ids(tokens)?,
-            (Modality::Text, InputPayload::Embeddings(embeddings)) => {
+            (InputModality::Text, InputPayload::TokenIds(tokens)) => validate_token_ids(tokens)?,
+            (InputModality::Text, InputPayload::Embeddings(embeddings)) => {
                 validate_embeddings(embeddings, "text embeddings")?
             }
-            (Modality::Text, InputPayload::Tensor(_)) => {
+            (InputModality::Text, InputPayload::Tensor(_)) => {
                 return Err(Exception::custom(
                     "text input does not accept tensor payloads",
                 ));
             }
-            (Modality::Image | Modality::Audio | Modality::Video, InputPayload::Tensor(tensor)) => {
+            (
+                InputModality::Image | InputModality::Audio | InputModality::Video,
+                InputPayload::Tensor(tensor),
+            ) => {
                 validate_rank_at_least(tensor, 2, part.modality().as_str())?;
             }
             (
-                Modality::Image | Modality::Audio | Modality::Video,
+                InputModality::Image | InputModality::Audio | InputModality::Video,
                 InputPayload::Embeddings(embeddings),
             ) => validate_embeddings(embeddings, part.modality().as_str())?,
-            (Modality::Image | Modality::Audio | Modality::Video, InputPayload::TokenIds(_)) => {
+            (
+                InputModality::Image | InputModality::Audio | InputModality::Video,
+                InputPayload::TokenIds(_),
+            ) => {
                 return Err(Exception::custom(format!(
                     "{} input does not accept token-id payloads",
                     part.modality().as_str()
@@ -146,8 +151,8 @@ pub fn text_token_ids(input: ModelInput<'_>, stream: &Stream) -> Result<Array, E
     let mut parts = Vec::new();
     for part in input.parts {
         match (part.modality(), part.payload()) {
-            (Modality::Text, InputPayload::TokenIds(tokens)) => parts.push(tokens.clone()),
-            (Modality::Text, InputPayload::Embeddings(_)) => {
+            (InputModality::Text, InputPayload::TokenIds(tokens)) => parts.push(tokens.clone()),
+            (InputModality::Text, InputPayload::Embeddings(_)) => {
                 return Err(Exception::custom(
                     "text embeddings are not supported by this model",
                 ));
@@ -240,13 +245,15 @@ fn validate_rank_at_least(tensor: &Array, min_rank: usize, name: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{input_part, validate, InputPayload, Modality, ModelInput};
+    use super::{input_part, validate, InputPayload, ModelInput};
+    use eredu_core::InputModality;
     use safemlx::Array;
 
     #[test]
     fn validates_text_token_part() {
         let tokens = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let parts = [input_part(Modality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
+        let parts =
+            [input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
 
         validate(ModelInput::new(&parts)).unwrap();
     }
@@ -261,7 +268,7 @@ mod tests {
     #[test]
     fn rejects_text_tensor_payload() {
         let tensor = Array::from_slice(&[0.0_f32, 1.0], &[1, 2]);
-        assert!(input_part(Modality::Text, InputPayload::Tensor(tensor), [], []).is_err());
+        assert!(input_part(InputModality::Text, InputPayload::Tensor(tensor), [], []).is_err());
     }
 
     #[test]
@@ -269,13 +276,13 @@ mod tests {
         let tensor = Array::from_slice(&[0.0_f32, 1.0], &[1, 2]);
         let parts = [
             input_part(
-                Modality::Audio,
+                InputModality::Audio,
                 InputPayload::Tensor(tensor.clone()),
                 [],
                 [],
             )
             .unwrap(),
-            input_part(Modality::Video, InputPayload::Tensor(tensor), [], []).unwrap(),
+            input_part(InputModality::Video, InputPayload::Tensor(tensor), [], []).unwrap(),
         ];
 
         validate(ModelInput::new(&parts)).unwrap();

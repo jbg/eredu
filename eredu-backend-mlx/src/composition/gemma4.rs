@@ -12,7 +12,7 @@ use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
 };
-use eredu_core::InputMetadataKey;
+use eredu_core::{InputMetadataKey, InputModality};
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, ExecutionUnitLayout,
@@ -1067,7 +1067,7 @@ struct PreparedAudioPart {
 
 pub struct PreparedParts {
     tokens: Vec<crate::MlxTensor>,
-    modalities: Vec<input::Modality>,
+    modalities: Vec<InputModality>,
     projected: Vec<Option<crate::MlxTensor>>,
     vision_parts: Vec<PreparedVisionPart>,
     vision: Option<PreparedVision>,
@@ -1105,7 +1105,7 @@ impl PreparedParts {
                     prepared
                         .tokens
                         .push(crate::MlxTensor::from_array(tokens.clone()));
-                    prepared.modalities.push(input::Modality::Text);
+                    prepared.modalities.push(InputModality::Text);
                     prepared.projected.push(None);
                 }
                 Gemma4InputPartPlan::Projected {
@@ -1173,7 +1173,7 @@ impl PreparedParts {
 
     fn push_vision(
         &mut self,
-        modality: input::Modality,
+        modality: InputModality,
         patches: &Array,
         positions: &Array,
         plan: VisionIngressPartPlan,
@@ -1251,7 +1251,7 @@ impl PreparedParts {
                 &vec![placeholder_token_id; plan.decoder_positions as usize],
                 &[1, plan.decoder_positions],
             )));
-        self.modalities.push(input::Modality::Audio);
+        self.modalities.push(InputModality::Audio);
         self.projected.push(None);
 
         self.audio_parts.push(PreparedAudioPart {
@@ -1327,10 +1327,10 @@ impl PreparedParts {
                     DecoderInputPart::Projected { tokens, embeddings }
                 } else {
                     match modality {
-                        input::Modality::Text => DecoderInputPart::Text(tokens),
-                        input::Modality::Image => DecoderInputPart::Image(tokens),
-                        input::Modality::Video => DecoderInputPart::Video(tokens),
-                        input::Modality::Audio => DecoderInputPart::Audio(tokens),
+                        InputModality::Text => DecoderInputPart::Text(tokens),
+                        InputModality::Image => DecoderInputPart::Image(tokens),
+                        InputModality::Video => DecoderInputPart::Video(tokens),
+                        InputModality::Audio => DecoderInputPart::Audio(tokens),
                     }
                 }
             })

@@ -4,14 +4,13 @@ use eredu_architectures::processor_plan::{
     MuseImagePlan, MusePatchPlan, MuseProcessorPlan, ProcessorPlanError, RgbResample,
     RgbTransformPlan,
 };
-use eredu_core::InputMetadataKey;
+use eredu_core::{InputMetadataKey, InputModality};
 use safemlx::Array;
 
 use crate::{
     backend::error::Error,
     backend::runtime::media::{
         image::{rescale_and_normalize_rgb8, resize_rgb8_lanczos3, NormalizedImage, RgbImageView},
-        input::Modality,
         media_input_part, prepared_model_input, push_text_token_ids,
         video::validate_rgb_frames,
         InputPart, MediaInput, MediaPayload, PreparedModelInput, ProcessorInput,
@@ -52,7 +51,7 @@ impl MuseGlimmerProcessor {
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
         match (media.modality, media.payload) {
-            (Modality::Image, MediaPayload::Rgb8(image)) => {
+            (InputModality::Image, MediaPayload::Rgb8(image)) => {
                 let plan = self
                     .plan
                     .image(image.height() as usize, image.width() as usize)
@@ -68,7 +67,7 @@ impl MuseGlimmerProcessor {
                 )?;
                 Ok(())
             }
-            (Modality::Video, MediaPayload::VideoFrames(video)) => {
+            (InputModality::Video, MediaPayload::VideoFrames(video)) => {
                 self.push_video(parts, video, encode_text)
             }
             (modality, _) => Err(Error::Processor(format!(
@@ -142,7 +141,7 @@ fn process_image(image: RgbImageView<'_>, plan: MuseImagePlan) -> Result<InputPa
     let image = normalize(image, plan.transform)?;
     let (patches, grid) = pack_patches(std::slice::from_ref(&image), plan.patches, true)?;
     media_input_part(
-        Modality::Image,
+        InputModality::Image,
         patches,
         [(InputMetadataKey::PatchGrid, grid)],
         [],
@@ -155,7 +154,7 @@ fn process_video_group(
 ) -> Result<InputPart, Error> {
     let (patches, grid) = pack_patches(frames, plan, false)?;
     media_input_part(
-        Modality::Video,
+        InputModality::Video,
         patches,
         [(InputMetadataKey::PatchGrid, grid)],
         [],
