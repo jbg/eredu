@@ -115,10 +115,12 @@ exporting `safemlx` exception or I/O variants. Portable execution plans remain
 the application surface for device and topology selection.
 Sampling functions and sampler traits whose signatures expose raw MLX arrays,
 streams, or random state are exported only through that native namespace, not
-through the flat application-facing adapter. Native realtime backend types,
-inputs, outputs, sessions, completions, and prompt helpers follow the same
-rule. Device assignments and device-bound MLX parallel contexts are likewise
-available through `eredu-backend-mlx::native` and the reusable `backend`
+through the flat application-facing adapter. Stream-bound checkpoint
+conversion, prepared models, backend errors, native-bearing load and inspection
+policy, and model-session outputs follow the same rule. Native realtime backend
+types, inputs, outputs, sessions, completions, and prompt helpers follow the
+same rule. Device assignments and device-bound MLX parallel contexts are
+likewise available through `eredu-backend-mlx::native` and the reusable `backend`
 hierarchy, not the flat adapter root. The backend's flat `MlxRealtimeAdapter`
 has no native-handle accessors and
 exists so the facade can own a concrete implementation; facade-owned wrappers
@@ -1102,7 +1104,7 @@ composition:
   is the sole MLX implementation of `eredu_nn::Tensor`;
 - `native::MlxModelSession` composition owns the executable model, cache,
   processor state, and
-  optional distributed context. The prepared `MlxModel` wrapper exposes
+  optional distributed context. The prepared `native::MlxModel` wrapper exposes
   neutral capabilities and telemetry while keeping its executable kind and
   architecture-specific payload private.
 - neural-network modules implement reusable MLX tensor operations;

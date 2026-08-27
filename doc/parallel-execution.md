@@ -7,7 +7,7 @@ coordinates and subgroup membership for the axes that apply to its model.
 All supported families use the ordinary architecture-erased loader. Build the
 canonical `eredu::ParallelTopology` in core terms, bind its process rank
 to an MLX device with `eredu_backend_mlx::native::MlxParallelContext`, and pass
-that context through `eredu_backend_mlx::ModelLoadOptions::with_parallel` in
+that context through `eredu_backend_mlx::native::ModelLoadOptions::with_parallel` in
 backend-specific tooling. Application clients normally submit the portable
 topology through an `ExecutionPlan` and let the `eredu` facade realize it.
 Unsupported combinations fail preflight before checkpoint payloads are

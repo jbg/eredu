@@ -17,9 +17,10 @@ use eredu_backend_mlx::backend::runtime::media::input::ModelInput;
 use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
-    Array, Device, DeviceType, ExecutionContext, MlxModelInput, MlxModelSession, Stream,
+    Array, Device, DeviceType, ExecutionContext, MlxModelInput, MlxModelSession, ModelLoadOptions,
+    Stream,
 };
-use eredu_backend_mlx::{MlxBackend, ModelLoadOptions};
+use eredu_backend_mlx::MlxBackend;
 use eredu_core::{
     load_model, BackendProvider as _, BackendSession as _, ObservationValue, TensorObservationData,
 };
@@ -418,7 +419,7 @@ fn run_probe(
 fn copy_logits(
     session: &MlxModelSession<'static>,
     backend: &MlxBackend<'static>,
-    output: &eredu_backend_mlx::MlxModelOutput,
+    output: &eredu_backend_mlx::native::MlxModelOutput,
 ) -> Result<(Vec<f32>, usize)> {
     let observations = session.observe_output(backend, output)?;
     let tensor = match observations.get("model.logits") {

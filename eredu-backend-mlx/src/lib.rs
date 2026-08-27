@@ -52,6 +52,46 @@ pub use adapter::*;
 /// use eredu_backend_mlx::MlxSessionCompletion;
 /// ```
 ///
+/// Prepared models, native-bearing load and inspection policy, backend errors,
+/// model-session outputs, and checkpoint conversion also require an explicit
+/// native import:
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxModel;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxModelConfig;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::ModelLoadOptions;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxError;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxInspectionOptions;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::inspect_model;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::MlxModelOutput;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::quantize_checkpoint;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::CheckpointQuantizationOptions;
+/// ```
+///
 /// Device-bound topology also stays behind the backend-author boundary:
 ///
 /// ```compile_fail
@@ -74,9 +114,14 @@ pub use adapter::*;
 /// ```
 pub mod native {
     pub use crate::backend::nn::generation::sample;
+    pub use crate::backend::runtime::checkpoint::quantization::{
+        CheckpointQuantizationOptions, CheckpointQuantizationReport,
+    };
     pub use crate::backend::runtime::generation::sampler::Sampler;
-    pub use crate::backend::MlxCompletion;
-    pub use crate::backend::{DeviceAssignment, MlxParallelContext};
+    pub use crate::backend::{
+        error::Error as MlxError, DeviceAssignment, MlxCompletion, MlxModel, MlxModelConfig,
+        MlxParallelContext, ModelLoadOptions,
+    };
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
         MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
@@ -84,8 +129,23 @@ pub mod native {
         MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
-    pub use crate::composition::mlx::{MlxModelInput, MlxModelSession, MlxSessionCompletion};
+    pub use crate::composition::mlx::{
+        inspect_model, MlxInspectionOptions, MlxModelInput, MlxModelOutput, MlxModelSession,
+        MlxSessionCompletion,
+    };
     pub use safemlx::*;
+
+    /// Converts a checkpoint with an explicitly selected native execution stream.
+    pub fn quantize_checkpoint(
+        source_dir: impl AsRef<std::path::Path>,
+        output_dir: impl AsRef<std::path::Path>,
+        options: &CheckpointQuantizationOptions,
+        stream: &Stream,
+    ) -> Result<CheckpointQuantizationReport, MlxError> {
+        crate::backend::runtime::checkpoint::quantization::quantize_checkpoint(
+            source_dir, output_dir, options, stream,
+        )
+    }
 
     /// Constructs an MLX backend from explicitly selected native streams.
     pub fn backend(stream: &Stream, weights_stream: &Stream) -> crate::MlxBackend<'static> {

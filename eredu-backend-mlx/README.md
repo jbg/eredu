@@ -17,8 +17,7 @@ backend development and backend-specific low-level tooling.
 
 ```rust,no_run
 use eredu_backend_mlx::{
-    native::{backend, Device, DeviceType, ExecutionContext},
-    ModelLoadOptions,
+    native::{backend, Device, DeviceType, ExecutionContext, ModelLoadOptions},
 };
 use eredu_core::load_model;
 
@@ -37,6 +36,9 @@ module below that root.
 The `native` module is a deliberate escape hatch for device assignment,
 device-bound parallel topology, streams, allocator state, random state,
 low-level arrays, sampling, and platform setup needed by concrete MLX tooling.
+Prepared models, load and inspection policy that can carry native topology,
+backend errors, model-session outputs, and stream-bound checkpoint conversion
+also live in this namespace rather than the flat adapter.
 `DeviceAssignment` and `MlxParallelContext` are available from `native` and the
 reusable `backend` hierarchy, but not from the flat application-facing root.
 Native sampling APIs that exchange raw arrays, streams, or random state are

@@ -6,9 +6,9 @@ use clap::Parser;
 use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
 use eredu_backend_mlx::native::{
     transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext, MlxModelInput,
-    MlxModelSession,
+    MlxModelSession, ModelLoadOptions,
 };
-use eredu_backend_mlx::{MlxBackend, MlxTensor, ModelLoadOptions};
+use eredu_backend_mlx::{MlxBackend, MlxTensor};
 use eredu_core::{
     cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
     load_model, AttentionPolicy, BackendProvider as _, BackendSession as _,

@@ -119,12 +119,12 @@ impl LocalLoadOptions {
         self.required_session_capabilities
     }
 
-    fn into_backend(self) -> eredu_backend_mlx::ModelLoadOptions {
+    fn into_backend(self) -> eredu_backend_mlx::native::ModelLoadOptions {
         let options = match self.quantization {
             Some(quantization) => {
-                eredu_backend_mlx::ModelLoadOptions::with_quantization(quantization)
+                eredu_backend_mlx::native::ModelLoadOptions::with_quantization(quantization)
             }
-            None => eredu_backend_mlx::ModelLoadOptions::default(),
+            None => eredu_backend_mlx::native::ModelLoadOptions::default(),
         };
         options
             .with_weight_residency(self.weight_residency)
@@ -132,7 +132,7 @@ impl LocalLoadOptions {
     }
 
     fn from_backend(
-        options: eredu_backend_mlx::ModelLoadOptions,
+        options: eredu_backend_mlx::native::ModelLoadOptions,
     ) -> Result<Self, crate::AutomaticPlanningError> {
         if options.parallel_topology().is_some() {
             return Err(crate::AutomaticPlanningError::Invalid(
@@ -184,9 +184,9 @@ pub fn inspect_local_model(
     path: impl AsRef<Path>,
     options: LocalInspectionOptions,
 ) -> Result<crate::ModelInspectionReport, LocalBackendError> {
-    eredu_backend_mlx::inspect_model(
+    eredu_backend_mlx::native::inspect_model(
         path,
-        eredu_backend_mlx::MlxInspectionOptions {
+        eredu_backend_mlx::native::MlxInspectionOptions {
             load: options.load.into_backend(),
         },
     )
@@ -537,7 +537,7 @@ fn observe_realtime_steps(
 }
 
 fn map_local_realtime_error(
-    error: eredu_core::RealtimeError<eredu_backend_mlx::MlxError>,
+    error: eredu_core::RealtimeError<eredu_backend_mlx::native::MlxError>,
 ) -> LocalRealtimeError {
     match error {
         eredu_core::RealtimeError::Backend(error) => {

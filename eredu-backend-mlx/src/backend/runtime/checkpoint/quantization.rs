@@ -219,7 +219,7 @@ impl PendingShard {
 /// The source directory may contain a single `model.safetensors` file or a
 /// Hugging Face sharded checkpoint index. Non-weight files are copied, while
 /// `config.json` is replaced by the exact architecture-authored output value.
-pub fn quantize_checkpoint(
+pub(crate) fn quantize_checkpoint(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
     options: &CheckpointQuantizationOptions,
