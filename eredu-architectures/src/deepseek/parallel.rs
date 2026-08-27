@@ -486,6 +486,16 @@ pub fn v3_layer_parameter_groups(
             ],
         )?);
     }
+    groups.push(replicated(
+        format!("{root}.norms"),
+        [
+            (format!("{root}.input_layernorm.weight"), vec![hidden]),
+            (
+                format!("{root}.post_attention_layernorm.weight"),
+                vec![hidden],
+            ),
+        ],
+    )?);
     let sparse = layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe);
     groups.extend(if sparse {
         expert_groups_v3(args, layer)?
@@ -794,18 +804,31 @@ fn expert_groups_v3(
     args: &V3Args,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let root = format!("model.layers.{layer}.mlp");
+    let experts = dim(args.n_routed_experts)?;
+    let hidden = dim(args.hidden_size)?;
     let mut groups = expert_groups(
-        &format!("model.layers.{layer}.mlp"),
-        dim(args.n_routed_experts)?,
+        &root,
+        experts,
         dim(args.moe_intermediate_size)?,
-        dim(args.hidden_size)?,
+        hidden,
         "experts.gate_up_proj",
         "experts.down_proj",
     )?;
+    groups.push(replicated(
+        format!("{root}.router"),
+        [
+            (format!("{root}.gate.weight"), vec![experts, hidden]),
+            (
+                format!("{root}.gate.e_score_correction_bias"),
+                vec![experts],
+            ),
+        ],
+    )?);
     groups.push(shared_expert_group(
-        &format!("model.layers.{layer}.mlp"),
+        &root,
         dim(args.moe_intermediate_size)? * dim(args.n_shared_experts)?,
-        dim(args.hidden_size)?,
+        hidden,
         "shared_experts.gate_proj.weight",
         "shared_experts.up_proj.weight",
         "shared_experts.down_proj.weight",
@@ -1306,6 +1329,90 @@ mod tests {
         assert!(draft
             .iter()
             .all(|group| group.logical_name().starts_with("mtp.0")));
+    }
+
+    #[test]
+    fn v3_description_owns_each_block_norm_with_its_execution_unit() {
+        let description = v3_parameter_description(&v3_args()).unwrap();
+        let norms = description
+            .groups()
+            .iter()
+            .filter(|owned| owned.group().logical_name().ends_with(".norms"))
+            .map(|owned| {
+                (
+                    owned.group().logical_name(),
+                    owned.owner(),
+                    owned
+                        .group()
+                        .members()
+                        .iter()
+                        .map(ParameterMemberSpec::target)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(norms.len(), 3);
+        for (layer, (logical_name, owner, members)) in norms.into_iter().enumerate() {
+            assert_eq!(logical_name, format!("model.layers.{layer}.norms"));
+            let (group, global_unit) = match owner {
+                ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
+                    (group.as_str(), *global_unit)
+                }
+                owner => panic!("unexpected V3 norm owner {owner:?}"),
+            };
+            if layer < 2 {
+                assert_eq!((group, global_unit), ("target", layer));
+            } else {
+                assert_eq!((group, global_unit), ("mtp.0", 0));
+            }
+            assert_eq!(
+                members,
+                [
+                    format!("model.layers.{layer}.input_layernorm.weight"),
+                    format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn v3_description_owns_each_sparse_router_with_its_execution_unit() {
+        let description = v3_parameter_description(&v3_args()).unwrap();
+        let routers = description
+            .groups()
+            .iter()
+            .filter(|owned| owned.group().logical_name().ends_with(".router"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(routers.len(), 2);
+        for (layer, owned, expected_group, expected_unit) in
+            [(1, routers[0], "target", 1), (2, routers[1], "mtp.0", 0)]
+        {
+            assert_eq!(
+                owned.group().logical_name(),
+                format!("model.layers.{layer}.mlp.router")
+            );
+            let (group, global_unit) = match owned.owner() {
+                ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
+                    (group.as_str(), *global_unit)
+                }
+                owner => panic!("unexpected V3 router owner {owner:?}"),
+            };
+            assert_eq!((group, global_unit), (expected_group, expected_unit));
+            assert_eq!(
+                owned
+                    .group()
+                    .members()
+                    .iter()
+                    .map(ParameterMemberSpec::target)
+                    .collect::<Vec<_>>(),
+                [
+                    format!("model.layers.{layer}.mlp.gate.weight"),
+                    format!("model.layers.{layer}.mlp.gate.e_score_correction_bias"),
+                ]
+            );
+        }
     }
 
     #[test]
