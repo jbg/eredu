@@ -395,6 +395,12 @@ pub(crate) struct PackedWeightCompanions {
     affine_companion_dtype: RecipeDtype,
 }
 
+impl PackedWeightCompanions {
+    pub(crate) fn companion_names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.scales_name.as_str()).chain(self.biases_name.as_deref())
+    }
+}
+
 pub(crate) fn packed_weight_companions<M>(
     module: &M,
     quantization: WeightQuantization,

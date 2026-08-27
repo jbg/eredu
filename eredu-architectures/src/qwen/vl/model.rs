@@ -269,12 +269,12 @@ impl eredu_runtime::ArchitectureBoundary for PipelineBoundarySchema {
         let mut specs = vec![
             eredu_runtime::BoundaryTensorSpec::new(
                 "cosine",
-                [Dim::Fixed(1), Dim::Sequence, Dim::Fixed(self.head_dim)],
+                [Dim::Sequence, Dim::Fixed(self.head_dim)],
                 Dtype::Activation,
             ),
             eredu_runtime::BoundaryTensorSpec::new(
                 "sine",
-                [Dim::Fixed(1), Dim::Sequence, Dim::Fixed(self.head_dim)],
+                [Dim::Sequence, Dim::Fixed(self.head_dim)],
                 Dtype::Activation,
             ),
             eredu_runtime::BoundaryTensorSpec::new("position_delta", [Dim::Fixed(1)], Dtype::Int32),
@@ -460,14 +460,19 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         if state.layout() != expected {
             return Err(Error::backend("Qwen3-VL partition state layout mismatch"));
         }
-        let (offset, persisted_delta) = {
-            let layer = state.layer(first_state_ordinal).map_err(Error::backend)?;
-            let offset = layer.position();
-            let delta = layer
+        let offset = state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .position();
+        let persisted_delta = if matches!(&input, LayeredPartitionInput::Tokens(_)) {
+            state
+                .layer(first_state_ordinal)
+                .map_err(Error::backend)?
                 .fixed_component(StateTensorRole::PositionDelta)
                 .map_err(Error::backend)?
-                .clone();
-            (offset, delta)
+                .clone()
+        } else {
+            None
         };
         let (input, batch, sequence) = match input {
             LayeredPartitionInput::Tokens(tokens) => (
@@ -494,11 +499,13 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         };
         let (forward, position_delta) = self
             .begin_routed_text_partition(input, mask, batch, sequence, offset, parallel, context)?;
-        *state
-            .layer(first_state_ordinal)
-            .map_err(Error::backend)?
-            .fixed_component(StateTensorRole::PositionDelta)
-            .map_err(Error::backend)? = Some(position_delta);
+        if first_state_ordinal == 0 {
+            *state
+                .layer(first_state_ordinal)
+                .map_err(Error::backend)?
+                .fixed_component(StateTensorRole::PositionDelta)
+                .map_err(Error::backend)? = Some(position_delta);
+        }
         Ok(forward)
     }
 
@@ -2184,7 +2191,7 @@ mod boundary_tests {
         let tensors = schema.wire_schema().unwrap().resolve(2, 5).unwrap();
         assert_eq!(tensors.primary().shape(), [2, 5, 32]);
         assert_eq!(tensors.auxiliary().len(), 5);
-        assert_eq!(tensors.auxiliary()[0].shape(), [1, 5, 8]);
+        assert_eq!(tensors.auxiliary()[0].shape(), [5, 8]);
         assert_eq!(tensors.auxiliary()[2].dtype(), BoundaryTensorDtype::Int32);
         assert_eq!(tensors.auxiliary()[3].role(), "deepstack.0");
         assert_eq!(tensors.auxiliary()[3].shape(), [2, 5, 32]);

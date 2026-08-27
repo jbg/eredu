@@ -27,6 +27,11 @@ pub struct TokenValidationBatch {
 }
 
 impl TokenValidationBatch {
+    /// Whether the submission registered no token-domain assertions.
+    pub fn is_empty(&self) -> bool {
+        self.validations.is_empty()
+    }
+
     /// Device reductions that must be included in the submission event.
     pub fn arrays(&self) -> impl Iterator<Item = &Array> {
         self.validations

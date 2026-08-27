@@ -251,12 +251,11 @@ impl PlacedExecutionDag {
                 )));
             }
             let static_tensors = static_owners(
-                &id,
                 first,
                 last,
                 request.first_owner_static_roles,
                 request.last_owner_static_roles,
-            )?;
+            );
             groups.push(ExecutionGroupPlacement {
                 id,
                 kind: request.kind,
@@ -287,6 +286,17 @@ impl PlacedExecutionDag {
                     pp_path: vec![from, to],
                 });
             }
+            if let Some(last) = group.owners.last().map(|owner| owner.pp_rank) {
+                if last != group.merge_destination {
+                    routes.push(PlacementRoute {
+                        from_group: group.id.clone(),
+                        to_group: group.id.clone(),
+                        from_pp_rank: last,
+                        to_pp_rank: group.merge_destination,
+                        pp_path: vec![last, group.merge_destination],
+                    });
+                }
+            }
         }
         for consumer in &groups {
             let to = consumer.first_owner().unwrap_or(consumer.merge_destination);
@@ -314,6 +324,47 @@ impl PlacedExecutionDag {
             unit_layout,
             pp_rank_count,
         })
+    }
+
+    /// Replaces one balanced group placement with architecture-planned,
+    /// dependency-safe unit ranges while preserving its PP rank path.
+    pub fn with_group_unit_ranges(
+        mut self,
+        group_id: &str,
+        ranges: Vec<Range<usize>>,
+    ) -> Result<Self, Error> {
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .ok_or_else(|| Error::Parallel(format!("unknown execution group {group_id:?}")))?;
+        if ranges.len() != group.owners.len() {
+            return Err(Error::Parallel(format!(
+                "execution group {group_id:?} planned {} unit ranges for {} PP owners",
+                ranges.len(),
+                group.owners.len()
+            )));
+        }
+        let mut frontier = group.global_unit_range.start;
+        for range in &ranges {
+            if range.start != frontier || range.is_empty() {
+                return Err(Error::Parallel(format!(
+                    "execution group {group_id:?} has non-contiguous unit range {range:?} after {frontier}"
+                )));
+            }
+            frontier = range.end;
+        }
+        if frontier != group.global_unit_range.end {
+            return Err(Error::Parallel(format!(
+                "execution group {group_id:?} unit ranges end at {frontier}, expected {}",
+                group.global_unit_range.end
+            )));
+        }
+        for (owner, range) in group.owners.iter_mut().zip(ranges) {
+            owner.global_units = range;
+        }
+        validate_segment_graph(&self.groups, &self.routes)?;
+        Ok(self)
     }
 
     /// Returns groups in architecture order.
@@ -530,26 +581,21 @@ fn balanced_ranges(unit_count: usize, ranks: &[usize]) -> Vec<PlacedUnitRange> {
 }
 
 fn static_owners(
-    id: &str,
     first: usize,
     last: usize,
     first_roles: Vec<String>,
     last_roles: Vec<String>,
-) -> Result<Vec<StaticTensorOwnership>, Error> {
-    let mut roles = BTreeMap::<String, usize>::new();
+) -> Vec<StaticTensorOwnership> {
+    let mut roles = BTreeSet::<(String, usize)>::new();
     for (owner, declared) in [(first, first_roles), (last, last_roles)] {
         for role in declared {
-            if let Some(previous) = roles.insert(role.clone(), owner) {
-                return Err(Error::Parallel(format!(
-                    "execution group {id:?} ambiguously assigns static role {role:?} to PP ranks {previous} and {owner}"
-                )));
-            }
+            roles.insert((role, owner));
         }
     }
-    Ok(roles
+    roles
         .into_iter()
         .map(|(role, pp_rank)| StaticTensorOwnership { role, pp_rank })
-        .collect())
+        .collect()
 }
 
 /// Validate physical `(group, rank)` nodes. Ranks are not collapsed because a
@@ -585,6 +631,12 @@ fn validate_segment_graph(
         }
     }
     for route in routes {
+        // Same-group routes are the already-validated owner chain plus an
+        // optional terminal return to a distinct merge owner. The latter is
+        // an ordered transport after group execution, not a dependency edge.
+        if route.from_group == route.to_group {
+            continue;
+        }
         add_edge(
             &nodes,
             &mut edges,
@@ -1183,6 +1235,88 @@ mod tests {
         assert!(graph.routes().iter().any(|route| {
             route.from_group == "projector" && route.to_group == "text" && route.pp_path == [3, 1]
         }));
+    }
+
+    #[test]
+    fn installs_architecture_planned_dependency_safe_unit_ranges() {
+        let graph = PlacedExecutionDag::plan(
+            2,
+            vec![request(
+                "text",
+                &[],
+                ExecutionGroupKind::Decoder,
+                4,
+                &[0, 1],
+            )],
+            "text",
+        )
+        .unwrap()
+        .with_group_unit_ranges("text", vec![0..1, 1..4])
+        .unwrap();
+        assert_eq!(
+            graph.group("text").unwrap().owners,
+            vec![
+                PlacedUnitRange {
+                    pp_rank: 0,
+                    global_units: 0..1,
+                },
+                PlacedUnitRange {
+                    pp_rank: 1,
+                    global_units: 1..4,
+                },
+            ]
+        );
+
+        assert!(graph
+            .clone()
+            .with_group_unit_ranges("text", vec![0..2, 3..4])
+            .is_err());
+        assert!(graph
+            .with_group_unit_ranges("text", vec![0..1, 1..3])
+            .is_err());
+    }
+
+    #[test]
+    fn routes_terminal_group_output_to_its_merge_owner() {
+        let mut text = request("text", &[], ExecutionGroupKind::Decoder, 2, &[1]);
+        text.merge_destination = Some(0);
+        text.first_owner_static_roles = vec!["embedding".into()];
+        text.last_owner_static_roles = vec!["embedding".into(), "output".into()];
+        let graph = PlacedExecutionDag::plan(2, vec![text], "text").unwrap();
+
+        assert_eq!(
+            graph.routes(),
+            [PlacementRoute {
+                from_group: "text".into(),
+                to_group: "text".into(),
+                from_pp_rank: 1,
+                to_pp_rank: 0,
+                pp_path: vec![1, 0],
+            }]
+        );
+        let merge = realize_partition(
+            &graph,
+            0,
+            None,
+            (),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
+            std::iter::empty(),
+        )
+        .unwrap();
+        assert!(merge.ownership().owns_output());
+        assert_eq!(
+            graph.group("text").unwrap().static_tensors,
+            [
+                StaticTensorOwnership {
+                    role: "embedding".into(),
+                    pp_rank: 1,
+                },
+                StaticTensorOwnership {
+                    role: "output".into(),
+                    pp_rank: 1,
+                },
+            ]
+        );
     }
 
     #[test]

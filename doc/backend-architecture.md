@@ -318,6 +318,13 @@ redeclare family-specific stacking, concatenation, reshaping, normalization,
 or recurrent-weight transformations. This includes format-dependent recipes
 such as fused projection assembly and recurrent transition conversion; backend
 composition may inspect recipe outputs but does not construct their equations.
+Checkpoint binding is always described against the global architecture. A
+rank-local tensor- or pipeline-parallel architecture describes executable
+geometry only and must not become a smaller checkpoint schema. Load-time
+quantization therefore constructs distinct global source and target parameter
+descriptions, validates each side of the transform against the corresponding
+description, and only then filters target bindings through realized stage
+ownership.
 Architecture-owned SafeTensors conversion plans likewise enumerate every exact
 dense source, packed-weight output, scale companion, optional affine-bias
 companion, and the complete output model configuration. Concrete backends
@@ -384,6 +391,11 @@ push those selections through their derived recipes. Backend composition only
 matches the resulting recipes to exact logical targets before applying generic
 tensor-parallel placement; it does not choose an expert axis or reconstruct
 selection geometry from the physical checkpoint layout.
+Cached and resident expert banks use that same tensor-parallel layout as their
+ordinary routed execution path. Generic backend transforms preserve every
+leading bank dimension while sharding only the architecture-declared projection
+axis, and their returned partial or reduced output follows the same neutral
+tensor-parallel contract as a directly resident bank.
 Hybrid target/MTP families additionally declare the execution group, physical
 MTP unit, checkpoint root, and cache identity of every sparse unit in this
 catalog; backend adapters filter catalog units against the realized partition
@@ -599,6 +611,12 @@ metadata. When separately materialized prediction state follows target state,
 the architecture's rank-local geometry publishes its `PartitionState`, including
 the architecture-global offset; a backend does not recover that offset from a
 family layer-count field.
+Each pipeline descriptor covers exactly the state executed and owned by that
+stage. Required fixed components are persisted only on their architecture-owned
+global layer, even when their current value also travels in an auxiliary
+boundary for downstream execution. Prediction segments appear only on the
+partition that owns them; topology coordinates and family-wide layer counts do
+not synthesize additional cache coverage.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
@@ -1082,6 +1100,12 @@ architecture planning and concrete backend realization.
 concrete neutral architecture. Backend placement code supplies rank-local
 ranges and ownership, but cannot substitute a caller-built topology that only
 resembles the architecture it will execute.
+Balanced unit ranges are only a placement default. When an architecture
+declares dependency-safe pipeline ranges—for example, to keep a shared-state
+publisher and consumer together—composition installs those exact contiguous
+ranges on the canonical group. A group's terminal owner also routes its result
+to a distinct architecture-declared merge destination before dependent groups
+or final output ownership are evaluated.
 
 `LayeredPartitionDriver` executes that canonical partition contract. It
 validates backend unit storage and mutable-state ranges, enforces ownership,
@@ -1124,6 +1148,11 @@ concrete backend must reject inactive dependency routes with tensors and active
 routes whose exact cardinality, ordered shapes, or physical dtypes differ from
 the resolved architecture boundary; backend-local string or optional-field
 schemas are not an alternate wire contract.
+Point-to-point boundary arrays are exact-completion values. A backend must
+complete each ordered receive before consuming or reusing its destination and
+complete each ordered send before submitting another boundary array that could
+alias the same lazy storage. Retaining a submitted handle without exact
+completion is not sufficient ordering for a multi-array boundary.
 
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and

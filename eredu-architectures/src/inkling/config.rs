@@ -312,6 +312,12 @@ impl TextArgs {
     }
     /// Returns one weight's normalized physical format.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
+        // Short-convolution kernels are rank-3 convolution parameters, not
+        // matrix projections. The model-wide load-time linear quantization
+        // policy must not change their representation.
+        if name.ends_with("_sconv.weight") || name.ends_with(".moe.router.weight") {
+            return LinearFormat::Dense;
+        }
         self.quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(name))
@@ -1308,6 +1314,32 @@ mod tests {
             .quantized_weight_configs =
             Some(HashMap::from([("vision.proj.weight".into(), format)]));
         assert_ne!(dense, vision_quantized.architecture_fingerprint());
+    }
+
+    #[test]
+    fn text_quantization_keeps_short_convolutions_dense() {
+        let mut args = ModelArgs::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        args.text_config.weight_quantization = Some(
+            eredu_checkpoint::AffineQuantization::new(32, 4)
+                .unwrap()
+                .into(),
+        );
+
+        assert_eq!(
+            args.text_config
+                .linear_format_for("model.layers.0.attn_sconv.weight"),
+            LinearFormat::Dense
+        );
+        assert_eq!(
+            args.text_config
+                .linear_format_for("model.layers.1.moe.router.weight"),
+            LinearFormat::Dense
+        );
+        assert_ne!(
+            args.text_config
+                .linear_format_for("model.layers.0.dense.down_proj.weight"),
+            LinearFormat::Dense
+        );
     }
 
     #[test]

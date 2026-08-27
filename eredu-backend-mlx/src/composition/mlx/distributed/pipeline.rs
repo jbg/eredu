@@ -90,8 +90,9 @@ use crate::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
     },
     backend::runtime::residency::expert_provider::{
-        GatedProductExpertExecution, GatedProductExpertExecutorProvider, Relu2ExpertExecution,
-        Relu2ExpertExecutorProvider, ResidentExpertExecutorProvider,
+        GatedProductExpertExecution, GatedProductExpertExecutionMode,
+        GatedProductExpertExecutorProvider, Relu2ExpertExecution, Relu2ExpertExecutorProvider,
+        ResidentExpertExecutorProvider,
     },
     backend::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
@@ -188,7 +189,7 @@ trait PipelineArchitectureBindings {
         architecture: &Self::Architecture,
         group: usize,
         index: usize,
-        stream: &Stream,
+        _stream: &Stream,
     ) -> Result<Self::Layer, Error>;
     fn layer_bindings(
         &self,
@@ -436,6 +437,11 @@ fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error> {
     let static_roles = selection.static_roles().to_vec();
     let static_companions = target.static_quantization_companions(quantization)?;
+    let static_companion_targets = static_companions
+        .values()
+        .flat_map(PackedWeightCompanions::companion_names)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     quantize_pipeline_stage_store_with(
         store,
         selection,
@@ -444,10 +450,11 @@ fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
         source.model_type(),
         static_companions,
         |store| {
-            select_static_binding_units_by_owner(
+            select_static_binding_units_by_owner_excluding_targets(
                 binding_authority,
                 source.static_units(store, &static_roles)?,
                 &static_roles,
+                &static_companion_targets,
             )
         },
         |binding| target.quantizes_static_binding(binding),
@@ -683,13 +690,6 @@ impl InklingPipelinePartition {
         self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::VisionEncoder)
     }
 
-    fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        self.partition
-            .state()
-            .map(|state| state.layout().clone())
-            .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))
-    }
-
     fn build_unit(
         &self,
         group: usize,
@@ -747,7 +747,14 @@ impl InklingPipelinePartition {
             vision_patches: prepared.images.as_ref(),
             audio,
         };
-        let mut state = MlxHybridState::device(self.state_layout()?)?;
+        // Media ingress executes through the complete rank-local architecture,
+        // before decoder pipeline ownership is applied. Its transient state
+        // must therefore match the architecture geometry rather than the
+        // decoder slice persisted by this stage.
+        let ingress_layout =
+            eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let mut state = MlxHybridState::device(ingress_layout)?;
         let forward = match execution.and_then(ParallelExecutionContext::group) {
             Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
                 MlxNeuralBackend,
@@ -1192,10 +1199,6 @@ struct PendingPipelineStageCompletion {
 }
 
 impl PendingPipelineStageCompletion {
-    fn retain(&mut self, array: Array) {
-        self.retained.push(array);
-    }
-
     fn submit(
         self,
         token_validations: TokenValidationBatch,
@@ -3704,19 +3707,16 @@ struct PipelineLayerExecution<'a, L> {
     stream: &'a Stream,
 }
 
-/// Executes a local range while lending one architecture owner to both unit
-/// construction and forward calls. This is the pipeline counterpart of the
-/// runtime's statically dispatched layered traversal and avoids parallel
-/// family implementations capturing separate shadow models in two closures.
-fn execute_pipeline_layer_range_with<C, L, N, F, O>(
+/// Executes a local range while lending one architecture owner to each
+/// forward call. This is the pipeline counterpart of the runtime's statically
+/// dispatched layered traversal.
+fn execute_pipeline_layer_range_with<C, L, F, O>(
     execution: PipelineLayerExecution<'_, L>,
     owner: &mut C,
-    mut new_layer: N,
     mut forward_layer: F,
 ) -> Result<Array, Error>
 where
-    L: ModuleParameters,
-    N: FnMut(&C, usize, &Stream) -> Result<L, Error>,
+    L: ModuleParameters + Clone,
     F: FnMut(&mut C, usize, &mut L, &Array, &mut PipelineLayerCache, &Stream) -> Result<O, Error>,
     O: IntoPipelineLayerForward,
 {
@@ -3729,9 +3729,7 @@ where
         mut hidden,
         stream,
     } = execution;
-    if caches.len() != range.len()
-        || (dense_layers.is_none() && resident_layers.len() != range.len())
-    {
+    if caches.len() != range.len() || resident_layers.len() != range.len() {
         return Err(Error::Parallel(format!(
             "pipeline local execution range {:?} has {} cache entries and {} resident layers",
             range,
@@ -3768,7 +3766,7 @@ where
                 transfer.index(),
                 local_index + dense_layers.unwrap().execution_offset
             );
-            let mut layer = new_layer(owner, global_layer, stream)?;
+            let mut layer = resident_layers[local_index].clone();
             let excluded = &dense_layers.unwrap().excluded_parameter_targets
                 [local_index + dense_layers.unwrap().execution_offset];
             if !excluded.is_empty() {
@@ -3792,7 +3790,7 @@ where
             window.refill()?;
         } else if let Some(dense) = dense_layers {
             let lease = dense.prepare_layerwise(local_index)?;
-            let mut layer = new_layer(owner, global_layer, stream)?;
+            let mut layer = resident_layers[local_index].clone();
             let excluded = &dense.excluded_parameter_targets[local_index + dense.execution_offset];
             if !excluded.is_empty() {
                 crate::backend::runtime::checkpoint::binding::populate_module_from_lease_excluding(
@@ -3857,7 +3855,7 @@ fn execute_neutral_partition_group<A, U, F>(
     observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<Array, Error>
 where
-    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     F: 'static,
     for<'state> A: eredu_runtime::LayeredArchitecture<
             MlxNeuralBackend,
@@ -3895,14 +3893,6 @@ where
             stream,
         },
         &mut owner,
-        |owner, global_layer, stream| {
-            <A as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::build_unit(owner.architecture, owner.group_index, global_layer, stream)
-            .map(MlxModule::new)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        },
         |owner, global_layer, layer, hidden, cache, stream| {
             let path =
                 <A as eredu_runtime::LayeredArchitecture<
@@ -3996,23 +3986,54 @@ fn execute_resident_distributed_experts(
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<TensorParallelExpertOutput<Array>, Exception> {
-    if partitions > 1 {
+    if hidden.ndim() < 2 || expert_ids.ndim() < 2 || weights.shape() != expert_ids.shape() {
+        return Err(Exception::custom(
+            "distributed expert routing requires hidden [..., hidden] and matching [..., top_k] routes",
+        ));
+    }
+    let hidden_shape = hidden.shape().to_vec();
+    let hidden_width = hidden.dim(-1);
+    let top_k = expert_ids.dim(-1);
+    let hidden = hidden.reshape(&[-1, hidden_width], stream)?;
+    let expert_ids = expert_ids.reshape(&[-1, top_k], stream)?;
+    let weights = weights.reshape(&[-1, top_k], stream)?;
+    let mut output = if partitions > 1 {
         let returned = dispatch_replicated_tensor_parallel(
-            hidden, expert_ids, weights, assignment, bank, group, partitions, stream,
+            &hidden,
+            &expert_ids,
+            &weights,
+            assignment,
+            bank,
+            group,
+            partitions,
+            stream,
         )
         .map_err(|error| Exception::custom(error.to_string()))?;
         statistics.accumulate(&returned.statistics);
-        Ok(returned.output)
+        returned.output
     } else {
-        let returned =
-            dispatch_replicated(hidden, expert_ids, weights, assignment, bank, group, stream)
-                .map_err(|error| Exception::custom(error.to_string()))?;
+        let returned = dispatch_replicated(
+            &hidden,
+            &expert_ids,
+            &weights,
+            assignment,
+            bank,
+            group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
         statistics.accumulate(&returned.statistics);
-        Ok(TensorParallelExpertOutput {
+        TensorParallelExpertOutput {
             reducible: returned.reduced_output,
             post_reduce: None,
-        })
-    }
+        }
+    };
+    output.reducible = output.reducible.reshape(&hidden_shape, stream)?;
+    output.post_reduce = output
+        .post_reduce
+        .map(|value| value.reshape(&hidden_shape, stream))
+        .transpose()?;
+    Ok(output)
 }
 
 /// Provider-aware form of the canonical neutral group executor.
@@ -4034,7 +4055,7 @@ fn execute_neutral_routed_partition_group<A, U, F, P>(
     observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<Array, Error>
 where
-    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     F: 'static,
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
@@ -4081,14 +4102,6 @@ where
             stream,
         },
         &mut owner,
-        |owner, global_layer, stream| {
-            <A as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                PipelineRangeState<'_>,
-            >>::build_unit(owner.architecture, owner.group_index, global_layer, stream)
-            .map(MlxModule::new)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        },
         |owner, global_layer, layer, hidden, cache, stream| {
             let path =
                 <A as eredu_runtime::LayeredArchitecture<
@@ -4473,7 +4486,7 @@ fn execute_neutral_routed_output_group<'input, A, U, P>(
     stream: &Stream,
 ) -> Result<(crate::MlxTensor, crate::MlxTensor), Error>
 where
-    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
     A: eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState, Unit = U>
@@ -4668,7 +4681,7 @@ fn execute_layered_partition_observed<A, U, F, G, Boundary>(
     observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
-    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     F: 'static,
     for<'state> A: eredu_runtime::PartitionedLayeredArchitecture<
         MlxNeuralBackend,
@@ -4803,7 +4816,7 @@ fn execute_routed_layered_partition_observed<A, U, F, G, Boundary, P>(
     observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
-    U: eredu_nn::Parameterized<crate::MlxTensor>,
+    U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     F: 'static,
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
@@ -4947,7 +4960,7 @@ where
     C: eredu_architectures::decoder::Config,
     P: eredu_architectures::decoder::BlockFactory<MlxNeuralBackend, C>,
     eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, P::FeedForward>:
-        eredu_nn::Parameterized<crate::MlxTensor>,
+        eredu_nn::Parameterized<crate::MlxTensor> + Clone,
 {
     let storage_range = stage.range();
     execute_layered_partition_observed(
@@ -4992,7 +5005,7 @@ where
     BF: eredu_architectures::decoder::BlockFactory<MlxNeuralBackend, C>,
     BF::FeedForward: eredu_architectures::decoder::RoutedFeedForwardOperator<MlxNeuralBackend>,
     eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, BF::FeedForward>:
-        eredu_nn::Parameterized<crate::MlxTensor>,
+        eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
@@ -5120,12 +5133,11 @@ fn qwen_hybrid_pipeline_prompt_cache_identity(
     args: &eredu_architectures::qwen::hybrid::HybridConfig,
     topology: MlxParallelContext,
     range: Range<usize>,
-    ownership: &eredu_runtime::PartitionOwnership,
+    _ownership: &eredu_runtime::PartitionOwnership,
     complete: &eredu_runtime::StateLayout,
 ) -> Result<PromptCacheModelIdentity, Error> {
-    let state_end = partition_state_end(ownership, range.end, complete.len());
     let layout = complete
-        .slice(range.start..state_end)
+        .slice(range.clone())
         .map_err(|error| Error::Parallel(error.to_string()))?;
     eredu_architectures::qwen::hybrid::state_identity(
         args,
@@ -5178,9 +5190,9 @@ fn qwen_hybrid_pipeline_cache_identity_preserves_prediction_frontiers() {
     .unwrap();
 
     assert_eq!(identity.layer_count, 4);
-    assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..4);
-    assert_eq!(identity.layer_prefix_offsets, [0, -1, -1]);
-    assert_eq!(identity.layer_layout.len(), 3);
+    assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..2);
+    assert_eq!(identity.layer_prefix_offsets, [0]);
+    assert_eq!(identity.layer_layout.len(), 1);
 
     let interior = qwen_hybrid_pipeline_prompt_cache_identity(
         &parsed.text,
@@ -6269,9 +6281,7 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = self
-            .architecture
-            .state_layout()
+        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let caches = (0..self.mtp_layers.len())
             .map(|depth| {
@@ -7012,7 +7022,11 @@ impl PipelineForward for QwenPipelinePartition {
                 input, step, mask, cache, execution, group, stream, observer,
             );
         }
-        if self.expert_assignment.is_some() {
+        if self
+            .expert_assignment
+            .as_ref()
+            .is_some_and(|assignment| assignment.group_size() > 1)
+        {
             return Err(Error::Parallel(
                 "Qwen expert assignment requires its EP communicator".into(),
             ));
@@ -7440,11 +7454,13 @@ impl PipelinePlacedIngress for InklingPipelinePartition {
     }
 
     fn placed_ingress_active(&self, _group: &str) -> Result<bool, Error> {
-        let state = self
-            .ingress_state
+        // Inkling's media group is also the pass-through producer for already
+        // projected image embeddings and text-only requests. Keep the placed
+        // route active even when there are no raw vision units to execute.
+        self.ingress_state
             .as_ref()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state is unavailable".into()))?;
-        Ok(self.ingress_active(state))
+        Ok(true)
     }
 
     fn placed_ingress_arrays(&self, _group: &str) -> Result<Vec<Array>, Error> {
@@ -8009,9 +8025,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self
-            .architecture
-            .state_layout()
+        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range().clone();
         let local = layout
@@ -8641,9 +8655,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self
-            .architecture
-            .state_layout()
+        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         qwen_hybrid_pipeline_prompt_cache_identity(
             &self.args().text,
@@ -8838,9 +8850,7 @@ impl PipelineEmbeddedMtp for QwenConditionalPipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = self
-            .architecture
-            .state_layout()
+        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
@@ -8994,9 +9004,7 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = self
-            .architecture
-            .state_layout()
+        let complete = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -9067,7 +9075,11 @@ impl PipelineForward for GptOssPipelinePartition {
                 input, step, mask, cache, execution, group, stream, observer,
             );
         }
-        if self.expert_assignment.is_some() {
+        if self
+            .expert_assignment
+            .as_ref()
+            .is_some_and(|assignment| assignment.group_size() > 1)
+        {
             return Err(Error::Parallel(
                 "GPT-OSS expert assignment requires its EP communicator".into(),
             ));
@@ -9163,9 +9175,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = self
-            .architecture
-            .state_layout()
+        let complete = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -9193,18 +9203,22 @@ impl PipelineForward for Lfm2PipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        if !self.expert_storage.is_external() && self.expert_assignment.is_none() {
-            execute_neutral_lfm2_partition_observed(
-                self, input, step, mask, cache, None, stream, None,
-            )
-        } else if self.expert_storage.is_external() {
+        if self.expert_storage.cache().is_some() {
             self.forward_external_experts_neutral(
                 input, step, mask, cache, None, None, stream, None,
             )
-        } else {
+        } else if self
+            .expert_assignment
+            .as_ref()
+            .is_some_and(|assignment| assignment.group_size() > 1)
+        {
             Err(Error::Parallel(
                 "resident LFM2 expert parallelism requires its EP communicator".into(),
             ))
+        } else {
+            execute_neutral_lfm2_partition_observed(
+                self, input, step, mask, cache, None, stream, None,
+            )
         }
     }
 
@@ -9236,7 +9250,11 @@ impl PipelineForward for Lfm2PipelinePartition {
                 input, step, mask, cache, execution, group, stream, observer,
             );
         }
-        if self.expert_assignment.is_some() {
+        if self
+            .expert_assignment
+            .as_ref()
+            .is_some_and(|assignment| assignment.group_size() > 1)
+        {
             return Err(Error::Parallel(
                 "LFM2 expert assignment requires its EP communicator".into(),
             ));
@@ -9283,7 +9301,7 @@ impl PipelineForward for Lfm2PipelinePartition {
                     )
                 }
             }
-            _ if self.expert_storage.is_external() => self.forward_external_experts_neutral(
+            _ if self.expert_storage.cache().is_some() => self.forward_external_experts_neutral(
                 input, step, mask, cache, None, None, stream, observer,
             ),
             _ => execute_neutral_lfm2_partition_observed(
@@ -9575,9 +9593,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = self
-            .architecture
-            .state_layout()
+        let complete = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let range = self.range();
         let layout = complete
@@ -9658,7 +9674,11 @@ impl PipelineForward for KimiLinearPipelinePartition {
                 input, step, mask, cache, execution, group, stream, observer,
             );
         }
-        if self.expert_assignment.is_some() {
+        if self
+            .expert_assignment
+            .as_ref()
+            .is_some_and(|assignment| assignment.group_size() > 1)
+        {
             return Err(Error::Parallel(
                 "Kimi expert assignment requires its EP communicator".into(),
             ));
@@ -10331,7 +10351,13 @@ impl PipelineModel {
             &mut cache.mtp,
             self.stage
                 .embedded_mtp()
-                .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
+                .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment)
+                .filter(|segment| {
+                    identity
+                        .state_segments
+                        .iter()
+                        .any(|owned| owned.id() == *segment)
+                }),
         ) {
             let prediction = identity
                 .state_segment(segment)
@@ -10459,7 +10485,13 @@ impl PipelineModel {
                 &mut cache.mtp,
                 self.stage
                     .embedded_mtp()
-                    .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
+                    .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment)
+                    .filter(|segment| {
+                        identity
+                            .state_segments
+                            .iter()
+                            .any(|owned| owned.id() == *segment)
+                    }),
             ) {
                 let prediction = identity
                     .state_segment(segment)
@@ -10540,7 +10572,7 @@ impl PipelineModel {
             .transpose()?;
         let stream = execution.stream();
         let token_validation_scope = TokenValidationScope::begin()?;
-        let mut output = self.forward_pipeline_on_group(
+        let output = self.forward_pipeline_on_group(
             tokens.map(PipelineIngress::Tokens),
             step,
             mask,
@@ -10558,15 +10590,6 @@ impl PipelineModel {
             stream,
             observer,
         )?;
-        // A proper PP subgroup needs an explicit lane boundary before a later
-        // world collective. When PP is the complete world, inserting a
-        // collective into the same ordered Ring channel as point-to-point
-        // traffic can overtake a peer receive and deadlock; the world channel
-        // already provides the required ordering.
-        if self.topology.pipeline_parallel_size < self.topology.world_size {
-            let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
-            output.retain(barrier);
-        }
         output.submit(token_validation_scope.finish())
     }
 
@@ -10630,7 +10653,7 @@ impl PipelineModel {
             .transpose()?;
         let stream = execution.stream();
         let token_validation_scope = TokenValidationScope::begin()?;
-        let mut output = self.forward_pipeline_on_group(
+        let output = self.forward_pipeline_on_group(
             input.map(PipelineIngress::ModelInput),
             step,
             mask,
@@ -10648,10 +10671,6 @@ impl PipelineModel {
             stream,
             observer,
         )?;
-        if self.topology.pipeline_parallel_size < self.topology.world_size {
-            let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
-            output.retain(barrier);
-        }
         output.submit(token_validation_scope.finish())
     }
 
@@ -11096,6 +11115,57 @@ impl PipelineModel {
 
             for &index in &batch {
                 let placed = &placement.groups()[index];
+                let Some(last_owner) = placed.owners.last().map(|owner| owner.pp_rank) else {
+                    continue;
+                };
+                if !active[index] || last_owner == placed.merge_destination {
+                    continue;
+                }
+                let (route_tag, route) = placement
+                    .routes()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, route)| {
+                        route.from_group == placed.id
+                            && route.to_group == placed.id
+                            && route.from_pp_rank == last_owner
+                            && route.to_pp_rank == placed.merge_destination
+                    })
+                    .ok_or_else(|| {
+                        Error::Parallel(format!(
+                            "placed group {:?} is missing its terminal merge route {} -> {}",
+                            placed.id, last_owner, placed.merge_destination
+                        ))
+                    })?;
+                if self.info.pipeline_stage == route.from_pp_rank {
+                    let arrays = working.get(&index).ok_or_else(|| {
+                        Error::Parallel(format!(
+                            "placed group {:?} produced no terminal payload",
+                            placed.id
+                        ))
+                    })?;
+                    let completion = DistributedCompletion::submit((), arrays.iter())?;
+                    completion.wait_on(stream)?;
+                    retained.extend(send_array_bundle(
+                        arrays,
+                        route_tag,
+                        route.to_pp_rank,
+                        group,
+                        stream,
+                    )?);
+                } else if self.info.pipeline_stage == route.to_pp_rank {
+                    let arrays = recv_array_bundle(route.from_pp_rank, route_tag, group, stream)?;
+                    self.stage
+                        .replace_placed_ingress_arrays(&placed.id, arrays.clone())?;
+                    working.insert(index, arrays);
+                }
+                if !schedule.routed_transfers.contains(route) {
+                    schedule.routed_transfers.push(route.clone());
+                }
+            }
+
+            for &index in &batch {
+                let placed = &placement.groups()[index];
                 let outgoing = placement
                     .routes()
                     .iter()
@@ -11353,6 +11423,7 @@ impl PipelineModel {
                     self.info.activation_dtype()
                 ))
             })?;
+            synchronize_outputs([&received])?;
             let received_auxiliary = resolved_boundary
                 .auxiliary()
                 .iter()
@@ -11365,6 +11436,7 @@ impl PipelineModel {
                                 self.info.pipeline_stage, spec.shape(), dtype
                             ))
                         })?;
+                    synchronize_outputs([&value])?;
                     Ok(value)
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -11543,6 +11615,7 @@ impl PipelineModel {
                         hidden.dtype()
                     ))
                 })?;
+                synchronize_outputs([&sent])?;
                 retained.push(sent);
                 for auxiliary in payload.auxiliary.tensors() {
                     let sent =
@@ -11552,8 +11625,9 @@ impl PipelineModel {
                             self.info.pipeline_stage,
                             auxiliary.shape(),
                             auxiliary.dtype()
-                        ))
+                            ))
                         })?;
+                    synchronize_outputs([&sent])?;
                     retained.push(sent);
                 }
                 Ok(PendingPipelineStageCompletion {
@@ -11582,22 +11656,6 @@ impl PipelineModel {
 
 #[cfg(test)]
 impl PipelineModel {
-    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
-        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
-    }
-
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.prompt_cache_model_identity()?.layer_layout)
-    }
-
-    pub fn prompt_cache_state_segments(
-        &self,
-    ) -> Result<Vec<eredu_core::cache::PromptCacheStateSegment>, Error> {
-        Ok(self.prompt_cache_model_identity()?.state_segments)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn sample_and_synchronize<S: crate::backend::runtime::generation::sampler::Sampler>(
         &self,
@@ -13271,10 +13329,25 @@ fn select_static_binding_units_by_owner(
     units: Vec<StaticUnitBindings>,
     roles: &[&str],
 ) -> Result<Vec<StaticUnitBindings>, Error> {
+    select_static_binding_units_by_owner_excluding_targets(
+        authority,
+        units,
+        roles,
+        &BTreeSet::new(),
+    )
+}
+
+fn select_static_binding_units_by_owner_excluding_targets(
+    authority: &[eredu_runtime::OwnedParameterGroupSpec],
+    units: Vec<StaticUnitBindings>,
+    roles: &[&str],
+    excluded_targets: &BTreeSet<String>,
+) -> Result<Vec<StaticUnitBindings>, Error> {
     let mut selected = Vec::with_capacity(roles.len());
     for role in roles {
         let owner = eredu_runtime::ParameterGroupOwner::static_role(*role);
-        let (expected, _) = owner_parameter_targets(authority, &owner, &[])?;
+        let (mut expected, _) = owner_parameter_targets(authority, &owner, &[])?;
+        expected.retain(|target| !excluded_targets.contains(target));
         let mut matches = units.iter().filter(|unit| {
             unit.bindings()
                 .iter()
@@ -13304,7 +13377,17 @@ fn select_static_binding_units_by_owner(
                 "pipeline architecture adapter declared duplicate bindings for static owner {owner:?}"
             )));
         }
-        validate_partition_owner_bindings(authority, &owner, unit.bindings())?;
+        let actual = unit
+            .bindings()
+            .iter()
+            .map(owned_binding_target)
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(Error::StrictLoadValidation {
+                missing: expected.difference(&actual).cloned().collect(),
+                unused: actual.difference(&expected).cloned().collect(),
+            });
+        }
         selected.push(StaticUnitBindings::new(*role, unit.bindings().to_vec())?);
     }
     Ok(selected)
@@ -14770,19 +14853,10 @@ fn load_qwen_pipeline(
     let static_roles = parameter_description.select_static_roles(&stage.partition);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let source_architecture =
-                match stage.architecture.shared_parallel_geometry() {
-                    Some(geometry) => eredu_architectures::qwen::RoutedLayeredModel::<
-                        MlxNeuralBackend,
-                    >::new_parallel(
-                        source_args.clone(), (*geometry).clone(), stream
-                    ),
-                    None => eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
-                        source_args.clone(),
-                        stream,
-                    ),
-                }
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            let source_architecture = eredu_architectures::qwen::RoutedLayeredModel::<
+                MlxNeuralBackend,
+            >::new(source_args.clone(), stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let source_quantization =
                 BoundPipelineBindings::new(&binding_adapter, &source_architecture);
             let target_quantization =
@@ -14816,8 +14890,17 @@ fn load_qwen_pipeline(
         &binding_adapter
     };
     info.materialization = materialization;
+    // Checkpoint bindings describe the global tensors. Build them against a
+    // global architecture, then apply the rank-local layout while loading the
+    // local architecture below.
+    let binding_architecture =
+        eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
+            target_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &binding_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -14839,13 +14922,13 @@ fn load_qwen_pipeline(
     if dense_stream.is_none() {
         for (global_layer, layer) in range.clone().zip(&mut stage.layers) {
             let bindings = binding_adapter.cartesian_layer_bindings(
-                &stage.architecture,
+                &binding_architecture,
                 decoder_group,
                 global_layer,
-                layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
+                stream,
             )?;
             if expert_cache_options.is_some() {
                 loaded.load_excluding_roles(
@@ -14910,15 +14993,15 @@ fn load_qwen_pipeline(
                     stream,
                 )
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
                 binding_adapter.cartesian_layer_bindings(
-                    architecture,
+                    &binding_architecture,
                     decoder_group,
                     global_layer,
-                    layer,
                     store,
                     streamed_layout.as_ref(),
                     streamed_assignment.as_ref(),
+                    stream,
                 )
             },
             |global_layer| {
@@ -15367,7 +15450,11 @@ fn load_muse_glimmer_pipeline(
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
             |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
         );
-        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
+        let entries = crate::composition::architecture_expert_units(
+            units,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
@@ -16446,6 +16533,9 @@ impl InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
+        if !self.ingress_active(state) {
+            return Ok(());
+        }
         if let Some(storage) = self.dense_layers.take() {
             let result = (|| {
                 let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
@@ -16976,6 +17066,13 @@ fn execute_pipeline_cached_kimi_linear(
         None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
+    if returned.reduced_output.shape() != hidden.shape() {
+        return Err(Error::Parallel(format!(
+            "cached Kimi expert output shape {:?} does not match hidden shape {:?}",
+            returned.reduced_output.shape(),
+            hidden.shape(),
+        )));
+    }
     Ok(returned.reduced_output)
 }
 
@@ -17094,6 +17191,15 @@ fn load_gpt_oss_pipeline(
     let seed_architecture =
         gpt_oss::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let binding_architecture =
+        gpt_oss::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let source_binding_architecture = quantize_on_load
+        .map(|_| {
+            gpt_oss::LayeredModel::<MlxNeuralBackend>::new(source_args.clone(), stream)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+        .transpose()?;
     let binding_parameter_description = seed_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -17187,12 +17293,7 @@ fn load_gpt_oss_pipeline(
             geometry.clone(),
             std::iter::empty(),
         )?;
-    let parameter_description = stage
-        .architecture
-        .as_ref()
-        .unwrap()
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let parameter_description = binding_parameter_description;
     let bindings = local_architecture_parameter_bindings(&parameter_description, &probe);
     let partition = info
         .placement
@@ -17220,12 +17321,16 @@ fn load_gpt_oss_pipeline(
     let static_roles = parameter_description.select_static_roles(&stage.partition);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let architecture = &stage.architecture;
-            let source_quantization = BoundPipelineBindings::new(&binding_adapter, architecture);
+            let source_quantization = BoundPipelineBindings::new(
+                &binding_adapter,
+                source_binding_architecture
+                    .as_ref()
+                    .expect("load-time quantization source architecture"),
+            );
             let target_quantization =
-                BoundPipelineBindings::new(&target_binding_adapter, architecture);
+                BoundPipelineBindings::new(&target_binding_adapter, &binding_architecture);
             let decoder_group =
-                architecture_decoder_group::<_, PipelineRangeState<'_>>(architecture)?;
+                architecture_decoder_group::<_, PipelineRangeState<'_>>(&binding_architecture)?;
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &source_quantization,
@@ -17254,7 +17359,7 @@ fn load_gpt_oss_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &binding_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -17277,13 +17382,13 @@ fn load_gpt_oss_pipeline(
         let architecture = &stage.architecture;
         for (global_layer, layer) in range.clone().zip(&mut stage.layers) {
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &binding_architecture,
                 decoder_group,
                 global_layer,
-                layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
+                stream,
             )?;
             if expert_cache_options.is_some() {
                 loaded.load_excluding_roles(
@@ -17325,6 +17430,7 @@ fn load_gpt_oss_pipeline(
         let streamed_realization = stage.expert_realization.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_architecture = &stage.architecture;
+        let binding_architecture = &binding_architecture;
         let streamed_bindings = &stage.bindings;
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
@@ -17350,15 +17456,15 @@ fn load_gpt_oss_pipeline(
                     stream,
                 )
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
                 binding_adapter.cartesian_layer_bindings(
-                    streamed_architecture,
+                    binding_architecture,
                     decoder_group,
                     global_layer,
-                    layer,
                     store,
                     streamed_layout.as_ref(),
                     streamed_assignment.as_ref(),
+                    stream,
                 )
             },
             |global_layer| {
@@ -17650,6 +17756,30 @@ fn load_lfm2_pipeline(
     )?;
     let range = topology.layer_range(target_units)?;
     let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
+    let source_architecture = if quantize_on_load.is_some() {
+        let source_global = eredu_architectures::lfm2::LayeredModel::<MlxNeuralBackend>::new(
+            source_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let source_description = source_global
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let source_layout = architecture_parallel_layout(&source_description, topology)?;
+        let source_geometry =
+            eredu_architectures::lfm2::local_geometry(&source_args, &source_layout)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+        Some(
+            eredu_architectures::lfm2::LayeredModel::<MlxNeuralBackend>::new_parallel(
+                source_args.clone(),
+                source_geometry,
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let geometry = Arc::new(
         eredu_architectures::lfm2::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -17671,8 +17801,7 @@ fn load_lfm2_pipeline(
         placement,
         model_kind,
     );
-    let runtime_state = architecture
-        .state_layout()
+    let runtime_state = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info
         .placement
@@ -17727,8 +17856,12 @@ fn load_lfm2_pipeline(
     let static_roles = parameter_description.select_static_roles(&stage.partition);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let source_quantization =
-                BoundPipelineBindings::new(&binding_adapter, &stage.architecture);
+            let source_quantization = BoundPipelineBindings::new(
+                &binding_adapter,
+                source_architecture
+                    .as_ref()
+                    .expect("load-time quantization source architecture"),
+            );
             let target_quantization =
                 BoundPipelineBindings::new(&target_binding_adapter, &stage.architecture);
             let (store, report) = quantize_pipeline_stage_store(
@@ -17895,7 +18028,11 @@ fn load_lfm2_pipeline(
                 })
             },
         );
-        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
+        let entries = crate::composition::architecture_expert_units(
+            units,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -19057,9 +19194,7 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = self
-            .architecture
-            .state_layout()
+        let complete = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         qwen_hybrid_pipeline_prompt_cache_identity(
             self.args(),
@@ -19084,9 +19219,7 @@ impl PipelineEmbeddedMtp for QwenHybridPipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = self
-            .architecture
-            .state_layout()
+        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
@@ -19326,8 +19459,7 @@ fn load_neutral_qwen_hybrid_pipeline(
         info.global_expert_count = Some(assignment.global_expert_count());
         info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
     }
-    let complete_state = architecture
-        .state_layout()
+    let complete_state = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
@@ -20275,8 +20407,7 @@ fn load_kimi_linear_pipeline(
         placement,
         model_kind,
     );
-    let runtime_state = architecture
-        .state_layout()
+    let runtime_state = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info
         .placement
@@ -20514,7 +20645,11 @@ fn load_kimi_linear_pipeline(
                 })
             },
         );
-        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
+        let entries = crate::composition::architecture_expert_units(
+            units,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -20640,6 +20775,7 @@ impl KimiLinearPipelinePartition {
         };
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            let mode = execution.mode;
             execute_pipeline_cached_kimi_linear(
                 &execution.spec,
                 execution.layer,
@@ -20653,7 +20789,19 @@ impl KimiLinearPipelinePartition {
                 &mut statistics,
                 context,
             )
-            .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
+            .map(|reducible| match mode {
+                GatedProductExpertExecutionMode::Complete => {
+                    eredu_runtime::RoutedExpertTensorParallelOutput::Complete(reducible)
+                }
+                GatedProductExpertExecutionMode::TensorParallel { .. } => {
+                    eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
+                        TensorParallelExpertOutput {
+                            reducible,
+                            post_reduce: None,
+                        },
+                    )
+                }
+            })
             .map_err(|error| Exception::custom(error.to_string()))
         };
         let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
@@ -20776,6 +20924,31 @@ fn load_neutral_inkling_pipeline(
         "Inkling decoder",
     )?;
     let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
+    let source_architecture = if quantize_on_load.is_some() {
+        let source_global = eredu_architectures::inkling::LayeredModel::<MlxNeuralBackend>::new(
+            source_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let source_description = source_global
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let source_layout = architecture_parallel_layout(&source_description, topology)?;
+        let source_geometry = Arc::new(
+            eredu_architectures::inkling::local_geometry(&source_args, &source_layout)
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+        );
+        Some(
+            eredu_architectures::inkling::LayeredModel::<MlxNeuralBackend>::new_parallel(
+                source_args.clone(),
+                source_geometry,
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let geometry = Arc::new(
         eredu_architectures::inkling::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
@@ -20800,8 +20973,7 @@ fn load_neutral_inkling_pipeline(
         "Inkling",
     )?;
     let range = topology.layer_range(target_units)?;
-    let runtime_state = architecture
-        .state_layout()
+    let runtime_state = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let neutral_placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
@@ -20868,8 +21040,12 @@ fn load_neutral_inkling_pipeline(
     let static_roles = parameter_description.select_static_roles(&stage.partition);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let source_quantization =
-                BoundPipelineBindings::new(&binding_adapter, &stage.architecture);
+            let source_quantization = BoundPipelineBindings::new(
+                &binding_adapter,
+                source_architecture
+                    .as_ref()
+                    .expect("load-time quantization source architecture"),
+            );
             let target_quantization =
                 BoundPipelineBindings::new(&target_binding_adapter, &stage.architecture);
             let (store, report) = quantize_pipeline_stage_store(
@@ -20901,7 +21077,7 @@ fn load_neutral_inkling_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &global_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -20923,12 +21099,12 @@ fn load_neutral_inkling_pipeline(
         let architecture = &stage.architecture;
         for (index, layer) in stage.vision_range().clone().zip(&mut stage.vision_layers) {
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &global_architecture,
                 vision_group,
                 index,
-                layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
+                stream,
             )?;
             loaded.load(
                 architecture_parameter_unit_owner::<_, MlxHybridState>(
@@ -20946,12 +21122,12 @@ fn load_neutral_inkling_pipeline(
         }
         for (index, layer) in stage.range().clone().zip(&mut stage.layers) {
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &global_architecture,
                 decoder_group,
                 index,
-                layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
+                stream,
             )?;
             loaded.load_excluding_roles(
                 architecture_parameter_unit_owner::<_, MlxHybridState>(
@@ -21022,24 +21198,24 @@ fn load_neutral_inkling_pipeline(
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 }
             },
-            |ordinal, layer, store| {
+            |ordinal, _layer, store| {
                 if ordinal < vision_count {
                     binding_adapter.cartesian_layer_bindings(
-                        architecture,
+                        &global_architecture,
                         vision_group,
                         vision_start + ordinal,
-                        layer,
                         store,
                         layout.as_ref(),
+                        stream,
                     )
                 } else {
                     binding_adapter.cartesian_layer_bindings(
-                        architecture,
+                        &global_architecture,
                         decoder_group,
                         text_start + ordinal - vision_count,
-                        layer,
                         store,
                         layout.as_ref(),
+                        stream,
                     )
                 }
             },
@@ -21074,7 +21250,11 @@ fn load_neutral_inkling_pipeline(
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
             |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
         );
-        let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
+        let entries = crate::composition::architecture_expert_units(
+            units,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
@@ -21200,10 +21380,17 @@ fn load_neutral_gemma4_pipeline(
     let runtime_state = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let neutral_placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
+    let decoder_group_id = architecture_group_id_by_kind::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
-    )?);
+        eredu_runtime::ArchitectureGroupKind::Decoder,
+    )?;
+    let neutral_placement = Arc::new(
+        media_architecture_transport::<_, MlxHybridState>(
+            &architecture,
+            topology.pipeline_parallel_size,
+        )?
+        .with_group_unit_ranges(&decoder_group_id, ranges.clone())?,
+    );
     let mut info = base_info(
         topology,
         wire_contract,

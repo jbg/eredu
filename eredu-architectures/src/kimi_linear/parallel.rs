@@ -443,7 +443,7 @@ where
                 B::Linear,
             >(
                 format!("{root}.mlp.shared_experts.intermediate"),
-                ParameterRole::ExpertIntermediate,
+                ParameterRole::FeedForwardIntermediate,
                 &[
                     (&moe.shared.gate, eredu_runtime::ProjectionSharding::Column),
                     (&moe.shared.up, eredu_runtime::ProjectionSharding::Column),

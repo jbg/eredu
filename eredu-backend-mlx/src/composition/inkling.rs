@@ -22,12 +22,16 @@ use eredu_runtime::{
 use safemlx::{
     error::Exception,
     ops::{concatenate_axis, indexing::TryIndexOp},
+    transforms::async_eval_with_event,
     Array, Stream,
 };
 
 use crate::backend::{
     error::Error,
-    nn::shared::{MlxModule, MlxNeuralBackend},
+    nn::{
+        shared::{MlxModule, MlxNeuralBackend},
+        tensor::TokenValidationScope,
+    },
     runtime::{
         cache::{
             residency::{
@@ -60,6 +64,19 @@ use crate::backend::{
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
 pub type InklingPipelineUnit = MlxModule<NeutralUnit>;
+
+fn with_token_validation_scope<T>(
+    operation: impl FnOnce() -> Result<T, Exception>,
+) -> Result<T, Exception> {
+    let scope = TokenValidationScope::begin()?;
+    let output = operation()?;
+    let validations = scope.finish();
+    if !validations.is_empty() {
+        async_eval_with_event(validations.arrays())?.synchronize()?;
+        validations.validate_completed()?;
+    }
+    Ok(output)
+}
 
 fn group_kind(
     architecture: &NeutralArchitecture,
@@ -202,11 +219,18 @@ impl InklingBindings {
         architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
-        global_layer: &InklingPipelineUnit,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
+        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
+        let global_layer = MlxModule::new(
+            <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::build_unit(architecture, group, index, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        );
+        let bindings = self.layer_bindings(architecture, group, index, &global_layer, store)?;
         if let Some(layout) = layout {
             shard_layer_bindings(bindings, store, layout)
         } else {
@@ -1726,10 +1750,12 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        cache.clear()?;
-        self.model
-            .forward_input_parallel_with_capture(input, cache, self.group, stream)
-            .map_err(|error| Exception::custom(error.to_string()))
+        with_token_validation_scope(|| {
+            cache.clear()?;
+            self.model
+                .forward_input_parallel_with_capture(input, cache, self.group, stream)
+                .map_err(|error| Exception::custom(error.to_string()))
+        })
     }
 
     fn verify_target(
@@ -1738,19 +1764,21 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let parts = [DecoderInputPart::Text(tokens)];
-        self.model
-            .forward_parallel_with_capture(
-                ModelInput {
-                    parts: &parts,
-                    vision_patches: None,
-                    audio: None,
-                },
-                cache,
-                self.group,
-                stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
+        with_token_validation_scope(|| {
+            let parts = [DecoderInputPart::Text(tokens)];
+            self.model
+                .forward_parallel_with_capture(
+                    ModelInput {
+                        parts: &parts,
+                        vision_patches: None,
+                        audio: None,
+                    },
+                    cache,
+                    self.group,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+        })
     }
 
     fn prefill_draft_cache(
@@ -1776,12 +1804,14 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
             .mtp
             .as_mut()
             .ok_or_else(|| Exception::custom("Inkling checkpoint has no MTP state"))?;
-        for depth in 0..self.model.mtp_len() {
-            let _ = self
-                .model
-                .forward_mtp_draft_parallel(&hidden, &next, depth, mtp, self.group, stream)?;
-        }
-        Ok(())
+        with_token_validation_scope(|| {
+            for depth in 0..self.model.mtp_len() {
+                let _ = self
+                    .model
+                    .forward_mtp_draft_parallel(&hidden, &next, depth, mtp, self.group, stream)?;
+            }
+            Ok(())
+        })
     }
 
     fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
@@ -1811,16 +1841,18 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(crate::MlxTensor, crate::MlxTensor), Exception> {
-        let token = crate::MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
-        let output = self.model.forward_mtp_draft_parallel(
-            hidden,
-            &token,
-            draft_index,
-            cache,
-            self.group,
-            stream,
-        )?;
-        Ok((output.logits, output.hidden))
+        with_token_validation_scope(|| {
+            let token = crate::MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
+            let output = self.model.forward_mtp_draft_parallel(
+                hidden,
+                &token,
+                draft_index,
+                cache,
+                self.group,
+                stream,
+            )?;
+            Ok((output.logits, output.hidden))
+        })
     }
 
     fn advance_draft_cache(
@@ -1830,12 +1862,14 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        for depth in 0..self.model.mtp_len() {
-            let _ = self
-                .model
-                .forward_mtp_draft_parallel(hidden, tokens, depth, cache, self.group, stream)?;
-        }
-        Ok(())
+        with_token_validation_scope(|| {
+            for depth in 0..self.model.mtp_len() {
+                let _ = self
+                    .model
+                    .forward_mtp_draft_parallel(hidden, tokens, depth, cache, self.group, stream)?;
+            }
+            Ok(())
+        })
     }
 
     fn max_draft_tokens(&self) -> usize {

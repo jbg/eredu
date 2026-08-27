@@ -653,8 +653,12 @@ impl PromptCacheManifest {
                 || block.second_shape != second_shape
             {
                 return Err(PromptCacheError::Malformed(format!(
-                    "global layer {} payload geometry does not match its policy",
-                    block.global_layer
+                    "global layer {} payload geometry does not match its policy: actual {:?}/{:?}/{:?}, expected {:?}/{first_shape:?}/{second_shape:?}",
+                    block.global_layer,
+                    block.representation,
+                    block.first_shape,
+                    block.second_shape,
+                    representation,
                 )));
             }
             if block.rank != self.topology.cache_rank_identity() {
@@ -719,8 +723,12 @@ impl PromptCacheManifest {
                 || !safe_relative_path(&entry.shard)
             {
                 return Err(PromptCacheError::Malformed(format!(
-                    "fixed-state tensor {:?} for {:?} does not match its policy",
-                    entry.role, entry.owner
+                    "fixed-state tensor {:?} for {:?} does not match its policy: shape {:?} and dtype {}, expected shape {:?}",
+                    entry.role,
+                    entry.owner,
+                    entry.shape,
+                    entry.dtype,
+                    policy.resolved_shape(self.batch_size, tokens)?,
                 )));
             }
         }

@@ -85,20 +85,15 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         match input {
-            LayeredPartitionInput::Tokens(tokens) => {
-                let parts = [DecoderInputPart::Text(tokens)];
-                self.begin_forward(
-                    ModelInput {
-                        parts: &parts,
-                        vision: None,
-                        audio: None,
-                        per_layer_tokens: None,
-                        mask,
-                    },
-                    state,
-                    context,
-                )
-            }
+            LayeredPartitionInput::Tokens(tokens) => self.begin_pipeline_text(
+                tokens,
+                mask.cloned(),
+                state,
+                expected,
+                first_state_ordinal,
+                None,
+                context,
+            ),
             LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_text(
                 hidden,
                 mask.cloned(),
@@ -121,21 +116,15 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         match input {
-            LayeredPartitionInput::Tokens(tokens) => {
-                let parts = [DecoderInputPart::Text(tokens)];
-                self.begin_forward_parallel(
-                    ModelInput {
-                        parts: &parts,
-                        vision: None,
-                        audio: None,
-                        per_layer_tokens: None,
-                        mask,
-                    },
-                    state,
-                    parallel,
-                    context,
-                )
-            }
+            LayeredPartitionInput::Tokens(tokens) => self.begin_pipeline_text(
+                tokens,
+                mask.cloned(),
+                state,
+                expected,
+                first_state_ordinal,
+                Some(parallel),
+                context,
+            ),
             LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_text(
                 hidden,
                 mask.cloned(),
@@ -942,6 +931,70 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                     tokens: tokens.clone(),
                     embeddings,
                 }],
+                per_layer_token_override: None,
+                per_layer_inputs: None,
+                shared: HashMap::new(),
+                vision_state: None,
+                vision_initial: None,
+                vision_output: None,
+                audio_valid: None,
+                audio_initial: None,
+                audio_output: None,
+            },
+        })
+    }
+
+    /// Starts a text-only pipeline partition against its stage-local state.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_pipeline_text<S: LayerRuntimeState<B>>(
+        &mut self,
+        tokens: &B::Tensor,
+        mask: Option<B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        if state.layout() != expected {
+            return Err(Error::backend("Gemma 4 pipeline state layout mismatch"));
+        }
+        let input = [DecoderInputPart::Text(tokens)];
+        let parts = match parallel {
+            Some(parallel) => self.prepare_parts_parallel(&input, parallel, context)?,
+            None => self.prepare_parts(&input, context)?,
+        };
+        let hidden = match &parts[0] {
+            PreparedPart::Text { embeddings, .. } => embeddings.clone(),
+            PreparedPart::Vision { .. } | PreparedPart::Audio { .. } => {
+                unreachable!("text input prepares a text part")
+            }
+        };
+        let mut position_offset = 0;
+        for (layer, policy) in self
+            .args
+            .text
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .skip(first_state_ordinal)
+            .take(expected.len())
+        {
+            if policy.key_value.owns_state() {
+                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                    state.layer(layer).map_err(Error::backend)?,
+                ));
+            }
+        }
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                mask,
+                position_offset,
+                parts,
                 per_layer_token_override: None,
                 per_layer_inputs: None,
                 shared: HashMap::new(),

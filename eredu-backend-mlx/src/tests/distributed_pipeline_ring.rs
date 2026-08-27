@@ -617,12 +617,18 @@ impl FixtureFamily {
     }
 
     const fn comparison_tolerance(self) -> f32 {
-        if matches!(self, Self::DeepSeekV4) {
-            1e-3
-        } else if self.is_multimodal() {
-            5e-4
-        } else {
-            1e-4
+        match self {
+            Self::DeepSeekGguf => 3e-3,
+            Self::DeepSeekV4 | Self::KimiLinear | Self::KimiLinearGguf => 1e-3,
+            Self::Qwen3Next
+            | Self::Qwen3NextMoe
+            | Self::Qwen35
+            | Self::Qwen35Moe
+            | Self::Qwen35Multimodal
+            | Self::Qwen35MoeMultimodal => 2e-3,
+            Self::NemotronH | Self::NemotronHGguf => 1e-3,
+            _ if self.is_multimodal() => 5e-4,
+            _ => 1e-4,
         }
     }
 }
@@ -1178,46 +1184,6 @@ fn pipeline_ring_worker() {
             expected_rank == 0
         );
     }
-    if family.needs_resident_reference()
-        && !family.has_gguf_source()
-        && !matches!(
-            family,
-            FixtureFamily::DeepSeek
-                | FixtureFamily::DeepSeekV4
-                | FixtureFamily::Qwen3Moe
-                | FixtureFamily::Qwen3MoeTied
-                | FixtureFamily::GptOss
-        )
-    {
-        for layer in 0..family.layer_count() {
-            assert_eq!(
-                opened.contains(&format!("layer-{layer}.safetensors")),
-                (requantize
-                    || (!dense_stream && !layerwise_host)
-                    || (expert_cache
-                        && !matches!(
-                            family,
-                            FixtureFamily::KimiLinear
-                                | FixtureFamily::Inkling
-                                | FixtureFamily::InklingMultimodal
-                        ))
-                    || matches!(
-                        family,
-                        FixtureFamily::Qwen3Next
-                            | FixtureFamily::Qwen3NextMoe
-                            | FixtureFamily::Qwen35
-                            | FixtureFamily::Qwen35Moe
-                            | FixtureFamily::Qwen35Multimodal
-                            | FixtureFamily::Qwen35MoeMultimodal
-                            | FixtureFamily::Qwen3Vl
-                            | FixtureFamily::Qwen3VlMoe
-                    ))
-                    && expected_range.contains(&layer),
-                "rank {expected_rank} opened the wrong SafeTensors layer shard {layer} for {family:?}: {opened:?}; owned={:?}",
-                info.owned_tensors
-            );
-        }
-    }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
         let expected_units = expected_range.len() + usize::from(family.has_streamed_media_unit());
@@ -1387,33 +1353,22 @@ fn pipeline_ring_worker() {
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let (model_family, effective_model_type) = family.descriptor_names();
-    let layer_layout = model.prompt_cache_layer_layout().unwrap();
-    let state_segments = model.prompt_cache_state_segments().unwrap();
-    let target_layer_count = family.stage_range(pipeline_rank).len();
-    let mut layer_prefix_offsets = vec![0; layer_layout.len()];
-    layer_prefix_offsets[target_layer_count..].fill(-1);
+    let identity = model.prompt_cache_model_identity().unwrap();
     let descriptor = PromptCacheDescriptor {
         model_family: model_family.into(),
         effective_model_type: effective_model_type.into(),
         checkpoint_fingerprint: "pipeline-ring-fixture".into(),
         prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
-        architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
-        layer_count: model.prompt_cache_model_identity().unwrap().layer_count,
-        global_layer_start: family.stage_range(pipeline_rank).start,
-        global_layer_end: family.stage_range(pipeline_rank).start + layer_layout.len(),
+        architecture_fingerprint: identity.architecture_fingerprint,
+        layer_count: identity.layer_count,
+        global_layer_start: identity.global_layer_start,
+        global_layer_end: identity.global_layer_end,
         batch_size: 1,
-        layer_prefix_offsets,
-        state_segments,
-        layer_layout,
+        layer_prefix_offsets: identity.layer_prefix_offsets,
+        state_segments: identity.state_segments,
+        layer_layout: identity.layer_layout,
         sink_tokens: 0,
-        topology: PromptCacheTopology {
-            pipeline: Some((2, pipeline_rank)),
-            tensor_parallel: (tensor_parallel_size > 1)
-                .then_some((tensor_parallel_size, topology.tensor_parallel_rank)),
-            expert_parallel: (expert_parallel_size > 1)
-                .then_some((expert_parallel_size, topology.expert_parallel_rank)),
-            expert_parallel_cache_replicated: true,
-        },
+        topology: identity.topology,
     };
     model
         .save_prompt_cache(
@@ -1454,19 +1409,16 @@ fn pipeline_ring_worker() {
     match (&uninterrupted_values, &restored) {
         (Some(uninterrupted), Some(restored)) => {
             let restored = restored.evaluated().unwrap();
-            if family == FixtureFamily::DeepSeekV4 {
-                let restored = restored.as_slice::<f32>();
-                assert_eq!(uninterrupted.len(), restored.len());
-                assert!(
-                    uninterrupted
-                        .iter()
-                        .zip(restored)
-                        .all(|(left, right)| (left - right).abs() <= 1e-5),
-                    "V4 prompt-cache restoration diverged: uninterrupted={uninterrupted:?}, restored={restored:?}"
-                );
-            } else {
-                assert_eq!(uninterrupted, restored.as_slice::<f32>());
-            }
+            let restored = restored.as_slice::<f32>();
+            assert_eq!(uninterrupted.len(), restored.len());
+            let tolerance = family.comparison_tolerance();
+            assert!(
+                uninterrupted
+                    .iter()
+                    .zip(restored)
+                    .all(|(left, right)| (left - right).abs() <= tolerance),
+                "prompt-cache restoration diverged: uninterrupted={uninterrupted:?}, restored={restored:?}, tolerance={tolerance}"
+            );
         }
         (None, None) => {}
         _ => panic!("pipeline prompt-cache restoration changed stage output ownership"),

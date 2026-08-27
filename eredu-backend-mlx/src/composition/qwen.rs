@@ -1536,15 +1536,20 @@ impl QwenPipelineBindings {
         architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
-        global_layer: &MlxModule<NeutralBlock>,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
+        let global_layer = MlxModule::new(
+            architecture
+                .construct_unit(index, stream)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        );
         let expert_targets = parameter_role_targets(
             &eredu_architectures::qwen::routed_layer_parallel_parameter_groups(
-                global_layer,
+                &global_layer,
                 architecture.args(),
                 index,
             )
@@ -1559,7 +1564,7 @@ impl QwenPipelineBindings {
         // Build against canonical bank recipes first. Architecture-produced
         // rank-local recipes then lower EP identity before generic TP sharding.
         let bindings = build_module_binding_plan_with_recipes_excluding(
-            global_layer,
+            &global_layer,
             "",
             store,
             recipes,

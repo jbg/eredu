@@ -226,9 +226,19 @@ fn unit_recipes(
     args: &ModelArgs,
     layer: usize,
 ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, Error> {
-    eredu_architectures::gpt_oss::expert_recipes(store, args, layer)
+    let recipes = eredu_architectures::gpt_oss::expert_recipes(store, args, layer)
         .map(|family| family.into_outputs().into_outputs())
-        .map_err(Error::ArchitectureModel)
+        .map_err(Error::ArchitectureModel)?;
+    recipes
+        .into_iter()
+        .map(|(name, mut recipe)| {
+            if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
+                recipe =
+                    crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, store)?;
+            }
+            Ok((name, recipe))
+        })
+        .collect()
 }
 
 /// Builds one neutral GPT-OSS runtime from an already opened checkpoint store.
@@ -652,15 +662,20 @@ impl GptOssPipelineBindings {
         architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
-        global_layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
+        let global_layer = MlxModule::new(
+            architecture
+                .construct_unit(index, stream)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        );
         let expert_targets = parameter_role_targets(
             &eredu_architectures::gpt_oss::layer_parallel_parameter_groups(
-                global_layer,
+                &global_layer,
                 architecture.args(),
                 index,
             )
@@ -673,7 +688,7 @@ impl GptOssPipelineBindings {
             unit_recipes(store, architecture.args(), index)?
         };
         let bindings = build_module_binding_plan_with_recipes_excluding(
-            global_layer,
+            &global_layer,
             "",
             store,
             recipes,

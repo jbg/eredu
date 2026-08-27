@@ -1616,9 +1616,18 @@ impl NeuralBackend for MlxNeuralBackend {
                 .map_err(ComputeError::backend)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        compute_tensor(safemlx::distributed::all_gather_uneven_axis(
-            &local, -1, &widths, parallel, context,
-        ))
+        compute_tensor(
+            safemlx::distributed::all_gather_uneven_axis(
+                &local, -1, &widths, parallel, context,
+            )
+            .map_err(|error| {
+                safemlx::error::Exception::custom(format!(
+                    "vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
+                    range.local,
+                    local.shape(),
+                ))
+            }),
+        )
     }
 
     fn vocabulary_parallel_embedding_project(
@@ -1647,9 +1656,18 @@ impl NeuralBackend for MlxNeuralBackend {
                 .map_err(ComputeError::backend)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        compute_tensor(safemlx::distributed::all_gather_uneven_axis(
-            &local, -1, &widths, parallel, context,
-        ))
+        compute_tensor(
+            safemlx::distributed::all_gather_uneven_axis(
+                &local, -1, &widths, parallel, context,
+            )
+            .map_err(|error| {
+                safemlx::error::Exception::custom(format!(
+                    "tied vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
+                    range.local,
+                    local.shape(),
+                ))
+            }),
+        )
     }
 
     fn normalization(
