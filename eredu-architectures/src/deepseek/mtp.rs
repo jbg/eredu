@@ -142,7 +142,7 @@ pub struct V3PredictionLayer<B: RoutedNeuralBackend + BlockwiseAttentionBackend>
     embedding_norm: B::Normalization,
     hidden_norm: B::Normalization,
     fusion: B::Linear,
-    decoder: V3Block<B>,
+    pub(crate) decoder: V3Block<B>,
     output_norm: B::Normalization,
     output_head: B::Linear,
 }
@@ -345,7 +345,7 @@ where
     hidden_projection: B::Linear,
     embedding_norm: B::Normalization,
     hidden_norm: B::Normalization,
-    decoder: V4Block<B>,
+    pub(crate) decoder: V4Block<B>,
     output_norm: B::Normalization,
     hyper_head: HyperHead<B>,
 }

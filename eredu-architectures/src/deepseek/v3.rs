@@ -5,7 +5,8 @@ use std::sync::Arc;
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
-    Error, LinearOperator, NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
+    Error, GatedProductExpertBankOperator, LinearOperator, NormalizationOperator, Parameterized,
+    RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
@@ -66,6 +67,20 @@ pub enum Unit<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
     Target(V3Block<B>),
     /// One embedded prediction depth.
     Prediction(V3PredictionLayer<B>),
+}
+
+impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Unit<B> {
+    /// Returns the exact routed bank specification retained by this realized unit.
+    pub fn expert_bank_spec(&self) -> Option<&eredu_nn::GatedProductExpertBankSpec> {
+        let feed_forward = match self {
+            Self::Target(block) => &block.feed_forward,
+            Self::Prediction(prediction) => &prediction.decoder.feed_forward,
+        };
+        match feed_forward {
+            super::block::V3FeedForward::Dense(_) => None,
+            super::block::V3FeedForward::Routed(moe) => Some(moe.experts.spec()),
+        }
+    }
 }
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
@@ -267,6 +282,7 @@ pub struct Model<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
     parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
 }
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
@@ -325,6 +341,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
             args,
             static_modules,
             parallel_geometry: None,
+            expert_realization: None,
         })
     }
 
@@ -352,6 +369,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
             args,
             static_modules,
             parallel_geometry: Some(Arc::new(geometry)),
+            expert_realization: None,
         })
     }
 
@@ -366,6 +384,14 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Borrows the shared rank-local geometry used by unit factories.
     pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V3LocalGeometry>> {
         self.parallel_geometry.clone()
+    }
+
+    /// Installs the architecture-derived expert realization used by every unit factory.
+    pub fn install_expert_realization(
+        &mut self,
+        realization: crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+    ) {
+        self.expert_realization = Some(realization);
     }
 
     /// Returns the normalized V3 arguments.
@@ -401,15 +427,40 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
             .parallel_geometry
             .as_ref()
             .map_or(&self.args, |geometry| geometry.args());
-        if group == 0 {
-            Ok(Unit::Target(V3Block::new(args, index, context)?))
+        let mut unit = if group == 0 {
+            Unit::Target(V3Block::new(args, index, context)?)
         } else {
-            Ok(Unit::Prediction(V3PredictionLayer::new(
-                args,
-                group - 1,
-                context,
-            )?))
+            Unit::Prediction(V3PredictionLayer::new(args, group - 1, context)?)
+        };
+        if let Some(realization) = &self.expert_realization {
+            let owner_group = if group == 0 {
+                "target".to_owned()
+            } else {
+                format!("mtp.{}", group - 1)
+            };
+            let spec = realization.unit_spec(&owner_group, index);
+            let feed_forward = match &mut unit {
+                Unit::Target(block) => &mut block.feed_forward,
+                Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
+            };
+            match (feed_forward, spec) {
+                (super::block::V3FeedForward::Routed(moe), Some(spec)) => {
+                    moe.experts = B::gated_product_expert_bank(spec.clone(), context)?;
+                }
+                (super::block::V3FeedForward::Routed(_), None) => {
+                    return Err(Error::backend(format!(
+                        "V3 expert realization has no bank for {owner_group}.{index}"
+                    )));
+                }
+                (super::block::V3FeedForward::Dense(_), Some(_)) => {
+                    return Err(Error::backend(format!(
+                        "V3 expert realization names dense unit {owner_group}.{index}"
+                    )));
+                }
+                (super::block::V3FeedForward::Dense(_), None) => {}
+            }
         }
+        Ok(unit)
     }
 
     /// Starts a replicated target partition and returns its typed immutable

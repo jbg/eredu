@@ -515,7 +515,9 @@ before MLX sees the plan. MLX family adapters accept the plan rather than the
 family configuration or parallel topology when creating their native dispatch
 assignment. The MLX assignment type is only a validated lowering of the plan's
 owner map; it exposes no independent balanced, round-robin, or explicit policy
-engine.
+engine. DeepSeek pipeline unit factories install the plan before constructing
+target or prediction units, and tensor-parallel expert-cache selection derives
+its local width from the same plan entries rather than from family arguments.
 Distributed expert callbacks also
 carry whether the requested result is globally complete or a rank-local
 tensor-parallel contribution, so EP recombination preserves the reducible and

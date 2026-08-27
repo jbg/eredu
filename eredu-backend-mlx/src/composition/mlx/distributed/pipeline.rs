@@ -2612,6 +2612,7 @@ struct PredictionPipelineRealization<A, G, B, U> {
     dense_layers: Option<PipelineLayerStorage>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
+    owns_routed_units: bool,
     routing_statistics: RoutingStatistics,
 }
 
@@ -5673,7 +5674,7 @@ impl DeepSeekV3PipelinePartition {
                 observer,
             )
         } else {
-            if expert_group.is_some() {
+            if expert_group.is_some() && self.owns_routed_units {
                 return Err(Error::Parallel(
                     "neutral DeepSeek V3 received EP without external experts".into(),
                 ));
@@ -6075,7 +6076,7 @@ impl DeepSeekV4PipelinePartition {
                 observer,
             )
         } else {
-            if expert_group.is_some() {
+            if expert_group.is_some() && self.owns_routed_units {
                 return Err(Error::Parallel(
                     "neutral DeepSeek V4 received EP without external experts".into(),
                 ));
@@ -21522,6 +21523,42 @@ fn preflight_pipeline_realization<S>(
     Ok(())
 }
 
+fn localized_gated_expert_width(
+    realization: &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+    family: &str,
+) -> Result<usize, Error> {
+    let local_experts = realization.local_global_expert_ids().len();
+    let mut width = None;
+    for spec in realization.unit_specs().values() {
+        let spec_experts = usize::try_from(spec.expert_count).map_err(|_| {
+            Error::Parallel(format!(
+                "{family} expert realization has an invalid localized expert count"
+            ))
+        })?;
+        if spec_experts != local_experts {
+            return Err(Error::Parallel(format!(
+                "{family} expert realization bank has {spec_experts} local experts, expected {local_experts}"
+            )));
+        }
+        let spec_width = usize::try_from(spec.intermediate_dimensions).map_err(|_| {
+            Error::Parallel(format!(
+                "{family} expert realization has an invalid localized expert width"
+            ))
+        })?;
+        if width.is_some_and(|current| current != spec_width) {
+            return Err(Error::Parallel(format!(
+                "{family} expert realization has inconsistent localized expert widths"
+            )));
+        }
+        width = Some(spec_width);
+    }
+    width.ok_or_else(|| {
+        Error::Parallel(format!(
+            "{family} expert realization has no bank specifications"
+        ))
+    })
+}
+
 #[cfg(test)]
 #[test]
 fn pipeline_preflight_requires_and_validates_the_expert_realization() {
@@ -21690,6 +21727,9 @@ fn load_neutral_deepseek_v3_pipeline(
         topology.rank_topology(),
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if let Some(realization) = expert_realization.clone() {
+        architecture.install_expert_realization(realization);
+    }
     let expert_assignment = external_experts
         .then(|| {
             ExpertAssignment::from_realization(expert_realization.as_ref().ok_or_else(|| {
@@ -21971,12 +22011,13 @@ fn load_neutral_deepseek_v3_pipeline(
             .expect("external expert assignment");
         let catalog = match &parallel_layout {
             Some(layout) => {
+                let realization = expert_realization
+                    .as_ref()
+                    .expect("external V3 experts have an architecture realization");
                 let intermediate = routed_expert_intermediate_range(
                     layout,
-                    usize::try_from(args.n_routed_experts)
-                        .map_err(|_| Error::Parallel("invalid V3 expert count".into()))?,
-                    usize::try_from(args.moe_intermediate_size)
-                        .map_err(|_| Error::Parallel("invalid V3 expert width".into()))?,
+                    realization.global_expert_count(),
+                    localized_gated_expert_width(realization, "DeepSeek V3")?,
                 )?;
                 crate::composition::deepseek_expert::v3_parallel_catalog_selected(
                     &args,
@@ -22018,6 +22059,15 @@ fn load_neutral_deepseek_v3_pipeline(
     let diagnostics = store.source_diagnostics()?;
     info.opened_checkpoint_shards = diagnostics.payload_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
+    let owns_routed_units = expert_realization.as_ref().is_some_and(|realization| {
+        realization
+            .unit_specs()
+            .keys()
+            .any(|(group, unit)| partition.owns_unit(group.as_str(), *unit))
+    });
+    if !owns_routed_units {
+        info.local_expert_ids.clear();
+    }
     let stage = DeepSeekV3PipelinePartition {
         architecture,
         partition,
@@ -22026,6 +22076,7 @@ fn load_neutral_deepseek_v3_pipeline(
         dense_layers,
         expert_assignment,
         expert_storage,
+        owns_routed_units,
         routing_statistics: RoutingStatistics::default(),
     };
     PipelineModel::from_adapter(topology, info, stage)
@@ -22112,6 +22163,7 @@ fn load_neutral_deepseek_v4_pipeline(
         topology.rank_topology(),
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    architecture.install_expert_realization(expert_realization.clone());
     let expert_assignment = external_experts
         .then(|| ExpertAssignment::from_realization(&expert_realization))
         .transpose()?;
@@ -22395,10 +22447,8 @@ fn load_neutral_deepseek_v4_pipeline(
             Some(layout) => {
                 let intermediate = routed_expert_intermediate_range(
                     layout,
-                    usize::try_from(args.n_routed_experts)
-                        .map_err(|_| Error::Parallel("invalid V4 expert count".into()))?,
-                    usize::try_from(args.moe_intermediate_size)
-                        .map_err(|_| Error::Parallel("invalid V4 expert width".into()))?,
+                    expert_realization.global_expert_count(),
+                    localized_gated_expert_width(&expert_realization, "DeepSeek V4")?,
                 )?;
                 crate::composition::deepseek_expert::v4_parallel_catalog_selected(
                     &args,
@@ -22440,6 +22490,13 @@ fn load_neutral_deepseek_v4_pipeline(
     let diagnostics = store.source_diagnostics()?;
     info.opened_checkpoint_shards = diagnostics.payload_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
+    let owns_routed_units = expert_realization
+        .unit_specs()
+        .keys()
+        .any(|(group, unit)| partition.owns_unit(group.as_str(), *unit));
+    if !owns_routed_units {
+        info.local_expert_ids.clear();
+    }
     let stage = DeepSeekV4PipelinePartition {
         architecture,
         partition,
@@ -22448,6 +22505,7 @@ fn load_neutral_deepseek_v4_pipeline(
         dense_layers,
         expert_assignment,
         expert_storage,
+        owns_routed_units,
         routing_statistics: RoutingStatistics::default(),
     };
     PipelineModel::from_adapter(topology, info, stage)

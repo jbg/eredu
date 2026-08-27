@@ -10,10 +10,10 @@ use eredu_core::{
     AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::{
-    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, HyperHead, HyperHeadSpec,
-    HyperNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, PoolingAttentionCache,
-    RoutedNeuralBackend, Tensor,
+    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GatedProductExpertBankOperator,
+    HyperHead, HyperHeadSpec, HyperNeuralBackend, Index, LinearOperator, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
+    PoolingAttentionCache, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
@@ -152,6 +152,19 @@ where
     Prediction(V4PredictionLayer<B>),
     /// One ordinary local-attention block in the fused DSpark chain.
     Dspark(V4Block<B>),
+}
+
+impl<B> Unit<B>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+{
+    /// Returns the exact routed bank specification retained by this realized unit.
+    pub fn expert_bank_spec(&self) -> &eredu_nn::GatedProductExpertBankSpec {
+        match self {
+            Self::Target(block) | Self::Dspark(block) => block.feed_forward.experts.spec(),
+            Self::Prediction(prediction) => prediction.decoder.feed_forward.experts.spec(),
+        }
+    }
 }
 
 /// V4 pinned modules shared by resident and bounded layer execution.
@@ -354,6 +367,7 @@ where
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
     parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
 }
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
@@ -574,6 +588,7 @@ where
             static_modules: static_modules(&args, text, context)?,
             args,
             parallel_geometry: None,
+            expert_realization: None,
         })
     }
 
@@ -601,6 +616,7 @@ where
             static_modules: static_modules(&args, text, context)?,
             args,
             parallel_geometry: Some(Arc::new(geometry)),
+            expert_realization: None,
         })
     }
 
@@ -615,6 +631,14 @@ where
     /// Borrows rank-local geometry for resident and streamed unit factories.
     pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V4LocalGeometry>> {
         self.parallel_geometry.clone()
+    }
+
+    /// Installs the architecture-derived expert realization used by every unit factory.
+    pub fn install_expert_realization(
+        &mut self,
+        realization: crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+    ) {
+        self.expert_realization = Some(realization);
     }
 
     /// Returns the normalized V4 arguments.
@@ -650,24 +674,38 @@ where
             .parallel_geometry
             .as_ref()
             .map_or(&self.args, |geometry| geometry.args());
-        if group == 0 {
-            Ok(Unit::Target(V4Block::new(args, index, context)?))
+        let mut unit = if group == 0 {
+            Unit::Target(V4Block::new(args, index, context)?)
         } else if self.args.dspark.is_some() {
             let global =
                 usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            Ok(Unit::Dspark(V4Block::new_at(
+            Unit::Dspark(V4Block::new_at(
                 args,
                 global,
                 &format!("mtp.{}", group - 1),
                 context,
-            )?))
+            )?)
         } else {
-            Ok(Unit::Prediction(V4PredictionLayer::new(
-                args,
-                group - 1,
-                context,
-            )?))
+            Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
+        };
+        if let Some(realization) = &self.expert_realization {
+            let owner_group = if group == 0 {
+                "target".to_owned()
+            } else {
+                format!("mtp.{}", group - 1)
+            };
+            let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
+                Error::backend(format!(
+                    "V4 expert realization has no bank for {owner_group}.{index}"
+                ))
+            })?;
+            let feed_forward = match &mut unit {
+                Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
+                Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
+            };
+            feed_forward.experts = B::gated_product_expert_bank(spec.clone(), context)?;
         }
+        Ok(unit)
     }
 
     /// Embeds tokens and broadcasts them across hyper-connection streams for

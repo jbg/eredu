@@ -391,11 +391,12 @@ impl ParallelPlanBuilder {
 /// Returns the planner-owned source-channel range for one routed expert bank.
 ///
 /// Quantized plans may partition in blocks rather than individual channels, so
-/// callers must not reconstruct this range from the rank-local tensor width.
+/// the architecture-local bank width must be mapped through the planner's
+/// logical range rather than multiplied by a tensor-parallel rank.
 pub(crate) fn routed_expert_intermediate_range(
     layout: &LocalModelLayout<TensorPlacement>,
     global_experts: usize,
-    global_width: usize,
+    local_width: usize,
 ) -> Result<std::ops::Range<usize>, Error> {
     let mut selected = None;
     for (target, tensor) in layout.tensors().filter(|(_, tensor)| {
@@ -413,12 +414,12 @@ pub(crate) fn routed_expert_intermediate_range(
                 "routed expert tensor {target:?} has no local logical range"
             ))
         })?;
-        if units == 0 || !global_width.is_multiple_of(units) {
+        if units == 0 || logical.is_empty() || !local_width.is_multiple_of(logical.len()) {
             return Err(Error::Parallel(format!(
-                "routed expert tensor {target:?} partitions width {global_width} into {units} incompatible units"
+                "routed expert tensor {target:?} maps local width {local_width} onto incompatible logical range {logical:?} of {units} units"
             )));
         }
-        let channels_per_unit = global_width / units;
+        let channels_per_unit = local_width / logical.len();
         let range = (logical.start * channels_per_unit)..(logical.end * channels_per_unit);
         if selected.as_ref().is_some_and(|current| current != &range) {
             return Err(Error::Parallel(
@@ -906,7 +907,7 @@ mod tests {
             let (_, local) = planner.finish().unwrap();
 
             assert_eq!(
-                routed_expert_intermediate_range(&local, 4, 5).unwrap(),
+                routed_expert_intermediate_range(&local, 4, expected.len()).unwrap(),
                 expected
             );
         }
