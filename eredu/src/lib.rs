@@ -78,7 +78,6 @@ pub use eredu_architectures::{
     prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
 };
 pub use eredu_architectures::{GgufArchitecture, ModelKind};
-pub use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 pub use eredu_core::artifact::{
     plan_model_preparation, ArtifactFormat, ArtifactInspection, LoadingProtocol,
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,

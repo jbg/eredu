@@ -980,12 +980,12 @@ mod tests {
         let singleton = crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1), wire);
         singleton.validate_replicated().unwrap();
         let combined = crate::backend::ModelLoadOptions::with_quantization(
-            eredu_checkpoint::WeightQuantization::MxFp4,
+            eredu_core::QuantizationRequest::MxFp4,
         )
         .with_parallel_topology(topology(0, 1, 1, 1), wire);
         assert_eq!(
             combined.quantization,
-            Some(eredu_checkpoint::WeightQuantization::MxFp4)
+            Some(eredu_core::QuantizationRequest::MxFp4)
         );
         assert!(combined.parallel_topology().unwrap().is_replicated());
 

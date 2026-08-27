@@ -584,7 +584,10 @@ intersection: the architecture declares whether its normalized parameter
 topology can be transformed before bounded materialization, and the backend
 declares whether its family composition implements that route. Core preserves
 the neutral quantization and residency request without maintaining a family
-allowlist.
+allowlist. Public backend load options carry `QuantizationRequest`, whose
+variants describe load-time transforms only; checkpoint storage encodings such
+as native GGUF blocks remain internal to artifact inspection and
+materialization.
 The same architecture capability report carries a typed parallel plan for
 tensor sharding, pipeline staging, and expert partitioning. Each axis is
 declared from the parsed family variant rather than inferred from parameter

@@ -7,8 +7,8 @@ use eredu_backend_mlx::native::{
     MlxRealtimeBackend, MlxRealtimeInput, Stream,
 };
 use eredu_backend_mlx::ModelLoadOptions;
-use eredu_checkpoint::AffineQuantization;
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
+use eredu_core::QuantizationRequest;
 use eredu_core::{
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler,
@@ -46,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = load_realtime_model_with_options(
             MlxRealtimeBackend::new(stream, weights_stream),
             eredu_architectures::moshi::prepare_realtime_model(&model_dir)?,
-            ModelLoadOptions::with_quantization(AffineQuantization::default()),
+            ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+                group_size: 64,
+                bits: 4,
+            }),
         )?;
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());

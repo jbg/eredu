@@ -1,7 +1,5 @@
 //! MLX observations and plan realization for neutral automatic planning.
 
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-
 use std::path::Path;
 
 use eredu_core::scheduler::SemanticStateTransaction;
@@ -11,11 +9,11 @@ use eredu_core::{
     ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
     ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
     HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, MtpCapability,
-    MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, RealizedDrafting,
-    RealtimeBackend, RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame,
-    RealtimeSampling, RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry,
-    SpeculativeGenerationBackend, Submission, TransferTelemetry, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics,
+    QuantizationRequest, RealizedDrafting, RealtimeBackend, RealtimeInputFrame,
+    RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling, RealtimeSpeechConfig,
+    ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend, Submission, TransferTelemetry,
+    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -295,10 +293,18 @@ fn mlx_load_options(
     let mut load = match plan.weight_transformation {
         WeightTransformationPlan::PreserveCheckpoint => ModelLoadOptions::default(),
         WeightTransformationPlan::Affine { bits, group_size } => {
-            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?)
+            ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+                group_size: u32::try_from(group_size).map_err(|_| {
+                    Error::Quantization(format!(
+                        "group_size must be non-negative, got {group_size}"
+                    ))
+                })?,
+                bits: u8::try_from(bits)
+                    .map_err(|_| Error::Quantization(format!("bits must fit in u8, got {bits}")))?,
+            })
         }
         WeightTransformationPlan::MxFp4 => {
-            ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+            ModelLoadOptions::with_quantization(QuantizationRequest::MxFp4)
         }
     };
     load.required_session_capabilities = plan.required_session_capabilities;
@@ -365,10 +371,18 @@ fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Er
     match plan.weight_transformation {
         WeightTransformationPlan::PreserveCheckpoint => Ok(ModelLoadOptions::default()),
         WeightTransformationPlan::Affine { bits, group_size } => Ok(
-            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?),
+            ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+                group_size: u32::try_from(group_size).map_err(|_| {
+                    Error::Quantization(format!(
+                        "group_size must be non-negative, got {group_size}"
+                    ))
+                })?,
+                bits: u8::try_from(bits)
+                    .map_err(|_| Error::Quantization(format!("bits must fit in u8, got {bits}")))?,
+            }),
         ),
         WeightTransformationPlan::MxFp4 => Ok(ModelLoadOptions::with_quantization(
-            WeightQuantization::MxFp4,
+            QuantizationRequest::MxFp4,
         )),
     }
 }

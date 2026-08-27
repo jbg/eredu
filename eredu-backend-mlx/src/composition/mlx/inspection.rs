@@ -394,11 +394,9 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         .preparation_policy()
         .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
     {
-        Ok(()) => match validate_gguf_quantization_source(
-            &checkpoint,
-            &metadata,
-            options.load.quantization,
-        ) {
+        Ok(()) => match options.load.weight_quantization().and_then(|quantization| {
+            validate_gguf_quantization_source(&checkpoint, &metadata, quantization)
+        }) {
             Ok(()) => report.requested_load = InspectionReadiness::Ready,
             Err(error) => reject_load_policy(&mut report, &error),
         },
@@ -1191,7 +1189,7 @@ mod tests {
         )
         .unwrap();
         let options = MlxInspectionOptions {
-            load: ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
+            load: ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
                 .with_parallel_topology(
                     topology,
                     eredu_runtime::PipelineWireContract::new(

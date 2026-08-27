@@ -1585,15 +1585,24 @@ mod tests {
             }
         }
 
-        for quantization in [
-            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
-            WeightQuantization::MxFp4,
+        for (request, quantization) in [
+            (
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+                WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            ),
+            (
+                eredu_core::QuantizationRequest::MxFp4,
+                WeightQuantization::MxFp4,
+            ),
         ] {
             let backend = MlxRealtimeBackend::new(&stream, &weights_stream);
             let mut model = load_realtime_model_with_options(
                 backend,
                 prepare(directory.path()),
-                ModelLoadOptions::with_quantization(quantization),
+                ModelLoadOptions::with_quantization(request),
             )
             .unwrap_or_else(|error| panic!("load-time {quantization:?} tiny model: {error}"));
             let metadata = model.model().metadata();

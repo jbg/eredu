@@ -25,12 +25,12 @@ use eredu::{
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AffineQuantization, AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan,
-    DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
+    AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
+    GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
     HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TextGenerationConfig,
-    TimingTelemetry, TokenOutput, WeightQuantization, WeightTransformationPlan,
+    PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, SemanticEvent,
+    TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_checkpoint::store::WeightStoreDiagnostics;
@@ -872,12 +872,16 @@ fn use_semantic_generation(
     }
 }
 
-fn requested_load_quantization(args: &Cli) -> Result<Option<WeightQuantization>> {
+fn requested_load_quantization(args: &Cli) -> Result<Option<QuantizationRequest>> {
     match (args.quantize, args.quantization_mode) {
-        (Some(bits), LoadQuantizationMode::Affine) => Ok(Some(
-            AffineQuantization::new(args.quantization_group_size, bits)?.into(),
-        )),
-        (Some(4), LoadQuantizationMode::Mxfp4) => Ok(Some(WeightQuantization::MxFp4)),
+        (Some(bits), LoadQuantizationMode::Affine) => {
+            eredu_checkpoint::AffineQuantization::new(args.quantization_group_size, bits)?;
+            Ok(Some(QuantizationRequest::Affine {
+                group_size: u32::try_from(args.quantization_group_size)?,
+                bits: u8::try_from(bits)?,
+            }))
+        }
+        (Some(4), LoadQuantizationMode::Mxfp4) => Ok(Some(QuantizationRequest::MxFp4)),
         (Some(_), LoadQuantizationMode::Mxfp4) => {
             bail!("--quantization-mode mxfp4 requires --quantize 4")
         }
@@ -3425,9 +3429,9 @@ mod tests {
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
         write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
         AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
-        ExecutionPlan, MtpDraftDevice, MtpSchedulerOptions, NativeToolSupport, ReasoningOutput,
-        ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
-        WeightQuantization, WeightTransformationPlan,
+        ExecutionPlan, MtpDraftDevice, MtpSchedulerOptions, NativeToolSupport, QuantizationRequest,
+        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -4128,7 +4132,7 @@ mod tests {
         validate_args(&mxfp4).unwrap();
         assert_eq!(
             requested_load_quantization(&mxfp4).unwrap(),
-            Some(WeightQuantization::MxFp4)
+            Some(QuantizationRequest::MxFp4)
         );
 
         let invalid_mxfp4 = Cli {

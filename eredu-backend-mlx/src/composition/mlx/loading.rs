@@ -37,19 +37,20 @@ fn materialize_gguf_model(
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = source.architecture().model_kind();
+    let quantization = options.weight_quantization()?;
     if !FamilyRealization::for_kind(kind).supports_gguf() {
         return Err(Error::ArchitectureModel(format!(
             "MLX has no GGUF realization for {}",
             kind.canonical_name()
         )));
     }
-    structural::validate_complete_gguf_quantization(kind, options.quantization.is_some())?;
+    structural::validate_complete_gguf_quantization(kind, quantization.is_some())?;
     let model = match source.architecture() {
         GgufArchitecture::KimiLinear => {
             let loaded = crate::composition::kimi_linear::load_kimi_linear_gguf_model(
                 source,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -77,7 +78,7 @@ fn materialize_gguf_model(
             let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_model(
                 source,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -107,7 +108,7 @@ fn materialize_gguf_model(
             let loaded = crate::composition::llama::load_llama_gguf_model(
                 source,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -127,7 +128,7 @@ fn materialize_gguf_model(
             let loaded = crate::composition::lfm2::load_lfm2_gguf_model(
                 source,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -137,7 +138,7 @@ fn materialize_gguf_model(
             let loaded = crate::composition::nemotron_h::load_nemotron_h_gguf_model(
                 source,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -147,7 +148,7 @@ fn materialize_gguf_model(
             let loaded = crate::composition::qwen::load_qwen_gguf_model(
                 source,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -163,7 +164,7 @@ fn materialize_gguf_model(
                 source,
                 projector,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -178,7 +179,7 @@ fn materialize_gguf_model(
                 source,
                 projector,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?;
@@ -639,7 +640,10 @@ fn materialize_tensor_parallel(
                 .into(),
         ));
     }
-    reject_complete_tensor_parallel_quantization(options.quantization, kind.canonical_name())?;
+    reject_complete_tensor_parallel_quantization(
+        options.weight_quantization()?,
+        kind.canonical_name(),
+    )?;
     let execution = options.weight_residency.layers();
     let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
@@ -776,7 +780,7 @@ fn materialize_gguf_artifact(
         structural::AdmittedGguf::from_admission(architecture, projector_plan, validated)?;
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
-    validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;
+    validate_gguf_quantization_source(checkpoint, metadata, options.weight_quantization()?)?;
     #[cfg(any(feature = "image", feature = "audio"))]
     let processor = ModelProcessor::from_plan(&architecture_plan);
     if options
@@ -833,7 +837,7 @@ fn materialize_gguf_tensor_parallel(
         Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
     })?;
     reject_complete_tensor_parallel_quantization(
-        options.quantization,
+        options.weight_quantization()?,
         architecture.metadata_name(),
     )?;
     let residency = options.weight_residency.layers();
@@ -1000,6 +1004,7 @@ pub(super) fn materialize_safetensors(
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = artifact.architecture().model_kind();
+    let quantization = options.weight_quantization()?;
     if let (Some(expert_cache), Some(non_expert)) = (
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),
@@ -1016,7 +1021,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::kimi_linear::load_kimi_linear_model(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1026,7 +1031,7 @@ pub(super) fn materialize_safetensors(
                 Box::new(crate::composition::deepseek::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?),
@@ -1036,7 +1041,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
                     artifact,
                     options.weight_residency,
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1046,7 +1051,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::gemma4::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1056,7 +1061,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::inkling::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1066,7 +1071,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::lfm2::load_lfm2_model(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1076,7 +1081,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::muse_glimmer::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1086,7 +1091,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::nemotron_h::load_nemotron_h_model(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1096,7 +1101,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::qwen::load_qwen_safetensors_mlx(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1106,7 +1111,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1116,7 +1121,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::qwen::vl::load_safetensors_with_residency(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1126,7 +1131,7 @@ pub(super) fn materialize_safetensors(
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
-                    options.quantization,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -1134,7 +1139,7 @@ pub(super) fn materialize_safetensors(
         };
     }
     let execution = options.weight_residency.layers();
-    if let Some(quantization) = options.quantization {
+    if let Some(quantization) = quantization {
         quantization.validate()?;
     }
     match kind {
@@ -1143,7 +1148,7 @@ pub(super) fn materialize_safetensors(
             Box::new(crate::composition::deepseek::load_safetensors(
                 artifact,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?),
@@ -1153,7 +1158,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::gemma4::load_safetensors(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1163,7 +1168,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::inkling::load_safetensors(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1173,7 +1178,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::kimi_linear::load_kimi_linear_model(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1183,7 +1188,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::llama::load_llama_safetensors_mlx(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1193,7 +1198,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::muse_glimmer::load_safetensors(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1203,7 +1208,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::qwen::load_qwen_safetensors_mlx(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1213,7 +1218,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
                 artifact,
                 options.weight_residency,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1223,7 +1228,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::lfm2::load_lfm2_model(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1233,7 +1238,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::nemotron_h::load_nemotron_h_model(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1243,7 +1248,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
                 execution,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1253,7 +1258,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::qwen::vl::load_safetensors(
                 artifact,
                 execution,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1263,7 +1268,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::qwen::vl::load_safetensors(
                 artifact,
                 execution,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1273,7 +1278,7 @@ pub(super) fn materialize_safetensors(
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
                 execution,
-                options.quantization,
+                quantization,
                 stream,
                 weights_stream,
             )?,

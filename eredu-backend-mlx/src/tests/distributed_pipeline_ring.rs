@@ -1063,11 +1063,21 @@ fn pipeline_ring_worker() {
     assert!(!(dense_stream && layerwise_host));
     let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
     let requantize = std::env::var_os(REQUANTIZE).is_some();
-    let requested_quantization = if family == FixtureFamily::NemotronH {
-        WeightQuantization::MxFp4
-    } else {
-        AffineQuantization::new(32, 4).unwrap().into()
-    };
+    let (requested_quantization, requested_weight_quantization) =
+        if family == FixtureFamily::NemotronH {
+            (
+                eredu_core::QuantizationRequest::MxFp4,
+                WeightQuantization::MxFp4,
+            )
+        } else {
+            (
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+                WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            )
+        };
     let base_options = || {
         if requantize {
             ModelLoadOptions::with_quantization(requested_quantization).with_parallel_topology(
@@ -1304,7 +1314,10 @@ fn pipeline_ring_worker() {
             assert!(report.owned_bytes > 0);
             assert_eq!(report.device_resident_experts, 0);
             if requantize {
-                assert_eq!(report.weight_quantization, Some(requested_quantization));
+                assert_eq!(
+                    report.weight_quantization,
+                    Some(requested_weight_quantization)
+                );
                 let materialization = report.materialization.as_ref().unwrap();
                 assert!(materialization.transformed_weights > 0);
                 assert!(materialization.source_tiles > 0);
@@ -1593,7 +1606,20 @@ fn resident_reference_quantized(
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
     let options = quantization
-        .map(ModelLoadOptions::with_quantization)
+        .map(|quantization| match quantization {
+            WeightQuantization::Affine(config) => {
+                ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::Affine {
+                    group_size: u32::try_from(config.group_size).unwrap(),
+                    bits: u8::try_from(config.bits).unwrap(),
+                })
+            }
+            WeightQuantization::MxFp4 => {
+                ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+            }
+            WeightQuantization::GgufIQuant { .. } => {
+                panic!("checkpoint-native GGUF quantization is not a load-time transform")
+            }
+        })
         .unwrap_or_default();
     let backend = crate::native::backend(stream, stream);
     let mut model = eredu_core::load_model(&backend, checkpoint, options)

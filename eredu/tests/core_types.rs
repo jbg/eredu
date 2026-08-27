@@ -23,7 +23,7 @@ fn facade_exports_are_curated_application_types() {
         TypeId::of::<eredu_core::MultimodalRequest>(),
     );
     assert_eq!(
-        TypeId::of::<eredu::WeightQuantization>(),
-        TypeId::of::<eredu_checkpoint::WeightQuantization>(),
+        TypeId::of::<eredu::QuantizationRequest>(),
+        TypeId::of::<eredu_core::QuantizationRequest>(),
     );
 }

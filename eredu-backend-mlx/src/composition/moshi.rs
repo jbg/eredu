@@ -318,7 +318,7 @@ pub fn load(
     });
 
     let quantize = options
-        .quantization
+        .weight_quantization()?
         .map(|requested| {
             should_quantize_on_load(
                 "Moshi family",

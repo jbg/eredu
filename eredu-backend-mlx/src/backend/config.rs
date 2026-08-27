@@ -1,6 +1,7 @@
 //! MLX model materialization options.
 
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use eredu_core::QuantizationRequest;
 
 use crate::backend::error::Error;
 use eredu_runtime::{PipelineWireContract, WeightResidency};
@@ -10,8 +11,8 @@ use super::MlxParallelContext;
 /// Options for materializing model weights with MLX.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct ModelLoadOptions {
-    /// Optional MLX weight encoding requested during dense checkpoint loading.
-    pub quantization: Option<WeightQuantization>,
+    /// Optional weight transformation requested during dense checkpoint loading.
+    pub quantization: Option<QuantizationRequest>,
     /// Validated runtime topology paired with its required wire contract.
     parallel: Option<(MlxParallelContext, PipelineWireContract)>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
@@ -22,9 +23,9 @@ pub struct ModelLoadOptions {
 
 impl ModelLoadOptions {
     /// Creates load options that quantize eligible dense weights on load.
-    pub fn with_quantization(quantization: impl Into<WeightQuantization>) -> Self {
+    pub fn with_quantization(quantization: QuantizationRequest) -> Self {
         Self {
-            quantization: Some(quantization.into()),
+            quantization: Some(quantization),
             parallel: None,
             weight_residency: WeightResidency::fully_resident(),
             required_session_capabilities: eredu_core::SessionCapabilities::default(),
@@ -88,6 +89,23 @@ impl ModelLoadOptions {
         self.parallel
     }
 
+    pub(crate) fn weight_quantization(self) -> Result<Option<WeightQuantization>, Error> {
+        self.quantization
+            .map(|request| match request {
+                QuantizationRequest::Affine { group_size, bits } => {
+                    let group_size = i32::try_from(group_size).map_err(|_| {
+                        Error::Quantization(format!("group_size must fit in i32, got {group_size}"))
+                    })?;
+                    Ok(WeightQuantization::Affine(AffineQuantization::new(
+                        group_size,
+                        i32::from(bits),
+                    )?))
+                }
+                QuantizationRequest::MxFp4 => Ok(WeightQuantization::MxFp4),
+            })
+            .transpose()
+    }
+
     pub(crate) fn validate_replicated(self) -> Result<(), Error> {
         if self
             .parallel_topology()
@@ -102,33 +120,10 @@ impl ModelLoadOptions {
     }
 
     pub fn preparation_policy(self) -> Result<eredu_core::PreparationPolicy, Error> {
-        use eredu_core::{QuantizationRequest, ResidencyRequest};
+        use eredu_core::ResidencyRequest;
         use eredu_runtime::LayerWeightResidency;
 
-        if let Some(quantization) = self.quantization {
-            quantization.validate()?;
-        }
-        let quantization = match self.quantization {
-            Some(WeightQuantization::Affine(config)) => Some(QuantizationRequest::Affine {
-                group_size: u32::try_from(config.group_size).map_err(|_| {
-                    Error::Quantization(format!(
-                        "group_size must be non-negative, got {}",
-                        config.group_size
-                    ))
-                })?,
-                bits: u8::try_from(config.bits).map_err(|_| {
-                    Error::Quantization(format!("bits must fit in u8, got {}", config.bits))
-                })?,
-            }),
-            Some(WeightQuantization::MxFp4) => Some(QuantizationRequest::MxFp4),
-            Some(WeightQuantization::GgufIQuant { .. }) => {
-                return Err(Error::Quantization(
-                    "checkpoint-native GGML blocks describe GGUF storage and cannot be requested as a load-time quantization transform"
-                        .into(),
-                ));
-            }
-            None => None,
-        };
+        self.weight_quantization()?;
         let residency = if self.weight_residency.expert_cache().is_some() {
             ResidencyRequest::ExpertCache
         } else {
@@ -139,7 +134,7 @@ impl ModelLoadOptions {
             }
         };
         Ok(eredu_core::PreparationPolicy {
-            quantization,
+            quantization: self.quantization,
             residency,
             topology: self.parallel_topology().map(MlxParallelContext::topology),
             required_session_capabilities: self.required_session_capabilities,
@@ -149,8 +144,7 @@ impl ModelLoadOptions {
 
 #[cfg(test)]
 mod tests {
-    use eredu_checkpoint::WeightQuantization;
-    use eredu_gguf::{Endian, GgmlType};
+    use eredu_core::QuantizationRequest;
     use eredu_runtime::LayerwiseLoadOptions;
 
     use super::{MlxParallelContext, ModelLoadOptions};
@@ -159,7 +153,7 @@ mod tests {
 
     #[test]
     fn preparation_policy_preserves_quantized_nonresident_request() {
-        let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+        let options = ModelLoadOptions::with_quantization(QuantizationRequest::MxFp4)
             .with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::default(),
             ));
@@ -175,10 +169,10 @@ mod tests {
     }
 
     #[test]
-    fn preparation_policy_rejects_checkpoint_native_gguf_encoding_as_a_transform() {
-        let error = ModelLoadOptions::with_quantization(WeightQuantization::GgufIQuant {
-            ggml_type: GgmlType::Q4_0,
-            endian: Endian::Little,
+    fn preparation_policy_rejects_invalid_affine_geometry() {
+        let error = ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+            group_size: 17,
+            bits: 4,
         })
         .preparation_policy()
         .unwrap_err();
@@ -186,7 +180,7 @@ mod tests {
         assert!(matches!(
             error,
             crate::backend::error::Error::Quantization(message)
-                if message.contains("checkpoint-native GGML blocks")
+                if message.contains("group_size")
         ));
     }
 

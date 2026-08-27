@@ -343,6 +343,7 @@ pub fn load_assistant_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
+    let quantization = options.weight_quantization()?;
     if !options.weight_residency.is_fully_resident() {
         return Err(Error::ArchitectureModel(
             "Gemma 4 assistant loading supports fully resident weights only".into(),
@@ -356,8 +357,7 @@ pub fn load_assistant_safetensors(
             "Gemma 4 assistant loading requires replicated placement".into(),
         ));
     }
-    let requested = options
-        .quantization
+    let requested = quantization
         .map(|requested| {
             should_quantize_on_load("Gemma 4 assistant", source_config.quantization, requested)
                 .map(|required| required.then_some(requested))
@@ -401,6 +401,7 @@ pub fn load_assistant_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
+    let quantization = options.weight_quantization()?;
     if !options.weight_residency.is_fully_resident() {
         return Err(Error::ArchitectureModel(
             "Gemma 4 assistant loading supports fully resident weights only".into(),
@@ -426,7 +427,7 @@ pub fn load_assistant_gguf(
     crate::composition::mlx::validate_gguf_quantization_source(
         &mlx_checkpoint,
         &metadata,
-        options.quantization,
+        quantization,
     )?;
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
@@ -436,7 +437,7 @@ pub fn load_assistant_gguf(
             })?
             .build()?,
     );
-    let (store, config) = if let Some(requested) = options.quantization {
+    let (store, config) = if let Some(requested) = quantization {
         let config = source_config
             .load_time_quantization(requested)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
