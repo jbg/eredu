@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs::read_to_string,
     ops::{Deref, DerefMut},
     path::Path,
@@ -41,7 +41,9 @@ pub fn vocabulary_fingerprint(tokenizer: &tokenizers::Tokenizer) -> [u8; 32] {
 /// A single chat template or a Hugging Face named-template collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelChatTemplate {
+    /// A single template used for every request.
     Single(String),
+    /// A collection indexed by template name.
     Named(BTreeMap<String, String>),
 }
 
@@ -60,7 +62,9 @@ impl From<&str> for ModelChatTemplate {
 /// Stable identity of the template selected from a checkpoint's template metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChatTemplateIdentity {
+    /// The checkpoint provides one unnamed template.
     Single,
+    /// The checkpoint provides a template with this name.
     Named(String),
 }
 
@@ -72,10 +76,12 @@ pub struct SelectedChatTemplate<'a> {
 }
 
 impl SelectedChatTemplate<'_> {
+    /// Returns the selected template source.
     pub fn template(&self) -> &str {
         self.template
     }
 
+    /// Returns the checkpoint-local identity of the selected template.
     pub fn identity(&self) -> &ChatTemplateIdentity {
         &self.identity
     }
@@ -138,6 +144,7 @@ impl FromStr for Tokenizer {
 }
 
 impl Tokenizer {
+    /// Wraps a Hugging Face tokenizer with chat-template support.
     pub fn from_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
         let mut env = Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -149,6 +156,7 @@ impl Tokenizer {
         }
     }
 
+    /// Replaces the default variables supplied to chat templates.
     pub fn set_template_kwargs(
         &mut self,
         template_kwargs: serde_json::Map<String, serde_json::Value>,
@@ -156,18 +164,22 @@ impl Tokenizer {
         self.template_kwargs = template_kwargs;
     }
 
+    /// Returns the default variables supplied to chat templates.
     pub fn template_kwargs(&self) -> &serde_json::Map<String, serde_json::Value> {
         &self.template_kwargs
     }
 
+    /// Loads and wraps a tokenizer from a `tokenizer.json` file.
     pub fn from_file(file: impl AsRef<Path>) -> tokenizers::Result<Self> {
         tokenizers::Tokenizer::from_file(file).map(Self::from_tokenizer)
     }
 
+    /// Loads and wraps a tokenizer from serialized `tokenizer.json` bytes.
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> tokenizers::Result<Self> {
         tokenizers::Tokenizer::from_bytes(bytes).map(Self::from_tokenizer)
     }
 
+    /// Renders a batch of structured conversations with a model chat template.
     pub fn apply_chat_template<'a, I, R, T>(
         &'a mut self,
         model_template: impl Into<ModelChatTemplate>,
@@ -186,6 +198,7 @@ impl Tokenizer {
         )
     }
 
+    /// Renders and tokenizes a batch of structured conversations.
     pub fn apply_chat_template_and_encode<'a, I, R, T>(
         &mut self,
         model_template: impl Into<ModelChatTemplate>,
@@ -213,6 +226,7 @@ impl Tokenizer {
             .map_err(Into::into)
     }
 
+    /// Renders conversations already represented as JSON message arrays.
     pub fn apply_chat_template_json<'a, I>(
         &mut self,
         model_template: impl Into<ModelChatTemplate>,
@@ -269,28 +283,32 @@ impl DerefMut for Tokenizer {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
+/// Standard roles used by chat-template messages.
 pub enum Role {
+    /// Instructions supplied by the system or model author.
     System,
+    /// Input supplied by the user.
     User,
+    /// Output supplied by the assistant.
     Assistant,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub enum Content {
-    String(String),
-    Map(HashMap<String, String>),
-}
-
+/// A role-tagged message passed to a chat template.
 #[derive(Debug, Clone, Serialize)]
 pub struct Conversation<R, T> {
+    /// The message role.
     pub role: R,
+    /// The message content.
     pub content: T,
 }
 
+/// An owned or borrowed conversation presented to a chat template.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Chat<'a, R, T> {
+    /// A borrowed conversation slice.
     Borrowed(&'a [Conversation<R, T>]),
+    /// An owned conversation.
     Owned(Vec<Conversation<R, T>>),
 }
 
@@ -317,16 +335,21 @@ impl<'a, R, T> From<&'a [Conversation<R, T>]> for Chat<'a, R, T> {
     }
 }
 
+/// A document made available for retrieval-aware chat templates.
 #[derive(Debug, Clone, Serialize)]
 pub struct Document {
+    /// The document title.
     pub title: String,
+    /// The document body.
     pub text: String,
 }
 
+/// A conversation whose messages are already represented as JSON values.
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub struct JsonConversation(pub Vec<serde_json::Value>);
 
+/// Inputs for rendering one or more conversations with a chat template.
 #[derive(Default)]
 pub struct ApplyChatTemplateArgs<'a, I, R = Role, T = String>
 where
@@ -334,17 +357,25 @@ where
     R: Serialize + 'a,
     T: Serialize + 'a,
 {
-    // pub conversations: &'a [Conversation<R, T>],
+    /// Conversations to render.
     pub conversations: I,
+    /// Tool definitions exposed to the template.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Documents exposed to the template.
     pub documents: Option<&'a [Document]>,
+    /// Stable model identifier used to cache the compiled template.
     pub model_id: &'a str,
+    /// Identifier of a template already registered in the environment.
     pub chat_template_id: Option<&'a str>,
+    /// Whether to ask the template to append its generation prompt.
     pub add_generation_prompt: Option<bool>,
+    /// Whether to trim the rendering after the final input message.
     pub continue_final_message: Option<bool>,
+    /// Additional variables exposed to the template.
     pub template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Loads chat-template metadata from serialized `tokenizer_config.json` data.
 pub fn load_model_chat_template_from_str(
     content: &str,
 ) -> std::io::Result<Option<ModelChatTemplate>> {
@@ -410,6 +441,7 @@ pub fn load_model_chat_template_from_str(
     Ok(Some(ModelChatTemplate::Named(templates)))
 }
 
+/// Loads chat-template metadata from a `tokenizer_config.json` file.
 pub fn load_model_chat_template_from_file(
     file: impl AsRef<Path>,
 ) -> std::io::Result<Option<ModelChatTemplate>> {
@@ -460,6 +492,7 @@ const STANDARD_CHAT_TEMPLATE_VARIABLES: &[&str] = &[
     "strftime_now",
 ];
 
+/// Renders JSON message arrays using a caller-provided MiniJinja environment.
 pub fn apply_chat_template_json<'a, I>(
     env: &mut Environment<'static>,
     model_template: impl Into<ModelChatTemplate>,
@@ -522,6 +555,7 @@ where
     )
 }
 
+/// Renders structured conversations using a caller-provided MiniJinja environment.
 pub fn apply_chat_template<'a, I, R, T>(
     env: &mut Environment<'static>,
     model_template: impl Into<ModelChatTemplate>,

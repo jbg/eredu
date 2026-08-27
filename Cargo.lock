@@ -846,7 +846,6 @@ dependencies = [
  "anyhow",
  "eredu-architectures",
  "eredu-backend-mlx",
- "eredu-checkpoint",
  "eredu-core",
  "eredu-gguf",
  "eredu-runtime",

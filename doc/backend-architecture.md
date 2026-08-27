@@ -48,9 +48,9 @@ reproduce the implementation crate's backend or composition module tree.
 Backend-internal
 fixtures and composition tests are crate-private unit tests; published crates
 expose no test-support feature or fixture namespace. The facade does not
-directly depend on `eredu-nn`. Direct MLX backend users also enable `image` and
-`audio` as needed; the facade forwards those same capability features through
-the optional adapter without selecting it. Shared
+directly depend on `eredu-nn` or `eredu-checkpoint`. Direct MLX backend users
+also enable `image` and `audio` as needed; the facade forwards those same
+capability features through the optional adapter without selecting it. Shared
 media-processing infrastructure is compiled whenever either capability is
 enabled; there is no capability-less `media` feature. Backend feature
 diagnostics name the active public spelling. Cargo features are all published,

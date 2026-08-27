@@ -103,7 +103,6 @@ eredu-backend-mlx = { workspace = true, optional = true }
 eredu-core.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
-eredu-checkpoint.workspace = true
 eredu-runtime.workspace = true
 eredu-architectures.workspace = true
 

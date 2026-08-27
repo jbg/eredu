@@ -94,8 +94,8 @@ pub struct ChatTemplateRequest {
     /// Additional variables exposed to the checkpoint chat template.
     ///
     /// `enable_thinking` and `reasoning_effort`, when explicitly set above,
-    /// override same-named entries. Existing renderer precedence for all other
-    /// keys is preserved.
+    /// replace same-named entries in this map. All other entries are passed to
+    /// the template unchanged.
     pub extra_template_kwargs: Map<String, Value>,
 }
 
