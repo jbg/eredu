@@ -17,7 +17,7 @@
 //! ## Basics
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{array, Dtype};
 //!
 //! let a = array!([1, 2, 3, 4]);
@@ -40,7 +40,7 @@
 //! still lazy, so it must be evaluated after the dependency is inserted.
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::array;
 //!
 //! let a = array!([1, 2, 3, 4]);
@@ -220,7 +220,7 @@
 //! location:
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! // let a = safemlx::random::normal(&[100], None, None, None, None).unwrap();
 //! // let b = safemlx::random::normal(&[100], None, None, None, None).unwrap();
 //!
@@ -237,7 +237,7 @@
 //! example:
 //!
 //! ```rust,ignore
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! // safemlx::ops::add(&a, &b, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
 //! // safemlx::ops::add(&a, &b, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
 //!

@@ -19,7 +19,7 @@
 //! ## One dimension
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Dtype, Array, Stream, complex64, fft::*};
 //!
 //! let src = [1.0f32, 2.0, 3.0, 4.0];
@@ -70,7 +70,7 @@
 //! ## Two dimensions
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Dtype, Array, Stream, complex64, fft::*};
 //!
 //! let src = [1.0f32, 1.0, 1.0, 1.0];
@@ -121,7 +121,7 @@
 //! ## `N` dimensions
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Dtype, Array, Stream, complex64, fft::*};
 //!
 //! let mut array = Array::ones::<f32>(&[2, 2, 2], &stream).unwrap();

@@ -15,7 +15,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -70,7 +70,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -125,7 +125,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -180,7 +180,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///

@@ -276,7 +276,7 @@ def stage_package(
     git_commit_index(index, relative_index_path, f"Stage {name} {version}")
 
 
-def validate_packaged_unit_tests(
+def validate_packaged_tests(
     package: dict[str, Any],
     archive: Path,
     destination: Path,
@@ -295,6 +295,18 @@ def validate_packaged_unit_tests(
             "test",
             "--no-run",
             "--lib",
+            "--no-default-features",
+            "--config",
+            str(config),
+        ],
+        cwd=package_root,
+        env=environment,
+    )
+    run(
+        [
+            "cargo",
+            "test",
+            "--doc",
             "--no-default-features",
             "--config",
             str(config),
@@ -395,7 +407,7 @@ def main() -> int:
                     f"{MAX_ARCHIVE_BYTES:,} bytes"
                 )
             print(f"    archive size: {size / 1024:.1f} KiB", flush=True)
-            validate_packaged_unit_tests(
+            validate_packaged_tests(
                 package,
                 archive,
                 root / "unit-tests",

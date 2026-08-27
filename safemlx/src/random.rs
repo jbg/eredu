@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// # Example
 ///
 /// ```rust,no_run
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::random::RandomState;
 /// use safemlx::transforms::compile::compile_with_state;
 /// use safemlx::random::categorical;
@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// let logits = Array::zeros::<f32>(&[1, 10], &stream).unwrap();
 /// let mut compiled = compile_with_state(
 ///     |state: &mut RandomState, x: &Array| {
-///         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+///         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 ///         let key = state.next_key(&stream)?;
 ///         categorical(x, None, None, Some(&key), &stream)
 ///     },
@@ -195,7 +195,7 @@ pub fn split_key_at(
 /// - `key` (optional): A PRNG key.
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// // create an array of shape `[50]` type f32 values in the range [0, 10)
@@ -247,7 +247,7 @@ pub fn uniform<'a, E: Into<Array>, T: ArrayElement>(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// // generate a single f32 with normal distribution
@@ -326,7 +326,7 @@ pub fn multivariate_normal<'a, T: ArrayElement>(
 /// scalars or arrays and must be roadcastable to `shape`.
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{array, random};
 ///
 /// let key = random::key(0).unwrap();
@@ -369,7 +369,7 @@ pub fn randint<'a, E: Into<Array>, T: ArrayElement>(
 /// must be broadcastable to `shape`.
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{array, Array, random};
 ///
 /// let key = random::key(0).unwrap();
@@ -417,7 +417,7 @@ pub fn bernoulli<'a>(
 /// can be scalars or arrays and must be broadcastable to `shape`.
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{array, random};
 ///
 /// let key = random::key(0).unwrap();
@@ -460,7 +460,7 @@ pub fn truncated_normal<'a, E: Into<Array>, T: ArrayElement>(
 /// which CDF `exp(-exp(-x))`.
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// // generate a single Float with Gumbel distribution
@@ -521,7 +521,7 @@ pub enum ShapeOrCount<'a> {
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// let key = safemlx::random::key(0).unwrap();
 ///
 /// let logits = safemlx::Array::zeros::<u32>(&[5, 20], &stream).unwrap();

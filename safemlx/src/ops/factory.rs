@@ -16,9 +16,9 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
-    /// Array::zeros::<f32>(&[5, 10], Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
+    /// Array::zeros::<f32>(&[5, 10], Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
     /// ```
     pub fn zeros<T: ArrayElement>(shape: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
         let dtype = T::DTYPE;
@@ -34,9 +34,9 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
-    /// Array::ones::<f32>(&[5, 10], Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
+    /// Array::ones::<f32>(&[5, 10], Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
     /// ```
     pub fn ones<T: ArrayElement>(shape: &[i32], stream: impl AsRef<Stream>) -> Result<Array> {
         let dtype = T::DTYPE;
@@ -54,10 +54,10 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     /// //  create [10, 10] array with 1's on the diagonal.
-    /// let r = Array::eye::<f32>(10, None, None, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
+    /// let r = Array::eye::<f32>(10, None, None, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
     /// ```
     pub fn eye<T: ArrayElement>(
         n: i32,
@@ -90,10 +90,10 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream, array};
     /// //  create [5, 4] array filled with 7
-    /// let r = Array::full::<f32>(&[5, 4], array!(7.0f32), Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
+    /// let r = Array::full::<f32>(&[5, 4], array!(7.0f32), Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
     /// ```
     pub fn full<T: ArrayElement>(
         shape: &[i32],
@@ -121,10 +121,10 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     /// //  create [10, 10] array with 1's on the diagonal.
-    /// let r = Array::identity::<f32>(10, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
+    /// let r = Array::identity::<f32>(10, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
     /// ```
     pub fn identity<T: ArrayElement>(n: i32, stream: impl AsRef<Stream>) -> Result<Array> {
         Array::try_from_op(|res| unsafe {
@@ -145,7 +145,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     ///
     /// // Create a 1-D array with values from 0 to 50
@@ -188,10 +188,10 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     /// // Create a 50 element 1-D array with values from 0 to 50
-    /// let r = Array::linspace::<_, f32>(0, 50, None, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))).unwrap();
+    /// let r = Array::linspace::<_, f32>(0, 50, None, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))).unwrap();
     /// ```
     pub fn linspace<U, T>(
         start: U,
@@ -230,7 +230,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     /// // repeat a [2, 2] array 4 times along axis 1
     /// let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
@@ -257,7 +257,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     /// // repeat a 4 element array 4 times along axis 0
     /// let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
@@ -284,10 +284,10 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Stream};
     /// // [5, 5] array with the lower triangle filled with 1s
-    /// let r = Array::tri::<f32>(5, None, None, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0)));
+    /// let r = Array::tri::<f32>(5, None, None, Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0)));
     /// ```
     pub fn tri<T: ArrayElement>(
         n: i32,
@@ -380,7 +380,7 @@ pub fn ones_like(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, Dtype, ops::full_like};
 ///
 /// let a = Array::from_slice(&[1i32, 2, 3], &[3]);

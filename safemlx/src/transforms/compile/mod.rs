@@ -19,11 +19,11 @@
 //! # Basic usage
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Array, array, transforms::compile::compile, error::Exception};
 //!
 //! let fun = |(x, y): (&Array, &Array)| -> Result<Array, Exception> {
-//!    let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//!    let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //!    safemlx::exp!(x.negative(&stream)?, stream=&stream)?.add(y, &stream)
 //! };
 //!
@@ -52,11 +52,11 @@
 //! should typically compile functions that you plan to use more than once.
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Array, array, transforms::compile::compile};
 //!
 //! let fun = |(x, y): (&Array, &Array)| {
-//!    let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//!    let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //!    safemlx::exp!(x.negative(&stream)?, stream=&stream)?.add(y, &stream)
 //! };
 //!
@@ -120,12 +120,12 @@
 //! pass the state as an mutable reference.
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Array, array, transforms::compile::compile_with_state};
 //! let mut state = vec![];
 //!
 //! let fun = |state: &mut Vec<Array>, (x, y): (&Array, &Array)| {
-//!     let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//!     let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //!     let z = x.add(y, &stream)?;
 //!     let result = safemlx::exp!(&z, stream=&stream);
 //!     state.push(z);

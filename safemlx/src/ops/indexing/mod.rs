@@ -44,7 +44,7 @@
 //! ## Examples
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! // See the multi-dimensional example code for mlx python https://ml-explore.github.io/mlx/build/html/usage/indexing.html
 //!
 //! use safemlx::{Array, ops::indexing::*};
@@ -72,7 +72,7 @@
 //! ## Example
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Array, ops::indexing::*};
 //!
 //! let mut a = Array::from_slice(&[1, 2, 3], &[3]);
@@ -83,7 +83,7 @@
 //! ```
 //!
 //! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 //! use safemlx::{Array, ops::indexing::*};
 //!
 //! let mut a = Array::from_iter(0i32..20, &[2, 2, 5]);

@@ -14,7 +14,7 @@ use crate::{error::Result, utils::guard::Guarded, Array, Stream};
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -41,7 +41,7 @@ pub fn sort_axis(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -64,7 +64,7 @@ pub fn sort(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Res
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -92,7 +92,7 @@ pub fn argsort_axis(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -121,7 +121,7 @@ pub fn argsort(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> 
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -162,7 +162,7 @@ pub fn partition_axis(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -196,7 +196,7 @@ pub fn partition(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);
@@ -238,7 +238,7 @@ pub fn argpartition_axis(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_slice(&[3, 2, 1], &[3]);

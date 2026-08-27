@@ -14,27 +14,27 @@ python3 validation/validate_release_packages.py
 ```
 
 The validator copies the Git package candidates to a temporary workspace, then
-runs `cargo package` for each crate. It unpacks each archive and compiles its
-library unit tests with default features disabled before adding that archive to
-an ephemeral local registry. This lets the next crate resolve the exact
-unpublished workspace version while retaining Cargo's normal package
-verification. Nothing contacts a registry publishing API and no credentials
-are required.
+runs `cargo package` for each crate. It unpacks each archive, compiles its
+library unit tests, and runs its doctests with default features disabled before
+adding that archive to an ephemeral local registry. This lets the next crate
+resolve the exact unpublished workspace version while retaining Cargo's normal
+package verification. Nothing contacts a registry publishing API and no
+credentials are required.
 
 This catches:
 
 - path dependencies without publishable versions or versions that do not match
   an earlier workspace archive;
-- files omitted from the generated archive that cause package or packaged unit
-  test compilation to fail;
+- files omitted from the generated archive that cause package, packaged unit
+  test compilation, or packaged doctests to fail;
 - archives above crates.io's 10 MiB compressed-size limit; and
 - new publishable crates or dependency changes that are missing from the
   declared order.
 
 The release-package CI job runs this validation on Ubuntu with the CPU MLX
-prerequisites. Archive unit tests are compiled without default features, while
-Cargo's normal package verification still compiles each crate's default
-packaged targets. Packaging does not need an Apple or NVIDIA runner:
+prerequisites. Archive unit tests are compiled and doctests run without default
+features, while Cargo's normal package verification still compiles each crate's
+default packaged targets. Packaging does not need an Apple or NVIDIA runner:
 target-native Metal and CUDA coverage remains in the platform workflows.
 
 ## Publication order

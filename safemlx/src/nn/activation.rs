@@ -18,7 +18,7 @@ use safemlx_macros::ModuleParameters;
 /// This is:
 ///
 /// ```rust, ignore
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// sigmoid(x, &stream)
 /// ```
 pub fn sigmoid(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
@@ -178,7 +178,7 @@ pub fn celu(
 /// This is:
 ///
 /// ```rust, ignore
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// x * sigmoid(x, &stream)
 /// ```
 pub fn silu(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
@@ -346,7 +346,7 @@ pub fn prelu(
 /// This is:
 ///
 /// ```rust, ignore
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// x * tanh(softplus(x, &stream))
 /// ```
 pub fn mish(x: impl AsRef<Array>, stream: impl AsRef<crate::Stream>) -> Result<Array> {
@@ -410,7 +410,7 @@ impl Module<&Array> for Glu {
 /// This is:
 ///
 /// ```rust, ignore
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// sigmoid(x, &stream)
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]
@@ -437,7 +437,7 @@ impl Module<&Array> for Sigmoid {
 /// This is:
 ///
 /// ```rust, ignore
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// x * tanh(softplus(x, &stream))
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]
@@ -654,7 +654,7 @@ impl Module<&Array> for Celu {
 /// This is:
 ///
 /// ```rust, ignore
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// x * sigmoid(x, &stream)
 /// ```
 #[derive(Debug, Clone, ModuleParameters)]

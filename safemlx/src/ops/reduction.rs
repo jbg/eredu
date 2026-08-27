@@ -30,7 +30,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let a = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[3, 4]);
     /// let mut b = a.all_axes(&[0], None, &stream).unwrap();
@@ -101,7 +101,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -170,7 +170,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -239,7 +239,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -335,7 +335,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///
@@ -405,7 +405,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::Array;
     /// let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
     ///

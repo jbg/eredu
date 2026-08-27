@@ -42,7 +42,7 @@ impl Array {
     /// # Example
     ///
     /// ```rust
-    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    /// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     /// use safemlx::{Array, Dtype};
     ///
     /// let array = Array::from_slice(&[1i16,2,3], &[3]);

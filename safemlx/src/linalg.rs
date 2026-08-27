@@ -132,7 +132,7 @@ pub fn norm_l2<'a>(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, Stream, linalg::*};
 ///
 /// let a = Array::from_slice(&[2.0f32, 3.0, 1.0, 2.0], &[2, 2]);
@@ -168,7 +168,7 @@ pub fn qr(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Resul
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, Stream, linalg::*};
 ///
 /// let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
@@ -212,7 +212,7 @@ pub fn svd(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, Stream, linalg::*};
 ///
 /// let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
@@ -358,7 +358,7 @@ pub fn eigvalsh(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, linalg::*, Stream};
 ///
 /// let a = Array::from_slice(&[1.0f32, 1.0, 3.0, 4.0], &[2, 2]);
@@ -391,7 +391,7 @@ pub fn eig(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> Resu
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, linalg::*, Stream};
 ///
 /// let a = Array::from_slice(&[1.0f32, 1.0, 3.0, 4.0], &[2, 2]);

@@ -5,7 +5,7 @@
 /// # Examples
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::array;
 ///
 /// // Create an empty array

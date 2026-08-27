@@ -181,7 +181,7 @@ pub fn broadcast_arrays(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_iter(0..10, &[10]);
@@ -224,7 +224,7 @@ pub fn as_strided<'a>(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_f32(2.3);
@@ -257,7 +257,7 @@ pub fn broadcast_to(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_iter(0..4, &[2, 2]);
@@ -298,7 +298,7 @@ pub fn concatenate(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::zeros::<i32>(&[2, 2], &stream).unwrap();
@@ -348,7 +348,7 @@ pub fn expand_dims(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::zeros::<i32>(&[2, 2, 2], &stream).unwrap();
@@ -411,7 +411,7 @@ pub fn unflatten(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::zeros::<i32>(&[2, 2], &stream).unwrap();
@@ -444,7 +444,7 @@ pub fn reshape(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::zeros::<i32>(&[1, 2, 1, 3], &stream).unwrap();
@@ -486,7 +486,7 @@ pub fn squeeze(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>) -> 
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_int(1);
@@ -508,7 +508,7 @@ pub fn at_least_1d(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>)
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_int(1);
@@ -530,7 +530,7 @@ pub fn at_least_2d(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>)
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_int(1);
@@ -554,7 +554,7 @@ pub fn at_least_3d(a: impl AsRef<Array>, #[optional] stream: impl AsRef<Stream>)
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::zeros::<i32>(&[2, 3, 4], &stream).unwrap();
@@ -583,7 +583,7 @@ pub fn move_axis(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..10, &[10]);
@@ -621,7 +621,7 @@ pub fn split_sections(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..10, &[10]);
@@ -733,7 +733,7 @@ impl PadMode {
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..4, &[2, 2]);
@@ -787,7 +787,7 @@ pub fn pad<'a>(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..4, &[2, 2]);
@@ -815,7 +815,7 @@ pub fn stack_axis(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..4, &[2, 2]);
@@ -844,7 +844,7 @@ pub fn stack(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let a = Array::from_iter(0..6, &[2, 3]);
@@ -878,7 +878,7 @@ pub fn swap_axes(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_slice(&[1, 2, 3], &[3]);
@@ -912,7 +912,7 @@ pub fn tile(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, ops::*};
 ///
 /// let x = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);

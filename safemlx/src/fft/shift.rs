@@ -27,7 +27,7 @@ fn resolve_axes(a: &Array, axes: Option<&[i32]>) -> SmallVec<[i32; DEFAULT_STACK
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, fft::*};
 ///
 /// let a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, -4.0, -3.0, -2.0, -1.0], &[9]);
@@ -66,7 +66,7 @@ pub fn fftshift<'a>(
 /// # Example
 ///
 /// ```rust
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 /// use safemlx::{Array, fft::*};
 ///
 /// let a = Array::from_slice(&[-4.0f32, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0], &[9]);
