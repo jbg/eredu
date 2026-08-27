@@ -6102,6 +6102,77 @@ impl DeepSeekV4PipelinePartition {
     }
 }
 
+fn deepseek_v4_pipeline_prompt_cache_identity(
+    args: &eredu_architectures::deepseek::V4Args,
+    topology: MlxParallelContext,
+    range: Range<usize>,
+    complete: &eredu_runtime::StateLayout,
+) -> Result<PromptCacheModelIdentity, Error> {
+    let layout = complete
+        .slice(range.clone())
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    eredu_architectures::deepseek::v4::state_identity(
+        args,
+        &layout,
+        range.start,
+        crate::backend::cache::prompt_cache_topology(topology),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+    .prompt_cache_identity(&layout)
+    .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+#[cfg(test)]
+#[test]
+fn deepseek_v4_pipeline_cache_identity_uses_realized_state_geometry() {
+    let args = eredu_architectures::deepseek::parse_v4_config(&serde_json::json!({
+        "hidden_size": 16,
+        "moe_intermediate_size": 8,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "q_lora_rank": 8,
+        "o_lora_rank": 8,
+        "o_groups": 2,
+        "vocab_size": 16,
+        "max_position_embeddings": 64,
+        "sliding_window": 8,
+        "compress_ratios": [0, 4, 0],
+        "index_n_heads": 2,
+        "index_head_dim": 4,
+        "index_topk": 2,
+        "hc_mult": 2,
+        "hc_sinkhorn_iters": 2,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 1,
+        "norm_topk_prob": true,
+        "num_nextn_predict_layers": 1
+    }))
+    .unwrap();
+    let global = eredu_architectures::deepseek::v4::state_layout(&args).unwrap();
+    let mut realized_args = args.clone();
+    realized_args.index_head_dim = 2;
+    let realized = eredu_architectures::deepseek::v4::state_layout(&realized_args).unwrap();
+    let topology = MlxParallelContext::for_rank(
+        0,
+        1,
+        1,
+        1,
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+
+    let identity =
+        deepseek_v4_pipeline_prompt_cache_identity(&args, topology, 1..2, &realized).unwrap();
+
+    assert_eq!(
+        identity.layer_layout,
+        *realized.slice(1..2).unwrap().layers()
+    );
+    assert_ne!(identity.layer_layout, *global.slice(1..2).unwrap().layers());
+}
+
 impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
     fn capability_estimate(
         &self,
@@ -6141,20 +6212,11 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let full = eredu_architectures::deepseek::v4::state_layout(self.args())
+        let complete = self
+            .architecture
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let layout = full
-            .slice(self.range())
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_architectures::deepseek::v4::state_identity(
-            self.args(),
-            &layout,
-            self.range().start,
-            crate::backend::cache::prompt_cache_topology(topology),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .prompt_cache_identity(&layout)
-        .map_err(|error| Error::Parallel(error.to_string()))
+        deepseek_v4_pipeline_prompt_cache_identity(self.args(), topology, self.range(), &complete)
     }
 
     fn new_cache_layers(
@@ -6164,14 +6226,20 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         let pinned_prefix_tokens = i32::try_from(identity.sink_tokens)
             .map_err(|_| Error::Parallel("V4 attention sink count exceeds i32".into()))?;
-        let layout = eredu_architectures::deepseek::v4::state_layout(self.args())
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        self.range()
-            .clone()
-            .map(|global_layer| {
-                let policy = layout.layer(global_layer).ok_or_else(|| {
-                    Error::Parallel(format!("missing V4 state layout layer {global_layer}"))
-                })?;
+        let range = self.range();
+        if (identity.global_layer_start..identity.global_layer_end) != range
+            || identity.layer_layout.len() != range.len()
+        {
+            return Err(Error::Parallel(format!(
+                "V4 prompt-cache identity owns layers {}..{} with {} policies, expected stage range {range:?}",
+                identity.global_layer_start,
+                identity.global_layer_end,
+                identity.layer_layout.len()
+            )));
+        }
+        range
+            .zip(identity.layer_layout.iter())
+            .map(|(global_layer, policy)| {
                 let cache = match &paged {
                     Some((manager, rank)) => MlxPoolingAttentionCache::paged_from_policy(
                         global_layer,
@@ -6201,7 +6269,9 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = eredu_architectures::deepseek::v4::state_layout(self.args())
+        let layout = self
+            .architecture
+            .state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let caches = (0..self.mtp_layers.len())
             .map(|depth| {
