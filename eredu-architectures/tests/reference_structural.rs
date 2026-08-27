@@ -1,3 +1,5 @@
+//! Multi-family structural and portable-lifecycle tests using a shape-only backend.
+
 use std::{cell::RefCell, collections::BTreeMap};
 
 use eredu_architectures::{
@@ -2932,4 +2934,52 @@ fn qwen_routed_execution_uses_the_runtime_provider_and_observer_contract() {
     assert_eq!(output.shape(), input.shape());
     assert_eq!(observer.route_shapes, vec![(vec![3, 2], vec![3, 2], 4)]);
     assert_eq!(provider.calls[1].1, ExpertPass::Decode);
+}
+
+#[test]
+fn released_moshi_profiles_share_one_portable_model_contract() {
+    let native = moshi::MoshiConfig::native_v0_1().unwrap();
+    let persona =
+        moshi::MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap();
+    for config in [&native, &persona] {
+        assert_eq!(config.family(), "moshi");
+        assert_eq!(config.temporal().parameter_root(), "transformer");
+        assert_eq!(
+            config.temporal().attention_window(),
+            config.temporal().context() + 1
+        );
+        assert_eq!(
+            config.depth_template().attention_window(),
+            config.depth_template().context()
+        );
+        assert_eq!(
+            config.depth_transformer(0).unwrap().parameter_root(),
+            "depformer.slices.0.transformer"
+        );
+        let layout = moshi::state_layout(config).unwrap();
+        assert_eq!(layout.segments()[0].id().as_str(), "temporal");
+        assert_eq!(layout.segments()[1].id().as_str(), "depth");
+    }
+    assert_ne!(
+        native.architecture_fingerprint(),
+        persona.architecture_fingerprint()
+    );
+}
+
+#[test]
+fn moshi_decision_domains_include_exact_released_padding_rows() {
+    for config in [
+        moshi::MoshiConfig::native_v0_1().unwrap(),
+        moshi::MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap(),
+    ] {
+        let boundary = moshi::DecisionBoundary::new(&config).unwrap();
+        assert_eq!(
+            boundary.text_token_domain().cardinality(),
+            config.text_vocabulary_size() as usize + 1
+        );
+        assert_eq!(
+            boundary.audio_token_domain().cardinality(),
+            config.audio_vocabulary_size() as usize + 1
+        );
+    }
 }

@@ -1,3 +1,5 @@
+//! Multi-family numerical reference tests using a deterministic scalar backend.
+
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
