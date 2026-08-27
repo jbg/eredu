@@ -74,7 +74,11 @@ path = "tests/native_tool_checkpoints.rs"
 required-features = ["mlx"]
 
 [package.metadata.docs.rs]
-targets = ["aarch64-apple-darwin"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 no-default-features = true
 features = ["mlx", "metal", "image", "audio"]
 
