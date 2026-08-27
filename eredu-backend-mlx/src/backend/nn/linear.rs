@@ -123,6 +123,11 @@ impl PhysicalLinear {
             _ => None,
         };
         let affine = quantization.filter(|value| value.gguf_iquant().is_none());
+        let mode = affine
+            .map(crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode)
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))?
+            .unwrap_or(QuantizationMode::Affine);
         Ok(Self {
             input_dimensions,
             output_dimensions,
@@ -177,9 +182,7 @@ impl PhysicalLinear {
             },
             group_size: affine.map_or(0, WeightQuantization::group_size),
             bits: affine.map_or(0, WeightQuantization::bits),
-            mode: affine.map_or(QuantizationMode::Affine, |value| {
-                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(value)
-            }),
+            mode,
             gguf: quantization.filter(|value| value.gguf_iquant().is_some()),
         })
     }
@@ -290,7 +293,8 @@ fn unloaded_maybe_quantized_linear_with_dtype(
                 output_dims,
                 config.group_size(),
                 config.bits(),
-                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(config),
+                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(config)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
                 bias,
                 stream,
             )?,
@@ -345,7 +349,8 @@ fn unloaded_maybe_quantized_embedding_with_dtype(
                 dimensions,
                 config.group_size(),
                 config.bits(),
-                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(config),
+                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(config)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
                 stream,
             )?,
         )),

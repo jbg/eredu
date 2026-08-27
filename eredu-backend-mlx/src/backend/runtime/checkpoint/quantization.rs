@@ -122,6 +122,7 @@ pub fn quantize_tensor(
 ) -> Result<QuantizedTensor, Error> {
     let config = config.into();
     config.validate()?;
+    let mode = mlx_quantization_mode(config)?;
     if weight.ndim() < 2 || !weight.dtype().is_float() {
         return Err(Error::Quantization(format!(
             "expected a floating-point weight with at least two dimensions, got shape {:?} and dtype {:?}",
@@ -144,13 +145,8 @@ pub fn quantize_tensor(
     } else {
         weight.reshape(&[leading_size, input_dims], stream)?
     };
-    let arrays = ops::quantize_with_mode(
-        &matrix,
-        config.group_size(),
-        config.bits(),
-        mlx_quantization_mode(config),
-        stream,
-    )?;
+    let arrays =
+        ops::quantize_with_mode(&matrix, config.group_size(), config.bits(), mode, stream)?;
     let restore_shape = |array: Array, last_dim: i32| -> Result<Array, Error> {
         if weight.ndim() == 2 {
             Ok(array)
@@ -173,13 +169,16 @@ pub fn quantize_tensor(
 }
 
 /// Maps a producible checkpoint quantization format to its MLX operator mode.
-pub fn mlx_quantization_mode(config: WeightQuantization) -> ops::QuantizationMode {
+///
+/// Checkpoint-native GGUF blocks are valid stored formats, but dense MLX
+/// quantization cannot produce them.
+pub fn mlx_quantization_mode(config: WeightQuantization) -> Result<ops::QuantizationMode, Error> {
     match config {
-        WeightQuantization::Affine(_) => ops::QuantizationMode::Affine,
-        WeightQuantization::MxFp4 => ops::QuantizationMode::MxFp4,
-        WeightQuantization::GgufIQuant { .. } => {
-            panic!("checkpoint-native GGML blocks cannot be produced by dense quantization")
-        }
+        WeightQuantization::Affine(_) => Ok(ops::QuantizationMode::Affine),
+        WeightQuantization::MxFp4 => Ok(ops::QuantizationMode::MxFp4),
+        WeightQuantization::GgufIQuant { .. } => Err(Error::Quantization(
+            "checkpoint-native GGUF blocks cannot be produced by dense quantization".into(),
+        )),
     }
 }
 
@@ -444,6 +443,7 @@ mod tests {
     use eredu_architectures::checkpoint_conversion::{
         SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
     };
+    use eredu_gguf::{Endian, GgmlType};
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use safemlx::{Device, DeviceType, Dtype, ExecutionContext};
 
@@ -484,6 +484,38 @@ mod tests {
             quantization,
             WeightQuantization::Affine(AffineQuantization::new(64, 4).unwrap())
         );
+    }
+
+    #[test]
+    fn valid_gguf_quantization_is_not_a_producible_mlx_format() {
+        let quantization = WeightQuantization::GgufIQuant {
+            ggml_type: GgmlType::Q4_0,
+            endian: Endian::Little,
+        };
+        quantization.validate().unwrap();
+
+        let error = mlx_quantization_mode(quantization).unwrap_err();
+        assert!(matches!(error, Error::Quantization(_)));
+        assert!(error
+            .to_string()
+            .contains("cannot be produced by dense quantization"));
+    }
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn quantize_tensor_returns_an_error_for_valid_gguf_quantization() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weight = Array::from_slice(&[0.25_f32; 64], &[2, 32]);
+        let quantization = WeightQuantization::GgufIQuant {
+            ggml_type: GgmlType::Q4_0,
+            endian: Endian::Little,
+        };
+
+        let error = quantize_tensor(&weight, quantization, context.stream()).unwrap_err();
+        assert!(matches!(error, Error::Quantization(_)));
+        assert!(error
+            .to_string()
+            .contains("cannot be produced by dense quantization"));
     }
 
     #[test]

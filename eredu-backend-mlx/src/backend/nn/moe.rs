@@ -89,6 +89,9 @@ pub fn packed_grouped_linear_with_options(
     sorted_indices: bool,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    let mode =
+        crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(quantization)
+            .map_err(|error| Exception::custom(error.to_string()))?;
     let routes = input.dim(0);
     let out_features = if transpose {
         weight.dim(-2)
@@ -114,7 +117,7 @@ pub fn packed_grouped_linear_with_options(
             true,
             quantization.group_size(),
             quantization.bits(),
-            crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(quantization),
+            mode,
             stream,
         )?
         .reshape(&[routes, out_features], stream);
@@ -132,7 +135,7 @@ pub fn packed_grouped_linear_with_options(
         quantization.group_size(),
         quantization.bits(),
         sorted_indices,
-        crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(quantization),
+        mode,
         stream,
     )?
     .reshape(&[routes, out_features], stream)
@@ -297,6 +300,11 @@ impl TopKRouter {
             }
         }
         let affine = quantization.filter(|q| !matches!(q, WeightQuantization::GgufIQuant { .. }));
+        let mode = affine
+            .map(crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode)
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))?
+            .unwrap_or(QuantizationMode::Affine);
         Ok(Self {
             top_k: config.top_k,
             num_experts: config.num_experts,
@@ -390,10 +398,7 @@ impl TopKRouter {
             input_inverse_sqrt_dimensions: config.input_inverse_sqrt_dimensions,
             group_size: affine.map_or(0, WeightQuantization::group_size),
             bits: affine.map_or(0, WeightQuantization::bits),
-            mode: affine.map_or(
-                QuantizationMode::Affine,
-                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode,
-            ),
+            mode,
             iquant: quantization.filter(|q| matches!(q, WeightQuantization::GgufIQuant { .. })),
         })
     }

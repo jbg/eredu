@@ -76,7 +76,9 @@ host-layerwise, and dense disk-streamed weights; independent expert caches;
 device-resident or paged request state; and reusable prompt caches, including
 embedded MTP and fused DSpark draft state. Eligible dense SafeTensors weights
 can be transformed to affine or MXFP4 layouts at load time. Checkpoint-native
-FP8 and packed encodings remain native.
+FP8 and packed encodings remain native. Requests to produce a checkpoint-native
+GGUF block encoding from dense weights fail explicitly; those encodings are
+loadable storage formats, not dense quantization targets.
 
 Qwen2 vision-language and Qwen2 MoE checkpoints are not accepted by the Qwen2
 text adapter. A model that needs custom Python code or uses an unregistered
