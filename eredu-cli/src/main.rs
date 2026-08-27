@@ -1248,10 +1248,7 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
 }
 
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<eredu::api::LocalLoadOptions> {
-    let realization =
-        eredu_core::realize_execution_plan_target(&LocalBackendFactory::default(), plan)?;
-    let (_, options) = realization.into_parts();
-    Ok(options)
+    Ok(LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), plan)?.load)
 }
 
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {

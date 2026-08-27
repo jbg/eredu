@@ -106,6 +106,13 @@ process runtime configuration, synchronization, allocator telemetry, and
 diagnostic benchmarks without exposing native tensors, streams, devices, or
 random state. Direct native access remains an explicit backend-author escape
 hatch under `eredu-backend-mlx::native`; it is not an application dependency.
+Its `LocalLoadOptions` and `LocalInspectionOptions` are facade-owned values
+containing only neutral quantization, residency, and session-capability policy.
+They are converted to MLX load policy inside the adapter; native device-bound
+parallel contexts are selected only by backend tooling. `LocalBackendError`
+similarly records facade operation context and a diagnostic message without
+exporting `safemlx` exception or I/O variants. Portable execution plans remain
+the application surface for device and topology selection.
 Sampling functions and sampler traits whose signatures expose raw MLX arrays,
 streams, or random state are exported only through that native namespace, not
 through the flat application-facing adapter. Native realtime backend types,

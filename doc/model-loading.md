@@ -15,11 +15,20 @@ backend request. Apply `api::inspect_text_model` to that report when admission
 also requires tokenizer, chat-template, EOS, semantic-streaming, or native-tool
 readiness.
 
-The selected local backend's `eredu::api::LocalLoadOptions` contain two
-independent choices:
+The selected local backend's `eredu::api::LocalLoadOptions` contain portable
+load policy:
 
 - `quantization`: an optional transformation for eligible dense weights; and
-- `weight_residency`: the static parameter placement policy.
+- `weight_residency`: the static parameter placement policy; and
+- `required_session_capabilities`: fail-closed requirements for the realized
+  session.
+
+These facade-owned options are configured with builders and queried with
+accessors. They do not contain an MLX device or parallel context. Applications
+derive them from a portable `ExecutionPlan` with
+`LocalInspectionOptions::for_execution_plan` when inspection must exactly
+match a planned load. Backend-author tooling that binds native distributed
+groups uses `eredu-backend-mlx` directly.
 
 Non-replicated distributed topologies use the same architecture-erased loader
 with an MLX parallel context.

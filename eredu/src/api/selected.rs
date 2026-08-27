@@ -4,6 +4,7 @@
 //! behind this module. Applications configure and operate the selected local
 //! backend through portable plans and facade-owned diagnostics.
 
+use std::path::Path;
 #[cfg(feature = "metal")]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,8 +15,6 @@ use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _};
 pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
 /// Converts a selected-backend expert-cache report into portable telemetry.
 pub use eredu_backend_mlx::expert_cache_telemetry as local_expert_cache_telemetry;
-/// Inspects a model using the selected local backend.
-pub use eredu_backend_mlx::inspect_model as inspect_local_model;
 /// Converts speculative statistics into portable telemetry.
 pub use eredu_backend_mlx::mtp_telemetry as local_mtp_telemetry;
 /// Converts a selected-backend residency report into portable telemetry.
@@ -32,14 +31,167 @@ pub use eredu_backend_mlx::residency_telemetry as local_residency_telemetry;
 pub use eredu_backend_mlx::MlxBackend as LocalBackend;
 /// Automatic planner and execution-plan factory for the selected local backend.
 pub use eredu_backend_mlx::MlxBackendFactory as LocalBackendFactory;
-/// Error reported by the selected local backend.
-pub use eredu_backend_mlx::MlxError as LocalBackendError;
-/// Options for selected-local-backend model inspection.
-pub use eredu_backend_mlx::MlxInspectionOptions as LocalInspectionOptions;
-/// Load policy accepted by the selected local backend.
-pub use eredu_backend_mlx::ModelLoadOptions as LocalLoadOptions;
 /// Scoped opt-in for selected-backend MTP component timing.
 pub use eredu_backend_mlx::MtpComponentTimingGuard as LocalMtpComponentTimingGuard;
+
+/// Opaque failure reported through the selected-local-backend facade.
+///
+/// The facade retains a stable error surface instead of exposing errors from
+/// the selected native runtime. The diagnostic message contains the backend's
+/// original context.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("selected local backend failed during {operation}: {message}")]
+pub struct LocalBackendError {
+    operation: &'static str,
+    message: String,
+}
+
+impl LocalBackendError {
+    fn new(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            operation,
+            message: error.to_string(),
+        }
+    }
+
+    /// Facade operation that failed.
+    pub const fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Backend diagnostic without exposing its native error type.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Facade-owned policy for loading a model on the selected local backend.
+///
+/// Distributed native device bindings are intentionally absent. Application
+/// clients select portable placement and topology through an
+/// [`crate::ExecutionPlan`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LocalLoadOptions {
+    quantization: Option<crate::QuantizationRequest>,
+    weight_residency: eredu_runtime::WeightResidency,
+    required_session_capabilities: crate::SessionCapabilities,
+}
+
+impl LocalLoadOptions {
+    /// Creates load options that quantize eligible dense weights on load.
+    pub fn with_quantization(quantization: crate::QuantizationRequest) -> Self {
+        Self {
+            quantization: Some(quantization),
+            ..Self::default()
+        }
+    }
+
+    /// Selects fully resident or bounded layer execution for checkpoint weights.
+    pub const fn with_weight_residency(
+        mut self,
+        residency: eredu_runtime::WeightResidency,
+    ) -> Self {
+        self.weight_residency = residency;
+        self
+    }
+
+    /// Requires capabilities from the exact inspected and realized session.
+    pub const fn with_required_session_capabilities(
+        mut self,
+        capabilities: crate::SessionCapabilities,
+    ) -> Self {
+        self.required_session_capabilities = capabilities;
+        self
+    }
+
+    /// Requested dense-weight transformation, if any.
+    pub const fn quantization(&self) -> Option<crate::QuantizationRequest> {
+        self.quantization
+    }
+
+    /// Selected immutable-weight residency policy.
+    pub const fn weight_residency(&self) -> eredu_runtime::WeightResidency {
+        self.weight_residency
+    }
+
+    /// Capabilities required from the realized session.
+    pub const fn required_session_capabilities(&self) -> crate::SessionCapabilities {
+        self.required_session_capabilities
+    }
+
+    fn into_backend(self) -> eredu_backend_mlx::ModelLoadOptions {
+        let options = match self.quantization {
+            Some(quantization) => {
+                eredu_backend_mlx::ModelLoadOptions::with_quantization(quantization)
+            }
+            None => eredu_backend_mlx::ModelLoadOptions::default(),
+        };
+        options
+            .with_weight_residency(self.weight_residency)
+            .with_required_session_capabilities(self.required_session_capabilities)
+    }
+
+    fn from_backend(
+        options: eredu_backend_mlx::ModelLoadOptions,
+    ) -> Result<Self, crate::AutomaticPlanningError> {
+        if options.parallel_topology().is_some() {
+            return Err(crate::AutomaticPlanningError::Invalid(
+                "selected-local inspection options cannot contain a native parallel context; use a portable execution plan"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            quantization: options.quantization,
+            weight_residency: options.weight_residency,
+            required_session_capabilities: options.required_session_capabilities,
+        })
+    }
+}
+
+impl Default for LocalLoadOptions {
+    fn default() -> Self {
+        Self {
+            quantization: None,
+            weight_residency: eredu_runtime::WeightResidency::fully_resident(),
+            required_session_capabilities: crate::SessionCapabilities::default(),
+        }
+    }
+}
+
+/// Facade-owned options for selected-local-backend model inspection.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct LocalInspectionOptions {
+    /// The exact facade loading policy that admission should validate.
+    pub load: LocalLoadOptions,
+}
+
+impl LocalInspectionOptions {
+    /// Derives inspection options from a portable execution plan.
+    pub fn for_execution_plan(
+        factory: &LocalBackendFactory,
+        plan: &crate::ExecutionPlan,
+    ) -> Result<Self, crate::AutomaticPlanningError> {
+        let realization = eredu_core::realize_execution_plan_target(factory, plan)?;
+        let (_, options) = realization.into_parts();
+        Ok(Self {
+            load: LocalLoadOptions::from_backend(options)?,
+        })
+    }
+}
+
+/// Inspects a model using facade-owned options and errors.
+pub fn inspect_local_model(
+    path: impl AsRef<Path>,
+    options: LocalInspectionOptions,
+) -> Result<crate::ModelInspectionReport, LocalBackendError> {
+    eredu_backend_mlx::inspect_model(
+        path,
+        eredu_backend_mlx::MlxInspectionOptions {
+            load: options.load.into_backend(),
+        },
+    )
+    .map_err(|error| LocalBackendError::new("model inspection", error))
+}
 
 /// A facade-level device class for the selected local backend.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -85,9 +237,12 @@ impl LocalRealtimeBackendFactory {
         options: LocalLoadOptions,
     ) -> Result<LocalRealtimeModel, LocalBackendError> {
         let device = local_device_plan(self.device)
-            .map_err(|error| LocalBackendError::AutomaticPlanning(error.to_string()))?;
-        let backend = eredu_backend_mlx::create_realtime_backend(&device)?;
-        let model = backend.materialize_realtime_model(preparation, options)?;
+            .map_err(|error| LocalBackendError::new("device planning", error))?;
+        let backend = eredu_backend_mlx::create_realtime_backend(&device)
+            .map_err(|error| LocalBackendError::new("realtime backend creation", error))?;
+        let model = backend
+            .materialize_realtime_model(preparation, options.into_backend())
+            .map_err(|error| LocalBackendError::new("realtime model loading", error))?;
         Ok(LocalRealtimeModel {
             inner: eredu_core::RealtimeModel::new(backend, model),
         })
@@ -174,7 +329,8 @@ impl LocalRealtimeScheduler {
         limits: crate::SchedulerLimits,
     ) -> Result<Self, LocalRealtimeError> {
         Ok(Self {
-            inner: eredu_core::RealtimeScheduler::new(&model.inner, limits)?,
+            inner: eredu_core::RealtimeScheduler::new(&model.inner, limits)
+                .map_err(map_local_realtime_error)?,
         })
     }
 
@@ -185,7 +341,9 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
         sampling: crate::RealtimeSampling,
     ) -> Result<(), LocalRealtimeError> {
-        self.inner.register_request(&model.inner, request, sampling)
+        self.inner
+            .register_request(&model.inner, request, sampling)
+            .map_err(map_local_realtime_error)
     }
 
     /// Registers a previously released request session.
@@ -197,6 +355,7 @@ impl LocalRealtimeScheduler {
     ) -> Result<(), LocalRealtimeError> {
         self.inner
             .register_request_with_session(&model.inner, request, session.inner)
+            .map_err(map_local_realtime_error)
     }
 
     /// Materializes and enqueues one portable host token frame.
@@ -221,9 +380,15 @@ impl LocalRealtimeScheduler {
             .inner
             .backend()
             .materialize_input(model.inner.model(), &frame)
-            .map_err(eredu_core::RealtimeError::Backend)?;
+            .map_err(|error| {
+                eredu_core::RealtimeError::Backend(LocalBackendError::new(
+                    "realtime input materialization",
+                    error,
+                ))
+            })?;
         self.inner
             .enqueue_with_deadline(&model.inner, request, input, deadline)
+            .map_err(map_local_realtime_error)
     }
 
     /// Atomically materializes and enqueues ordered portable host token frames.
@@ -240,10 +405,17 @@ impl LocalRealtimeScheduler {
                     .inner
                     .backend()
                     .materialize_input(model.inner.model(), frame)
-                    .map_err(eredu_core::RealtimeError::Backend)
+                    .map_err(|error| {
+                        eredu_core::RealtimeError::Backend(LocalBackendError::new(
+                            "realtime input materialization",
+                            error,
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.inner.enqueue_batch(&model.inner, request, inputs)
+        self.inner
+            .enqueue_batch(&model.inner, request, inputs)
+            .map_err(map_local_realtime_error)
     }
 
     /// Advances one unbounded fair scheduling turn and observes completed frames.
@@ -251,7 +423,10 @@ impl LocalRealtimeScheduler {
         &mut self,
         model: &mut LocalRealtimeModel,
     ) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
-        let completed = self.inner.run_queued(&mut model.inner)?;
+        let completed = self
+            .inner
+            .run_queued(&mut model.inner)
+            .map_err(map_local_realtime_error)?;
         observe_realtime_steps(model, completed)
     }
 
@@ -261,18 +436,25 @@ impl LocalRealtimeScheduler {
         model: &mut LocalRealtimeModel,
         max_frames: usize,
     ) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
-        let completed = self.inner.run_bounded(&mut model.inner, max_frames)?;
+        let completed = self
+            .inner
+            .run_bounded(&mut model.inner, max_frames)
+            .map_err(map_local_realtime_error)?;
         observe_realtime_steps(model, completed)
     }
 
     /// Completes one request and drops its backend session.
     pub fn finish_request(&mut self, request: crate::RequestId) -> Result<(), LocalRealtimeError> {
-        self.inner.finish_request(request)
+        self.inner
+            .finish_request(request)
+            .map_err(map_local_realtime_error)
     }
 
     /// Cancels one request and discards queued frames.
     pub fn cancel_request(&mut self, request: crate::RequestId) -> Result<(), LocalRealtimeError> {
-        self.inner.cancel_request(request)
+        self.inner
+            .cancel_request(request)
+            .map_err(map_local_realtime_error)
     }
 
     /// Releases an idle request for persistence or resumption.
@@ -281,7 +463,10 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
     ) -> Result<LocalRealtimeSession, LocalRealtimeError> {
         Ok(LocalRealtimeSession {
-            inner: self.inner.release_request(request)?,
+            inner: self
+                .inner
+                .release_request(request)
+                .map_err(map_local_realtime_error)?,
         })
     }
 
@@ -290,7 +475,9 @@ impl LocalRealtimeScheduler {
         &mut self,
         request: crate::RequestId,
     ) -> Result<crate::RequestStatus, LocalRealtimeError> {
-        self.inner.forget_terminal_request(request)
+        self.inner
+            .forget_terminal_request(request)
+            .map_err(map_local_realtime_error)
     }
 
     /// Lifecycle state for a known request.
@@ -312,6 +499,7 @@ impl LocalRealtimeScheduler {
     ) -> Result<(), LocalRealtimeError> {
         self.inner
             .set_request_sampling(&model.inner, request, sampling)
+            .map_err(map_local_realtime_error)
     }
 
     /// Generic occupancy and lifecycle telemetry.
@@ -337,10 +525,45 @@ fn observe_realtime_steps(
                 .inner
                 .backend()
                 .observe_output(&output)
-                .map_err(eredu_core::RealtimeError::Backend)?;
+                .map_err(|error| {
+                    eredu_core::RealtimeError::Backend(LocalBackendError::new(
+                        "realtime output observation",
+                        error,
+                    ))
+                })?;
             Ok(LocalRealtimeCompletedStep { work, output })
         })
         .collect()
+}
+
+fn map_local_realtime_error(
+    error: eredu_core::RealtimeError<eredu_backend_mlx::MlxError>,
+) -> LocalRealtimeError {
+    match error {
+        eredu_core::RealtimeError::Backend(error) => {
+            eredu_core::RealtimeError::Backend(LocalBackendError::new("realtime execution", error))
+        }
+        eredu_core::RealtimeError::Scheduler(error) => eredu_core::RealtimeError::Scheduler(error),
+        eredu_core::RealtimeError::ModelMismatch { component } => {
+            eredu_core::RealtimeError::ModelMismatch { component }
+        }
+        eredu_core::RealtimeError::BatchSize {
+            request,
+            expected,
+            actual,
+        } => eredu_core::RealtimeError::BatchSize {
+            request,
+            expected,
+            actual,
+        },
+        eredu_core::RealtimeError::EmptyRunBound => eredu_core::RealtimeError::EmptyRunBound,
+        eredu_core::RealtimeError::SamplingWhileQueued { request, queued } => {
+            eredu_core::RealtimeError::SamplingWhileQueued { request, queued }
+        }
+        eredu_core::RealtimeError::Asynchronous { work, message } => {
+            eredu_core::RealtimeError::Asynchronous { work, message }
+        }
+    }
 }
 
 /// Process-global configuration for the selected local runtime.
@@ -375,10 +598,12 @@ pub fn configure_local_runtime(
 ) -> Result<(), LocalBackendError> {
     #[cfg(feature = "metal")]
     if let Some(path) = &configuration.accelerator_library_path {
-        eredu_backend_mlx::native::metal::set_metallib_path(path)?;
+        eredu_backend_mlx::native::metal::set_metallib_path(path)
+            .map_err(|error| LocalBackendError::new("runtime configuration", error))?;
     }
     if let Some(bytes) = configuration.allocator_cache_limit {
-        eredu_backend_mlx::native::memory::set_cache_limit(bytes)?;
+        eredu_backend_mlx::native::memory::set_cache_limit(bytes)
+            .map_err(|error| LocalBackendError::new("allocator configuration", error))?;
     }
     Ok(())
 }
@@ -409,12 +634,15 @@ const fn compiled_accelerator_family() -> Option<&'static str> {
 
 /// Waits for work submitted to the selected local backend.
 pub fn synchronize_local_backend(backend: &LocalBackend<'_>) -> Result<(), LocalBackendError> {
-    backend.synchronize()
+    backend
+        .synchronize()
+        .map_err(|error| LocalBackendError::new("synchronization", error))
 }
 
 /// Resets the selected runtime's allocator high-water mark.
 pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
-    eredu_backend_mlx::native::memory::reset_peak_memory()?;
+    eredu_backend_mlx::native::memory::reset_peak_memory()
+        .map_err(|error| LocalBackendError::new("allocator peak reset", error))?;
     Ok(())
 }
 
@@ -424,9 +652,15 @@ pub fn local_allocator_telemetry(
 ) -> Result<crate::AllocatorTelemetry, LocalBackendError> {
     synchronize_local_backend(backend)?;
     Ok(crate::AllocatorTelemetry {
-        peak_bytes: eredu_backend_mlx::native::memory::peak_memory()? as u64,
-        active_bytes: eredu_backend_mlx::native::memory::active_memory()? as u64,
-        cache_bytes: eredu_backend_mlx::native::memory::cache_memory()? as u64,
+        peak_bytes: eredu_backend_mlx::native::memory::peak_memory()
+            .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
+            as u64,
+        active_bytes: eredu_backend_mlx::native::memory::active_memory()
+            .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
+            as u64,
+        cache_bytes: eredu_backend_mlx::native::memory::cache_memory()
+            .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
+            as u64,
     })
 }
 
@@ -510,7 +744,8 @@ fn expert_snapshot(
 ) -> Result<ExpertSnapshot, LocalExpertCacheBenchmarkError> {
     let report = runtime
         .session()
-        .expert_cache_report()?
+        .expert_cache_report()
+        .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))?
         .ok_or(LocalExpertCacheBenchmarkError::ExpertCacheUnavailable)?;
     Ok(ExpertSnapshot {
         prefill: report.prefill,
@@ -577,14 +812,20 @@ pub fn benchmark_local_expert_cache(
     let prompt = <LocalBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
         runtime.backend(),
         token_ids.to_vec(),
-    )?;
+    )
+    .map_err(|error| LocalBackendError::new("expert-cache prompt preparation", error))?;
 
     let before_cold = expert_snapshot(runtime)?;
-    runtime.session_mut().reset()?;
+    runtime
+        .session_mut()
+        .reset()
+        .map_err(|error| LocalBackendError::new("expert-cache session reset", error))?;
     let started = std::time::Instant::now();
     let logits = runtime
-        .prefill(prompt.clone())?
-        .wait()?
+        .prefill(prompt.clone())
+        .map_err(|error| LocalBackendError::new("expert-cache prefill submission", error))?
+        .wait()
+        .map_err(|error| LocalBackendError::new("expert-cache prefill completion", error))?
         .into_logits()
         .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
@@ -596,11 +837,16 @@ pub fn benchmark_local_expert_cache(
         after_cold,
     );
 
-    runtime.session_mut().reset()?;
+    runtime
+        .session_mut()
+        .reset()
+        .map_err(|error| LocalBackendError::new("expert-cache session reset", error))?;
     let started = std::time::Instant::now();
     let logits = runtime
-        .prefill(prompt)?
-        .wait()?
+        .prefill(prompt)
+        .map_err(|error| LocalBackendError::new("expert-cache prefill submission", error))?
+        .wait()
+        .map_err(|error| LocalBackendError::new("expert-cache prefill completion", error))?
         .into_logits()
         .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
@@ -615,9 +861,12 @@ pub fn benchmark_local_expert_cache(
     let started = std::time::Instant::now();
     let output = {
         let (backend, session) = runtime.parts_mut();
-        session.submit_token_decode(backend, token_ids[token_ids.len() - 1])?
+        session
+            .submit_token_decode(backend, token_ids[token_ids.len() - 1])
+            .map_err(|error| LocalBackendError::new("expert-cache decode submission", error))?
     }
-    .wait()?;
+    .wait()
+    .map_err(|error| LocalBackendError::new("expert-cache decode completion", error))?;
     let logits = output
         .into_logits()
         .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
