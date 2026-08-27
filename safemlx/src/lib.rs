@@ -174,18 +174,18 @@
 //! ```
 //!
 //! An important behavior to be aware of is when the graph will be implicitly
-//! evaluated. Printing an array evaluates it, and host memory access requires
-//! first materializing an [`EvaluatedArray`] before calling methods such as
-//! [`EvaluatedArray::as_slice`]. Saving arrays via [`Array::save_numpy`] or
-//! [`Array::save_safetensors`] (or any other MLX saving functions) will also
-//! evaluate the array.
+//! evaluated. Formatting an array with [`Debug`](std::fmt::Debug) or
+//! [`Display`](std::fmt::Display) only prints its dtype and shape; it does not
+//! evaluate the array. Host memory access requires first materializing an
+//! [`EvaluatedArray`] before calling methods such as [`EvaluatedArray::as_slice`].
+//! Saving arrays via [`Array::save_numpy`] or [`Array::save_safetensors`] (or any
+//! other MLX saving functions) will evaluate the array.
 //!
 //! Calling [`Array::item`] on a scalar array will also evaluate it. In the
-//! example above, printing the loss (`println!("{:?}", loss)`) or pushing the
-//! loss scalar to a [`Vec`] (`losses.push(loss.item::<f32>(&stream))`) would cause a
-//! graph evaluation. If these lines are before evaluating the loss and module
-//! parameters, then this will be a partial evaluation, computing only the
-//! forward pass.
+//! example above, pushing the loss scalar to a [`Vec`]
+//! (`losses.push(loss.item::<f32>(&stream))`) would cause a graph evaluation. If
+//! this line is before evaluating the loss and module parameters, then this will
+//! be a partial evaluation, computing only the forward pass.
 //!
 //! Also, evaluating an array or set of arrays multiple times is
 //! perfectly fine. This is effectively a no-op.

@@ -87,54 +87,6 @@ fn expert_parameter_targets(
     Ok(targets)
 }
 
-struct NeutralGptOssObserver<'a> {
-    inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
-}
-
-impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
-    for NeutralGptOssObserver<'_>
-{
-    fn observe(&mut self, path: &str, value: &crate::MlxTensor) -> Result<(), eredu_nn::Error> {
-        self.inner
-            .observe(path, value.as_array())
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-    }
-
-    fn intervene(
-        &mut self,
-        path: &str,
-        value: &crate::MlxTensor,
-    ) -> Result<Option<crate::MlxTensor>, eredu_nn::Error> {
-        self.inner
-            .intervene(path, value.as_array())
-            .map(|value| value.map(crate::MlxTensor::from_array))
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-    }
-
-    fn observe_routing(
-        &mut self,
-        routing: eredu_runtime::RoutingObservation<'_, crate::MlxTensor>,
-    ) -> Result<(), eredu_nn::Error> {
-        let routing = eredu_runtime::RoutingObservation {
-            path: routing.path,
-            selected_experts: routing.selected_experts.as_array(),
-            selected_scores: routing.selected_scores.as_array(),
-            route_weights: routing.route_weights.as_array(),
-            routed_output: routing.routed_output.as_array(),
-            local_routed_output: routing.local_routed_output.map(crate::MlxTensor::as_array),
-            reduced_routed_output: routing
-                .reduced_routed_output
-                .map(crate::MlxTensor::as_array),
-            shared_output: routing.shared_output.map(crate::MlxTensor::as_array),
-            combined_output: routing.combined_output.map(crate::MlxTensor::as_array),
-            expert_count: routing.expert_count,
-        };
-        self.inner
-            .observe_routing(routing)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-    }
-}
-
 fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
     let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
         MlxNeuralBackend,
@@ -1317,7 +1269,7 @@ impl GptOssModel {
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
         let expert_cache = self.expert_cache.take();
-        let mut observer = NeutralGptOssObserver { inner: observer };
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
         let result = match expert_cache.as_ref() {
             Some(expert_cache) => {
                 let args = self.args.clone();
@@ -1354,7 +1306,7 @@ impl GptOssModel {
         cache: &mut Cache,
         provider: &mut P,
         stream: &Stream,
-        observer: &mut NeutralGptOssObserver<'_>,
+        observer: &mut crate::composition::NeutralActivationObserver<'_>,
     ) -> Result<Array, Error>
     where
         P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,

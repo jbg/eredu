@@ -51,7 +51,6 @@ eredu-evaluation = { version = "0.1.0", path = "eredu-evaluation" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokenizers = "0.23"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 syn = { version = "3", features = ["full"] }
@@ -60,7 +59,6 @@ proc-macro2 = "1"
 itertools = "0.15"
 bindgen = "0.72"
 cmake = "0.1"
-cc = "1"
 tempfile = "3"
 half = "2"
 sha2 = "0.11"
