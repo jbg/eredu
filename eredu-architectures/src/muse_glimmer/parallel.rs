@@ -450,67 +450,65 @@ pub fn vision_parameter_groups(
         return Ok(Vec::new());
     };
     let hidden = dim(config.hidden_size)?;
-    let heads = dim(config.num_heads)?;
+    let _ = dim(config.num_heads)?;
     let patch_input = dim(config.temporal_patch_size * 3 * config.patch_size * config.patch_size)?;
     let positions = dim(config.position_height * config.position_width)?;
-    let mut groups = vec![ParameterGroupSpec::partitioned(
+    let mut groups = vec![ParameterGroupSpec::new(
         "model.vision_tower.patch_channels",
         ParameterRole::Channels,
-        hidden,
         [
             member(
                 "model.vision_tower.patch_embedder.patch_embedding.weight",
                 vec![hidden, patch_input],
-                partitioned(0),
+                MemberSharding::Replicated,
             ),
             member(
                 "model.vision_tower.patch_embedder.position_embedding_table.weight",
                 vec![positions, hidden],
-                partitioned(1),
+                MemberSharding::Replicated,
             ),
         ],
     )?];
     for layer in 0..config.layer_count() {
         let root = format!("model.vision_tower.layers.{layer}");
-        groups.push(ParameterGroupSpec::partitioned(
+        groups.push(ParameterGroupSpec::new(
             format!("{root}.attention_heads"),
             ParameterRole::AttentionHeads,
-            heads,
             [
                 member(
                     format!("{root}.attn.q_proj.weight"),
                     vec![hidden, hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.q_proj.bias"),
                     vec![hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.k_proj.weight"),
                     vec![hidden, hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.k_proj.bias"),
                     vec![hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.v_proj.weight"),
                     vec![hidden, hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.v_proj.bias"),
                     vec![hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.proj.weight"),
                     vec![hidden, hidden],
-                    partitioned(1),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.attn.proj.bias"),
@@ -520,25 +518,24 @@ pub fn vision_parameter_groups(
             ],
         )?);
         let intermediate = dim(config.intermediate_size)?;
-        groups.push(ParameterGroupSpec::partitioned(
+        groups.push(ParameterGroupSpec::new(
             format!("{root}.mlp.intermediate"),
             ParameterRole::FeedForwardIntermediate,
-            intermediate,
             [
                 member(
                     format!("{root}.mlp.fc1.weight"),
                     vec![intermediate, hidden],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.mlp.fc1.bias"),
                     vec![intermediate],
-                    partitioned(0),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.mlp.fc2.weight"),
                     vec![hidden, intermediate],
-                    partitioned(1),
+                    MemberSharding::Replicated,
                 ),
                 member(
                     format!("{root}.mlp.fc2.bias"),
@@ -561,31 +558,29 @@ pub fn vision_parameter_groups(
     let shuffled = hidden
         .checked_mul(dim(config.merge_size * config.merge_size)?)
         .ok_or_else(|| invalid("Muse-Glimmer shuffled width overflow"))?;
-    groups.push(ParameterGroupSpec::partitioned(
+    groups.push(ParameterGroupSpec::new(
         "model.vision_adapter.intermediate",
         ParameterRole::FeedForwardIntermediate,
-        projector,
         [
             member(
                 "model.vision_adapter.fc1.weight",
                 vec![projector, shuffled],
-                partitioned(0),
+                MemberSharding::Replicated,
             ),
             member(
                 "model.vision_adapter.fc2.weight",
                 vec![projector, projector],
-                partitioned(1),
+                MemberSharding::Replicated,
             ),
         ],
     )?);
-    groups.push(ParameterGroupSpec::partitioned(
+    groups.push(ParameterGroupSpec::new(
         "model.vision_projection",
         ParameterRole::ColumnProjection,
-        dim(config.language_hidden_size)?,
         [member(
             "model.vision_projection.weight",
             vec![dim(config.language_hidden_size)?, projector],
-            partitioned(0),
+            MemberSharding::Replicated,
         )],
     )?);
     groups.push(replicated(
@@ -715,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn distinguishes_text_experts_router_and_vision_heads() {
+    fn distinguishes_text_experts_router_and_replicated_vision() {
         let args = args();
         let text = layer_parameter_groups(&args, 0).unwrap();
         assert!(text
@@ -728,6 +723,11 @@ mod tests {
         assert!(vision
             .iter()
             .any(|group| group.logical_name().ends_with("attention_heads")));
+        assert!(vision.iter().all(|group| group.partition_units().is_none()));
+        assert!(vision.iter().all(|group| group
+            .members()
+            .iter()
+            .all(|member| member.sharding() == &MemberSharding::Replicated)));
     }
 
     #[test]

@@ -434,6 +434,9 @@ any of those facts from substrings in checkpoint names. External-expert
 tensor-parallel loaders validate the description against the neutral
 architecture and register its owned groups directly; they do not reconstruct
 target/prediction unit counts or enumerate family layer groups themselves.
+The description includes replicated pinned and execution-unit groups alongside
+sharded groups, so backend lowering does not omit multimodal units or rebuild a
+family-specific subset of the topology.
 
 Every layered family implements the state-independent
 `ArchitectureParameters` supercontract. It is the authoritative source for the

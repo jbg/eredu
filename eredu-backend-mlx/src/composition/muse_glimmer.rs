@@ -62,16 +62,6 @@ type NeutralUnit = Unit<MlxNeuralBackend>;
 type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxNeuralBackend>;
 pub type MuseGlimmerPipelineUnit = MlxModule<NeutralUnit>;
 
-fn group_kind(
-    architecture: &NeutralArchitecture,
-    group: usize,
-) -> eredu_runtime::ArchitectureGroupKind {
-    <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxKeyValueState,
-    >>::group_transport(architecture, group)
-    .kind
-}
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -1711,33 +1701,13 @@ fn load_parallel_store(
 ) -> Result<MuseGlimmerModel, Error> {
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_execution =
         architecture_execution_layout::<_, MlxKeyValueState>(&global_architecture)?;
-    let decoder_groups = (0..global_execution.group_count())
-        .filter(|&group| {
-            group_kind(&global_architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder
-        })
-        .collect::<Vec<_>>();
-    let [decoder_group] = decoder_groups.as_slice() else {
-        return Err(Error::Parallel(format!(
-            "Muse-Glimmer architecture declared {} decoder execution groups; expected one",
-            decoder_groups.len()
-        )));
-    };
-    let layer_count = global_execution
-        .group_range(*decoder_group)
-        .expect("validated execution group")
-        .len();
-    let mut planner = build.planner();
-    for group in eredu_architectures::muse_glimmer::static_parameter_groups(&args)? {
-        planner.register(group)?;
-    }
-    for index in 0..layer_count {
-        for group in eredu_architectures::muse_glimmer::layer_parameter_groups(&args, index)? {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "Muse-Glimmer declared no tensor-parallel parameters".into(),
@@ -1843,13 +1813,7 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            if group_kind(&binding_architecture, address.group())
-                == eredu_runtime::ArchitectureGroupKind::Decoder
-            {
-                shard_layer_bindings(bindings, store, &unit_sharding)
-            } else {
-                Ok(bindings)
-            }
+            shard_layer_bindings(bindings, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

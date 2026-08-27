@@ -444,36 +444,15 @@ fn load_neutral_parallel(
 ) -> Result<NemotronHModel, Error> {
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_execution =
         architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
-    let expert_targets = Arc::new(
-        global_architecture
-            .parameter_description(stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?
-            .targets_for_role(ParameterRole::ExpertIntermediate),
-    );
-    let mut planner = build.planner();
-    for group in eredu_architectures::nemotron_h::static_parallel_parameter_groups::<
-        MlxNeuralBackend,
-    >(global_architecture.static_modules())?
-    {
-        planner.register(group)?;
-    }
-    for ordinal in 0..global_execution.len() {
-        let unit = construct_architecture_unit(
-            &global_architecture,
-            &global_execution,
-            ordinal,
-            stream,
-            std::marker::PhantomData::<MlxHybridState>,
-        )?;
-        for group in
-            eredu_architectures::nemotron_h::unit_parallel_parameter_groups(&unit, &args, ordinal)?
-        {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let expert_targets =
+        Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "Nemotron-H declared no tensor-parallel parameters".into(),

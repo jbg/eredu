@@ -2051,36 +2051,13 @@ fn load_parallel_store(
 ) -> Result<InklingModel, Error> {
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let parameter_description = global_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_execution =
         architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
-    let decoder_groups = (0..global_execution.group_count())
-        .filter(|&group| {
-            group_kind(&global_architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder
-        })
-        .collect::<Vec<_>>();
-    let [decoder_group] = decoder_groups.as_slice() else {
-        return Err(Error::Parallel(format!(
-            "Inkling architecture declared {} decoder execution groups; expected one",
-            decoder_groups.len()
-        )));
-    };
-    let layer_count = global_execution
-        .group_range(*decoder_group)
-        .expect("validated execution group")
-        .len();
-    let mut planner = build.planner();
-    for group in eredu_architectures::inkling::static_parameter_groups(&args)? {
-        planner.register(group)?;
-    }
-    for group in eredu_architectures::inkling::mtp_parameter_groups(&args)? {
-        planner.register(group)?;
-    }
-    for index in 0..layer_count {
-        for group in eredu_architectures::inkling::layer_parameter_groups(&args, index)? {
-            planner.register(group)?;
-        }
-    }
-    let (_, layout) = planner.finish()?;
+    let layout =
+        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
     if layout.is_empty() {
         return Err(Error::Parallel(
             "Inkling declared no tensor-parallel parameters".into(),
