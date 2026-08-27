@@ -1,7 +1,7 @@
 //! Backend-neutral model loading, generation, and realtime facade.
 //!
 //! [`api`] and [`runtime`] remain available without an execution backend. The
-//! `mlx` feature adds the MLX model implementations and runtime. Platform and
+//! `mlx` feature selects the optional MLX backend adapter. Platform and
 //! capability features configure that backend without selecting it.
 //!
 //! Backend implementation contracts are imported from their owning crates:
