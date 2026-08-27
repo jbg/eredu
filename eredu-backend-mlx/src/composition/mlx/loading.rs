@@ -18,8 +18,8 @@ use crate::{
 };
 
 use super::realization::{
-    CompleteTensorParallelBinding as TensorParallelBinding, ExpertCacheBinding, FamilyRealization,
-    ParallelRealization,
+    CompleteTensorParallelBinding as TensorParallelBinding, ExpertCacheBinding, FamilyBinding,
+    FamilyRealization, ParallelRealization,
 };
 
 /// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
@@ -1142,8 +1142,8 @@ pub(super) fn materialize_safetensors(
     if let Some(quantization) = quantization {
         quantization.validate()?;
     }
-    match kind {
-        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Ok(Executable::deepseek(
+    match FamilyRealization::for_kind(kind).binding() {
+        FamilyBinding::DeepSeekV3 | FamilyBinding::DeepSeekV4 => Ok(Executable::deepseek(
             kind,
             Box::new(crate::composition::deepseek::load_safetensors(
                 artifact,
@@ -1153,7 +1153,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?),
         )?),
-        ModelKind::Gemma4 => Ok(Executable::gemma4(
+        FamilyBinding::Gemma4 => Ok(Executable::gemma4(
             kind,
             crate::composition::gemma4::load_safetensors(
                 artifact,
@@ -1163,7 +1163,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Inkling => Ok(Executable::inkling(
+        FamilyBinding::Inkling => Ok(Executable::inkling(
             kind,
             crate::composition::inkling::load_safetensors(
                 artifact,
@@ -1173,7 +1173,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::KimiLinear => Ok(Executable::kimi_linear(
+        FamilyBinding::KimiLinear => Ok(Executable::kimi_linear(
             kind,
             crate::composition::kimi_linear::load_kimi_linear_model(
                 artifact,
@@ -1183,7 +1183,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Llama => Ok(Executable::llama(
+        FamilyBinding::Llama => Ok(Executable::llama(
             kind,
             crate::composition::llama::load_llama_safetensors_mlx(
                 artifact,
@@ -1193,7 +1193,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::MuseGlimmer => Ok(Executable::muse_glimmer(
+        FamilyBinding::MuseGlimmer => Ok(Executable::muse_glimmer(
             kind,
             crate::composition::muse_glimmer::load_safetensors(
                 artifact,
@@ -1203,7 +1203,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Executable::qwen(
+        FamilyBinding::Qwen => Ok(Executable::qwen(
             kind,
             crate::composition::qwen::load_qwen_safetensors_mlx(
                 artifact,
@@ -1213,7 +1213,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::GptOss => Ok(Executable::gpt_oss(
+        FamilyBinding::GptOss => Ok(Executable::gpt_oss(
             kind,
             crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
                 artifact,
@@ -1223,7 +1223,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Lfm2 => Ok(Executable::lfm2(
+        FamilyBinding::Lfm2 => Ok(Executable::lfm2(
             kind,
             crate::composition::lfm2::load_lfm2_model(
                 artifact,
@@ -1233,7 +1233,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::NemotronH => Ok(Executable::nemotron_h(
+        FamilyBinding::NemotronH => Ok(Executable::nemotron_h(
             kind,
             crate::composition::nemotron_h::load_nemotron_h_model(
                 artifact,
@@ -1243,7 +1243,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Qwen3Next => Ok(Executable::qwen3_next(
+        FamilyBinding::Qwen3Next => Ok(Executable::qwen3_next(
             kind,
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
@@ -1253,7 +1253,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Qwen3Vl => Ok(Executable::qwen3_vl(
+        FamilyBinding::Qwen3Vl => Ok(Executable::qwen3_vl(
             kind,
             crate::composition::qwen::vl::load_safetensors(
                 artifact,
@@ -1263,7 +1263,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Qwen3VlMoe => Ok(Executable::qwen3_vl_moe(
+        FamilyBinding::Qwen3VlMoe => Ok(Executable::qwen3_vl_moe(
             kind,
             crate::composition::qwen::vl::load_safetensors(
                 artifact,
@@ -1273,7 +1273,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Qwen35 => Ok(Executable::qwen35(
+        FamilyBinding::Qwen35 => Ok(Executable::qwen35(
             kind,
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
@@ -1283,7 +1283,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        ModelKind::Moshi => Err(Error::ArchitectureModel(
+        FamilyBinding::MoshiRealtime => Err(Error::ArchitectureModel(
             "Moshi-family bounded layer residency is selected through the realtime loader".into(),
         )),
     }

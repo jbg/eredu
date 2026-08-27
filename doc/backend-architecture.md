@@ -815,10 +815,12 @@ Each concrete backend keeps one exhaustive realization descriptor per
 normalized family for the artifact formats and backend-owned materializers it
 actually implements. The MLX descriptor binds GGUF availability, complete or
 distributed-stage tensor parallelism, independent expert-cache loading, and
-load-time quantization in one place; preflight and loader dispatch consume the
-same typed bindings. Adding a normalized family therefore requires an explicit
-MLX decision for every realization path instead of extending independent
-capability lists.
+load-time quantization in one place. It also selects the backend-owned family
+implementation used by complete and distributed materializers. Preflight and
+loader dispatch consume those typed bindings instead of independently matching
+the architecture registry. Adding a normalized family therefore requires one
+explicit MLX availability decision; adding a genuinely new MLX implementation
+extends the binding enum, whose exhaustive consumers are compiler checked.
 `BackendProvider::create_session` consumes a `PreparedModel`, so an executable
 cannot be paired with a cache or session created by another backend.
 

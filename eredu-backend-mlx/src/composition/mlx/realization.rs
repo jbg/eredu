@@ -45,6 +45,34 @@ pub(crate) enum ExpertCacheBinding {
     Qwen35,
 }
 
+/// MLX composition implementation selected for a normalized family.
+///
+/// Multiple normalized families may intentionally share one implementation.
+/// Loader dispatch is exhaustive over this backend-owned type, so adding a
+/// family to the architecture registry changes availability only in
+/// [`FamilyRealization::for_kind`]. A genuinely new implementation adds a
+/// variant here and the compiler identifies every materializer that must bind
+/// it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FamilyBinding {
+    DeepSeekV3,
+    DeepSeekV4,
+    Gemma4,
+    GptOss,
+    Inkling,
+    KimiLinear,
+    Llama,
+    MuseGlimmer,
+    Lfm2,
+    NemotronH,
+    MoshiRealtime,
+    Qwen,
+    Qwen3Next,
+    Qwen3Vl,
+    Qwen3VlMoe,
+    Qwen35,
+}
+
 /// Complete MLX realization surface for one normalized architecture family.
 ///
 /// This is intentionally an exhaustive `ModelKind` match. Adding a family to
@@ -52,6 +80,7 @@ pub(crate) enum ExpertCacheBinding {
 /// MLX artifact, parallel, residency, and quantization paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FamilyRealization {
+    binding: FamilyBinding,
     gguf: bool,
     tensor_parallel: ParallelRealization,
     expert_cache: Option<ExpertCacheBinding>,
@@ -61,6 +90,7 @@ pub(crate) struct FamilyRealization {
 
 impl FamilyRealization {
     const fn new(
+        binding: FamilyBinding,
         gguf: bool,
         tensor_parallel: ParallelRealization,
         expert_cache: Option<ExpertCacheBinding>,
@@ -68,6 +98,7 @@ impl FamilyRealization {
         complete_gguf_quantization: bool,
     ) -> Self {
         Self {
+            binding,
             gguf,
             tensor_parallel,
             expert_cache,
@@ -80,16 +111,28 @@ impl FamilyRealization {
     pub(crate) const fn for_kind(kind: ModelKind) -> Self {
         use CompleteTensorParallelBinding as Tp;
         use ExpertCacheBinding as Cache;
+        use FamilyBinding as Family;
         use ParallelRealization::{DistributedStage, Unavailable};
 
         match kind {
-            ModelKind::DeepSeekV3 => {
-                Self::new(true, DistributedStage, Some(Cache::DeepSeek), true, false)
-            }
-            ModelKind::DeepSeekV4 => {
-                Self::new(true, DistributedStage, Some(Cache::DeepSeek), true, false)
-            }
+            ModelKind::DeepSeekV3 => Self::new(
+                Family::DeepSeekV3,
+                true,
+                DistributedStage,
+                Some(Cache::DeepSeek),
+                true,
+                false,
+            ),
+            ModelKind::DeepSeekV4 => Self::new(
+                Family::DeepSeekV4,
+                true,
+                DistributedStage,
+                Some(Cache::DeepSeek),
+                true,
+                false,
+            ),
             ModelKind::Gemma4 => Self::new(
+                Family::Gemma4,
                 true,
                 ParallelRealization::Complete(Tp::Gemma4),
                 Some(Cache::Gemma4),
@@ -97,6 +140,7 @@ impl FamilyRealization {
                 false,
             ),
             ModelKind::GptOss => Self::new(
+                Family::GptOss,
                 true,
                 ParallelRealization::Complete(Tp::GptOss),
                 Some(Cache::GptOss),
@@ -104,6 +148,7 @@ impl FamilyRealization {
                 true,
             ),
             ModelKind::Inkling => Self::new(
+                Family::Inkling,
                 true,
                 ParallelRealization::Complete(Tp::Inkling),
                 Some(Cache::Inkling),
@@ -111,6 +156,7 @@ impl FamilyRealization {
                 false,
             ),
             ModelKind::KimiLinear => Self::new(
+                Family::KimiLinear,
                 true,
                 ParallelRealization::Complete(Tp::KimiLinear),
                 Some(Cache::KimiLinear),
@@ -118,6 +164,7 @@ impl FamilyRealization {
                 true,
             ),
             ModelKind::Llama => Self::new(
+                Family::Llama,
                 true,
                 ParallelRealization::Complete(Tp::Llama),
                 None,
@@ -125,6 +172,7 @@ impl FamilyRealization {
                 true,
             ),
             ModelKind::MuseGlimmer => Self::new(
+                Family::MuseGlimmer,
                 true,
                 ParallelRealization::Complete(Tp::MuseGlimmer),
                 Some(Cache::MuseGlimmer),
@@ -132,6 +180,7 @@ impl FamilyRealization {
                 false,
             ),
             ModelKind::Lfm2 => Self::new(
+                Family::Lfm2,
                 true,
                 ParallelRealization::Complete(Tp::Lfm2),
                 Some(Cache::Lfm2),
@@ -139,14 +188,23 @@ impl FamilyRealization {
                 true,
             ),
             ModelKind::NemotronH => Self::new(
+                Family::NemotronH,
                 true,
                 ParallelRealization::Complete(Tp::NemotronH),
                 Some(Cache::NemotronH),
                 true,
                 true,
             ),
-            ModelKind::Moshi => Self::new(false, Unavailable, None, false, false),
+            ModelKind::Moshi => Self::new(
+                Family::MoshiRealtime,
+                false,
+                Unavailable,
+                None,
+                false,
+                false,
+            ),
             ModelKind::Qwen2 => Self::new(
+                Family::Qwen,
                 true,
                 ParallelRealization::Complete(Tp::Qwen),
                 None,
@@ -154,21 +212,45 @@ impl FamilyRealization {
                 true,
             ),
             ModelKind::Qwen3 => Self::new(
+                Family::Qwen,
                 true,
                 ParallelRealization::Complete(Tp::Qwen),
                 Some(Cache::Qwen),
                 true,
                 true,
             ),
-            ModelKind::Qwen3Next => {
-                Self::new(true, DistributedStage, Some(Cache::Qwen3Next), true, true)
+            ModelKind::Qwen3Next => Self::new(
+                Family::Qwen3Next,
+                true,
+                DistributedStage,
+                Some(Cache::Qwen3Next),
+                true,
+                true,
+            ),
+            ModelKind::Qwen3Vl => {
+                Self::new(Family::Qwen3Vl, true, DistributedStage, None, true, true)
             }
-            ModelKind::Qwen3Vl => Self::new(true, DistributedStage, None, true, true),
-            ModelKind::Qwen3VlMoe => {
-                Self::new(true, DistributedStage, Some(Cache::Qwen3VlMoe), true, true)
-            }
-            ModelKind::Qwen35 => Self::new(true, DistributedStage, Some(Cache::Qwen35), true, true),
+            ModelKind::Qwen3VlMoe => Self::new(
+                Family::Qwen3VlMoe,
+                true,
+                DistributedStage,
+                Some(Cache::Qwen3VlMoe),
+                true,
+                true,
+            ),
+            ModelKind::Qwen35 => Self::new(
+                Family::Qwen35,
+                true,
+                DistributedStage,
+                Some(Cache::Qwen35),
+                true,
+                true,
+            ),
         }
+    }
+
+    pub(crate) const fn binding(self) -> FamilyBinding {
+        self.binding
     }
 
     pub(crate) const fn supports_gguf(self) -> bool {

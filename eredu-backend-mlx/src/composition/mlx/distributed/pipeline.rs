@@ -49,6 +49,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::composition::mlx::realization::{FamilyBinding, FamilyRealization};
 use crate::{
     backend::error::Error,
     backend::nn::{
@@ -13714,8 +13715,9 @@ pub fn load_pipeline_model_with_options(
                 "GGUF",
                 architecture.metadata_name(),
             )?;
-            return match architecture {
-                GgufArchitecture::DeepSeek4 => {
+            let binding = FamilyRealization::for_kind(architecture.model_kind()).binding();
+            return match binding {
+                FamilyBinding::DeepSeekV4 => {
                     let eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) =
                         admitted.model()
                     else {
@@ -13742,7 +13744,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+                FamilyBinding::Llama => {
                     let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(&admitted)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
@@ -13762,7 +13764,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::MuseGlimmer => {
+                FamilyBinding::MuseGlimmer => {
                     let (args, store) =
                         crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
                             &admitted,
@@ -13782,7 +13784,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::DeepSeek2 => {
+                FamilyBinding::DeepSeekV3 => {
                     let eredu_architectures::configuration::GgufModelConfig::DeepSeekV3(args) =
                         admitted.model()
                     else {
@@ -13809,7 +13811,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::Gemma4 => {
+                FamilyBinding::Gemma4 => {
                     let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
                         &admitted,
                         projector.as_ref(),
@@ -13828,9 +13830,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                architecture @ (GgufArchitecture::Qwen2
-                | GgufArchitecture::Qwen3
-                | GgufArchitecture::Qwen3Moe) => {
+                FamilyBinding::Qwen => {
                     let is_moe = architecture == GgufArchitecture::Qwen3Moe;
                     let prepared =
                         crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
@@ -13856,7 +13856,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+                FamilyBinding::Qwen3Vl | FamilyBinding::Qwen3VlMoe => {
                     let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
                         &admitted,
                         projector.as_ref().ok_or_else(|| {
@@ -13879,7 +13879,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::GptOss => {
+                FamilyBinding::GptOss => {
                     let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
@@ -13900,7 +13900,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                architecture @ (GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe) => {
+                FamilyBinding::Lfm2 => {
                     let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
                     let is_moe = architecture == GgufArchitecture::Lfm2Moe;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
@@ -13924,7 +13924,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                architecture @ (GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe) => {
+                FamilyBinding::NemotronH => {
                     let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
@@ -13932,7 +13932,6 @@ pub fn load_pipeline_model_with_options(
                         eredu_architectures::nemotron_h::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
-                    let _ = architecture;
                     load_nemotron_h_pipeline(
                         prepared.args,
                         model_kind,
@@ -13946,9 +13945,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::Qwen35
-                | GgufArchitecture::Qwen35Moe
-                | GgufArchitecture::Qwen3Next => {
+                FamilyBinding::Qwen35 | FamilyBinding::Qwen3Next => {
                     let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
                         &admitted,
                         projector.as_ref(),
@@ -13982,7 +13979,7 @@ pub fn load_pipeline_model_with_options(
                         )
                     }
                 }
-                GgufArchitecture::KimiLinear => {
+                FamilyBinding::KimiLinear => {
                     let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
@@ -14003,7 +14000,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::Inkling => {
+                FamilyBinding::Inkling => {
                     let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
                         &admitted,
                         projector.as_ref(),
@@ -14022,6 +14019,9 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
+                FamilyBinding::MoshiRealtime => Err(Error::ArchitectureModel(
+                    "Moshi-family models have no GGUF decoder-pipeline realization".into(),
+                )),
             };
         }
         ModelArtifact::SafeTensors {
