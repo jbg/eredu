@@ -148,16 +148,6 @@ pub fn validate_token_domain(
     Ok(tokens)
 }
 
-#[allow(unused_macros)]
-macro_rules! try_unwrap {
-    ($expr:expr) => {
-        match $expr {
-            core::result::Result::Ok(val) => val,
-            core::result::Result::Err(e) => return Some(Err(e.into())),
-        }
-    };
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QuantizedAttentionGeometry {
     batch: i32,
