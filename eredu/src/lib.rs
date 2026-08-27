@@ -22,6 +22,10 @@
 //! use eredu::Completion;
 //! ```
 //!
+//! ```compile_fail
+//! use eredu::ValueDescriptor;
+//! ```
+//!
 //! Generic realtime scheduling and speculative execution infrastructure also
 //! comes from `eredu-core`; the facade exposes selected-backend realtime
 //! wrappers and prepared-chat speculative requests instead:
@@ -122,6 +126,6 @@ pub use eredu_core::{
     TensorObservation, TensorObservationData, TextGenerationConfig, TextSamplingStrategy,
     TimingTelemetry, TokenFilter, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
     TokenizedMultimodalSegment, TokenizerCompatibilityError, TokenizerCompatibilityProof,
-    TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION, EXECUTION_PLAN_SCHEMA_VERSION,
+    TransferTelemetry, Video, VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    EXECUTION_PLAN_SCHEMA_VERSION,
 };

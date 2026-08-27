@@ -86,8 +86,9 @@ and prefetch engines, generic schedulers and completions, speculative execution
 request and lane contracts, parameter plans, and other infrastructure are
 imported from their owning crates. Backend providers, sessions, prepared
 models, runtime handles, completion and submission primitives, distributed
-execution contracts, and `eredu-runtime` infrastructure likewise come directly
-from their owning crates rather than facade compatibility re-exports.
+execution contracts—including received-value shape and dtype descriptors—and
+`eredu-runtime` infrastructure likewise come directly from their owning crates
+rather than facade compatibility re-exports.
 
 The selected adapter exposes the causal backend type and facade-owned realtime
 model, scheduler, session, completed-step, and error wrappers because the neutral

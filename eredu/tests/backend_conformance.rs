@@ -32,8 +32,7 @@ use eredu::{
     ParallelTopology, PhysicalMemorySemantics, RealtimeFrameConvention, RealtimeSampling,
     RealtimeSpeechConfig, ResidencyPlan, RuntimeStateEstimate, SemanticEvent, SessionCapabilities,
     SpeculativeDraft, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
-    StaticMemoryReport, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
-    AUTOMATIC_SCHEMA_VERSION,
+    StaticMemoryReport, TextGenerationConfig, TokenFilter, TokenOutput, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::{
     checkpoint::TensorDtype,
@@ -54,7 +53,7 @@ use eredu_core::{
     SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationVisitor,
     SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
     SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout, Submission,
-    TextGenerationBackend,
+    TextGenerationBackend, ValueDescriptor,
 };
 use tokenizers::{
     decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
