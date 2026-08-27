@@ -3346,7 +3346,7 @@ fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
 }
 
 #[test]
-fn prepared_prompt_matches_existing_json_renderer() {
+fn prepared_prompt_matches_direct_tokenizer_rendering() {
     let template = ModelChatTemplate::Single(
         concat!(
             "{{ prefix }}",
@@ -3363,13 +3363,13 @@ fn prepared_prompt_matches_existing_json_renderer() {
 
     for add_generation_prompt in [false, true] {
         let raw = Tokenizer::new(WordLevel::default());
-        let mut existing_tokenizer = ChatTokenizer::from_tokenizer(raw.clone());
-        let expected = existing_tokenizer
+        let mut direct_tokenizer = ChatTokenizer::from_tokenizer(raw.clone());
+        let expected = direct_tokenizer
             .apply_chat_template_json(
                 template.clone(),
                 [messages.clone()],
                 Some(&tools),
-                "legacy-json-renderer",
+                "direct-tokenizer-rendering",
                 add_generation_prompt,
                 Some(&kwargs),
             )
@@ -3379,7 +3379,7 @@ fn prepared_prompt_matches_existing_json_renderer() {
         let prepared = prepare_chat_from_parts(
             &mut preparation_tokenizer,
             template.clone(),
-            "prepared-json-renderer",
+            "prepared-chat-rendering",
             &[],
             None,
             ChatTemplateRequest {
