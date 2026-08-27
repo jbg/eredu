@@ -67,9 +67,6 @@ fn unloaded_layer_norm<T: Tensor>(
     )
 }
 
-/// Default released Mimi checkpoint filename used by PersonaPlex.
-pub const PERSONAPLEX_MIMI_SAFETENSORS: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
-
 /// Mimi resampling strategy.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ResampleMethod {
