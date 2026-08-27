@@ -33,9 +33,13 @@ native build runs. Consumers selecting CUDA from a package whose default is
 `mlx`, including `eredu-cli`, must disable default features while enabling
 `cuda`. The backend crate itself has no default features and disables the
 `safemlx` defaults, so direct backend users select native execution support
-explicitly. The facade exposes a flat,
-application-facing local adapter under `eredu::api`; it does not reproduce the
-implementation crate's backend or composition module tree. Backend-internal
+explicitly. The `safemlx-tests` package likewise exposes separate `metal` and
+`cuda` platform features. Its default selects Metal, so CUDA CI disables
+package defaults before selecting `cuda`; the test package's dependency on
+`safemlx` itself enables only backend-neutral SafeTensors support. The facade
+exposes a flat, application-facing local adapter under `eredu::api`; it does not
+reproduce the implementation crate's backend or composition module tree.
+Backend-internal
 fixtures and composition tests are crate-private unit tests; published crates
 expose no test-support feature or fixture namespace. The facade does not
 directly depend on `eredu-nn`. Direct MLX backend users also enable `image` and

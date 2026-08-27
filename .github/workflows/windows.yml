@@ -139,7 +139,7 @@ jobs:
       - name: Compile CUDA codec and integration tests
         run: |
           cargo test -j 1 -p eredu-backend-mlx --features "cuda,codec" --test mimi_codec --no-run
-          cargo test -j 1 -p safemlx-tests --features cuda --no-run
+          cargo test -j 1 -p safemlx-tests --no-default-features --features cuda --no-run
 
   cuda-gpu-runtime:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_gpu }}

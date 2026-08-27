@@ -9,12 +9,14 @@ license.workspace = true
 publish = false
 
 [features]
+default = ["metal"]
 cuda = ["safemlx/cuda"]
+metal = ["safemlx/accelerate", "safemlx/metal"]
 nccl = ["cuda", "safemlx/nccl"]
 
 [dependencies]
 
 [dev-dependencies]
 safemlx-internal-macros.workspace = true
-safemlx = { workspace = true, features = ["accelerate", "metal", "safetensors"] }
+safemlx = { workspace = true, features = ["safetensors"] }
 tempfile.workspace = true
