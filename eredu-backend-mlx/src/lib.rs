@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-#![allow(missing_docs)]
+#![deny(missing_docs)]
 #![allow(
     clippy::arc_with_non_send_sync,
     clippy::drop_non_drop,

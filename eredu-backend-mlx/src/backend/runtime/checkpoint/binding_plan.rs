@@ -16,14 +16,19 @@ use crate::backend::runtime::residency::manager::ResidencyError;
 /// One runtime target and the physical recipe that produces it.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PlannedBinding {
+    /// Runtime parameter name populated by this binding.
     pub target_name: String,
+    /// Logical shape required by the runtime parameter.
     pub expected_shape: Vec<usize>,
+    /// Logical dtype required by the runtime parameter.
     pub expected_dtype: RecipeDtype,
+    /// Declarative transformation from checkpoint sources to the target.
     pub recipe: DerivedWeightRecipe,
 }
 
 impl PlannedBinding {
     #[cfg(test)]
+    /// Creates a direct-source binding for tests.
     pub fn direct(
         target_name: impl Into<String>,
         source_key: impl Into<String>,
@@ -115,11 +120,13 @@ impl BindingPlan {
     }
 
     #[cfg(test)]
+    /// Returns planned bindings in deterministic target order.
     pub fn bindings(&self) -> &[PlannedBinding] {
         &self.bindings
     }
 
     #[cfg(test)]
+    /// Returns the distinct checkpoint source keys used by the plan.
     pub fn source_keys(&self) -> Vec<&str> {
         let mut keys = BTreeSet::new();
         for binding in &self.bindings {
@@ -129,6 +136,7 @@ impl BindingPlan {
     }
 
     #[cfg(test)]
+    /// Returns source keys explicitly shared by multiple targets.
     pub fn shared_source_keys(&self) -> &BTreeSet<String> {
         &self.shared_source_keys
     }
@@ -197,42 +205,81 @@ fn is_floating_recipe_dtype(dtype: &RecipeDtype) -> bool {
 /// Invalid declarative bindings or inferred recipe outputs.
 #[derive(Debug, thiserror::Error)]
 pub enum BindingPlanError {
+    /// A binding declared an empty runtime target name.
     #[error("binding target must not be empty")]
     EmptyTarget,
+    /// A target declared an empty or otherwise invalid logical shape.
     #[error("binding target {target:?} has invalid shape {shape:?}")]
-    InvalidTargetShape { target: String, shape: Vec<usize> },
+    InvalidTargetShape {
+        /// Invalid target name.
+        target: String,
+        /// Invalid logical shape.
+        shape: Vec<usize>,
+    },
+    /// Computing a target's logical element count overflowed.
     #[error("binding target {target:?} shape element count overflows")]
-    TargetShapeOverflow { target: String },
+    TargetShapeOverflow {
+        /// Target whose shape overflowed.
+        target: String,
+    },
+    /// More than one binding declared the same runtime target.
     #[error("binding plan contains duplicate target {target:?}")]
-    DuplicateTarget { target: String },
+    DuplicateTarget {
+        /// Duplicated target name.
+        target: String,
+    },
+    /// A derived binding did not reference any checkpoint source.
     #[error("binding target {target:?} has a recipe with no checkpoint sources")]
-    EmptyRecipeSources { target: String },
+    EmptyRecipeSources {
+        /// Target with the empty recipe.
+        target: String,
+    },
+    /// A recipe referenced an empty checkpoint source key.
     #[error("binding target {target:?} has an empty checkpoint source key")]
-    InvalidSourceKey { target: String },
+    InvalidSourceKey {
+        /// Target containing the invalid source key.
+        target: String,
+    },
+    /// Two runtime targets claimed exclusive ownership of one source.
     #[error("checkpoint source {source_key:?} is claimed by both {first:?} and {second:?}")]
     DuplicateSourceClaim {
+        /// Checkpoint key claimed twice.
         source_key: String,
+        /// First runtime target claiming the source.
         first: String,
+        /// Second runtime target claiming the source.
         second: String,
     },
+    /// The inferred recipe shape differs from the declared target shape.
     #[error("binding target {target:?} expects shape {expected:?}, recipe produces {actual:?}")]
     ShapeMismatch {
+        /// Runtime target name.
         target: String,
+        /// Declared logical shape.
         expected: Vec<usize>,
+        /// Shape inferred from the recipe.
         actual: Vec<usize>,
     },
+    /// The inferred recipe dtype differs from the declared target dtype.
     #[error("binding target {target:?} expects dtype {expected:?}, recipe produces {actual:?}")]
     DtypeMismatch {
+        /// Runtime target name.
         target: String,
+        /// Declared logical dtype.
         expected: RecipeDtype,
+        /// Dtype inferred from the recipe.
         actual: RecipeDtype,
     },
+    /// A checkpoint-derived recipe was invalid or could not be lowered.
     #[error(transparent)]
     Recipe(#[from] WeightRecipeError),
+    /// A backend-neutral recipe was invalid.
     #[error(transparent)]
     NeutralRecipe(#[from] eredu_checkpoint::recipe::RecipeError),
+    /// A runtime residency declaration was invalid.
     #[error(transparent)]
     Declaration(#[from] eredu_runtime::ResidencyDeclarationError),
+    /// A residency operation failed while validating the plan.
     #[error(transparent)]
     Residency(#[from] ResidencyError),
 }

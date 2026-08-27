@@ -47,6 +47,7 @@ pub struct MlxDistributedSession<'a> {
 }
 
 impl<'a> MlxDistributedSession<'a> {
+    /// Creates a distributed session and validates its execution stream.
     pub fn new(config: MlxDistributedConfig<'a>, stream: &Stream) -> Result<Self, Error> {
         config.topology.validate_execution_stream(stream)?;
         let communicators = ParallelCommunicators::new(config.topology, config.world)?;
@@ -67,10 +68,12 @@ impl<'a> MlxDistributedSession<'a> {
         &self.stream
     }
 
+    /// Returns the world communicator for the session.
     pub const fn world(&self) -> &Group {
         self.communicators.world()
     }
 
+    /// Creates the tensor-parallel execution context, or a replicated context.
     pub fn tensor_context(&self) -> Result<ParallelExecutionContext<'_>, Error> {
         match self.communicators.tensor_group() {
             Some(group) => {
@@ -80,14 +83,17 @@ impl<'a> MlxDistributedSession<'a> {
         }
     }
 
+    /// Returns the tensor-parallel communicator when that axis is partitioned.
     pub fn tensor_group(&self) -> Option<&Group> {
         self.communicators.tensor_group()
     }
 
+    /// Returns the expert-parallel communicator when that axis is partitioned.
     pub fn expert_group(&self) -> Option<&Group> {
         self.communicators.expert_group()
     }
 
+    /// Returns the pipeline-parallel communicator when that axis is partitioned.
     pub fn pipeline_group(&self) -> Option<&Group> {
         self.communicators.pipeline_group()
     }

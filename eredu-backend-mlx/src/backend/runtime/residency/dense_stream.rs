@@ -23,6 +23,7 @@ pub struct BackgroundLayerPrefetch {
 }
 
 impl BackgroundLayerPrefetch {
+    /// Starts a bounded background host-prefetch worker.
     pub fn new(manager: ResidencyManager, capacity: usize) -> Result<Self, DenseStreamError> {
         let worker_manager = manager.clone();
         let operation = Arc::new(move |id: &OffloadUnitId| {
@@ -46,11 +47,13 @@ impl BackgroundLayerPrefetch {
         Ok(Self { manager, worker })
     }
 
+    /// Queues one unit unless it is already host-resident.
     pub fn submit(&self, id: &OffloadUnitId) -> Result<(), DenseStreamError> {
         let resident = self.manager.is_resident(id, MemoryTier::Host)?;
         Ok(self.worker.submit(id, resident)?)
     }
 
+    /// Waits for queued prefetch and acquires a host-resident lease.
     pub fn acquire(&self, id: &OffloadUnitId) -> Result<ResidentUnitLease, DenseStreamError> {
         let resolution = self.worker.wait(id)?;
         if let PrefetchDemandResolution::Failed(message) = resolution {
@@ -62,10 +65,12 @@ impl BackgroundLayerPrefetch {
         Ok(self.manager.acquire(id, MemoryTier::Host)?)
     }
 
+    /// Cancels queued work and joins the worker.
     pub fn cancel(&self) -> Result<(), DenseStreamError> {
         Ok(self.worker.cancel()?)
     }
 
+    /// Returns current background-prefetch telemetry.
     pub fn report(&self) -> Result<BackgroundPrefetchReport, DenseStreamError> {
         Ok(self.worker.report()?)
     }

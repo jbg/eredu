@@ -134,6 +134,7 @@ fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
 }
 
 #[cfg(any(feature = "image", feature = "audio"))]
+/// Builds one tensor-backed input part for a media modality.
 pub fn media_input_part(
     modality: InputModality,
     tensor: Array,
@@ -304,6 +305,7 @@ fn mlx_tensor_identity(identity: &InputTensorIdentity) -> Result<(Dtype, Vec<i32
     Ok((dtype, shape))
 }
 
+/// Returns the MLX dtypes and shapes encoded by a prepared-input identity.
 pub fn prepared_identity_wire_arrays(
     identity: &PreparedInputIdentity,
 ) -> Result<Vec<(Dtype, Vec<i32>)>, Error> {
@@ -320,9 +322,12 @@ pub fn prepared_identity_wire_arrays(
 
 #[derive(Debug)]
 #[cfg(any(feature = "image", feature = "audio"))]
+/// Failure while converting application input into backend-ready model input.
 pub enum ProcessorPreparationError<E> {
+    /// MLX media preparation failed.
     Backend(Error),
     #[cfg_attr(not(feature = "image"), allow(dead_code))]
+    /// Application text preparation failed.
     Text(E),
 }
 
@@ -334,6 +339,7 @@ impl<E> From<Error> for ProcessorPreparationError<E> {
 }
 
 #[cfg(any(test, feature = "image", feature = "audio"))]
+/// Validates and assembles owned prepared model-input parts.
 pub fn prepared_model_input(parts: Vec<InputPart>) -> Result<PreparedModelInput, Error> {
     if parts.is_empty() {
         return Err(Error::Processor(
@@ -344,6 +350,7 @@ pub fn prepared_model_input(parts: Vec<InputPart>) -> Result<PreparedModelInput,
 }
 
 #[cfg(any(test, feature = "image", feature = "audio"))]
+/// Appends a non-empty text-token input part.
 pub fn push_text_token_ids(parts: &mut Vec<InputPart>, token_ids: &[u32]) -> Result<(), Error> {
     if !token_ids.is_empty() {
         parts.push(text_input_part(token_ids)?);

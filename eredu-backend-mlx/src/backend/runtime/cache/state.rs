@@ -182,6 +182,7 @@ impl MlxPoolingAttentionCache {
         }
     }
 
+    /// Copies every state array into an independent MLX graph value.
     pub fn deep_clone_state(&self) -> Result<Self, Exception> {
         match self {
             Self::Local(local) => local.deep_clone_state().map(Self::Local),

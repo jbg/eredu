@@ -35,6 +35,7 @@ pub struct DistributedCompletion<T> {
 }
 
 impl<T> DistributedCompletion<T> {
+    /// Submits the supplied output arrays and couples their event to `value`.
     pub fn submit<'a>(
         value: T,
         outputs: impl IntoIterator<Item = &'a Array>,
@@ -105,6 +106,7 @@ impl<T> eredu_core::Completion for DistributedCompletion<T> {
     }
 }
 
+/// Submits and host-synchronizes exactly the supplied output arrays.
 pub fn synchronize_outputs<'a>(
     outputs: impl IntoIterator<Item = &'a Array>,
 ) -> safemlx::error::Result<()> {

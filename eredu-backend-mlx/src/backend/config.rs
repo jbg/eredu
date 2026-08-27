@@ -119,6 +119,7 @@ impl ModelLoadOptions {
         Ok(())
     }
 
+    /// Converts these MLX load options into the portable preparation policy.
     pub fn preparation_policy(self) -> Result<eredu_core::PreparationPolicy, Error> {
         use eredu_core::ResidencyRequest;
         use eredu_runtime::LayerWeightResidency;

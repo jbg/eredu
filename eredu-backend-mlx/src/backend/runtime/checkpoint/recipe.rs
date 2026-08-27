@@ -108,27 +108,32 @@ pub fn lower_mxfp4_recipe(
 /// MLX lowering operations for a backend-neutral recipe.
 pub trait MlxWeightRecipeExt {
     #[cfg(test)]
+    /// Materializes the recipe synchronously for tests.
     fn materialize(
         &self,
         store: &dyn CheckpointSource,
         source_stream: &Stream,
     ) -> Result<Array, WeightRecipeError>;
+    /// Prepares owned checkpoint sources and submits the recipe transformations.
     fn prepare_materialization(
         &self,
         store: &dyn CheckpointSource,
         context: &MlxParameterMaterializationContext,
     ) -> Result<PendingWeightRecipe, WeightRecipeError>;
+    /// Prepares borrowed checkpoint sources and submits the recipe transformations.
     fn prepare_borrowed_materialization(
         &self,
         store: &dyn CheckpointSource,
         context: &MlxParameterMaterializationContext,
     ) -> Result<PendingWeightRecipe, WeightRecipeError>;
+    /// Prepares a recipe using the selected source ownership mode.
     fn prepare_materialization_mode(
         &self,
         store: &dyn CheckpointSource,
         context: &MlxParameterMaterializationContext,
         borrow_sources: bool,
     ) -> Result<PendingWeightRecipe, WeightRecipeError>;
+    /// Recursively lowers a recipe and retains all pending source operations.
     fn materialize_inner(
         &self,
         store: &dyn CheckpointSource,
@@ -353,12 +358,14 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
     }
 }
 
+/// Submitted recipe output and the source operations it retains.
 pub struct PendingWeightRecipe {
     output: Array,
     sources: Vec<PendingWeightMaterialization>,
 }
 
 impl PendingWeightRecipe {
+    /// Separates the output array from its retained source operations.
     pub fn into_parts(self) -> (Array, Vec<PendingWeightMaterialization>) {
         (self.output, self.sources)
     }

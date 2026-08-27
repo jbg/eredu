@@ -50,6 +50,7 @@ fn is_temporary_residency_contention(error: &Error) -> bool {
     )
 }
 
+/// Opens a shared safetensors source with a bounded mapped-shard cache.
 pub fn open_safetensors_weight_store(
     model_dir: &Path,
     max_mapped_shards: usize,
@@ -59,6 +60,7 @@ pub fn open_safetensors_weight_store(
     ))
 }
 
+/// Coordinates bounded host prefetch, device transfers, and dense-stream telemetry.
 pub struct DenseStreamController {
     options: DenseDiskStreamLoadOptions,
     background: Option<BackgroundLayerPrefetch>,
@@ -66,6 +68,7 @@ pub struct DenseStreamController {
 }
 
 impl DenseStreamController {
+    /// Creates a controller for a validated dense disk-stream plan.
     pub fn new(
         manager: &ResidencyManager,
         options: DenseDiskStreamLoadOptions,
@@ -95,6 +98,7 @@ impl DenseStreamController {
         })
     }
 
+    /// Opens a bounded device-transfer window for selected group-local units.
     pub fn transfer_window(
         self: &Arc<Self>,
         manager: &ResidencyManager,
@@ -143,6 +147,7 @@ impl DenseStreamController {
         Ok(())
     }
 
+    /// Cancels prefetch and removes host/device protection for one group.
     pub fn clear_group(&self, manager: &ResidencyManager, group: &str) -> Result<(), Error> {
         manager.protect_group_window(&format!("dense:{group}:host"), &[], MemoryTier::Host)?;
         manager.protect_group_window(&format!("dense:{group}:device"), &[], MemoryTier::Device)?;
@@ -152,6 +157,7 @@ impl DenseStreamController {
         Ok(())
     }
 
+    /// Starts transactional telemetry for one model forward pass.
     pub fn forward_guard(
         self: &Arc<Self>,
         prefill: bool,
@@ -182,6 +188,7 @@ impl DenseStreamController {
         self.telemetry.abort_forward();
     }
 
+    /// Starts cleanup and execution accounting for one group.
     pub fn group_guard(
         self: &Arc<Self>,
         manager: &ResidencyManager,
@@ -195,6 +202,7 @@ impl DenseStreamController {
         }
     }
 
+    /// Returns current dense-stream and residency telemetry.
     pub fn report(&self, manager: &ResidencyManager) -> Result<DenseDiskStreamReport, Error> {
         let residency = manager.report()?;
         let background = self
@@ -320,6 +328,7 @@ impl DensePreparedTransfer {
     }
 }
 
+/// Transactional guard for dense-stream forward telemetry.
 pub struct DenseStreamForwardGuard {
     controller: Arc<DenseStreamController>,
     manager: ResidencyManager,
@@ -327,6 +336,7 @@ pub struct DenseStreamForwardGuard {
 }
 
 impl DenseStreamForwardGuard {
+    /// Commits the forward telemetry and disarms rollback-on-drop.
     pub fn complete(mut self) -> Result<(), Error> {
         let result = self.controller.commit_forward(&self.manager);
         if result.is_ok() {
@@ -344,6 +354,7 @@ impl Drop for DenseStreamForwardGuard {
     }
 }
 
+/// Cleanup guard for one dense-stream execution group.
 pub struct DenseStreamGroupGuard {
     controller: Arc<DenseStreamController>,
     manager: ResidencyManager,
@@ -352,6 +363,7 @@ pub struct DenseStreamGroupGuard {
 }
 
 impl DenseStreamGroupGuard {
+    /// Clears group protections and records successful execution.
     pub fn complete(mut self) -> Result<(), Error> {
         let result = self
             .controller
@@ -643,6 +655,7 @@ mod packed_weight_companion_tests {
     }
 }
 
+/// Builds a quantized checkpoint overlay from neutral parameter topologies.
 pub fn quantize_parameterized_store<SM, U, SF, TF>(
     store: SharedCheckpointSource,
     source_static: &SM,
@@ -846,10 +859,12 @@ pub struct PipelineStageQuantizationSelection<'a> {
 }
 
 impl<'a> PipelineStageQuantizationSelection<'a> {
+    /// Returns the static parameter roles owned by this pipeline stage.
     pub fn static_roles(&self) -> &'a [&'a str] {
         self.static_roles
     }
 
+    /// Creates a selection with one stage-local layer group.
     pub fn new(static_roles: &'a [&'a str], layer_group: usize, layer_range: Range<usize>) -> Self {
         Self {
             static_roles,
@@ -857,6 +872,7 @@ impl<'a> PipelineStageQuantizationSelection<'a> {
         }
     }
 
+    /// Adds a non-empty stage-local layer group to the selection.
     pub fn with_layer_group(mut self, layer_group: usize, layer_range: Range<usize>) -> Self {
         if !layer_range.is_empty() {
             self.layer_groups.push((layer_group, layer_range));
@@ -1119,6 +1135,7 @@ fn stored_tensor_selection(
     })
 }
 
+/// Applies the local parallel layout to architecture-declared layer bindings.
 pub fn shard_layer_bindings(
     bindings: Vec<WeightBinding>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -1292,6 +1309,7 @@ mod shard_layer_bindings_tests {
     }
 }
 
+/// Rejects checkpoint tensors that were neither consumed nor explicitly ignored.
 pub fn validate_unused<F>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     consumed: &BTreeSet<String>,
@@ -1359,6 +1377,7 @@ mod validate_unused_tests {
     }
 }
 
+/// Validates that required host storage fits the configured offload budget.
 pub fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Error> {
     if let Some(budget) = config.host_budget_bytes() {
         if required > budget {
@@ -1368,6 +1387,7 @@ pub fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), 
     Ok(())
 }
 
+/// Validates that static and window storage fit the configured device budget.
 pub fn validate_device_budget(
     config: OffloadConfig,
     static_bytes: u64,

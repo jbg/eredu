@@ -51,18 +51,33 @@ use eredu_runtime::{
     PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
 };
 
+/// Maximum number of cache blocks scheduled ahead by paged-cache prefetch.
 pub const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_WRITE_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_DEMOTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
+/// Device arrays held by one resident attention-cache block.
 pub enum CacheBlockArrays {
-    KeyValue { keys: Array, values: Array },
-    CompressedLatentRotary { latent: Array, rotary_key: Array },
+    /// Conventional key/value attention state.
+    KeyValue {
+        /// Key-cache values.
+        keys: Array,
+        /// Value-cache values.
+        values: Array,
+    },
+    /// Compressed latent attention state and its decoupled rotary keys.
+    CompressedLatentRotary {
+        /// Compressed latent values.
+        latent: Array,
+        /// Decoupled rotary-key values.
+        rotary_key: Array,
+    },
 }
 
 impl CacheBlockArrays {
+    /// Returns the portable representation encoded by these arrays.
     pub fn representation(&self) -> CacheRepresentation {
         match self {
             Self::KeyValue { .. } => CacheRepresentation::KeyValue,
@@ -1117,6 +1132,7 @@ impl CacheResidencyManager {
             .map_err(|_| CacheResidencyError::ManagerPoisoned)
     }
 
+    /// Binds the manager to the transfer device selected by `stream`.
     pub fn bind_transfer_device(&self, stream: &Stream) -> Result<(), CacheResidencyError> {
         let device = CacheTransferDevice::from_stream(stream)?;
         let mut state = self.lock()?;
@@ -1133,6 +1149,7 @@ impl CacheResidencyManager {
         }
     }
 
+    /// Updates the mutable tail's logical byte count and end position.
     pub fn set_tail_state(
         &self,
         layer: usize,
@@ -1161,6 +1178,7 @@ impl CacheResidencyManager {
         Ok(())
     }
 
+    /// Publishes a completed mutable tail range as an immutable cache block.
     pub fn seal_block(
         &self,
         global_layer: usize,
@@ -1217,6 +1235,7 @@ impl CacheResidencyManager {
         Ok(id)
     }
 
+    /// Returns ordered block identities for a layer and visible token range.
     pub fn layer_block_ids(
         &self,
         layer: usize,
@@ -1239,6 +1258,7 @@ impl CacheResidencyManager {
             .collect())
     }
 
+    /// Returns the greatest logical end position stored for a layer.
     pub fn layer_end(
         &self,
         layer: usize,
@@ -1254,6 +1274,7 @@ impl CacheResidencyManager {
             .unwrap_or(0))
     }
 
+    /// Removes one unleased cache block from all tiers.
     pub fn remove_block(&self, id: &CacheBlockId) -> Result<(), CacheResidencyError> {
         let mut state = self.lock()?;
         if !state.blocks.contains_key(id) {
@@ -1272,6 +1293,7 @@ impl CacheResidencyManager {
         Ok(())
     }
 
+    /// Atomically truncates a layer while preserving its protected prefix.
     pub fn truncate_layer_transaction(
         &self,
         global_layer: usize,
@@ -1407,6 +1429,7 @@ impl CacheResidencyManager {
         Ok(())
     }
 
+    /// Promotes and leases one cache block for use on `stream`.
     pub fn lease_block(
         &self,
         id: &CacheBlockId,
@@ -1761,6 +1784,7 @@ impl CacheResidencyManager {
         }
     }
 
+    /// Discards layer blocks entirely before the visible window.
     pub fn discard_before(
         &self,
         layer: usize,
@@ -1869,6 +1893,7 @@ impl CacheResidencyManager {
         }
     }
 
+    /// Records one attention scan and its scratch-memory use in telemetry.
     pub fn record_attention_scan(
         &self,
         global_layer: usize,
@@ -2738,14 +2763,17 @@ pub struct CacheBlockLease {
 }
 
 impl CacheBlockLease {
+    /// Returns the leased block identity.
     pub fn id(&self) -> &CacheBlockId {
         &self.id
     }
 
+    /// Returns the leased device arrays.
     pub fn arrays(&self) -> &CacheBlockArrays {
         &self.arrays
     }
 
+    /// Returns the logical device byte count of the leased arrays.
     pub fn bytes(&self) -> u64 {
         self.arrays.bytes()
     }
@@ -2854,8 +2882,11 @@ pub fn open_prompt_cache(
 
 /// Materialized non-attention state tensor from a validated prompt cache.
 pub struct LoadedPromptCacheStateTensor {
+    /// Architecture state owner identified by the prompt-cache manifest.
     pub owner: StateTensorOwner,
+    /// Semantic role of the state tensor.
     pub role: StateTensorRole,
+    /// Materialized MLX state array.
     pub array: Array,
 }
 

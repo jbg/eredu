@@ -33,6 +33,7 @@ pub struct CachedRelu2ExpertProvider<'a, F> {
 }
 
 impl<'a, F> CachedRelu2ExpertProvider<'a, F> {
+    /// Creates a cached provider using the supplied layer-spec factory.
     pub const fn new(cache: &'a ExpertCache, spec_for_layer: F) -> Self {
         Self {
             cache,
@@ -84,6 +85,7 @@ pub struct CachedGatedProductExpertProvider<'a> {
 }
 
 impl<'a> CachedGatedProductExpertProvider<'a> {
+    /// Creates a gated-product provider backed by an expert cache.
     pub const fn new(cache: &'a ExpertCache) -> Self {
         Self { cache }
     }
@@ -151,6 +153,7 @@ pub struct ExpertExecutorProvider<'a, F> {
 }
 
 impl<'a, F> ExpertExecutorProvider<'a, F> {
+    /// Wraps a callback that owns expert execution and communication.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
     }
@@ -272,6 +275,7 @@ pub struct GatedProductExpertExecutorProvider<'a, F> {
 }
 
 impl<'a, F> GatedProductExpertExecutorProvider<'a, F> {
+    /// Wraps a callback preserving complete versus rank-local output semantics.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
     }
@@ -427,6 +431,7 @@ pub struct Relu2ExpertExecutorProvider<'a, F> {
 }
 
 impl<'a, F> Relu2ExpertExecutorProvider<'a, F> {
+    /// Wraps a callback that executes a ReLU2 expert request.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
     }
@@ -519,6 +524,7 @@ pub struct ResidentExpertExecutorProvider<'a, F> {
 }
 
 impl<'a, F> ResidentExpertExecutorProvider<'a, F> {
+    /// Wraps a callback that executes against a resident rank-local bank.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
     }

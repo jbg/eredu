@@ -16,13 +16,18 @@ decoder used by Moshi-family speech models. It supports:
 - latent-to-token and token-to-latent conversion; and
 - stateful one-frame decoding for realtime playback.
 
-```rust,ignore
-use eredu_codec::{mimi::{Config, Mimi}, AudioTokenizer};
+```rust,no_run
+use eredu_codec::mimi::Mimi;
+use eredu_nn::Tensor;
 
-let mut mimi = Mimi::new(Config::v0_1(Some(8)), context)?;
-// Load backend-native tensors with `Mimi::load_parameters`.
-let tokens = mimi.encode(&pcm, stream)?;
-let reconstructed = mimi.decode(&tokens, stream)?;
+fn round_trip<T: Tensor>(
+    mimi: &mut Mimi<T>,
+    pcm: &T,
+    context: &T::Context,
+) -> Result<T, eredu_codec::Error> {
+    let tokens = mimi.encode(pcm, context)?;
+    mimi.decode(&tokens, context)
+}
 ```
 
 Tensor shapes follow `[batch, channels, samples_or_frames]`. Audio capture,

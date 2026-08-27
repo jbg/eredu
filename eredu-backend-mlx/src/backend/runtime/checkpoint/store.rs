@@ -279,6 +279,7 @@ impl MlxParameterMaterializationContext {
         &self.execution_stream
     }
 
+    /// Wraps a neutral checkpoint lease for MLX materialization.
     pub fn weight_lease(&self, lease: CheckpointLease) -> Result<WeightLease, WeightStoreError> {
         WeightLease::from_checkpoint_lease(lease, Arc::clone(&self.converted_groups))
     }
@@ -345,6 +346,7 @@ fn gguf_test_plan(
 }
 
 #[cfg(test)]
+/// Opens a GGUF source under a catalog-derived strict test contract.
 pub fn open_gguf_checkpoint_source_for_test<F>(
     checkpoint: GgufCheckpoint,
     translate: F,
@@ -485,6 +487,7 @@ fn neutral_metadata(metadata: eredu_checkpoint::store::TensorMetadata) -> Weight
     }
 }
 
+/// Converts a backend-neutral checkpoint-store error into the MLX store error.
 pub fn neutral_store_error(error: eredu_checkpoint::store::StoreError) -> WeightStoreError {
     use eredu_checkpoint::store::StoreError;
     match error {
@@ -1006,6 +1009,7 @@ pub struct WeightMaterialization {
 }
 
 impl WeightMaterialization {
+    /// Submits an output and retains its source materializations until completion.
     pub fn submit_retained(
         output: Array,
         sources: Vec<PendingWeightMaterialization>,

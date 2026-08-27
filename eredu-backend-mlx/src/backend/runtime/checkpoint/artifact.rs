@@ -16,6 +16,7 @@ use crate::backend::error::Error;
 /// logical file layout.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub enum LoadedArtifactIdentity {
+    /// SHA-256 digest of the artifact's logical layout and content.
     Content([u8; 32]),
 }
 
@@ -30,11 +31,14 @@ impl std::fmt::Debug for LoadedArtifactIdentity {
 /// One file and its stable logical name within a checkpoint artifact.
 #[derive(Debug, Clone)]
 pub struct ArtifactFile {
+    /// Stable logical name within the checkpoint artifact.
     pub logical_name: String,
+    /// Filesystem path containing the artifact file.
     pub path: PathBuf,
 }
 
 impl ArtifactFile {
+    /// Creates a named artifact-file descriptor.
     pub fn new(logical_name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
             logical_name: logical_name.into(),

@@ -57,6 +57,7 @@ pub struct MlxRealtimeModel {
 }
 
 impl MlxRealtimeModel {
+    /// Returns the stable identity of the loaded checkpoint artifact.
     pub fn artifact_identity(&self) -> &LoadedArtifactIdentity {
         self.model.artifact_identity()
     }

@@ -57,10 +57,12 @@ pub fn profile_expert_parallel_timings() -> ExpertParallelTimingGuard {
     ExpertParallelTimingGuard { previous }
 }
 
+/// Returns whether eager expert-parallel phase timing is enabled on this thread.
 pub fn timing_profiling_enabled() -> bool {
     EAGER_TIMING_PROFILING.with(Cell::get)
 }
 
+/// Materializes a phase's outputs when eager timing is enabled.
 pub fn materialize_timing_phase<'a>(
     outputs: impl IntoIterator<Item = &'a Array>,
 ) -> safemlx::error::Result<()> {
@@ -380,6 +382,7 @@ pub trait LocalExpertBank {
     }
 }
 
+/// Creates one unit weight for every routed token.
 pub fn unit_route_weights(routes: i32, dtype: Dtype, stream: &Stream) -> Result<Array, Error> {
     Ok(safemlx::ops::ones_dtype(&[routes, 1], dtype, stream)?)
 }

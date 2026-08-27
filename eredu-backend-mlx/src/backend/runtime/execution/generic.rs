@@ -251,18 +251,22 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
         Ok(())
     }
 
+    /// Returns the checkpoint source backing this layerwise policy.
     pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.store.as_ref()
     }
 
+    /// Clones the shared checkpoint source backing this layerwise policy.
     pub fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
         Arc::clone(&self.store)
     }
 
+    /// Returns current weight-residency accounting.
     pub fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {
         self.residency.report().map_err(Into::into)
     }
 
+    /// Returns dense disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         self.dense
             .as_ref()
@@ -270,6 +274,7 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             .transpose()
     }
 
+    /// Returns the number of pinned static-weight leases.
     pub fn static_lease_count(&self) -> usize {
         self._static_leases.len()
     }
@@ -289,6 +294,7 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             .map_err(|error| Error::Parallel(error.to_string()))
     }
 
+    /// Returns residency reports for every semantic execution group.
     pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
         (0..self.layout.group_count())
             .map(|group| {
@@ -299,6 +305,7 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             .collect()
     }
 
+    /// Evicts temporary device weights belonging to one execution group.
     pub fn clear_device_group(&self, id: &str) -> Result<(), Error> {
         let group = (0..self.layout.group_count())
             .find(|&group| {
@@ -380,18 +387,22 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
 }
 
 impl<U> MlxResidentPolicy<U> {
+    /// Returns the checkpoint source backing this resident policy.
     pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.store.as_ref()
     }
 
+    /// Clones the shared checkpoint source backing this resident policy.
     pub fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
         Arc::clone(&self.store)
     }
 
+    /// Returns current weight-residency accounting.
     pub fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {
         self.residency.report().map_err(Into::into)
     }
 
+    /// Returns the number of pinned static-weight leases.
     pub fn static_lease_count(&self) -> usize {
         1
     }
@@ -414,6 +425,7 @@ impl<U> MlxResidentPolicy<U> {
         .map_err(|error| Error::Parallel(error.to_string()))
     }
 
+    /// Returns residency reports for every semantic execution group.
     pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
         (0..self.layout.group_count())
             .map(|group| {

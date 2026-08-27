@@ -254,6 +254,7 @@ impl MlxModel {
     }
 
     #[cfg(test)]
+    /// Extracts a complete executable, rejecting a pipeline model.
     pub fn into_complete(self) -> Result<Executable, Error> {
         match self.inner {
             MlxModelKind::Complete(model) => Ok(model),
@@ -389,6 +390,7 @@ impl<'a> MlxBackend<'a> {
     }
 
     #[cfg(test)]
+    /// Creates test communication for a topology using the backend stream.
     pub fn communication_for_topology(
         &self,
         topology: crate::backend::MlxParallelContext,

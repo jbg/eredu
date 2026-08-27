@@ -415,6 +415,7 @@ impl MlxModelInput {
         input.with_model_input(|input| Self::from(input))
     }
 
+    /// Borrows the owned input parts as a model-input view for one operation.
     pub fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
         execute(input::ModelInput::new(&self.parts))
     }
@@ -454,6 +455,7 @@ pub(super) enum MlxSpeculativeSessionParts<'session, 'world> {
 }
 
 impl<'a> MlxModelSession<'a> {
+    /// Creates a session and validates that its communicator matches the model topology.
     pub fn from_model(
         model: MlxModel,
         distributed: Option<MlxDistributedSession<'a>>,
@@ -1050,6 +1052,7 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    /// Submits an instrumented prefill for a non-pipeline executable.
     pub fn submit_complete_prefill_with_observer(
         model: &mut Executable,
         input: MlxModelInput,

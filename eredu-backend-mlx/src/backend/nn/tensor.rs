@@ -141,6 +141,7 @@ pub fn validate_token_domain(
 }
 
 #[allow(non_snake_case)]
+/// Builds a causal attention mask with optional window and sequence lengths.
 pub fn create_causal_mask(
     N: i32,
     offset: Option<i32>,

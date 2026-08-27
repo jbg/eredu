@@ -45,8 +45,11 @@ use eredu_runtime::ResidencyReport;
 /// A resident unit that prevents eviction of one tier until it is dropped.
 pub type ResidentUnitLease = ResidencyLease<ResidentLeaseStorage, ManagerInner>;
 
+/// Host or device storage retained by a weight-residency lease.
 pub enum ResidentLeaseStorage {
+    /// Immutable host-transfer buffers.
     Host(Arc<ResidentHostBuffers>),
+    /// Materialized device arrays.
     Device(Arc<ResidentArrays>),
 }
 
@@ -690,6 +693,7 @@ impl ResidencyManager {
         ))
     }
 
+    /// Returns initialized state, aggregate telemetry, unit reports, and active window.
     pub fn telemetry_snapshot(
         &self,
     ) -> Result<
@@ -751,6 +755,7 @@ impl ResidencyWindowManager for ResidencyManager {
     }
 }
 
+/// Shared lease and transfer owner for a residency manager.
 pub struct ManagerInner {
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     state: Mutex<ManagerState>,
@@ -885,14 +890,17 @@ fn release_backend_copies(
     Ok(())
 }
 
+/// Named device arrays retained by one resident unit.
 pub struct ResidentArrays {
     arrays: BTreeMap<String, Array>,
 }
 
+/// Named immutable host buffers retained by one resident unit.
 pub struct ResidentHostBuffers {
     buffers: BTreeMap<String, Arc<ImmutableHostTransferBuffer>>,
 }
 
+/// Source and destination resources retained through an asynchronous transfer.
 pub struct ResidentTransferResources {
     sources: Vec<PendingWeightMaterialization>,
     retained_arrays: Vec<Array>,

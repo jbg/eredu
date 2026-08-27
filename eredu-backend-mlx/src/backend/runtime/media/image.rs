@@ -66,6 +66,7 @@ impl<'a> RgbImageView<'a> {
         self.height
     }
 
+    /// Returns tightly packed row-major RGB pixels without row padding.
     pub fn packed_pixels(self) -> Vec<u8> {
         let packed_stride = self.width as usize * 3;
         if self.row_stride == packed_stride {

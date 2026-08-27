@@ -23,6 +23,7 @@ use serde::Deserialize;
 use crate::backend::error::Error;
 use crate::backend::runtime::checkpoint::quantization::quantize_tensor;
 
+/// Copies decoded GGUF metadata into a name-addressable map.
 pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
     checkpoint
         .metadata()
@@ -31,6 +32,7 @@ pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadat
         .collect()
 }
 
+/// Extracts affine quantization configurations from translated GGUF tensors.
 pub fn gguf_affine_configs<F>(
     checkpoint: &GgufCheckpoint,
     mut translate: F,
@@ -115,14 +117,17 @@ pub struct StrictLoadReport {
 }
 
 impl StrictLoadReport {
+    /// Records a checkpoint tensor successfully assigned to a parameter.
     pub fn record_loaded(&mut self, key: String) {
         self.loaded.insert(key);
     }
 
+    /// Records an unused checkpoint tensor.
     pub fn record_unused(&mut self, key: String) {
         self.unused.push(key);
     }
 
+    /// Records a checkpoint tensor whose shape did not match its parameter.
     pub fn record_shape_mismatch(
         &mut self,
         weight_key: String,
@@ -196,6 +201,7 @@ pub fn load_arrays_quantized_strict<M: ModuleParameters>(
     Ok(())
 }
 
+/// Visits every tensor in one safetensors file as an MLX-owned array.
 pub fn for_each_safetensor_array<F>(
     path: impl AsRef<Path>,
     stream: &Stream,

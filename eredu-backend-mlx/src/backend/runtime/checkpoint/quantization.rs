@@ -172,6 +172,7 @@ pub fn quantize_tensor(
     })
 }
 
+/// Maps a producible checkpoint quantization format to its MLX operator mode.
 pub fn mlx_quantization_mode(config: WeightQuantization) -> ops::QuantizationMode {
     match config {
         WeightQuantization::Affine(_) => ops::QuantizationMode::Affine,

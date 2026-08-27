@@ -55,6 +55,7 @@ pub fn parameter_role_targets(
         .collect()
 }
 
+/// Returns whether a parameter name is one of the declared targets.
 pub fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool {
     targets.contains(name)
 }
@@ -175,6 +176,7 @@ pub struct ModuleBindingPlan {
 }
 
 impl ModuleBindingPlan {
+    /// Resolves the plan into runtime bindings against a checkpoint source.
     pub fn build_bindings(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -193,6 +195,7 @@ impl ModuleBindingPlan {
     }
 }
 
+/// Builds a complete module binding plan including derived-weight recipes.
 pub fn build_module_binding_plan_with_recipes(
     module: &impl ModuleParameters,
     prefix: &str,
@@ -469,6 +472,7 @@ where
     report.finish_excluding(module, excluded)
 }
 
+/// Builds bindings while excluding parameters managed by another loader.
 pub fn build_module_bindings_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
@@ -483,6 +487,7 @@ where
         .build_bindings(store)
 }
 
+/// Builds a derived binding plan while excluding independently managed parameters.
 pub fn build_module_binding_plan_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,

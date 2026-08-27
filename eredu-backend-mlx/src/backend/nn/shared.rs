@@ -288,6 +288,7 @@ impl<'a> ParameterVisitor<'a, MlxTensor> for ParameterStateCollector {
     }
 }
 
+/// Collects immutable MLX parameter references from a neutral module.
 pub fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
     module: &M,
     trainable_only: bool,
@@ -301,6 +302,7 @@ pub fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
     collector.parameters
 }
 
+/// Collects mutable MLX parameter references from a neutral module.
 pub fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
     module: &mut M,
 ) -> ModuleParamMut<'_> {
@@ -312,6 +314,7 @@ pub fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
     collector.parameters
 }
 
+/// Returns the trainable state of each parameter in neutral traversal order.
 pub fn neutral_parameter_states<M: Parameterized<MlxTensor>>(module: &M) -> Vec<bool> {
     validate_parameter_topology(module).expect("backend-neutral parameter topology is valid");
     let mut collector = ParameterStateCollector { states: Vec::new() };
@@ -423,6 +426,7 @@ pub struct MlxModuleRef<'a, M> {
 }
 
 impl<'a, M> MlxModuleRef<'a, M> {
+    /// Borrows a neutral module as an MLX module-parameter view.
     pub const fn new(inner: &'a mut M) -> Self {
         Self { inner }
     }

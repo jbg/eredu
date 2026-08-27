@@ -20,21 +20,32 @@ fn ceil_div(value: i32, divisor: i32) -> i32 {
 /// Backend-owned linear materialization for every neutral physical format.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct PhysicalLinear {
+    /// Logical input width.
     pub input_dimensions: i32,
+    /// Logical output width.
     pub output_dimensions: i32,
     #[param]
+    /// Dense or packed weight array.
     pub weight: Param<Array>,
     #[param]
+    /// Inverse scale for native block-float formats.
     pub weight_scale_inv: Param<Option<Array>>,
     #[param]
+    /// Per-group affine scales, when applicable.
     pub scales: Param<Option<Array>>,
     #[param]
+    /// Per-group affine biases, when applicable.
     pub biases: Param<Option<Array>>,
     #[param]
+    /// Optional additive output bias.
     pub bias: Param<Option<Array>>,
+    /// Number of logical values in each quantization group.
     pub group_size: i32,
+    /// Number of bits in each affine-quantized value.
     pub bits: i32,
+    /// Native MLX quantized-matmul mode.
     pub mode: QuantizationMode,
+    /// Checkpoint-native GGUF format, when values remain block encoded.
     pub gguf: Option<WeightQuantization>,
 }
 
