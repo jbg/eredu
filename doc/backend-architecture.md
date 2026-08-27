@@ -8,17 +8,21 @@ and an execution backend. It is intended for backend authors and maintainers of
 
 ```text
 eredu-core        eredu-checkpoint        eredu-nn
-        \                |                /
-                     eredu-runtime
-                           |
-                   eredu-architectures
-                           |
-                  eredu-backend-mlx
-                           |
-                         eredu
+        \                |                /    \
+                     eredu-runtime          eredu-codec
+                           |                     :
+                   eredu-architectures           : optional
+                           |                     :
+                           +-- eredu-backend-mlx -+
+                                      |
+                                    eredu
 ```
 
 The neutral crates contain no native accelerator dependency under any feature.
+`eredu-codec` owns backend-neutral neural audio codec architectures and depends
+on the neutral tensor contracts in `eredu-nn`. `eredu-backend-mlx` depends on
+`eredu-codec` only when its optional `codec` feature is enabled; the codec crate
+does not acquire an MLX feature or dependency in the other direction.
 `eredu-gguf` is likewise a backend-neutral storage dependency. Backends that
 execute nonlinear GGUF IQ blocks consume their canonical values through the
 typed `IQuantCodebook` API; generated table modules remain private and cannot
