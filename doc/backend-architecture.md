@@ -56,12 +56,11 @@ enabled; there is no capability-less `media` feature. Backend feature
 diagnostics name the active public spelling. Cargo features are all published,
 selectable API; none of these feature names imply privacy.
 
-The `eredu-cli` executable uses an empty `backend` feature solely as a shared
-Cargo `required-features` gate because Cargo cannot express an OR condition for
-targets. This published feature is unstable implementation wiring and must not
-be selected directly. The supported `mlx` and `cuda` features both enable it.
-Consequently, checking the package with no features omits the executable
-instead of compiling a target whose implementation cannot run.
+The `eredu-cli` executable requires its public `mlx` feature. Its `metal` and
+`cuda` convenience features both imply `mlx`, and `nccl` implies `cuda`.
+Consequently, every named CLI feature is independently valid, while checking
+the package with no features omits the executable instead of compiling a
+target whose implementation cannot run.
 
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same

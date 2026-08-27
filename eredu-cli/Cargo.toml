@@ -13,17 +13,15 @@ readme = "README.md"
 
 [features]
 default = ["mlx", "metal"]
-# Implementation gate for Cargo's `required-features`; do not select directly.
-backend = []
-mlx = ["backend", "eredu/mlx"]
+mlx = ["eredu/mlx"]
 metal = ["mlx", "eredu/metal"]
-cuda = ["backend", "eredu/mlx", "eredu/cuda"]
+cuda = ["mlx", "eredu/cuda"]
 nccl = ["cuda", "eredu/nccl"]
 
 [[bin]]
 name = "eredu"
 path = "src/main.rs"
-required-features = ["backend"]
+required-features = ["mlx"]
 
 [dependencies]
 anyhow.workspace = true

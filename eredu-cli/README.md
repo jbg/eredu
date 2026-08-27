@@ -32,9 +32,8 @@ On supported CUDA hosts, disabling the default features and enabling `cuda`
 replaces the default Metal/Accelerate backend selection instead of combining
 native backends.
 
-The supported `mlx` and `cuda` features make the executable available. Cargo
-also exposes an empty `backend` feature used solely as an unstable
-`required-features` implementation gate; do not select it directly. A bare
+The `mlx` feature makes the executable available. The `metal` and `cuda`
+features both imply `mlx`, while `nccl` implies `cuda`. A bare
 `--no-default-features` package check is supported but intentionally does not
 build or install an `eredu` executable.
 
