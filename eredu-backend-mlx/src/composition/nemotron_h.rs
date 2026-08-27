@@ -406,8 +406,7 @@ fn load_neutral(
     metadata.set_model_type(args.model_type.clone());
     metadata.set_quantization(args.weight_quantization);
     metadata.set_materialization(materialization);
-    let state_layout = architecture
-        .state_layout()
+    let state_layout = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
         NemotronHExecution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
@@ -470,8 +469,7 @@ fn load_neutral_parallel(
     if let Some(realization) = expert_realization.clone() {
         architecture.install_expert_realization(realization);
     }
-    let state_layout = architecture
-        .state_layout()
+    let state_layout = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = NemotronHParallelUnitPopulator {
         external_experts,

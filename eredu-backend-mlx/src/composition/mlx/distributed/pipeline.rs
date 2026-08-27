@@ -9306,9 +9306,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = self
-            .architecture
-            .state_layout()
+        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = match paged {
             Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
@@ -18049,6 +18047,17 @@ fn load_nemotron_h_pipeline(
             stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    // Released recipes describe global tensors. Bind global architecture probes
+    // first, then apply the planner layout exactly once before loading local modules.
+    let global_source_architecture = quantize_on_load
+        .map(|_| {
+            eredu_architectures::nemotron_h::LayeredModel::<MlxNeuralBackend>::new(
+                source_args.clone(),
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+        .transpose()?;
     let binding_parameter_description = global_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -18087,8 +18096,7 @@ fn load_nemotron_h_pipeline(
         "Nemotron-H",
     )?;
     let range = topology.layer_range(target_units)?;
-    let runtime_state = architecture
-        .state_layout()
+    let runtime_state = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let neutral_placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
@@ -18177,10 +18185,14 @@ fn load_nemotron_h_pipeline(
                     selection = selection.with_layer_group(*group, units.clone());
                 }
             }
-            let source_quantization =
-                BoundPipelineBindings::new(&binding_adapter, &stage.architecture);
+            let source_quantization = BoundPipelineBindings::new(
+                &binding_adapter,
+                global_source_architecture
+                    .as_ref()
+                    .expect("requested Nemotron-H conversion has a source architecture"),
+            );
             let target_quantization =
-                BoundPipelineBindings::new(&target_binding_adapter, &stage.architecture);
+                BoundPipelineBindings::new(&target_binding_adapter, &global_architecture);
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &source_quantization,
@@ -18202,7 +18214,7 @@ fn load_nemotron_h_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &global_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -18222,11 +18234,15 @@ fn load_nemotron_h_pipeline(
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().clone().zip(&mut stage.layers) {
+            let binding_layer = global_architecture
+                .construct_unit(decoder_group, global_layer, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &global_architecture,
                 decoder_group,
                 global_layer,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -18268,11 +18284,15 @@ fn load_nemotron_h_pipeline(
         for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
             let (group, units) = &prediction_units[depth];
             for (index, layer) in units.clone().zip(layers) {
+                let binding_layer = global_architecture
+                    .construct_unit(*group, index, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 let bindings = binding_adapter.cartesian_layer_bindings(
-                    architecture,
+                    &global_architecture,
                     *group,
                     index,
-                    layer,
+                    &binding_layer,
                     store.as_ref(),
                     parallel_layout.as_ref(),
                     stage.expert_assignment.as_ref(),
@@ -18316,6 +18336,7 @@ fn load_nemotron_h_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let architecture = &stage.architecture;
+        let binding_architecture = &global_architecture;
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -18336,12 +18357,16 @@ fn load_nemotron_h_pipeline(
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
+                let binding_layer = binding_architecture
+                    .construct_unit(decoder_group, global_layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 binding_adapter.cartesian_layer_bindings(
-                    architecture,
+                    binding_architecture,
                     decoder_group,
                     global_layer,
-                    layer,
+                    &binding_layer,
                     store,
                     streamed_layout.as_ref(),
                     streamed_assignment.as_ref(),
