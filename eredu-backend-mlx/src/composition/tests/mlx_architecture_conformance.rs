@@ -36,31 +36,30 @@ fn every_layered_family_exposes_authoritative_geometry_and_parameter_binding() {
     assert_bindable::<eredu_architectures::moshi::LayeredModel<MlxNeuralBackend>>();
 }
 
-fn mlx_execution() -> Option<ExecutionContext> {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    let available = AVAILABLE.get_or_init(|| {
+fn mlx_execution() -> ExecutionContext {
+    static AVAILABLE: OnceLock<()> = OnceLock::new();
+    AVAILABLE.get_or_init(|| {
         #[cfg(feature = "metal")]
         {
             match safemlx::metal::is_available() {
                 Ok(true) => {}
-                Ok(false) => return false,
+                Ok(false) => panic!("native MLX Metal execution is required for conformance tests"),
                 Err(error) => panic!("MLX Metal availability probe failed: {error}"),
             }
         }
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        match safemlx::ops::zeros::<f32>(&[1], execution.stream())
+        safemlx::ops::zeros::<f32>(&[1], execution.stream())
             .and_then(|probe| probe.evaluated().map(|_| ()))
-        {
-            Ok(()) => true,
-            Err(error) if error.what().contains("No Metal device available") => false,
-            Err(error) => panic!("MLX execution probe failed: {error}"),
-        }
+            .unwrap_or_else(|error| {
+                panic!("native MLX execution is required for conformance tests: {error}")
+            });
     });
-    if !available {
-        eprintln!("skipping MLX execution conformance: native device initialization failed");
-        return None;
-    }
-    Some(ExecutionContext::new(Device::new(DeviceType::Cpu, 0)))
+    ExecutionContext::new(Device::new(DeviceType::Cpu, 0))
+}
+
+#[test]
+fn native_mlx_execution_is_available() {
+    let _ = mlx_execution();
 }
 
 macro_rules! execute_group {
@@ -228,9 +227,7 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
         .unwrap(),
     )
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -313,9 +310,7 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
         .unwrap(),
     )
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -409,9 +404,7 @@ fn neutral_muse_glimmer_text_only_forward_monomorphizes_on_mlx() {
     )
     .unwrap();
     args.vision_config = None;
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -489,9 +482,7 @@ fn neutral_llama_forward_executes_on_mlx() {
         "max_position_embeddings":64,"rope_theta":10000.0,"tie_word_embeddings":true
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -521,9 +512,7 @@ fn neutral_qwen_forward_executes_on_mlx() {
         "max_position_embeddings":64,"rope_theta":1000000.0,"tie_word_embeddings":true
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -559,9 +548,7 @@ fn neutral_qwen3_next_hybrid_forward_executes_on_mlx() {
         }))
         .unwrap()
         .text;
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -606,9 +593,7 @@ fn neutral_qwen35_conditional_forward_executes_on_mlx() {
             }
         }))
         .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state = MlxHybridState::device(
@@ -675,9 +660,7 @@ fn neutral_qwen3_vl_forward_executes_on_mlx() {
         }
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -722,9 +705,7 @@ fn neutral_gpt_oss_forward_executes_on_mlx() {
         "layer_types":["full_attention"]
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture =
         eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(args.clone(), stream)
@@ -763,9 +744,7 @@ fn neutral_kimi_linear_forward_executes_on_mlx() {
         "num_expert_group":1,"topk_group":1
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -798,9 +777,7 @@ fn neutral_lfm2_forward_executes_on_mlx() {
         "block_auto_adjust_ff_dim":true,"tie_word_embeddings":false
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -835,9 +812,7 @@ fn neutral_nemotron_h_forward_executes_on_mlx() {
         "mtp_hybrid_override_pattern":"*E"
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -869,9 +844,7 @@ fn neutral_deepseek_v3_forward_executes_on_mlx() {
         "tie_word_embeddings":false
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state = State::create(
@@ -907,9 +880,7 @@ fn neutral_deepseek_v4_forward_executes_on_mlx() {
         "norm_topk_prob":true,"num_nextn_predict_layers":1
     }))
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state = MlxPoolingAttentionStateFactory::device(
@@ -932,9 +903,7 @@ fn neutral_deepseek_v4_forward_executes_on_mlx() {
 fn deepseek_unit_factories_use_installed_expert_realizations() {
     use eredu_nn::GatedProductExpertBankOperator;
 
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let topology = eredu_core::ParallelRankTopology::new(
         eredu_core::ParallelTopology::new(1, 1, 2, 1).unwrap(),
@@ -1063,9 +1032,7 @@ fn neutral_moshi_forward_executes_on_mlx() {
         }"#,
     )
     .unwrap();
-    let Some(execution) = mlx_execution() else {
-        return;
-    };
+    let execution = mlx_execution();
     let stream = execution.stream();
     let mut architecture = Architecture::new(config.clone(), stream).unwrap();
     let mut state =

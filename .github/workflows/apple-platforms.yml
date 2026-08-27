@@ -33,6 +33,11 @@ jobs:
             exit 0
           fi
           xcodebuild -downloadComponent MetalToolchain
+      - name: Require native MLX execution
+        run: |
+          cargo test -p eredu-backend-mlx --features metal --lib \
+            composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
+            --exact
       - name: Test the macOS workspace
         run: |
           cargo test --workspace -- \

@@ -1,0 +1,35 @@
+name: Native release gate
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: Native MLX and complete Ring conformance
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Metal toolchain when required
+        run: |
+          if xcrun --toolchain Metal metal --version; then
+            exit 0
+          fi
+          if xcrun metal --version; then
+            exit 0
+          fi
+          xcodebuild -downloadComponent MetalToolchain
+      - name: Require native MLX execution
+        run: |
+          cargo test -p eredu-backend-mlx --features metal --lib \
+            composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
+            --exact
+      - name: Test every distributed pipeline Ring case
+        run: |
+          cargo test -p eredu-backend-mlx --lib \
+            tests::distributed_pipeline_ring:: -- \
+            --ignored --test-threads=1 --nocapture

@@ -37,6 +37,22 @@ features, while Cargo's normal package verification still compiles each crate's
 default packaged targets. Packaging does not need an Apple or NVIDIA runner:
 target-native Metal and CUDA coverage remains in the platform workflows.
 
+The manually dispatched `Native release gate` workflow must pass before
+publication. Its macOS job first proves that native MLX execution is available;
+failure to initialize Metal is a test failure, never a skip. The same job runs
+every ignored distributed pipeline Ring test serially rather than sampling the
+representative cases used by pull-request CI. To run these gates locally on an
+Apple silicon host, outside a sandbox:
+
+```bash
+cargo test -p eredu-backend-mlx --features metal --lib \
+  composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
+  --exact
+cargo test -p eredu-backend-mlx --lib \
+  tests::distributed_pipeline_ring:: -- \
+  --ignored --test-threads=1 --nocapture
+```
+
 ## Publication order
 
 Publish one crate at a time in this order, waiting for each version to become
