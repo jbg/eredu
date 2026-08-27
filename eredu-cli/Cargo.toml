@@ -12,10 +12,12 @@ description = "Command-line interface for running local models with Eredu"
 readme = "README.md"
 
 [features]
-default = ["mlx"]
-backend = ["eredu/backend-mlx"]
+default = ["mlx", "metal"]
+# Implementation gate for Cargo's `required-features`; do not select directly.
+backend = []
 mlx = ["backend", "eredu/mlx"]
-cuda = ["backend", "eredu/cuda"]
+metal = ["mlx", "eredu/metal"]
+cuda = ["backend", "eredu/mlx", "eredu/cuda"]
 nccl = ["cuda", "eredu/nccl"]
 
 [[bin]]

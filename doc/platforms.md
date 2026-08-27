@@ -73,7 +73,7 @@ Install the toolkit and cuDNN according to NVIDIA's packages for the host, then
 build:
 
 ```sh
-cargo build --release -p eredu --no-default-features --features cuda
+cargo build --release -p eredu --no-default-features --features mlx,cuda
 ```
 
 MLX normally detects the local GPU architecture. On a build machine without an
@@ -82,7 +82,7 @@ CMake architecture list:
 
 ```sh
 SAFEMLX_CUDA_ARCHITECTURES=80 \
-  cargo build --release -p eredu --no-default-features --features cuda
+  cargo build --release -p eredu --no-default-features --features mlx,cuda
 ```
 
 The build also honors `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT`,
@@ -94,7 +94,7 @@ NCCL is opt-in because it adds native link requirements. Enable `nccl` and use
 help:
 
 ```sh
-cargo build --release -p eredu --no-default-features --features nccl
+cargo build --release -p eredu --no-default-features --features mlx,nccl
 ```
 
 ## Windows x86-64
@@ -117,7 +117,7 @@ $env:SAFEMLX_CUDA_ARCHITECTURES = "75"
 $env:CMAKE_GENERATOR = "Ninja"
 $env:PATH = "$env:CUDA_PATH\bin;C:\tools\cudnn\bin\x64;$env:PATH"
 
-cargo build --release -p eredu --no-default-features --features cuda
+cargo build --release -p eredu --no-default-features --features mlx,cuda
 ```
 
 Eredu's MLX backend builds `mlx` and `mlxc` as DLLs and stages them, along with
@@ -149,10 +149,9 @@ should still select their intended backend explicitly.
 The `eredu-cli` crate has its own `cuda` feature, which enables CUDA in Eredu
 and its MLX implementation layer.
 
-At the facade layer, the supported `backend-mlx` feature selects the base local
-adapter without a platform optimization bundle. The `mlx` and `cuda` features
-enable that adapter and add their respective platform bundle. Selecting `cuda`
-with default features disabled does not enable Metal or Accelerate. When adding
-`image` or `audio` to a no-default-features build, select `mlx` or `cuda`
-alongside it. The modality features select preprocessing support, while `mlx`
-and `cuda` select the execution platform.
+At the facade layer, `mlx` selects the MLX backend. The weak `metal`, `cuda`,
+`image`, `audio`, and `nccl` features configure that backend but never select
+it. Direct facade builds therefore combine `mlx` with the capabilities they
+need. Selecting `mlx,cuda` with default features disabled does not enable Metal
+or Accelerate. The CLI's `cuda` convenience feature selects the facade's `mlx`
+and `cuda` features together.

@@ -104,7 +104,7 @@ impl Default for CliDevice {
     fn default() -> Self {
         if cfg!(any(
             feature = "cuda",
-            all(feature = "mlx", target_vendor = "apple")
+            all(feature = "metal", target_vendor = "apple")
         )) {
             Self::Gpu(0)
         } else {
@@ -4210,7 +4210,7 @@ mod tests {
         let defaults = Cli::try_parse_from(["eredu", "--model", "model-id", "prompt"]).unwrap();
         let expected_default = if cfg!(any(
             feature = "cuda",
-            all(feature = "mlx", target_vendor = "apple")
+            all(feature = "metal", target_vendor = "apple")
         )) {
             CliDevice::Gpu(0)
         } else {

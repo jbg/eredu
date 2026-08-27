@@ -67,15 +67,14 @@ streams, tensors, sessions, and completions stay behind the facade.
 
 ## Cargo features
 
-- `backend-mlx`: the MLX-based local execution adapter without a platform
-  optimization bundle. The `mlx`, `cuda`, `image`, and `audio` features enable
-  it automatically.
-- `mlx`: MLX execution with Metal and Accelerate; enabled by default.
-- `image`: image and video preprocessing for the selected local backend.
-- `audio`: audio preprocessing for the selected local backend.
-- `cuda`: MLX CUDA execution on supported Linux and Windows hosts without
-  enabling Metal or Accelerate.
-- `nccl`: NCCL distributed support for CUDA builds.
+- `mlx`: the MLX execution backend; enabled by default.
+- `metal`: Metal execution with Accelerate on Apple platforms; enabled by
+  default and effective only with `mlx`.
+- `cuda`: CUDA execution on supported Linux and Windows hosts; effective only
+  with `mlx` and mutually exclusive with `metal`.
+- `image`: image and video preprocessing; effective only with `mlx`.
+- `audio`: audio preprocessing; effective only with `mlx`.
+- `nccl`: NCCL distributed support; effective only with `mlx` and CUDA.
 - `onig`: Oniguruma tokenizer regular expressions; enabled by default.
 - `esaxx_fast`: fast SentencePiece-compatible tokenization; enabled by
   default.

@@ -4,7 +4,7 @@
 //! behind this module. Applications configure and operate the selected local
 //! backend through portable plans and facade-owned diagnostics.
 
-#[cfg(feature = "mlx")]
+#[cfg(feature = "metal")]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -346,7 +346,7 @@ fn observe_realtime_steps(
 /// Process-global configuration for the selected local runtime.
 #[derive(Debug, Clone, Default)]
 pub struct LocalRuntimeConfiguration {
-    #[cfg(feature = "mlx")]
+    #[cfg(feature = "metal")]
     accelerator_library_path: Option<PathBuf>,
     allocator_cache_limit: Option<usize>,
 }
@@ -356,7 +356,7 @@ impl LocalRuntimeConfiguration {
     ///
     /// Embedded Apple applications use this when their bundled library cannot
     /// be found through the runtime's default search path.
-    #[cfg(feature = "mlx")]
+    #[cfg(feature = "metal")]
     pub fn with_accelerator_library(mut self, path: impl Into<PathBuf>) -> Self {
         self.accelerator_library_path = Some(path.into());
         self
@@ -373,7 +373,7 @@ impl LocalRuntimeConfiguration {
 pub fn configure_local_runtime(
     configuration: &LocalRuntimeConfiguration,
 ) -> Result<(), LocalBackendError> {
-    #[cfg(feature = "mlx")]
+    #[cfg(feature = "metal")]
     if let Some(path) = &configuration.accelerator_library_path {
         eredu_backend_mlx::native::metal::set_metallib_path(path)?;
     }
@@ -400,7 +400,7 @@ pub fn local_device_plan(device: LocalDevice) -> Result<crate::DevicePlan, Local
 const fn compiled_accelerator_family() -> Option<&'static str> {
     if cfg!(feature = "cuda") {
         Some("cuda")
-    } else if cfg!(all(feature = "mlx", target_vendor = "apple")) {
+    } else if cfg!(all(feature = "metal", target_vendor = "apple")) {
         Some("metal")
     } else {
         None
@@ -658,7 +658,7 @@ mod tests {
         let plan = local_device_plan(LocalDevice::Accelerator(3));
         if cfg!(feature = "cuda") {
             assert_eq!(plan.unwrap().device, "cuda:3");
-        } else if cfg!(all(feature = "mlx", target_vendor = "apple")) {
+        } else if cfg!(all(feature = "metal", target_vendor = "apple")) {
             assert_eq!(plan.unwrap().device, "metal:3");
         } else {
             assert_eq!(plan, Err(LocalDevicePlanError::AcceleratorNotCompiled));

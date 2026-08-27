@@ -32,10 +32,11 @@ On supported CUDA hosts, disabling the default features and enabling `cuda`
 replaces the default Metal/Accelerate backend selection instead of combining
 native backends.
 
-The `backend` feature makes the executable available with the base MLX-backed
-adapter and no platform optimization bundle. The `mlx` and `cuda` features
-enable `backend` automatically. A bare `--no-default-features` package check is
-supported but intentionally does not build or install an `eredu` executable.
+The supported `mlx` and `cuda` features make the executable available. Cargo
+also exposes an empty `backend` feature used solely as an unstable
+`required-features` implementation gate; do not select it directly. A bare
+`--no-default-features` package check is supported but intentionally does not
+build or install an `eredu` executable.
 
 Run the command with `--help` for the complete option list.
 

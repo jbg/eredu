@@ -1,8 +1,9 @@
 //! Backend-neutral language-model facade.
 //!
 //! This module is available without an execution backend. Enabling the
-//! `backend-mlx` feature adds the selected local execution adapter; the `mlx`
-//! and `cuda` platform bundles enable it automatically.
+//! `mlx` feature adds the selected local execution adapter. The `metal`,
+//! `cuda`, `image`, and `audio` features only configure that adapter when it is
+//! selected.
 //!
 //! Backend implementation traits and their errors are imported from
 //! `eredu-core`, not this facade namespace:
@@ -33,7 +34,7 @@ mod portable;
 mod request;
 mod tokenizer;
 
-#[cfg(feature = "backend-mlx")]
+#[cfg(feature = "mlx")]
 mod selected;
 
 pub use crate::runtime::chat::constraints::ConstraintError;
@@ -47,7 +48,7 @@ pub use request::{
     PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpGenerationOptions,
     PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint,
 };
-#[cfg(feature = "backend-mlx")]
+#[cfg(feature = "mlx")]
 pub use selected::*;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 

@@ -1,7 +1,8 @@
 //! Backend-neutral model loading, generation, and realtime facade.
 //!
 //! [`api`] and [`runtime`] remain available without an execution backend. The
-//! `mlx` or `cuda` feature adds the MLX model implementations and runtime.
+//! `mlx` feature adds the MLX model implementations and runtime. Platform and
+//! capability features configure that backend without selecting it.
 //!
 //! Backend implementation contracts are imported from their owning crates:
 //!
@@ -59,9 +60,9 @@
     clippy::type_complexity
 )]
 
-#[cfg(all(feature = "mlx", feature = "cuda"))]
+#[cfg(all(feature = "metal", feature = "cuda"))]
 compile_error!(
-    "the `mlx` and `cuda` backend features are mutually exclusive; disable default features before enabling `cuda`"
+    "the `metal` and `cuda` MLX backend features are mutually exclusive; disable default features before enabling `cuda`"
 );
 
 /// High-level model loading, dispatch, and request APIs.

@@ -24,27 +24,27 @@ include = [
 [[example]]
 name = "gemma4_generate"
 path = "examples/gemma4_generate.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[example]]
 name = "gemma4_speculative_generate"
 path = "examples/gemma4_speculative_generate.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[example]]
 name = "gguf_generate"
 path = "examples/gguf_generate.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[example]]
 name = "native_tool_calling"
 path = "examples/native_tool_calling.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[example]]
 name = "qwen35_moe_bench"
 path = "examples/qwen35_moe_bench.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[test]]
 name = "backend_conformance"
@@ -61,38 +61,37 @@ path = "tests/portable_facade.rs"
 [[test]]
 name = "selected_backend_api"
 path = "tests/selected_backend_api.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[test]]
 name = "automatic_planner_api"
 path = "tests/automatic_planner_api.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [[test]]
 name = "native_tool_checkpoints"
 path = "tests/native_tool_checkpoints.rs"
-required-features = ["backend-mlx"]
+required-features = ["mlx"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
 no-default-features = true
-features = ["mlx", "image", "audio"]
+features = ["mlx", "metal", "image", "audio"]
 
 [features]
-default = ["mlx", "onig", "esaxx_fast"]
+default = ["mlx", "metal", "onig", "esaxx_fast"]
 
-backend-mlx = ["dep:eredu-backend-mlx"]
-mlx = [
-    "backend-mlx",
-    "eredu-backend-mlx/accelerate",
-    "eredu-backend-mlx/metal",
+mlx = ["dep:eredu-backend-mlx"]
+metal = [
+    "eredu-backend-mlx?/accelerate",
+    "eredu-backend-mlx?/metal",
 ]
-cuda = ["backend-mlx", "eredu-backend-mlx/cuda"]
+cuda = ["eredu-backend-mlx?/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
-nccl = ["cuda", "eredu-backend-mlx/nccl"]
-image = ["backend-mlx", "eredu-backend-mlx/image"]
-audio = ["backend-mlx", "eredu-backend-mlx/audio"]
+nccl = ["cuda", "eredu-backend-mlx?/nccl"]
+image = ["eredu-backend-mlx?/image"]
+audio = ["eredu-backend-mlx?/audio"]
 
 [dependencies]
 # Local dependencies
