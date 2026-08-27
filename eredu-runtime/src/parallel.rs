@@ -427,7 +427,7 @@ where
     if let Some(error) = collector.error {
         return Err(error);
     }
-    ParameterGroupSpec::partitioned(logical_name, role, preferred_units, collector.members)
+    partitioned_group_with_preferred_units(logical_name, role, preferred_units, collector.members)
 }
 
 /// Describes one affine projection and all encoding companions.
@@ -476,7 +476,6 @@ where
             "partitioned projection group has zero preferred units".into(),
         ));
     }
-    let mut units = preferred_units;
     let mut members = Vec::new();
     for (module, placement) in projections {
         let group = projection_parameter_group::<T, M>("projection", role, *module, *placement)?;
@@ -486,14 +485,8 @@ where
                     MemberSharding::Replicated
                 }
                 (ProjectionSharding::Column, 0) => unreachable!("validated above"),
-                (ProjectionSharding::Column, _) => {
-                    units = greatest_common_divisor(units, member.global_shape[0]);
-                    MemberSharding::Partitioned { axis: 0 }
-                }
-                (ProjectionSharding::Row, _) => {
-                    units = greatest_common_divisor(units, member.global_shape[1]);
-                    MemberSharding::Partitioned { axis: 1 }
-                }
+                (ProjectionSharding::Column, _) => MemberSharding::Partitioned { axis: 0 },
+                (ProjectionSharding::Row, _) => MemberSharding::Partitioned { axis: 1 },
             };
             members.push(ParameterMemberSpec::new(
                 member.target,
@@ -502,7 +495,7 @@ where
             ));
         }
     }
-    ParameterGroupSpec::partitioned(logical_name, role, units, members)
+    partitioned_group_with_preferred_units(logical_name, role, preferred_units, members)
 }
 
 /// Describes a component-major fused column projection and its row-parallel
@@ -538,10 +531,6 @@ where
         previous_end = segment.end;
     }
 
-    let mut units = preferred_units;
-    for segment in &segments {
-        units = greatest_common_divisor(units, segment.len());
-    }
     let fused_group =
         projection_parameter_group::<T, M>("fused", role, fused, ProjectionSharding::Column)?;
     let row_group = projection_parameter_group::<T, M>("row", role, row, ProjectionSharding::Row)?;
@@ -551,7 +540,7 @@ where
         fused_group,
         row_group,
         segments,
-        units,
+        preferred_units,
         previous_end,
     )
 }
@@ -563,7 +552,7 @@ fn assemble_segmented_projection_group(
     fused_group: ParameterGroupSpec,
     row_group: ParameterGroupSpec,
     segments: Vec<Range<usize>>,
-    mut units: usize,
+    units: usize,
     expected_fused_width: usize,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
     let mut members = Vec::new();
@@ -591,7 +580,6 @@ fn assemble_segmented_projection_group(
     }
     for member in row_group.members {
         let sharding = if member.global_shape.len() >= 2 {
-            units = greatest_common_divisor(units, member.global_shape[1]);
             MemberSharding::Partitioned { axis: 1 }
         } else {
             MemberSharding::Replicated
@@ -602,12 +590,7 @@ fn assemble_segmented_projection_group(
             sharding,
         ));
     }
-    if units == 0 {
-        return Err(ParallelPlanError::InvalidGroup(
-            "segmented projection has no common logical partition".into(),
-        ));
-    }
-    ParameterGroupSpec::partitioned(logical_name, role, units, members)
+    partitioned_group_with_preferred_units(logical_name, role, units, members)
 }
 
 /// Returns the finest legal logical-unit count for an aligned partition.
@@ -650,33 +633,54 @@ pub fn expand_linear_format_parameter_groups(
                 });
             }
             match group.partition_units() {
-                Some(mut units) => {
-                    for member in &members {
-                        match member.sharding() {
-                            MemberSharding::Partitioned { axis } => {
-                                units =
-                                    greatest_common_divisor(units, member.global_shape()[*axis]);
-                            }
-                            MemberSharding::PartitionedSegments { segments, .. }
-                            | MemberSharding::Segmented { segments, .. } => {
-                                for segment in segments {
-                                    units = greatest_common_divisor(units, segment.len());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    ParameterGroupSpec::partitioned(
-                        group.logical_name(),
-                        group.role(),
-                        units,
-                        members,
-                    )
-                }
+                Some(units) => partitioned_group_with_preferred_units(
+                    group.logical_name(),
+                    group.role(),
+                    units,
+                    members,
+                ),
                 None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
             }
         })
         .collect()
+}
+
+fn partitioned_group_with_preferred_units(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    preferred_units: usize,
+    members: Vec<ParameterMemberSpec>,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let mut units = preferred_units;
+    for member in &members {
+        match member.sharding() {
+            MemberSharding::Partitioned { axis } => {
+                let dimension = member.global_shape().get(*axis).ok_or_else(|| {
+                    ParallelPlanError::InvalidTensor(format!(
+                        "partitioned parameter {} has no axis {axis}",
+                        member.target()
+                    ))
+                })?;
+                units = greatest_common_divisor(units, *dimension);
+            }
+            MemberSharding::PartitionedSegments { axis, segments }
+            | MemberSharding::Segmented { axis, segments } => {
+                if member.global_shape().get(*axis).is_none() {
+                    return Err(ParallelPlanError::InvalidTensor(format!(
+                        "segmented parameter {} has no axis {axis}",
+                        member.target()
+                    )));
+                }
+                for segment in segments {
+                    units = greatest_common_divisor(units, segment.len());
+                }
+            }
+            MemberSharding::Replicated
+            | MemberSharding::Equal { .. }
+            | MemberSharding::Balanced { .. } => {}
+        }
+    }
+    ParameterGroupSpec::partitioned(logical_name, role, units, members)
 }
 
 fn remap_linear_segments(
@@ -1096,6 +1100,35 @@ mod tests {
             )],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn preferred_partition_units_follow_every_physical_companion() {
+        let group = partitioned_group_with_preferred_units(
+            "experts.intermediate",
+            ParameterRole::ExpertIntermediate,
+            64,
+            vec![
+                ParameterMemberSpec::new(
+                    "experts.up_proj",
+                    [4, 64, 16],
+                    MemberSharding::Partitioned { axis: 1 },
+                ),
+                ParameterMemberSpec::new(
+                    "experts.down_proj",
+                    [4, 16, 8],
+                    MemberSharding::Partitioned { axis: 2 },
+                ),
+                ParameterMemberSpec::new(
+                    "experts.down_proj_scales",
+                    [4, 16, 2],
+                    MemberSharding::Partitioned { axis: 2 },
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(group.partition_units(), Some(2));
     }
 
     #[test]

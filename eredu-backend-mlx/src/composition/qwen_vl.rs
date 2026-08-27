@@ -16,7 +16,7 @@ use eredu_runtime::{
     ArchitectureParameters,
     CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
-    PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
+    PagedCacheOptions, ParameterRole, ResidencyReport, WeightBinding,
     WeightResidency,
 };
 use safemlx::{
@@ -287,14 +287,6 @@ impl QwenVlPipelineBindings {
             None => architecture.begin_pipeline(input, offset, delta, stream),
         }
         .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub fn static_units(
-        &self,
-        architecture: &Architecture,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {

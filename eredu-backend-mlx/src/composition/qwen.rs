@@ -84,7 +84,7 @@ pub mod vl {
 }
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, StaticUnitBindings,
+    ParallelModelInfo, ParameterRole,
 };
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
@@ -1485,14 +1485,6 @@ impl QwenPipelineBindings {
         &architecture.args().model_type
     }
 
-    pub fn static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        crate::composition::architecture_static_units(architecture, store)
-    }
-
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
         true
     }
@@ -1706,9 +1698,7 @@ mod tests {
         ])
         .unwrap();
 
-        let units = QwenPipelineBindings::new()
-            .static_units(&architecture, &store)
-            .unwrap();
+        let units = crate::composition::architecture_static_units(&architecture, &store).unwrap();
         let actual = units
             .iter()
             .map(|unit| {
@@ -1731,5 +1721,19 @@ mod tests {
                 ("output", "lm_head.weight", Some("lm_head.weight")),
             ]
         );
+
+        let input_stage = MemoryWeightStore::from_safetensors([f32_tensor(
+            "model.embed_tokens.weight",
+            vec![32, 8],
+        )])
+        .unwrap();
+        let selected = crate::composition::architecture_static_units_for_roles(
+            &architecture,
+            &input_stage,
+            &["embedding"],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id().as_str(), "embedding");
     }
 }

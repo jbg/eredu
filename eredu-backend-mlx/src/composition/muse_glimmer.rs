@@ -17,8 +17,7 @@ use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
     LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, RuntimeState, StaticUnitBindings, WeightBinding,
-    WeightResidency,
+    ParallelModelInfo, ParameterRole, RuntimeState, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -417,14 +416,6 @@ impl MuseGlimmerPipelineBindings {
 
     pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
         &architecture.args().model_type
-    }
-
-    pub fn static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {

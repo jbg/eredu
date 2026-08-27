@@ -72,6 +72,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
 struct StaticBindingVisitor<'a> {
     store: &'a dyn CheckpointSource,
     recipes: std::collections::BTreeMap<String, DerivedWeightRecipe>,
+    selected_roles: Option<std::collections::BTreeSet<String>>,
     units: Vec<StaticUnitBindings>,
 }
 
@@ -82,6 +83,19 @@ impl StaticParameterVisitor<MlxNeuralBackend> for StaticBindingVisitor<'_> {
     where
         M: Parameterized<crate::MlxTensor>,
     {
+        if self
+            .selected_roles
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(role))
+        {
+            for name in crate::backend::nn::shared::neutral_parameter_refs(module, false)
+                .flatten()
+                .into_keys()
+            {
+                self.recipes.remove(name.as_ref());
+            }
+            return Ok(());
+        }
         let bindings =
             crate::backend::runtime::checkpoint::binding::build_neutral_module_bindings_with_recipes(
                 module,
@@ -100,12 +114,35 @@ pub(crate) fn architecture_static_units<A>(
 where
     A: ArchitectureParameters<MlxNeuralBackend>,
 {
+    architecture_static_units_selected(architecture, store, None)
+}
+
+pub(crate) fn architecture_static_units_for_roles<A>(
+    architecture: &A,
+    store: &dyn CheckpointSource,
+    roles: &[&str],
+) -> Result<Vec<StaticUnitBindings>, Error>
+where
+    A: ArchitectureParameters<MlxNeuralBackend>,
+{
+    architecture_static_units_selected(architecture, store, Some(roles))
+}
+
+fn architecture_static_units_selected<A>(
+    architecture: &A,
+    store: &dyn CheckpointSource,
+    roles: Option<&[&str]>,
+) -> Result<Vec<StaticUnitBindings>, Error>
+where
+    A: ArchitectureParameters<MlxNeuralBackend>,
+{
     let recipes = architecture
         .static_parameter_recipes(store)
         .map_err(Error::ArchitectureModel)?;
     let mut visitor = StaticBindingVisitor {
         store,
         recipes,
+        selected_roles: roles.map(|roles| roles.iter().map(|role| (*role).to_owned()).collect()),
         units: Vec::new(),
     };
     architecture.visit_static_parameters(&mut visitor)?;

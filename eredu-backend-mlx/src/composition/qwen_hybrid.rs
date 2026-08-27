@@ -20,7 +20,7 @@ use eredu_runtime::{
     ArchitectureParameters,
     CacheResidencyPolicy, CausalModel, ExecutionResidency, LayerWeightResidency,
     LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
-    PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
+    PagedCacheOptions, ParameterRole, ResidencyReport, WeightBinding,
 };
 use safemlx::{
     error::Exception,
@@ -256,14 +256,6 @@ impl QwenConditionalPipelineBindings {
         &architecture.parsed().text.model_type
     }
 
-    pub fn static_units(
-        &self,
-        architecture: &ConditionalArchitecture,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        crate::composition::architecture_static_units(architecture, store)
-    }
-
     pub fn begin_pipeline_ingress(
         &self,
         architecture: &mut ConditionalArchitecture,
@@ -447,14 +439,6 @@ impl QwenHybridPipelineBindings {
 
     pub fn model_type<'a>(&self, architecture: &'a Architecture) -> &'a str {
         &architecture.config().model_type
-    }
-
-    pub fn static_units(
-        &self,
-        architecture: &Architecture,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn layer_count(&self, architecture: &Architecture, group: usize) -> Result<usize, Error> {

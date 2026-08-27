@@ -7,8 +7,7 @@ use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, Wei
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
     LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
-    WeightResidency,
+    ParallelModelInfo, ParameterRole, ResidencyReport, WeightBinding, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -140,14 +139,6 @@ impl KimiLinearBindings {
 
     pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
         &architecture.args().model_type
-    }
-
-    pub fn static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn layer_count(

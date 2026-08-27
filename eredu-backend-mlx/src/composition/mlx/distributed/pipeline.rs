@@ -149,6 +149,7 @@ trait PipelineQuantizationAdapter {
     fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
+        roles: &[&str],
     ) -> Result<Vec<StaticUnitBindings>, Error>;
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool;
     fn static_quantization_companions(
@@ -174,6 +175,7 @@ trait PipelineArchitectureBindings {
         &self,
         architecture: &Self::Architecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
+        roles: &[&str],
     ) -> Result<Vec<StaticUnitBindings>, Error>;
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool;
     fn static_quantization_companions(
@@ -222,8 +224,9 @@ impl<B: PipelineArchitectureBindings> PipelineQuantizationAdapter for BoundPipel
     fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
+        roles: &[&str],
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.bindings.static_units(self.architecture, store)
+        self.bindings.static_units(self.architecture, store, roles)
     }
 
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
@@ -307,8 +310,9 @@ macro_rules! impl_pipeline_architecture_bindings {
                 &self,
                 architecture: &Self::Architecture,
                 store: &dyn eredu_checkpoint::store::CheckpointSource,
+                roles: &[&str],
             ) -> Result<Vec<StaticUnitBindings>, Error> {
-                <$adapter>::static_units(self, architecture, store)
+                crate::composition::architecture_static_units_for_roles(architecture, store, roles)
             }
 
             fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
@@ -442,7 +446,7 @@ fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
         |store| {
             select_static_binding_units_by_owner(
                 binding_authority,
-                source.static_units(store)?,
+                source.static_units(store, &static_roles)?,
                 &static_roles,
             )
         },
@@ -13186,7 +13190,7 @@ fn pipeline_binding_units<A: PipelineQuantizationAdapter>(
 ) -> Result<Vec<StaticUnitBindings>, Error> {
     select_static_binding_units_by_owner(
         partition.parameter_bindings(),
-        adapter.static_units(store)?,
+        adapter.static_units(store, roles)?,
         roles,
     )
 }
@@ -13208,8 +13212,20 @@ fn select_static_binding_units_by_owner(
                 == expected
         });
         let unit = matches.next().ok_or_else(|| {
+            let declared = units
+                .iter()
+                .map(|unit| {
+                    (
+                        unit.id().as_str(),
+                        unit.bindings()
+                            .iter()
+                            .map(owned_binding_target)
+                            .collect::<BTreeSet<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
             Error::Parallel(format!(
-                "pipeline architecture adapter did not declare bindings for static owner {owner:?}"
+                "pipeline architecture adapter did not declare bindings for static owner {owner:?}: expected {expected:?}, declared {declared:?}"
             ))
         })?;
         if matches.next().is_some() {
@@ -18185,11 +18201,17 @@ fn load_nemotron_h_pipeline(
                     selection = selection.with_layer_group(*group, units.clone());
                 }
             }
-            let source_quantization = BoundPipelineBindings::new(
-                &binding_adapter,
-                global_source_architecture
-                    .as_ref()
-                    .expect("requested Nemotron-H conversion has a source architecture"),
+            let source_architecture = global_source_architecture
+                .as_ref()
+                .expect("requested Nemotron-H conversion has a source architecture");
+            let source_quantization =
+                BoundPipelineBindings::new(&binding_adapter, source_architecture);
+            let source_parameter_description = source_architecture
+                .parameter_description(stream)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            let source_binding_authority = local_architecture_parameter_bindings(
+                &source_parameter_description,
+                &stage.partition,
             );
             let target_quantization =
                 BoundPipelineBindings::new(&target_binding_adapter, &global_architecture);
@@ -18197,7 +18219,7 @@ fn load_nemotron_h_pipeline(
                 store,
                 &source_quantization,
                 &target_quantization,
-                stage.partition.parameter_bindings(),
+                &source_binding_authority,
                 selection,
                 quantization,
                 stream,

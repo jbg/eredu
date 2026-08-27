@@ -542,7 +542,11 @@ fn block_parallel_parameter_groups<B: RoutedNeuralBackend>(
                 })?,
                 mamba,
                 |metadata, shape| {
-                    let name = metadata.id.as_str();
+                    let name = metadata
+                        .linear_companion_of
+                        .as_ref()
+                        .unwrap_or(&metadata.id)
+                        .as_str();
                     if name.ends_with("in_proj.weight") || name.ends_with("in_proj.bias") {
                         Ok(MemberSharding::PartitionedSegments {
                             axis: 0,
@@ -573,7 +577,11 @@ fn block_parallel_parameter_groups<B: RoutedNeuralBackend>(
                 })?,
                 attention,
                 |metadata, shape| {
-                    let name = metadata.id.as_str();
+                    let name = metadata
+                        .linear_companion_of
+                        .as_ref()
+                        .unwrap_or(&metadata.id)
+                        .as_str();
                     if name.ends_with("q_proj.weight")
                         || name.ends_with("k_proj.weight")
                         || name.ends_with("v_proj.weight")
@@ -611,7 +619,12 @@ fn block_parallel_parameter_groups<B: RoutedNeuralBackend>(
                 })?,
                 &moe.experts,
                 |metadata, _| {
-                    if metadata.id.as_str().contains("up_proj") {
+                    let name = metadata
+                        .linear_companion_of
+                        .as_ref()
+                        .unwrap_or(&metadata.id)
+                        .as_str();
+                    if name.contains("up_proj") {
                         Ok(MemberSharding::Partitioned { axis: 1 })
                     } else {
                         Ok(MemberSharding::Partitioned { axis: 2 })

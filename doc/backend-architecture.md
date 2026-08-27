@@ -621,6 +621,16 @@ checkpoint to derive a second capability report. SafeTensors capability and
 floating-state dtype derivation likewise accepts only the typed architecture
 plan retained by admission; raw JSON is parsed once by the architecture
 registry.
+Architecture group helpers treat a semantic partition count as a preferred
+domain and refine it to the largest count shared by every partitioned physical
+member. This includes weights constructed directly in a packed format and
+their scale or affine-bias companions, so one group-level range always maps to
+integral physical ranges without format-specific backend planning.
+Stage-local load-time transforms validate pre-transform bindings against the
+source architecture description and post-transform bindings against the target
+description. Static binding traversal is restricted to the roles owned by that
+pipeline stage, so a packed overlay need not materialize companions for an
+unowned stage merely to construct the local adapter.
 Validated architecture parameter descriptions retain their canonical
 execution-unit layout alongside owner-tagged parameter groups. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for
