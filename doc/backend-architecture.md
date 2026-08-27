@@ -640,7 +640,9 @@ Validated architecture parameter descriptions retain their canonical
 execution-unit layout alongside owner-tagged parameter groups. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for
 target and prediction placement; it does not rebuild target/MTP counts from
-family configuration fields.
+family configuration fields. Pipeline topology preflight and stage-range
+selection likewise use the decoder group count from that description, before
+constructing any rank-local units.
 Rank-local materialization traverses the canonical units exposed by its
 `ArchitecturePartition`, so composite vision, target, and prediction ordering
 is never restated by a backend loader. Every MLX distributed family loader

@@ -14638,9 +14638,35 @@ fn load_qwen_pipeline(
         },
     )?;
     let expert_quantization = quantize_on_load;
-    let range = topology.layer_range(source_args.attention_schedule.len())?;
-    let mut stage = QwenPipelinePartition::new(
+    let seed_architecture = eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
         target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let binding_parameter_description = seed_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let decoder_group =
+        architecture_decoder_group::<_, PipelineRangeState<'_>>(&seed_architecture)?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        decoder_group,
+        "Qwen decoder",
+    )?;
+    let seed_expert_realization = eredu_architectures::qwen::expert_realization_plan(
+        &seed_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    topology.preflight(
+        Some(target_units),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
+    )?;
+    let range = topology.layer_range(target_units)?;
+    let mut stage = QwenPipelinePartition::new(
+        seed_architecture,
         range.clone(),
         expert_cache_options.is_some(),
         stream,
@@ -14649,20 +14675,6 @@ fn load_qwen_pipeline(
         .architecture
         .take()
         .expect("Qwen partition constructor owns a neutral architecture");
-    let seed_expert_realization = eredu_architectures::qwen::expert_realization_plan(
-        &seed_architecture,
-        topology.rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    topology.preflight(
-        Some(source_args.attention_schedule.len()),
-        seed_expert_realization
-            .as_ref()
-            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
-    )?;
-    let binding_parameter_description = seed_architecture
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::local_geometry(&target_args, &layout)
@@ -15835,7 +15847,7 @@ impl QwenPipelinePartition {
     }
 
     fn new(
-        args: eredu_architectures::qwen::ModelArgs,
+        architecture: eredu_architectures::qwen::RoutedLayeredModel<MlxNeuralBackend>,
         range: Range<usize>,
         external_experts: bool,
         stream: &Stream,
@@ -15853,11 +15865,6 @@ impl QwenPipelinePartition {
         } else {
             crate::composition::qwen::QwenPipelineBindings::new()
         };
-        let architecture = eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
-            args.clone(),
-            stream,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = range
             .clone()
             .map(|layer| {
@@ -17084,9 +17091,33 @@ fn load_gpt_oss_pipeline(
     } else {
         neutral_gpt_oss::GptOssPipelineBindings::new()
     };
-    let range = topology.layer_range(source_args.attention_schedule.len())?;
+    let seed_architecture =
+        gpt_oss::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let binding_parameter_description = seed_architecture
+        .parameter_description(stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let decoder_group =
+        architecture_decoder_group::<_, PipelineRangeState<'_>>(&seed_architecture)?;
+    let target_units = architecture_group_unit_count(
+        &binding_parameter_description,
+        decoder_group,
+        "GPT-OSS decoder",
+    )?;
+    let seed_expert_realization = eredu_architectures::gpt_oss::expert_realization_plan(
+        &seed_architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    topology.preflight(
+        Some(target_units),
+        seed_expert_realization
+            .as_ref()
+            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
+    )?;
+    let range = topology.layer_range(target_units)?;
     let mut stage = GptOssPipelinePartition::new(
-        target_args.clone(),
+        seed_architecture,
         range.clone(),
         expert_cache_options.is_some(),
         stream,
@@ -17095,20 +17126,6 @@ fn load_gpt_oss_pipeline(
         .architecture
         .take()
         .expect("GPT-OSS neutral architecture");
-    let seed_expert_realization = eredu_architectures::gpt_oss::expert_realization_plan(
-        &seed_architecture,
-        topology.rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    topology.preflight(
-        Some(source_args.attention_schedule.len()),
-        seed_expert_realization
-            .as_ref()
-            .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
-    )?;
-    let binding_parameter_description = seed_architecture
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = gpt_oss::local_geometry(&target_args, &layout)
@@ -17519,7 +17536,7 @@ impl GptOssPipelinePartition {
     }
 
     fn new(
-        args: gpt_oss::ModelArgs,
+        architecture: gpt_oss::LayeredModel<MlxNeuralBackend>,
         range: Range<usize>,
         external_experts: bool,
         stream: &Stream,
@@ -17537,8 +17554,6 @@ impl GptOssPipelinePartition {
         } else {
             neutral_gpt_oss::GptOssPipelineBindings::new()
         };
-        let architecture = gpt_oss::LayeredModel::<MlxNeuralBackend>::new(args.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = range
             .clone()
             .map(|layer| {
