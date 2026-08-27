@@ -446,7 +446,7 @@ where
         let layer = address.index();
         self.layers
             .get(layer)
-            .map(RuntimeLayerState::retained_values)
+            .map(|layer| layer.retained_values())
             .ok_or(StateError::UnknownLayer {
                 layer,
                 count: self.layers.len(),
