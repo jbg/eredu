@@ -1,7 +1,6 @@
 use eredu_backend_mlx::backend::{
     config::ModelLoadOptions,
     error::Error,
-    nn::generation::sample as backend_sample,
     nn::shared::MlxNeuralBackend,
     runtime::{
         cache::state::MlxKeyValueState,
@@ -13,8 +12,8 @@ use eredu_backend_mlx::backend::{
     MlxBackend, MlxCompletion, MlxModel, MlxModelConfig,
 };
 use eredu_backend_mlx::native::{
-    error::Exception, random::RandomState, Array, MlxDrafter, MlxInspectionOptions, MlxModelInput,
-    MlxModelOutput, MlxModelSession, MlxRealtimeModel, MlxSessionCompletion, Stream,
+    MlxDrafter, MlxInspectionOptions, MlxModelInput, MlxModelOutput, MlxModelSession,
+    MlxRealtimeModel, MlxSessionCompletion,
 };
 use eredu_backend_mlx::MlxTensor;
 
@@ -31,8 +30,6 @@ fn reusable_backend_modules_are_rooted_directly_under_backend() {
 
 #[test]
 fn reusable_sampling_api_is_rooted_under_backend() {
-    let _: fn(&Array, f32, Option<&mut RandomState>, &Stream) -> Result<Array, Exception> =
-        backend_sample;
     assert_public_type::<MlxSamplingBackend>();
     assert_public_type::<dyn BackendSampler>();
     assert_public_type::<dyn SpeculativeSampler>();

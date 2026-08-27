@@ -35,11 +35,11 @@ use crate::backend::{
     nn::shared::MlxNeuralBackend,
     runtime::cache::{
         kv::{
-            CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-            PagedKeyValueTransactionCheckpoint, PoolingCacheState, RetainedArrayIter,
+            CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
+            PagedKeyValueCache, PagedKeyValueTransactionCheckpoint, PoolingCache,
+            PoolingCacheState, RetainedArrayIter,
         },
         residency::{CacheResidencyManager, LoadedPromptCacheStateTensor, PromptCacheStateArray},
-        LiveKeyValueCache, PoolingCache,
     },
 };
 use eredu_core::cache::CacheRankIdentity;

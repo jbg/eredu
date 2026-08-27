@@ -4706,7 +4706,7 @@ mod tests {
     #[test]
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
-            backend::runtime::cache::{state::MlxKeyValueState, PagedKeyValueCache},
+            backend::runtime::cache::{kv::PagedKeyValueCache, state::MlxKeyValueState},
             composition::mlx::distributed::pipeline::{
                 PipelineCache, PipelineKeyValueCache, PipelineLayerCache,
             },

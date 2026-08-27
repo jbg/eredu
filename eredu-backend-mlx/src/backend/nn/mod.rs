@@ -6,8 +6,6 @@ pub mod attention;
 pub mod fp8;
 /// Gated-delta recurrent scans shared by linear-attention architectures.
 pub mod gated_delta;
-/// Causal language-model generation traits used by architecture implementations.
-pub mod generation;
 /// Multi-stream residual mixing shared by hyper-connection architectures.
 pub mod hyper_connections;
 /// Activation functions.

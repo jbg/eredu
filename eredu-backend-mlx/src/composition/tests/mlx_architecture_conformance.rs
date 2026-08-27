@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 use crate::backend::{
     nn::{shared::MlxNeuralBackend, tensor::TokenValidationScope},
     runtime::cache::{
+        kv::CompressedLatentCache,
         state::{MlxHybridState, MlxKeyValueState, MlxPoolingAttentionStateFactory},
-        CompressedLatentCache,
     },
 };
 use crate::MlxTensor;

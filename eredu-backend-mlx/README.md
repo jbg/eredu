@@ -35,8 +35,8 @@ Because this crate implements only MLX, there is no additional backend-name
 module below that root. The canonical sampling implementation follows the same
 rule: backend-generic policies come from `eredu-runtime`, while
 `backend::runtime::generation::sampler` exposes the MLX realization and its
-raw-array adapters. The standalone raw sampling function lives in
-`backend::nn::generation`.
+raw-array adapters. There is no separate MLX sampling policy or standalone
+sampling function under `backend::nn`.
 
 The `native` module is a deliberate escape hatch for devices, device-bound
 streams, allocator state, random state, low-level arrays, and platform setup

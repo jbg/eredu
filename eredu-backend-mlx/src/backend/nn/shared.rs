@@ -53,7 +53,7 @@ use crate::backend::{
     },
     runtime::cache::kv::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueAttentionBlock, KeyValueCache,
-        PagedKeyValueCache, SlidingKeyValueCache,
+        PagedKeyValueCache,
     },
 };
 use crate::MlxTensor;
@@ -2850,7 +2850,6 @@ macro_rules! impl_attention_cache {
 }
 
 impl_attention_cache!(ConcatKeyValueCache);
-impl_attention_cache!(SlidingKeyValueCache);
 impl_attention_cache!(PagedKeyValueCache);
 impl_attention_cache!(crate::backend::runtime::cache::state::MlxKeyValueLayerState);
 

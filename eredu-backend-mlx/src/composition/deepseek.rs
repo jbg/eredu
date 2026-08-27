@@ -20,11 +20,11 @@ use crate::backend::{
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::{
+            kv::CompressedLatentCache,
             residency::{
                 load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
             },
             state::{MlxPoolingAttentionState, MlxPoolingAttentionStateFactory},
-            CompressedLatentCache,
         },
         checkpoint::binding::{
             build_module_bindings, build_module_bindings_with_recipes_excluding,

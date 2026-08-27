@@ -119,11 +119,15 @@ Backend-generic sampling policy lives in `eredu-runtime`; the canonical MLX
 realization and raw-array adapters live in the reusable
 `eredu-backend-mlx::backend` hierarchy. The `native` namespace supplies the
 arrays, streams, and random state required by raw sampling signatures, but does
-not re-export the sampling APIs under second names. Backend configuration,
-errors, topology, prepared models, neural operators, cache types, and runtime
-facilities likewise have one public path in their leaf `backend` ownership
-module; neither `native`, parent modules, nor the flat root duplicate those
-names. Composition-owned model sessions, inputs, outputs, inspection policy,
+not re-export the sampling APIs under second names. There is no parallel raw
+sampler under `backend::nn`. Backend configuration, errors, topology, prepared
+models, neural operators, supported cache-state types, and runtime facilities
+likewise have one public path in their leaf `backend` ownership module; neither
+`native`, parent modules, nor the flat root duplicate those names. Raw
+key/value cache implementations and their native-array abstraction are
+crate-private; backend authors use the public neutral cache contracts and the
+supported `backend::runtime::cache::state` realizations. Composition-owned
+model sessions, inputs, outputs, inspection policy,
 realtime types, and prompt helpers have their sole public path under `native`.
 The flat root exports only application adapters whose implementation modules
 are private, so those exports establish one public name rather than aliases.

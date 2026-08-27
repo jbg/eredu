@@ -62,8 +62,8 @@ use crate::{
     },
     backend::runtime::cache::state::MlxKeyValueState,
     backend::runtime::cache::{
+        kv::{CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
         state::{MlxHybridState, MlxPoolingAttentionCache},
-        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     backend::runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, materialize_module_bindings,

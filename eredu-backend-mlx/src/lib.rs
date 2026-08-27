@@ -133,6 +133,17 @@ pub use adapter::*;
 /// use eredu_backend_mlx::backend::runtime::{cache::KeyValueCache, media::InputPart};
 /// ```
 ///
+/// Raw cache implementations and the retired neural-network sampler are not
+/// public backend-author APIs:
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::backend::runtime::cache::kv::KeyValueCache;
+/// ```
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::backend::nn::generation::sample;
+/// ```
+///
 /// Raw completion submission is internal even though the opaque completion
 /// type also participates in the public reusable backend implementation:
 ///

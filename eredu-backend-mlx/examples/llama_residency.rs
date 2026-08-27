@@ -4,7 +4,8 @@ use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
 use eredu_backend_mlx::backend::{
-    config::ModelLoadOptions, nn::generation::sample, runtime::media::input::ModelInput,
+    config::ModelLoadOptions,
+    runtime::{generation::sampler::Sampler, media::input::ModelInput},
 };
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 use eredu_core::{
@@ -12,7 +13,9 @@ use eredu_core::{
     residency::{MemoryTier, OffloadConfig, TransferDirection},
     BackendProvider as _, BackendSession as _,
 };
-use eredu_runtime::{DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency};
+use eredu_runtime::{
+    DefaultSampler, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure synchronous Llama decoder-layer host transfers")]
@@ -157,8 +160,9 @@ fn main() -> anyhow::Result<()> {
     let repeated_prefill = repeated_prefill_started.elapsed();
 
     let decode_started = Instant::now();
+    let mut sampler = DefaultSampler;
     for _ in 0..args.decode_tokens {
-        let token = sample(logits.as_array(), 0.0, None, stream)?;
+        let token = sampler.sample(logits.as_array(), 0.0, None, stream)?;
         stream.synchronize()?;
         let token = token.reshape(&[1, 1], stream)?;
         logits = session
