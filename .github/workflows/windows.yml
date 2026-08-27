@@ -46,6 +46,11 @@ jobs:
           Get-Command cl
       - name: Test the pure-Rust GGUF backend
         run: cargo test -p eredu-gguf
+      - name: Test the portable facade and CPU CLI
+        run: |
+          cargo test --locked -p eredu --no-default-features --test portable_facade
+          cargo test --locked -p eredu --no-default-features --test backend_conformance
+          cargo test --locked -p eredu-cli --no-default-features --features mlx
       - name: Build and final-link safemlx tests
         run: |
           cargo test -p safemlx --lib --no-run --no-default-features

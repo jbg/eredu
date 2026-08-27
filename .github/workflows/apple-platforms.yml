@@ -65,6 +65,12 @@ jobs:
           cargo test -p eredu-backend-mlx --lib \
             tests::distributed_pipeline_ring::ring_two_process_kimi_linear_dense_stream_pipeline -- \
             --ignored --exact --nocapture
+          cargo test -p eredu-backend-mlx --lib \
+            tests::distributed_pipeline_ring::ring_four_process_deepseek_tensor_pipeline -- \
+            --ignored --exact --nocapture
+          cargo test -p eredu-backend-mlx --lib \
+            tests::distributed_pipeline_ring::ring_four_process_deepseek_v4_tensor_pipeline -- \
+            --ignored --exact --nocapture
       - name: Test the MLX codec backend
         run: cargo test -p eredu-backend-mlx --features codec
       - name: Test concurrent MLX use
