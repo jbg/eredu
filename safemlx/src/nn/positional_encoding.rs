@@ -11,12 +11,6 @@ use crate::{
 use safemlx_internal_macros::{generate_builder, Buildable, Builder};
 use safemlx_macros::ModuleParameters;
 
-/// Type alias for [`RotaryPositionalEncoding`].
-pub type Rope = RotaryPositionalEncoding;
-
-/// Type alias for [`RotaryPositionalEncodingBuilder`].
-pub type RopeBuilder = RotaryPositionalEncodingBuilder;
-
 generate_builder! {
     /// Implements the rotary positional encoding.
     ///
@@ -135,12 +129,6 @@ where
     fn training_mode(&mut self, _mode: bool) {}
 }
 
-/// Type alias for [`SinusoidalPositionalEncoding`].
-pub type Sinpe = SinusoidalPositionalEncoding;
-
-/// Type alias for [`SinusoidalPositionalEncodingBuilder`].
-pub type SinpeBuilder = SinusoidalPositionalEncodingBuilder;
-
 /// Implements sinusoidal positional encoding.
 ///
 /// For more details see the paper "Attention Is All You Need"
@@ -159,7 +147,7 @@ pub struct SinusoidalPositionalEncoding {
     pub cosine_first: bool,
 }
 
-impl Sinpe {
+impl SinusoidalPositionalEncoding {
     /// Default value for `cosine_first` field.
     pub const DEFAULT_COSINE_FIRST: bool = false;
 
@@ -183,24 +171,26 @@ impl Sinpe {
 pub struct SinusoidalPositionalEncodingBuilder {
     dimensions: i32,
 
-    #[builder(optional, default = Sinpe::DEFAULT_MIN_FREQUENCY)]
+    #[builder(optional, default = SinusoidalPositionalEncoding::DEFAULT_MIN_FREQUENCY)]
     min_frequency: f32,
 
-    #[builder(optional, default = Sinpe::DEFAULT_MAX_FREQUENCY)]
+    #[builder(optional, default = SinusoidalPositionalEncoding::DEFAULT_MAX_FREQUENCY)]
     max_frequency: f32,
 
     #[builder(optional, default = None)]
     scale: Option<f32>,
 
-    #[builder(optional, default = Sinpe::DEFAULT_COSINE_FIRST)]
+    #[builder(optional, default = SinusoidalPositionalEncoding::DEFAULT_COSINE_FIRST)]
     cosine_first: bool,
 
-    #[builder(optional, default = Sinpe::DEFAULT_FULL_TURNS)]
+    #[builder(optional, default = SinusoidalPositionalEncoding::DEFAULT_FULL_TURNS)]
     full_turns: bool,
 }
 
-fn build_sinpe(builder: SinpeBuilder) -> Result<SinusoidalPositionalEncoding, Exception> {
-    let SinpeBuilder {
+fn build_sinpe(
+    builder: SinusoidalPositionalEncodingBuilder,
+) -> Result<SinusoidalPositionalEncoding, Exception> {
+    let SinusoidalPositionalEncodingBuilder {
         dimensions,
         min_frequency,
         max_frequency,
@@ -236,7 +226,7 @@ fn build_sinpe(builder: SinpeBuilder) -> Result<SinusoidalPositionalEncoding, Ex
     })
 }
 
-impl Module<&Array> for Sinpe {
+impl Module<&Array> for SinusoidalPositionalEncoding {
     type Error = Exception;
     type Output = Array;
 
@@ -426,7 +416,7 @@ mod tests {
     };
     use float_eq::assert_float_eq;
 
-    use crate::nn::Rope;
+    use crate::nn::RotaryPositionalEncoding;
 
     // The unit test below is adapted from the swift binding at:
     // mlx-swift/Tests/MLXTests/IntegrationTests.swift
@@ -448,7 +438,7 @@ mod tests {
             abs <= 2.60232421875
         );
 
-        let mut rope = Rope::new(8);
+        let mut rope = RotaryPositionalEncoding::new(8);
         let result = rope.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16]);
         assert_eq!(result.dtype(), Dtype::Float32);
@@ -475,7 +465,7 @@ mod tests {
         )
         .as_dtype(Dtype::Bfloat16, stream)
         .unwrap();
-        let mut rope = Rope::new(8);
+        let mut rope = RotaryPositionalEncoding::new(8);
 
         let actual = rope.forward((&input, 1), stream).unwrap();
         let flat = input.reshape(&[8, 1, 8], stream).unwrap();
@@ -527,7 +517,7 @@ mod tests {
             abs <= 2.5736187744140624
         );
 
-        let mut sinpe = crate::nn::Sinpe::new(8).unwrap();
+        let mut sinpe = crate::nn::SinusoidalPositionalEncoding::new(8).unwrap();
         let result = sinpe.forward(&a, stream).unwrap();
         assert_eq!(result.shape(), &[2, 8, 16, 8]);
         assert_eq!(result.dtype(), Dtype::Float32);

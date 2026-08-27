@@ -368,7 +368,7 @@ where
 #[derive(Debug, Clone)]
 pub enum RopeVariant {
     /// Standard MLX RoPE.
-    Default(nn::Rope),
+    Default(nn::RotaryPositionalEncoding),
     /// Piecewise wavelength-scaled RoPE.
     FrequencyScaled(FrequencyScaledRope),
     /// Proportional-prefix RoPE.
@@ -471,7 +471,7 @@ where
     fn training_mode(&mut self, mode: bool) {
         match self {
             RopeVariant::Default(rope) => {
-                <nn::Rope as Module<nn::RopeInput>>::training_mode(rope, mode)
+                <nn::RotaryPositionalEncoding as Module<nn::RopeInput>>::training_mode(rope, mode)
             }
             RopeVariant::FrequencyScaled(rope) => {
                 <FrequencyScaledRope as Module<nn::RopeInput>>::training_mode(rope, mode)
@@ -502,7 +502,7 @@ pub fn initialize_rope(
                 _ => unreachable!(),
             };
             Ok(RopeVariant::Default(
-                nn::RopeBuilder::new(dims)
+                nn::RotaryPositionalEncodingBuilder::new(dims)
                     .traditional(traditional)
                     .base(base)
                     .scale(scale)
