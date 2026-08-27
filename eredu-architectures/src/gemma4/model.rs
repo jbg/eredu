@@ -424,11 +424,6 @@ impl<T> ForwardContext<T> {
     pub fn pipeline_per_layer_inputs(&self) -> Option<&T> {
         self.per_layer_inputs.as_ref()
     }
-
-    /// Replaces the caller-supplied decoder mask for a pipeline stage.
-    pub fn set_pipeline_mask(&mut self, mask: Option<T>) {
-        self.mask = mask;
-    }
 }
 
 /// Family-owned schema for decoder-wide per-layer input transport.
@@ -1253,65 +1248,6 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         )
     }
 
-    /// Executes one ordinary text block through the shared neutral context.
-    pub fn forward_text_unit<S: LayerRuntimeState<B>>(
-        &mut self,
-        index: usize,
-        unit: &mut DenseBlock<B>,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut ForwardContext<B::Tensor>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        S::LayerState: AttentionCache<B::Tensor>,
-    {
-        let policy = self
-            .args
-            .text
-            .layer_policy(index)
-            .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-        let generated_mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
-            Some(B::causal_mask(
-                hidden.dim(1),
-                forward.position_offset,
-                policy
-                    .attention
-                    .window()
-                    .map(|window| window.get() as i32 - 1),
-                context,
-            )?)
-        } else {
-            None
-        };
-        let per_layer_input = forward
-            .per_layer_inputs
-            .as_ref()
-            .map(|inputs| {
-                inputs.index(
-                    &[
-                        Index::Full,
-                        Index::Full,
-                        Index::At(index as i32),
-                        Index::Full,
-                    ],
-                    context,
-                )
-            })
-            .transpose()?;
-        unit.forward(
-            BlockInput {
-                hidden,
-                mask: forward.mask.as_ref().or(generated_mask.as_ref()),
-                cache: Some(state.layer(index).map_err(Error::backend)?),
-                shared: &mut forward.shared,
-                per_layer_input: per_layer_input.as_ref(),
-                rotary_position: Some(RotaryPosition::Offset(forward.position_offset)),
-            },
-            context,
-        )
-    }
-
     /// Executes one rank-local text block with a runtime-owned routed bank.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_text_unit_parallel_with_provider<S, P>(
@@ -1397,19 +1333,6 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         model_text::args_cap::<B>(logits, self.args.text.final_logit_softcapping, context)
-    }
-
-    /// Applies the ordinary final normalization and vocabulary projection.
-    pub fn project_pipeline_logits(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.static_modules.text.project_logits(
-            hidden,
-            self.args.text.final_logit_softcapping,
-            context,
-        )
     }
 
     /// Executes one text unit while delegating its routed bank to a runtime-owned provider.

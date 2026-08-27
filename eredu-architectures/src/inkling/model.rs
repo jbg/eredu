@@ -788,18 +788,6 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .forward(&embeddings, context)
     }
 
-    /// Normalizes predictor embeddings supplied by a backend-owned sharded
-    /// vocabulary table.
-    pub fn normalize_mtp_embeddings(
-        &mut self,
-        embeddings: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.static_modules
-            .embedding_norm
-            .forward(embeddings, context)
-    }
-
     /// Applies the target muP scale before a backend-owned sharded MTP head.
     pub fn final_mtp_parallel_hidden(
         &mut self,
@@ -930,22 +918,6 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             parallel,
             context,
         )?;
-        self.trim_logits(logits, context)
-    }
-
-    /// Applies final target normalization, released logit scaling, output
-    /// projection, and vocabulary trimming for a serial partition.
-    pub fn project_target_logits(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.final_norm.forward(hidden, context)?;
-        let hidden = hidden.multiply_scalar(
-            self.args.text_config.logits_mup_width_multiplier.recip(),
-            context,
-        )?;
-        let logits = self.static_modules.output.forward(&hidden, context)?;
         self.trim_logits(logits, context)
     }
 

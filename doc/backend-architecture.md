@@ -1052,7 +1052,10 @@ on the output owner, and returns either a typed transport boundary or a final
 output with an optional embedded-predictor capture. Concrete backends supply
 only unit residency, state storage, collectives, and encoding or decoding
 through the partition's `ArchitectureBoundary`; backend composition does not
-reconstruct a family's begin/finish lifecycle. Primary decoder and embedded
+reconstruct a family's begin/finish lifecycle. Families do not expose alternate
+public execution seams that accept caller-supplied embedding, reduction, or
+projection operations, or piecemeal setters for partition forward state.
+Primary decoder and embedded
 prediction groups have distinct semantic kinds, so multimodal ingress ends at
 the decoder boundary and prediction runs only in its explicit phase.
 
