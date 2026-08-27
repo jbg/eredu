@@ -1299,7 +1299,6 @@ mod tests {
                 "llama.attention.layer_norm_rms_epsilon".into(),
                 MetadataValue::Float32(1e-5),
             ),
-            ("llama.vocab_size".into(), MetadataValue::Uint32(1)),
             ("llama.context_length".into(), MetadataValue::Uint32(1)),
         ]);
         Writer::default()
@@ -1321,5 +1320,124 @@ mod tests {
             ArtifactError::InvalidArtifact(detail)
                 if detail.contains("output_norm.weight")
         ));
+    }
+
+    #[test]
+    fn gguf_structural_admission_ignores_malformed_tokenizer_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("model.gguf");
+        let scalar = 1.0_f32.to_le_bytes();
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("llama".into()),
+            ),
+            ("llama.embedding_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.attention.head_count".into(),
+                MetadataValue::Uint32(1),
+            ),
+            ("llama.block_count".into(), MetadataValue::Uint32(1)),
+            ("llama.feed_forward_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::Float32(1e-5),
+            ),
+            ("llama.vocab_size".into(), MetadataValue::Uint32(1)),
+            ("llama.context_length".into(), MetadataValue::Uint32(1)),
+            (
+                "tokenizer.ggml.tokens".into(),
+                MetadataValue::String("wrong type".into()),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                MetadataValue::String("wrong type".into()),
+            ),
+            (
+                "tokenizer.ggml.padding_token_id".into(),
+                MetadataValue::String("wrong type".into()),
+            ),
+        ]);
+        const VECTOR: &[u64] = &[1];
+        const MATRIX: &[u64] = &[1, 1];
+        let tensors = [
+            TensorInput {
+                name: "token_embd.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "output_norm.weight",
+                dimensions: VECTOR,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.attn_norm.weight",
+                dimensions: VECTOR,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.ffn_norm.weight",
+                dimensions: VECTOR,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.attn_q.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.attn_k.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.attn_v.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.attn_output.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.ffn_gate.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.ffn_up.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+            TensorInput {
+                name: "blk.0.ffn_down.weight",
+                dimensions: MATRIX,
+                ggml_type: GgmlType::F32,
+                data: &scalar,
+            },
+        ];
+        Writer::default()
+            .write(File::create(&path).unwrap(), &metadata, &tensors)
+            .unwrap();
+
+        let inspection = inspect_artifact(&path).unwrap();
+        let GgufModelConfig::Llama(args) =
+            inspection.architecture_plan().gguf_plan().unwrap().model()
+        else {
+            panic!("expected Llama GGUF plan");
+        };
+        assert_eq!(args.vocab_size, 1);
     }
 }

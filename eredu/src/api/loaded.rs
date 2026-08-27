@@ -638,13 +638,14 @@ where
 
     fn from_inspected(
         backend: B,
-        inspection: eredu_core::ArtifactInspection<
+        mut inspection: eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         options: B::LoadOptions,
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
     ) -> Result<Self, LoadedModelLoadError<B::Error>> {
+        bind_gguf_special_token_ids(&mut inspection, &tokenizer)?;
         let prepared = match eredu_core::prepare_inspected_model(&backend, inspection, options) {
             Ok(prepared) => prepared,
             Err(eredu_core::ModelLoadError::Artifact(error)) => {
@@ -661,6 +662,45 @@ where
             .map_err(LoadedModelLoadError::Backend)?;
         Ok(Self::from_runtime(runtime, tokenizer, config))
     }
+}
+
+fn bind_gguf_special_token_ids(
+    inspection: &mut eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    tokenizer: &ChatTokenizer,
+) -> Result<(), TextMetadataError> {
+    use eredu_architectures::processor_plan::{GgufSpecialTokenIds, GgufSpecialTokenKind};
+
+    let Some(kind) = inspection
+        .architecture_plan()
+        .required_gguf_special_tokens()
+    else {
+        return Ok(());
+    };
+    let required = |token: &str| {
+        tokenizer.token_to_id(token).ok_or_else(|| {
+            TextMetadataError::TokenizerConfiguration(format!(
+                "GGUF tokenizer is missing required media token {token:?}"
+            ))
+        })
+    };
+    let ids = match kind {
+        GgufSpecialTokenKind::Qwen => GgufSpecialTokenIds::Qwen {
+            image_token_id: required("<|image_pad|>")?,
+            video_token_id: required("<|video_pad|>")?,
+            vision_start_token_id: required("<|vision_start|>")?,
+            vision_end_token_id: required("<|vision_end|>")?,
+        },
+        GgufSpecialTokenKind::Inkling => GgufSpecialTokenIds::Inkling {
+            image_bos_token_id: required("<|content_image|>")?,
+            audio_bos_token_id: required("<|content_audio_input|>")?,
+        },
+    };
+    inspection
+        .architecture_plan_mut()
+        .bind_gguf_special_token_ids(ids)
+        .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
 }
 
 fn loaded_text_artifact(

@@ -37,6 +37,50 @@ pub struct ModelArgs {
     pub model_type: String,
 }
 
+/// Structurally admitted Qwen3-VL GGUF geometry awaiting facade-owned token IDs.
+#[derive(Debug, Clone)]
+pub struct GgufModelArgs {
+    /// Ordinary neutral Qwen/Qwen-MoE decoder configuration.
+    pub text: qwen::ModelArgs,
+    /// Shared full-attention DeepStack vision configuration.
+    pub vision: VisionConfig,
+    /// Temporal/height/width interleaving sections.
+    pub mrope_section: [i32; 3],
+    /// Effective top-level model type.
+    pub model_type: String,
+}
+
+impl GgufModelArgs {
+    /// Binds tokenizer-resolved media placeholders after structural admission.
+    pub fn with_media_token_ids(
+        self,
+        image_token_id: u32,
+        video_token_id: u32,
+    ) -> Result<ModelArgs, VlConfigError> {
+        let image_token_id = i32::try_from(image_token_id)
+            .map_err(|_| invalid("Qwen3-VL image token id exceeds i32"))?;
+        let video_token_id = i32::try_from(video_token_id)
+            .map_err(|_| invalid("Qwen3-VL video token id exceeds i32"))?;
+        if image_token_id == video_token_id {
+            return Err(invalid("Qwen3-VL image and video placeholders must differ"));
+        }
+        if image_token_id >= self.text.vocab_size || video_token_id >= self.text.vocab_size {
+            return Err(invalid(format!(
+                "Qwen3-VL media token ids {image_token_id} and {video_token_id} must fit structural vocabulary {}",
+                self.text.vocab_size
+            )));
+        }
+        Ok(ModelArgs {
+            text: self.text,
+            vision: self.vision,
+            image_token_id,
+            video_token_id,
+            mrope_section: self.mrope_section,
+            model_type: self.model_type,
+        })
+    }
+}
+
 /// Strict Qwen3-VL configuration error.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("{0}")]
@@ -157,7 +201,7 @@ pub fn model_args_from_gguf_parts(
     text: qwen::ModelArgs,
     metadata: &HashMap<String, MetadataValue>,
     vision: VisionConfig,
-) -> Result<ModelArgs, VlConfigError> {
+) -> Result<GgufModelArgs, VlConfigError> {
     vision
         .validate_for(VisionMode::DeepStack)
         .map_err(|error| invalid(error.to_string()))?;
@@ -198,14 +242,6 @@ pub fn model_args_from_gguf_parts(
             text.head_dim
         )));
     }
-    let token_id = |token: &str| {
-        metadata
-            .get("tokenizer.ggml.tokens")
-            .and_then(MetadataValue::as_strings)
-            .and_then(|tokens| tokens.iter().position(|value| value == token))
-            .and_then(|index| i32::try_from(index).ok())
-            .ok_or_else(|| invalid(format!("Qwen3-VL tokenizer is missing {token:?}")))
-    };
     if vision.out_hidden_size != text.hidden_size {
         return Err(invalid(format!(
             "Qwen3-VL projector output {} does not match text hidden size {}",
@@ -223,11 +259,9 @@ pub fn model_args_from_gguf_parts(
             )));
         }
     }
-    Ok(ModelArgs {
+    Ok(GgufModelArgs {
         text,
         vision,
-        image_token_id: token_id("<|image_pad|>")?,
-        video_token_id: token_id("<|video_pad|>")?,
         mrope_section,
         model_type: if architecture == GgufArchitecture::Qwen3VlMoe {
             "qwen3_vl_moe".into()

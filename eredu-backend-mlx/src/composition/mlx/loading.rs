@@ -747,6 +747,15 @@ pub(super) fn validate_plan_options(
     plan: &ModelPreparationPlan<ArtifactArchitecturePlan>,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
+    if let Some(kind) = plan
+        .inspection()
+        .architecture_plan()
+        .required_gguf_special_tokens()
+    {
+        return Err(Error::ArchitectureModel(format!(
+            "GGUF {kind:?} media token IDs must be resolved by the facade before MLX preparation"
+        )));
+    }
     if plan.policy() != options.preparation_policy()? {
         return Err(Error::ArchitectureModel(
             "MLX materialization options do not match the backend-neutral preparation plan".into(),

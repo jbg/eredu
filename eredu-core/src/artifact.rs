@@ -293,6 +293,10 @@ impl<P> ArtifactInspection<P> {
     pub fn architecture_plan(&self) -> &P {
         &self.architecture_plan
     }
+    /// Mutably borrows architecture-owned state for facade-level enrichment.
+    pub fn architecture_plan_mut(&mut self) -> &mut P {
+        &mut self.architecture_plan
+    }
 }
 
 /// Requested load-time weight transformation.

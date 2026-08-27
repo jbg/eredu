@@ -14,7 +14,8 @@ pub use checkpoint::{
 pub use config::{
     model_args_from_config_value, model_args_from_gguf_parts,
     prompt_cache_architecture_fingerprint, state_identity, state_layout,
-    state_layout_with_key_value_heads, vision_config_from_gguf_catalog, ModelArgs, VlConfigError,
+    state_layout_with_key_value_heads, vision_config_from_gguf_catalog, GgufModelArgs, ModelArgs,
+    VlConfigError,
 };
 pub use model::{
     ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,

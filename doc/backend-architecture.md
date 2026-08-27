@@ -198,6 +198,14 @@ and generation-termination policy, including EOS metadata from model sidecars
 and GGUF headers. Backend weight inspection and materialization do not parse
 tokenizer or EOS policy metadata: malformed or unsupported facade-owned policy
 cannot reject an otherwise valid weight artifact.
+Architecture admission derives vocabulary geometry exclusively from
+family-owned structural fields and the admitted tensor catalog; tokenizer token
+lists never override that geometry. When GGUF media protocols identify framing
+or placeholder tokens by spelling, inspection retains an unresolved typed media
+plan. After reconstructing the tokenizer, the facade resolves those spellings
+to numeric IDs and binds them before backend preparation. Missing or malformed
+tokenizer metadata can therefore fail tokenizer-aware facade loading, but not
+structural weight admission.
 Public chat preparation contracts live under `eredu::runtime::chat`.
 Committed-token streaming and constrained-decoding machinery remain private to
 the facade, and constrained-decoding failures are exposed only through the

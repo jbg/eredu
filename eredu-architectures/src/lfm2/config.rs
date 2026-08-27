@@ -521,19 +521,7 @@ pub fn model_args_from_gguf_catalog(
             .collect(),
     )
     .map_err(|error| invalid(format!("LFM2 GGUF {error}")))?;
-    let vocab_size = match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("GGUF tokenizer vocabulary exceeds i32"))?,
-        None if metadata.contains_key("tokenizer.ggml.tokens") => {
-            return Err(invalid(
-                "GGUF tokenizer.ggml.tokens metadata has the wrong type",
-            ));
-        }
-        None => gguf_i32(metadata, &key("vocab_size"))?,
-    };
+    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
     let expert_bias_name =
         |name: &str| name.contains("ffn_exp_probs_b") || name.contains("exp_probs_b");
     let args = ModelArgs {

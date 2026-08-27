@@ -933,17 +933,7 @@ fn gguf_vocab_size(
     metadata: &HashMap<String, MetadataValue>,
     fallback: &str,
 ) -> Result<i32, ConfigError> {
-    match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("Muse-Glimmer GGUF vocabulary exceeds i32")),
-        None if metadata.contains_key("tokenizer.ggml.tokens") => Err(invalid(
-            "Muse-Glimmer GGUF tokenizer.ggml.tokens must be a string array",
-        )),
-        None => gguf_i32(metadata, fallback),
-    }
+    gguf_i32(metadata, fallback)
 }
 
 fn gguf_string(

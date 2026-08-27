@@ -767,19 +767,7 @@ pub fn model_args_from_gguf_catalog(
             .collect(),
     )
     .map_err(|error| invalid(format!("hybrid {error}")))?;
-    let vocab_size = match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("GGUF tokenizer vocabulary exceeds i32"))?,
-        None if metadata.contains_key("tokenizer.ggml.tokens") => {
-            return Err(invalid(
-                "GGUF tokenizer.ggml.tokens metadata has the wrong type",
-            ));
-        }
-        None => gguf_i32(metadata, &key("vocab_size"))?,
-    };
+    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
     let is_moe = variant != HybridVariant::Qwen35Dense;
     let rope_theta = gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(10_000_000.0);
     let mut rope_parameters = HashMap::new();
@@ -861,11 +849,9 @@ pub fn model_args_from_gguf_catalog(
 }
 
 /// Attaches an independently validated shared-vision projector to a Qwen3.5
-/// text GGUF policy using tokenizer placeholder identities from the text
-/// artifact.
+/// text GGUF policy without interpreting facade-owned tokenizer metadata.
 pub fn with_gguf_vision_projector(
     mut parsed: ParsedHybridConfig,
-    metadata: &HashMap<String, MetadataValue>,
     vision: VisionConfig,
 ) -> Result<ParsedHybridConfig, HybridConfigError> {
     if parsed.text.variant == HybridVariant::Qwen3Next {
@@ -880,22 +866,36 @@ pub fn with_gguf_vision_projector(
             vision.out_hidden_size, parsed.text.hidden_size
         )));
     }
-    let token_id = |token: &str| {
-        metadata
-            .get("tokenizer.ggml.tokens")
-            .and_then(MetadataValue::as_strings)
-            .and_then(|tokens| tokens.iter().position(|value| value == token))
-            .and_then(|index| i32::try_from(index).ok())
-            .ok_or_else(|| invalid(format!("Qwen3.5 tokenizer is missing {token:?}")))
-    };
-    let image = token_id("<|image_pad|>")?;
-    let video = token_id("<|video_pad|>")?;
+    parsed.vision = Some(vision);
+    Ok(parsed)
+}
+
+/// Binds facade-resolved media placeholders to admitted Qwen3.5 GGUF geometry.
+pub fn with_media_token_ids(
+    mut parsed: ParsedHybridConfig,
+    image_token_id: u32,
+    video_token_id: u32,
+) -> Result<ParsedHybridConfig, HybridConfigError> {
+    if parsed.vision.is_none() {
+        return Err(invalid(
+            "Qwen3.5 media token IDs require admitted vision geometry",
+        ));
+    }
+    let image =
+        i32::try_from(image_token_id).map_err(|_| invalid("Qwen3.5 image token id exceeds i32"))?;
+    let video =
+        i32::try_from(video_token_id).map_err(|_| invalid("Qwen3.5 video token id exceeds i32"))?;
     if image == video {
         return Err(invalid("Qwen3.5 image and video placeholders must differ"));
     }
+    if image >= parsed.text.vocab_size || video >= parsed.text.vocab_size {
+        return Err(invalid(format!(
+            "Qwen3.5 media token ids {image} and {video} must fit structural vocabulary {}",
+            parsed.text.vocab_size
+        )));
+    }
     parsed.image_token_id = Some(image);
     parsed.video_token_id = Some(video);
-    parsed.vision = Some(vision);
     Ok(parsed)
 }
 

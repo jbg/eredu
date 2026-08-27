@@ -21,8 +21,12 @@ pub enum GgufMediaProjectorConfig {
     MuseGlimmer(crate::muse_glimmer::DecoderConfig),
     /// Qwen3-VL text plus its admitted DeepStack vision projector.
     Qwen3Vl(crate::qwen::vl::ModelArgs),
+    /// Structurally admitted Qwen3-VL awaiting facade-resolved media token IDs.
+    Qwen3VlPending(crate::qwen::vl::GgufModelArgs),
     /// Qwen3.5 text plus its admitted window-scheduled vision projector.
     Qwen35(crate::qwen::hybrid::ParsedHybridConfig),
+    /// Structurally admitted Qwen3.5 awaiting facade-resolved media token IDs.
+    Qwen35Pending(crate::qwen::hybrid::ParsedHybridConfig),
 }
 
 /// Architecture-owned proof that a resolved media-projector GGUF matches the model.
@@ -41,6 +45,34 @@ impl GgufMediaProjectorPlan {
     /// Exact companion checkpoint schema proven by portable inspection.
     pub const fn checkpoint(&self) -> &GgufCheckpointPlan {
         &self.checkpoint
+    }
+
+    pub(crate) fn bind_qwen_token_ids(
+        &mut self,
+        image_token_id: u32,
+        video_token_id: u32,
+    ) -> Result<(), String> {
+        let bound = match &self.model {
+            GgufMediaProjectorConfig::Qwen3VlPending(args) => GgufMediaProjectorConfig::Qwen3Vl(
+                args.clone()
+                    .with_media_token_ids(image_token_id, video_token_id)
+                    .map_err(|error| error.to_string())?,
+            ),
+            GgufMediaProjectorConfig::Qwen35Pending(args) => GgufMediaProjectorConfig::Qwen35(
+                crate::qwen::hybrid::with_media_token_ids(
+                    args.clone(),
+                    image_token_id,
+                    video_token_id,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            GgufMediaProjectorConfig::Qwen3Vl(_) | GgufMediaProjectorConfig::Qwen35(_) => {
+                return Err("Qwen GGUF media token IDs were already bound".into())
+            }
+            _ => return Err("non-Qwen GGUF projector received Qwen token IDs".into()),
+        };
+        self.model = bound;
+        Ok(())
     }
 }
 
@@ -111,9 +143,9 @@ pub(crate) fn resolve_media_projector(
             let model =
                 crate::qwen::vl::model_args_from_gguf_parts(text.clone(), &model_metadata, vision)
                     .map_err(|error| error.to_string())?;
-            let checkpoint = crate::qwen::vl::projector_gguf_plan(&model)?;
+            let checkpoint = crate::qwen::vision::gguf_plan(&model.vision, model.text.hidden_size)?;
             validate_qwen_translation(projector, &model.vision)?;
-            (GgufMediaProjectorConfig::Qwen3Vl(model), checkpoint)
+            (GgufMediaProjectorConfig::Qwen3VlPending(model), checkpoint)
         }
         GgufModelConfig::QwenHybrid(parsed) => {
             let vision = crate::qwen::hybrid::vision_config_from_gguf_catalog(
@@ -121,12 +153,8 @@ pub(crate) fn resolve_media_projector(
                 &projector_metadata,
             )
             .map_err(|error| error.to_string())?;
-            let model = crate::qwen::hybrid::with_gguf_vision_projector(
-                parsed.clone(),
-                &model_metadata,
-                vision,
-            )
-            .map_err(|error| error.to_string())?;
+            let model = crate::qwen::hybrid::with_gguf_vision_projector(parsed.clone(), vision)
+                .map_err(|error| error.to_string())?;
             let checkpoint = crate::qwen::hybrid::conditional_projector_gguf_plan(&model)?;
             validate_qwen_translation(
                 projector,
@@ -135,7 +163,7 @@ pub(crate) fn resolve_media_projector(
                     .as_ref()
                     .ok_or("admitted Qwen3.5 projector omitted its vision geometry")?,
             )?;
-            (GgufMediaProjectorConfig::Qwen35(model), checkpoint)
+            (GgufMediaProjectorConfig::Qwen35Pending(model), checkpoint)
         }
         _ => {
             return Err(format!(

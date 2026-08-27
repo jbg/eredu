@@ -489,17 +489,7 @@ pub fn model_args_from_gguf_catalog_with_context(
     } else {
         LayerSchedule::all_full(layers).map_err(|error| invalid(error.to_string()))?
     };
-    let vocab_size = match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("GGUF tokenizer vocabulary exceeds i32"))?,
-        None if metadata.contains_key("tokenizer.ggml.tokens") => {
-            return Err(invalid("GGUF tokenizer.ggml.tokens has the wrong type"));
-        }
-        None => gguf_i32(metadata, &key("vocab_size"))?,
-    };
+    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
     let is_moe = variant == QwenVariant::Qwen3Moe;
     let args = ModelArgs {
         variant,
@@ -1023,6 +1013,18 @@ const fn default_rope_theta() -> f32 {
 mod tests {
     use super::*;
 
+    struct Catalog;
+
+    impl GgufTensorCatalog for Catalog {
+        fn contains(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn any(&self, _predicate: impl FnMut(&str) -> bool) -> bool {
+            false
+        }
+    }
+
     fn base(model_type: &str) -> Value {
         serde_json::json!({
             "model_type": model_type,
@@ -1048,6 +1050,43 @@ mod tests {
         assert!(!qwen2.attention_bias(AttentionProjection::Output));
         assert_eq!(qwen2.query_key_norm_epsilon(), None);
         assert_eq!(qwen3.query_key_norm_epsilon(), Some(0.000001));
+    }
+
+    #[test]
+    fn gguf_structural_vocabulary_ignores_malformed_tokenizer_metadata() {
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("qwen3".into()),
+            ),
+            ("qwen3.embedding_length".into(), MetadataValue::Uint32(16)),
+            ("qwen3.block_count".into(), MetadataValue::Uint32(3)),
+            (
+                "qwen3.attention.head_count".into(),
+                MetadataValue::Uint32(4),
+            ),
+            (
+                "qwen3.attention.head_count_kv".into(),
+                MetadataValue::Uint32(2),
+            ),
+            (
+                "qwen3.feed_forward_length".into(),
+                MetadataValue::Uint32(32),
+            ),
+            (
+                "qwen3.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::Float32(1e-6),
+            ),
+            ("qwen3.vocab_size".into(), MetadataValue::Uint32(64)),
+            ("qwen3.context_length".into(), MetadataValue::Uint32(128)),
+            (
+                "tokenizer.ggml.tokens".into(),
+                MetadataValue::String("malformed tokenizer payload".into()),
+            ),
+        ]);
+
+        let args = model_args_from_gguf_catalog(&Catalog, &metadata).unwrap();
+        assert_eq!(args.vocab_size, 64);
     }
 
     #[test]

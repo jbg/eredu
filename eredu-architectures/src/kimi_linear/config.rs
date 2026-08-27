@@ -480,20 +480,7 @@ pub fn model_args_from_gguf_catalog(
         .transpose()
         .map_err(|_| invalid("GGUF query LoRA rank exceeds i32"))?
         .filter(|rank| *rank > 0);
-    let vocab_size = match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => {
-            i32::try_from(tokens.len()).map_err(|_| invalid("GGUF vocabulary exceeds i32"))?
-        }
-        None if metadata.contains_key("tokenizer.ggml.tokens") => {
-            return Err(invalid(
-                "GGUF tokenizer.ggml.tokens metadata has the wrong type",
-            ));
-        }
-        None => gguf_i32(metadata, &key("vocab_size"))?,
-    };
+    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
     let gating = gguf_optional_i64(metadata, &key("expert_gating_func"))?.unwrap_or(2);
     if gating != 2 {
         return Err(invalid(format!(

@@ -520,19 +520,7 @@ pub fn model_args_from_gguf_catalog(
         .map_err(|_| invalid("Nemotron-H head size exceeds i32"))?
         .unwrap_or(hidden_size / num_attention_heads);
     let norm_eps = gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?;
-    let vocab_size = match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("GGUF tokenizer vocabulary exceeds i32"))?,
-        None if metadata.contains_key("tokenizer.ggml.tokens") => {
-            return Err(invalid(
-                "GGUF tokenizer.ggml.tokens metadata has the wrong type",
-            ));
-        }
-        None => gguf_i32(metadata, &key("vocab_size"))?,
-    };
+    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
 
     let n_routed_experts = if is_moe {
         gguf_i32(metadata, &key("expert_count"))?

@@ -43,6 +43,38 @@ pub struct MediaFraming {
     pub end_token_id: u32,
 }
 
+/// Facade-owned tokenizer identities required to finish one GGUF media plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufSpecialTokenKind {
+    /// Qwen image/video placeholders and media framing tokens.
+    Qwen,
+    /// Inkling image/audio content framing tokens.
+    Inkling,
+}
+
+/// Typed token IDs resolved from strings only after tokenizer reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufSpecialTokenIds {
+    /// Qwen tokenizer protocol IDs.
+    Qwen {
+        /// Image tensor placeholder.
+        image_token_id: u32,
+        /// Video tensor placeholder.
+        video_token_id: u32,
+        /// Opening vision framing token.
+        vision_start_token_id: u32,
+        /// Closing vision framing token.
+        vision_end_token_id: u32,
+    },
+    /// Inkling tokenizer protocol IDs.
+    Inkling {
+        /// Opening image-content token.
+        image_bos_token_id: u32,
+        /// Opening audio-content token.
+        audio_bos_token_id: u32,
+    },
+}
+
 /// Backend-executed RGB transform selected by architecture policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RgbTransformPlan {
@@ -190,7 +222,7 @@ pub struct QwenVideoPlan {
 pub struct QwenProcessorPlan {
     image: Option<QwenVisualSource>,
     video: Option<QwenVisualSource>,
-    framing: MediaFraming,
+    framing: Option<MediaFraming>,
 }
 
 impl QwenProcessorPlan {
@@ -220,16 +252,15 @@ impl QwenProcessorPlan {
         Ok(Some(Self {
             image,
             video,
-            framing: MediaFraming {
+            framing: Some(MediaFraming {
                 start_token_id,
                 end_token_id,
-            },
+            }),
         }))
     }
 
-    /// Derives Qwen preprocessing entirely from the admitted GGUF model and projector.
-    pub fn from_gguf_metadata(
-        model: &BTreeMap<String, MetadataValue>,
+    /// Derives Qwen preprocessing geometry from the admitted GGUF projector.
+    fn from_gguf_metadata(
         projector: &BTreeMap<String, MetadataValue>,
     ) -> Result<Self, ProcessorPlanError> {
         let patch_size = required_btree_usize(projector, "clip.vision.patch_size")?;
@@ -277,11 +308,16 @@ impl QwenProcessorPlan {
         Ok(Self {
             image: Some(visual.clone()),
             video: Some(visual),
-            framing: MediaFraming {
-                start_token_id: required_gguf_token_id(model, "<|vision_start|>")?,
-                end_token_id: required_gguf_token_id(model, "<|vision_end|>")?,
-            },
+            framing: None,
         })
+    }
+
+    fn bind_framing(&mut self, framing: MediaFraming) {
+        self.framing = Some(framing);
+    }
+
+    const fn has_framing(&self) -> bool {
+        self.framing.is_some()
     }
 
     /// Derives one still-image transform and patch plan.
@@ -306,7 +342,9 @@ impl QwenProcessorPlan {
             (height, width)
         };
         Ok(QwenImagePlan {
-            framing: self.framing,
+            framing: self
+                .framing
+                .ok_or_else(|| invalid("Qwen GGUF media framing token IDs are unresolved"))?,
             transform: qwen_transform(source, height, width),
             patches: qwen_patches(source),
         })
@@ -376,7 +414,9 @@ impl QwenProcessorPlan {
             })
             .collect();
         Ok(QwenVideoPlan {
-            framing: self.framing,
+            framing: self
+                .framing
+                .ok_or_else(|| invalid("Qwen GGUF media framing token IDs are unresolved"))?,
             transform: qwen_transform(source, height, width),
             patches: qwen_patches(source),
             groups,
@@ -554,11 +594,9 @@ impl ArtifactArchitecturePlan {
                 })
                 .transpose()?
                 .map(NormalizedProcessorPlan::Gemma4),
-            GgufArchitecture::Inkling if projector.is_some() => {
-                Some(NormalizedProcessorPlan::Inkling(
-                    InklingProcessorPlan::from_gguf_metadata(&as_hash_map(model))?,
-                ))
-            }
+            GgufArchitecture::Inkling if projector.is_some() => Some(
+                NormalizedProcessorPlan::Inkling(InklingProcessorPlan::from_gguf_metadata()?),
+            ),
             GgufArchitecture::MuseGlimmer => projector
                 .map(|projector| MuseProcessorPlan::from_gguf_metadata(&as_hash_map(projector)))
                 .transpose()?
@@ -567,7 +605,7 @@ impl ArtifactArchitecturePlan {
             | GgufArchitecture::Qwen3VlMoe
             | GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe => projector
-                .map(|projector| QwenProcessorPlan::from_gguf_metadata(model, projector))
+                .map(QwenProcessorPlan::from_gguf_metadata)
                 .transpose()?
                 .map(NormalizedProcessorPlan::Qwen),
             _ => None,
@@ -620,6 +658,63 @@ impl ArtifactArchitecturePlan {
         self.processor.is_some()
     }
 
+    /// Tokenizer protocol required to make an admitted GGUF media plan executable.
+    pub const fn required_gguf_special_tokens(&self) -> Option<GgufSpecialTokenKind> {
+        match &self.processor {
+            Some(NormalizedProcessorPlan::Qwen(plan)) if !plan.has_framing() => {
+                Some(GgufSpecialTokenKind::Qwen)
+            }
+            Some(NormalizedProcessorPlan::Inkling(plan)) if !plan.has_token_ids() => {
+                Some(GgufSpecialTokenKind::Inkling)
+            }
+            _ => None,
+        }
+    }
+
+    /// Binds facade-resolved GGUF tokenizer IDs after structural admission.
+    pub fn bind_gguf_special_token_ids(
+        &mut self,
+        ids: GgufSpecialTokenIds,
+    ) -> Result<(), ProcessorPlanError> {
+        match ids {
+            GgufSpecialTokenIds::Qwen {
+                image_token_id,
+                video_token_id,
+                vision_start_token_id,
+                vision_end_token_id,
+            } => {
+                if !matches!(&self.processor, Some(NormalizedProcessorPlan::Qwen(_))) {
+                    return Err(invalid("Qwen GGUF special tokens require a processor plan"));
+                }
+                let projector = self.media_projector.as_mut().ok_or_else(|| {
+                    invalid("Qwen GGUF special tokens require an admitted media projector")
+                })?;
+                projector
+                    .bind_qwen_token_ids(image_token_id, video_token_id)
+                    .map_err(invalid)?;
+                let Some(NormalizedProcessorPlan::Qwen(plan)) = self.processor.as_mut() else {
+                    unreachable!("Qwen processor presence checked before projector mutation")
+                };
+                plan.bind_framing(MediaFraming {
+                    start_token_id: vision_start_token_id,
+                    end_token_id: vision_end_token_id,
+                });
+            }
+            GgufSpecialTokenIds::Inkling {
+                image_bos_token_id,
+                audio_bos_token_id,
+            } => {
+                let Some(NormalizedProcessorPlan::Inkling(plan)) = self.processor.as_mut() else {
+                    return Err(invalid(
+                        "Inkling GGUF special tokens require a processor plan",
+                    ));
+                };
+                plan.bind_token_ids(image_bos_token_id, audio_bos_token_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the retained Gemma 4 processor plan, when admitted.
     pub const fn gemma4(&self) -> Option<&Gemma4ProcessorPlan> {
         match &self.processor {
@@ -631,7 +726,7 @@ impl ArtifactArchitecturePlan {
     /// Returns the retained Inkling processor plan, when admitted.
     pub const fn inkling(&self) -> Option<&InklingProcessorPlan> {
         match &self.processor {
-            Some(NormalizedProcessorPlan::Inkling(plan)) => Some(plan),
+            Some(NormalizedProcessorPlan::Inkling(plan)) if plan.has_token_ids() => Some(plan),
             _ => None,
         }
     }
@@ -647,7 +742,7 @@ impl ArtifactArchitecturePlan {
     /// Returns the retained Qwen processor plan, when admitted.
     pub const fn qwen(&self) -> Option<&QwenProcessorPlan> {
         match &self.processor {
-            Some(NormalizedProcessorPlan::Qwen(plan)) => Some(plan),
+            Some(NormalizedProcessorPlan::Qwen(plan)) if plan.has_framing() => Some(plan),
             _ => None,
         }
     }
@@ -1369,25 +1464,6 @@ fn required_btree_rgb(
     })
 }
 
-fn required_gguf_token_id(
-    metadata: &BTreeMap<String, MetadataValue>,
-    token: &str,
-) -> Result<u32, ProcessorPlanError> {
-    let tokens = metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-        .ok_or_else(|| invalid("Qwen GGUF is missing tokenizer.ggml.tokens"))?;
-    let index = tokens
-        .iter()
-        .position(|candidate| candidate == token)
-        .ok_or_else(|| {
-            invalid(format!(
-                "Qwen GGUF tokenizer is missing media marker {token:?}"
-            ))
-        })?;
-    u32::try_from(index).map_err(|_| invalid("Qwen media token id exceeds u32"))
-}
-
 fn invalid_metadata(key: &str) -> ProcessorPlanError {
     invalid(format!(
         "processor GGUF metadata key {key:?} must be a non-negative integer"
@@ -1621,8 +1697,8 @@ pub enum Logarithm {
 /// Normalized Inkling multimodal processor policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InklingProcessorPlan {
-    image_bos_token_id: u32,
-    audio_bos_token_id: u32,
+    image_bos_token_id: Option<u32>,
+    audio_bos_token_id: Option<u32>,
     dmel_bins: usize,
     dmel_min: f32,
     dmel_max: f32,
@@ -1650,17 +1726,23 @@ impl InklingProcessorPlan {
         .map(Some)
     }
 
-    /// Derives Inkling framing from a portable GGUF tokenizer vocabulary.
-    pub fn from_gguf_metadata(
-        metadata: &HashMap<String, MetadataValue>,
+    /// Builds structurally admitted Inkling GGUF processing awaiting token IDs.
+    fn from_gguf_metadata() -> Result<Self, ProcessorPlanError> {
+        Self::new_unresolved(
+            default_inkling_dmel_bins(),
+            default_inkling_dmel_min(),
+            default_inkling_dmel_max(),
+        )
+    }
+
+    /// Builds Inkling GGUF processing from facade-resolved tokenizer IDs.
+    pub fn from_gguf_token_ids(
+        image_bos_token_id: u32,
+        audio_bos_token_id: u32,
     ) -> Result<Self, ProcessorPlanError> {
         Self::new(
-            gguf_token_id(metadata, "<|content_image|>", default_inkling_image_bos())?,
-            gguf_token_id(
-                metadata,
-                "<|content_audio_input|>",
-                default_inkling_audio_bos(),
-            )?,
+            image_bos_token_id,
+            audio_bos_token_id,
             default_inkling_dmel_bins(),
             default_inkling_dmel_min(),
             default_inkling_dmel_max(),
@@ -1678,12 +1760,32 @@ impl InklingProcessorPlan {
             return Err(invalid("invalid Inkling dMel bin configuration"));
         }
         Ok(Self {
-            image_bos_token_id,
-            audio_bos_token_id,
+            image_bos_token_id: Some(image_bos_token_id),
+            audio_bos_token_id: Some(audio_bos_token_id),
             dmel_bins,
             dmel_min,
             dmel_max,
         })
+    }
+
+    fn new_unresolved(
+        dmel_bins: usize,
+        dmel_min: f32,
+        dmel_max: f32,
+    ) -> Result<Self, ProcessorPlanError> {
+        let mut plan = Self::new(0, 1, dmel_bins, dmel_min, dmel_max)?;
+        plan.image_bos_token_id = None;
+        plan.audio_bos_token_id = None;
+        Ok(plan)
+    }
+
+    fn bind_token_ids(&mut self, image_bos_token_id: u32, audio_bos_token_id: u32) {
+        self.image_bos_token_id = Some(image_bos_token_id);
+        self.audio_bos_token_id = Some(audio_bos_token_id);
+    }
+
+    const fn has_token_ids(&self) -> bool {
+        self.image_bos_token_id.is_some() && self.audio_bos_token_id.is_some()
     }
 
     /// Derives the released image grid and normalization policy.
@@ -1696,7 +1798,9 @@ impl InklingProcessorPlan {
             return Err(invalid("Inkling image dimensions must be positive"));
         }
         Ok(InklingImagePlan {
-            start_token_id: self.image_bos_token_id,
+            start_token_id: self
+                .image_bos_token_id
+                .ok_or_else(|| invalid("Inkling GGUF image framing token ID is unresolved"))?,
             patch_size: 40,
             temporal_patch_size: 2,
             patch_rows: height.div_ceil(40),
@@ -1709,9 +1813,11 @@ impl InklingProcessorPlan {
     }
 
     /// Returns the released audio framing, analysis, and quantization policy.
-    pub const fn audio(&self) -> InklingAudioPlan {
-        InklingAudioPlan {
-            start_token_id: self.audio_bos_token_id,
+    pub fn audio(&self) -> Result<InklingAudioPlan, ProcessorPlanError> {
+        Ok(InklingAudioPlan {
+            start_token_id: self
+                .audio_bos_token_id
+                .ok_or_else(|| invalid("Inkling GGUF audio framing token ID is unresolved"))?,
             sample_rate: 16_000,
             fft_length: 1_600,
             hop_length: 800,
@@ -1732,27 +1838,8 @@ impl InklingProcessorPlan {
             dmel_min: self.dmel_min,
             dmel_max: self.dmel_max,
             energy_floor: 1e-10,
-        }
+        })
     }
-}
-
-fn gguf_token_id(
-    metadata: &HashMap<String, MetadataValue>,
-    token: &str,
-    fallback: u32,
-) -> Result<u32, ProcessorPlanError> {
-    let Some(tokens) = metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    else {
-        return Ok(fallback);
-    };
-    let Some(index) = tokens.iter().position(|candidate| candidate == token) else {
-        return Err(invalid(format!(
-            "Inkling GGUF tokenizer is missing media marker {token:?}"
-        )));
-    };
-    u32::try_from(index).map_err(|_| invalid("Inkling media token id exceeds u32"))
 }
 
 fn default_muse_true() -> bool {
@@ -2183,8 +2270,8 @@ fn metadata_rgb(
 mod tests {
     use super::{
         ArtifactArchitecturePlan, AudioFrameCount, AudioWindow, Gemma4ProcessorPlan,
-        InklingProcessorPlan, Logarithm, MelNormalization, MelScale, MuseProcessorPlan,
-        QwenProcessorPlan, SpectrumValue,
+        GgufSpecialTokenKind, InklingProcessorPlan, Logarithm, MediaFraming, MelNormalization,
+        MelScale, MuseProcessorPlan, QwenProcessorPlan, SpectrumValue,
     };
     use crate::{GgufArchitecture, ModelKind};
     use eredu_core::VideoSampling;
@@ -2297,11 +2384,14 @@ mod tests {
             .unwrap()
             .gemma4()
             .is_some());
-        assert!(gguf_artifact_plan(GgufArchitecture::Inkling)
+        let inkling = gguf_artifact_plan(GgufArchitecture::Inkling)
             .with_gguf_processors(&BTreeMap::new(), Some(&BTreeMap::new()))
-            .unwrap()
-            .inkling()
-            .is_some());
+            .unwrap();
+        assert_eq!(
+            inkling.required_gguf_special_tokens(),
+            Some(GgufSpecialTokenKind::Inkling)
+        );
+        assert!(inkling.inkling().is_none());
 
         let muse_projector = BTreeMap::from([
             ("clip.vision.patch_size".into(), MetadataValue::Uint32(2)),
@@ -2324,18 +2414,14 @@ mod tests {
             .muse()
             .is_some());
 
-        let qwen_model = BTreeMap::from([(
-            "tokenizer.ggml.tokens".into(),
-            MetadataValue::Array(MetadataArray::String(vec![
-                "<|vision_start|>".into(),
-                "<|vision_end|>".into(),
-            ])),
-        )]);
-        assert!(gguf_artifact_plan(GgufArchitecture::Qwen3Vl)
-            .with_gguf_processors(&qwen_model, Some(&muse_projector))
-            .unwrap()
-            .qwen()
-            .is_some());
+        let qwen = gguf_artifact_plan(GgufArchitecture::Qwen3Vl)
+            .with_gguf_processors(&BTreeMap::new(), Some(&muse_projector))
+            .unwrap();
+        assert_eq!(
+            qwen.required_gguf_special_tokens(),
+            Some(GgufSpecialTokenKind::Qwen)
+        );
+        assert!(qwen.qwen().is_none());
     }
 
     #[test]
@@ -2355,16 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_gguf_plan_uses_embedded_tokenizer_and_projector_policy() {
-        let mut model = BTreeMap::new();
-        model.insert(
-            "tokenizer.ggml.tokens".into(),
-            MetadataValue::Array(MetadataArray::String(vec![
-                "ordinary".into(),
-                "<|vision_start|>".into(),
-                "<|vision_end|>".into(),
-            ])),
-        );
+    fn qwen_gguf_plan_binds_typed_framing_to_projector_policy() {
         let mut projector = BTreeMap::new();
         projector.insert("clip.vision.patch_size".into(), MetadataValue::Uint32(2));
         projector.insert(
@@ -2388,7 +2465,12 @@ mod tests {
             MetadataValue::Array(MetadataArray::Float32(vec![0.4, 0.5, 0.6])),
         );
 
-        let plan = QwenProcessorPlan::from_gguf_metadata(&model, &projector).unwrap();
+        let mut plan = QwenProcessorPlan::from_gguf_metadata(&projector).unwrap();
+        assert!(plan.image(8, 8).is_err());
+        plan.bind_framing(MediaFraming {
+            start_token_id: 1,
+            end_token_id: 2,
+        });
         let image = plan.image(8, 8).unwrap();
         assert_eq!(image.framing.start_token_id, 1);
         assert_eq!(image.framing.end_token_id, 2);
@@ -2432,7 +2514,7 @@ mod tests {
         let image = plan.image(40, 40).unwrap();
         assert_eq!(image.start_token_id, 7);
         assert_eq!((image.patch_rows, image.patch_columns), (1, 2));
-        let audio = plan.audio();
+        let audio = plan.audio().unwrap();
         assert_eq!(audio.start_token_id, 8);
         assert_eq!((audio.mel_bins, audio.dmel_bins), (80, 32));
         assert_eq!(audio.window, AudioWindow::PeriodicHann);

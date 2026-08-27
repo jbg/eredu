@@ -234,19 +234,7 @@ pub fn model_args_from_gguf_catalog(
     let rope_theta = gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(10_000.0);
     let rope_scaling = gguf_rope_scaling(metadata, &architecture)?;
     let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"))?;
-    let vocab_size = match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("GGUF tokenizer vocabulary exceeds i32"))?,
-        None if metadata.contains_key("tokenizer.ggml.tokens") => {
-            return Err(invalid(
-                "GGUF tokenizer.ggml.tokens metadata has the wrong type",
-            ));
-        }
-        None => gguf_i32(metadata, &key("vocab_size"))?,
-    };
+    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
     let num_hidden_layers = gguf_i32(metadata, &key("block_count"))?;
     let layer_count = usize::try_from(num_hidden_layers).map_err(|_| {
         invalid(format!(
@@ -713,7 +701,7 @@ mod tests {
 
     #[test]
     fn normalizes_gguf_without_backend_types() {
-        let metadata = HashMap::from([
+        let mut metadata = HashMap::from([
             (
                 "general.architecture".into(),
                 MetadataValue::String("llama".into()),
@@ -743,8 +731,13 @@ mod tests {
                 MetadataValue::Uint32(32),
             ),
         ]);
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            MetadataValue::String("malformed tokenizer payload".into()),
+        );
         let catalog = Catalog(vec!["output.weight".into(), "blk.0.attn_q.bias".into()]);
         let args = model_args_from_gguf_catalog(&catalog, &metadata).unwrap();
+        assert_eq!(args.vocab_size, 64);
         assert_eq!(args.head_dim, 4);
         assert!(args.attention_bias);
         assert!(!args.mlp_bias);

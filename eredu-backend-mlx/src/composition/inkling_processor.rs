@@ -65,7 +65,7 @@ impl InklingProcessor {
             }
             #[cfg(feature = "audio")]
             (InputModality::Audio, MediaPayload::AudioF32(waveform)) => {
-                let plan = self.plan.audio();
+                let plan = self.plan.audio().map_err(processor_error)?;
                 push_text_token_ids(_parts, &[plan.start_token_id])?;
                 _parts.push(self.process_audio(waveform, plan)?);
                 Ok(())
@@ -279,25 +279,15 @@ fn mel_filters(plan: InklingAudioPlan) -> Vec<f32> {
 mod tests {
     #[cfg(any(feature = "image", feature = "audio"))]
     #[test]
-    fn gguf_processor_resolves_media_markers_from_embedded_tokenizer() {
-        use std::collections::HashMap;
-
+    fn gguf_processor_uses_facade_resolved_media_markers() {
         use eredu_architectures::processor_plan::InklingProcessorPlan;
-        use eredu_gguf::{MetadataArray, MetadataValue};
 
-        let metadata = HashMap::from([(
-            "tokenizer.ggml.tokens".into(),
-            MetadataValue::Array(MetadataArray::String(vec![
-                "<|content_audio_input|>".into(),
-                "<|content_image|>".into(),
-            ])),
-        )]);
-        let plan = InklingProcessorPlan::from_gguf_metadata(&metadata).unwrap();
+        let plan = InklingProcessorPlan::from_gguf_token_ids(1, 0).unwrap();
         let processor = super::InklingProcessor::from_plan(plan);
         #[cfg(feature = "image")]
         assert_eq!(processor.plan.image(40, 40).unwrap().start_token_id, 1);
         #[cfg(feature = "audio")]
-        assert_eq!(processor.plan.audio().start_token_id, 0);
+        assert_eq!(processor.plan.audio().unwrap().start_token_id, 0);
     }
 
     #[cfg(feature = "image")]
@@ -325,7 +315,8 @@ mod tests {
         )
         .unwrap()
         .unwrap()
-        .audio();
+        .audio()
+        .unwrap();
         let features = super::inkling_log_mel(waveform, plan).unwrap();
         assert_eq!(features.len(), 2 * 80);
         assert!(features.iter().all(|value| (*value + 10.0).abs() < 1e-6));

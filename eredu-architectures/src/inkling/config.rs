@@ -482,8 +482,6 @@ struct ModelSource {
     image_token_id: u32,
     #[serde(default = "default_audio_token_id")]
     audio_token_id: u32,
-    #[serde(default)]
-    eos_token_id: Option<u32>,
 }
 
 /// Released top-level Inkling configuration.
@@ -503,8 +501,6 @@ pub struct ModelArgs {
     pub image_token_id: u32,
     /// Audio placeholder.
     pub audio_token_id: u32,
-    /// Optional end token.
-    pub eos_token_id: Option<u32>,
 }
 
 impl ModelArgs {
@@ -531,7 +527,6 @@ impl ModelArgs {
             vision_config: source.vision_config,
             image_token_id: source.image_token_id,
             audio_token_id: source.audio_token_id,
-            eos_token_id: source.eos_token_id,
         };
         args.validate()?;
         Ok(args)
@@ -687,7 +682,6 @@ impl ModelArgs {
             vision_config: None,
             image_token_id: default_image_token_id(),
             audio_token_id: default_audio_token_id(),
-            eos_token_id: gguf_eos_token_id(metadata)?,
         };
         args.validate()?;
         Ok(args)
@@ -1066,17 +1060,7 @@ fn gguf_vocab_size(
     metadata: &HashMap<String, MetadataValue>,
     fallback: &str,
 ) -> Result<i32, ConfigError> {
-    match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| invalid("Inkling GGUF tokenizer vocabulary exceeds i32")),
-        None if metadata.contains_key("tokenizer.ggml.tokens") => Err(invalid(
-            "Inkling GGUF tokenizer.ggml.tokens metadata has the wrong type",
-        )),
-        None => gguf_i32(metadata, fallback),
-    }
+    gguf_i32(metadata, fallback)
 }
 
 fn gguf_i32(metadata: &HashMap<String, MetadataValue>, key: &str) -> Result<i32, ConfigError> {
@@ -1127,25 +1111,6 @@ fn gguf_optional_f32(
             value
                 .as_f32()
                 .ok_or_else(|| invalid(format!("Inkling GGUF {key:?} must be numeric")))
-        })
-        .transpose()
-}
-
-fn gguf_eos_token_id(
-    metadata: &HashMap<String, MetadataValue>,
-) -> Result<Option<u32>, ConfigError> {
-    let scalar = metadata
-        .get("tokenizer.ggml.eos_token_id")
-        .and_then(MetadataValue::as_i64);
-    let value = scalar.or_else(|| {
-        metadata
-            .get("tokenizer.ggml.eos_token_ids")
-            .and_then(MetadataValue::to_i64_vec)
-            .and_then(|values| values.first().copied())
-    });
-    value
-        .map(|value| {
-            u32::try_from(value).map_err(|_| invalid("Inkling GGUF EOS token identity exceeds u32"))
         })
         .transpose()
 }
@@ -1406,6 +1371,10 @@ mod tests {
         metadata.insert(
             "inkling.attention.head_count_kv".into(),
             MetadataValue::Array(MetadataArray::Uint32(vec![1, 2])),
+        );
+        metadata.insert(
+            "tokenizer.ggml.eos_token_id".into(),
+            MetadataValue::String("wrong type".into()),
         );
         let args = ModelArgs::from_gguf_metadata(&metadata).unwrap();
         assert_eq!(args.text_config.num_key_value_heads, 2);

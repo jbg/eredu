@@ -1120,17 +1120,7 @@ fn gguf_vocab_size(
     metadata: &HashMap<String, MetadataValue>,
     architecture: &str,
 ) -> Result<i32, ConfigError> {
-    match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => i32::try_from(tokens.len())
-            .map_err(|_| ConfigError::Invalid("GGUF vocabulary exceeds i32".into())),
-        None if metadata.contains_key("tokenizer.ggml.tokens") => Err(ConfigError::Invalid(
-            "GGUF tokenizer.ggml.tokens has the wrong type".into(),
-        )),
-        None => gguf_i32(metadata, &format!("{architecture}.vocab_size")),
-    }
+    gguf_i32(metadata, &format!("{architecture}.vocab_size"))
 }
 
 fn gguf_string(
@@ -1560,7 +1550,7 @@ mod tests {
 
     #[test]
     fn parses_v3_gguf_without_backend_metadata_types() {
-        let metadata = HashMap::from([
+        let mut metadata = HashMap::from([
             (
                 "general.architecture".into(),
                 MetadataValue::String("deepseek2".into()),
@@ -1629,8 +1619,13 @@ mod tests {
                 MetadataValue::Uint32(1),
             ),
         ]);
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            MetadataValue::String("malformed tokenizer payload".into()),
+        );
         let catalog = Catalog(vec!["blk.0.attn_k_b.weight".into()]);
         let args = parse_v3_gguf(&catalog, &metadata).unwrap();
+        assert_eq!(args.vocab_size, 128);
         assert_eq!(args.qk_nope_head_dim, 24);
         assert!(v3_uses_split_kv(&catalog));
     }

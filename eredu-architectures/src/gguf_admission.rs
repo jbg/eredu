@@ -33,11 +33,21 @@ fn resolve_family(
     ),
     String,
 > {
-    let metadata = checkpoint
+    let mut metadata = checkpoint
         .metadata()
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<String, MetadataValue>>();
+    let vocabulary_key = format!("{}.vocab_size", architecture.metadata_name());
+    if let std::collections::hash_map::Entry::Vacant(entry) = metadata.entry(vocabulary_key) {
+        if let Some(vocabulary) = checkpoint
+            .logical_outputs()
+            .find(|output| output.name == "token_embd.weight")
+            .and_then(|output| output.shape.first().copied())
+        {
+            entry.insert(MetadataValue::Uint64(vocabulary));
+        }
+    }
     match architecture {
         GgufArchitecture::DeepSeek2 => {
             let args = crate::deepseek::parse_v3_gguf(checkpoint, &metadata)

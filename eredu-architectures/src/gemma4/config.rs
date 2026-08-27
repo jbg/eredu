@@ -239,7 +239,7 @@ impl ModelArgs {
             "num_attention_heads": gguf_i32(metadata, "gemma4.attention.head_count")?,
             "rms_norm_eps": gguf_f32(metadata, "gemma4.attention.layer_norm_rms_epsilon")?,
             "vocab_size": vocabulary,
-            "pad_token_id": gguf_optional_i32(metadata, "tokenizer.ggml.padding_token_id")?.unwrap_or(0),
+            "pad_token_id": 0,
             "num_key_value_heads": local_kv.or(global_kv).ok_or_else(|| invalid("Gemma 4 GGUF has no KV-head geometry"))?,
             "num_global_key_value_heads": global_kv,
             "max_position_embeddings": gguf_i32(metadata, "gemma4.context_length")?,
@@ -914,18 +914,7 @@ fn gguf_vocab_size(
     metadata: &HashMap<String, MetadataValue>,
     fallback: &str,
 ) -> Result<i32, ConfigError> {
-    match metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_strings)
-    {
-        Some(tokens) => {
-            i32::try_from(tokens.len()).map_err(|_| invalid("Gemma 4 GGUF vocabulary exceeds i32"))
-        }
-        None if metadata.contains_key("tokenizer.ggml.tokens") => Err(invalid(
-            "Gemma 4 GGUF tokenizer.ggml.tokens must be a string array",
-        )),
-        None => gguf_i32(metadata, fallback),
-    }
+    gguf_i32(metadata, fallback)
 }
 
 fn gguf_i32(metadata: &HashMap<String, MetadataValue>, key: &str) -> Result<i32, ConfigError> {
@@ -1092,7 +1081,7 @@ mod tests {
 
     #[test]
     fn parses_portable_gguf_schedule_shared_kv_and_key_as_value() {
-        let metadata = HashMap::from([
+        let mut metadata = HashMap::from([
             ("gemma4.block_count".into(), MetadataValue::Uint32(4)),
             ("gemma4.embedding_length".into(), MetadataValue::Uint32(32)),
             (
@@ -1138,6 +1127,10 @@ mod tests {
                 MetadataValue::Array(MetadataArray::Bool(vec![true, false, true, false])),
             ),
         ]);
+        metadata.insert(
+            "tokenizer.ggml.padding_token_id".into(),
+            MetadataValue::String("wrong type".into()),
+        );
         let catalog = HashSet::from([
             "output.weight".into(),
             "blk.1.attn_k.weight".into(),
@@ -1145,6 +1138,7 @@ mod tests {
             "blk.0.attn_v.weight".into(),
         ]);
         let args = ModelArgs::from_gguf_metadata(&catalog, &metadata).unwrap();
+        assert_eq!(args.pad_token_id, 0);
         assert!(!args.tie_word_embeddings);
         assert_eq!(args.num_hidden_layers(), 4);
         assert!(matches!(
