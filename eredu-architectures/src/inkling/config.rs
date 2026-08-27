@@ -1281,6 +1281,14 @@ mod tests {
     }
 
     #[test]
+    fn ignores_facade_owned_array_eos_metadata() {
+        let mut value = config();
+        value["eos_token_id"] = serde_json::json!([62, 63]);
+
+        ModelArgs::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    #[test]
     fn prompt_cache_fingerprint_includes_component_quantization() {
         let args = ModelArgs::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
         let dense = args.architecture_fingerprint();
