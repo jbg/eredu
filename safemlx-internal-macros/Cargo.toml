@@ -8,7 +8,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
-documentation = "https://github.com/jbg/eredu"
+documentation = "https://docs.rs/safemlx-internal-macros"
 description = "Internal procedural macros for safemlx"
 
 [lib]

@@ -10,7 +10,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license = "MIT"
-documentation = "https://github.com/jbg/eredu"
+documentation = "https://docs.rs/safemlx-sys"
 readme = "README.md"
 links = "mlx"
 
