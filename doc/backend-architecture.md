@@ -499,10 +499,13 @@ the complete global-expert-to-owner map, the current rank's global expert IDs,
 and the exact rank-local bank specification for every routed execution unit.
 Distributed preflight consumes the plan's global count, and a concrete backend
 lowers the declared owner map into its native dispatch representation without
-running another assignment policy. Backend composition must not pass family
-fields or a separately derived tensor-parallel width into expert-bank
-construction; the bank specification retained by this same plan is the only
-construction input.
+running another assignment policy. The plan's presence or absence is also the
+only authority for whether the realized architecture has routed execution
+units; composition must not inspect a family schedule or configuration count
+to decide expert availability. Backend composition must not pass family fields
+or a separately derived tensor-parallel width into expert-bank construction;
+the bank specification retained by this same plan is the only construction
+input.
 Qwen, Qwen3-VL, Qwen hybrid (including conditional vision and embedded MTP),
 GPT-OSS, LFM2, Kimi Linear, Nemotron-H, Muse-Glimmer, Inkling, Gemma 4, and
 DeepSeek V3/V4 expose family-specific realization entry points over their

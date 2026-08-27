@@ -14893,11 +14893,6 @@ fn load_muse_glimmer_pipeline(
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::MuseGlimmer], "Muse-Glimmer")?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    if external_experts && !source_args.is_moe() {
-        return Err(Error::Parallel(
-            "Muse-Glimmer expert placement requires a sparse-MoE checkpoint".into(),
-        ));
-    }
     let binding_adapter = if external_experts {
         MuseGlimmerPipelineBindings::new_external_experts()
     } else {
@@ -14936,11 +14931,6 @@ fn load_muse_glimmer_pipeline(
         binding_decoder_group,
         "Muse-Glimmer decoder",
     )?;
-    topology.preflight(
-        Some(target_units),
-        external_experts.then_some(source_args.num_experts as usize),
-    )?;
-    let range = topology.layer_range(target_units)?;
     let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = muse_glimmer::local_geometry(&target_args, &layout)
@@ -14955,6 +14945,19 @@ fn load_muse_glimmer_pipeline(
     } else {
         (seed_architecture, None)
     };
+    let expert_realization = eredu_architectures::muse_glimmer::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    preflight_pipeline_realization(
+        topology,
+        target_units,
+        expert_realization.as_ref(),
+        external_experts,
+        "Muse-Glimmer",
+    )?;
+    let range = topology.layer_range(target_units)?;
     let placement = Arc::new(media_architecture_transport::<_, MlxKeyValueState>(
         &architecture,
         topology.pipeline_parallel_size,
@@ -15030,11 +15033,6 @@ fn load_muse_glimmer_pipeline(
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let expert_realization = eredu_architectures::muse_glimmer::expert_realization_plan(
-        &architecture,
-        topology.rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut stage = MuseGlimmerPipelinePartition {
         architecture,
         partition,
@@ -18064,11 +18062,6 @@ fn load_nemotron_h_pipeline(
         &global_architecture,
         &binding_parameter_description,
     )?;
-    topology.preflight(
-        Some(target_units),
-        external_experts.then_some(source_args.n_routed_experts as usize),
-    )?;
-    let range = topology.layer_range(target_units)?;
     let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::nemotron_h::local_geometry(&target_args, &planned_layout)
@@ -18081,6 +18074,19 @@ fn load_nemotron_h_pipeline(
             stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    preflight_pipeline_realization(
+        topology,
+        target_units,
+        expert_realization.as_ref(),
+        external_experts,
+        "Nemotron-H",
+    )?;
+    let range = topology.layer_range(target_units)?;
     let runtime_state = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -18119,11 +18125,6 @@ fn load_nemotron_h_pipeline(
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
-    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
-        &architecture,
-        topology.rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     if let Some(realization) = expert_realization.clone() {
         architecture.install_expert_realization(realization);
     }
@@ -18133,9 +18134,11 @@ fn load_nemotron_h_pipeline(
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
-        if stage.range().clone().any(|layer| {
-            source_args.layer_schedule.get(layer)
-                == Some(&eredu_architectures::nemotron_h::LayerPolicy::SparseMoe)
+        if expert_realization.as_ref().is_some_and(|realization| {
+            realization
+                .unit_specs()
+                .keys()
+                .any(|(group, unit)| stage.partition.owns_unit(group.as_str(), *unit))
         }) {
             info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         }
@@ -20594,15 +20597,7 @@ fn load_neutral_inkling_pipeline(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Inkling], "Inkling")?;
-    let sparse = source_args.text_config.layer_schedule.iter().any(|policy| {
-        policy.feed_forward == eredu_architectures::inkling::FeedForwardPolicy::SparseMoe
-    });
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    if external_experts && !sparse {
-        return Err(Error::Parallel(
-            "Inkling expert placement requires sparse decoder layers".into(),
-        ));
-    }
     let binding_adapter = if external_experts {
         InklingBindings::new_external_experts()
     } else {
@@ -20647,11 +20642,6 @@ fn load_neutral_inkling_pipeline(
         global_decoder_group,
         "Inkling decoder",
     )?;
-    topology.preflight(
-        Some(target_units),
-        external_experts.then_some(source_args.text_config.n_routed_experts as usize),
-    )?;
-    let range = topology.layer_range(target_units)?;
     let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
     let geometry = Arc::new(
         eredu_architectures::inkling::local_geometry(&target_args, &planned_layout)
@@ -20664,6 +20654,19 @@ fn load_neutral_inkling_pipeline(
             stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_realization = eredu_architectures::inkling::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    preflight_pipeline_realization(
+        topology,
+        target_units,
+        expert_realization.as_ref(),
+        external_experts,
+        "Inkling",
+    )?;
+    let range = topology.layer_range(target_units)?;
     let runtime_state = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -20702,11 +20705,6 @@ fn load_neutral_inkling_pipeline(
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
-    let expert_realization = eredu_architectures::inkling::expert_realization_plan(
-        &architecture,
-        topology.rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut stage = InklingPipelinePartition::new(architecture, partition)?;
     if external_experts {
         let assignment =
@@ -20993,29 +20991,8 @@ fn load_neutral_gemma4_pipeline(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Gemma4], "Gemma 4")?;
-    let sparse = source_args.text.layer_schedule.iter().any(|policy| {
-        policy.feed_forward == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
-    });
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    if external_experts && !sparse {
-        return Err(Error::Parallel(
-            "Gemma 4 expert placement requires sparse decoder layers".into(),
-        ));
-    }
     let binding_adapter = Gemma4Bindings::new(external_experts);
-    let expert_count = external_experts
-        .then(|| {
-            source_args
-                .text
-                .num_experts
-                .ok_or_else(|| Error::Parallel("Gemma 4 sparse config has no expert count".into()))
-                .and_then(|count| {
-                    usize::try_from(count).map_err(|_| {
-                        Error::Parallel("Gemma 4 expert count must be non-negative".into())
-                    })
-                })
-        })
-        .transpose()?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -21051,7 +21028,29 @@ fn load_neutral_gemma4_pipeline(
         global_decoder_group,
         "Gemma 4 decoder",
     )?;
-    topology.preflight(Some(target_units), expert_count)?;
+    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
+    let geometry = Arc::new(
+        eredu_architectures::gemma4::local_geometry(&target_args, &planned_layout)
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+    );
+    let architecture = eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::new_parallel(
+        target_args.clone(),
+        (*geometry).clone(),
+        stream,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let expert_realization = eredu_architectures::gemma4::expert_realization_plan(
+        &architecture,
+        topology.rank_topology(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    preflight_pipeline_realization(
+        topology,
+        target_units,
+        expert_realization.as_ref(),
+        external_experts,
+        "Gemma 4",
+    )?;
     let ranges = target_args
         .text
         .pipeline_layer_ranges(topology.pipeline_parallel_size)
@@ -21065,17 +21064,6 @@ fn load_neutral_gemma4_pipeline(
         .get(topology.pipeline_parallel_rank)
         .cloned()
         .ok_or_else(|| Error::Parallel("Gemma 4 pipeline rank has no layer range".into()))?;
-    let planned_layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
-    let geometry = Arc::new(
-        eredu_architectures::gemma4::local_geometry(&target_args, &planned_layout)
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-    );
-    let architecture = eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::new_parallel(
-        target_args.clone(),
-        (*geometry).clone(),
-        stream,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21112,13 +21100,8 @@ fn load_neutral_gemma4_pipeline(
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
-    let expert_realization = eredu_architectures::gemma4::expert_realization_plan(
-        &architecture,
-        topology.rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut stage = Gemma4PipelinePartition::new(architecture, partition)?;
-    if expert_count.is_some() {
+    if external_experts {
         let assignment =
             ExpertAssignment::from_realization(expert_realization.as_ref().ok_or_else(|| {
                 Error::Parallel(
@@ -21126,11 +21109,11 @@ fn load_neutral_gemma4_pipeline(
                 )
             })?)?;
         info.global_expert_count = Some(assignment.global_expert_count());
-        if stage.range().clone().any(|layer| {
-            source_args.text.layer_policy(layer).is_some_and(|policy| {
-                policy.feed_forward
-                    == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
-            })
+        if expert_realization.as_ref().is_some_and(|realization| {
+            realization
+                .unit_specs()
+                .keys()
+                .any(|(group, unit)| stage.partition.owns_unit(group.as_str(), *unit))
         }) {
             info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         }
@@ -21462,6 +21445,64 @@ fn architecture_parallel_layout(
         ParallelBuildContext::new(topology, ShardingPolicy::Require),
         description,
     )
+}
+
+fn preflight_pipeline_realization<S>(
+    topology: MlxParallelContext,
+    target_units: usize,
+    expert_realization: Option<&eredu_architectures::ExpertRealizationPlan<S>>,
+    require_experts: bool,
+    family: &str,
+) -> Result<(), Error> {
+    if require_experts && expert_realization.is_none() {
+        return Err(Error::Parallel(format!(
+            "{family} expert placement requires architecture-declared routed execution units"
+        )));
+    }
+    if let Some(realization) = expert_realization {
+        if realization.expert_parallel_size() != topology.expert_parallel_size
+            || realization.expert_parallel_rank() != topology.expert_parallel_rank
+        {
+            return Err(Error::Parallel(format!(
+                "{family} expert realization topology does not match pipeline topology"
+            )));
+        }
+    }
+    topology.preflight(
+        Some(target_units),
+        expert_realization.map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn pipeline_preflight_requires_and_validates_the_expert_realization() {
+    let device = crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
+    let topology = MlxParallelContext::for_rank(0, 1, 1, 2, device).unwrap();
+    let mut unit_specs = std::collections::BTreeMap::new();
+    unit_specs.insert(
+        (eredu_runtime::ExecutionGroupId::new("decoder").unwrap(), 0),
+        (),
+    );
+    let realization = eredu_architectures::ExpertRealizationPlan::balanced(
+        4,
+        topology.rank_topology(),
+        unit_specs.clone(),
+    )
+    .unwrap();
+    preflight_pipeline_realization(topology, 2, Some(&realization), true, "test").unwrap();
+
+    assert!(preflight_pipeline_realization::<()>(topology, 2, None, true, "test").is_err());
+
+    let replicated = MlxParallelContext::for_rank(0, 1, 1, 1, device).unwrap();
+    let mismatched = eredu_architectures::ExpertRealizationPlan::balanced(
+        4,
+        replicated.rank_topology(),
+        unit_specs,
+    )
+    .unwrap();
+    assert!(preflight_pipeline_realization(topology, 2, Some(&mismatched), true, "test").is_err());
 }
 
 fn architecture_group_unit_count(
