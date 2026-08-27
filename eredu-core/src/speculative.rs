@@ -253,17 +253,6 @@ pub struct MtpSchedulerStats {
     pub peak_optimistic_branches: usize,
 }
 
-/// Completed independently progressing text batch.
-#[derive(Debug, Clone, Default)]
-pub struct MtpBatchOutput {
-    /// Generated token ids in original batch-lane order.
-    pub token_ids: Vec<Vec<u32>>,
-    /// Per-lane speculative statistics in the same order.
-    pub stats: Vec<MtpStats>,
-    /// Aggregate fair-scheduler telemetry.
-    pub scheduler: MtpSchedulerStats,
-}
-
 /// Backend telemetry that can contribute to portable speculative statistics.
 ///
 /// Implementations translate backend-specific measurements into the stable

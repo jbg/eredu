@@ -91,11 +91,10 @@ pub use execution::{
 };
 pub use generation::{
     resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
-    GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationPhase,
-    GenerationSequence, MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle,
-    MtpRequestPhase, MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig,
-    SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
-    TokenTerminalSignals,
+    GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationSequence,
+    MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase,
+    MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig, SemanticEvent,
+    SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit, TokenTerminalSignals,
 };
 pub use input::{
     InputExtent, InputMetadataKey, InputModality, InputPartDescriptor, InputPayloadKind,
@@ -129,14 +128,13 @@ pub use residency::{
 pub use speculative::{
     cancel_pending_verification, propose_block, resolve_commit_and_publish,
     resolve_optimistic_branch, resolve_round, submit_verification_transaction,
-    CompletedSpeculativeRequest, CompletedSpeculativeSchedule, MtpBatchOutput, MtpCapability,
-    MtpCheckpointKind, MtpSchedulerStats, MtpStats, PendingSpeculativeVerification,
-    PreparedSpeculativeLane, ProposalDecision, PublishedSpeculativeResult,
-    PublishedSpeculativeVerification, ResolvedSpeculativeRound, SamplingPlacement,
-    SpeculativeAction, SpeculativeCallbackPublisher, SpeculativeCandidate, SpeculativeCommit,
-    SpeculativeConstraint, SpeculativeContinuation, SpeculativeDraft, SpeculativeDraftBlock,
-    SpeculativeDriverError, SpeculativeExecutionTopology, SpeculativeExecutor,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    CompletedSpeculativeRequest, CompletedSpeculativeSchedule, MtpCapability, MtpCheckpointKind,
+    MtpSchedulerStats, MtpStats, PendingSpeculativeVerification, PreparedSpeculativeLane,
+    ProposalDecision, PublishedSpeculativeResult, PublishedSpeculativeVerification,
+    ResolvedSpeculativeRound, SamplingPlacement, SpeculativeAction, SpeculativeCallbackPublisher,
+    SpeculativeCandidate, SpeculativeCommit, SpeculativeConstraint, SpeculativeContinuation,
+    SpeculativeDraft, SpeculativeDraftBlock, SpeculativeDriverError, SpeculativeExecutionTopology,
+    SpeculativeExecutor, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
     SpeculativeGenerationVisitor, SpeculativeOptimisticBranch, SpeculativeOutputError,
     SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeProposal,

@@ -45,20 +45,6 @@ impl GenerationCancellationToken {
     }
 }
 
-/// Backend-independent phase of one autoregressive session.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GenerationPhase {
-    /// Session exists but prompt work has not been submitted.
-    Created,
-    /// Prompt prefill is in flight.
-    Prefilling,
-    /// Session is ready for cached decode.
-    Decoding,
-    /// Session has terminated.
-    Finished,
-}
-
 /// Terminal signals observed while committing one token.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct TokenTerminalSignals {

@@ -303,63 +303,6 @@ impl StateLayout {
     }
 }
 
-/// Runtime policy selecting how architecture-declared mutable state is held.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum StateResidencyPlan {
-    /// Keep every mutable layer state in backend execution memory.
-    Device,
-    /// Seal append-only state into independently pageable blocks.
-    Paged(PagedStatePlan),
-}
-
-/// Backend-independent controls for a paged mutable-state realization.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct PagedStatePlan {
-    block_tokens: usize,
-    device_bytes: u64,
-    host_bytes: u64,
-}
-
-impl PagedStatePlan {
-    /// Creates finite paged-state limits.
-    pub fn new(
-        block_tokens: usize,
-        device_bytes: u64,
-        host_bytes: u64,
-    ) -> Result<Self, StateError> {
-        if block_tokens == 0 {
-            return Err(StateError::InvalidResidency(
-                "paged-state block size must be nonzero".into(),
-            ));
-        }
-        if device_bytes == 0 {
-            return Err(StateError::InvalidResidency(
-                "paged-state device budget must be nonzero".into(),
-            ));
-        }
-        Ok(Self {
-            block_tokens,
-            device_bytes,
-            host_bytes,
-        })
-    }
-
-    /// Returns the number of token positions sealed into one block.
-    pub const fn block_tokens(self) -> usize {
-        self.block_tokens
-    }
-
-    /// Returns the finite execution-device budget.
-    pub const fn device_bytes(self) -> u64 {
-        self.device_bytes
-    }
-
-    /// Returns the finite host budget; zero disables host residency.
-    pub const fn host_bytes(self) -> u64 {
-        self.host_bytes
-    }
-}
-
 /// Concrete layer state capable of exposing backend-native retained tensors.
 pub trait RuntimeLayerState<B: NeuralBackend> {
     /// Allocation-free iterator returned for one layer.
