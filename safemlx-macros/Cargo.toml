@@ -11,6 +11,7 @@ license.workspace = true
 documentation = "https://docs.rs/safemlx-macros"
 
 description = "Procedural macros for safemlx"
+readme = "README.md"
 
 [lib]
 proc-macro = true

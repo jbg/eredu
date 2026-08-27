@@ -10,6 +10,7 @@ categories.workspace = true
 license.workspace = true
 documentation = "https://docs.rs/safemlx-internal-macros"
 description = "Internal procedural macros for safemlx"
+readme = "README.md"
 
 [lib]
 proc-macro = true

@@ -7,6 +7,7 @@ repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Backend-neutral model execution runtime for Eredu"
+readme = "README.md"
 
 [dependencies]
 eredu-checkpoint.workspace = true
