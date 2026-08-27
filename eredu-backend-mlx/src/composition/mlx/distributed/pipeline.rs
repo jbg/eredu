@@ -10583,7 +10583,7 @@ impl PipelineModel {
         let completion =
             self.forward_distributed_inner(tokens, step, mask, cache, execution, Some(observer))?;
         if let Some(logits) = completion.logits() {
-            observer.observe("model.logits", logits)?;
+            observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits)?;
         }
         Ok(completion)
     }
@@ -10668,7 +10668,7 @@ impl PipelineModel {
         let completion =
             self.prefill_distributed_inner(input, step, mask, cache, execution, Some(observer))?;
         if let Some(logits) = completion.logits() {
-            observer.observe("model.logits", logits)?;
+            observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits)?;
         }
         Ok(completion)
     }

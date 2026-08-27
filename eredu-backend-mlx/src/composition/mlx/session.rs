@@ -1329,7 +1329,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
         if let Some(logits) = output.logits() {
             observations
                 .insert(
-                    "model.logits",
+                    eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
                     ObservationValue::Tensor(observe_tensor(logits, backend.stream())?),
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;

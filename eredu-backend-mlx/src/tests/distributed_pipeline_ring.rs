@@ -889,7 +889,10 @@ fn pipeline_ring_worker() {
                 inspected.observations
             );
             assert_eq!(
-                inspected.observations.get("model.logits").is_some(),
+                inspected
+                    .observations
+                    .get(eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+                    .is_some(),
                 pipeline_rank + 1 == pipeline_parallel_size
             );
             return;

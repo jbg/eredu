@@ -1112,7 +1112,7 @@ impl QwenHybridModel {
             }
             .map(crate::MlxTensor::into_array)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            observer.observe("model.logits", &output)?;
+            observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, &output)?;
             return Ok(output);
         }
         let input = EmbeddedInput::target(crate::composition::tensor_ref(tokens), None);
@@ -1127,7 +1127,7 @@ impl QwenHybridModel {
         }
         .map(crate::MlxTensor::into_array)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        observer.observe("model.logits", &output)?;
+        observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, &output)?;
         Ok(output)
     }
 
@@ -1265,7 +1265,10 @@ impl QwenHybridModel {
                 _ => return Err(Exception::custom("Qwen3.5 model is not conditional")),
             }
             .map_err(|error| Exception::custom(error.to_string()))?;
-            observer.observe("model.logits", logits.as_array())?;
+            observer.observe(
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                logits.as_array(),
+            )?;
             return Ok(PreparedConditionalOutput {
                 logits,
                 hidden: None,

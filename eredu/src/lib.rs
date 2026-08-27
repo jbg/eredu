@@ -127,5 +127,5 @@ pub use eredu_core::{
     TimingTelemetry, TokenFilter, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
     TokenizedMultimodalSegment, TokenizerCompatibilityError, TokenizerCompatibilityProof,
     TransferTelemetry, Video, VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
-    EXECUTION_PLAN_SCHEMA_VERSION,
+    EXECUTION_PLAN_SCHEMA_VERSION, MODEL_LOGITS_OBSERVATION_PATH,
 };

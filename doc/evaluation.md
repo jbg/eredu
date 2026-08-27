@@ -7,9 +7,10 @@ turns those values into parity, quality, and performance evidence.
 ## Observation boundary
 
 `eredu-core` owns the portable `ObservationSet`, `ObservationValue`, and
-`TensorObservation` schemas. Paths are stable semantic names such as
-`model.logits`, not backend object names. Host materialization is always
-explicit:
+`TensorObservation` schemas as well as canonical protocol paths. Model output
+logits use `MODEL_LOGITS_OBSERVATION_PATH` (`model.logits`) in every execution
+mode rather than backend-local literals. Paths are stable semantic names, not
+backend object names. Host materialization is always explicit:
 
 - `BackendSession::observe_output` observes an already completed prefill or
   decode output;

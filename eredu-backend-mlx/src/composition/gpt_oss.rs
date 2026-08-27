@@ -1178,9 +1178,13 @@ impl GptOssModel {
                 }
             }
             .map_err(|error| Error::Parallel(error.to_string()))?;
-            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
-                .map(crate::MlxTensor::into_array)
-                .map_err(Error::from)
+            eredu_runtime::observe_and_intervene(
+                &mut neutral,
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                &output,
+            )
+            .map(crate::MlxTensor::into_array)
+            .map_err(Error::from)
         };
         self.expert_cache = expert_cache;
         result
@@ -1345,9 +1349,13 @@ impl GptOssModel {
                 ))
             }
         };
-        eredu_runtime::observe_and_intervene(observer, "model.logits", &output)
-            .map(crate::MlxTensor::into_array)
-            .map_err(Into::into)
+        eredu_runtime::observe_and_intervene(
+            observer,
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+            &output,
+        )
+        .map(crate::MlxTensor::into_array)
+        .map_err(Into::into)
     }
 
     /// Runs prompt prefill and returns final-token logits.

@@ -1375,9 +1375,13 @@ impl NemotronHModel {
             }
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::observe_and_intervene(observer, "model.logits", &output)
-            .map(crate::MlxTensor::into_array)
-            .map_err(Into::into)
+        eredu_runtime::observe_and_intervene(
+            observer,
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+            &output,
+        )
+        .map(crate::MlxTensor::into_array)
+        .map_err(Into::into)
     }
 
     /// Runs the neutral decoder while delegating routed experts to an
@@ -1658,9 +1662,13 @@ impl NemotronHModel {
                 }
             }
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
-            .map(crate::MlxTensor::into_array)
-            .map_err(Into::into)
+        eredu_runtime::observe_and_intervene(
+            &mut neutral,
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+            &output,
+        )
+        .map(crate::MlxTensor::into_array)
+        .map_err(Into::into)
     }
 }
 

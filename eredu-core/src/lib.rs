@@ -110,7 +110,7 @@ pub use media::{
 };
 pub use observation::{
     InspectedOutput, ObservationError, ObservationRequest, ObservationSelector, ObservationSet,
-    ObservationValue, TensorObservation, TensorObservationData,
+    ObservationValue, TensorObservation, TensorObservationData, MODEL_LOGITS_OBSERVATION_PATH,
 };
 pub use realtime::{
     load_realtime_model, load_realtime_model_with_options, RealtimeBackend, RealtimeCompletedStep,

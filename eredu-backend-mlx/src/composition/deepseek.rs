@@ -1581,7 +1581,7 @@ impl DeepSeekModel {
         };
         observer
             .inner
-            .observe("model.logits", output.as_array())
+            .observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output.as_array())
             .map_err(Error::from)?;
         Ok(output.into_array())
     }

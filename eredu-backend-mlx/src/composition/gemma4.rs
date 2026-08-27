@@ -818,7 +818,7 @@ impl Gemma4Model {
         };
         self.expert_cache = expert_cache;
         let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        observer.observe("model.logits", logits.as_array())?;
+        observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits.as_array())?;
         Ok(logits)
     }
 
@@ -1156,8 +1156,12 @@ impl Gemma4Model {
                 },
             }
             .map_err(|error| Error::Parallel(error.to_string()))?;
-            eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
-                .map_err(Error::from)
+            eredu_runtime::observe_and_intervene(
+                &mut neutral,
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                &output,
+            )
+            .map_err(Error::from)
         };
         self.expert_cache = expert_cache;
         result

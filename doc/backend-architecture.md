@@ -166,7 +166,10 @@ portable host token frames and observations through
 Distributed inspection is rank-local: every rank participates in the same
 production collective and point-to-point execution, each rank returns only the
 globally named units it owns, and only the logits-owning rank returns
-`model.logits`. Inspection never performs an implicit cross-rank host gather.
+`model.logits`. `eredu-core::MODEL_LOGITS_OBSERVATION_PATH` is the canonical
+owner of that semantic path; family composition, distributed pipelines, and
+architecture-erased sessions must use it rather than defining backend-local
+names. Inspection never performs an implicit cross-rank host gather.
 
 Backend-neutral parity, distribution metrics, timing summaries, evidence, and
 evaluation drivers live in `eredu-evaluation`. Concrete backend examples only

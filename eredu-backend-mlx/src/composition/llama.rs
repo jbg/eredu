@@ -424,7 +424,7 @@ impl LlamaModel {
                         &mut neutral_observer,
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                observer.observe("model.logits", output.as_array())?;
+                observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output.as_array())?;
                 Ok(output.into_array())
             }
             LlamaExecution::Layerwise(execution) => {
@@ -439,7 +439,7 @@ impl LlamaModel {
                         &mut neutral_observer,
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                observer.observe("model.logits", output.as_array())?;
+                observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output.as_array())?;
                 Ok(output.into_array())
             }
         }
@@ -526,9 +526,13 @@ impl LlamaModel {
             }
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::observe_and_intervene(&mut neutral, "model.logits", &output)
-            .map(crate::MlxTensor::into_array)
-            .map_err(Into::into)
+        eredu_runtime::observe_and_intervene(
+            &mut neutral,
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+            &output,
+        )
+        .map(crate::MlxTensor::into_array)
+        .map_err(Into::into)
     }
 
     /// Runs prompt prefill and returns last-token logits.

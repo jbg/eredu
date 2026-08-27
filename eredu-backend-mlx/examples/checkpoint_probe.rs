@@ -422,10 +422,16 @@ fn copy_logits(
     output: &eredu_backend_mlx::native::MlxModelOutput,
 ) -> Result<(Vec<f32>, usize)> {
     let observations = session.observe_output(backend, output)?;
-    let tensor = match observations.get("model.logits") {
+    let tensor = match observations.get(eredu_core::MODEL_LOGITS_OBSERVATION_PATH) {
         Some(ObservationValue::Tensor(tensor)) => tensor,
-        Some(_) => anyhow::bail!("model.logits observation is not a tensor"),
-        None => anyhow::bail!("selected backend rank did not observe model.logits"),
+        Some(_) => anyhow::bail!(
+            "{} observation is not a tensor",
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH
+        ),
+        None => anyhow::bail!(
+            "selected backend rank did not observe {}",
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH
+        ),
     };
     let shape = tensor.shape();
     ensure!(
@@ -434,7 +440,10 @@ fn copy_logits(
     );
     let values = match tensor.data() {
         TensorObservationData::F32(values) => values.clone(),
-        _ => anyhow::bail!("model.logits observation is not F32"),
+        _ => anyhow::bail!(
+            "{} observation is not F32",
+            eredu_core::MODEL_LOGITS_OBSERVATION_PATH
+        ),
     };
     Ok((values, shape[1]))
 }

@@ -642,11 +642,17 @@ mod tests {
     fn logit_parity_computes_shared_metrics_once() {
         let mut actual = ObservationSet::new();
         actual
-            .insert("model.logits", tensor(vec![1, 3], vec![0.0, 2.0, 1.0]))
+            .insert(
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                tensor(vec![1, 3], vec![0.0, 2.0, 1.0]),
+            )
             .unwrap();
         let mut reference = ObservationSet::new();
         reference
-            .insert("model.logits", tensor(vec![1, 3], vec![0.0, 2.1, 0.9]))
+            .insert(
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                tensor(vec![1, 3], vec![0.0, 2.1, 0.9]),
+            )
             .unwrap();
         let policy = ParityPolicy {
             default: ParityComparison::Logits {

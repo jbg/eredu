@@ -4,6 +4,13 @@ use std::collections::{btree_map::Entry, BTreeMap};
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical observation path for a model's output logits.
+///
+/// Every execution mode uses this path so resident, layerwise, tensor-parallel,
+/// pipeline-parallel, and architecture-erased sessions expose the same
+/// semantic observation.
+pub const MODEL_LOGITS_OBSERVATION_PATH: &str = "model.logits";
+
 /// Materialized row-major tensor values.
 ///
 /// Backends may normalize native storage such as F16 or BF16 to F32 when
@@ -290,19 +297,22 @@ mod tests {
     #[test]
     fn selectors_and_sets_are_stable_and_collision_safe() {
         let request = ObservationRequest::selected([
-            ObservationSelector::Exact("model.logits".into()),
+            ObservationSelector::Exact(MODEL_LOGITS_OBSERVATION_PATH.into()),
             ObservationSelector::Prefix("model.layers.2".into()),
         ]);
-        assert!(request.matches("model.logits"));
+        assert_eq!(MODEL_LOGITS_OBSERVATION_PATH, "model.logits");
+        assert!(request.matches(MODEL_LOGITS_OBSERVATION_PATH));
         assert!(request.matches("model.layers.2.output"));
         assert!(!request.matches("model.layers.20.output"));
 
         let mut set = ObservationSet::new();
-        set.insert("model.logits", ObservationValue::Unsigned(3))
+        set.insert(MODEL_LOGITS_OBSERVATION_PATH, ObservationValue::Unsigned(3))
             .unwrap();
         assert_eq!(
-            set.insert("model.logits", ObservationValue::Unsigned(4)),
-            Err(ObservationError::DuplicatePath("model.logits".into()))
+            set.insert(MODEL_LOGITS_OBSERVATION_PATH, ObservationValue::Unsigned(4)),
+            Err(ObservationError::DuplicatePath(
+                MODEL_LOGITS_OBSERVATION_PATH.into()
+            ))
         );
     }
 }
