@@ -118,9 +118,6 @@ pub enum MediaPayload<'a> {
     /// Mono floating-point PCM samples and their sampling rate.
     #[cfg(feature = "audio")]
     AudioF32(AudioWaveform<'a>),
-    #[cfg(not(any(feature = "image", feature = "audio")))]
-    #[doc(hidden)]
-    _Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
 #[cfg(any(test, feature = "image", feature = "audio"))]

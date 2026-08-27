@@ -823,11 +823,11 @@ configuration, checkpoint metadata, companion selection, or route.
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
 Each concrete backend keeps one exhaustive realization descriptor per
-normalized family for the artifact formats and backend-owned materializers it
-actually implements. The MLX descriptor binds GGUF availability, complete or
+normalized family for the artifact formats and materializers it actually
+implements. The MLX descriptor binds GGUF availability, complete or
 distributed-stage tensor parallelism, independent expert-cache loading, and
-load-time quantization in one place. It also selects the backend-owned family
-implementation used by complete and distributed materializers. Preflight and
+load-time quantization in one place. It also selects the MLX composition used
+by complete and distributed materializers. Preflight and
 loader dispatch consume those typed bindings instead of independently matching
 the architecture registry. Adding a normalized family therefore requires one
 explicit MLX availability decision; adding a genuinely new MLX implementation

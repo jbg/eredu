@@ -537,8 +537,8 @@ impl ModelArgs {
         Ok(args)
     }
 
-    /// Parses the released Inkling GGUF metadata without a backend-owned
-    /// checkpoint or array type. Sibling projector geometry is applied
+    /// Parses the released Inkling GGUF metadata without a concrete-backend
+    /// checkpoint or tensor type. Sibling projector geometry is applied
     /// separately after its own artifact has been admitted.
     pub fn from_gguf_metadata(
         metadata: &HashMap<String, MetadataValue>,

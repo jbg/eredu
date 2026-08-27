@@ -39,8 +39,8 @@ impl MlxTensor {
         &self.0
     }
 
-    /// Mutably borrows the backend-native array for backend-owned parameter
-    /// binding without materialization or copying.
+    /// Mutably borrows the native array for parameter binding without
+    /// materialization or copying.
     pub(crate) fn as_array_mut(&mut self) -> &mut Array {
         &mut self.0
     }

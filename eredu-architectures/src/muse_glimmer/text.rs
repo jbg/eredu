@@ -974,7 +974,7 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
         B::rms_norm_without_weight(hidden, self.embedding_epsilon, context)
     }
 
-    /// Applies the replicated final norm before a backend-owned vocabulary head.
+    /// Applies the replicated final norm before the vocabulary projection.
     pub fn final_hidden(
         &mut self,
         hidden: &B::Tensor,

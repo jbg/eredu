@@ -48,7 +48,7 @@ pub(crate) enum ExpertCacheBinding {
 /// MLX composition implementation selected for a normalized family.
 ///
 /// Multiple normalized families may intentionally share one implementation.
-/// Loader dispatch is exhaustive over this backend-owned type, so adding a
+/// Loader dispatch is exhaustive over this MLX composition type, so adding a
 /// family to the architecture registry changes availability only in
 /// [`FamilyRealization::for_kind`]. A genuinely new implementation adds a
 /// variant here and the compiler identifies every materializer that must bind

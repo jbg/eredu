@@ -316,7 +316,7 @@ pub struct MlxSpeculativeSampling<S> {
 }
 
 impl<S> MlxSpeculativeSampling<S> {
-    /// Wraps one facade sampling policy for backend-owned execution.
+    /// Wraps one facade sampling policy for MLX execution.
     pub const fn new(inner: S) -> Self {
         Self { inner }
     }

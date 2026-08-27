@@ -22,7 +22,7 @@ use super::realization::{
     FamilyRealization, ParallelRealization,
 };
 
-/// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
+/// MLX arrays, modules, and media preprocessing from one GGUF artifact.
 struct MaterializedGgufModel {
     model: Executable,
     #[cfg(any(feature = "image", feature = "audio"))]
@@ -1038,7 +1038,7 @@ pub(super) fn materialize_safetensors(
             )?),
             ExpertCacheBinding::GptOss => Ok(Executable::gpt_oss(
                 kind,
-                crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
+                crate::composition::gpt_oss::load_safetensors(
                     artifact,
                     options.weight_residency,
                     quantization,
@@ -1098,7 +1098,7 @@ pub(super) fn materialize_safetensors(
             )?),
             ExpertCacheBinding::Qwen => Ok(Executable::qwen(
                 kind,
-                crate::composition::qwen::load_qwen_safetensors_mlx(
+                crate::composition::qwen::load_safetensors(
                     artifact,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
                     quantization,
@@ -1185,7 +1185,7 @@ pub(super) fn materialize_safetensors(
         )?),
         FamilyBinding::Llama => Ok(Executable::llama(
             kind,
-            crate::composition::llama::load_llama_safetensors_mlx(
+            crate::composition::llama::load_safetensors(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
                 quantization,
@@ -1205,7 +1205,7 @@ pub(super) fn materialize_safetensors(
         )?),
         FamilyBinding::Qwen => Ok(Executable::qwen(
             kind,
-            crate::composition::qwen::load_qwen_safetensors_mlx(
+            crate::composition::qwen::load_safetensors(
                 artifact,
                 eredu_runtime::WeightResidency::with_layers(execution),
                 quantization,
@@ -1215,7 +1215,7 @@ pub(super) fn materialize_safetensors(
         )?),
         FamilyBinding::GptOss => Ok(Executable::gpt_oss(
             kind,
-            crate::composition::gpt_oss::load_gpt_oss_safetensors_mlx(
+            crate::composition::gpt_oss::load_safetensors(
                 artifact,
                 options.weight_residency,
                 quantization,

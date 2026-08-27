@@ -1079,7 +1079,7 @@ impl CausalModel<MlxKeyValueState> for QwenModel {
     }
 }
 
-pub fn load_qwen_safetensors_mlx(
+pub fn load_safetensors(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     weight_residency: WeightResidency,
     quantization: Option<WeightQuantization>,

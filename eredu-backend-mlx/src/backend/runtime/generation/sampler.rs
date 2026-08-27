@@ -180,7 +180,7 @@ where
     }
 }
 
-/// Applies a portable vocabulary filter to backend-owned MLX logits.
+/// Applies a portable vocabulary filter to MLX logits.
 pub fn apply_token_filter(
     logits: &Array,
     filter: &TokenFilter,

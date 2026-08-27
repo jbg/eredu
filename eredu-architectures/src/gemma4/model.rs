@@ -1317,7 +1317,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         )
     }
 
-    /// Applies the replicated final norm before a backend-owned vocabulary head.
+    /// Applies the replicated final norm before the vocabulary-parallel projection.
     pub fn final_parallel_hidden(
         &mut self,
         hidden: &B::Tensor,

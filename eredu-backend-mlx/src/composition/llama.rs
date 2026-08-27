@@ -631,7 +631,7 @@ impl CausalModel<MlxKeyValueState> for LlamaModel {
     }
 }
 
-pub fn load_llama_safetensors_mlx(
+pub fn load_safetensors(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     weight_residency: WeightResidency,
     quantization: Option<WeightQuantization>,

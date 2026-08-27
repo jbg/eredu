@@ -749,7 +749,7 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    /// Clears all backend-owned cache state while preserving session topology.
+    /// Clears all MLX cache state while preserving session topology.
     pub fn reset(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model) => model.reset_cache().map_err(Into::into),

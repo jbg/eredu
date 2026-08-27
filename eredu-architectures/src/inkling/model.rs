@@ -545,8 +545,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         self.parallel_geometry.clone()
     }
 
-    /// Starts a text-only pass from an embedding produced by a backend-owned
-    /// vocabulary-parallel table.
+    /// Starts a text-only pass from a rank-local vocabulary embedding.
     pub fn begin_parallel_text<S: LayerRuntimeState<B>>(
         &mut self,
         tokens: &B::Tensor,
@@ -723,8 +722,8 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         )
     }
 
-    /// Applies the replicated final normalization and muP scaling before a
-    /// backend-owned vocabulary-parallel output head.
+    /// Applies replicated final normalization and muP scaling before the
+    /// vocabulary-parallel output projection.
     pub fn final_parallel_hidden(
         &mut self,
         hidden: &B::Tensor,
@@ -788,7 +787,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .forward(&embeddings, context)
     }
 
-    /// Applies the target muP scale before a backend-owned sharded MTP head.
+    /// Applies the target muP scale before the sharded MTP output projection.
     pub fn final_mtp_parallel_hidden(
         &mut self,
         hidden: &B::Tensor,

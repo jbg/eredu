@@ -1470,7 +1470,7 @@ fn attach_expert_cache(
 }
 
 /// Loads SafeTensors GPT-OSS using the selected weight-residency policy.
-pub fn load_gpt_oss_safetensors_mlx(
+pub fn load_safetensors(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     weight_residency: WeightResidency,
     quantization: Option<WeightQuantization>,
