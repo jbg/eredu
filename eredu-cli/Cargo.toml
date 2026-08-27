@@ -13,15 +13,15 @@ readme = "README.md"
 
 [features]
 default = ["mlx"]
-_backend = ["eredu/_mlx"]
-mlx = ["_backend", "eredu/mlx"]
-cuda = ["_backend", "eredu/cuda"]
+backend = ["eredu/backend-mlx"]
+mlx = ["backend", "eredu/mlx"]
+cuda = ["backend", "eredu/cuda"]
 nccl = ["cuda", "eredu/nccl"]
 
 [[bin]]
 name = "eredu"
 path = "src/main.rs"
-required-features = ["_backend"]
+required-features = ["backend"]
 
 [dependencies]
 anyhow.workspace = true

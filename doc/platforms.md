@@ -149,9 +149,10 @@ should still select their intended backend explicitly.
 The `eredu-cli` crate has its own `cuda` feature, which enables CUDA in Eredu
 and its MLX implementation layer.
 
-At the facade layer, `mlx` and `cuda` are separate platform bundles over one
-private adapter feature. Selecting `cuda` with default features disabled does
-not enable Metal or Accelerate. When adding `image` or `audio` to a
-no-default-features build, select `mlx` or `cuda` alongside it. The modality
-features select preprocessing support, while `mlx` and `cuda` select the
-execution platform.
+At the facade layer, the supported `backend-mlx` feature selects the base local
+adapter without a platform optimization bundle. The `mlx` and `cuda` features
+enable that adapter and add their respective platform bundle. Selecting `cuda`
+with default features disabled does not enable Metal or Accelerate. When adding
+`image` or `audio` to a no-default-features build, select `mlx` or `cuda`
+alongside it. The modality features select preprocessing support, while `mlx`
+and `cuda` select the execution platform.

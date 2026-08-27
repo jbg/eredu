@@ -67,6 +67,9 @@ streams, tensors, sessions, and completions stay behind the facade.
 
 ## Cargo features
 
+- `backend-mlx`: the MLX-based local execution adapter without a platform
+  optimization bundle. The `mlx`, `cuda`, `image`, and `audio` features enable
+  it automatically.
 - `mlx`: MLX execution with Metal and Accelerate; enabled by default.
 - `image`: image and video preprocessing for the selected local backend.
 - `audio`: audio preprocessing for the selected local backend.

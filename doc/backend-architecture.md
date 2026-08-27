@@ -24,10 +24,11 @@ execute nonlinear GGUF IQ blocks consume their canonical values through the
 typed `IQuantCodebook` API; generated table modules remain private and cannot
 serve as an undocumented cross-crate integration surface.
 The `eredu` facade is also portable when built with
-`default-features = false`. A private `_mlx` feature selects the optional
-`eredu-backend-mlx` adapter. The public `mlx` bundle adds the backend crate's
-`accelerate` and `metal` features, while the sibling `cuda` bundle adds only
-its `cuda` feature. These platform bundles are mutually exclusive, and both
+`default-features = false`. The supported `backend-mlx` feature selects the
+optional `eredu-backend-mlx` adapter without a platform optimization bundle.
+The `mlx` bundle adds the backend crate's `accelerate` and `metal` features,
+while the sibling `cuda` bundle adds only its `cuda` feature. These platform
+bundles are mutually exclusive, and both
 the facade and direct backend crate reject selecting them together before the
 native build runs. Consumers selecting CUDA from a package whose default is
 `mlx`, including `eredu-cli`, must disable default features while enabling
@@ -44,17 +45,18 @@ fixtures and composition tests are crate-private unit tests; published crates
 expose no test-support feature or fixture namespace. The facade does not
 directly depend on `eredu-nn`. Direct MLX backend users also enable `image` and
 `audio` as needed; the facade forwards those same capability features through
-the private adapter without selecting either platform bundle. Shared
+the `backend-mlx` adapter without selecting either platform bundle. Shared
 media-processing infrastructure is compiled whenever either capability is
 enabled; there is no capability-less `media` feature. Backend feature
-diagnostics name the active public spelling.
+diagnostics name the active public spelling. Cargo features are all published,
+selectable API; none of these feature names imply privacy.
 
-The `eredu-cli` executable requires its private `_backend` feature because the
+The `eredu-cli` executable requires its supported `backend` feature because the
 command is a native model runner, not a backend-neutral library surface. Its
-public `mlx` and `cuda` features both enable that private feature. Consequently,
-checking the package with no features omits the executable instead of compiling
-a target whose implementation cannot run, while either platform feature makes
-the executable available.
+`mlx` and `cuda` features both enable `backend`. Consequently, checking the
+package with no features omits the executable instead of compiling a target
+whose implementation cannot run, while `backend` or either platform feature
+makes the executable available.
 
 The facade root and `api` namespace expose portable application concepts plus
 the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
