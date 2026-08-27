@@ -808,9 +808,14 @@ impl QwenHybridModel {
     pub fn model_type(&self) -> &str {
         &self.parsed.text.model_type
     }
-    /// Actual configured embedded prediction depth.
+    /// Embedded prediction depth declared by the constructed architecture graph.
     pub fn mtp_len(&self) -> usize {
-        self.parsed.text.mtp_num_hidden_layers.max(0) as usize
+        match &self.execution {
+            Execution::Resident(runtime) => runtime.architecture().mtp_len(),
+            Execution::Bounded(runtime) => runtime.architecture().mtp_len(),
+            Execution::ConditionalResident(runtime) => runtime.architecture().mtp_len(),
+            Execution::ConditionalBounded(runtime) => runtime.architecture().mtp_len(),
+        }
     }
     /// This initial binder is replicated; distributed construction installs topology separately.
     pub fn parallel_info(

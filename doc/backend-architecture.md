@@ -561,7 +561,9 @@ Runtime state follows the same contract at materialization time. Architecture
 `StateLayout` values are authoritative for per-layer attention windows,
 append-only pooling streams, and named segment boundaries and lifetimes.
 Concrete backends derive native cache objects directly from those policies;
-model-family arguments are not a second source of state geometry. Composite
+cache advancement and advertised embedded-draft limits likewise come from the
+constructed architecture graph and its state layout. Parsed model-family
+arguments are not a second source of execution or state geometry. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
 assembled by the architecture before a backend consumes them. Architecture
 capability construction consumes that same composite layout for admission

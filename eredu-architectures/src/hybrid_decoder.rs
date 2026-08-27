@@ -90,6 +90,14 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         }
     }
 
+    /// Returns the number of prediction depths declared by the constructed graph.
+    pub fn prediction_count(&self) -> usize {
+        match &self.groups {
+            HybridExecutionGroups::Target(_) => 0,
+            HybridExecutionGroups::TargetAndPrediction(groups) => groups.prediction_count(),
+        }
+    }
+
     /// Returns the number of units in the target group.
     pub fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
         match &self.groups {

@@ -494,6 +494,11 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         self.decoder.into_static_modules()
     }
 
+    /// Returns the prediction depth count declared by the constructed execution graph.
+    pub fn mtp_len(&self) -> usize {
+        self.decoder.prediction_count()
+    }
+
     /// Returns target plus configured prediction state policy.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
         state_layout(&self.config).map_err(Error::backend)

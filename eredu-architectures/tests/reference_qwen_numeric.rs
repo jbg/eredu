@@ -9027,6 +9027,33 @@ fn qwen3_vl_tp2_runs_full_vision_and_text_lifecycle() {
 }
 
 #[test]
+fn qwen_hybrid_constructed_graph_owns_embedded_prediction_depth() {
+    let config = qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+        "model_type": "qwen3_5_text",
+        "vocab_size": 8,
+        "hidden_size": 8,
+        "num_hidden_layers": 2,
+        "mtp_num_hidden_layers": 2,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "max_position_embeddings": 16,
+        "intermediate_size": 16,
+        "num_experts": 0,
+        "tie_word_embeddings": true,
+        "layer_types": ["full_attention", "full_attention"]
+    }))
+    .unwrap()
+    .text;
+    let architecture =
+        qwen::hybrid::LayeredModel::<NumericBackend>::new(config, &NumericContext::default())
+            .unwrap();
+
+    assert_eq!(architecture.mtp_len(), 2);
+    assert_eq!(architecture.unit_layout().unwrap().group_count(), 3);
+}
+
+#[test]
 fn qwen35_conditional_tp2_runs_full_vision_and_text_lifecycle() {
     let parsed = qwen::hybrid::model_args_from_config_value(&serde_json::json!({
         "model_type": "qwen3_5", "image_token_id": 5, "video_token_id": 6,

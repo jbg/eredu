@@ -783,6 +783,11 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
         &self.parsed
     }
 
+    /// Returns the prediction depth count declared by the constructed execution graph.
+    pub const fn mtp_len(&self) -> usize {
+        self.prediction_steps
+    }
+
     /// Returns replicated or planner-derived target/MTP state geometry.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         self.parallel_geometry
