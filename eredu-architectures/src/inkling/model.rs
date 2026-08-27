@@ -331,10 +331,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        crate::static_parameters::module_recipes(
-            &self.static_modules,
-            super::safetensors_recipes(&self.args, source)?,
-        )
+        super::static_safetensors_recipes(&self.args, source)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>

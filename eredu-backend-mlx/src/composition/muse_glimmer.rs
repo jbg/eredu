@@ -479,11 +479,13 @@ impl MuseGlimmerPipelineBindings {
         } else {
             std::collections::BTreeSet::new()
         };
-        let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-            global_layer,
+        let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
             architecture.args(),
             store,
-        )?;
+            group,
+            index,
+        )
+        .map_err(Error::ArchitectureModel)?;
         let bindings = build_module_bindings_with_recipes_excluding(
             global_layer,
             "",
@@ -522,11 +524,13 @@ impl MuseGlimmerPipelineBindings {
         } else {
             std::collections::BTreeSet::new()
         };
-        let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-            layer,
+        let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
             architecture.args(),
             store,
-        )?;
+            group,
+            index,
+        )
+        .map_err(Error::ArchitectureModel)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -1650,19 +1654,21 @@ fn load_store(
         move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         move |modules, store| {
             let module = MlxModule::new(modules.clone());
-            let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-                &module,
-                &static_args,
-                store,
-            )?;
+            let recipes =
+                eredu_architectures::muse_glimmer::static_safetensors_recipes(&static_args, store)
+                    .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
-        move |_ordinal, _address, _path, unit, store, _stream| {
+        move |_ordinal, address, _path, unit, store, _stream| {
             let module = MlxModule::new(unit);
-            let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-                &module, &unit_args, store,
-            )?;
+            let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
+                &unit_args,
+                store,
+                address.group(),
+                address.index(),
+            )
+            .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |name| {
                 external_experts && parameter_name_in_targets(name, &binding_expert_targets)
             })
@@ -1750,11 +1756,9 @@ fn load_parallel_store(
         )
         .clone(),
     );
-    let static_recipes = crate::composition::muse_glimmer_expert::module_recipes(
-        &global_static,
-        &args,
-        store.as_ref(),
-    )?;
+    let static_recipes =
+        eredu_architectures::muse_glimmer::static_safetensors_recipes(&args, store.as_ref())
+            .map_err(Error::ArchitectureModel)?;
     let global_static_bindings = build_module_bindings_with_recipes_excluding(
         &global_static,
         "",
@@ -1764,6 +1768,9 @@ fn load_parallel_store(
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for ordinal in 0..global_execution.len() {
+        let address = global_execution
+            .address(ordinal)
+            .expect("validated Muse-Glimmer layout covers every global unit");
         let unit = MlxModule::new(construct_architecture_unit(
             &global_architecture,
             &global_execution,
@@ -1771,8 +1778,13 @@ fn load_parallel_store(
             stream,
             std::marker::PhantomData::<MlxKeyValueState>,
         )?);
-        let recipes =
-            crate::composition::muse_glimmer_expert::module_recipes(&unit, &args, store.as_ref())?;
+        let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
+            &args,
+            store.as_ref(),
+            address.group(),
+            address.index(),
+        )
+        .map_err(Error::ArchitectureModel)?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(binding_bytes(
                 &build_module_bindings_with_recipes_excluding(
@@ -1820,11 +1832,13 @@ fn load_parallel_store(
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
                 );
-            let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-                &global,
+            let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
                 &binding_args,
                 store,
-            )?;
+                address.group(),
+                address.index(),
+            )
+            .map_err(Error::ArchitectureModel)?;
             let bindings =
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false

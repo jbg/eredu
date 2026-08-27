@@ -970,8 +970,8 @@ pub fn safetensors_aliases(args: &ModelArgs) -> Result<Vec<ParameterAlias>, Stri
 ///
 /// The catalog covers direct aliases, two-dimensional released convolution
 /// kernels, interleaved dense projections, routed/shared fused experts, and
-/// embedded MTP blocks. Backends may filter these outputs to a module, but do
-/// not recreate the family transformations.
+/// embedded MTP blocks. Architecture selectors partition these outputs into
+/// complete static and execution-unit groups before backend binding.
 pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
     args: &ModelArgs,
     catalog: &C,
@@ -1015,6 +1015,104 @@ pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
         }
     }
     Ok(recipes)
+}
+
+/// Selects the complete architecture-owned SafeTensors recipe group for pinned modules.
+///
+/// The returned recipes are not intersected with a backend module. Consumers must bind the
+/// complete group and reject any recipe that remains unconsumed.
+pub fn static_safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &ModelArgs,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    select_safetensors_recipe_group(args, catalog, None)
+}
+
+/// Selects the complete architecture-owned SafeTensors recipe group for one execution unit.
+///
+/// `group` and `index` use the canonical Inkling execution layout: vision is group zero and the
+/// text decoder is group one. The returned group is deliberately complete so a backend binding
+/// mismatch fails on leftover recipes instead of being silently filtered.
+pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &ModelArgs,
+    catalog: &C,
+    group: usize,
+    index: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let available = match group {
+        0 => args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.num_hidden_layers as usize),
+        1 => nonnegative_count(args.text_config.num_hidden_layers, "layer count")?,
+        _ => {
+            return Err(format!(
+                "Inkling recipe group {group} is outside two groups"
+            ))
+        }
+    };
+    if index >= available {
+        return Err(format!(
+            "Inkling recipe unit {index} is outside group {group} with {available} units"
+        ));
+    }
+    select_safetensors_recipe_group(args, catalog, Some((group, index)))
+}
+
+fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
+    args: &ModelArgs,
+    catalog: &C,
+    selected: Option<(usize, usize)>,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let vision_layers = args
+        .vision_config
+        .as_ref()
+        .map_or(0, |vision| vision.num_hidden_layers as usize);
+    let text_layers = nonnegative_count(args.text_config.num_hidden_layers, "layer count")?;
+    let mut selected_recipes = BTreeMap::new();
+    for (target, recipe) in safetensors_recipes(args, catalog)? {
+        let owner = if let Some(index) = indexed_recipe_target(&target, "visual.layers.")? {
+            if index >= vision_layers {
+                return Err(format!(
+                    "Inkling recipe {target:?} names vision unit {index}, but only {vision_layers} exist"
+                ));
+            }
+            Some((0, index))
+        } else if let Some(index) = indexed_recipe_target(&target, "model.layers.")? {
+            if index >= text_layers {
+                return Err(format!(
+                    "Inkling recipe {target:?} names text unit {index}, but only {text_layers} exist"
+                ));
+            }
+            Some((1, index))
+        } else {
+            None
+        };
+        if owner == selected {
+            selected_recipes.insert(target, recipe);
+        }
+    }
+    Ok(selected_recipes)
+}
+
+fn indexed_recipe_target(target: &str, root: &str) -> Result<Option<usize>, String> {
+    let Some(rest) = target.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let Some((index, parameter)) = rest.split_once('.') else {
+        return Err(format!(
+            "architecture recipe target {target:?} has no parameter below its execution unit"
+        ));
+    };
+    if parameter.is_empty() {
+        return Err(format!(
+            "architecture recipe target {target:?} has an empty unit parameter"
+        ));
+    }
+    index
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| format!("architecture recipe target {target:?} has a non-numeric unit index"))
 }
 
 /// Builds the complete architecture-owned schedule for independent expert residency.
@@ -1557,8 +1655,9 @@ mod tests {
     use super::{
         dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
         mmproj_gguf_plan, normalize_gguf_weight_formats, partition_mmproj_weight_formats,
-        safetensors_plan, safetensors_recipes, translate_gguf_weight_name,
-        translate_gguf_weight_name_for_model, translate_mmproj_weight_name,
+        safetensors_plan, safetensors_recipes, static_safetensors_recipes,
+        translate_gguf_weight_name, translate_gguf_weight_name_for_model,
+        translate_mmproj_weight_name, unit_safetensors_recipes,
     };
     use crate::inkling::ModelArgs;
 
@@ -1726,6 +1825,10 @@ mod tests {
         let routed = "model.llm.layers.1.mlp.experts.w13_weight";
         let shared = "model.llm.layers.1.mlp.shared_experts.shared_w13_weight";
         let catalog = Catalog(BTreeMap::from([
+            (
+                "model.llm.embed.weight".into(),
+                metadata("model.llm.embed.weight", vec![64, 16]),
+            ),
             (convolution.into(), metadata(convolution, vec![16, 4])),
             (dense.into(), metadata(dense, vec![64, 16])),
             (routed.into(), metadata(routed, vec![4, 64, 16])),
@@ -1751,6 +1854,23 @@ mod tests {
             recipes.get("model.layers.1.moe.shared_experts.gate_up_proj"),
             Some(DerivedWeightRecipe::Concatenate { axis: 1, .. })
         ));
+
+        let pinned = static_safetensors_recipes(&args, &catalog).unwrap();
+        assert_eq!(
+            pinned.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["model.embed_tokens.weight"]
+        );
+        let dense_unit = unit_safetensors_recipes(&args, &catalog, 1, 0).unwrap();
+        assert!(!dense_unit.is_empty());
+        assert!(dense_unit
+            .keys()
+            .all(|name| name.starts_with("model.layers.0.")));
+        let sparse_unit = unit_safetensors_recipes(&args, &catalog, 1, 1).unwrap();
+        assert!(sparse_unit
+            .keys()
+            .all(|name| name.starts_with("model.layers.1.")));
+        assert!(unit_safetensors_recipes(&args, &catalog, 2, 0).is_err());
+        assert!(unit_safetensors_recipes(&args, &catalog, 1, 2).is_err());
     }
 
     #[test]

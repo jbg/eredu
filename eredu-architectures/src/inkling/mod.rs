@@ -14,9 +14,9 @@ pub use audio::{AudioInput, AudioTower};
 pub use checkpoint::{
     dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
     load_time_quantization, mmproj_gguf_plan, normalize_gguf_weight_formats, safetensors_aliases,
-    safetensors_plan, safetensors_recipes, translate_gguf_weight_name,
-    translate_gguf_weight_name_for_model, translate_mmproj_weight_name, with_checkpoint_formats,
-    DenseW13Recipes, ParameterAlias,
+    safetensors_plan, safetensors_recipes, static_safetensors_recipes, translate_gguf_weight_name,
+    translate_gguf_weight_name_for_model, translate_mmproj_weight_name, unit_safetensors_recipes,
+    with_checkpoint_formats, DenseW13Recipes, ParameterAlias,
 };
 pub use config::{
     AudioConfig, ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs,

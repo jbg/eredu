@@ -192,8 +192,13 @@ impl InklingBindings {
         } else {
             Default::default()
         };
-        let recipes =
-            crate::composition::inkling_expert::module_recipes(layer, architecture.args(), store)?;
+        let recipes = eredu_architectures::inkling::unit_safetensors_recipes(
+            architecture.args(),
+            store,
+            group,
+            index,
+        )
+        .map_err(Error::ArchitectureModel)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -1891,6 +1896,7 @@ fn quantize_store(
     );
     let static_args = source.clone();
     let unit_args = source.clone();
+    let recipe_layout = source_layout.clone();
     let (store, report) = quantize_module_store_with_bindings(
         store,
         &source_static,
@@ -1920,13 +1926,22 @@ fn quantize_store(
         stream,
         move |module, store| {
             let recipes =
-                crate::composition::inkling_expert::module_recipes(module, &static_args, store)?;
+                eredu_architectures::inkling::static_safetensors_recipes(&static_args, store)
+                    .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
-        move |_index, module, store| {
-            let recipes =
-                crate::composition::inkling_expert::module_recipes(module, &unit_args, store)?;
+        move |index, module, store| {
+            let address = recipe_layout
+                .address(index)
+                .expect("validated Inkling recipe layout covers every unit");
+            let recipes = eredu_architectures::inkling::unit_safetensors_recipes(
+                &unit_args,
+                store,
+                address.group(),
+                address.index(),
+            )
+            .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
@@ -1970,14 +1985,20 @@ fn load_store(
         move |modules, store| {
             let module = MlxModule::new(modules.clone());
             let recipes =
-                crate::composition::inkling_expert::module_recipes(&module, &static_args, store)?;
+                eredu_architectures::inkling::static_safetensors_recipes(&static_args, store)
+                    .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
-        move |_ordinal, _address, _path, unit, store, _stream| {
+        move |_ordinal, address, _path, unit, store, _stream| {
             let module = MlxModule::new(unit);
-            let recipes =
-                crate::composition::inkling_expert::module_recipes(&module, &unit_args, store)?;
+            let recipes = eredu_architectures::inkling::unit_safetensors_recipes(
+                &unit_args,
+                store,
+                address.group(),
+                address.index(),
+            )
+            .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |name| {
                 external_experts && parameter_name_in_targets(name, &binding_expert_targets)
             })
@@ -2082,7 +2103,8 @@ fn load_parallel_store(
         .clone(),
     );
     let static_recipes =
-        crate::composition::inkling_expert::module_recipes(&global_static, &args, store.as_ref())?;
+        eredu_architectures::inkling::static_safetensors_recipes(&args, store.as_ref())
+            .map_err(Error::ArchitectureModel)?;
     let global_static_bindings = build_module_bindings_with_recipes_excluding(
         &global_static,
         "",
@@ -2092,6 +2114,9 @@ fn load_parallel_store(
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for ordinal in 0..global_execution.len() {
+        let address = global_execution
+            .address(ordinal)
+            .expect("validated Inkling layout covers every global unit");
         let unit = MlxModule::new(construct_architecture_unit(
             &global_architecture,
             &global_execution,
@@ -2099,8 +2124,13 @@ fn load_parallel_store(
             stream,
             std::marker::PhantomData::<MlxHybridState>,
         )?);
-        let recipes =
-            crate::composition::inkling_expert::module_recipes(&unit, &args, store.as_ref())?;
+        let recipes = eredu_architectures::inkling::unit_safetensors_recipes(
+            &args,
+            store.as_ref(),
+            address.group(),
+            address.index(),
+        )
+        .map_err(Error::ArchitectureModel)?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(binding_bytes(
                 &build_module_bindings_with_recipes_excluding(
@@ -2146,8 +2176,13 @@ fn load_parallel_store(
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
                 );
-            let recipes =
-                crate::composition::inkling_expert::module_recipes(&global, &binding_args, store)?;
+            let recipes = eredu_architectures::inkling::unit_safetensors_recipes(
+                &binding_args,
+                store,
+                address.group(),
+                address.index(),
+            )
+            .map_err(Error::ArchitectureModel)?;
             let bindings =
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false

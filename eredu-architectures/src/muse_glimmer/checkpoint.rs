@@ -345,9 +345,9 @@ pub fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckpointPla
 /// Resolves every released SafeTensors alias and derived expert layout into
 /// canonical architecture parameter identities.
 ///
-/// The returned catalog is intentionally model-wide. Backend composition may
-/// filter it to a static module or execution unit, but does not reconstruct
-/// any family-specific name or tensor equation.
+/// The returned catalog is model-wide but contains only runtime parameter
+/// outputs; independent or split expert tensors remain recipe inputs rather
+/// than becoming spurious backend-visible destinations.
 pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
     args: &DecoderConfig,
     catalog: &C,
@@ -365,10 +365,13 @@ pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
             .chain(tensor.aliases.iter().cloned())
             .find(|name| catalog.tensor_metadata(name).is_ok());
         if let Some(source) = source {
-            recipes.insert(
-                canonical_safetensors_target(&tensor.key),
-                DerivedWeightRecipe::source(source, TensorSelection::Full),
-            );
+            let target = canonical_safetensors_target(&tensor.key);
+            if !is_expert_recipe_intermediate(&target) {
+                recipes.insert(
+                    target,
+                    DerivedWeightRecipe::source(source, TensorSelection::Full),
+                );
+            }
         }
     }
     if args.is_moe() {
@@ -379,6 +382,116 @@ pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
         }
     }
     Ok(recipes)
+}
+
+fn is_expert_recipe_intermediate(target: &str) -> bool {
+    let Some(local) = target.split(".mlp.experts.").nth(1) else {
+        return false;
+    };
+    local
+        .split('.')
+        .next()
+        .is_some_and(|segment| segment.parse::<usize>().is_ok())
+        || local.starts_with("gate_proj")
+        || local.starts_with("up_proj")
+}
+
+/// Selects the complete architecture-owned SafeTensors recipe group for pinned modules.
+///
+/// Backends must bind the returned group as a whole and reject unexpected leftovers.
+pub fn static_safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &DecoderConfig,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    select_safetensors_recipe_group(args, catalog, None)
+}
+
+/// Selects the complete architecture-owned SafeTensors recipe group for one execution unit.
+///
+/// `group` and `index` use the canonical Muse-Glimmer layout: vision is group zero and the text
+/// decoder is group one. No backend-native parameter topology participates in selection.
+pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &DecoderConfig,
+    catalog: &C,
+    group: usize,
+    index: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let available = match group {
+        0 => args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.layer_count()),
+        1 => dimension(args.num_hidden_layers, "text layer count")?,
+        _ => {
+            return Err(format!(
+                "Muse-Glimmer recipe group {group} is outside two groups"
+            ))
+        }
+    };
+    if index >= available {
+        return Err(format!(
+            "Muse-Glimmer recipe unit {index} is outside group {group} with {available} units"
+        ));
+    }
+    select_safetensors_recipe_group(args, catalog, Some((group, index)))
+}
+
+fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
+    args: &DecoderConfig,
+    catalog: &C,
+    selected: Option<(usize, usize)>,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let vision_layers = args
+        .vision_config
+        .as_ref()
+        .map_or(0, |vision| vision.layer_count());
+    let text_layers = dimension(args.num_hidden_layers, "text layer count")?;
+    let mut selected_recipes = BTreeMap::new();
+    for (target, recipe) in safetensors_recipes(args, catalog)? {
+        let owner = if let Some(index) =
+            indexed_recipe_target(&target, "model.vision_tower.layers.")?
+        {
+            if index >= vision_layers {
+                return Err(format!(
+                    "Muse-Glimmer recipe {target:?} names vision unit {index}, but only {vision_layers} exist"
+                ));
+            }
+            Some((0, index))
+        } else if let Some(index) = indexed_recipe_target(&target, "model.layers.")? {
+            if index >= text_layers {
+                return Err(format!(
+                    "Muse-Glimmer recipe {target:?} names text unit {index}, but only {text_layers} exist"
+                ));
+            }
+            Some((1, index))
+        } else {
+            None
+        };
+        if owner == selected {
+            selected_recipes.insert(target, recipe);
+        }
+    }
+    Ok(selected_recipes)
+}
+
+fn indexed_recipe_target(target: &str, root: &str) -> Result<Option<usize>, String> {
+    let Some(rest) = target.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let Some((index, parameter)) = rest.split_once('.') else {
+        return Err(format!(
+            "architecture recipe target {target:?} has no parameter below its execution unit"
+        ));
+    };
+    if parameter.is_empty() {
+        return Err(format!(
+            "architecture recipe target {target:?} has an empty unit parameter"
+        ));
+    }
+    index
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| format!("architecture recipe target {target:?} has a non-numeric unit index"))
 }
 
 fn canonical_safetensors_target(source: &str) -> String {
@@ -1348,7 +1461,7 @@ mod tests {
                 tensors.insert(name.clone(), metadata(&name, shape));
             }
         }
-        let recipes = safetensors_recipes(&args, &Catalog(tensors)).unwrap();
+        let recipes = safetensors_recipes(&args, &Catalog(tensors.clone())).unwrap();
         assert!(matches!(
             recipes.get("model.embed_tokens.weight"),
             Some(DerivedWeightRecipe::Source { key, .. })
@@ -1362,6 +1475,41 @@ mod tests {
             recipes.get("model.layers.0.mlp.experts.down_proj"),
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
         ));
+
+        let pinned = static_safetensors_recipes(&args, &Catalog(tensors.clone())).unwrap();
+        assert_eq!(
+            pinned.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["model.embed_tokens.weight"]
+        );
+        let unit = unit_safetensors_recipes(&args, &Catalog(tensors), 1, 0).unwrap();
+        assert_eq!(unit.len(), 2);
+        assert!(unit.keys().all(|name| name.starts_with("model.layers.0.")));
+
+        let split_root = "model.language_model.layers.0.mlp.experts";
+        let split = Catalog(BTreeMap::from([
+            (
+                format!("{split_root}.gate_proj"),
+                metadata(&format!("{split_root}.gate_proj"), vec![4, 32, 32]),
+            ),
+            (
+                format!("{split_root}.up_proj"),
+                metadata(&format!("{split_root}.up_proj"), vec![4, 32, 32]),
+            ),
+            (
+                format!("{split_root}.down_proj"),
+                metadata(&format!("{split_root}.down_proj"), vec![4, 32, 32]),
+            ),
+        ]));
+        let split_unit = unit_safetensors_recipes(&args, &split, 1, 0).unwrap();
+        assert_eq!(
+            split_unit.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "model.layers.0.mlp.experts.down_proj",
+                "model.layers.0.mlp.experts.gate_up_proj",
+            ]
+        );
+        assert!(unit_safetensors_recipes(&args, &Catalog(BTreeMap::new()), 2, 0).is_err());
+        assert!(unit_safetensors_recipes(&args, &Catalog(BTreeMap::new()), 1, 1).is_err());
     }
 
     #[test]

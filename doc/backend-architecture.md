@@ -326,10 +326,13 @@ loading likewise resolves an exact declared parameter identity before mapping
 a canonical weight identity to a private native slot; it never rejects a name
 because one of its path segments is spelled `inner`.
 
-These catalogs are model-wide and configuration-derived. Backend adapters may
-filter their outputs to the parameters present in a static module, execution
-unit, or independently resident bank; that filtering does not transfer source
-name discovery or recipe construction into backend composition.
+The underlying catalogs are model-wide and configuration-derived, but each
+family's architecture checkpoint API selects the complete recipe group for a
+static module set or canonical execution-group/unit address. Backend adapters
+must bind that selected group as a whole and fail if any recipe remains
+unconsumed; they do not intersect recipes with backend-native module topology.
+This keeps source-name discovery, parameter ownership, and recipe-group
+selection together in the architecture.
 Architecture checkpoint APIs also derive rank-local independently resident
 expert recipes, including segmented fused-projection selection; backend
 composition binds those recipes without reconstructing the segment equation.

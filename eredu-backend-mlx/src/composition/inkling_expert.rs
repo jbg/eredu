@@ -1,10 +1,6 @@
 //! MLX checkpoint and residency adapter for neutral Inkling expert banks.
 
-use std::collections::BTreeMap;
-
 use eredu_architectures::inkling::ModelArgs;
-use eredu_checkpoint::recipe::DerivedWeightRecipe;
-use safemlx::module::ModuleParameters;
 
 use crate::backend::{
     error::Error,
@@ -13,19 +9,6 @@ use crate::backend::{
         expert_provider::CachedGatedProductExpertProvider,
     },
 };
-
-/// Selects the architecture-owned released-layout recipes used by one module.
-pub fn module_recipes<M: ModuleParameters>(
-    module: &M,
-    args: &ModelArgs,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    let parameters = module.parameters().flatten();
-    let mut recipes = eredu_architectures::inkling::safetensors_recipes(args, store)
-        .map_err(Error::ArchitectureModel)?;
-    recipes.retain(|name, _| parameters.contains_key(name.as_str()));
-    Ok(recipes)
-}
 
 /// Returns one independently leasable unit for every routed and shared expert.
 pub fn expert_catalog(
