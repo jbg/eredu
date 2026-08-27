@@ -1394,7 +1394,7 @@ fn pipeline_ring_worker() {
         checkpoint_fingerprint: "pipeline-ring-fixture".into(),
         prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
-        layer_count: family.layer_count(),
+        layer_count: model.prompt_cache_model_identity().unwrap().layer_count,
         global_layer_start: family.stage_range(pipeline_rank).start,
         global_layer_end: family.stage_range(pipeline_rank).start + layer_layout.len(),
         batch_size: 1,

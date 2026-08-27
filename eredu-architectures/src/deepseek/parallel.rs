@@ -496,6 +496,21 @@ pub fn v3_layer_parameter_groups(
             ),
         ],
     )?);
+    if layer >= target {
+        groups.push(replicated(
+            format!("{root}.prediction"),
+            [
+                (format!("{root}.enorm.weight"), vec![hidden]),
+                (format!("{root}.hnorm.weight"), vec![hidden]),
+                (format!("{root}.eh_proj.weight"), vec![hidden, 2 * hidden]),
+                (format!("{root}.shared_head.norm.weight"), vec![hidden]),
+                (
+                    format!("{root}.shared_head.head.weight"),
+                    vec![dim(args.vocab_size)?, hidden],
+                ),
+            ],
+        )?);
+    }
     let sparse = layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe);
     groups.extend(if sparse {
         expert_groups_v3(args, layer)?
@@ -721,6 +736,23 @@ pub fn v4_layer_parameter_groups(
             ),
         ],
     )?];
+    groups.push(replicated(
+        format!("{root}.attention_shared"),
+        [
+            (
+                format!("{root}.attn.wq_a.weight"),
+                vec![dim(args.q_lora_rank)?, hidden],
+            ),
+            (
+                format!("{root}.attn.q_norm.weight"),
+                vec![dim(args.q_lora_rank)?],
+            ),
+            (format!("{root}.attn.wkv.weight"), vec![head, hidden]),
+            (format!("{root}.attn.kv_norm.weight"), vec![head]),
+            (format!("{root}.attn_norm.weight"), vec![hidden]),
+            (format!("{root}.ffn_norm.weight"), vec![hidden]),
+        ],
+    )?);
     let streams = dim(args.hc_mult)?;
     groups.push(replicated(
         format!("{root}.hyper_streams"),
@@ -762,6 +794,76 @@ pub fn v4_layer_parameter_groups(
                     format!("{root}.attn.indexer.weights_proj.weight"),
                     vec![dim(args.index_n_heads)?, hidden],
                 ),
+            ],
+        )?);
+    }
+    if layer < target {
+        if let Some(super::V4AttentionPolicy::Compressed { ratio }) = args.attention_policy(layer) {
+            let output = head
+                .checked_mul(if ratio == 4 { 2 } else { 1 })
+                .ok_or_else(|| invalid("V4 compressor output width overflowed"))?;
+            groups.push(replicated(
+                format!("{root}.attn.compressor"),
+                [
+                    (
+                        format!("{root}.attn.compressor.wkv.weight"),
+                        vec![output, hidden],
+                    ),
+                    (
+                        format!("{root}.attn.compressor.wgate.weight"),
+                        vec![output, hidden],
+                    ),
+                    (
+                        format!("{root}.attn.compressor.ape"),
+                        vec![dim(ratio)?, output],
+                    ),
+                    (format!("{root}.attn.compressor.norm.weight"), vec![head]),
+                ],
+            )?);
+            if ratio == 4 {
+                let index = dim(args.index_head_dim)?;
+                let index_output = index
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid("V4 index compressor output width overflowed"))?;
+                groups.push(replicated(
+                    format!("{root}.attn.indexer.compressor"),
+                    [
+                        (
+                            format!("{root}.attn.indexer.compressor.wkv.weight"),
+                            vec![index_output, hidden],
+                        ),
+                        (
+                            format!("{root}.attn.indexer.compressor.wgate.weight"),
+                            vec![index_output, hidden],
+                        ),
+                        (
+                            format!("{root}.attn.indexer.compressor.ape"),
+                            vec![4, index_output],
+                        ),
+                        (
+                            format!("{root}.attn.indexer.compressor.norm.weight"),
+                            vec![index],
+                        ),
+                    ],
+                )?);
+            }
+        }
+    }
+    if layer >= target && args.dspark.is_none() {
+        groups.push(replicated(
+            format!("{root}.prediction"),
+            [
+                (format!("{root}.e_proj.weight"), vec![hidden, hidden]),
+                (format!("{root}.h_proj.weight"), vec![hidden, hidden]),
+                (format!("{root}.enorm.weight"), vec![hidden]),
+                (format!("{root}.hnorm.weight"), vec![hidden]),
+                (format!("{root}.norm.weight"), vec![hidden]),
+                (
+                    format!("{root}.hc_head_fn"),
+                    vec![streams, streams * hidden],
+                ),
+                (format!("{root}.hc_head_base"), vec![streams]),
+                (format!("{root}.hc_head_scale"), vec![1]),
             ],
         )?);
     }
@@ -838,11 +940,12 @@ fn expert_groups_v3(
 
 fn expert_groups_v4(
     args: &V4Args,
-    _layer: usize,
+    layer: usize,
     root: &str,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let root = format!("{root}.ffn");
     let mut groups = expert_groups(
-        &format!("{root}.ffn"),
+        &root,
         dim(args.n_routed_experts)?,
         dim(args.moe_intermediate_size)?,
         dim(args.hidden_size)?,
@@ -850,13 +953,29 @@ fn expert_groups_v4(
         "switch_mlp.down_proj",
     )?;
     groups.push(shared_expert_group(
-        &format!("{root}.ffn"),
+        &root,
         dim(args.moe_intermediate_size)? * dim(args.n_shared_experts)?,
         dim(args.hidden_size)?,
         "shared_experts.w1.weight",
         "shared_experts.w3.weight",
         "shared_experts.w2.weight",
     )?);
+    let experts = dim(args.n_routed_experts)?;
+    let mut router = vec![(
+        format!("{root}.gate.weight"),
+        vec![experts, dim(args.hidden_size)?],
+    )];
+    let hash_layers = usize::try_from(args.num_hash_layers)
+        .map_err(|_| invalid("V4 hash layer count must not be negative"))?;
+    if layer < hash_layers {
+        router.push((
+            format!("{root}.gate.tid2eid"),
+            vec![dim(args.vocab_size)?, dim(args.num_experts_per_tok)?],
+        ));
+    } else {
+        router.push((format!("{root}.gate.bias"), vec![experts]));
+    }
+    groups.push(replicated(format!("{root}.router"), router)?);
     Ok(groups)
 }
 
@@ -1313,6 +1432,10 @@ mod tests {
         assert!(v3_groups
             .iter()
             .any(|group| group.role() == ParameterRole::ExpertIntermediate));
+        assert!(v3_groups
+            .iter()
+            .flat_map(ParameterGroupSpec::members)
+            .any(|member| member.target() == "model.layers.2.eh_proj.weight"));
 
         let v4 = v4_args();
         let v4_description = v4_parameter_description(&v4).unwrap();
@@ -1441,6 +1564,35 @@ mod tests {
                 ("hyper_head", "hyper_head"),
             ]
         );
+    }
+
+    #[test]
+    fn v4_description_includes_replicated_attention_and_router_state() {
+        let mut args = v4_args();
+        args.num_hash_layers = 1;
+        let description = v4_parameter_description(&args).unwrap();
+        let targets = description
+            .groups()
+            .iter()
+            .flat_map(|owned| owned.group().members())
+            .map(ParameterMemberSpec::target)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for target in [
+            "layers.0.attn.kv_norm.weight",
+            "layers.0.attn_norm.weight",
+            "layers.0.ffn.gate.weight",
+            "layers.0.ffn.gate.tid2eid",
+            "layers.1.attn.compressor.ape",
+            "layers.1.attn.indexer.compressor.ape",
+            "layers.1.ffn.gate.bias",
+            "layers.2.attn.compressor.ape",
+            "mtp.0.e_proj.weight",
+            "mtp.0.h_proj.weight",
+            "mtp.0.hc_head_fn",
+        ] {
+            assert!(targets.contains(target), "missing V4 parameter {target}");
+        }
     }
 
     #[test]

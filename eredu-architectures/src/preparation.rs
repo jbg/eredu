@@ -349,8 +349,8 @@ pub fn prepared_safetensors_floating_state_dtype_source(
                 "Moshi floating-state dtype belongs to the realtime loader contract",
             ));
         }
+        SafetensorsModelConfig::DeepSeekV4(_) => "embed.weight".into(),
         SafetensorsModelConfig::DeepSeekV3(_)
-        | SafetensorsModelConfig::DeepSeekV4(_)
         | SafetensorsModelConfig::KimiLinear(_)
         | SafetensorsModelConfig::Llama(_)
         | SafetensorsModelConfig::Lfm2(_)
@@ -667,6 +667,40 @@ mod tests {
         })
     }
 
+    fn deepseek_v4_config() -> Value {
+        serde_json::json!({
+            "model_type": "deepseek_v4",
+            "hidden_size": 16,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "qk_rope_head_dim": 2,
+            "q_lora_rank": 4,
+            "o_lora_rank": 4,
+            "o_groups": 2,
+            "vocab_size": 128,
+            "max_position_embeddings": 4096,
+            "sliding_window": 8,
+            "compress_ratios": [0, 4, 0, 0],
+            "index_n_heads": 4,
+            "index_head_dim": 4,
+            "index_topk": 2,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 4,
+            "n_routed_experts": 8,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "num_hash_layers": 1,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "num_nextn_predict_layers": 1
+        })
+    }
+
     fn kimi_linear_config(first_k_dense_replace: i32) -> Value {
         serde_json::json!({
             "model_type":"kimi_linear","vocab_size":16,"hidden_size":12,
@@ -841,6 +875,17 @@ mod tests {
         assert_eq!(source.parameter(), "model.embed_tokens.weight");
         assert_eq!(source.checkpoint_tensor(), "model.embed_tokens.weight");
         assert_eq!(source.dtype(), &TensorDtype::F16);
+    }
+
+    #[test]
+    fn deepseek_v4_state_dtype_source_uses_its_canonical_embedding_parameter() {
+        let plan = safetensors_plan(&deepseek_v4_config());
+        let catalog = TensorCatalog::new([tensor("embed.weight", TensorDtype::Bf16)]).unwrap();
+
+        let source = prepared_safetensors_floating_state_dtype_source(&plan, &catalog).unwrap();
+        assert_eq!(source.parameter(), "embed.weight");
+        assert_eq!(source.checkpoint_tensor(), "embed.weight");
+        assert_eq!(source.dtype(), &TensorDtype::Bf16);
     }
 
     #[test]

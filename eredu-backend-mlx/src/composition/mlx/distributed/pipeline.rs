@@ -4355,7 +4355,7 @@ where
     (0..graph.groups().len())
         .filter(|&group| {
             let transport = architecture.group_transport(group);
-            transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder
+            transport.kind == eredu_runtime::ArchitectureGroupKind::Prediction
                 && transport.placement == eredu_runtime::ArchitectureGroupPlacement::OutputOwner
         })
         .nth(depth)
@@ -4378,7 +4378,7 @@ where
     Ok((0..graph.groups().len())
         .filter(|&group| {
             let transport = architecture.group_transport(group);
-            transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder
+            transport.kind == eredu_runtime::ArchitectureGroupKind::Prediction
                 && transport.placement == eredu_runtime::ArchitectureGroupPlacement::OutputOwner
         })
         .collect())
@@ -21839,10 +21839,18 @@ fn load_neutral_deepseek_v3_pipeline(
     for ((prediction_group, ordinal), unit) in
         prediction_units.iter().copied().zip(mtp_layers.iter_mut())
     {
+        let flat_ordinal = parameter_description
+            .unit_layout()
+            .ordinal(prediction_group, ordinal)
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "DeepSeek V3 parameter layout has no prediction unit {prediction_group}:{ordinal}"
+                ))
+            })?;
         let bindings = match &parallel_layout {
             Some(layout) => v3_sharded_unit_bindings(
                 &args,
-                ordinal,
+                flat_ordinal,
                 store.as_ref(),
                 external_experts,
                 layout,
@@ -21850,7 +21858,7 @@ fn load_neutral_deepseek_v3_pipeline(
             )?,
             None => crate::composition::deepseek::v3_unit_bindings(
                 &args,
-                ordinal,
+                flat_ordinal,
                 unit,
                 store.as_ref(),
                 external_experts,
@@ -22256,10 +22264,18 @@ fn load_neutral_deepseek_v4_pipeline(
     for ((prediction_group, ordinal), unit) in
         prediction_units.iter().copied().zip(mtp_layers.iter_mut())
     {
+        let flat_ordinal = parameter_description
+            .unit_layout()
+            .ordinal(prediction_group, ordinal)
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "DeepSeek V4 parameter layout has no prediction unit {prediction_group}:{ordinal}"
+                ))
+            })?;
         let bindings = match &parallel_layout {
             Some(layout) => v4_sharded_unit_bindings(
                 &args,
-                ordinal,
+                flat_ordinal,
                 store.as_ref(),
                 external_experts,
                 layout,
@@ -22267,7 +22283,7 @@ fn load_neutral_deepseek_v4_pipeline(
             )?,
             None => crate::composition::deepseek::v4_unit_bindings(
                 &args,
-                ordinal,
+                flat_ordinal,
                 unit,
                 store.as_ref(),
                 external_experts,
