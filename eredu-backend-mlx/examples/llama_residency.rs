@@ -3,10 +3,10 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use eredu_backend_mlx::backend::runtime::media::input::ModelInput;
-use eredu_backend_mlx::native::{
-    sample, Array, Device, DeviceType, ExecutionContext, ModelLoadOptions,
+use eredu_backend_mlx::backend::{
+    config::ModelLoadOptions, nn::generation::sample, runtime::media::input::ModelInput,
 };
+use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 use eredu_core::{
     load_model,
     residency::{MemoryTier, OffloadConfig, TransferDirection},

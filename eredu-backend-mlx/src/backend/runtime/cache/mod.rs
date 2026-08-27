@@ -7,4 +7,4 @@ pub mod residency;
 /// Runtime-policy-selected key/value state realization.
 pub mod state;
 
-pub use kv::*;
+pub(crate) use kv::*;

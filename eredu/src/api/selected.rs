@@ -11,14 +11,6 @@ use std::time::{Duration, Instant};
 
 use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _};
 
-/// Discovers hardware available to the selected local backend.
-pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
-/// Converts a selected-backend expert-cache report into portable telemetry.
-pub use eredu_backend_mlx::expert_cache_telemetry as local_expert_cache_telemetry;
-/// Converts speculative statistics into portable telemetry.
-pub use eredu_backend_mlx::mtp_telemetry as local_mtp_telemetry;
-/// Converts a selected-backend residency report into portable telemetry.
-pub use eredu_backend_mlx::residency_telemetry as local_residency_telemetry;
 /// Backend selected for local model execution.
 ///
 /// Native streams remain private to the selected backend:
@@ -28,7 +20,15 @@ pub use eredu_backend_mlx::residency_telemetry as local_residency_telemetry;
 ///     let _ = backend.stream();
 /// }
 /// ```
-pub use eredu_backend_mlx::MlxBackend as LocalBackend;
+pub use eredu_backend_mlx::backend::MlxBackend as LocalBackend;
+/// Discovers hardware available to the selected local backend.
+pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
+/// Converts a selected-backend expert-cache report into portable telemetry.
+pub use eredu_backend_mlx::expert_cache_telemetry as local_expert_cache_telemetry;
+/// Converts speculative statistics into portable telemetry.
+pub use eredu_backend_mlx::mtp_telemetry as local_mtp_telemetry;
+/// Converts a selected-backend residency report into portable telemetry.
+pub use eredu_backend_mlx::residency_telemetry as local_residency_telemetry;
 /// Automatic planner and execution-plan factory for the selected local backend.
 pub use eredu_backend_mlx::MlxBackendFactory as LocalBackendFactory;
 /// Scoped opt-in for selected-backend MTP component timing.
@@ -119,12 +119,14 @@ impl LocalLoadOptions {
         self.required_session_capabilities
     }
 
-    fn into_backend(self) -> eredu_backend_mlx::native::ModelLoadOptions {
+    fn into_backend(self) -> eredu_backend_mlx::backend::config::ModelLoadOptions {
         let options = match self.quantization {
             Some(quantization) => {
-                eredu_backend_mlx::native::ModelLoadOptions::with_quantization(quantization)
+                eredu_backend_mlx::backend::config::ModelLoadOptions::with_quantization(
+                    quantization,
+                )
             }
-            None => eredu_backend_mlx::native::ModelLoadOptions::default(),
+            None => eredu_backend_mlx::backend::config::ModelLoadOptions::default(),
         };
         options
             .with_weight_residency(self.weight_residency)
@@ -132,7 +134,7 @@ impl LocalLoadOptions {
     }
 
     fn from_backend(
-        options: eredu_backend_mlx::native::ModelLoadOptions,
+        options: eredu_backend_mlx::backend::config::ModelLoadOptions,
     ) -> Result<Self, crate::AutomaticPlanningError> {
         if options.parallel_topology().is_some() {
             return Err(crate::AutomaticPlanningError::Invalid(
@@ -537,7 +539,7 @@ fn observe_realtime_steps(
 }
 
 fn map_local_realtime_error(
-    error: eredu_core::RealtimeError<eredu_backend_mlx::native::MlxError>,
+    error: eredu_core::RealtimeError<eredu_backend_mlx::backend::error::Error>,
 ) -> LocalRealtimeError {
     match error {
         eredu_core::RealtimeError::Backend(error) => {
@@ -731,8 +733,8 @@ pub enum LocalExpertCacheBenchmarkError {
 
 #[derive(Clone, Copy)]
 struct ExpertSnapshot {
-    prefill: eredu_backend_mlx::ExpertPassStatistics,
-    decode: eredu_backend_mlx::ExpertPassStatistics,
+    prefill: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
+    decode: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
     host_resident_experts: usize,
     host_resident_bytes: u64,
     device_resident_experts: usize,
@@ -759,8 +761,8 @@ fn expert_snapshot(
 
 fn benchmark_sample(
     elapsed: Duration,
-    before: eredu_backend_mlx::ExpertPassStatistics,
-    after: eredu_backend_mlx::ExpertPassStatistics,
+    before: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
+    after: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
     occupancy: ExpertSnapshot,
 ) -> LocalExpertCacheBenchmarkSample {
     LocalExpertCacheBenchmarkSample {

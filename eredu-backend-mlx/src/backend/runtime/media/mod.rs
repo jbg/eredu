@@ -18,7 +18,7 @@ use crate::backend::runtime::media::input::InputPayload;
 use crate::{backend::error::Error, backend::runtime::media::input::ModelInput};
 
 /// Backend-neutral runtime input part specialized to MLX arrays.
-pub use crate::backend::runtime::media::input::InputPart;
+pub(crate) use crate::backend::runtime::media::input::InputPart;
 
 /// Shared PCM waveform validation and spectral operations.
 #[cfg(feature = "audio")]
@@ -31,9 +31,9 @@ pub mod image;
 pub mod video;
 
 #[cfg(feature = "audio")]
-pub use audio::AudioWaveform;
+pub(crate) use audio::AudioWaveform;
 #[cfg(feature = "image")]
-pub use image::RgbImageView;
+pub(crate) use image::RgbImageView;
 
 /// One decoded media item supplied to a model processor.
 #[derive(Debug, Clone, Copy)]

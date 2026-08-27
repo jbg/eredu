@@ -6,8 +6,10 @@ coordinates and subgroup membership for the axes that apply to its model.
 
 All supported families use the ordinary architecture-erased loader. Build the
 canonical `eredu::ParallelTopology` in core terms, bind its process rank
-to an MLX device with `eredu_backend_mlx::native::MlxParallelContext`, and pass
-that context through `eredu_backend_mlx::native::ModelLoadOptions::with_parallel` in
+to an MLX device with
+`eredu_backend_mlx::backend::topology::MlxParallelContext`, and pass that
+context through
+`eredu_backend_mlx::backend::config::ModelLoadOptions::with_parallel` in
 backend-specific tooling. Application clients normally submit the portable
 topology through an `ExecutionPlan` and let the `eredu` facade realize it.
 Unsupported combinations fail preflight before checkpoint payloads are
@@ -16,11 +18,10 @@ materialized; there are no public family-specific parallel loaders.
 `ParallelTopology` derives world size from its tensor, pipeline, expert, and
 data dimensions. `ParallelRankTopology` owns coordinate mapping, subgroup
 membership, pipeline neighbors, balanced layer/expert ownership, and pure
-preflight planning. The native `MlxParallelContext` adds only a process-local
-MLX device assignment. Device-bound topology types live under the explicit
-`native` escape hatch rather than the flat application-facing adapter. Native
-groups, arrays, transfers, and exact completions stay in the selected MLX
-session.
+preflight planning. The MLX `MlxParallelContext` adds only a process-local
+device assignment. Device-bound topology types live under `backend::topology`,
+not the flat application-facing adapter. Native groups, arrays, transfers, and
+exact completions stay in the selected MLX session.
 
 ## Topology matrix
 

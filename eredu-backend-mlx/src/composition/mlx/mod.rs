@@ -17,14 +17,14 @@ mod session;
 pub mod speculative;
 pub mod structural;
 
-pub use execution::{submit_decode, submit_prefill};
+pub(crate) use execution::{submit_decode, submit_prefill};
 pub use inspection::{inspect_model, MlxInspectionOptions};
-pub use loading::validate_gguf_quantization_source;
-pub use model::Executable;
+pub(crate) use loading::validate_gguf_quantization_source;
+pub(crate) use model::Executable;
 #[cfg(any(feature = "image", feature = "audio"))]
 pub(crate) use processor::ModelProcessor;
 pub use session::{MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion};
 
-pub use crate::backend::{
+pub(crate) use crate::backend::{
     error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, ModelLoadOptions,
 };

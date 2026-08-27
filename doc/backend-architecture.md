@@ -63,9 +63,11 @@ the package with no features omits the executable instead of compiling a
 target whose implementation cannot run.
 
 The facade root and `api` namespace expose portable application concepts plus
-the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
-application-facing adapter as an explicit flat root API and deliberately makes
-its reusable `backend` module tree public for backend authors. Family
+the narrow selected-backend adapter. Its `LocalBackend` name is a deliberate
+facade alias required by public selected-backend associated types; the concrete
+type still has one name inside `eredu-backend-mlx`. That implementation crate
+exports composition-owned adapter factories at its flat root and deliberately
+makes its reusable `backend` module tree public for backend authors. Family
 composition and architecture-erased dispatch remain crate-private. Native
 facade integration tests realize execution plans through
 `eredu::api::LocalBackendFactory`; they do not construct native devices,
@@ -113,16 +115,19 @@ parallel contexts are selected only by backend tooling. `LocalBackendError`
 similarly records facade operation context and a diagnostic message without
 exporting `safemlx` exception or I/O variants. Portable execution plans remain
 the application surface for device and topology selection.
-Sampling functions and sampler traits whose signatures expose raw MLX arrays,
-streams, or random state are exported only through that native namespace, not
-through the flat application-facing adapter. Stream-bound checkpoint
-conversion, prepared models, backend errors, native-bearing load and inspection
-policy, and model-session outputs follow the same rule. Native realtime backend
-types, inputs, outputs, sessions, completions, and prompt helpers follow the
-same rule. Device assignments and device-bound MLX parallel contexts are
-likewise available through `eredu-backend-mlx::native` and the reusable `backend`
-hierarchy, not the flat adapter root. The backend's flat `MlxRealtimeAdapter`
-has no native-handle accessors and
+Backend-generic sampling policy lives in `eredu-runtime`; the canonical MLX
+realization and raw-array adapters live in the reusable
+`eredu-backend-mlx::backend` hierarchy. The `native` namespace supplies the
+arrays, streams, and random state required by raw sampling signatures, but does
+not re-export the sampling APIs under second names. Backend configuration,
+errors, topology, prepared models, neural operators, cache types, and runtime
+facilities likewise have one public path in their leaf `backend` ownership
+module; neither `native`, parent modules, nor the flat root duplicate those
+names. Composition-owned model sessions, inputs, outputs, inspection policy,
+realtime types, and prompt helpers have their sole public path under `native`.
+The flat root exports only application adapters whose implementation modules
+are private, so those exports establish one public name rather than aliases.
+The backend's flat `MlxRealtimeAdapter` has no native-handle accessors and
 exists so the facade can own a concrete implementation; facade-owned wrappers
 expose only portable frames, scheduling identities, limits, lifecycle state,
 and telemetry. Concrete causal sessions, exact completion types, speculative
@@ -1124,20 +1129,19 @@ composition:
 - reusable public mechanics are rooted directly at
   `eredu_backend_mlx::backend::{nn, runtime, ...}`. The dedicated MLX crate
   does not repeat its backend name as another module layer;
-- `MlxBackend` is the facade backend provider and privately owns execution and
-  weight-materialization streams. Its production inherent API neither accepts
-  nor returns native handles; callers that deliberately construct
-  backend-native sessions do so through `eredu_backend_mlx::native`.
-  `MlxNeuralBackend` is
+- `backend::MlxBackend` is the facade backend provider and privately owns
+  execution and weight-materialization streams. Its production inherent API
+  neither accepts nor returns native handles; callers that deliberately
+  construct backend-native sessions do so through `eredu_backend_mlx::native`.
+  `backend::nn::shared::MlxNeuralBackend` is
   the distinct zero-sized selector that implements the neutral neural,
   parameter, submission, and transfer traits for architecture specialization.
 - `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and
   is the sole MLX implementation of `eredu_nn::Tensor`;
 - `native::MlxModelSession` composition owns the executable model, cache,
-  processor state, and
-  optional distributed context. The prepared `native::MlxModel` wrapper exposes
-  neutral capabilities and telemetry while keeping its executable kind and
-  architecture-specific payload private.
+  processor state, and optional distributed context. The prepared
+  `backend::MlxModel` wrapper exposes neutral capabilities and telemetry while
+  keeping its executable kind and architecture-specific payload private.
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
   residency workers, media processing, and collectives. Their production

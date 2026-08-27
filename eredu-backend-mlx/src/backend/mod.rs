@@ -17,10 +17,12 @@ pub mod residency;
 pub mod runtime;
 /// MLX process-local device binding for a canonical core rank topology.
 pub mod topology;
-pub use config::ModelLoadOptions;
-pub use distributed::MlxDistributedConfig;
-pub use distributed::MlxDistributedSession;
-pub use topology::{DeviceAssignment, MlxParallelContext};
+pub(crate) use config::ModelLoadOptions;
+pub(crate) use distributed::MlxDistributedConfig;
+pub(crate) use distributed::MlxDistributedSession;
+#[cfg(test)]
+pub(crate) use topology::DeviceAssignment;
+pub(crate) use topology::MlxParallelContext;
 
 use eredu_core::backend::{
     BackendDescriptor, BackendProvider, Completion, DeviceCapabilities, DeviceDescriptor,

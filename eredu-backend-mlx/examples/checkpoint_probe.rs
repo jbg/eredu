@@ -13,14 +13,14 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use eredu_backend_mlx::backend::runtime::media::input::ModelInput;
+use eredu_backend_mlx::backend::{
+    config::ModelLoadOptions, runtime::media::input::ModelInput, MlxBackend,
+};
 use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
-    Array, Device, DeviceType, ExecutionContext, MlxModelInput, MlxModelSession, ModelLoadOptions,
-    Stream,
+    Array, Device, DeviceType, ExecutionContext, MlxModelInput, MlxModelSession, Stream,
 };
-use eredu_backend_mlx::MlxBackend;
 use eredu_core::{
     load_model, BackendProvider as _, BackendSession as _, ObservationValue, TensorObservationData,
 };

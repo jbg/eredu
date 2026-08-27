@@ -2,9 +2,10 @@
 
 use std::{path::PathBuf, time::Instant};
 
+use eredu_backend_mlx::backend::config::ModelLoadOptions;
 use eredu_backend_mlx::native::{
     personaplex_sine_frame, transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext,
-    MlxRealtimeBackend, MlxRealtimeInput, ModelLoadOptions, Stream,
+    MlxRealtimeBackend, MlxRealtimeInput, Stream,
 };
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
 use eredu_core::QuantizationRequest;

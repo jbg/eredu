@@ -48,9 +48,10 @@ use safemlx::{
 use crate::backend::{
     nn::{
         self as common,
-        tensor::{rope::RopeVariant, validate_token_domain},
+        rope::{self, RopeVariant},
+        tensor::validate_token_domain,
     },
-    runtime::cache::{
+    runtime::cache::kv::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueAttentionBlock, KeyValueCache,
         PagedKeyValueCache, SlidingKeyValueCache,
     },
@@ -1680,7 +1681,7 @@ impl NeuralBackend for MlxNeuralBackend {
     }
 
     fn rotary(spec: RotarySpec, context: &Stream) -> Result<MlxRotary, ComputeError> {
-        compute(crate::backend::nn::tensor::rope::initialize_rope(
+        compute(rope::initialize_rope(
             spec.dimensions,
             spec.base,
             spec.traditional,

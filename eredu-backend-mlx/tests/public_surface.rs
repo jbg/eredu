@@ -1,14 +1,20 @@
 use eredu_backend_mlx::backend::{
+    config::ModelLoadOptions,
     error::Error,
-    nn::MlxNeuralBackend,
-    runtime::{cache::state::MlxKeyValueState, checkpoint::store::WeightStoreError},
-    MlxBackend,
+    nn::generation::sample as backend_sample,
+    nn::shared::MlxNeuralBackend,
+    runtime::{
+        cache::state::MlxKeyValueState,
+        checkpoint::quantization::{CheckpointQuantizationOptions, CheckpointQuantizationReport},
+        checkpoint::store::WeightStoreError,
+        generation::sampler::{MlxSamplingBackend, Sampler as BackendSampler, SpeculativeSampler},
+    },
+    topology::{DeviceAssignment, MlxParallelContext},
+    MlxBackend, MlxCompletion, MlxModel, MlxModelConfig,
 };
 use eredu_backend_mlx::native::{
-    error::Exception, random::RandomState, sample, Array, CheckpointQuantizationOptions,
-    CheckpointQuantizationReport, DeviceAssignment, MlxCompletion, MlxDrafter, MlxError,
-    MlxInspectionOptions, MlxModel, MlxModelConfig, MlxModelInput, MlxModelOutput, MlxModelSession,
-    MlxParallelContext, MlxRealtimeModel, MlxSessionCompletion, ModelLoadOptions, Sampler, Stream,
+    error::Exception, random::RandomState, Array, MlxDrafter, MlxInspectionOptions, MlxModelInput,
+    MlxModelOutput, MlxModelSession, MlxRealtimeModel, MlxSessionCompletion, Stream,
 };
 use eredu_backend_mlx::MlxTensor;
 
@@ -24,28 +30,34 @@ fn reusable_backend_modules_are_rooted_directly_under_backend() {
 }
 
 #[test]
-fn raw_sampling_api_is_rooted_under_native() {
-    let _: fn(&Array, f32, Option<&mut RandomState>, &Stream) -> Result<Array, Exception> = sample;
-    assert_public_type::<dyn Sampler>();
+fn reusable_sampling_api_is_rooted_under_backend() {
+    let _: fn(&Array, f32, Option<&mut RandomState>, &Stream) -> Result<Array, Exception> =
+        backend_sample;
+    assert_public_type::<MlxSamplingBackend>();
+    assert_public_type::<dyn BackendSampler>();
+    assert_public_type::<dyn SpeculativeSampler>();
 }
 
 #[test]
-fn native_model_execution_types_are_rooted_under_native() {
+fn backend_owned_types_are_rooted_under_backend_ownership_modules() {
     assert_public_type::<CheckpointQuantizationOptions>();
     assert_public_type::<CheckpointQuantizationReport>();
     assert_public_type::<DeviceAssignment>();
     assert_public_type::<MlxCompletion>();
-    assert_public_type::<MlxDrafter>();
-    assert_public_type::<MlxError>();
-    assert_public_type::<MlxInspectionOptions>();
     assert_public_type::<MlxModel>();
     assert_public_type::<MlxModelConfig>();
+    assert_public_type::<MlxParallelContext>();
+    assert_public_type::<ModelLoadOptions>();
+}
+
+#[test]
+fn composition_owned_native_types_have_one_public_native_path() {
+    assert_public_type::<MlxDrafter>();
+    assert_public_type::<MlxInspectionOptions>();
     assert_public_type::<MlxModelInput>();
     assert_public_type::<MlxModelOutput>();
     assert_public_type::<MlxModelSession<'static>>();
-    assert_public_type::<MlxParallelContext>();
     assert_public_type::<MlxSessionCompletion>();
-    assert_public_type::<ModelLoadOptions>();
 }
 
 #[test]

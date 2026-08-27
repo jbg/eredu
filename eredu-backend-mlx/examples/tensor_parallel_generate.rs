@@ -1,9 +1,15 @@
 //! Minimal MLX two-or-more-process tensor-parallel generation probe.
 
-use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
-use eredu_backend_mlx::native::{
-    distributed::{self, Backend},
-    DeviceAssignment, DeviceType, MlxParallelContext, ModelLoadOptions, Stream,
+use eredu_backend_mlx::{
+    backend::{
+        config::ModelLoadOptions,
+        runtime::media::input::{token_ids_part, ModelInput},
+        topology::{DeviceAssignment, MlxParallelContext},
+    },
+    native::{
+        distributed::{self, Backend},
+        DeviceType, Stream,
+    },
 };
 use eredu_core::{load_model, BackendProvider as _, BackendSession};
 use eredu_runtime::DefaultSampler;

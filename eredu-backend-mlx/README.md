@@ -17,7 +17,8 @@ backend development and backend-specific low-level tooling.
 
 ```rust,no_run
 use eredu_backend_mlx::{
-    native::{backend, Device, DeviceType, ExecutionContext, ModelLoadOptions},
+    backend::config::ModelLoadOptions,
+    native::{backend, Device, DeviceType, ExecutionContext},
 };
 use eredu_core::load_model;
 
@@ -31,19 +32,23 @@ let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?
 Reusable low-level mechanics are rooted directly under
 `eredu_backend_mlx::backend`, including `backend::nn` and `backend::runtime`.
 Because this crate implements only MLX, there is no additional backend-name
-module below that root.
+module below that root. The canonical sampling implementation follows the same
+rule: backend-generic policies come from `eredu-runtime`, while
+`backend::runtime::generation::sampler` exposes the MLX realization and its
+raw-array adapters. The standalone raw sampling function lives in
+`backend::nn::generation`.
 
-The `native` module is a deliberate escape hatch for device assignment,
-device-bound parallel topology, streams, allocator state, random state,
-low-level arrays, sampling, and platform setup needed by concrete MLX tooling.
-Prepared models, load and inspection policy that can carry native topology,
-backend errors, model-session outputs, and stream-bound checkpoint conversion
-also live in this namespace rather than the flat adapter.
-`DeviceAssignment` and `MlxParallelContext` are available from `native` and the
-reusable `backend` hierarchy, but not from the flat application-facing root.
-Native sampling APIs that exchange raw arrays, streams, or random state are
-available only through this namespace. Backend-neutral APIs exchange
-`MlxTensor` instead of raw arrays.
+The `native` module is a deliberate escape hatch for devices, device-bound
+streams, allocator state, random state, low-level arrays, and platform setup
+needed by concrete MLX tooling. It supplies the native types required by raw
+sampling signatures, but does not give backend-owned types a second public
+name. Backend configuration, errors, topology, prepared models, and reusable
+runtime facilities remain in their owning `backend` modules.
+Composition-owned model sessions, inputs, outputs, inspection policy, and
+realtime types have their sole public path under `native`.
+Raw sampling is not exported by `native` or the flat application-facing
+adapter. Backend-generic sampling APIs exchange `MlxTensor` instead of raw
+arrays.
 
 ## Features
 

@@ -13,7 +13,6 @@ use safemlx::{
 };
 use std::cell::RefCell;
 
-pub use crate::backend::nn::rope;
 use crate::backend::runtime::cache::KeyValueCache;
 
 thread_local! {

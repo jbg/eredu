@@ -22,8 +22,9 @@ use crate::{
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::{
-        error::Error as MlxError, DeviceAssignment, MlxBackend, MlxDistributedSession,
-        MlxParallelContext, ModelLoadOptions,
+        error::Error as MlxError,
+        nn::shared::{MlxModule, MlxNeuralBackend},
+        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
     },
     composition::mlx::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineModel, PipelineStep,
@@ -2133,7 +2134,7 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
             self.arrays.push((name, value));
         }
     }
-    type Backend = crate::backend::nn::MlxNeuralBackend;
+    type Backend = MlxNeuralBackend;
     let architecture =
         eredu_architectures::deepseek::v3::Model::<Backend>::new(args.clone(), stream).unwrap();
     let mut collector = Collector {
@@ -2449,9 +2450,10 @@ fn qwen_fixture_arrays(
         }
     }
 
-    let architecture = eredu_architectures::qwen::RoutedLayeredModel::<
-        crate::backend::nn::MlxNeuralBackend,
-    >::new(args.clone(), stream)
+    let architecture = eredu_architectures::qwen::RoutedLayeredModel::<MlxNeuralBackend>::new(
+        args.clone(),
+        stream,
+    )
     .unwrap();
     let mut collector = Collector {
         stream,
@@ -2461,11 +2463,9 @@ fn qwen_fixture_arrays(
         .static_modules()
         .visit_parameters(&mut collector);
     for layer in 0..args.num_hidden_layers as usize {
-        eredu_architectures::qwen::new_routed_block::<crate::backend::nn::MlxNeuralBackend>(
-            args, layer, stream,
-        )
-        .unwrap()
-        .visit_parameters(&mut collector);
+        eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(args, layer, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
     }
     collector.arrays
 }
@@ -2943,9 +2943,7 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
-        lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
-    );
+    let mut model = MlxModule::new(lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap());
     for (name, parameter) in model.parameters_mut().flatten() {
         let shape = parameter.shape().to_vec();
         *parameter = if name.ends_with("norm.weight") {
@@ -3006,9 +3004,8 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
-        lfm2::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap(),
-    );
+    let mut model =
+        MlxModule::new(lfm2::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap());
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in model.parameters().flatten() {
@@ -3271,7 +3268,7 @@ fn write_kimi_linear_fixture(directory: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         neutral_kimi_linear::KimiLinearCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -3423,7 +3420,7 @@ fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Valu
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -3464,7 +3461,7 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -3626,7 +3623,7 @@ fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
             .unwrap(),
     );
@@ -3639,7 +3636,7 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
             .unwrap(),
     );
@@ -3685,7 +3682,7 @@ fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         crate::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(parsed, stream)
             .unwrap(),
     );
@@ -3736,7 +3733,7 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
-    let mut model = crate::backend::nn::MlxModule::new(
+    let mut model = MlxModule::new(
         crate::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);

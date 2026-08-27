@@ -6,8 +6,9 @@ use clap::{Parser, ValueEnum};
 use eredu_architectures::checkpoint_conversion::{
     SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
 };
-use eredu_backend_mlx::native::{
-    quantize_checkpoint, CheckpointQuantizationOptions, Device, DeviceType, ExecutionContext,
+use eredu_backend_mlx::{
+    backend::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
+    native::{quantize_checkpoint, Device, DeviceType, ExecutionContext},
 };
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 
