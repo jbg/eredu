@@ -5,9 +5,13 @@ emits protocol-neutral semantic events. Applications do not need to build a
 grammar, inspect tokenizer internals, or parse a checkpoint-specific wire
 format.
 
-The application entry point is `LocalModel::prepare_chat`, followed by one of
-its `generate_prepared_chat*` methods. Backend authors can use the generic
-`LoadedModel<B>` surface instead. The complete application example is
+The sole model-level chat-rendering entry point is `LocalModel::prepare_chat`,
+including for chats without tools. It renders the selected checkpoint template,
+validates the request, and returns the prompt and its generation metadata.
+Applications can encode `PreparedChat::rendered_prompt()` for raw token
+generation or pass the prepared chat to one of the `generate_prepared_chat*`
+methods. Backend authors can use the generic `LoadedModel<B>` surface instead.
+The complete semantic-generation example is
 [`eredu/examples/native_tool_calling.rs`](../eredu/examples/native_tool_calling.rs).
 
 ## Capability gating

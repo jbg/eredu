@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{local_device_plan, LocalBackendFactory, LocalDevice, LocalModel},
+    api::{local_device_plan, ChatTemplateRequest, LocalBackendFactory, LocalDevice, LocalModel},
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
 
@@ -26,17 +26,12 @@ fn main() -> anyhow::Result<()> {
         LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
 
-    let rendered = model
-        .apply_chat_template_json(
-            vec![vec![gemma4_message(&prompt, model.model_id())]],
-            None,
-            true,
-        )?
-        .unwrap_or_else(|| {
-            args.get(1)
-                .cloned()
-                .unwrap_or_else(|| "what is MLX?".to_string())
-        });
+    let prepared = model.prepare_chat(ChatTemplateRequest {
+        messages: vec![gemma4_message(&prompt, model.model_id())],
+        add_generation_prompt: true,
+        ..ChatTemplateRequest::default()
+    })?;
+    let rendered = prepared.rendered_prompt().to_owned();
     println!("\n=== prompt ===\n{rendered}\n");
     println!("temperature: {temp}");
 

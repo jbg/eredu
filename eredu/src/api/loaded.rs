@@ -12,11 +12,10 @@ use eredu_gguf::MetadataValue as GgufMetadataValue;
 use eredu_text::{
     gguf::GgufTokenizer,
     tokenizer::{
-        chat_template_kwargs as inspect_chat_template_kwargs, ApplyChatTemplateArgs, Chat,
-        ModelChatTemplate, Tokenizer as ChatTokenizer,
+        chat_template_kwargs as inspect_chat_template_kwargs, ModelChatTemplate,
+        Tokenizer as ChatTokenizer,
     },
 };
-use serde::Serialize;
 
 use super::{
     LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChat, PreparedChatError,
@@ -431,7 +430,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         )
     }
 
-    /// Prepares one JSON-valued chat for generation.
+    /// Renders and validates one JSON-valued chat for generation.
     pub fn prepare_chat(
         &mut self,
         request: ChatTemplateRequest,
@@ -450,85 +449,6 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             Some(&constraint_compiler),
             request,
         )
-    }
-
-    /// Applies the selected chat template to structured conversations.
-    pub fn apply_chat_template<'a, I, R, T>(
-        &'a mut self,
-        conversations: I,
-        tools: Option<&'a [serde_json::Value]>,
-        add_generation_prompt: bool,
-    ) -> Result<Option<String>, TextModelError>
-    where
-        I: IntoIterator<Item = Chat<'a, R, T>>,
-        R: Serialize + 'a,
-        T: Serialize + 'a,
-    {
-        self.apply_chat_template_with_kwargs(conversations, tools, add_generation_prompt, None)
-    }
-
-    /// Applies the selected chat template with extra template variables.
-    pub fn apply_chat_template_with_kwargs<'a, I, R, T>(
-        &'a mut self,
-        conversations: I,
-        tools: Option<&'a [serde_json::Value]>,
-        add_generation_prompt: bool,
-        template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, TextModelError>
-    where
-        I: IntoIterator<Item = Chat<'a, R, T>>,
-        R: Serialize + 'a,
-        T: Serialize + 'a,
-    {
-        let Some(template) = self.chat_template.clone() else {
-            return Ok(None);
-        };
-        let rendered = self.tokenizer.apply_chat_template(
-            template,
-            ApplyChatTemplateArgs {
-                conversations,
-                tools,
-                documents: None,
-                model_id: &self.model_id,
-                chat_template_id: None,
-                add_generation_prompt: Some(add_generation_prompt),
-                continue_final_message: None,
-                template_kwargs,
-            },
-        )?;
-        Ok(rendered.into_iter().next())
-    }
-
-    /// Applies the selected chat template to JSON-valued conversations.
-    pub fn apply_chat_template_json(
-        &mut self,
-        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
-        tools: Option<&[serde_json::Value]>,
-        add_generation_prompt: bool,
-    ) -> Result<Option<String>, TextModelError> {
-        self.apply_chat_template_json_with_kwargs(conversations, tools, add_generation_prompt, None)
-    }
-
-    /// Applies the selected chat template with extra JSON template variables.
-    pub fn apply_chat_template_json_with_kwargs(
-        &mut self,
-        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
-        tools: Option<&[serde_json::Value]>,
-        add_generation_prompt: bool,
-        template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, TextModelError> {
-        let Some(template) = self.chat_template.clone() else {
-            return Ok(None);
-        };
-        let rendered = self.tokenizer.apply_chat_template_json(
-            template,
-            conversations,
-            tools,
-            &self.model_id,
-            add_generation_prompt,
-            template_kwargs,
-        )?;
-        Ok(rendered.into_iter().next())
     }
 }
 

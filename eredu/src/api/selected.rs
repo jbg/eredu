@@ -490,39 +490,12 @@ impl LocalModel {
         self.inner.chat_template_kwargs()
     }
 
-    /// Prepares a JSON-valued chat for generation.
+    /// Renders and validates a JSON-valued chat for generation.
     pub fn prepare_chat(
         &mut self,
         request: crate::runtime::chat::ChatTemplateRequest,
     ) -> Result<super::PreparedChat, super::TextModelError> {
         self.inner.prepare_chat(request)
-    }
-
-    /// Applies the selected chat template to JSON-valued conversations.
-    pub fn apply_chat_template_json(
-        &mut self,
-        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
-        tools: Option<&[serde_json::Value]>,
-        add_generation_prompt: bool,
-    ) -> Result<Option<String>, super::TextModelError> {
-        self.inner
-            .apply_chat_template_json(conversations, tools, add_generation_prompt)
-    }
-
-    /// Applies the selected chat template with extra JSON variables.
-    pub fn apply_chat_template_json_with_kwargs(
-        &mut self,
-        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
-        tools: Option<&[serde_json::Value]>,
-        add_generation_prompt: bool,
-        template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, super::TextModelError> {
-        self.inner.apply_chat_template_json_with_kwargs(
-            conversations,
-            tools,
-            add_generation_prompt,
-            template_kwargs,
-        )
     }
 
     /// Reports fail-closed speculative support for this local session.

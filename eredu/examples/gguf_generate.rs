@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{local_device_plan, LocalBackendFactory, LocalDevice, LocalModel},
+    api::{local_device_plan, ChatTemplateRequest, LocalBackendFactory, LocalDevice, LocalModel},
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
 
@@ -61,16 +61,21 @@ fn main() -> anyhow::Result<()> {
     println!("model type: {}", model.model_type());
     println!("chat template: {}", model.has_chat_template());
 
-    let rendered = model
-        .apply_chat_template_json(
-            vec![vec![serde_json::json!({
-                "role": "user",
-                "content": prompt,
-            })]],
-            None,
-            true,
-        )?
-        .unwrap_or_else(|| prompt.to_owned());
+    let rendered = if model.has_chat_template() {
+        model
+            .prepare_chat(ChatTemplateRequest {
+                messages: vec![serde_json::json!({
+                    "role": "user",
+                    "content": prompt,
+                })],
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            })?
+            .rendered_prompt()
+            .to_owned()
+    } else {
+        prompt.to_owned()
+    };
     let (prompt_len, output_ids) = generate(&mut model, &rendered, max_tokens, temperature)?;
 
     println!("prompt tokens: {prompt_len}");
