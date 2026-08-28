@@ -407,42 +407,37 @@ impl LlamaModel {
         let inputs = crate::MlxTensor::from_array(inputs.clone());
         let mask = mask.cloned().map(crate::MlxTensor::from_array);
         let mut neutral_observer = crate::composition::NeutralActivationObserver::new(observer);
-        match &mut self.execution {
+        let output = match &mut self.execution {
             LlamaExecution::TensorParallelResident(_)
             | LlamaExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
                 "tensor-parallel observation requires its collective execution context".into(),
             )),
-            LlamaExecution::Resident(execution) => {
-                let output = execution
-                    .forward_with_observer(
-                        eredu_architectures::llama::LayeredInput {
-                            tokens: &inputs,
-                            mask: mask.as_ref(),
-                        },
-                        cache,
-                        stream,
-                        &mut neutral_observer,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output.as_array())?;
-                Ok(output.into_array())
-            }
-            LlamaExecution::Layerwise(execution) => {
-                let output = execution
-                    .forward_with_observer(
-                        eredu_architectures::llama::LayeredInput {
-                            tokens: &inputs,
-                            mask: mask.as_ref(),
-                        },
-                        cache,
-                        stream,
-                        &mut neutral_observer,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output.as_array())?;
-                Ok(output.into_array())
-            }
-        }
+            LlamaExecution::Resident(execution) => execution
+                .forward_with_observer(
+                    eredu_architectures::llama::LayeredInput {
+                        tokens: &inputs,
+                        mask: mask.as_ref(),
+                    },
+                    cache,
+                    stream,
+                    &mut neutral_observer,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
+            LlamaExecution::Layerwise(execution) => execution
+                .forward_with_observer(
+                    eredu_architectures::llama::LayeredInput {
+                        tokens: &inputs,
+                        mask: mask.as_ref(),
+                    },
+                    cache,
+                    stream,
+                    &mut neutral_observer,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
+        }?;
+        eredu_runtime::observe_model_logits(&mut neutral_observer, &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Error::from)
     }
 
     /// Runs a rank-local tensor-parallel forward pass.
@@ -526,13 +521,9 @@ impl LlamaModel {
             }
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::observe_and_intervene(
-            &mut neutral,
-            eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-            &output,
-        )
-        .map(crate::MlxTensor::into_array)
-        .map_err(Into::into)
+        eredu_runtime::observe_model_logits(&mut neutral, &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Into::into)
     }
 
     /// Runs prompt prefill and returns last-token logits.

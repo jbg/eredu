@@ -720,8 +720,7 @@ impl QwenVlModel {
         let logits = result
             .map(crate::MlxTensor::into_array)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, &logits)?;
-        Ok(logits)
+        eredu_runtime::observe_model_logits(observer, &logits).map_err(Error::from)
     }
 
     fn prepared_forward(

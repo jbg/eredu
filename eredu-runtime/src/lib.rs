@@ -97,8 +97,8 @@ pub use generation::{
 };
 pub use input::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
 pub use inspection::{
-    observe_and_intervene, ActivationObserver, NoopObserver, RoutingObservation,
-    TargetStateCapture, TargetStateCaptureError, TargetStateTap,
+    observe_and_intervene, observe_model_logits, ActivationObserver, NoopObserver,
+    RoutingObservation, TargetStateCapture, TargetStateCaptureError, TargetStateTap,
 };
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,

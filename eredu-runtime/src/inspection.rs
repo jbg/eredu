@@ -118,7 +118,7 @@ pub trait ActivationObserver<T, E> {
     /// Observes a named backend-native tensor.
     fn observe(&mut self, path: &str, value: &T) -> Result<(), E>;
 
-    /// Optionally replaces an activation before downstream computation.
+    /// Optionally replaces an activation before it is consumed or returned.
     fn intervene(&mut self, _path: &str, _value: &T) -> Result<Option<T>, E> {
         Ok(None)
     }
@@ -140,6 +140,19 @@ where
     Ok(observer
         .intervene(path, value)?
         .unwrap_or_else(|| value.clone()))
+}
+
+/// Observes final model logits and applies an optional replacement.
+///
+/// Family and topology adapters must return this value, rather than merely
+/// reporting [`eredu_core::MODEL_LOGITS_OBSERVATION_PATH`], so final-output
+/// intervention has the same semantics as every other activation point.
+pub fn observe_model_logits<T, E, O>(observer: &mut O, logits: &T) -> Result<T, E>
+where
+    T: Clone,
+    O: ActivationObserver<T, E> + ?Sized,
+{
+    observe_and_intervene(observer, eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits)
 }
 
 /// Zero-sized observer used by the ordinary unobserved inference path.
@@ -197,6 +210,26 @@ mod tests {
         let output = observe_and_intervene(&mut observer, "model.layers.0.output", &3).unwrap();
         assert_eq!(output, 7);
         assert_eq!(observer.observed, ["model.layers.0.output"]);
+    }
+
+    #[test]
+    fn final_logits_observation_returns_the_intervention() {
+        struct ReplacingLogits;
+
+        impl ActivationObserver<i32, ()> for ReplacingLogits {
+            fn observe(&mut self, path: &str, value: &i32) -> Result<(), ()> {
+                assert_eq!(path, eredu_core::MODEL_LOGITS_OBSERVATION_PATH);
+                assert_eq!(*value, 3);
+                Ok(())
+            }
+
+            fn intervene(&mut self, path: &str, value: &i32) -> Result<Option<i32>, ()> {
+                assert_eq!(path, eredu_core::MODEL_LOGITS_OBSERVATION_PATH);
+                Ok(Some(value + 4))
+            }
+        }
+
+        assert_eq!(observe_model_logits(&mut ReplacingLogits, &3), Ok(7));
     }
 
     #[test]

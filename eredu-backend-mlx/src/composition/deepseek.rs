@@ -1579,11 +1579,9 @@ impl DeepSeekModel {
                 ))
             }
         };
-        observer
-            .inner
-            .observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output.as_array())
-            .map_err(Error::from)?;
-        Ok(output.into_array())
+        eredu_runtime::observe_model_logits(&mut observer, &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Error::from)
     }
 
     /// Returns last-token logits for prefill or decode.

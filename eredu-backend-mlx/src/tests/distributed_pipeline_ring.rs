@@ -64,6 +64,7 @@ const PROMPT_CACHE_ROOT: &str = "EREDU_PIPELINE_PROMPT_CACHE";
 const CARTESIAN_AXES: &str = "EREDU_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "EREDU_PIPELINE_EXPERT_CACHE";
 const REQUANTIZE: &str = "EREDU_PIPELINE_REQUANTIZE";
+const FINAL_OUTPUT_INTERVENTION: &str = "EREDU_PIPELINE_FINAL_OUTPUT_INTERVENTION";
 const OPAQUE_SESSION: &str = "EREDU_PIPELINE_OPAQUE_SESSION";
 const OPAQUE_INSPECTION: &str = "EREDU_PIPELINE_OPAQUE_INSPECTION";
 const OPAQUE_TEXT_GENERATION: &str = "EREDU_PIPELINE_OPAQUE_TEXT_GENERATION";
@@ -1313,6 +1314,58 @@ fn pipeline_ring_worker() {
         family.stage_range(pipeline_rank).collect::<Vec<_>>()
     );
     assert_family_cache(family, pipeline_rank, &cache, 0);
+    if std::env::var_os(FINAL_OUTPUT_INTERVENTION).is_some() {
+        struct ReplacingLogits {
+            observed: bool,
+        }
+
+        impl eredu_runtime::ActivationObserver<Array, safemlx::error::Exception> for ReplacingLogits {
+            fn observe(
+                &mut self,
+                path: &str,
+                _value: &Array,
+            ) -> Result<(), safemlx::error::Exception> {
+                self.observed |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
+                Ok(())
+            }
+
+            fn intervene(
+                &mut self,
+                path: &str,
+                _value: &Array,
+            ) -> Result<Option<Array>, safemlx::error::Exception> {
+                Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+                    .then(|| Array::from_slice(&[37.0f32], &[1])))
+            }
+        }
+
+        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let mut observer = ReplacingLogits { observed: false };
+        let logits = model
+            .forward_distributed_with_observer(
+                (pipeline_rank == 0).then_some(&prompt),
+                PipelineStep::new(1, 2).unwrap(),
+                None,
+                &mut cache,
+                &execution,
+                &mut observer,
+            )
+            .unwrap()
+            .into_logits()
+            .unwrap();
+        assert_eq!(
+            observer.observed,
+            pipeline_rank + 1 == pipeline_parallel_size
+        );
+        match logits {
+            Some(logits) => {
+                assert_eq!(logits.shape(), &[1]);
+                assert_eq!(logits.evaluated().unwrap().as_slice::<f32>(), &[37.0]);
+            }
+            None => assert_ne!(pipeline_rank + 1, pipeline_parallel_size),
+        }
+        return;
+    }
     let prefix_ids = match family {
         FixtureFamily::InklingMultimodal => vec![1, 2, 21, 20, 20],
         FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
@@ -1549,6 +1602,71 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
             .cache_residency_report()
             .unwrap()
             .is_some());
+    }
+}
+
+#[test]
+fn complete_family_adapters_return_final_output_interventions() {
+    fn write_qwen(directory: &Path) {
+        write_qwen_fixture(directory, "qwen3");
+    }
+
+    let fixtures: [(&str, fn(&Path)); 7] = [
+        ("Llama", write_fixture),
+        ("Qwen", write_qwen),
+        ("DeepSeek", |directory| write_deepseek_fixture(directory, 2)),
+        ("Gemma 4", write_gemma4_tensor_parallel_fixture),
+        ("Inkling", write_inkling_fixture),
+        ("Muse-Glimmer", write_muse_glimmer_tensor_parallel_fixture),
+        ("Kimi Linear", write_kimi_linear_fixture),
+    ];
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+
+    for (family, write_fixture) in fixtures {
+        struct ReplacingLogits {
+            observed: bool,
+        }
+
+        impl eredu_runtime::ActivationObserver<MlxTensor, safemlx::error::Exception> for ReplacingLogits {
+            fn observe(
+                &mut self,
+                path: &str,
+                _value: &MlxTensor,
+            ) -> Result<(), safemlx::error::Exception> {
+                self.observed |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
+                Ok(())
+            }
+
+            fn intervene(
+                &mut self,
+                path: &str,
+                _value: &MlxTensor,
+            ) -> Result<Option<MlxTensor>, safemlx::error::Exception> {
+                Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+                    .then(|| MlxTensor::from_array(Array::from_slice(&[41.0f32], &[1]))))
+            }
+        }
+
+        let checkpoint = tempfile::tempdir().unwrap();
+        write_fixture(checkpoint.path());
+        let backend = crate::native::backend(&stream, &stream);
+        let mut model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default())
+            .unwrap()
+            .into_inner()
+            .into_complete()
+            .unwrap();
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let mut observer = ReplacingLogits { observed: false };
+        let output = model
+            .forward_with_observer(&tokens, None, &stream, &mut observer)
+            .unwrap_or_else(|error| panic!("{family} observed forward failed: {error}"));
+        assert!(observer.observed, "{family} did not report final logits");
+        assert_eq!(output.shape(), &[1], "{family} ignored the intervention");
+        assert_eq!(
+            output.evaluated().unwrap().as_slice::<f32>(),
+            &[41.0],
+            "{family} returned its original logits"
+        );
     }
 }
 
@@ -4973,6 +5091,19 @@ fn ring_two_process_pipeline_inspection_uses_canonical_paths() {
     run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueInspection);
 }
 
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_pipeline_final_output_intervention_is_uniform_across_families() {
+    for family in [
+        FixtureFamily::Llama,
+        FixtureFamily::Qwen3,
+        FixtureFamily::DeepSeek,
+        FixtureFamily::KimiLinear,
+    ] {
+        run_ring_pipeline_mode(false, family, WorkerMode::FinalOutputIntervention);
+    }
+}
+
 /// Runs backend-generic text generation across a pipeline whose non-output
 /// rank legitimately produces no local logits.
 #[test]
@@ -6719,6 +6850,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WorkerMode {
     Standard,
+    FinalOutputIntervention,
     ExpertCache,
     ExpertCacheRequantize,
     Requantize,
@@ -6902,6 +7034,9 @@ fn run_ring_pipeline_processes(
         }
         match mode {
             WorkerMode::Standard => {}
+            WorkerMode::FinalOutputIntervention => {
+                command.env(FINAL_OUTPUT_INTERVENTION, "1");
+            }
             WorkerMode::ExpertCache => {
                 command.env(EXPERT_CACHE, "1");
             }

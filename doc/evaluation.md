@@ -32,7 +32,11 @@ residency, and topology information before tensor payload materialization.
 Instrumented execution wraps the production resident, bounded, expert-provider,
 and distributed paths rather than running a second family implementation.
 Distributed observations are rank-local; only the output-owning rank exposes
-`model.logits`.
+`model.logits`. An `ActivationObserver` may replace any reported activation;
+the instrumented result includes that replacement uniformly across model
+families and topologies. Final outputs use the runtime-owned
+`observe_model_logits` finalizer, and a distributed finalizer runs only on the
+rank that owns logits.
 
 Architecture execution already emits named activation and routed-expert points
 through `eredu-runtime::ActivationObserver`. A backend inspection adapter binds

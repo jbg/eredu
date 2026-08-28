@@ -982,8 +982,9 @@ impl MuseGlimmerModel {
         };
         self.expert_cache = expert_cache;
         let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits.as_array())?;
-        Ok(logits)
+        eredu_runtime::observe_model_logits(observer, logits.as_array())
+            .map(crate::MlxTensor::from_array)
+            .map_err(Error::from)
     }
 
     pub fn forward_tokens_with_observer(
@@ -1310,12 +1311,7 @@ impl MuseGlimmerModel {
                 },
             }
             .map_err(|error| Error::Parallel(error.to_string()))?;
-            eredu_runtime::observe_and_intervene(
-                &mut neutral,
-                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-                &output,
-            )
-            .map_err(Error::from)
+            eredu_runtime::observe_model_logits(&mut neutral, &output).map_err(Error::from)
         };
         self.expert_cache = expert_cache;
         result

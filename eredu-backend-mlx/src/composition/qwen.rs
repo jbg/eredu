@@ -603,11 +603,7 @@ impl QwenModel {
         };
         self.expert_cache = expert_cache;
         let output = result?;
-        observer
-            .inner
-            .observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, &output)
-            .map_err(Error::from)?;
-        Ok(output)
+        eredu_runtime::observe_model_logits(observer.inner, &output).map_err(Error::from)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -803,13 +799,9 @@ impl QwenModel {
                 }
             }
             .map_err(|error| Error::Parallel(error.to_string()))?;
-            eredu_runtime::observe_and_intervene(
-                &mut neutral,
-                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-                &output,
-            )
-            .map(crate::MlxTensor::into_array)
-            .map_err(Error::from)
+            eredu_runtime::observe_model_logits(&mut neutral, &output)
+                .map(crate::MlxTensor::into_array)
+                .map_err(Error::from)
         };
         self.expert_cache = expert_cache;
         result

@@ -152,8 +152,13 @@ Backends may additionally implement `InspectableBackendSession` by binding the
 named activation and routed-expert points already emitted by
 `eredu-runtime::ActivationObserver`. These are general diagnostics contracts
 used by telemetry, inspection, observability, and evaluation rather than an
-evaluation-specific backend surface. Realtime applications likewise exchange
-portable host token frames and observations through
+evaluation-specific backend surface. `ActivationObserver` is also an
+intervention contract: every named activation returned by instrumented
+execution must include any replacement it supplies. Family adapters and
+topology executors finalize logits through
+`eredu_runtime::observe_model_logits`; pipeline execution does so on the
+logits-owning rank before submitting its completion. Realtime applications
+likewise exchange portable host token frames and observations through
 `RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
 Distributed inspection is rank-local: every rank participates in the same
 production collective and point-to-point execution, each rank returns only the

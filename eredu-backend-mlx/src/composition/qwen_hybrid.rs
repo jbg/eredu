@@ -1110,10 +1110,10 @@ impl QwenHybridModel {
                 }
                 _ => unreachable!("conditional policy uses conditional execution"),
             }
-            .map(crate::MlxTensor::into_array)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, &output)?;
-            return Ok(output);
+            return eredu_runtime::observe_model_logits(&mut neutral_observer, &output)
+                .map(crate::MlxTensor::into_array)
+                .map_err(Error::from);
         }
         let input = EmbeddedInput::target(crate::composition::tensor_ref(tokens), None);
         let output = match &mut self.execution {
@@ -1125,10 +1125,10 @@ impl QwenHybridModel {
             }
             Execution::ConditionalResident(_) | Execution::ConditionalBounded(_) => unreachable!(),
         }
-        .map(crate::MlxTensor::into_array)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, &output)?;
-        Ok(output)
+        eredu_runtime::observe_model_logits(&mut neutral_observer, &output)
+            .map(crate::MlxTensor::into_array)
+            .map_err(Error::from)
     }
 
     pub fn prefill_input_with_observer(
@@ -1265,10 +1265,8 @@ impl QwenHybridModel {
                 _ => return Err(Exception::custom("Qwen3.5 model is not conditional")),
             }
             .map_err(|error| Exception::custom(error.to_string()))?;
-            observer.observe(
-                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-                logits.as_array(),
-            )?;
+            let logits = eredu_runtime::observe_model_logits(&mut neutral_observer, &logits)
+                .map_err(|error| Exception::custom(error.to_string()))?;
             return Ok(PreparedConditionalOutput {
                 logits,
                 hidden: None,

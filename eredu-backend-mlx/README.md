@@ -84,6 +84,8 @@ capabilities are derived from the inspected architecture, residency policy,
 and topology before checkpoint payloads are materialized, then verified again
 on the realized session. Activation inspection executes the production forward
 path for resident, bounded, tensor-parallel, and pipeline/Cartesian sessions.
+Observer replacements are returned from every named activation point,
+including final logits, independently of family and topology.
 Distributed results are rank-local: ranks report the global activation paths
 they own, and only the final/logits-owning rank reports `model.logits`; no
 implicit host gather is performed.

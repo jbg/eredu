@@ -10603,12 +10603,7 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<PipelineStageCompletion, Error> {
-        let completion =
-            self.forward_distributed_inner(tokens, step, mask, cache, execution, Some(observer))?;
-        if let Some(logits) = completion.logits() {
-            observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits)?;
-        }
-        Ok(completion)
+        self.forward_distributed_inner(tokens, step, mask, cache, execution, Some(observer))
     }
 
     /// Runs typed multimodal prefill through the selected distributed session.
@@ -10684,12 +10679,7 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<PipelineStageCompletion, Error> {
-        let completion =
-            self.prefill_distributed_inner(input, step, mask, cache, execution, Some(observer))?;
-        if let Some(logits) = completion.logits() {
-            observer.observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, logits)?;
-        }
-        Ok(completion)
+        self.prefill_distributed_inner(input, step, mask, cache, execution, Some(observer))
     }
 
     /// Reports the complete pipeline's prediction support.
@@ -11548,7 +11538,7 @@ impl PipelineModel {
                     .expect("non-input-owner partition received payload"),
             );
             validate_stage_input(&self.info, &input, step, &resolved_boundary)?;
-            match observer {
+            match observer.as_mut() {
                 Some(observer) => self.stage.forward_observed_with_execution(
                     input,
                     step,
@@ -11557,7 +11547,7 @@ impl PipelineModel {
                     tensor,
                     expert_group,
                     stream,
-                    observer,
+                    &mut **observer,
                 )?,
                 None if tensor.is_none() && expert_group.is_none() => {
                     self.stage
@@ -11637,6 +11627,11 @@ impl PipelineModel {
             }
             PipelineStageOutput::Logits(logits) => {
                 self.last_mtp_hidden = None;
+                let logits = match observer.as_mut() {
+                    Some(observer) => eredu_runtime::observe_model_logits(&mut **observer, &logits)
+                        .map_err(Error::from)?,
+                    None => logits,
+                };
                 Ok(PendingPipelineStageCompletion {
                     logits: Some(logits),
                     retained,
@@ -11645,6 +11640,11 @@ impl PipelineModel {
             PipelineStageOutput::EmbeddedMtpLogits { logits, hidden } => {
                 retained.push(hidden.clone());
                 self.last_mtp_hidden = Some(hidden);
+                let logits = match observer.as_mut() {
+                    Some(observer) => eredu_runtime::observe_model_logits(&mut **observer, &logits)
+                        .map_err(Error::from)?,
+                    None => logits,
+                };
                 Ok(PendingPipelineStageCompletion {
                     logits: Some(logits),
                     retained,
