@@ -468,6 +468,26 @@ impl<M: Parameterized<MlxTensor>> ModuleParameters for MlxModuleRef<'_, M> {
     }
 }
 
+impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxModuleRef<'_, M> {
+    fn visit_parameters<'b, V>(&'b self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'b, MlxTensor>,
+    {
+        self.inner.visit_parameters(visitor);
+    }
+
+    fn visit_parameters_mut<'b, V>(&'b mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'b, MlxTensor>,
+    {
+        self.inner.visit_parameters_mut(visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        self.inner.set_trainable(trainable);
+    }
+}
+
 /// Native MLX module exposed through stable neutral parameter identities.
 #[derive(Debug, Clone)]
 pub struct MlxNamedModule<M> {

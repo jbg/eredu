@@ -110,7 +110,7 @@ where
 
 /// Accumulates strict checkpoint-loading diagnostics across one or more files.
 #[derive(Debug, Clone, Default)]
-pub struct StrictLoadReport {
+pub(crate) struct StrictLoadReport {
     loaded: HashSet<String>,
     unused: Vec<String>,
     shape_mismatches: Vec<String>,
@@ -118,17 +118,17 @@ pub struct StrictLoadReport {
 
 impl StrictLoadReport {
     /// Records a checkpoint tensor successfully assigned to a parameter.
-    pub fn record_loaded(&mut self, key: String) {
+    fn record_loaded(&mut self, key: String) {
         self.loaded.insert(key);
     }
 
     /// Records an unused checkpoint tensor.
-    pub fn record_unused(&mut self, key: String) {
+    fn record_unused(&mut self, key: String) {
         self.unused.push(key);
     }
 
     /// Records a checkpoint tensor whose shape did not match its parameter.
-    pub fn record_shape_mismatch(
+    fn record_shape_mismatch(
         &mut self,
         weight_key: String,
         param_key: String,
@@ -141,13 +141,14 @@ impl StrictLoadReport {
     }
 
     /// Validates the report against the model parameters.
-    pub fn finish<M: ModuleParameters + ?Sized>(self, model: &M) -> Result<(), Error> {
+    #[cfg(test)]
+    pub(crate) fn finish<M: ModuleParameters + ?Sized>(self, model: &M) -> Result<(), Error> {
         self.finish_excluding(model, |_| false)
     }
 
     /// Validates a partial strict load while leaving an independently managed
     /// parameter class untouched.
-    pub fn finish_excluding<M, F>(self, model: &M, excluded: F) -> Result<(), Error>
+    pub(crate) fn finish_excluding<M, F>(self, model: &M, excluded: F) -> Result<(), Error>
     where
         M: ModuleParameters + ?Sized,
         F: Fn(&str) -> bool,
@@ -173,32 +174,6 @@ impl StrictLoadReport {
             Err(Error::StrictLoadValidation { missing, unused })
         }
     }
-}
-
-/// Strict-loads and quantizes eligible tensors from an in-memory named-array
-/// source such as an unquantized GGUF. The map is consumed so each dense source
-/// array can be released after its packed replacement is materialized.
-#[cfg(test)]
-pub fn load_arrays_quantized_strict<M: ModuleParameters>(
-    model: &mut M,
-    loaded: HashMap<String, Array>,
-    quantization_stream: &Stream,
-    quantization: WeightQuantization,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    quantization.validate()?;
-    let mut params = model.parameters_mut().flatten();
-    for (key, value) in loaded {
-        load_array_quantized_strict(
-            &mut params,
-            key,
-            value,
-            quantization_stream,
-            quantization,
-            report,
-        )?;
-    }
-    Ok(())
 }
 
 /// Visits every tensor in one safetensors file as an MLX-owned array.
@@ -234,40 +209,33 @@ fn quantize_safetensors_for_test<M: ModuleParameters>(
     weights_stream: &Stream,
     quantization_stream: &Stream,
     quantization: WeightQuantization,
+    recipes: &HashMap<String, QuantizedLoadRecipe>,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
     quantization.validate()?;
     let mut params = model.parameters_mut().flatten();
     for_each_safetensor_array(path, weights_stream, |key, value| {
+        let recipe = recipes.get(&key);
         load_array_quantized_strict(
             &mut params,
             key,
             value,
             quantization_stream,
             quantization,
+            recipe,
             report,
         )
     })
 }
 
-/// Strict-loads one architecture-named checkpoint tensor into a module.
-///
-/// Exact parameter identities take precedence. A canonical `weight` key is
-/// mapped to a private MLX `inner.weight` slot only when no exact slot exists.
-pub fn load_array_strict(
+/// Strict-loads one exact checkpoint tensor identity into a module parameter.
+pub(crate) fn load_array_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
     value: Array,
     report: &mut StrictLoadReport,
 ) {
-    let parameter_key = if params.contains_key(key.as_str()) {
-        key.clone()
-    } else {
-        wrapped_weight_parameter_name(&key)
-            .filter(|candidate| params.contains_key(candidate.as_str()))
-            .unwrap_or_else(|| key.clone())
-    };
-    load_array_for_parameter_strict(params, key, parameter_key, value, report);
+    load_array_for_parameter_strict(params, key.clone(), key, value, report);
 }
 
 fn load_array_for_parameter_strict(
@@ -282,33 +250,8 @@ fn load_array_for_parameter_strict(
             let expected_shape = param.shape().to_vec();
             let actual_shape = value.shape().to_vec();
             if expected_shape == actual_shape {
-                let checkpoint_native_blocks = value.dtype() == safemlx::Dtype::Uint8;
                 **param = value;
-                report.record_loaded(parameter_key.clone());
-                if checkpoint_native_blocks {
-                    let prefix = if matches!(parameter_key.as_str(), "inner.weight" | "weight") {
-                        Some("")
-                    } else {
-                        parameter_key
-                            .strip_suffix(".inner.weight")
-                            .or_else(|| parameter_key.strip_suffix(".weight"))
-                    };
-                    if let Some(prefix) = prefix {
-                        let scales = if prefix.is_empty() {
-                            "scales".to_string()
-                        } else {
-                            format!("{prefix}.scales")
-                        };
-                        if params
-                            .get(scales.as_str())
-                            .is_some_and(|scales| scales.shape() == [1])
-                        {
-                            // Native-block modules retain a one-element unloaded
-                            // scale placeholder solely for parameter compatibility.
-                            report.record_loaded(scales);
-                        }
-                    }
-                }
+                report.record_loaded(parameter_key);
             } else {
                 report.record_shape_mismatch(
                     source_key,
@@ -323,116 +266,97 @@ fn load_array_for_parameter_strict(
     }
 }
 
-fn wrapped_weight_parameter_name(key: &str) -> Option<String> {
-    if key == "weight" {
-        Some("inner.weight".into())
-    } else {
-        key.strip_suffix(".weight")
-            .map(|prefix| format!("{prefix}.inner.weight"))
+/// Exact parameter destinations for quantizing one dense source tensor.
+///
+/// The caller obtains these identities from architecture parameter metadata;
+/// this loader never derives private slots or companion names.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(in crate::backend::runtime::checkpoint) struct QuantizedLoadRecipe {
+    weight: String,
+    scales: String,
+    biases: Option<String>,
+}
+
+impl QuantizedLoadRecipe {
+    pub(in crate::backend::runtime::checkpoint) fn new(
+        weight: impl Into<String>,
+        scales: impl Into<String>,
+        biases: Option<String>,
+    ) -> Self {
+        Self {
+            weight: weight.into(),
+            scales: scales.into(),
+            biases,
+        }
     }
 }
 
-fn quantization_companion_names(weight_key: &str) -> (String, String) {
-    let (prefix, underscore_companions) = if let Some(prefix) = weight_key.strip_suffix(".weight") {
-        (prefix, false)
-    } else if weight_key == "weight" {
-        ("", false)
-    } else {
-        (weight_key, true)
-    };
-    if prefix.is_empty() {
-        ("scales".into(), "biases".into())
-    } else if underscore_companions {
-        (format!("{prefix}_scales"), format!("{prefix}_biases"))
-    } else {
-        (format!("{prefix}.scales"), format!("{prefix}.biases"))
-    }
-}
-
-fn wrapped_weight_companion_names(parameter_key: &str) -> Option<(String, String)> {
-    let prefix = if parameter_key == "inner.weight" {
-        ""
-    } else {
-        parameter_key.strip_suffix(".inner.weight")?
-    };
-    Some(if prefix.is_empty() {
-        ("scales".into(), "biases".into())
-    } else {
-        (format!("{prefix}.scales"), format!("{prefix}.biases"))
-    })
-}
-
-/// Strict-loads a dense safetensors file into a model whose selected parameters
-/// use the standard MLX affine quantized layout.
+/// Strict-loads or explicitly quantizes one named array.
 ///
 /// Dense matrices are quantized and materialized one at a time as they are
-/// read, bounding the lazy graph and active allocation peak. Exact checkpoint
-/// identities and companion slots take precedence; canonical `weight` names
-/// are mapped to wrapped MLX `inner.weight` storage only when necessary.
-pub fn load_array_quantized_strict(
+/// read, bounding the lazy graph and active allocation peak. A quantization
+/// recipe contains every exact destination; without one, loading is exact.
+pub(in crate::backend::runtime::checkpoint) fn load_array_quantized_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
     value: Array,
     quantization_stream: &Stream,
     quantization: WeightQuantization,
+    recipe: Option<&QuantizedLoadRecipe>,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
-    {
-        let weight_key = key.clone();
-        let parameter_key = if params.contains_key(weight_key.as_str()) {
-            weight_key.clone()
-        } else {
-            wrapped_weight_parameter_name(&weight_key)
-                .filter(|candidate| params.contains_key(candidate.as_str()))
-                .unwrap_or_else(|| weight_key.clone())
-        };
-        let exact_companions = quantization_companion_names(&weight_key);
-        let companions = std::iter::once(exact_companions.clone())
-            .chain(
-                wrapped_weight_companion_names(&parameter_key)
-                    .filter(|candidate| candidate != &exact_companions),
-            )
-            .find(|(scales_key, biases_key)| {
-                params.contains_key(scales_key.as_str())
-                    && (!quantization.has_biases() || params.contains_key(biases_key.as_str()))
-            });
-        let wrapped_weight = parameter_key != weight_key;
-        let packed_direct_weight = !wrapped_weight
-            && params
-                .get(parameter_key.as_str())
-                .is_some_and(|target| target.shape() != value.shape());
-        let target = companions
-            .filter(|_| {
-                params.contains_key(parameter_key.as_str())
-                    && (wrapped_weight || packed_direct_weight)
-            })
-            .map(|(scales_key, biases_key)| (weight_key, parameter_key, scales_key, biases_key));
-
-        if let Some((weight_key, parameter_key, scales_key, biases_key)) = target {
-            let quantized = quantize_tensor(&value, quantization, quantization_stream)?;
-            // MLX quantization is lazy. Materialize this tensor before the
-            // source value leaves the streaming callback so subsequent
-            // weights do not accumulate a checkpoint-sized dense graph.
-            let mut arrays = vec![&quantized.weight, &quantized.scales];
-            if let Some(biases) = &quantized.biases {
-                arrays.push(biases);
-            }
-            async_eval_with_event(arrays)?.synchronize()?;
-            load_array_for_parameter_strict(
-                params,
-                weight_key,
-                parameter_key,
-                quantized.weight,
-                report,
-            );
-            load_array_strict(params, scales_key, quantized.scales, report);
-            if let Some(biases) = quantized.biases {
-                load_array_strict(params, biases_key, biases, report);
-            }
-            return Ok(());
-        }
+    let Some(recipe) = recipe else {
+        load_array_strict(params, key, value, report);
+        return Ok(());
+    };
+    let quantized = quantize_tensor(&value, quantization, quantization_stream)?;
+    // MLX quantization is lazy. Materialize this tensor before the source
+    // value leaves the streaming callback so subsequent weights do not
+    // accumulate a checkpoint-sized dense graph.
+    let mut arrays = vec![&quantized.weight, &quantized.scales];
+    if let Some(biases) = &quantized.biases {
+        arrays.push(biases);
     }
-    load_array_strict(params, key, value, report);
+    async_eval_with_event(arrays)?.synchronize()?;
+    load_array_for_parameter_strict(params, key, recipe.weight.clone(), quantized.weight, report);
+    load_array_strict(params, recipe.scales.clone(), quantized.scales, report);
+    if let Some(biases) = quantized.biases {
+        let Some(biases_key) = &recipe.biases else {
+            return Err(Error::ArchitectureModel(format!(
+                "quantized load recipe for {:?} has no affine-bias destination",
+                recipe.weight
+            )));
+        };
+        load_array_strict(params, biases_key.clone(), biases, report);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+fn load_arrays_quantized_strict<M: ModuleParameters>(
+    model: &mut M,
+    loaded: HashMap<String, Array>,
+    quantization_stream: &Stream,
+    quantization: WeightQuantization,
+    recipes: &HashMap<String, QuantizedLoadRecipe>,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    quantization.validate()?;
+    let mut params = model.parameters_mut().flatten();
+    for (key, value) in loaded {
+        load_array_quantized_strict(
+            &mut params,
+            key.clone(),
+            value,
+            quantization_stream,
+            quantization,
+            recipes.get(&key),
+            report,
+        )?;
+    }
     Ok(())
 }
 
@@ -493,8 +417,8 @@ mod tests {
     use super::gguf_quantization_configs;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use super::{
-        load_array_strict, load_arrays_quantized_strict, quantize_safetensors_for_test,
-        StrictLoadReport,
+        load_array_strict, load_arrays_quantized_strict, quantize_safetensors_for_test, Error,
+        QuantizedLoadRecipe, StrictLoadReport,
     };
 
     #[test]
@@ -644,6 +568,35 @@ mod tests {
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
+    fn strict_load_does_not_translate_canonical_weight_to_private_slot() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut model = ExactInnerWeight {
+            projection: ExactInnerProjection {
+                inner: ExactPackedLinear {
+                    weight: Param::<Array>::unloaded(&[8, 64], Dtype::Float32, stream).unwrap(),
+                    scales: Param::<Array>::unloaded(&[8, 2], Dtype::Float32, stream).unwrap(),
+                    biases: Param::new(None),
+                },
+            },
+        };
+        let value = Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]);
+        let mut report = StrictLoadReport::default();
+        load_array_strict(
+            &mut model.parameters_mut().flatten(),
+            "projection.weight".into(),
+            value,
+            &mut report,
+        );
+        assert!(matches!(
+            report.finish_excluding(&model, |name| name != "projection.inner.weight"),
+            Err(Error::StrictLoadValidation { missing, unused })
+                if missing == ["projection.inner.weight"] && unused == ["projection.weight"]
+        ));
+    }
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
     fn named_array_quantization_packs_rank_three_experts() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
@@ -660,6 +613,10 @@ mod tests {
             HashMap::from([("experts".into(), dense)]),
             stream,
             WeightQuantization::MxFp4,
+            &HashMap::from([(
+                "experts".into(),
+                QuantizedLoadRecipe::new("experts", "experts_scales", None),
+            )]),
             &mut report,
         )
         .unwrap();
@@ -674,7 +631,7 @@ mod tests {
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
-    fn quantized_strict_load_maps_canonical_weight_names_to_private_slots() {
+    fn quantized_strict_load_uses_explicit_private_slot_recipe() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -712,6 +669,14 @@ mod tests {
             weights_stream,
             stream,
             quantization.into(),
+            &HashMap::from([(
+                "projection.weight".into(),
+                QuantizedLoadRecipe::new(
+                    "projection.inner.weight",
+                    "projection.scales",
+                    Some("projection.biases".into()),
+                ),
+            )]),
             &mut report,
         )
         .unwrap();
@@ -776,6 +741,14 @@ mod tests {
             HashMap::from([("projection.inner.weight".into(), dense)]),
             stream,
             quantization.into(),
+            &HashMap::from([(
+                "projection.inner.weight".into(),
+                QuantizedLoadRecipe::new(
+                    "projection.inner.weight",
+                    "projection.inner.scales",
+                    Some("projection.inner.biases".into()),
+                ),
+            )]),
             &mut report,
         )
         .unwrap();
@@ -830,6 +803,10 @@ mod tests {
             weights_stream,
             stream,
             WeightQuantization::MxFp4,
+            &HashMap::from([(
+                "projection.weight".into(),
+                QuantizedLoadRecipe::new("projection.inner.weight", "projection.scales", None),
+            )]),
             &mut report,
         )
         .unwrap();

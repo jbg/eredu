@@ -12473,14 +12473,17 @@ fn validate_hidden_metadata(
     Ok(())
 }
 
-fn load_bound_module(
-    module: &mut (impl ModuleParameters + ?Sized),
+fn load_bound_module<M>(
+    module: &mut M,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
-) -> Result<(u64, Vec<String>), Error> {
+) -> Result<(u64, Vec<String>), Error>
+where
+    M: ModuleParameters + Parameterized<crate::MlxTensor>,
+{
     load_bound_module_excluding(
         module,
         store,
@@ -12493,15 +12496,18 @@ fn load_bound_module(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_bound_module_excluding(
-    module: &mut (impl ModuleParameters + ?Sized),
+fn load_bound_module_excluding<M>(
+    module: &mut M,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
     excluded: &dyn Fn(&str) -> bool,
-) -> Result<(u64, Vec<String>), Error> {
+) -> Result<(u64, Vec<String>), Error>
+where
+    M: ModuleParameters + Parameterized<crate::MlxTensor>,
+{
     let arrays = materialize_module_bindings(store, bindings, weights_stream, stream)?;
     if let Some(quantization) = quantize_on_load {
         populate_module_from_dense_arrays_quantized_excluding(
@@ -12558,7 +12564,7 @@ impl PipelineLoadAccumulator {
         }
     }
 
-    fn load<M: ModuleParameters + ?Sized>(
+    fn load<M>(
         &mut self,
         owner: eredu_runtime::ParameterGroupOwner,
         module: &mut M,
@@ -12567,7 +12573,10 @@ impl PipelineLoadAccumulator {
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
         stream: &Stream,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        M: ModuleParameters + Parameterized<crate::MlxTensor>,
+    {
         validate_partition_owner_bindings(&self.binding_authority, &owner, bindings)?;
         let (bytes, names) = load_bound_module(
             module,
@@ -12585,7 +12594,7 @@ impl PipelineLoadAccumulator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn load_excluding_roles<M: ModuleParameters + ?Sized>(
+    fn load_excluding_roles<M>(
         &mut self,
         owner: eredu_runtime::ParameterGroupOwner,
         module: &mut M,
@@ -12595,7 +12604,10 @@ impl PipelineLoadAccumulator {
         weights_stream: &Stream,
         stream: &Stream,
         excluded_roles: &[eredu_runtime::ParameterRole],
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        M: ModuleParameters + Parameterized<crate::MlxTensor>,
+    {
         let (_, excluded_targets) =
             owner_parameter_targets(&self.binding_authority, &owner, excluded_roles)?;
         validate_partition_owner_bindings_excluding_roles(

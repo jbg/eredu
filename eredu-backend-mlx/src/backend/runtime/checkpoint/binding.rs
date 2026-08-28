@@ -8,7 +8,7 @@ use eredu_checkpoint::{
     store::{ReadPolicy, TensorReadRequest},
     WeightQuantization,
 };
-use eredu_nn::Parameterized;
+use eredu_nn::{validate_parameter_topology, LinearCompanionRole, Parameterized};
 use eredu_runtime::{ParameterGroupSpec, ParameterRole, WeightBinding, WeightBindingPlan};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -22,7 +22,9 @@ use crate::{
     backend::error::Error,
     backend::nn::shared::neutral_parameter_refs,
     backend::runtime::checkpoint::binding_plan::{BindingPlan, BindingPlanError, PlannedBinding},
-    backend::runtime::checkpoint::load::{load_array_quantized_strict, StrictLoadReport},
+    backend::runtime::checkpoint::load::{
+        load_array_quantized_strict, QuantizedLoadRecipe, StrictLoadReport,
+    },
     backend::runtime::checkpoint::recipe::{
         recipe_dtype_from_mlx, MlxWeightRecipeExt, WeightRecipeError,
     },
@@ -444,17 +446,19 @@ where
 
 /// Populates a quantized target from dense direct or derived bindings while an
 /// independent residency manager may own an excluded parameter class.
-pub fn populate_module_from_dense_arrays_quantized_excluding<F>(
-    module: &mut (impl ModuleParameters + ?Sized),
+pub(crate) fn populate_module_from_dense_arrays_quantized_excluding<M, F>(
+    module: &mut M,
     arrays: &BTreeMap<String, Array>,
     quantization: WeightQuantization,
     stream: &Stream,
     excluded: F,
 ) -> Result<(), Error>
 where
+    M: ModuleParameters + Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     quantization.validate()?;
+    let recipes = quantized_load_recipes(module, quantization)?;
     let mut report = StrictLoadReport::default();
     {
         let mut parameters = module.parameters_mut().flatten();
@@ -465,11 +469,80 @@ where
                 value.clone(),
                 stream,
                 quantization,
+                recipes.get(name),
                 &mut report,
             )?;
         }
     }
     report.finish_excluding(module, excluded)
+}
+
+fn quantized_load_recipes<M>(
+    module: &M,
+    quantization: WeightQuantization,
+) -> Result<BTreeMap<String, QuantizedLoadRecipe>, Error>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    #[derive(Default)]
+    struct Companions {
+        scales: Option<String>,
+        biases: Option<String>,
+    }
+
+    let topology = validate_parameter_topology(module)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let parameters = topology
+        .iter()
+        .map(|parameter| parameter.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut companions = BTreeMap::<String, Companions>::new();
+    for parameter in &topology {
+        let (Some(role), Some(owner)) = (
+            parameter.linear_companion,
+            parameter.linear_companion_of.as_ref(),
+        ) else {
+            continue;
+        };
+        if !parameters.contains(owner.as_str()) {
+            return Err(Error::ArchitectureModel(format!(
+                "linear companion {:?} names missing owner {:?}",
+                parameter.id.as_str(),
+                owner.as_str()
+            )));
+        }
+        let target = companions.entry(owner.as_str().to_owned()).or_default();
+        let slot = match role {
+            LinearCompanionRole::Scale => &mut target.scales,
+            LinearCompanionRole::AffineBias => &mut target.biases,
+        };
+        if slot.replace(parameter.id.as_str().to_owned()).is_some() {
+            return Err(Error::ArchitectureModel(format!(
+                "linear weight {:?} declares duplicate {role:?} companions",
+                owner.as_str()
+            )));
+        }
+    }
+
+    companions
+        .into_iter()
+        .map(|(weight, companions)| {
+            let scales = companions.scales.ok_or_else(|| {
+                Error::ArchitectureModel(format!(
+                    "quantized linear weight {weight:?} has no declared scale companion"
+                ))
+            })?;
+            if quantization.has_biases() != companions.biases.is_some() {
+                return Err(Error::ArchitectureModel(format!(
+                    "quantized linear weight {weight:?} companion declaration does not match {quantization:?}"
+                )));
+            }
+            Ok((
+                weight.clone(),
+                QuantizedLoadRecipe::new(weight, scales, companions.biases),
+            ))
+        })
+        .collect()
 }
 
 /// Builds bindings while excluding parameters managed by another loader.
@@ -893,6 +966,52 @@ pub enum ModuleBindingError {
 mod tests {
     use super::*;
     use eredu_checkpoint::store::MemoryWeightStore;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use eredu_checkpoint::AffineQuantization;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use eredu_nn::{LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn quantized_population_uses_declared_companion_identities() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let quantization = AffineQuantization::default();
+        let parameter = |name| ParameterSpec::trainable(name).unwrap();
+        let linear = <crate::backend::nn::shared::MlxNeuralBackend as NeuralBackend>::linear(
+            LinearSpec {
+                input: 64,
+                output: 8,
+                weight: parameter("unconventional.matrix"),
+                bias: None,
+                format: LinearFormatSpec::affine(
+                    LinearFormat::Affine(quantization),
+                    parameter("separate.scale.factor"),
+                    parameter("another.affine.offset"),
+                )
+                .unwrap(),
+            },
+            stream,
+        )
+        .unwrap();
+        let mut module = crate::backend::nn::shared::MlxModule::new(linear);
+        let dense = Array::from_slice(&vec![0.25f32; 8 * 64], &[8, 64]);
+        populate_module_from_dense_arrays_quantized_excluding(
+            &mut module,
+            &BTreeMap::from([("unconventional.matrix".into(), dense)]),
+            quantization.into(),
+            stream,
+            |_| false,
+        )
+        .unwrap();
+
+        let parameters = module.parameters().flatten();
+        assert_eq!(parameters["unconventional.matrix"].shape(), &[8, 8]);
+        assert_eq!(parameters["separate.scale.factor"].shape(), &[8, 1]);
+        assert_eq!(parameters["another.affine.offset"].shape(), &[8, 1]);
+    }
 
     #[test]
     fn architecture_inner_path_is_an_exact_parameter_identity() {

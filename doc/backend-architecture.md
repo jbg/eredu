@@ -347,9 +347,13 @@ neutral `Parameterized` topology, including when native storage uses private
 module slots. Generic binding, residency, and distributed-planning utilities
 consume those exact identities and never normalize path segments; private
 native topology must not widen or rewrite the checkpoint contract. Backend
-loading likewise resolves an exact declared parameter identity before mapping
-a canonical weight identity to a private native slot; it never rejects a name
-because one of its path segments is spelled `inner`.
+loading traverses that declared topology, so any canonical identity-to-private
+slot association is fixed when the operator is constructed rather than
+inferred from a checkpoint name. Load-time quantization consumes explicit
+weight, scale, and optional affine-bias relationships from the same topology;
+the strict loader neither derives companion names nor treats backend-only
+placeholder slots as checkpoint-backed parameters. An architecture identity
+containing an `inner` segment is therefore loaded exactly like any other name.
 
 The underlying catalogs are model-wide and configuration-derived, but each
 family's architecture checkpoint API selects the complete recipe group for a
@@ -1197,7 +1201,10 @@ composition:
   checkpoint API consumes exact local parameter identities and
   architecture-derived bindings and recipes. Strict module loading performs no
   prefix stripping, prefix rewriting, unused-prefix exemptions, or implicit
-  parameter-name expansion. Selective partition loading likewise requires
+  parameter-name expansion. Load-time quantization receives exact companion
+  destinations through architecture parameter metadata, and backend-only
+  native sentinels are absent from that topology rather than marked as loaded.
+  Selective partition loading likewise requires
   exact checkpoint keys in its placement plan; neither surface invents family
   aliases or exposes parsers for physical family checkpoint names. Distributed
   sharding resolves each non-alias binding solely by its exact
