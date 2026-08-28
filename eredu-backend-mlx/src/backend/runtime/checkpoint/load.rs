@@ -141,7 +141,10 @@ impl StrictLoadReport {
     }
 
     /// Validates the report against the model parameters.
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+    ))]
     pub(crate) fn finish<M: ModuleParameters + ?Sized>(self, model: &M) -> Result<(), Error> {
         self.finish_excluding(model, |_| false)
     }
