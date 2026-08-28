@@ -101,10 +101,11 @@ collective groups remain backend-author concerns.
 Application-only targets and platform examples can depend solely on the
 `eredu` facade. Infrastructure-aware clients such as the CLI also depend on
 the neutral owning crates for the low-level policies they configure. The
-selected-local-backend API owns device-plan creation,
-process runtime configuration, synchronization, allocator telemetry, and
-diagnostic benchmarks without exposing native tensors, streams, devices, or
-random state. Direct native access remains an explicit backend-author escape
+selected-local-backend API owns device-plan creation, process runtime
+configuration, allocator telemetry, and diagnostic benchmarks, while
+`LocalModel::synchronize` is the sole application-facing synchronization entry
+point. These APIs do not expose native tensors, streams, devices, or random
+state. Direct native access remains an explicit backend-author escape
 hatch under `eredu-backend-mlx::native`; it is not an application dependency.
 Its `LocalLoadOptions` and `LocalInspectionOptions` are facade-owned values
 containing only neutral quantization, residency, and session-capability policy.

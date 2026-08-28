@@ -1232,11 +1232,6 @@ const fn compiled_accelerator_family() -> Option<&'static str> {
     }
 }
 
-/// Waits for work submitted by a local model.
-pub fn synchronize_local_model(model: &LocalModel) -> Result<(), LocalBackendError> {
-    model.synchronize()
-}
-
 /// Resets the selected runtime's allocator high-water mark.
 pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
     eredu_backend_mlx::native::memory::reset_peak_memory()
