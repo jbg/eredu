@@ -15,7 +15,7 @@ use safemlx_internal_macros::generate_macro;
 /// A compiled custom Metal kernel.
 ///
 /// The kernel owns the underlying MLX fast-metal handle and can be applied
-/// repeatedly with different inputs and [`MetalKernelConfig`] values.
+/// repeatedly with different inputs and [`CustomKernelConfig`] values.
 pub struct MetalKernel {
     c_kernel: safemlx_sys::mlx_fast_metal_kernel,
     name: String,
@@ -105,7 +105,7 @@ impl MetalKernel {
     pub fn apply_device<I, A>(
         &self,
         inputs: I,
-        config: &MetalKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<Vec<Array>>
     where
@@ -139,7 +139,7 @@ impl MetalKernel {
     pub fn apply_one_device<I, A>(
         &self,
         inputs: I,
-        config: &MetalKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<Array>
     where
@@ -163,14 +163,6 @@ impl Drop for MetalKernel {
         }
     }
 }
-
-/// Dispatch configuration for a custom CUDA kernel.
-///
-/// Metal and CUDA custom kernels expose the same output, grid, thread-group,
-/// and template-argument controls in MLX, so both backends intentionally share
-/// one configuration representation.
-#[cfg(feature = "cuda")]
-pub type CudaKernelConfig = MetalKernelConfig;
 
 /// A JIT-compiled custom CUDA kernel.
 #[cfg(feature = "cuda")]
@@ -254,7 +246,7 @@ impl CudaKernel {
     pub fn apply_device<I, A>(
         &self,
         inputs: I,
-        config: &CudaKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<Vec<Array>>
     where
@@ -286,7 +278,7 @@ impl CudaKernel {
     pub fn apply_one_device<I, A>(
         &self,
         inputs: I,
-        config: &CudaKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<Array>
     where
@@ -396,7 +388,7 @@ impl StatefulMetalKernel {
     pub fn apply_device<I, A>(
         &self,
         inputs: I,
-        config: &MetalKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<StatefulKernelOutput>
     where
@@ -453,7 +445,7 @@ impl RecurrentScanKernel {
     pub fn decode_device<I, A>(
         &self,
         inputs: I,
-        config: &MetalKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<StatefulKernelOutput>
     where
@@ -467,7 +459,7 @@ impl RecurrentScanKernel {
     pub fn prefill_device<I, A>(
         &self,
         inputs: I,
-        config: &MetalKernelConfig,
+        config: &CustomKernelConfig,
         stream: impl AsRef<Stream>,
     ) -> Result<StatefulKernelOutput>
     where
@@ -478,9 +470,9 @@ impl RecurrentScanKernel {
     }
 }
 
-/// Output declaration for a custom Metal kernel.
+/// Output declaration for a custom kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetalKernelOutput {
+pub struct CustomKernelOutput {
     /// Output shape.
     pub shape: Vec<i32>,
 
@@ -488,7 +480,7 @@ pub struct MetalKernelOutput {
     pub dtype: Dtype,
 }
 
-impl MetalKernelOutput {
+impl CustomKernelOutput {
     /// Create an output declaration.
     pub fn new(shape: impl Into<Vec<i32>>, dtype: Dtype) -> Self {
         Self {
@@ -498,9 +490,9 @@ impl MetalKernelOutput {
     }
 }
 
-/// Template argument for a custom Metal kernel.
+/// Template argument for a custom kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MetalKernelTemplateArg {
+pub enum CustomKernelTemplateArg {
     /// Dtype template argument.
     Dtype {
         /// Template parameter name.
@@ -529,18 +521,21 @@ pub enum MetalKernelTemplateArg {
     },
 }
 
-/// Dispatch configuration for a custom Metal kernel.
+/// Dispatch configuration shared by custom Metal and CUDA kernels.
+///
+/// Both backends expose the same output, grid, thread-group, initialization,
+/// verbosity, and template-argument controls in MLX.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct MetalKernelConfig {
-    outputs: Vec<MetalKernelOutput>,
-    template_args: Vec<MetalKernelTemplateArg>,
+pub struct CustomKernelConfig {
+    outputs: Vec<CustomKernelOutput>,
+    template_args: Vec<CustomKernelTemplateArg>,
     grid: Option<[i32; 3]>,
     thread_group: Option<[i32; 3]>,
     init_value: Option<f32>,
     verbose: bool,
 }
 
-impl MetalKernelConfig {
+impl CustomKernelConfig {
     /// Create an empty dispatch configuration.
     pub fn new() -> Self {
         Self::default()
@@ -552,18 +547,18 @@ impl MetalKernelConfig {
     }
 
     /// Return the output declarations.
-    pub fn outputs(&self) -> &[MetalKernelOutput] {
+    pub fn outputs(&self) -> &[CustomKernelOutput] {
         &self.outputs
     }
 
     /// Return the template arguments.
-    pub fn template_args(&self) -> &[MetalKernelTemplateArg] {
+    pub fn template_args(&self) -> &[CustomKernelTemplateArg] {
         &self.template_args
     }
 
     /// Add an output declaration.
     pub fn add_output_arg(&mut self, shape: impl Into<Vec<i32>>, dtype: Dtype) -> &mut Self {
-        self.outputs.push(MetalKernelOutput::new(shape, dtype));
+        self.outputs.push(CustomKernelOutput::new(shape, dtype));
         self
     }
 
@@ -623,7 +618,7 @@ impl MetalKernelConfig {
 
     /// Add a dtype template argument.
     pub fn add_template_arg_dtype(&mut self, name: impl Into<String>, dtype: Dtype) -> &mut Self {
-        self.template_args.push(MetalKernelTemplateArg::Dtype {
+        self.template_args.push(CustomKernelTemplateArg::Dtype {
             name: name.into(),
             dtype,
         });
@@ -638,7 +633,7 @@ impl MetalKernelConfig {
 
     /// Add an integer template argument.
     pub fn add_template_arg_int(&mut self, name: impl Into<String>, value: i32) -> &mut Self {
-        self.template_args.push(MetalKernelTemplateArg::Int {
+        self.template_args.push(CustomKernelTemplateArg::Int {
             name: name.into(),
             value,
         });
@@ -653,7 +648,7 @@ impl MetalKernelConfig {
 
     /// Add a boolean template argument.
     pub fn add_template_arg_bool(&mut self, name: impl Into<String>, value: bool) -> &mut Self {
-        self.template_args.push(MetalKernelTemplateArg::Bool {
+        self.template_args.push(CustomKernelTemplateArg::Bool {
             name: name.into(),
             value,
         });
@@ -672,7 +667,7 @@ struct RawMetalKernelConfig {
 }
 
 impl RawMetalKernelConfig {
-    fn try_from_config(config: &MetalKernelConfig) -> Result<Self> {
+    fn try_from_config(config: &CustomKernelConfig) -> Result<Self> {
         crate::error::ensure_mlx_error_handler();
 
         let c_config = unsafe { safemlx_sys::mlx_fast_metal_kernel_config_new() };
@@ -692,7 +687,7 @@ impl RawMetalKernelConfig {
         self.c_config
     }
 
-    fn populate(&self, config: &MetalKernelConfig) -> Result<()> {
+    fn populate(&self, config: &CustomKernelConfig) -> Result<()> {
         for output in &config.outputs {
             check_status(unsafe {
                 safemlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
@@ -728,7 +723,7 @@ impl RawMetalKernelConfig {
 
         for template_arg in &config.template_args {
             match template_arg {
-                MetalKernelTemplateArg::Dtype { name, dtype } => {
+                CustomKernelTemplateArg::Dtype { name, dtype } => {
                     let name = cstring(name)?;
                     check_status(unsafe {
                         safemlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
@@ -738,7 +733,7 @@ impl RawMetalKernelConfig {
                         )
                     })?;
                 }
-                MetalKernelTemplateArg::Int { name, value } => {
+                CustomKernelTemplateArg::Int { name, value } => {
                     let name = cstring(name)?;
                     check_status(unsafe {
                         safemlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
@@ -748,7 +743,7 @@ impl RawMetalKernelConfig {
                         )
                     })?;
                 }
-                MetalKernelTemplateArg::Bool { name, value } => {
+                CustomKernelTemplateArg::Bool { name, value } => {
                     let name = cstring(name)?;
                     check_status(unsafe {
                         safemlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
@@ -780,7 +775,7 @@ struct RawCudaKernelConfig {
 
 #[cfg(feature = "cuda")]
 impl RawCudaKernelConfig {
-    fn try_from_config(config: &CudaKernelConfig) -> Result<Self> {
+    fn try_from_config(config: &CustomKernelConfig) -> Result<Self> {
         crate::error::ensure_mlx_error_handler();
         let c_config = unsafe { safemlx_sys::mlx_fast_cuda_kernel_config_new() };
         if c_config.ctx.is_null() {
@@ -798,7 +793,7 @@ impl RawCudaKernelConfig {
         self.c_config
     }
 
-    fn populate(&self, config: &CudaKernelConfig) -> Result<()> {
+    fn populate(&self, config: &CustomKernelConfig) -> Result<()> {
         for output in &config.outputs {
             check_status(unsafe {
                 safemlx_sys::mlx_fast_cuda_kernel_config_add_output_arg(
@@ -829,7 +824,7 @@ impl RawCudaKernelConfig {
         })?;
         for template_arg in &config.template_args {
             match template_arg {
-                MetalKernelTemplateArg::Dtype { name, dtype } => {
+                CustomKernelTemplateArg::Dtype { name, dtype } => {
                     let name = cstring(name)?;
                     check_status(unsafe {
                         safemlx_sys::mlx_fast_cuda_kernel_config_add_template_arg_dtype(
@@ -839,7 +834,7 @@ impl RawCudaKernelConfig {
                         )
                     })?;
                 }
-                MetalKernelTemplateArg::Int { name, value } => {
+                CustomKernelTemplateArg::Int { name, value } => {
                     let name = cstring(name)?;
                     check_status(unsafe {
                         safemlx_sys::mlx_fast_cuda_kernel_config_add_template_arg_int(
@@ -849,7 +844,7 @@ impl RawCudaKernelConfig {
                         )
                     })?;
                 }
-                MetalKernelTemplateArg::Bool { name, value } => {
+                CustomKernelTemplateArg::Bool { name, value } => {
                     let name = cstring(name)?;
                     check_status(unsafe {
                         safemlx_sys::mlx_fast_cuda_kernel_config_add_template_arg_bool(
@@ -1183,8 +1178,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_metal_kernel_config_builder() {
-        let config = MetalKernelConfig::new()
+    fn test_custom_kernel_config_builder() {
+        let config = CustomKernelConfig::new()
             .with_output_arg([2, 3], Dtype::Float32)
             .with_grid([6, 1, 1])
             .with_thread_group([32, 1, 1])
@@ -1197,9 +1192,25 @@ mod tests {
         assert_eq!(config.output_count(), 1);
         assert_eq!(
             config.outputs()[0],
-            MetalKernelOutput::new([2, 3], Dtype::Float32)
+            CustomKernelOutput::new([2, 3], Dtype::Float32)
         );
-        assert_eq!(config.template_args().len(), 3);
+        assert_eq!(
+            config.template_args(),
+            &[
+                CustomKernelTemplateArg::Dtype {
+                    name: "T".to_string(),
+                    dtype: Dtype::Float32,
+                },
+                CustomKernelTemplateArg::Int {
+                    name: "N".to_string(),
+                    value: 6,
+                },
+                CustomKernelTemplateArg::Bool {
+                    name: "DO_SCALE".to_string(),
+                    value: true,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1222,7 +1233,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = MetalKernelConfig::new()
+        let config = CustomKernelConfig::new()
             .with_template_arg_dtype("T", Dtype::Float32)
             .with_grid([input.size() as i32, 1, 1])
             .with_thread_group([256, 1, 1])
@@ -1290,7 +1301,7 @@ mod tests {
         .unwrap();
         let recurrent = RecurrentScanKernel::new(decode, prefill);
 
-        let decode_config = MetalKernelConfig::new()
+        let decode_config = CustomKernelConfig::new()
             .with_grid([2, 1, 1])
             .with_thread_group([32, 1, 1])
             .with_output_arg([2], Dtype::Float32)
@@ -1311,7 +1322,7 @@ mod tests {
             &[11.0, 22.0]
         );
 
-        let prefill_config = MetalKernelConfig::new()
+        let prefill_config = CustomKernelConfig::new()
             .with_template_arg_int("L", 3)
             .with_template_arg_int("D", 2)
             .with_grid([2, 1, 1])

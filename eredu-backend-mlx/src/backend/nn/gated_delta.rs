@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 
 #[cfg(not(feature = "cuda"))]
-use safemlx::fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
+use safemlx::fast::{CustomKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
 #[cfg(not(feature = "cuda"))]
 use safemlx::DeviceType;
 use safemlx::{
@@ -209,7 +209,7 @@ fn metal_scan_chunk(
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(metal_kernels(vector_decay)?);
         }
-        let config = MetalKernelConfig::new()
+        let config = CustomKernelConfig::new()
             .with_template_arg_int("KD", key_dim)
             .with_template_arg_int("VD", value_dim)
             .with_grid([batch * heads * value_dim, 1, 1])

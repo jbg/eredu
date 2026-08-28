@@ -19,7 +19,7 @@ use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 use crate::DeviceType;
 use crate::{
     error::Exception,
-    fast::{MetalKernel, MetalKernelConfig},
+    fast::{CustomKernelConfig, MetalKernel},
     ops::{broadcast_to, matmul, sum_axis},
     transforms::eval,
     Array, Dtype, Stream,
@@ -1206,9 +1206,9 @@ fn q4k_config(
     output_rows: i32,
     output_cols: i32,
     dtype: Dtype,
-) -> MetalKernelConfig {
+) -> CustomKernelConfig {
     let out_grid = ((output_cols + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
-    MetalKernelConfig::new()
+    CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("IN_DIM", view.columns)
         .with_template_arg_int("OUT_DIM", output_cols)
@@ -1223,11 +1223,11 @@ fn q4k_config(
         .with_output_arg([output_rows, output_cols], dtype)
 }
 
-fn q4k_decode_config(view: &NativeQuantizedTensor, dtype: Dtype) -> MetalKernelConfig {
+fn q4k_decode_config(view: &NativeQuantizedTensor, dtype: Dtype) -> CustomKernelConfig {
     let output_pairs = (view.rows + Q4K_DECODE_ROWS_PER_SIMD - 1) / Q4K_DECODE_ROWS_PER_SIMD;
     let pair_grid = ((output_pairs + Q4K_DECODE_SIMD_GROUPS - 1) / Q4K_DECODE_SIMD_GROUPS)
         * Q4K_DECODE_SIMD_GROUPS;
-    MetalKernelConfig::new()
+    CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("OUT_DIM", view.rows)
         .with_template_arg_int("BLOCKS", view.columns / Q4_K_BLOCK_VALUES)
@@ -1242,11 +1242,11 @@ fn qk_decode_config(
     view: &NativeQuantizedTensor,
     dtype: Dtype,
     rows_per_simd: i32,
-) -> MetalKernelConfig {
+) -> CustomKernelConfig {
     let output_tiles = (view.rows + rows_per_simd - 1) / rows_per_simd;
     let tile_grid = ((output_tiles + Q4K_DECODE_SIMD_GROUPS - 1) / Q4K_DECODE_SIMD_GROUPS)
         * Q4K_DECODE_SIMD_GROUPS;
-    MetalKernelConfig::new()
+    CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("OUT_DIM", view.rows)
         .with_template_arg_int("BLOCKS", view.columns / Q5_K_BLOCK_VALUES)
@@ -1497,7 +1497,7 @@ fn qk_matmul_metal(
     debug_assert!(k_quant_supports_tiled_matmul(view));
     let output_tiles = (view.rows + OUTPUT_TILE - 1) / OUTPUT_TILE;
     let activation_tiles = (rows + ACTIVATION_TILE - 1) / ACTIVATION_TILE;
-    let config = MetalKernelConfig::new()
+    let config = CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_grid([REDUCTION_TILE, output_tiles * SIMD_GROUPS, activation_tiles])
         .with_thread_group([REDUCTION_TILE, SIMD_GROUPS, 1])
@@ -1653,9 +1653,9 @@ fn q5_1_config(
     output_rows: i32,
     output_cols: i32,
     dtype: Dtype,
-) -> MetalKernelConfig {
+) -> CustomKernelConfig {
     let out_grid = ((output_cols + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
-    MetalKernelConfig::new()
+    CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("IN_DIM", view.columns)
         .with_template_arg_int("OUT_DIM", output_cols)
@@ -1689,7 +1689,7 @@ fn iq_linear_metal(
     let flat = input.reshape(&[rows, view.columns], stream)?;
     let (_, block_bytes) = view.format().block_geometry();
     let batch_tile = native_batch_tile(rows);
-    let mut config = MetalKernelConfig::new()
+    let mut config = CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("ROWS", rows)
         .with_template_arg_int("IN_DIM", view.columns)
@@ -1741,7 +1741,7 @@ fn iq_embedding_metal(
     let big_endian = view.storage.endian == GgufEndian::Big;
     let kernel_key = (view.format(), big_endian);
     let (block_values, block_bytes) = view.format().block_geometry();
-    let config = MetalKernelConfig::new()
+    let config = CustomKernelConfig::new()
         .with_template_arg_int("IN_DIM", view.columns)
         .with_template_arg_int("ROWS", view.rows)
         .with_template_arg_int("BLOCKS", view.columns / block_values)
@@ -1777,7 +1777,7 @@ fn iq_grouped_metal(
     let big_endian = view.storage.endian == GgufEndian::Big;
     let kernel_key = (view.format(), big_endian);
     let (block_values, block_bytes) = view.format().block_geometry();
-    let config = MetalKernelConfig::new()
+    let config = CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("IN_DIM", view.columns)
         .with_template_arg_int("OUT_DIM", view.rows)
@@ -1806,10 +1806,10 @@ fn q8_0_config(
     output_cols: i32,
     dtype: Dtype,
     batch_tile: i32,
-) -> MetalKernelConfig {
+) -> CustomKernelConfig {
     let out_tile = q8_0_out_tile(output_cols);
     let out_grid = ((output_cols + out_tile - 1) / out_tile) * out_tile;
-    MetalKernelConfig::new()
+    CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("ROWS", output_rows)
         .with_template_arg_int("IN_DIM", view.columns)
@@ -2003,7 +2003,7 @@ fn q4k_embedding_metal(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     let count = indices.size() as i32;
-    let config = MetalKernelConfig::new()
+    let config = CustomKernelConfig::new()
         .with_template_arg_int("IN_DIM", view.columns)
         .with_template_arg_int("ROWS", view.rows)
         .with_template_arg_int("BLOCKS", view.columns / Q4_K_BLOCK_VALUES)
@@ -2032,7 +2032,7 @@ fn q8_0_embedding_metal(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     let count = indices.size() as i32;
-    let config = MetalKernelConfig::new()
+    let config = CustomKernelConfig::new()
         .with_template_arg_int("IN_DIM", view.columns)
         .with_template_arg_int("ROWS", view.rows)
         .with_template_arg_int("BLOCKS", view.columns / Q8_0_BLOCK_VALUES)

@@ -12,9 +12,9 @@ use std::cell::RefCell;
 
 #[cfg(feature = "cuda")]
 use safemlx::fast::CudaKernel;
+use safemlx::fast::CustomKernelConfig;
 #[cfg(not(feature = "cuda"))]
 use safemlx::fast::MetalKernel;
-use safemlx::fast::MetalKernelConfig;
 use safemlx::{
     error::Exception,
     ops::{
@@ -79,9 +79,14 @@ pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> 
     }
 }
 
-fn linear_tiled_config(rows: i32, in_dim: i32, out_dim: i32, scale_cols: i32) -> MetalKernelConfig {
+fn linear_tiled_config(
+    rows: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_cols: i32,
+) -> CustomKernelConfig {
     let out_grid = ceil_div(out_dim, OUT_TILE) * OUT_TILE;
-    MetalKernelConfig::new()
+    CustomKernelConfig::new()
         .with_template_arg_int("IN_DIM", in_dim)
         .with_template_arg_int("OUT_DIM", out_dim)
         .with_template_arg_int("OUT_TILE", OUT_TILE)
@@ -99,7 +104,7 @@ fn grouped_tiled_config(
     out_dim: i32,
     scale_out: i32,
     scale_cols: i32,
-) -> MetalKernelConfig {
+) -> CustomKernelConfig {
     linear_tiled_config(routes, in_dim, out_dim, scale_cols)
         .with_template_arg_int("SCALE_OUT", scale_out)
 }
@@ -185,7 +190,7 @@ fn quantize_activations(
     stream: &Stream,
 ) -> Result<QuantizedActivations, Exception> {
     let scale_cols = ceil_div(in_dim, SCALE_BLOCK);
-    let config = MetalKernelConfig::new()
+    let config = CustomKernelConfig::new()
         .with_template_arg_int("IN_DIM", in_dim)
         .with_template_arg_int("SCALE_COLS", scale_cols)
         .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
@@ -533,7 +538,7 @@ fn linear_scalar(
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(linear_scalar_kernel()?);
         }
-        let config = MetalKernelConfig::new()
+        let config = CustomKernelConfig::new()
             .with_template_arg_int("IN_DIM", in_dim)
             .with_template_arg_int("OUT_DIM", out_dim)
             .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
@@ -821,7 +826,7 @@ fn grouped_linear_scalar(
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(grouped_linear_scalar_kernel()?);
         }
-        let config = MetalKernelConfig::new()
+        let config = CustomKernelConfig::new()
             .with_template_arg_int("IN_DIM", in_dim)
             .with_template_arg_int("OUT_DIM", out_dim)
             .with_template_arg_int("SCALE_OUT", scale.dim(1))
@@ -966,7 +971,7 @@ pub fn segmented_linear(
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(segmented_linear_kernel()?);
         }
-        let config = MetalKernelConfig::new()
+        let config = CustomKernelConfig::new()
             .with_template_arg_int("IN_DIM", input.dim(1))
             .with_template_arg_int("OUT_DIM", output_dims)
             .with_template_arg_int("GROUP_STRIDE", group_stride)
@@ -1035,7 +1040,7 @@ pub fn segmented_transposed_linear(
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(segmented_transposed_linear_kernel()?);
         }
-        let config = MetalKernelConfig::new()
+        let config = CustomKernelConfig::new()
             .with_template_arg_int("SEGMENT_ROWS", input.dim(1))
             .with_template_arg_int("OUT_DIM", output_dims)
             .with_template_arg_int("GROUP_STRIDE", group_stride)
