@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{local_device_plan, ChatTemplateRequest, LocalBackendFactory, LocalDevice, LocalModel},
+    api::{
+        default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
+        LocalModel,
+    },
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
 
@@ -21,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(0.0);
 
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
+    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
         LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();

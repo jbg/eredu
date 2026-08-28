@@ -37,16 +37,21 @@ token handles, drafting resources, and native errors remain private:
 
 ```rust,ignore
 use eredu::{
-    api::{local_device_plan, LocalBackendFactory, LocalDevice, LocalModel},
+    api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel},
     ExecutionPlan,
 };
 
-let device = local_device_plan(LocalDevice::Accelerator(0))?;
+let device = local_device_plan(default_local_device())?;
 let plan = ExecutionPlan::fully_resident(device);
 let factory = LocalBackendFactory::default();
 let planned = LocalModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
 let (mut model, drafting) = planned.into_parts();
 ```
+
+`default_local_device` selects accelerator zero in CUDA and Apple Metal builds,
+and falls back to CPU in CPU-only MLX builds. Pass `LocalDevice::Cpu` or
+`LocalDevice::Accelerator(index)` to `local_device_plan` when an application
+needs an explicit device.
 
 Model-family architecture modules remain owned by `eredu-architectures`.
 Reusable MLX tensors, operators, caches, streams, and family composition live

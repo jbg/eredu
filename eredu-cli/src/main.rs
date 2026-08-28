@@ -95,13 +95,9 @@ enum CliDevice {
 
 impl Default for CliDevice {
     fn default() -> Self {
-        if cfg!(any(
-            feature = "cuda",
-            all(feature = "metal", target_vendor = "apple")
-        )) {
-            Self::Gpu(0)
-        } else {
-            Self::Cpu
+        match eredu::api::default_local_device() {
+            LocalDevice::Cpu => Self::Cpu,
+            LocalDevice::Accelerator(index) => Self::Gpu(index as i32),
         }
     }
 }

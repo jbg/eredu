@@ -792,6 +792,16 @@ pub enum LocalDevice {
     Accelerator(u32),
 }
 
+/// Selects accelerator zero when this build includes a native accelerator
+/// family, or the CPU for CPU-only builds.
+pub const fn default_local_device() -> LocalDevice {
+    if compiled_accelerator_family().is_some() {
+        LocalDevice::Accelerator(0)
+    } else {
+        LocalDevice::Cpu
+    }
+}
+
 /// Failure to map a facade device choice to the selected local backend.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum LocalDevicePlanError {
@@ -1486,8 +1496,8 @@ pub fn benchmark_local_expert_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        local_device_plan, validate_expert_cache_benchmark_prompt, LocalDevice,
-        LocalDevicePlanError, LocalExpertCacheBenchmarkError,
+        default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
+        LocalDevice, LocalDevicePlanError, LocalExpertCacheBenchmarkError,
     };
 
     #[test]
@@ -1509,5 +1519,20 @@ mod tests {
         } else {
             assert_eq!(plan, Err(LocalDevicePlanError::AcceleratorNotCompiled));
         }
+    }
+
+    #[test]
+    fn default_device_uses_an_available_accelerator_or_cpu() {
+        let expected = if cfg!(any(
+            feature = "cuda",
+            all(feature = "metal", target_vendor = "apple")
+        )) {
+            LocalDevice::Accelerator(0)
+        } else {
+            LocalDevice::Cpu
+        };
+        let device = default_local_device();
+        assert_eq!(device, expected);
+        assert!(local_device_plan(device).is_ok());
     }
 }

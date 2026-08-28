@@ -7,8 +7,8 @@ use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        local_device_plan, ChatTemplateRequest, LocalBackendFactory, LocalDevice, LocalModel,
-        LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
+        default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
+        LocalDevice, LocalModel, LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
         LocalPreparedChatMtpGenerationRequest, NativeToolSupport, ParallelToolCallPolicy,
         PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions, ToolChoice,
     },
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: native_tool_calling TARGET [DRAFTER]")?;
     let drafter_path = arguments.next();
 
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     if let Some(path) = &drafter_path {
         plan.drafting = DraftingPlan::External {
             model: path.clone(),
