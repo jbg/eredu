@@ -1342,7 +1342,7 @@ fn assert_automatic_planning_conformance() {
         planned_loading_client_code(&backend, artifact.path(), "gpu:0");
     assert_eq!(realized_report.plan, report.plan);
     let model = planned.model_mut();
-    assert_eq!(model.runtime().backend().descriptor().name, "mock");
+    assert_eq!(model.backend_descriptor().name, "mock");
     assert_eq!(client_code(model), vec![1, 2, 3]);
 
     let mut wrong_backend = report.plan.clone();

@@ -6,12 +6,12 @@ use std::{
 
 use eredu::{
     api::{
-        local_device_plan, ChatTemplateRequest, LoadedModel, LocalBackendFactory, LocalDevice,
-        PreparedChat, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
+        local_device_plan, ChatTemplateRequest, LocalBackendFactory, LocalDevice, LocalModel,
+        LocalPreparedChatInput, LocalPreparedChatMtpGenerationRequest, PreparedChat,
+        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions,
     },
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
-    GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    GenerationConfigOverrides, TextGenerationConfig,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -77,7 +77,7 @@ struct GenerationResult {
 fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<PreparedChat> {
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
     loaded
         .prepare_chat(ChatTemplateRequest {
@@ -98,7 +98,7 @@ fn run_greedy(
 ) -> anyhow::Result<GenerationResult> {
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
     let prompt_tokens = loaded.encode(prompt, false)?;
     let eos = loaded.eos_token_ids().to_vec();
@@ -114,7 +114,7 @@ fn run_greedy(
             .generate_tokens(prompt_tokens, TextGenerationConfig::new(resolved))?
             .take(max_tokens);
         for token in generator {
-            let id = token?.token_id()?;
+            let id = token?;
             if eos.contains(&id) {
                 break;
             }
@@ -146,14 +146,14 @@ fn run_mtp(
         adaptive_lookahead: false,
     };
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
     let (mut target, mut drafting) = planned.into_parts();
-    let drafting = drafting
-        .as_speculative_draft()
-        .ok_or_else(|| anyhow::anyhow!("external drafting plan was not realized"))?;
-    let output = target.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-        input: PreparedChatInput::rendered_prompt(prepared),
-        drafting,
+    if !drafting.is_enabled() {
+        anyhow::bail!("external drafting plan was not realized");
+    }
+    let output = target.generate_prepared_chat_mtp(LocalPreparedChatMtpGenerationRequest {
+        input: LocalPreparedChatInput::rendered_prompt(prepared),
+        drafting: &mut drafting,
         settings: PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(0.0),

@@ -42,6 +42,10 @@ The prepared-chat client surface is backend-generic. A backend implements
 `SpeculativeGenerationBackend`, supplies its own associated drafter type and
 typed execution-resource visitor handoff, and then uses the same
 `LoadedModel<B>::generate_prepared_chat_mtp` and batch APIs.
+Applications using the selected backend instead receive an opaque
+`LocalDrafting` alongside `LocalModel` and call
+`LocalModel::generate_prepared_chat_mtp`; neither the native drafter nor its
+error type crosses the facade.
 `MtpCapability` and `MtpCheckpointKind` are portable core values; absence of the
 capability implementation fails at the type boundary rather than silently
 falling back to ordinary generation.
@@ -49,8 +53,9 @@ falling back to ordinary generation.
 ## Execution placement
 
 Prepared-chat requests do not accept streams. The target retains the execution
-placement selected when it was loaded; an external `MlxDrafter` independently
-retains its load-time placement. Drafter loading requires its tokenizer as an
+placement selected when it was loaded; an external assistant independently
+retains its load-time placement. The MLX implementation's drafter loading
+requires its tokenizer as an
 explicit portable input; the backend fingerprints it but never discovers or
 parses tokenizer sidecars. The MLX adapter classifies that pair as:
 

@@ -14,13 +14,12 @@ use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Pars
 use eredu::{
     api::{
         benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
-        inspect_local_model, local_allocator_telemetry, local_device_plan,
-        local_expert_cache_telemetry, local_mtp_telemetry, local_residency_telemetry,
-        reset_local_allocator_peak, synchronize_local_backend, LoadedModel, LocalBackendFactory,
-        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
-        LocalMtpComponentTimingGuard, LocalRuntimeConfiguration, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest, ResidencyPlan, TextDecoder, TextModelError,
+        inspect_local_model, local_device_plan, local_mtp_telemetry, reset_local_allocator_peak,
+        LocalBackendFactory, LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
+        LocalModel, LocalMtpComponentTimingGuard, LocalPreparedChatGenerationRequest,
+        LocalPreparedChatInput, LocalPreparedChatMtpGenerationRequest, LocalRuntimeConfiguration,
+        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions, ResidencyPlan,
+        TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -30,15 +29,9 @@ use eredu::{
     GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
     HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
     PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, SemanticEvent,
-    TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
-    EXECUTION_PLAN_SCHEMA_VERSION,
+    TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
-use eredu_checkpoint::store::WeightStoreDiagnostics;
-use eredu_core::{
-    residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
-    speculative::MtpStats,
-    RealizedDrafting,
-};
+use eredu_core::{residency::CacheEvictionPolicy, speculative::MtpStats};
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use serde::{Deserialize, Serialize};
@@ -1421,8 +1414,8 @@ fn automatic_plan(
 ) -> Result<ExecutionPlanReport> {
     let request = AutomaticPlanRequest::new(model_path, device_plan(device)?)
         .with_prior_telemetry(prior_telemetry.iter().cloned());
-    AutomaticPlanner::default()
-        .plan(&LocalBackendFactory::default(), &request)
+    LocalBackendFactory::default()
+        .plan(&AutomaticPlanner::default(), &request)
         .map_err(Into::into)
 }
 
@@ -2125,7 +2118,7 @@ fn main() -> Result<()> {
     let load_started = Instant::now();
     let factory =
         LocalBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
-    let planned = LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan)
+    let planned = LocalModel::load_execution_plan(&factory, &model_path, &execution_plan)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
     let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
@@ -2160,7 +2153,7 @@ fn main() -> Result<()> {
             resolved_generation.do_sample
         );
     }
-    synchronize_local_backend(model.runtime().backend())?;
+    model.synchronize()?;
     let load_elapsed = load_started.elapsed();
 
     let tools_requested = args.tools.is_some();
@@ -2240,11 +2233,11 @@ fn main() -> Result<()> {
         bail!("the prompt produced no input tokens");
     }
     if args.expert_cache_benchmark {
-        let benchmark = benchmark_local_expert_cache(model.runtime_mut(), &prompt_token_ids)?;
+        let benchmark = benchmark_local_expert_cache(&mut model, &prompt_token_ids)?;
         print_expert_benchmark_result("cold_prefill", benchmark.cold_prefill);
         print_expert_benchmark_result("repeated_prefill", benchmark.repeated_prefill);
         print_expert_benchmark_result("cached_decode", benchmark.cached_decode);
-        model.runtime_mut().session_mut().reset()?;
+        model.reset()?;
     }
 
     let eos_token_ids = model.eos_token_ids().to_vec();
@@ -2270,7 +2263,7 @@ fn main() -> Result<()> {
     }
     let mut stderr = stderr.lock();
 
-    let drafting_enabled = !matches!(&drafting, RealizedDrafting::Disabled);
+    let drafting_enabled = drafting.is_enabled();
     let _component_timing_guard = args.verbose.then(LocalMtpComponentTimingGuard::enable);
     let scheduler_options = MtpSchedulerOptions {
         adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
@@ -2298,50 +2291,52 @@ fn main() -> Result<()> {
             seed: args.seed,
         };
         let mut semantic_error = None;
-        if let Some(speculative_draft) = drafting.as_speculative_draft() {
+        if drafting.is_enabled() {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(prepared),
-                drafting: speculative_draft,
-                settings,
-                options: PreparedChatMtpGenerationOptions {
-                    max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
-                        .expect("planned speculative execution validates non-zero draft tokens"),
-                    scheduler: scheduler_options,
-                },
-                caller_stop_sequences: &args.stop_sequences,
-                cancellation,
-                on_event: |event| {
-                    if time_to_first_token.is_none()
-                        && !matches!(event, SemanticEvent::Finished { .. })
-                    {
-                        time_to_first_token = Some(generation_started.elapsed());
-                    }
-                    if semantic_error.is_none() {
-                        semantic_error = write_semantic_event(
-                            &event,
-                            &mut stdout,
-                            &mut stderr,
-                            &mut streamed_text,
-                            &mut reasoning_stream,
-                            reasoning_output,
-                        )
-                        .err();
-                        if semantic_error.is_some() {
-                            cancel_on_error.cancel();
+            let output =
+                model.generate_prepared_chat_mtp(LocalPreparedChatMtpGenerationRequest {
+                    input: LocalPreparedChatInput::rendered_prompt(prepared),
+                    drafting: &mut drafting,
+                    settings,
+                    options: PreparedChatMtpGenerationOptions {
+                        max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens).expect(
+                            "planned speculative execution validates non-zero draft tokens",
+                        ),
+                        scheduler: scheduler_options,
+                    },
+                    caller_stop_sequences: &args.stop_sequences,
+                    cancellation,
+                    on_event: |event| {
+                        if time_to_first_token.is_none()
+                            && !matches!(event, SemanticEvent::Finished { .. })
+                        {
+                            time_to_first_token = Some(generation_started.elapsed());
                         }
-                    }
-                },
-            })?;
+                        if semantic_error.is_none() {
+                            semantic_error = write_semantic_event(
+                                &event,
+                                &mut stdout,
+                                &mut stderr,
+                                &mut streamed_text,
+                                &mut reasoning_stream,
+                                reasoning_output,
+                            )
+                            .err();
+                            if semantic_error.is_some() {
+                                cancel_on_error.cancel();
+                            }
+                        }
+                    },
+                })?;
             output_ids = output.token_ids;
             mtp_stats = Some(output.stats);
             prepared_finish_reason = Some(output.finish_reason);
         } else {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(prepared),
+            let output = model.generate_prepared_chat(LocalPreparedChatGenerationRequest {
+                input: LocalPreparedChatInput::rendered_prompt(prepared),
                 settings,
                 caller_stop_sequences: &args.stop_sequences,
                 cancellation,
@@ -2386,7 +2381,7 @@ fn main() -> Result<()> {
         };
         let generator = model.generate_tokens(prompt_token_ids.clone(), config)?;
         for token in generator {
-            let token_id = token?.token_id()?;
+            let token_id = token?;
             if time_to_first_token.is_none() {
                 time_to_first_token = Some(generation_started.elapsed());
             }
@@ -2430,7 +2425,7 @@ fn main() -> Result<()> {
     }
 
     let allocator_telemetry = if args.verbose || args.telemetry_json.is_some() {
-        Some(local_allocator_telemetry(model.runtime().backend())?)
+        Some(model.allocator_telemetry()?)
     } else {
         None
     };
@@ -2502,44 +2497,25 @@ fn main() -> Result<()> {
             "mlx_cache_memory: {}",
             format_bytes(allocator.cache_bytes as usize)
         );
-        if let Some(report) = model.runtime().session().residency_report()? {
-            let offload = report.offload();
+        if let Some(report) = model.residency_telemetry()? {
             eprintln!(
                 "residency_current_host_device: {} / {} bytes",
-                offload.resident_bytes().get(MemoryTier::Host),
-                offload.resident_bytes().get(MemoryTier::Device)
+                report.current_host_bytes, report.current_device_bytes
             );
             eprintln!(
                 "residency_peak_host_device: {} / {} bytes",
-                offload.peak_resident_bytes().get(MemoryTier::Host),
-                offload.peak_resident_bytes().get(MemoryTier::Device)
+                report.peak_host_bytes, report.peak_device_bytes
             );
-            for direction in TransferDirection::ALL {
-                let transfer = offload.transfer(direction);
-                if transfer.count() > 0 {
+            for transfer in report.transfers {
+                if transfer.count > 0 {
                     eprintln!(
-                        "residency_{direction:?}: {} transfers, {} bytes",
-                        transfer.count(),
-                        transfer.bytes()
+                        "residency_{}: {} transfers, {} bytes",
+                        transfer.direction, transfer.count, transfer.bytes
                     );
                 }
             }
-            eprintln!(
-                "weight_store: {}",
-                format_weight_store_diagnostics(report.weight_store())
-            );
-            if let Some(materialization) = report.materialization() {
-                eprintln!(
-                    "ordinary_weight_quantization: {} weights, {} tiles, {} source bytes -> {} packed bytes, {} peak working-set bytes",
-                    materialization.transformed_weights,
-                    materialization.source_tiles,
-                    materialization.source_bytes_read,
-                    materialization.output_bytes,
-                    materialization.peak_planned_working_set_bytes
-                );
-            }
         }
-        if let Some(report) = model.runtime().session().expert_cache_report()? {
+        if let Some(report) = model.expert_cache_telemetry()? {
             eprintln!(
                 "expert_cache_owned: {} experts, {} bytes",
                 report.owned_experts, report.owned_bytes
@@ -2551,18 +2527,6 @@ fn main() -> Result<()> {
                 report.host_resident_bytes,
                 report.device_resident_bytes
             );
-            eprintln!("expert_cache_prefill: {:?}", report.prefill);
-            eprintln!("expert_cache_decode: {:?}", report.decode);
-            if let Some(materialization) = &report.materialization {
-                eprintln!(
-                    "expert_cache_quantization: {} weights, {} tiles, {} source bytes -> {} packed bytes, {} peak working-set bytes",
-                    materialization.transformed_weights,
-                    materialization.source_tiles,
-                    materialization.source_bytes_read,
-                    materialization.output_bytes,
-                    materialization.peak_planned_working_set_bytes
-                );
-            }
         }
         if eos_token_ids.is_empty() {
             eprintln!("warning: the model config contains no EOS token id");
@@ -2581,7 +2545,7 @@ fn main() -> Result<()> {
             }
         }
     } else if args.timing {
-        synchronize_local_backend(model.runtime().backend())?;
+        model.synchronize()?;
         write_timing_report(
             &mut io::stderr().lock(),
             load_elapsed,
@@ -2606,18 +2570,8 @@ fn main() -> Result<()> {
             },
             |report| report.explanation.clone(),
         );
-        let residency = model
-            .runtime()
-            .session()
-            .residency_report()?
-            .as_ref()
-            .map(local_residency_telemetry);
-        let expert_cache = model
-            .runtime()
-            .session()
-            .expert_cache_report()?
-            .as_ref()
-            .map(local_expert_cache_telemetry);
+        let residency = model.residency_telemetry()?;
+        let expert_cache = model.expert_cache_telemetry()?;
         let telemetry = ExecutionTelemetry {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
             model_type: model.model_type().into(),
@@ -2747,22 +2701,6 @@ fn format_bytes(bytes: usize) -> String {
         (bytes_float, "B")
     };
     format!("{value:.2} {unit} ({bytes} bytes)")
-}
-
-fn format_weight_store_diagnostics(diagnostics: &WeightStoreDiagnostics) -> String {
-    format!(
-        "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, payload_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
-        diagnostics.backend,
-        diagnostics.mapping_hits,
-        diagnostics.mapping_misses,
-        diagnostics.evictions,
-        diagnostics.currently_mapped_shards,
-        diagnostics.touched_shard_paths.len(),
-        diagnostics.payload_shard_paths.len(),
-        diagnostics.physical_reads,
-        diagnostics.physical_read_bytes,
-        diagnostics.coalesced_group_hits,
-    )
 }
 
 fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkSample) {
@@ -3418,17 +3356,17 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_local_hardware, embedded_mtp_count, format_bytes, format_weight_store_diagnostics,
-        median, model_advertises_embedded_mtp, read_automatic_feedback,
-        requested_load_quantization, select_cached_gguf_from_revisions,
-        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
-        use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
-        write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
-        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
-        ExecutionPlan, MtpDraftDevice, MtpSchedulerOptions, NativeToolSupport, QuantizationRequest,
-        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason, WeightTransformationPlan,
+        discover_local_hardware, embedded_mtp_count, format_bytes, median,
+        model_advertises_embedded_mtp, read_automatic_feedback, requested_load_quantization,
+        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
+        select_cached_gguf_path, select_revision, select_unique_cached_gguf,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
+        validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
+        write_timing_report, AutoMode, AutoPlanCacheKey, AutomaticCliOverrides, CachedGgufRole,
+        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, MtpDraftDevice,
+        MtpSchedulerOptions, NativeToolSupport, QuantizationRequest, ReasoningOutput,
+        ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
+        WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -4637,33 +4575,5 @@ mod tests {
             format_bytes(3 * 1024 * 1024 * 1024),
             "3.00 GiB (3221225472 bytes)"
         );
-    }
-
-    #[test]
-    fn concise_weight_store_diagnostics_omit_shard_paths() {
-        let diagnostics = eredu_checkpoint::store::WeightStoreDiagnostics {
-            backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
-            mapping_hits: 17,
-            mapping_misses: 2,
-            evictions: 1,
-            currently_mapped_shards: 2,
-            touched_shard_paths: vec![
-                Path::new("/private/checkpoint/model-00001.safetensors").into(),
-                Path::new("/tmp/quantized-00000.safetensors").into(),
-            ],
-            payload_shard_paths: vec![
-                Path::new("/private/checkpoint/model-00001.safetensors").into()
-            ],
-            physical_reads: 3,
-            physical_read_bytes: 4096,
-            coalesced_group_hits: 4,
-        };
-
-        let formatted = format_weight_store_diagnostics(&diagnostics);
-        assert!(formatted.contains("backend=Safetensors"));
-        assert!(formatted.contains("touched_shards=2"));
-        assert!(formatted.contains("payload_shards=1"));
-        assert!(!formatted.contains("model-00001.safetensors"));
-        assert!(!formatted.contains("quantized-00000.safetensors"));
     }
 }

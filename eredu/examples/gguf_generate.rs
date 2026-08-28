@@ -1,13 +1,12 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{local_device_plan, LoadedModel, LocalBackendFactory, LocalDevice},
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    api::{local_device_plan, LocalBackendFactory, LocalDevice, LocalModel},
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
-use eredu_core::TextGenerationBackend;
 
-fn generate<B: TextGenerationBackend>(
-    model: &mut LoadedModel<B>,
+fn generate(
+    model: &mut LocalModel,
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
@@ -23,7 +22,7 @@ fn generate<B: TextGenerationBackend>(
     let mut output_ids = Vec::new();
     let generator = model.generate_tokens(prompt_ids, TextGenerationConfig::new(sampling))?;
     for token in generator {
-        let token_id = token?.token_id()?;
+        let token_id = token?;
         output_ids.push(token_id);
         if eos_token_ids.contains(&token_id) {
             break;
@@ -56,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &gguf_file, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &gguf_file, &plan)?;
     let (mut model, _) = planned.into_parts();
 
     println!("model type: {}", model.model_type());

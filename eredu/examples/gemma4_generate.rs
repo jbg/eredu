@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{local_device_plan, LoadedModel, LocalBackend, LocalBackendFactory, LocalDevice},
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    api::{local_device_plan, LocalBackendFactory, LocalDevice, LocalModel},
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?);
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
 
     let rendered = model
@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     let ids = model.encode(&rendered, false)?;
     let eos = model.eos_token_ids().to_vec();
     print_first_token_distribution(&mut model, ids.clone())?;
-    model.runtime_mut().session_mut().reset()?;
+    model.reset()?;
     let mut output_ids = Vec::new();
 
     {
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
                 Some(token) => token?,
                 None => break,
             };
-            let id = token.token_id()?;
+            let id = token;
             output_ids.push(id);
             if eos.contains(&id) {
                 break;
@@ -82,10 +82,7 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
     }
 }
 
-fn print_first_token_distribution(
-    model: &mut LoadedModel<LocalBackend<'static>>,
-    tokens: Vec<u32>,
-) -> anyhow::Result<()> {
+fn print_first_token_distribution(model: &mut LocalModel, tokens: Vec<u32>) -> anyhow::Result<()> {
     let resolved = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: Some(0.0),
         ..Default::default()
@@ -94,7 +91,7 @@ fn print_first_token_distribution(
     let Some(first) = generator.next() else {
         return Ok(());
     };
-    let first_id = first?.token_id()?;
+    let first_id = first?;
     drop(generator);
     println!(
         "first greedy id: {first_id} {:?}",

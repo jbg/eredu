@@ -63,20 +63,19 @@ the package with no features omits the executable instead of compiling a
 target whose implementation cannot run.
 
 The facade root and `api` namespace expose portable application concepts plus
-the narrow selected-backend adapter. Its `LocalBackend` name is a deliberate
-facade alias required by public selected-backend associated types; the concrete
-type still has one name inside `eredu-backend-mlx`. That implementation crate
+the opaque selected-backend adapter. `LocalBackendFactory`, `LocalModel`,
+`LocalPlannedModel`, `LocalDrafting`, `LocalPrompt`, and local generation
+iterators are facade-owned wrappers with private backend state. The selected
+factory does not implement the public neutral factory traits, and the facade
+does not name or alias the concrete backend, session, prompt, drafter, token,
+completion, or error types in its public selected API. The implementation crate
 exports composition-owned adapter factories at its flat root and deliberately
 makes its reusable `backend` module tree public for backend authors. Family
 composition and architecture-erased dispatch remain crate-private. Native
-facade integration tests realize execution plans through
-`eredu::api::LocalBackendFactory`; they do not construct native devices,
-streams, tensors, samplers, or backend load options. Tests that require those
-backend facilities live in `eredu-backend-mlx`, while facade sampling-policy
-tests use neutral sampling traits and mock backends. The backend crate does not
-alias neutral crates into its namespace; direct backend consumers import
-neutral contracts from their owning crates. Composition-only load validation
-helpers remain crate-private rather than becoming part of the backend API.
+facade integration tests realize execution plans through facade-owned methods;
+tests that require backend facilities live in `eredu-backend-mlx`, while facade
+sampling-policy tests use neutral sampling traits and mock backends. Direct
+backend consumers import neutral contracts from their owning crates.
 
 The facade may re-export deliberately application-facing portable value types
 from neutral crates so applications can use its high-level APIs without
@@ -90,15 +89,13 @@ execution contracts—including received-value shape and dtype descriptors—and
 `eredu-runtime` infrastructure likewise come directly from their owning crates
 rather than facade compatibility re-exports.
 
-The selected adapter exposes the causal backend type and facade-owned realtime
-model, scheduler, session, completed-step, and error wrappers because the neutral
-execution contracts have different model, input, output, session, and
-completion associated types. The realtime factory loads an architecture-owned
-preparation directly into the facade model. The facade scheduler materializes
-portable host input frames and observes portable host output frames while the
-concrete backend's native associated types and handle-oriented constructors
-remain private. An application therefore loads and operates local realtime
-models with only an `eredu` dependency. Explicit native streams and distributed
+The selected adapter exposes only facade-owned causal and realtime model,
+planning, drafting, scheduler, completed-step, and error wrappers. The realtime
+factory loads an architecture-owned preparation directly into the facade model.
+The facade materializes portable inputs and observes portable outputs while
+concrete associated types and handle-oriented constructors remain private. An
+application therefore loads and operates local models with only an `eredu`
+dependency. Explicit native sessions, streams, token handles, and distributed
 collective groups remain backend-author concerns.
 
 Application-only targets and platform examples can depend solely on the
@@ -894,19 +891,21 @@ extends the binding enum, whose exhaustive consumers are compiler checked.
 `BackendProvider::create_session` consumes a `PreparedModel`, so an executable
 cannot be paired with a cache or session created by another backend.
 
-`ModelRuntime<B>` owns the selected backend and its sole session. Applications
-normally use `eredu::api::LoadedModel<B>`, which combines that runtime
-with tokenizer, EOS, generation-default, and chat-template metadata.
+`ModelRuntime<B>` owns a backend and its sole session. Backend-generic clients
+use `eredu::api::LoadedModel<B>`, whose runtime remains private while portable
+model operations stay generic. Applications using the selected local backend
+use `eredu::api::LocalModel`, which also erases the backend parameter and maps
+native loading and generation failures into `LocalBackendError`.
 
 Automatic planning produces a portable `ExecutionPlan`. An
 `ExecutionPlanBackendFactory` realizes the complete plan into a target backend,
 backend load options, and the selected disabled, embedded, or external drafting
-configuration. `LoadedModel::load_execution_plan` and
-`LoadedModel::plan_and_load` therefore do not require callers to construct
-backend devices, queues, streams, or assistant models. Concrete device families
-are validated against the backend features and runtime hardware during
-realization. The backend reports the canonical identity derived from that
-realized device binding rather than echoing the plan's requested identifier.
+configuration. `LocalModel::load_execution_plan` and `LocalModel::plan_and_load`
+therefore do not require callers to construct or name backend devices, queues,
+streams, assistant models, sessions, or errors. Concrete device families are
+validated against the backend features and runtime hardware during realization.
+The backend reports the canonical identity derived from that realized device
+binding rather than echoing the plan's requested identifier.
 
 External assistants cross that factory boundary as an architecture-owned
 `ExternalAssistantPreparationPlan`. Architecture inspection fixes the
@@ -1169,7 +1168,7 @@ composition:
 - reusable public mechanics are rooted directly at
   `eredu_backend_mlx::backend::{nn, runtime, ...}`. The dedicated MLX crate
   does not repeat its backend name as another module layer;
-- `backend::MlxBackend` is the facade backend provider and privately owns
+- `backend::MlxBackend` is the provider used internally by the selected facade and privately owns
   execution and weight-materialization streams. Its production inherent API
   neither accepts nor returns native handles; callers that deliberately
   construct backend-native sessions do so through `eredu_backend_mlx::native`.

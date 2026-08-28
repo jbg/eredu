@@ -3,36 +3,78 @@
 //! Native device, stream, tensor, random-state, and allocator handles stay
 //! behind this module. Applications configure and operate the selected local
 //! backend through portable plans and facade-owned diagnostics.
+//!
+//! The selected backend and its session are not part of the application API:
+//!
+//! ```compile_fail
+//! use eredu::api::LocalBackend;
+//! ```
+//!
+//! ```compile_fail
+//! fn native_session(model: &eredu::api::LocalModel) {
+//!     let _ = model.runtime().session();
+//! }
+//! ```
 
 use std::path::Path;
 #[cfg(feature = "metal")]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _};
+use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _, TokenOutput as _};
 
-/// Backend selected for local model execution.
-///
-/// Native streams remain private to the selected backend:
-///
-/// ```compile_fail
-/// fn native_stream(backend: &eredu::api::LocalBackend<'_>) {
-///     let _ = backend.stream();
-/// }
-/// ```
-pub use eredu_backend_mlx::backend::MlxBackend as LocalBackend;
 /// Discovers hardware available to the selected local backend.
 pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
-/// Converts a selected-backend expert-cache report into portable telemetry.
-pub use eredu_backend_mlx::expert_cache_telemetry as local_expert_cache_telemetry;
-/// Converts speculative statistics into portable telemetry.
-pub use eredu_backend_mlx::mtp_telemetry as local_mtp_telemetry;
-/// Converts a selected-backend residency report into portable telemetry.
-pub use eredu_backend_mlx::residency_telemetry as local_residency_telemetry;
+
+type SelectedBackend = eredu_backend_mlx::backend::MlxBackend<'static>;
+type SelectedDrafter = eredu_backend_mlx::native::MlxDrafter;
+type SelectedPrompt = <SelectedBackend as eredu_core::TextGenerationBackend>::Prompt;
+
 /// Automatic planner and execution-plan factory for the selected local backend.
-pub use eredu_backend_mlx::MlxBackendFactory as LocalBackendFactory;
+///
+/// Its concrete backend factory is intentionally not exposed or implemented as
+/// a public backend trait. Application code realizes plans through [`LocalModel`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalBackendFactory {
+    inner: eredu_backend_mlx::MlxBackendFactory,
+}
+
+impl LocalBackendFactory {
+    /// Enables allocator and process-memory sampling for bounded residency.
+    pub const fn with_residency_diagnostics(
+        mut self,
+        sample_backend_memory: bool,
+        sample_process_memory: bool,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_residency_diagnostics(sample_backend_memory, sample_process_memory);
+        self
+    }
+
+    /// Produces a portable execution plan without exposing the selected backend.
+    pub fn plan(
+        &self,
+        planner: &crate::AutomaticPlanner,
+        request: &crate::AutomaticPlanRequest,
+    ) -> Result<crate::ExecutionPlanReport, crate::AutomaticPlanningError> {
+        planner.plan(&self.inner, request)
+    }
+}
+
 /// Scoped opt-in for selected-backend MTP component timing.
-pub use eredu_backend_mlx::MtpComponentTimingGuard as LocalMtpComponentTimingGuard;
+pub struct LocalMtpComponentTimingGuard {
+    _inner: eredu_backend_mlx::MtpComponentTimingGuard,
+}
+
+impl LocalMtpComponentTimingGuard {
+    /// Enables component timing until the returned guard is dropped.
+    pub fn enable() -> Self {
+        Self {
+            _inner: eredu_backend_mlx::MtpComponentTimingGuard::enable(),
+        }
+    }
+}
 
 /// Opaque failure reported through the selected-local-backend facade.
 ///
@@ -62,6 +104,579 @@ impl LocalBackendError {
     /// Backend diagnostic without exposing its native error type.
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+/// Failure while loading a tokenizer-aware model through the local facade.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalModelLoadError {
+    /// Portable artifact inspection or preparation planning failed.
+    #[error(transparent)]
+    Artifact(#[from] eredu_core::artifact::ArtifactError),
+    /// The selected backend failed materialization or session creation.
+    #[error(transparent)]
+    Backend(#[from] LocalBackendError),
+    /// The inspected model/session route lacks a required capability.
+    #[error(transparent)]
+    SessionCapability(#[from] eredu_core::SessionCapabilityError),
+    /// Portable tokenizer, chat-template, or generation metadata loading failed.
+    #[error(transparent)]
+    Metadata(#[from] super::TextMetadataError),
+}
+
+/// Failure while planning and loading a model through the local facade.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalPlannedModelLoadError {
+    /// Portable planning or device realization failed.
+    #[error(transparent)]
+    Planning(#[from] crate::AutomaticPlanningError),
+    /// Artifact, metadata, materialization, or session creation failed.
+    #[error(transparent)]
+    Loading(#[from] LocalModelLoadError),
+}
+
+fn map_local_model_load_error(
+    error: super::LoadedModelLoadError<eredu_backend_mlx::backend::error::Error>,
+) -> LocalModelLoadError {
+    match error {
+        super::LoadedModelLoadError::Artifact(error) => LocalModelLoadError::Artifact(error),
+        super::LoadedModelLoadError::Backend(error) => {
+            LocalBackendError::new("model loading", error).into()
+        }
+        super::LoadedModelLoadError::SessionCapability(error) => {
+            LocalModelLoadError::SessionCapability(error)
+        }
+        super::LoadedModelLoadError::Metadata(error) => LocalModelLoadError::Metadata(error),
+    }
+}
+
+fn map_local_planned_model_load_error(
+    error: super::PlannedModelLoadError<eredu_backend_mlx::backend::error::Error>,
+) -> LocalPlannedModelLoadError {
+    match error {
+        super::PlannedModelLoadError::Planning(error) => {
+            LocalPlannedModelLoadError::Planning(error)
+        }
+        super::PlannedModelLoadError::Loading(error) => {
+            LocalPlannedModelLoadError::Loading(map_local_model_load_error(error))
+        }
+    }
+}
+
+/// Opaque prompt prepared for the selected local model.
+pub struct LocalPrompt {
+    inner: SelectedPrompt,
+}
+
+/// Explicit prompt source for local prepared-chat generation.
+pub enum LocalPreparedChatInput<'a> {
+    /// Tokenizes the rendered prompt stored in the prepared chat.
+    RenderedPrompt(&'a super::PreparedChat),
+    /// Uses a facade-owned prompt prepared from portable media.
+    PreparedPrompt {
+        /// Prepared chat that owns generation semantics.
+        prepared_chat: &'a super::PreparedChat,
+        /// Opaque selected-backend prompt.
+        prompt: LocalPrompt,
+    },
+}
+
+impl<'a> LocalPreparedChatInput<'a> {
+    /// Creates a text-only input from the prepared chat's rendered prompt.
+    pub const fn rendered_prompt(prepared_chat: &'a super::PreparedChat) -> Self {
+        Self::RenderedPrompt(prepared_chat)
+    }
+
+    /// Binds a facade-prepared prompt to prepared-chat semantics.
+    pub fn prepared_prompt(prepared_chat: &'a super::PreparedChat, prompt: LocalPrompt) -> Self {
+        Self::PreparedPrompt {
+            prepared_chat,
+            prompt,
+        }
+    }
+
+    fn into_backend(self) -> super::PreparedChatInput<'a, SelectedBackend> {
+        match self {
+            Self::RenderedPrompt(prepared_chat) => {
+                super::PreparedChatInput::rendered_prompt(prepared_chat)
+            }
+            Self::PreparedPrompt {
+                prepared_chat,
+                prompt,
+            } => super::PreparedChatInput::prepared_backend_input(prepared_chat, prompt.inner),
+        }
+    }
+}
+
+/// Request for ordinary semantic generation through the local facade.
+pub struct LocalPreparedChatGenerationRequest<'a, F> {
+    /// Text-only or facade-prepared multimodal prompt.
+    pub input: LocalPreparedChatInput<'a>,
+    /// Portable sampling configuration, token limit, and random seed.
+    pub settings: super::PreparedChatGenerationSettings,
+    /// Additional decoded text sequences that terminate generation.
+    pub caller_stop_sequences: &'a [String],
+    /// Cooperative cancellation token.
+    pub cancellation: eredu_core::generation::GenerationCancellationToken,
+    /// Called synchronously as semantic events become available.
+    pub on_event: F,
+}
+
+/// Request for speculative semantic generation through the local facade.
+pub struct LocalPreparedChatMtpGenerationRequest<'a, F> {
+    /// Text-only or facade-prepared multimodal prompt.
+    pub input: LocalPreparedChatInput<'a>,
+    /// Opaque drafting realization loaded with the target model.
+    pub drafting: &'a mut LocalDrafting,
+    /// Portable sampling configuration, token limit, and random seed.
+    pub settings: super::PreparedChatGenerationSettings,
+    /// Proposal-block and scheduler controls.
+    pub options: super::PreparedChatMtpGenerationOptions,
+    /// Additional decoded text sequences that terminate generation.
+    pub caller_stop_sequences: &'a [String],
+    /// Cooperative cancellation token.
+    pub cancellation: eredu_core::generation::GenerationCancellationToken,
+    /// Called synchronously as semantic events become available.
+    pub on_event: F,
+}
+
+fn map_prepared_chat_error(
+    error: super::PreparedChatError<eredu_backend_mlx::backend::error::Error>,
+) -> super::PreparedChatError<LocalBackendError> {
+    match error {
+        super::PreparedChatError::Backend(error) => super::PreparedChatError::Backend(
+            LocalBackendError::new("prepared-chat generation", error),
+        ),
+        super::PreparedChatError::Constraint(error) => super::PreparedChatError::Constraint(error),
+        super::PreparedChatError::Generation(error) => super::PreparedChatError::Generation(error),
+        super::PreparedChatError::Tokenizer(error) => super::PreparedChatError::Tokenizer(error),
+        super::PreparedChatError::Semantic(error) => super::PreparedChatError::Semantic(error),
+        super::PreparedChatError::MissingTerminalToken => {
+            super::PreparedChatError::MissingTerminalToken
+        }
+    }
+}
+
+fn map_prepared_chat_mtp_error(
+    error: super::PreparedChatMtpError<eredu_backend_mlx::backend::error::Error>,
+) -> super::PreparedChatMtpError<LocalBackendError> {
+    match error {
+        super::PreparedChatMtpError::Backend(error) => super::PreparedChatMtpError::Backend(
+            LocalBackendError::new("prepared-chat speculative generation", error),
+        ),
+        super::PreparedChatMtpError::Generation(error) => {
+            super::PreparedChatMtpError::Generation(error)
+        }
+        super::PreparedChatMtpError::Text(error) => super::PreparedChatMtpError::Text(error),
+        super::PreparedChatMtpError::Constraint(error) => {
+            super::PreparedChatMtpError::Constraint(error)
+        }
+        super::PreparedChatMtpError::Semantic(error) => {
+            super::PreparedChatMtpError::Semantic(error)
+        }
+        super::PreparedChatMtpError::OutputCardinality { expected, actual } => {
+            super::PreparedChatMtpError::OutputCardinality { expected, actual }
+        }
+    }
+}
+
+/// Opaque drafting resources realized with a local model.
+pub struct LocalDrafting {
+    inner: eredu_core::RealizedDrafting<SelectedDrafter>,
+}
+
+impl LocalDrafting {
+    /// Returns whether speculative generation was selected.
+    pub const fn is_enabled(&self) -> bool {
+        !matches!(self.inner, eredu_core::RealizedDrafting::Disabled)
+    }
+
+    /// Returns whether a separately loaded assistant is owned by this plan.
+    pub const fn is_external(&self) -> bool {
+        self.inner.is_external()
+    }
+}
+
+/// One local model plus the opaque drafting resources from its execution plan.
+pub struct LocalPlannedModel {
+    model: LocalModel,
+    drafting: LocalDrafting,
+}
+
+impl LocalPlannedModel {
+    /// Borrows the loaded target model.
+    pub const fn model(&self) -> &LocalModel {
+        &self.model
+    }
+
+    /// Mutably borrows the loaded target model.
+    pub fn model_mut(&mut self) -> &mut LocalModel {
+        &mut self.model
+    }
+
+    /// Borrows the realized drafting mode.
+    pub const fn drafting(&self) -> &LocalDrafting {
+        &self.drafting
+    }
+
+    /// Mutably borrows both facade-owned resources.
+    pub fn parts_mut(&mut self) -> (&mut LocalModel, &mut LocalDrafting) {
+        (&mut self.model, &mut self.drafting)
+    }
+
+    /// Consumes the plan into its facade-owned target and drafting resources.
+    pub fn into_parts(self) -> (LocalModel, LocalDrafting) {
+        (self.model, self.drafting)
+    }
+}
+
+/// Asynchronous local token generation with portable token ids and opaque errors.
+pub struct LocalTextGeneration<'a> {
+    inner: eredu_core::TextGeneration<'a, SelectedBackend>,
+}
+
+impl Iterator for LocalTextGeneration<'_> {
+    type Item = Result<u32, LocalBackendError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|result| {
+            result
+                .map_err(|error| LocalBackendError::new("text generation", error))
+                .and_then(|token| {
+                    token
+                        .token_id()
+                        .map_err(|error| LocalBackendError::new("token materialization", error))
+                })
+        })
+    }
+}
+
+/// Loaded local model with no public backend, session, tensor, or completion type.
+///
+/// ```compile_fail
+/// fn native_session(model: &eredu::api::LocalModel) {
+///     let _ = model.runtime().session();
+/// }
+/// ```
+pub struct LocalModel {
+    inner: super::LoadedModel<SelectedBackend>,
+}
+
+impl LocalModel {
+    /// Realizes a complete execution plan through the selected local backend.
+    pub fn load_execution_plan(
+        factory: &LocalBackendFactory,
+        artifact: impl AsRef<Path>,
+        plan: &crate::ExecutionPlan,
+    ) -> Result<LocalPlannedModel, LocalPlannedModelLoadError> {
+        let planned = super::LoadedModel::load_execution_plan(&factory.inner, artifact, plan)
+            .map_err(map_local_planned_model_load_error)?;
+        let (model, drafting) = planned.into_parts();
+        Ok(LocalPlannedModel {
+            model: Self { inner: model },
+            drafting: LocalDrafting { inner: drafting },
+        })
+    }
+
+    /// Plans and loads a model without exposing backend realization types.
+    pub fn plan_and_load(
+        factory: &LocalBackendFactory,
+        planner: &crate::AutomaticPlanner,
+        request: &crate::AutomaticPlanRequest,
+    ) -> Result<(LocalPlannedModel, crate::ExecutionPlanReport), LocalPlannedModelLoadError> {
+        let report = factory.plan(planner, request)?;
+        let model = Self::load_execution_plan(factory, &request.model_path, &report.plan)?;
+        Ok((model, report))
+    }
+
+    /// Returns the effective runtime model type.
+    pub fn model_type(&self) -> &str {
+        self.inner.model_type()
+    }
+
+    /// Returns the model id used for chat-template rendering.
+    pub fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    /// Borrows the portable tokenizer.
+    pub const fn tokenizer(&self) -> &super::ChatTokenizer {
+        self.inner.tokenizer()
+    }
+
+    /// Returns the stable token-id vocabulary fingerprint.
+    pub const fn tokenizer_fingerprint(&self) -> &[u8; 32] {
+        self.inner.tokenizer_fingerprint()
+    }
+
+    /// Encodes text to portable vocabulary ids.
+    pub fn encode(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, super::TextModelError> {
+        self.inner.encode(text, add_special_tokens)
+    }
+
+    /// Decodes portable vocabulary ids.
+    pub fn decode(
+        &self,
+        ids: &[u32],
+        skip_special_tokens: bool,
+    ) -> Result<String, super::TextModelError> {
+        self.inner.decode(ids, skip_special_tokens)
+    }
+
+    /// Creates an incremental portable text decoder.
+    pub fn text_decoder(&self, skip_special_tokens: bool) -> super::TextDecoder {
+        self.inner.text_decoder(skip_special_tokens)
+    }
+
+    /// Returns checkpoint sampling recommendations, when present.
+    pub fn checkpoint_generation_config(
+        &self,
+    ) -> Option<&eredu_core::generation::CheckpointGenerationConfig> {
+        self.inner.checkpoint_generation_config()
+    }
+
+    /// Resolves request overrides over checkpoint recommendations and defaults.
+    pub fn resolve_generation_config(
+        &self,
+        overrides: eredu_core::generation::GenerationConfigOverrides,
+    ) -> Result<
+        eredu_core::generation::ResolvedGenerationConfig,
+        eredu_core::generation::GenerationError,
+    > {
+        self.inner.resolve_generation_config(overrides)
+    }
+
+    /// Starts local token generation without exposing backend token handles.
+    pub fn generate_tokens(
+        &mut self,
+        prompt_token_ids: Vec<u32>,
+        config: eredu_core::TextGenerationConfig,
+    ) -> Result<LocalTextGeneration<'_>, LocalBackendError> {
+        self.inner
+            .generate_tokens(prompt_token_ids, config)
+            .map(|inner| LocalTextGeneration { inner })
+            .map_err(|error| LocalBackendError::new("text generation", error))
+    }
+
+    /// Returns whether a chat template is attached.
+    pub fn has_chat_template(&self) -> bool {
+        self.inner.has_chat_template()
+    }
+
+    /// Returns the configured EOS vocabulary ids.
+    pub fn eos_token_ids(&self) -> &[u32] {
+        self.inner.eos_token_ids()
+    }
+
+    /// Returns true when `id` is a configured EOS id.
+    pub fn is_eos_token(&self, id: u32) -> bool {
+        self.inner.is_eos_token(id)
+    }
+
+    /// Returns the selected chat-template identity for `tools`.
+    pub fn selected_chat_template_identity(
+        &self,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Option<crate::runtime::chat::ChatTemplateIdentity>, super::TextModelError> {
+        self.inner.selected_chat_template_identity(tools)
+    }
+
+    /// Returns likely user-provided variables referenced by the chat template.
+    pub fn chat_template_kwargs(&self) -> Result<Vec<String>, super::TextModelError> {
+        self.inner.chat_template_kwargs()
+    }
+
+    /// Prepares a JSON-valued chat for generation.
+    pub fn prepare_chat(
+        &mut self,
+        request: crate::runtime::chat::ChatTemplateRequest,
+    ) -> Result<super::PreparedChat, super::TextModelError> {
+        self.inner.prepare_chat(request)
+    }
+
+    /// Applies the selected chat template to JSON-valued conversations.
+    pub fn apply_chat_template_json(
+        &mut self,
+        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+    ) -> Result<Option<String>, super::TextModelError> {
+        self.inner
+            .apply_chat_template_json(conversations, tools, add_generation_prompt)
+    }
+
+    /// Applies the selected chat template with extra JSON variables.
+    pub fn apply_chat_template_json_with_kwargs(
+        &mut self,
+        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+        template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Option<String>, super::TextModelError> {
+        self.inner.apply_chat_template_json_with_kwargs(
+            conversations,
+            tools,
+            add_generation_prompt,
+            template_kwargs,
+        )
+    }
+
+    /// Reports fail-closed speculative support for this local session.
+    pub fn mtp_capability(&self) -> eredu_core::MtpCapability {
+        self.inner.mtp_capability()
+    }
+
+    /// Generates one constrained semantic response.
+    pub fn generate_prepared_chat<F>(
+        &mut self,
+        request: LocalPreparedChatGenerationRequest<'_, F>,
+    ) -> Result<super::PreparedChatGenerationOutput, super::PreparedChatError<LocalBackendError>>
+    where
+        F: FnMut(eredu_core::generation::SemanticEvent),
+    {
+        self.inner
+            .generate_prepared_chat(super::PreparedChatGenerationRequest {
+                input: request.input.into_backend(),
+                settings: request.settings,
+                caller_stop_sequences: request.caller_stop_sequences,
+                cancellation: request.cancellation,
+                on_event: request.on_event,
+            })
+            .map_err(map_prepared_chat_error)
+    }
+
+    /// Generates one constrained response using opaque drafting resources.
+    pub fn generate_prepared_chat_mtp<F>(
+        &mut self,
+        request: LocalPreparedChatMtpGenerationRequest<'_, F>,
+    ) -> Result<
+        eredu_core::SpeculativeGenerationOutput,
+        super::PreparedChatMtpError<LocalBackendError>,
+    >
+    where
+        F: FnMut(eredu_core::generation::SemanticEvent),
+    {
+        let drafting = request
+            .drafting
+            .inner
+            .as_speculative_draft()
+            .ok_or_else(|| {
+                super::PreparedChatMtpError::Semantic(
+                    "the execution plan did not enable speculative drafting".into(),
+                )
+            })?;
+        self.inner
+            .generate_prepared_chat_mtp(super::PreparedChatMtpGenerationRequest {
+                input: request.input.into_backend(),
+                drafting,
+                settings: request.settings,
+                options: request.options,
+                caller_stop_sequences: request.caller_stop_sequences,
+                cancellation: request.cancellation,
+                on_event: request.on_event,
+            })
+            .map_err(map_prepared_chat_mtp_error)
+    }
+
+    /// Tokenizes and prepares a portable multimodal request.
+    #[cfg(any(feature = "image", feature = "audio"))]
+    pub fn prepare_multimodal_input(
+        &self,
+        request: &eredu_core::MultimodalRequest,
+    ) -> Result<LocalPrompt, super::MultimodalPreparationError<LocalBackendError>> {
+        self.inner
+            .prepare_multimodal_input(request)
+            .map(|inner| LocalPrompt { inner })
+            .map_err(map_multimodal_error)
+    }
+
+    /// Binds decoded media to a prepared chat and prepares its prompt.
+    #[cfg(any(feature = "image", feature = "audio"))]
+    pub fn prepare_chat_multimodal_input(
+        &self,
+        prepared_chat: &super::PreparedChat,
+        bindings: &[eredu_core::MediaBinding],
+    ) -> Result<LocalPrompt, super::MultimodalPreparationError<LocalBackendError>> {
+        self.inner
+            .prepare_chat_multimodal_input(prepared_chat, bindings)
+            .map(|inner| LocalPrompt { inner })
+            .map_err(map_multimodal_error)
+    }
+
+    /// Resets this model's session state.
+    pub fn reset(&mut self) -> Result<(), LocalBackendError> {
+        self.inner
+            .runtime
+            .session_mut()
+            .reset()
+            .map_err(|error| LocalBackendError::new("session reset", error))
+    }
+
+    /// Waits for all work submitted by this model.
+    pub fn synchronize(&self) -> Result<(), LocalBackendError> {
+        self.inner
+            .runtime
+            .backend()
+            .synchronize()
+            .map_err(|error| LocalBackendError::new("synchronization", error))
+    }
+
+    /// Synchronizes the model and samples allocator counters.
+    pub fn allocator_telemetry(&self) -> Result<crate::AllocatorTelemetry, LocalBackendError> {
+        self.synchronize()?;
+        allocator_telemetry()
+    }
+
+    /// Returns portable sparse expert-cache telemetry when available.
+    pub fn expert_cache_telemetry(
+        &self,
+    ) -> Result<Option<crate::ExpertCacheTelemetry>, LocalBackendError> {
+        self.inner
+            .runtime
+            .session()
+            .expert_cache_report()
+            .map(|report| {
+                report
+                    .as_ref()
+                    .map(eredu_backend_mlx::expert_cache_telemetry)
+            })
+            .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))
+    }
+
+    /// Returns portable weight-residency telemetry when available.
+    pub fn residency_telemetry(
+        &self,
+    ) -> Result<Option<crate::ResidencyTelemetry>, LocalBackendError> {
+        self.inner
+            .runtime
+            .session()
+            .residency_report()
+            .map_err(|error| LocalBackendError::new("residency telemetry", error))
+            .map(|report| report.as_ref().map(eredu_backend_mlx::residency_telemetry))
+    }
+}
+
+#[cfg(any(feature = "image", feature = "audio"))]
+fn map_multimodal_error(
+    error: super::MultimodalPreparationError<eredu_backend_mlx::backend::error::Error>,
+) -> super::MultimodalPreparationError<LocalBackendError> {
+    match error {
+        super::MultimodalPreparationError::Request(error) => {
+            super::MultimodalPreparationError::Request(error)
+        }
+        super::MultimodalPreparationError::Text(error) => {
+            super::MultimodalPreparationError::Text(error)
+        }
+        super::MultimodalPreparationError::Backend(error) => {
+            super::MultimodalPreparationError::Backend(LocalBackendError::new(
+                "multimodal preparation",
+                error,
+            ))
+        }
     }
 }
 
@@ -173,7 +788,7 @@ impl LocalInspectionOptions {
         factory: &LocalBackendFactory,
         plan: &crate::ExecutionPlan,
     ) -> Result<Self, crate::AutomaticPlanningError> {
-        let realization = eredu_core::realize_execution_plan_target(factory, plan)?;
+        let realization = eredu_core::realize_execution_plan_target(&factory.inner, plan)?;
         let (_, options) = realization.into_parts();
         Ok(Self {
             load: LocalLoadOptions::from_backend(options)?,
@@ -634,11 +1249,9 @@ const fn compiled_accelerator_family() -> Option<&'static str> {
     }
 }
 
-/// Waits for work submitted to the selected local backend.
-pub fn synchronize_local_backend(backend: &LocalBackend<'_>) -> Result<(), LocalBackendError> {
-    backend
-        .synchronize()
-        .map_err(|error| LocalBackendError::new("synchronization", error))
+/// Waits for work submitted by a local model.
+pub fn synchronize_local_model(model: &LocalModel) -> Result<(), LocalBackendError> {
+    model.synchronize()
 }
 
 /// Resets the selected runtime's allocator high-water mark.
@@ -648,11 +1261,12 @@ pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
     Ok(())
 }
 
-/// Synchronizes the selected backend and samples its allocator counters.
-pub fn local_allocator_telemetry(
-    backend: &LocalBackend<'_>,
-) -> Result<crate::AllocatorTelemetry, LocalBackendError> {
-    synchronize_local_backend(backend)?;
+/// Converts neutral speculative statistics into portable execution telemetry.
+pub fn local_mtp_telemetry(stats: &eredu_core::speculative::MtpStats) -> crate::MtpTelemetry {
+    eredu_backend_mlx::mtp_telemetry(stats)
+}
+
+fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, LocalBackendError> {
     Ok(crate::AllocatorTelemetry {
         peak_bytes: eredu_backend_mlx::native::memory::peak_memory()
             .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
@@ -741,10 +1355,10 @@ struct ExpertSnapshot {
     device_resident_bytes: u64,
 }
 
-fn expert_snapshot(
-    runtime: &eredu_core::ModelRuntime<LocalBackend<'static>>,
-) -> Result<ExpertSnapshot, LocalExpertCacheBenchmarkError> {
-    let report = runtime
+fn expert_snapshot(model: &LocalModel) -> Result<ExpertSnapshot, LocalExpertCacheBenchmarkError> {
+    let report = model
+        .inner
+        .runtime
         .session()
         .expert_cache_report()
         .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))?
@@ -807,23 +1421,27 @@ fn validate_expert_cache_benchmark_prompt(
 
 /// Benchmarks selected-backend expert-cache reuse without exposing tensors or streams.
 pub fn benchmark_local_expert_cache(
-    runtime: &mut eredu_core::ModelRuntime<LocalBackend<'static>>,
+    model: &mut LocalModel,
     token_ids: &[u32],
 ) -> Result<LocalExpertCacheBenchmark, LocalExpertCacheBenchmarkError> {
     validate_expert_cache_benchmark_prompt(token_ids)?;
-    let prompt = <LocalBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
-        runtime.backend(),
+    let prompt = <SelectedBackend as eredu_core::TextGenerationBackend>::prepare_text_prompt(
+        model.inner.runtime.backend(),
         token_ids.to_vec(),
     )
     .map_err(|error| LocalBackendError::new("expert-cache prompt preparation", error))?;
 
-    let before_cold = expert_snapshot(runtime)?;
-    runtime
+    let before_cold = expert_snapshot(model)?;
+    model
+        .inner
+        .runtime
         .session_mut()
         .reset()
         .map_err(|error| LocalBackendError::new("expert-cache session reset", error))?;
     let started = std::time::Instant::now();
-    let logits = runtime
+    let logits = model
+        .inner
+        .runtime
         .prefill(prompt.clone())
         .map_err(|error| LocalBackendError::new("expert-cache prefill submission", error))?
         .wait()
@@ -831,7 +1449,7 @@ pub fn benchmark_local_expert_cache(
         .into_logits()
         .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
-    let after_cold = expert_snapshot(runtime)?;
+    let after_cold = expert_snapshot(model)?;
     let cold_prefill = benchmark_sample(
         started.elapsed(),
         before_cold.prefill,
@@ -839,12 +1457,16 @@ pub fn benchmark_local_expert_cache(
         after_cold,
     );
 
-    runtime
+    model
+        .inner
+        .runtime
         .session_mut()
         .reset()
         .map_err(|error| LocalBackendError::new("expert-cache session reset", error))?;
     let started = std::time::Instant::now();
-    let logits = runtime
+    let logits = model
+        .inner
+        .runtime
         .prefill(prompt)
         .map_err(|error| LocalBackendError::new("expert-cache prefill submission", error))?
         .wait()
@@ -852,7 +1474,7 @@ pub fn benchmark_local_expert_cache(
         .into_logits()
         .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
-    let after_repeated = expert_snapshot(runtime)?;
+    let after_repeated = expert_snapshot(model)?;
     let repeated_prefill = benchmark_sample(
         started.elapsed(),
         after_cold.prefill,
@@ -862,7 +1484,7 @@ pub fn benchmark_local_expert_cache(
 
     let started = std::time::Instant::now();
     let output = {
-        let (backend, session) = runtime.parts_mut();
+        let (backend, session) = model.inner.runtime.parts_mut();
         session
             .submit_token_decode(backend, token_ids[token_ids.len() - 1])
             .map_err(|error| LocalBackendError::new("expert-cache decode submission", error))?
@@ -873,7 +1495,7 @@ pub fn benchmark_local_expert_cache(
         .into_logits()
         .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
-    let after_decode = expert_snapshot(runtime)?;
+    let after_decode = expert_snapshot(model)?;
     let cached_decode = benchmark_sample(
         started.elapsed(),
         after_repeated.decode,

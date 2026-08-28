@@ -5,8 +5,9 @@ emits protocol-neutral semantic events. Applications do not need to build a
 grammar, inspect tokenizer internals, or parse a checkpoint-specific wire
 format.
 
-The entry point is `LoadedModel::prepare_chat`, followed by one of the
-`generate_prepared_chat*` methods. The complete example is
+The application entry point is `LocalModel::prepare_chat`, followed by one of
+its `generate_prepared_chat*` methods. Backend authors can use the generic
+`LoadedModel<B>` surface instead. The complete application example is
 [`eredu/examples/native_tool_calling.rs`](../eredu/examples/native_tool_calling.rs).
 
 ## Capability gating
@@ -53,9 +54,13 @@ different tools without sharing mutable parser state.
 Choose one cohesive generation call:
 
 - `generate_prepared_chat` for ordinary constrained generation;
-- `generate_prepared_chat_mtp` with `SpeculativeDraft::External` or
-  `SpeculativeDraft::Embedded`; or
+- `generate_prepared_chat_mtp` with the opaque `LocalDrafting` loaded from the
+  same execution plan; or
 - `generate_prepared_chat_mtp_batch` for independently scheduled requests.
+
+The batch API and explicit `SpeculativeDraft` variants are backend-generic
+infrastructure. The selected application facade keeps the native drafter and
+its failures private.
 
 All paths use the same tokenizer-aware byte decoder, stop matcher, constraint
 engine, and semantic event pipeline. Speculation and scheduler interleaving can
@@ -85,8 +90,8 @@ event.
 
 ```rust,ignore
 let mut events = Vec::new();
-let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
-    input: PreparedChatInput::rendered_prompt(&prepared),
+let output = model.generate_prepared_chat(LocalPreparedChatGenerationRequest {
+    input: LocalPreparedChatInput::rendered_prompt(&prepared),
     settings: PreparedChatGenerationSettings::default(),
     caller_stop_sequences: &[],
     cancellation: GenerationCancellationToken::new(),

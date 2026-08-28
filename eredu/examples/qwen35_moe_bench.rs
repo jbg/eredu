@@ -2,11 +2,9 @@ use std::{path::PathBuf, time::Instant};
 
 use eredu::{
     api::{
-        local_allocator_telemetry, local_device_plan, reset_local_allocator_peak,
-        synchronize_local_backend, LoadedModel, LocalBackend, LocalBackendFactory, LocalDevice,
+        local_device_plan, reset_local_allocator_peak, LocalBackendFactory, LocalDevice, LocalModel,
     },
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
-    WeightTransformationPlan,
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, WeightTransformationPlan,
 };
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
@@ -52,11 +50,11 @@ fn main() -> anyhow::Result<()> {
     reset_local_allocator_peak()?;
     let load_start = Instant::now();
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
-    synchronize_local_backend(model.runtime().backend())?;
+    model.synchronize()?;
     let load_elapsed = load_start.elapsed();
-    let allocator = local_allocator_telemetry(model.runtime().backend())?;
+    let allocator = model.allocator_telemetry()?;
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
     println!("mlx_active_memory_bytes={}", allocator.active_bytes);
     println!("mlx_peak_memory_bytes={}", allocator.peak_bytes);
@@ -115,13 +113,13 @@ struct BenchResult {
 }
 
 fn run_case(
-    model: &mut LoadedModel<LocalBackend<'static>>,
+    model: &mut LocalModel,
     prompt: &str,
     decode_tokens: usize,
 ) -> anyhow::Result<BenchResult> {
     let prompt_ids = model.encode(prompt, false)?;
     let prompt_tokens = prompt_ids.len();
-    model.runtime_mut().session_mut().reset()?;
+    model.reset()?;
     let resolved = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: Some(0.0),
         ..Default::default()
@@ -135,14 +133,14 @@ fn run_case(
     };
     let first = first?;
     let prefill_s = prefill_start.elapsed().as_secs_f64();
-    ids.push(first.token_id()?);
+    ids.push(first);
 
     let decode_start = Instant::now();
     for _ in 1..decode_tokens {
         let Some(token) = generator.next() else {
             break;
         };
-        ids.push(token?.token_id()?);
+        ids.push(token?);
     }
     let decode_s = decode_start.elapsed().as_secs_f64();
     let decode_count = ids.len().saturating_sub(1);
@@ -166,10 +164,7 @@ fn run_case(
     })
 }
 
-fn prompt_near_token_count(
-    model: &mut LoadedModel<LocalBackend<'static>>,
-    target_tokens: usize,
-) -> anyhow::Result<String> {
+fn prompt_near_token_count(model: &mut LocalModel, target_tokens: usize) -> anyhow::Result<String> {
     let base = "Discuss hybrid linear attention, sparse mixture-of-experts routing, recurrent cache updates, grouped convolution, and vocabulary projection in a text generation runtime. ";
     let mut prompt = "Summarize linear attention performance.".to_string();
     while model.encode(&prompt, false)?.len() < target_tokens {

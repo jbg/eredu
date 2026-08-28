@@ -7,13 +7,12 @@ use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        local_device_plan, ChatTemplateRequest, LoadedModel, LocalBackendFactory, LocalDevice,
-        NativeToolSupport, ParallelToolCallPolicy, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest, SpeculativeDraft, ToolChoice,
+        local_device_plan, ChatTemplateRequest, LocalBackendFactory, LocalDevice, LocalModel,
+        LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
+        LocalPreparedChatMtpGenerationRequest, NativeToolSupport, ParallelToolCallPolicy,
+        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions, ToolChoice,
     },
-    DraftPlacementPlan, DraftingPlan, ExecutionPlan, MtpCapability, MtpCheckpointKind,
-    MtpSchedulerOptions, SemanticEvent,
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, MtpSchedulerOptions, SemanticEvent,
 };
 use serde_json::json;
 
@@ -37,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     }
     let planned =
-        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &target_path, &plan)?;
+        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &target_path, &plan)?;
     let (mut model, mut drafting) = planned.into_parts();
     let prepared = model.prepare_chat(ChatTemplateRequest {
         messages: vec![json!({
@@ -91,33 +90,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = Vec::<SemanticEvent>::new();
 
     let finish_reason = if drafter_path.is_some() {
-        let drafting = drafting
-            .as_speculative_draft()
-            .ok_or("external drafting plan was not realized")?;
-        model
-            .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&prepared),
-                drafting,
-                settings,
-                options: PreparedChatMtpGenerationOptions {
-                    max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                    scheduler,
-                },
-                caller_stop_sequences: &[],
-                cancellation: eredu::GenerationCancellationToken::new(),
-                on_event: |event| events.push(event),
-            })?
-            .finish_reason
-    } else if matches!(
-        model.mtp_capability(),
-        MtpCapability::Ready {
-            checkpoint: MtpCheckpointKind::Embedded
+        if !drafting.is_enabled() {
+            return Err("external drafting plan was not realized".into());
         }
-    ) {
         model
-            .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&prepared),
-                drafting: SpeculativeDraft::Embedded,
+            .generate_prepared_chat_mtp(LocalPreparedChatMtpGenerationRequest {
+                input: LocalPreparedChatInput::rendered_prompt(&prepared),
+                drafting: &mut drafting,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),
@@ -130,8 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .finish_reason
     } else {
         model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&prepared),
+            .generate_prepared_chat(LocalPreparedChatGenerationRequest {
+                input: LocalPreparedChatInput::rendered_prompt(&prepared),
                 settings,
                 caller_stop_sequences: &[],
                 cancellation: eredu::GenerationCancellationToken::new(),

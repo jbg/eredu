@@ -155,14 +155,13 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         }
     }
 
-    /// Borrows the selected backend and its session owner.
-    pub const fn runtime(&self) -> &ModelRuntime<B> {
+    pub(crate) const fn runtime(&self) -> &ModelRuntime<B> {
         &self.runtime
     }
 
-    /// Mutably borrows the selected backend and its session owner.
-    pub fn runtime_mut(&mut self) -> &mut ModelRuntime<B> {
-        &mut self.runtime
+    /// Returns portable metadata for the backend that owns this model.
+    pub fn backend_descriptor(&self) -> eredu_core::BackendDescriptor {
+        self.runtime.backend().descriptor()
     }
 
     /// Returns the effective runtime model type.

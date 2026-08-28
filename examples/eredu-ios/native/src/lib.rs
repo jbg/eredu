@@ -11,11 +11,11 @@ use std::{
 
 use eredu::{
     api::{
-        configure_local_runtime, local_device_plan, synchronize_local_backend, LoadedModel,
-        LocalBackend, LocalBackendFactory, LocalDevice, LocalRuntimeConfiguration,
+        configure_local_runtime, local_device_plan, LocalBackendFactory, LocalDevice, LocalModel,
+        LocalRuntimeConfiguration,
     },
     runtime::chat::ChatTemplateRequest,
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
@@ -85,7 +85,7 @@ fn publish_error(out: *mut *mut c_char, message: String) {
 }
 
 fn generate(
-    model: &mut LoadedModel<LocalBackend<'static>>,
+    model: &mut LocalModel,
     prompt: &str,
     callback: TextCallback,
     context: usize,
@@ -130,10 +130,7 @@ fn generate(
     let mut generated_tokens = 0_u64;
     let mut ttft = None;
     for token in generator {
-        let token_id = token
-            .map_err(|error| error.to_string())?
-            .token_id()
-            .map_err(|error| error.to_string())?;
+        let token_id = token.map_err(|error| error.to_string())?;
         if eos.contains(&token_id) {
             break;
         }
@@ -169,10 +166,10 @@ fn worker_main(
             local_device_plan(LocalDevice::Accelerator(0)).map_err(|error| error.to_string())?,
         );
         let planned =
-            LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_path, &plan)
+            LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_path, &plan)
                 .map_err(|error| error.to_string())?;
         let (mut model, _) = planned.into_parts();
-        synchronize_local_backend(model.runtime().backend()).map_err(|error| error.to_string())?;
+        model.synchronize().map_err(|error| error.to_string())?;
         ready
             .send(Ok(()))
             .map_err(|_| "loader disconnected".to_string())?;

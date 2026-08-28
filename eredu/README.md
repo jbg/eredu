@@ -31,20 +31,20 @@ crates.
 
 ## Loading a model
 
-`LoadedModel<B>` owns one selected backend session together with tokenizer,
-EOS, generation-default, and chat-template metadata. The same loading and
-generation methods work for every backend:
+`LocalModel` owns one selected backend session together with tokenizer, EOS,
+generation-default, and chat-template metadata. Its backend, session, prompts,
+token handles, drafting resources, and native errors remain private:
 
 ```rust,ignore
 use eredu::{
-    api::{local_device_plan, LoadedModel, LocalBackendFactory, LocalDevice},
+    api::{local_device_plan, LocalBackendFactory, LocalDevice, LocalModel},
     ExecutionPlan,
 };
 
 let device = local_device_plan(LocalDevice::Accelerator(0))?;
 let plan = ExecutionPlan::fully_resident(device);
 let factory = LocalBackendFactory::default();
-let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
+let planned = LocalModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
 let (mut model, drafting) = planned.into_parts();
 ```
 
@@ -54,10 +54,11 @@ in `eredu-backend-mlx`. Application clients use the flat selected-local-backend
 adapter in `eredu::api`; backend implementers and backend-specific tooling
 import the implementation crate directly.
 
-Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` when the
+Use `LocalModel::load_execution_plan` or `LocalModel::plan_and_load` when the
 application wants portable plan-to-backend realization. These entry points
 construct the selected backend and any embedded or external speculative
-drafter described by the plan.
+drafter described by the plan. Backend implementers can use the separate
+generic `LoadedModel<B>` API with a backend imported from its owning crate.
 
 Realtime speech models use the selected facade's concrete application API.
 `prepare_realtime_model` inspects the artifact, `LocalRealtimeBackendFactory`
