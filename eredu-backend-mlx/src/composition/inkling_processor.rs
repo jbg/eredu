@@ -3,7 +3,7 @@
 #[cfg(feature = "image")]
 use eredu_architectures::processor_plan::InklingImagePlan;
 use eredu_architectures::processor_plan::InklingProcessorPlan;
-#[cfg(feature = "image")]
+#[cfg(any(feature = "image", feature = "audio"))]
 use eredu_architectures::processor_plan::ProcessorPlanError;
 #[cfg(feature = "audio")]
 use eredu_architectures::processor_plan::{
@@ -114,7 +114,7 @@ impl InklingProcessor {
     }
 }
 
-#[cfg(feature = "image")]
+#[cfg(any(feature = "image", feature = "audio"))]
 fn processor_error(error: ProcessorPlanError) -> Error {
     Error::Processor(error.to_string())
 }

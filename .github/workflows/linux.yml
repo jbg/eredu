@@ -49,6 +49,11 @@ jobs:
         run: cargo test -p safemlx --test events --no-default-features
       - name: Check the Linux workspace
         run: cargo check --workspace
+      - name: Check isolated audio and codec features
+        run: |
+          cargo check -p eredu-backend-mlx --no-default-features --features audio
+          cargo check -p eredu-backend-mlx --no-default-features --features codec
+          cargo check -p eredu --no-default-features --features mlx,audio
       - name: Test the portable facade without default features
         run: |
           cargo test --locked -p eredu --no-default-features --test portable_facade
