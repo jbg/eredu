@@ -749,10 +749,12 @@ path and checkpoint handle in `ValidatedGguf`. After resolution, the
 architecture registry reconstructs the composite family from the already
 admitted primary geometry and companion header, validates the companion's exact
 tensor schema, and retains that typed companion plan alongside the primary plan.
-The architecture also owns the plan that maps a structurally validated sibling
-media projector to resulting input modalities. Inspection applies that plan to
-the same resolved artifact, so expected modalities and multimodal readiness
-describe one composition.
+The architecture also owns one preparation plan that declares whether a media
+projector is inapplicable, optional, or required and maps a structurally
+validated projector to resulting input modalities. Portable companion
+resolution, backend inspection, and materialization consume that policy rather
+than matching families independently, so admission, expected modalities,
+multimodal readiness, and loader requirements describe one composition.
 Muse-Glimmer's base GGUF is a complete text decoder; its optional official
 image-only projector adds the vision graph, parameters, processor plan, and
 image modality without changing text checkpoint admission.
@@ -888,11 +890,14 @@ normalized family for the artifact formats and materializers it actually
 implements. The MLX descriptor binds GGUF availability, complete or
 distributed-stage tensor parallelism, independent expert-cache loading, and
 load-time quantization in one place. It also selects the MLX composition used
-by complete and distributed materializers. Preflight and
-loader dispatch consume those typed bindings instead of independently matching
-the architecture registry. Adding a normalized family therefore requires one
-explicit MLX availability decision; adding a genuinely new MLX implementation
-extends the binding enum, whose exhaustive consumers are compiler checked.
+by replicated, complete tensor-parallel, and distributed-stage materializers.
+Preflight and loader dispatch consume those typed bindings instead of
+independently matching the architecture registry; exact GGUF architecture
+variants remain data interpreted inside the selected family composition, not a
+second backend dispatch matrix. Adding a normalized family therefore requires
+one explicit MLX availability decision; adding a genuinely new MLX
+implementation extends the binding enum, whose exhaustive consumers are
+compiler checked.
 `BackendProvider::create_session` consumes a `PreparedModel`, so an executable
 cannot be paired with a cache or session created by another backend.
 

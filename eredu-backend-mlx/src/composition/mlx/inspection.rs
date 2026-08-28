@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::composition::mlx::structural;
+#[cfg(test)]
 use eredu_architectures::GgufArchitecture;
 use eredu_core::{
     checkpoint::{TensorCatalog, TensorDtype},
@@ -402,7 +403,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         },
         Err(error) => reject_load_policy(&mut report, &error),
     }
-    let composition = inspect_gguf_projector(&mut report, path, gguf_architecture, validated);
+    let composition = inspect_gguf_projector(&mut report, path, composite_plan, validated);
     report.expected_modalities = artifact_modalities(composite_plan.input_modalities(composition));
     if composition
         == eredu_architectures::preparation::GgufArtifactComposition::ValidatedMediaProjector
@@ -591,129 +592,66 @@ fn apply_structural_validation(
 fn inspect_gguf_projector(
     report: &mut ModelInspectionReport,
     path: &Path,
-    architecture: GgufArchitecture,
+    plan: eredu_architectures::preparation::GgufCompositeArtifactPlan,
     validated: &eredu_core::ValidatedGguf,
 ) -> eredu_architectures::preparation::GgufArtifactComposition {
-    use eredu_architectures::preparation::GgufArtifactComposition;
+    use eredu_architectures::preparation::{
+        GgufArtifactComposition, GgufMediaProjectorRequirement,
+    };
 
-    let mut composition = GgufArtifactComposition::ModelOnly;
-    match architecture {
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            let projector = prepared_projector(validated)
-                .expect("portable Qwen3-VL admission requires a media projector");
-            composition = GgufArtifactComposition::ValidatedMediaProjector;
+    let requirement = plan.media_projector_requirement();
+    match (requirement, prepared_projector(validated)) {
+        (GgufMediaProjectorRequirement::NotApplicable, _) => {
+            report.multimodal = InspectionReadiness::NotApplicable;
+            GgufArtifactComposition::ModelOnly
+        }
+        (_, Some(projector)) => {
             report.requirements.push(InspectionRequirement {
                 code: InspectionIssueCode::MissingMediaProjector,
                 readiness: InspectionReadiness::Ready,
-                detail: "portable admission validated the qwen3vl vision projector".into(),
+                detail: "portable admission validated the architecture-declared media projector"
+                    .into(),
                 path: Some(projector),
             });
+            GgufArtifactComposition::ValidatedMediaProjector
         }
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
-            match prepared_projector(validated) {
-                Some(projector_path) => {
-                    composition = GgufArtifactComposition::ValidatedMediaProjector;
-                    report.requirements.push(InspectionRequirement {
-                        code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: InspectionReadiness::Ready,
-                        detail: "portable admission validated the Qwen3.5 vision projector".into(),
-                        path: Some(projector_path),
-                    });
-                }
-                None => {
-                    report.multimodal = InspectionReadiness::Missing;
-                    report.requirements.push(InspectionRequirement {
-                        code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: InspectionReadiness::Missing,
-                        detail: "Qwen3.5 text loading is available, but image/video input requires a sibling qwen35 mmproj GGUF".into(),
-                        path: None,
-                    });
-                    report.issue(
-                        InspectionIssueCode::MissingMediaProjector,
-                        InspectionSeverity::Warning,
-                        "Qwen3.5 has no sibling multimodal projector; text loading remains available",
-                        Some(path.to_path_buf()),
-                    );
-                }
-            }
+        (GgufMediaProjectorRequirement::Optional, None) => {
+            report.multimodal = InspectionReadiness::Missing;
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Missing,
+                detail: "text loading is available, but media input requires an architecture-declared sibling projector GGUF".into(),
+                path: None,
+            });
+            report.issue(
+                InspectionIssueCode::MissingMediaProjector,
+                InspectionSeverity::Warning,
+                "no sibling media projector was admitted; text loading remains available",
+                Some(path.to_path_buf()),
+            );
+            GgufArtifactComposition::ModelOnly
         }
-        GgufArchitecture::Inkling => match prepared_projector(validated) {
-            Some(_projector_path) => {
-                composition = GgufArtifactComposition::ValidatedMediaProjector;
-            }
-            None => {
-                report.multimodal = InspectionReadiness::Missing;
-                report.requirements.push(InspectionRequirement {
-                    code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: InspectionReadiness::Missing,
-                    detail: "Inkling text loading is available, but image/audio input requires a sibling mmproj GGUF".into(),
-                    path: None,
-                });
-                report.issue(
-                    InspectionIssueCode::MissingMediaProjector,
-                    InspectionSeverity::Warning,
-                    "Inkling has no sibling multimodal projector; text loading remains available",
-                    Some(path.to_path_buf()),
-                );
-            }
-        },
-        GgufArchitecture::Gemma4 => match prepared_projector(validated) {
-            Some(projector_path) => {
-                composition = GgufArtifactComposition::ValidatedMediaProjector;
-                report.requirements.push(InspectionRequirement {
-                    code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: InspectionReadiness::Ready,
-                    detail: "portable admission validated the Gemma 4 vision/audio projector"
+        (GgufMediaProjectorRequirement::Required, None) => {
+            report.multimodal = InspectionReadiness::Missing;
+            report.model_loadability = InspectionReadiness::Invalid;
+            report.requested_load = InspectionReadiness::Invalid;
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Missing,
+                detail:
+                    "architecture preparation requires a validated sibling media projector GGUF"
                         .into(),
-                    path: Some(projector_path),
-                });
-            }
-            None => {
-                report.multimodal = InspectionReadiness::Missing;
-                report.requirements.push(InspectionRequirement {
-                    code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: InspectionReadiness::Missing,
-                    detail: "Gemma 4 text loading is available, but image/audio input requires a sibling mmproj GGUF".into(),
-                    path: None,
-                });
-                report.issue(
-                    InspectionIssueCode::MissingMediaProjector,
-                    InspectionSeverity::Warning,
-                    "Gemma 4 has no sibling multimodal projector; text loading remains available",
-                    Some(path.to_path_buf()),
-                );
-            }
-        },
-        GgufArchitecture::MuseGlimmer => match prepared_projector(validated) {
-            Some(projector_path) => {
-                composition = GgufArtifactComposition::ValidatedMediaProjector;
-                report.requirements.push(InspectionRequirement {
-                    code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: InspectionReadiness::Ready,
-                    detail: "portable admission validated the image-only Muse-Glimmer projector"
-                        .into(),
-                    path: Some(projector_path),
-                });
-            }
-            None => {
-                report.multimodal = InspectionReadiness::Missing;
-                report.requirements.push(InspectionRequirement {
-                    code: InspectionIssueCode::MissingMediaProjector,
-                    readiness: InspectionReadiness::Missing,
-                    detail: "Muse-Glimmer text loading is available, but image input requires a sibling mmproj GGUF".into(),
-                    path: None,
-                });
-                report.issue(
-                    InspectionIssueCode::MissingMediaProjector,
-                    InspectionSeverity::Warning,
-                    "Muse-Glimmer has no sibling image projector; text loading remains available",
-                    Some(path.to_path_buf()),
-                );
-            }
-        },
-        _ => report.multimodal = InspectionReadiness::NotApplicable,
+                path: None,
+            });
+            report.issue(
+                InspectionIssueCode::MissingMediaProjector,
+                InspectionSeverity::Error,
+                "portable admission omitted an architecture-required media projector",
+                Some(path.to_path_buf()),
+            );
+            GgufArtifactComposition::ModelOnly
+        }
     }
-    composition
 }
 
 fn inspect_safetensors_media(

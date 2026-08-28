@@ -89,22 +89,41 @@ pub enum GgufArtifactComposition {
     ValidatedMediaProjector,
 }
 
-/// Architecture-owned modality policy for a possibly composite GGUF artifact.
+/// Whether one GGUF architecture admits a separately stored media projector.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GgufMediaProjectorRequirement {
+    /// The architecture has no media-projector composition.
+    NotApplicable,
+    /// A projector may extend the text-only model with media inputs.
+    Optional,
+    /// A validated projector is required for the model artifact.
+    Required,
+}
+
+/// Architecture-owned projector and modality policy for a GGUF artifact.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct GgufCompositeArtifactPlan {
     model_modalities: InputModalities,
     projector_modalities: Option<InputModalities>,
+    projector_requirement: GgufMediaProjectorRequirement,
 }
 
 impl GgufCompositeArtifactPlan {
     const fn new(
         model_modalities: InputModalities,
         projector_modalities: Option<InputModalities>,
+        projector_requirement: GgufMediaProjectorRequirement,
     ) -> Self {
         Self {
             model_modalities,
             projector_modalities,
+            projector_requirement,
         }
+    }
+
+    /// Architecture-owned presence policy for a sibling media projector.
+    pub const fn media_projector_requirement(self) -> GgufMediaProjectorRequirement {
+        self.projector_requirement
     }
 
     /// Input modalities provided by the validated artifact composition.
@@ -121,7 +140,9 @@ impl GgufCompositeArtifactPlan {
 pub const fn gguf_composite_artifact_plan(
     architecture: GgufArchitecture,
 ) -> GgufCompositeArtifactPlan {
-    let (model_modalities, projector_modalities) = match architecture {
+    use GgufMediaProjectorRequirement::{NotApplicable, Optional, Required};
+
+    let (model_modalities, projector_modalities, projector_requirement) = match architecture {
         GgufArchitecture::Inkling => (
             InputModalities::TEXT,
             Some(InputModalities {
@@ -130,6 +151,7 @@ pub const fn gguf_composite_artifact_plan(
                 audio: true,
                 video: false,
             }),
+            Optional,
         ),
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let modalities = InputModalities {
@@ -138,7 +160,7 @@ pub const fn gguf_composite_artifact_plan(
                 audio: false,
                 video: true,
             };
-            (modalities, Some(modalities))
+            (modalities, Some(modalities), Required)
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => (
             InputModalities::TEXT,
@@ -148,6 +170,7 @@ pub const fn gguf_composite_artifact_plan(
                 audio: false,
                 video: true,
             }),
+            Optional,
         ),
         GgufArchitecture::Gemma4 => (
             InputModalities::TEXT,
@@ -157,6 +180,7 @@ pub const fn gguf_composite_artifact_plan(
                 audio: true,
                 video: false,
             }),
+            Optional,
         ),
         GgufArchitecture::MuseGlimmer => (
             InputModalities::TEXT,
@@ -166,10 +190,15 @@ pub const fn gguf_composite_artifact_plan(
                 audio: false,
                 video: false,
             }),
+            Optional,
         ),
-        _ => (InputModalities::TEXT, None),
+        _ => (InputModalities::TEXT, None, NotApplicable),
     };
-    GgufCompositeArtifactPlan::new(model_modalities, projector_modalities)
+    GgufCompositeArtifactPlan::new(
+        model_modalities,
+        projector_modalities,
+        projector_requirement,
+    )
 }
 
 /// Architecture-owned distributed capabilities for one normalized model.
@@ -988,6 +1017,10 @@ mod tests {
         ] {
             let plan = gguf_composite_artifact_plan(architecture);
             assert_eq!(
+                plan.media_projector_requirement(),
+                GgufMediaProjectorRequirement::Optional
+            );
+            assert_eq!(
                 plan.input_modalities(GgufArtifactComposition::ModelOnly),
                 InputModalities::TEXT
             );
@@ -996,5 +1029,19 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn gguf_projector_presence_is_architecture_preparation_policy() {
+        for architecture in [GgufArchitecture::Qwen3Vl, GgufArchitecture::Qwen3VlMoe] {
+            assert_eq!(
+                gguf_composite_artifact_plan(architecture).media_projector_requirement(),
+                GgufMediaProjectorRequirement::Required
+            );
+        }
+        assert_eq!(
+            gguf_composite_artifact_plan(GgufArchitecture::Llama).media_projector_requirement(),
+            GgufMediaProjectorRequirement::NotApplicable
+        );
     }
 }

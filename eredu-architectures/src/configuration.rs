@@ -164,29 +164,28 @@ fn read_optional_sidecar(path: &Path, filename: &str) -> Result<Option<Vec<u8>>,
 pub fn gguf_companion_requirements(
     architecture: GgufArchitecture,
 ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
-    let policy = match architecture {
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            Some((true, GgufCompanionEncoding::DensePreferred))
-        }
-        GgufArchitecture::MuseGlimmer => Some((false, GgufCompanionEncoding::DensePreferred)),
-        GgufArchitecture::Gemma4 => Some((false, GgufCompanionEncoding::DenseRequired)),
-        GgufArchitecture::Inkling | GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
-            Some((false, GgufCompanionEncoding::DensePreferred))
-        }
-        _ => None,
+    use crate::preparation::GgufMediaProjectorRequirement;
+
+    let required = match crate::preparation::gguf_composite_artifact_plan(architecture)
+        .media_projector_requirement()
+    {
+        GgufMediaProjectorRequirement::NotApplicable => return Ok(Vec::new()),
+        GgufMediaProjectorRequirement::Optional => false,
+        GgufMediaProjectorRequirement::Required => true,
     };
-    policy
-        .map(|(required, encoding)| {
-            GgufCompanionRequirement::new(
-                GgufCompanionRole::MediaProjector,
-                required,
-                "mmproj",
-                1,
-                encoding,
-            )
-            .map(|requirement| vec![requirement])
-        })
-        .unwrap_or_else(|| Ok(Vec::new()))
+    let encoding = if architecture == GgufArchitecture::Gemma4 {
+        GgufCompanionEncoding::DenseRequired
+    } else {
+        GgufCompanionEncoding::DensePreferred
+    };
+    GgufCompanionRequirement::new(
+        GgufCompanionRole::MediaProjector,
+        required,
+        "mmproj",
+        1,
+        encoding,
+    )
+    .map(|requirement| vec![requirement])
 }
 
 /// Architecture family identity owned by the architecture registry.

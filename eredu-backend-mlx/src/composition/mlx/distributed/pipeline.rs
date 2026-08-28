@@ -13872,6 +13872,10 @@ pub fn load_pipeline_model_with_options(
                     projector_plan,
                     validated,
                 )?;
+            crate::composition::mlx::loading::validate_gguf_projector_requirement(
+                admitted.architecture(),
+                projector.is_some(),
+            )?;
             let architecture = admitted.architecture();
             let checkpoint = admitted.checkpoint().clone();
             let capabilities =
@@ -14027,11 +14031,9 @@ pub fn load_pipeline_model_with_options(
                 FamilyBinding::Qwen3Vl | FamilyBinding::Qwen3VlMoe => {
                     let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
                         &admitted,
-                        projector.as_ref().ok_or_else(|| {
-                            Error::ArchitectureModel(
-                                "Qwen3-VL preparation omitted its required media projector".into(),
-                            )
-                        })?,
+                        projector
+                            .as_ref()
+                            .expect("required GGUF projector was validated above"),
                         max_mapped_shards,
                     )?;
                     load_neutral_qwen_vl_pipeline(

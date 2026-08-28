@@ -3,7 +3,7 @@
 use eredu_checkpoint::WeightQuantization;
 
 use eredu_architectures::processor_plan::ArtifactArchitecturePlan;
-use eredu_architectures::{GgufArchitecture, ModelKind};
+use eredu_architectures::ModelKind;
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::Stream;
@@ -29,6 +29,23 @@ struct MaterializedGgufModel {
     processor: Option<ModelProcessor>,
 }
 
+pub(crate) fn validate_gguf_projector_requirement(
+    architecture: eredu_architectures::GgufArchitecture,
+    has_projector: bool,
+) -> Result<(), Error> {
+    let requirement = eredu_architectures::preparation::gguf_composite_artifact_plan(architecture)
+        .media_projector_requirement();
+    if requirement == eredu_architectures::preparation::GgufMediaProjectorRequirement::Required
+        && !has_projector
+    {
+        return Err(Error::ArchitectureModel(format!(
+            "{} preparation omitted its architecture-required media projector",
+            architecture.model_kind().canonical_name()
+        )));
+    }
+    Ok(())
+}
+
 fn materialize_gguf_model(
     source: &structural::AdmittedGguf,
     projector: Option<&structural::AdmittedGgufProjector>,
@@ -38,15 +55,17 @@ fn materialize_gguf_model(
 ) -> Result<Executable, Error> {
     let kind = source.architecture().model_kind();
     let quantization = options.weight_quantization()?;
-    if !FamilyRealization::for_kind(kind).supports_gguf() {
+    let realization = FamilyRealization::for_kind(kind);
+    if !realization.supports_gguf() {
         return Err(Error::ArchitectureModel(format!(
             "MLX has no GGUF realization for {}",
             kind.canonical_name()
         )));
     }
+    validate_gguf_projector_requirement(source.architecture(), projector.is_some())?;
     structural::validate_complete_gguf_quantization(kind, quantization.is_some())?;
-    let model = match source.architecture() {
-        GgufArchitecture::KimiLinear => {
+    let model = match realization.binding() {
+        FamilyBinding::KimiLinear => {
             let loaded = crate::composition::kimi_linear::load_kimi_linear_gguf_model(
                 source,
                 options.weight_residency,
@@ -56,7 +75,7 @@ fn materialize_gguf_model(
             )?;
             Executable::kimi_linear(kind, loaded)?
         }
-        GgufArchitecture::DeepSeek2 => {
+        FamilyBinding::DeepSeekV3 => {
             let loaded = crate::composition::deepseek::load_gguf(
                 source,
                 options.weight_residency,
@@ -65,7 +84,7 @@ fn materialize_gguf_model(
             )?;
             Executable::deepseek(kind, Box::new(loaded))?
         }
-        GgufArchitecture::DeepSeek4 => {
+        FamilyBinding::DeepSeekV4 => {
             let loaded = crate::composition::deepseek::load_gguf(
                 source,
                 options.weight_residency,
@@ -74,7 +93,7 @@ fn materialize_gguf_model(
             )?;
             Executable::deepseek(kind, Box::new(loaded))?
         }
-        GgufArchitecture::GptOss => {
+        FamilyBinding::GptOss => {
             let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_model(
                 source,
                 options.weight_residency,
@@ -84,7 +103,7 @@ fn materialize_gguf_model(
             )?;
             Executable::gpt_oss(kind, loaded)?
         }
-        GgufArchitecture::Inkling => {
+        FamilyBinding::Inkling => {
             let loaded = crate::composition::inkling::load_gguf(
                 source,
                 projector,
@@ -94,7 +113,7 @@ fn materialize_gguf_model(
             )?;
             Executable::inkling(kind, loaded)?
         }
-        GgufArchitecture::Gemma4 => {
+        FamilyBinding::Gemma4 => {
             let loaded = crate::composition::gemma4::load_gguf(
                 source,
                 projector,
@@ -104,7 +123,7 @@ fn materialize_gguf_model(
             )?;
             Executable::gemma4(kind, loaded)?
         }
-        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+        FamilyBinding::Llama => {
             let loaded = crate::composition::llama::load_llama_gguf_model(
                 source,
                 options.weight_residency,
@@ -114,7 +133,7 @@ fn materialize_gguf_model(
             )?;
             Executable::llama(kind, loaded)?
         }
-        GgufArchitecture::MuseGlimmer => {
+        FamilyBinding::MuseGlimmer => {
             let loaded = crate::composition::muse_glimmer::load_gguf(
                 source,
                 projector,
@@ -124,7 +143,7 @@ fn materialize_gguf_model(
             )?;
             Executable::muse_glimmer(kind, loaded)?
         }
-        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+        FamilyBinding::Lfm2 => {
             let loaded = crate::composition::lfm2::load_lfm2_gguf_model(
                 source,
                 options.weight_residency,
@@ -134,7 +153,7 @@ fn materialize_gguf_model(
             )?;
             Executable::lfm2(kind, loaded)?
         }
-        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
+        FamilyBinding::NemotronH => {
             let loaded = crate::composition::nemotron_h::load_nemotron_h_gguf_model(
                 source,
                 options.weight_residency,
@@ -144,7 +163,7 @@ fn materialize_gguf_model(
             )?;
             Executable::nemotron_h(kind, loaded)?
         }
-        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+        FamilyBinding::Qwen => {
             let loaded = crate::composition::qwen::load_qwen_gguf_model(
                 source,
                 options.weight_residency,
@@ -154,12 +173,8 @@ fn materialize_gguf_model(
             )?;
             Executable::qwen(kind, loaded)?
         }
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            let projector = projector.ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "Qwen3-VL preparation omitted its required media projector".into(),
-                )
-            })?;
+        binding @ (FamilyBinding::Qwen3Vl | FamilyBinding::Qwen3VlMoe) => {
+            let projector = projector.expect("required GGUF projector was validated above");
             let loaded = crate::composition::qwen::vl::load_gguf(
                 source,
                 projector,
@@ -168,13 +183,13 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            if source.architecture() == GgufArchitecture::Qwen3VlMoe {
-                Executable::qwen3_vl_moe(kind, loaded)?
-            } else {
-                Executable::qwen3_vl(kind, loaded)?
+            match binding {
+                FamilyBinding::Qwen3Vl => Executable::qwen3_vl(kind, loaded)?,
+                FamilyBinding::Qwen3VlMoe => Executable::qwen3_vl_moe(kind, loaded)?,
+                _ => unreachable!(),
             }
         }
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
+        binding @ (FamilyBinding::Qwen35 | FamilyBinding::Qwen3Next) => {
             let loaded = crate::composition::qwen::hybrid::load_gguf(
                 source,
                 projector,
@@ -183,11 +198,16 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            if source.architecture() == GgufArchitecture::Qwen3Next {
-                Executable::qwen3_next(kind, loaded)?
-            } else {
-                Executable::qwen35(kind, loaded)?
+            match binding {
+                FamilyBinding::Qwen35 => Executable::qwen35(kind, loaded)?,
+                FamilyBinding::Qwen3Next => Executable::qwen3_next(kind, loaded)?,
+                _ => unreachable!(),
             }
+        }
+        FamilyBinding::MoshiRealtime => {
+            return Err(Error::ArchitectureModel(
+                "Moshi-family models have no GGUF realization".into(),
+            ));
         }
     };
     Ok(model)
