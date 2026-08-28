@@ -16,10 +16,13 @@ python3 validation/validate_release_packages.py
 The validator copies the Git package candidates to a temporary workspace, then
 runs `cargo package` for each crate. It unpacks each archive, compiles its
 library unit tests, and runs its doctests with default features disabled before
-adding that archive to an ephemeral local registry. This lets the next crate
-resolve the exact unpublished workspace version while retaining Cargo's normal
-package verification. Nothing contacts a registry publishing API and no
-credentials are required.
+adding that archive to an ephemeral local registry. After staging a library, it
+also checks a new lock-free downstream crate that depends on the staged package
+with default features disabled. This lets consumers and the next workspace crate
+resolve the exact unpublished version while retaining Cargo's normal package
+verification. Package builds use a temporary target directory that is removed
+after validation. Nothing contacts a registry publishing API and no credentials
+are required.
 
 This catches:
 
@@ -27,6 +30,8 @@ This catches:
   an earlier workspace archive;
 - files omitted from the generated archive that cause package, packaged unit
   test compilation, or packaged doctests to fail;
+- dependency requirements that fail when a downstream consumer resolves the
+  published crate without inheriting the workspace lockfile;
 - archives above crates.io's 10 MiB compressed-size limit; and
 - new publishable crates or dependency changes that are missing from the
   declared order.

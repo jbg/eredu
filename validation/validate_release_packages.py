@@ -316,6 +316,43 @@ def validate_packaged_tests(
     )
 
 
+def validate_downstream_consumer(
+    package: dict[str, Any],
+    destination: Path,
+    config: Path,
+    environment: dict[str, str],
+) -> None:
+    library_kinds = {"lib", "proc-macro"}
+    if not any(library_kinds.intersection(target["kind"]) for target in package["targets"]):
+        return
+
+    consumer = destination / package["name"]
+    source = consumer / "src"
+    source.mkdir(parents=True)
+    (consumer / "Cargo.toml").write_text(
+        "\n".join(
+            [
+                "[package]",
+                f'name = "{package["name"]}-release-consumer"',
+                'version = "0.0.0"',
+                'edition = "2021"',
+                "",
+                "[dependencies]",
+                f'{package["name"]} = {{ version = "={package["version"]}", '
+                'registry = "staged", default-features = false }',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (source / "lib.rs").write_text("", encoding="utf-8")
+    run(
+        ["cargo", "check", "--config", str(config)],
+        cwd=consumer,
+        env=environment,
+    )
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -341,8 +378,6 @@ def main() -> int:
     packages = publishable_packages(metadata)
     validate_release_order(packages)
     publishable_names = set(packages)
-    target_dir = workspace / "target" / "release-package-validation"
-    target_dir.mkdir(parents=True, exist_ok=True)
 
     sizes: list[tuple[str, int]] = []
     with tempfile.TemporaryDirectory(prefix="eredu-release-packages-") as temporary:
@@ -350,9 +385,11 @@ def main() -> int:
         release_workspace = root / "workspace"
         index = root / "index"
         downloads = root / "downloads"
+        target_dir = root / "target"
         release_workspace.mkdir()
         index.mkdir()
         downloads.mkdir()
+        target_dir.mkdir()
         copy_release_source(workspace, release_workspace)
 
         (index / "config.json").write_text(
@@ -417,6 +454,12 @@ def main() -> int:
             stage_package(package, archive, index, downloads, publishable_names)
             staged.append(package)
             write_cargo_config(config, index, staged)
+            validate_downstream_consumer(
+                package,
+                root / "downstream-consumers",
+                config,
+                environment,
+            )
 
     print("\nValidated publishable crate archives:")
     for crate_name, size in sizes:
