@@ -1818,6 +1818,15 @@ impl MlxHybridState {
             .find_map(MlxHybridAttentionState::manager)
     }
 
+    /// Borrows every native array retained by the complete hybrid state.
+    pub fn retained_arrays(&self) -> Vec<&Array> {
+        self.layers
+            .iter()
+            .flat_map(RuntimeLayerState::<MlxNeuralBackend>::retained_values)
+            .map(MlxTensor::as_array)
+            .collect()
+    }
+
     /// Returns the common absolute token frontier.
     pub fn offset(&self) -> i32 {
         self.layers

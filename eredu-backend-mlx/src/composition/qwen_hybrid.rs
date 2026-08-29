@@ -63,6 +63,40 @@ fn qwen_hybrid_input_plan(
         .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
 }
 
+pub(crate) fn prompt_token_ids(
+    parsed: &ParsedHybridConfig,
+    input: input::ModelInput<'_>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    input::validate(input)?;
+    let tokens = input
+        .parts
+        .iter()
+        .map(|part| match qwen_hybrid_input_plan(parsed, part)? {
+            QwenHybridInputPartPlan::TextTokens { .. } => {
+                let input::InputPayload::TokenIds(tokens) = part.payload() else {
+                    unreachable!()
+                };
+                Ok(tokens.clone())
+            }
+            QwenHybridInputPartPlan::Projected { .. } => {
+                let input::InputPayload::Embeddings(embeddings) = part.payload() else {
+                    unreachable!()
+                };
+                input::token_ids_array(
+                    &vec![0; usize::try_from(embeddings.dim(1)).unwrap_or_default()],
+                    stream,
+                )
+            }
+            QwenHybridInputPartPlan::Media { ingress, .. } => {
+                super::materialize_qwen_media_ingress(ingress, stream).map(|ingress| ingress.tokens)
+            }
+        })
+        .collect::<Result<Vec<_>, Exception>>()?;
+    let tokens = tokens.iter().collect::<Vec<_>>();
+    safemlx::ops::concatenate_axis(&tokens, 1, stream)
+}
+
 use crate::backend::{
     error::Error,
     nn::shared::{MlxNeuralBackend, MlxModule},
@@ -1549,17 +1583,15 @@ impl CausalModel<MlxHybridState> for QwenHybridModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Exception> {
-        let output = if self.parsed.vision.is_some() {
-            self.prepared_conditional_forward(input, cache, stream, None)?
-                .logits
-        } else {
-            let tokens = input::text_token_ids(input, stream)?;
-            crate::MlxTensor::from_array(
-                self.forward(&tokens, cache, stream)
-                    .map_err(|error| Exception::custom(error.to_string()))?,
-            )
-        };
+        let output = <Self as crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget>::prefill_target(
+            self, input, cache, stream,
+        )?;
+        let tokens = output.tokens.clone();
+        <Self as crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget>::prefill_draft_cache(
+            self, &output, &tokens, cache, stream,
+        )?;
         output
+            .logits
             .as_array()
             .try_index_device((.., -1, ..), stream)
             .map(crate::MlxTensor::from_array)

@@ -1380,6 +1380,23 @@ pub(in crate::composition::mlx) enum PipelineMtpCache {
     Hybrid(MlxHybridState),
 }
 
+impl PipelineMtpCache {
+    fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::None => Vec::new(),
+            Self::DeepSeek(caches) => caches
+                .iter()
+                .flat_map(CompressedLatentCache::retained_arrays)
+                .collect(),
+            Self::NeutralDeepSeekV4(caches) => caches
+                .iter()
+                .flat_map(MlxPoolingAttentionCache::retained_arrays)
+                .collect(),
+            Self::Hybrid(state) => state.retained_arrays(),
+        }
+    }
+}
+
 impl PipelineCache {
     /// Creates a cache from an explicit architecture identity and ordered layer entries.
     pub fn new(model_kind: ModelKind, layers: Vec<PipelineLayerCache>) -> Self {
@@ -3010,6 +3027,14 @@ trait PipelineEmbeddedMtp {
     fn embedded_mtp_len(&self) -> usize;
 
     fn embedded_mtp_state_segment(&self) -> Option<&'static str>;
+
+    fn prefill_token_identity(
+        &self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        pipeline_mtp_token_identity(input, stream).map_err(Into::into)
+    }
 
     fn new_embedded_mtp_cache(
         &self,
@@ -8836,6 +8861,15 @@ impl PipelineEmbeddedMtp for QwenConditionalPipelinePartition {
         Some(eredu_architectures::qwen::hybrid::PREDICTION_STATE_SEGMENT)
     }
 
+    fn prefill_token_identity(
+        &self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        crate::composition::qwen::hybrid::prompt_token_ids(self.args(), input, stream)
+            .map_err(Into::into)
+    }
+
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
@@ -9825,6 +9859,76 @@ impl<'session, 'world> PipelineEmbeddedMtpTarget<'session, 'world> {
     ) -> Self {
         Self { model, execution }
     }
+
+    fn prefill_target_inner(
+        &mut self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+        cache: &mut PipelineCache,
+        stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let tokens = self
+            .model
+            .stage
+            .embedded_mtp()
+            .ok_or_else(|| Exception::custom("pipeline stage has no embedded MTP"))?
+            .prefill_token_identity(input, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let multimodal = input
+            .parts
+            .iter()
+            .any(|part| part.modality() != eredu_core::InputModality::Text);
+        cache
+            .reset()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.model
+            .ensure_embedded_mtp_cache(cache)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let local = match (multimodal, observer) {
+            (true, Some(observer)) => self.model.prefill_distributed_with_observer(
+                self.model.info.owns_input.then_some(input),
+                step,
+                None,
+                cache,
+                self.execution,
+                observer,
+            ),
+            (true, None) => self.model.prefill_distributed(
+                self.model.info.owns_input.then_some(input),
+                step,
+                None,
+                cache,
+                self.execution,
+            ),
+            (false, Some(observer)) => self.model.forward_distributed_with_observer(
+                self.model.info.owns_input.then_some(&tokens),
+                step,
+                None,
+                cache,
+                self.execution,
+                observer,
+            ),
+            (false, None) => self.model.forward_distributed(
+                self.model.info.owns_input.then_some(&tokens),
+                step,
+                None,
+                cache,
+                self.execution,
+            ),
+        }
+        .and_then(|completion| {
+            completion.synchronize()?;
+            Ok(completion)
+        });
+        let logits = local
+            .map_err(|error| Exception::custom(error.to_string()))?
+            .into_submitted_logits();
+        let hidden = self.model.last_mtp_hidden.take();
+        self.model
+            .synchronize_embedded_mtp_output(logits, hidden, tokens, self.execution, stream)
+    }
 }
 
 fn pipeline_mtp_token_identity(
@@ -10230,20 +10334,32 @@ impl PipelineModel {
         }
     }
 
-    #[cfg(test)]
-    pub fn prefill_embedded_mtp_cache_for_test(
+    /// Prefills target and architecture-declared prediction state as one session operation.
+    pub(crate) fn prefill_distributed_with_embedded_mtp(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
         cache: &mut PipelineCache,
         execution: &crate::backend::MlxDistributedSession<'_>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let tokens = pipeline_mtp_token_identity(input, stream)?;
-        let tokens = crate::MlxTensor::from_array(tokens);
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelineStageCompletion, Error> {
+        let stream = execution.stream();
+        let owns_output = self.info.owns_output;
         let mut target = PipelineEmbeddedMtpTarget::new(self, execution);
-        let output = target.prefill_target(input, cache, stream)?;
+        let output = target.prefill_target_inner(input, cache, stream, observer)?;
+        synchronize_outputs([output.logits.as_array(), output.hidden.as_array()])?;
+        let tokens = output.tokens.clone();
+        let token_validation_scope = TokenValidationScope::begin()?;
         target.prefill_draft_cache(&output, &tokens, cache, stream)?;
-        Ok(())
+        let token_validations = token_validation_scope.finish();
+        let logits = owns_output.then(|| output.logits.into_array());
+        let retained = cache
+            .layers
+            .iter()
+            .flat_map(PipelineLayerCache::retained_arrays)
+            .chain(cache.mtp.retained_arrays())
+            .cloned()
+            .collect();
+        PipelineStageCompletion::submit(logits, retained, token_validations)
     }
 
     /// Returns aggregate cache-residency telemetry for a paged stage cache.
@@ -10550,6 +10666,13 @@ impl PipelineModel {
 
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         Ok(self.cache_identity.clone())
+    }
+
+    pub(crate) fn requires_embedded_mtp_prefill(&self) -> bool {
+        matches!(
+            self.info.model_kind,
+            ModelKind::Qwen3Next | ModelKind::Qwen35
+        ) && self.info.global_embedded_mtp_layers > 0
     }
 
     /// Runs a microbatch through the selected distributed backend session.
@@ -11715,46 +11838,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
-        let tokens = pipeline_mtp_token_identity(input, stream)?;
-        let multimodal = input
-            .parts
-            .iter()
-            .any(|part| part.modality() != eredu_core::InputModality::Text);
-        cache
-            .reset()
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        self.model
-            .ensure_embedded_mtp_cache(cache)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let local = if multimodal {
-            self.model.prefill_distributed(
-                self.model.info.owns_input.then_some(input),
-                step,
-                None,
-                cache,
-                self.execution,
-            )
-        } else {
-            self.model.forward_distributed(
-                self.model.info.owns_input.then_some(&tokens),
-                step,
-                None,
-                cache,
-                self.execution,
-            )
-        }
-        .and_then(|completion| {
-            completion.synchronize()?;
-            Ok(completion)
-        });
-        let logits = local
-            .map_err(|error| Exception::custom(error.to_string()))?
-            .into_submitted_logits();
-        let hidden = self.model.last_mtp_hidden.take();
-        self.model
-            .synchronize_embedded_mtp_output(logits, hidden, tokens, self.execution, stream)
+        self.prefill_target_inner(input, cache, stream, None)
     }
 
     fn verify_target(
@@ -11832,7 +11916,8 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         let next = tokens.as_array().try_index_device((.., 1..), stream)?;
         let mut draft = self.draft_cache(cache);
         for depth in 0..self.max_draft_tokens() {
-            let _ = self.forward_draft(&hidden, &next, depth, &mut draft, stream)?;
+            let output = self.forward_draft(&hidden, &next, depth, &mut draft, stream)?;
+            synchronize_outputs([output.logits.as_array(), output.hidden.as_array()])?;
         }
         cache.mtp = draft;
         Ok(())
@@ -11956,10 +12041,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
     }
 
     fn max_draft_tokens(&self) -> usize {
-        self.model
-            .stage
-            .embedded_mtp()
-            .map_or(0, PipelineEmbeddedMtp::embedded_mtp_len)
+        self.model.info.global_embedded_mtp_layers
     }
 }
 

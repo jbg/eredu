@@ -1257,6 +1257,14 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     Error::Parallel("pipeline model session has no communication".into())
                 })?;
                 let completion = input.with_borrowed(|borrowed| {
+                    if model.requires_embedded_mtp_prefill() {
+                        return model.prefill_distributed_with_embedded_mtp(
+                            borrowed,
+                            cache,
+                            distributed,
+                            None,
+                        );
+                    }
                     let multimodal = borrowed
                         .parts
                         .iter()
@@ -1358,13 +1366,21 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     Error::Parallel("pipeline model session has no communication".into())
                 })?;
                 let completion = input.with_borrowed(|borrowed| {
+                    let mut observer = ArrayObserverAdapter {
+                        inner: &mut collector,
+                    };
+                    if model.requires_embedded_mtp_prefill() {
+                        return model.prefill_distributed_with_embedded_mtp(
+                            borrowed,
+                            cache,
+                            distributed,
+                            Some(&mut observer),
+                        );
+                    }
                     let multimodal = borrowed
                         .parts
                         .iter()
                         .any(|part| part.modality() != InputModality::Text);
-                    let mut observer = ArrayObserverAdapter {
-                        inner: &mut collector,
-                    };
                     if multimodal {
                         let step = model.prepared_input_step(borrowed)?;
                         model.prefill_distributed_with_observer(

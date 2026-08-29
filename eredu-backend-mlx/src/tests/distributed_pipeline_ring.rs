@@ -355,6 +355,18 @@ enum FixtureFamily {
 }
 
 impl FixtureFamily {
+    const fn is_qwen_hybrid(self) -> bool {
+        matches!(
+            self,
+            Self::Qwen3Next
+                | Self::Qwen3NextMoe
+                | Self::Qwen35
+                | Self::Qwen35Moe
+                | Self::Qwen35Multimodal
+                | Self::Qwen35MoeMultimodal
+        )
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Self::Llama => "llama",
@@ -1382,26 +1394,44 @@ fn pipeline_ring_worker() {
         let prepared = multimodal_prepared_input(family);
         prepared
             .with_model_input(|input| {
-                model.prefill_distributed(
-                    model.stage_info().owns_input.then_some(input),
-                    PipelineStep::new(1, prompt_length).unwrap(),
-                    None,
-                    &mut cache,
-                    &execution,
-                )
+                if family.is_qwen_hybrid() {
+                    model.prefill_distributed_with_embedded_mtp(input, &mut cache, &execution, None)
+                } else {
+                    model.prefill_distributed(
+                        model.stage_info().owns_input.then_some(input),
+                        PipelineStep::new(1, prompt_length).unwrap(),
+                        None,
+                        &mut cache,
+                        &execution,
+                    )
+                }
             })
             .unwrap()
             .into_logits()
             .unwrap()
     } else {
         let prompt = crate::native::Array::from_slice(&prefix_ids, &[1, prompt_length]);
-        forward_pipeline_model(
-            &mut model,
-            (pipeline_rank == 0).then_some(&prompt),
-            PipelineStep::new(1, prompt_length).unwrap(),
-            &mut cache,
-            &execution,
-        )
+        if family.is_qwen_hybrid() {
+            let parts = [text_input_part(&prompt)];
+            model
+                .prefill_distributed_with_embedded_mtp(
+                    crate::backend::runtime::media::input::ModelInput::new(&parts),
+                    &mut cache,
+                    &execution,
+                    None,
+                )
+                .unwrap()
+                .into_logits()
+                .unwrap()
+        } else {
+            forward_pipeline_model(
+                &mut model,
+                (pipeline_rank == 0).then_some(&prompt),
+                PipelineStep::new(1, prompt_length).unwrap(),
+                &mut cache,
+                &execution,
+            )
+        }
     };
     assert_eq!(logits.is_some(), pipeline_rank == 1);
     if let (Some(actual), Some((expected, _))) = (&logits, &reference) {
@@ -1409,18 +1439,6 @@ fn pipeline_ring_worker() {
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
-    if qwen_hybrid_prompt_cache {
-        let prompt = crate::native::Array::from_slice(&prefix_ids, &[1, prompt_length]);
-        let parts = [text_input_part(&prompt)];
-        model
-            .prefill_embedded_mtp_cache_for_test(
-                crate::backend::runtime::media::input::ModelInput::new(&parts),
-                &mut cache,
-                &execution,
-                &stream,
-            )
-            .unwrap();
-    }
     let (model_family, effective_model_type) = family.descriptor_names();
     let identity = model.prompt_cache_model_identity().unwrap();
     if qwen_hybrid_prompt_cache {
@@ -3704,7 +3722,7 @@ fn qwen_hybrid_config(model_type: &str) -> serde_json::Value {
     serde_json::json!({
         "architectures": [if model_type == "qwen3_next" { "Qwen3NextForCausalLM" } else { "Qwen3_5ForCausalLM" }],
         "model_type": model_type,
-        "vocab_size": 32,
+        "vocab_size": 64,
         "hidden_size": 16,
         "num_hidden_layers": 2,
         "mtp_num_hidden_layers": 1,

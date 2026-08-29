@@ -149,6 +149,11 @@ publishes a manifest plus bounded SafeTensors shards atomically. Loading first
 validates the entire manifest and owned layer layout, then attaches compatible
 shards as read-only disk blocks and promotes them only on demand.
 
+For Qwen3-Next and Qwen3.5-family checkpoints with embedded prediction layers,
+ordinary prefill also advances prediction state to its architecture-declared
+prefix-relative frontier. Callers do not need to enter speculative generation
+before saving a complete prompt cache.
+
 Schema version 8 records:
 
 - model family, effective type, checkpoint identity, and an architecture
