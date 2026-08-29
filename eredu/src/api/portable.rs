@@ -1,5 +1,6 @@
 //! Backend-neutral loaded-model ownership and text generation.
 
+use eredu_architectures::ModelKind;
 use eredu_core::generation::{
     resolve_generation_config, CheckpointGenerationConfig, GenerationConfigOverrides,
     ResolvedGenerationConfig,
@@ -67,8 +68,10 @@ impl TextDecoder {
 
 /// Backend-neutral tokenizer and chat metadata attached to a prepared runtime.
 pub struct LoadedTextModelConfig {
-    /// Normalized architecture identity reported to clients.
-    pub model_type: String,
+    /// Canonical architecture family reported to clients.
+    pub model_family: ModelKind,
+    /// Parsed implementation or nested text-model type.
+    pub effective_model_type: String,
     /// Model identity supplied to chat-template rendering.
     pub model_id: String,
     /// Optional checkpoint chat template or named-template collection.
@@ -88,7 +91,8 @@ pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],
     pub(crate) chat_template: Option<ModelChatTemplate>,
-    pub(crate) model_type: String,
+    pub(crate) model_family: ModelKind,
+    pub(crate) effective_model_type: String,
     pub(crate) model_id: String,
     pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
@@ -148,7 +152,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             tokenizer,
             tokenizer_fingerprint,
             chat_template: config.chat_template,
-            model_type: config.model_type,
+            model_family: config.model_family,
+            effective_model_type: config.effective_model_type,
             model_id: config.model_id,
             eos_token_ids: config.eos_token_ids,
             checkpoint_generation_config: config.checkpoint_generation_config,
@@ -164,9 +169,14 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.runtime.backend().descriptor()
     }
 
-    /// Returns the effective runtime model type.
-    pub fn model_type(&self) -> &str {
-        &self.model_type
+    /// Returns the canonical architecture family.
+    pub const fn model_family(&self) -> ModelKind {
+        self.model_family
+    }
+
+    /// Returns the parsed implementation or nested text-model type.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
     }
 
     /// Borrows the tokenizer attached to the prepared model.

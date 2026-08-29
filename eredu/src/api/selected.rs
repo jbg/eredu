@@ -394,9 +394,14 @@ impl LocalModel {
         Ok((model, report))
     }
 
-    /// Returns the effective runtime model type.
-    pub fn model_type(&self) -> &str {
-        self.inner.model_type()
+    /// Returns the canonical architecture family.
+    pub const fn model_family(&self) -> super::ModelKind {
+        self.inner.model_family()
+    }
+
+    /// Returns the parsed implementation or nested text-model type.
+    pub fn effective_model_type(&self) -> &str {
+        self.inner.effective_model_type()
     }
 
     /// Returns the model id used for chat-template rendering.

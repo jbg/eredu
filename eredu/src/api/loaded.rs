@@ -698,7 +698,8 @@ fn loaded_text_artifact(
     Ok((
         tokenizer,
         LoadedTextModelConfig {
-            model_type: configuration.effective_model_type.clone(),
+            model_family: kind,
+            effective_model_type: configuration.effective_model_type.clone(),
             model_id,
             chat_template,
             eos_token_ids,

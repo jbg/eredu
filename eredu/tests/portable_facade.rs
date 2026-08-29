@@ -4,8 +4,8 @@ use eredu::api::{
 };
 use eredu::{
     ArtifactFormat, BackendDescriptor, DeviceCapabilities, DeviceDescriptor,
-    GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport, ObservationSet,
-    ObservationValue, TextGenerationConfig, TokenFilter, TokenOutput,
+    GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport, ModelKind,
+    ObservationSet, ObservationValue, TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use eredu_core::{
     BackendProvider, BackendSession, Completion, ModelRuntime, PreparedModel, Submission,
@@ -183,7 +183,8 @@ fn loaded_model_generates_without_an_mlx_dependency() {
         runtime,
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
-            model_type: "mock".into(),
+            model_family: ModelKind::Qwen35,
+            effective_model_type: "qwen3_5_text".into(),
             model_id: "mock/model".into(),
             chat_template: None,
             eos_token_ids: vec![99],
@@ -204,7 +205,8 @@ fn loaded_model_generates_without_an_mlx_dependency() {
         .collect::<Vec<_>>();
 
     assert_eq!(tokens, vec![1, 2, 3]);
-    assert_eq!(model.model_type(), "mock");
+    assert_eq!(model.model_family(), ModelKind::Qwen35);
+    assert_eq!(model.effective_model_type(), "qwen3_5_text");
 }
 
 #[test]

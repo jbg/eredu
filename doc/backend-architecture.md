@@ -320,10 +320,13 @@ while artifact normalization failures retain the backend-neutral artifact error
 and facade-owned workflow validation retains a facade-owned error. Concrete
 backend errors do not use an unsupported-architecture string funnel for these
 unrelated ownership domains.
-Loaded backend models and sessions preserve these as two distinct identities:
+Loaded facade models, backend models, and sessions preserve these as two distinct identities:
 `model_family()` returns the canonical architecture-owned `ModelKind`, while
 `effective_model_type()` returns the parsed implementation or nested text-model
-type. Complete-model materialization stores the already resolved `ModelKind`
+type. The portable `LoadedTextModelConfig` requires both identities, and the
+facade carries the resolved family through artifact loading rather than exposing
+the effective type under the ambiguous legacy `model_type` name. Complete-model
+materialization stores the already resolved `ModelKind`
 alongside the concrete model implementation; it does not reconstruct family
 identity from the effective type. Distributed composition carries that same
 admitted `ModelKind` into every pipeline stage; a rank-local architecture

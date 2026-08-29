@@ -430,7 +430,7 @@ impl MultimodalPreparationBackend for MockBackend {
 impl ModelCapabilityBackend for MockBackend {
     fn model_capabilities(_: &ModelRuntime<Self>) -> Result<ModelCapabilities, CapabilityError> {
         Ok(ModelCapabilities {
-            model_type: "llama".into(),
+            model_type: "mistral".into(),
             native_max_context: Observed::exact(32, "mock configuration"),
             effective_max_context: Observed::exact(32, "mock configuration"),
             state_strategy: CacheStateStrategy::FullKv,
@@ -583,7 +583,7 @@ impl AutomaticPlanningBackend for MockBackend {
         let mut profile =
             ModelResourceProfile::unmeasured(model_path.into(), ArtifactFormat::SafeTensors);
         profile.model_family = Some(ModelKind::Llama.canonical_name().into());
-        profile.architecture = Some("llama".into());
+        profile.architecture = Some("mistral".into());
         profile.tensor_count = Some(1);
         profile.checkpoint_shards = Some(1);
         profile.embedded_draft_layers = Observed::exact(0, "normalized architecture fixture");
@@ -1041,7 +1041,7 @@ fn multimodal_client_code<B: MultimodalPreparationBackend>(model: &LoadedModel<B
 
 fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, prepared: &B::Prompt) {
     let capabilities = model.capabilities().unwrap();
-    assert_eq!(capabilities.model_type, model.model_type());
+    assert_eq!(capabilities.model_type, model.effective_model_type());
     assert_eq!(model.count_token_ids(&[1, 2]).unwrap().model_positions, 2);
     assert_eq!(model.count_text("hello", false).unwrap().text_tokens, 1);
     let input = model.count_prepared_input(prepared).unwrap();
@@ -1174,7 +1174,7 @@ fn write_loadable_text_artifact(root: &std::path::Path) {
     std::fs::write(
         root.join("config.json"),
         r#"{
-          "model_type":"llama","eos_token_id":0,"hidden_size":16,
+          "model_type":"mistral","eos_token_id":0,"hidden_size":16,
           "num_hidden_layers":2,"intermediate_size":32,
           "num_attention_heads":4,"rms_norm_eps":0.00001,"vocab_size":64
         }"#,
@@ -1522,7 +1522,8 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
 
     let mut model = LoadedModel::load(MockBackend, artifact.path(), ()).unwrap();
 
-    assert_eq!(model.model_type(), "llama");
+    assert_eq!(model.model_family(), ModelKind::Llama);
+    assert_eq!(model.effective_model_type(), "mistral");
     assert_eq!(model.eos_token_ids(), &[0]);
     let prepared = multimodal_client_code(&model);
     assert_eq!(prepared, vec![1, 2_001, 7, 1]);
@@ -1578,7 +1579,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
         runtime,
         tokenizer,
         LoadedTextModelConfig {
-            model_type: "qwen2".into(),
+            model_family: ModelKind::Qwen2,
+            effective_model_type: "qwen2".into(),
             model_id: "mock-qwen".into(),
             chat_template: Some(ModelChatTemplate::Single(QWEN_TEMPLATE.into())),
             eos_token_ids: vec![eos_token_id],

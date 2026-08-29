@@ -61,7 +61,8 @@ fn main() -> anyhow::Result<()> {
         LocalModel::load_execution_plan(&LocalBackendFactory::default(), &gguf_file, &plan)?;
     let (mut model, _) = planned.into_parts();
 
-    println!("model type: {}", model.model_type());
+    println!("model family: {}", model.model_family().canonical_name());
+    println!("effective model type: {}", model.effective_model_type());
     println!("chat template: {}", model.has_chat_template());
 
     let rendered = if model.has_chat_template() {

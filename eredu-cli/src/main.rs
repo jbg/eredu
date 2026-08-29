@@ -2441,8 +2441,9 @@ fn main() -> Result<()> {
             .as_ref()
             .expect("verbose execution collected allocator telemetry");
         eprintln!(
-            "model_type: {}, prompt_tokens: {}, generated_tokens: {}",
-            model.model_type(),
+            "model_family: {}, effective_model_type: {}, prompt_tokens: {}, generated_tokens: {}",
+            model.model_family().canonical_name(),
+            model.effective_model_type(),
             prompt_token_ids.len(),
             output_ids.len(),
         );
@@ -2582,7 +2583,7 @@ fn main() -> Result<()> {
         let expert_cache = model.expert_cache_telemetry()?;
         let telemetry = ExecutionTelemetry {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
-            model_type: model.model_type().into(),
+            model_type: model.effective_model_type().into(),
             plan: Some(plan),
             plan_explanation: Some(plan_explanation),
             hardware: hardware_profile,
