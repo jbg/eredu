@@ -69,7 +69,10 @@ Realtime speech models use the selected facade's concrete application API.
 `prepare_realtime_model` inspects the artifact, `LocalRealtimeBackendFactory`
 loads it, and `LocalRealtimeScheduler` accepts and returns portable host token
 frames. These operations require only the `eredu` crate; native backend traits,
-streams, tensors, sessions, and completions stay behind the facade.
+streams, tensors, sessions, and completions stay behind the facade. The
+realtime factory's default uses `default_local_device`, matching ordinary local
+model loading; construct it with an explicit `LocalDevice` to override that
+choice.
 
 ## Cargo features
 

@@ -816,6 +816,9 @@ pub enum LocalDevicePlanError {
 }
 
 /// Factory for local realtime model loading and execution.
+///
+/// [`Default`] uses [`default_local_device`]. Pass an explicit [`LocalDevice`]
+/// to [`Self::new`] to override that policy.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalRealtimeBackendFactory {
     device: LocalDevice,
@@ -856,7 +859,7 @@ impl LocalRealtimeBackendFactory {
 
 impl Default for LocalRealtimeBackendFactory {
     fn default() -> Self {
-        Self::new(LocalDevice::Cpu)
+        Self::new(default_local_device())
     }
 }
 
@@ -1505,6 +1508,7 @@ mod tests {
     use super::{
         default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
         LocalDevice, LocalDevicePlanError, LocalExpertCacheBenchmarkError,
+        LocalRealtimeBackendFactory,
     };
 
     #[test]
@@ -1541,5 +1545,6 @@ mod tests {
         let device = default_local_device();
         assert_eq!(device, expected);
         assert!(local_device_plan(device).is_ok());
+        assert_eq!(LocalRealtimeBackendFactory::default().device, device);
     }
 }
