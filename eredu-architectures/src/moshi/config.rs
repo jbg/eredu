@@ -389,6 +389,10 @@ impl MoshiTransformerConfig {
 }
 
 impl DecoderConfig for MoshiTransformerConfig {
+    fn model_family(&self) -> &'static str {
+        "moshi_transformer"
+    }
+
     fn model_identity(&self) -> &str {
         &self.model_identity
     }

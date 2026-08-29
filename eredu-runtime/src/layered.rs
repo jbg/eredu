@@ -47,6 +47,16 @@ pub trait ArchitectureParameters<B: NeuralBackend> {
     /// Returns the authoritative mutable-state geometry for this realization.
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError>;
 
+    /// Declares cache-relevant architecture identity for one realized state partition.
+    ///
+    /// The partition supplies the exact rank-local layout and architecture-global
+    /// offset. Concrete backends supply only their lowered parallel topology.
+    fn state_identity(
+        &self,
+        state: &crate::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<crate::ModelStateIdentity, Self::DefinitionError>;
+
     /// Describes every parameter with its canonical graph owner and placement.
     fn parameter_description(
         &self,

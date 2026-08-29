@@ -113,6 +113,8 @@ impl BlockParameterFields<'_> {
 
 /// Geometry and policy required by the shared decoder mechanics.
 pub trait Config: 'static {
+    /// Stable architecture family used by persistence identity.
+    fn model_family(&self) -> &'static str;
     /// Stable normalized model identity.
     fn model_identity(&self) -> &str;
     /// Stable identity of the complete normalized architecture policy.
@@ -190,6 +192,36 @@ pub trait Config: 'static {
     fn rotary_enabled(&self) -> bool {
         true
     }
+}
+
+/// Declares cache identity shared by ordinary layered decoder families.
+pub fn state_identity<C: Config>(
+    args: &C,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+) -> Result<eredu_runtime::ModelStateIdentity, Error> {
+    args.validate_config()?;
+    topology.validate().map_err(Error::backend)?;
+    let layer_count = usize::try_from(args.num_hidden_layers()).map_err(Error::backend)?;
+    let global_layer_end = global_layer_start
+        .checked_add(layout.len())
+        .ok_or_else(|| Error::backend("decoder owned state range overflowed"))?;
+    if global_layer_end > layer_count {
+        return Err(Error::backend(format!(
+            "{} owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers",
+            args.model_family()
+        )));
+    }
+    Ok(eredu_runtime::ModelStateIdentity {
+        model_family: args.model_family().into(),
+        effective_model_type: args.model_identity().into(),
+        architecture_fingerprint: args.architecture_fingerprint(),
+        layer_count,
+        global_layer_start,
+        sink_tokens: 0,
+        topology,
+    })
 }
 
 /// Semantic attention projection selected by architecture policy.
@@ -3235,6 +3267,19 @@ where
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
         self.state_layout_impl()
+    }
+
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        state_identity(
+            &self.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
     }
 
     fn parameter_description(

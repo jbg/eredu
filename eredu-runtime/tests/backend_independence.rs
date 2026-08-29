@@ -917,6 +917,22 @@ impl ArchitectureParameters<FakeBackend> for GroupedFixture {
         StateLayout::new(LayerSchedule::new(4, policies).unwrap()).map_err(Error::backend)
     }
 
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        Ok(eredu_runtime::ModelStateIdentity {
+            model_family: "fixture".into(),
+            effective_model_type: "fixture".into(),
+            architecture_fingerprint: "fixture".into(),
+            layer_count: 4,
+            global_layer_start: state.global_layer_offset(),
+            sink_tokens: 0,
+            topology,
+        })
+    }
+
     fn parameter_description(
         &self,
         _: &(),
@@ -1115,6 +1131,9 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
         trace: Vec::new(),
     };
     let ownership = PartitionOwnership::new(true, false, ["embedding"]).expect("valid ownership");
+    let parameters = architecture
+        .parameter_description(&())
+        .expect("fixture parameter description");
     let partition =
         ArchitecturePartition::<(), eredu_runtime::NoAuxiliaryBoundarySchema>::from_architecture::<
             FakeBackend,
@@ -1125,10 +1144,9 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
             &architecture,
             [("vision", 0..1), ("text", 0..2)],
             ownership,
-            None,
             (),
             eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
-            std::iter::empty(),
+            &parameters,
         )
         .expect("partition derives its canonical graph");
     partition

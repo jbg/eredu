@@ -199,6 +199,9 @@ impl ModelArgs {
 }
 
 impl Config for ModelArgs {
+    fn model_family(&self) -> &'static str {
+        "qwen"
+    }
     fn model_identity(&self) -> &str {
         &self.model_type
     }

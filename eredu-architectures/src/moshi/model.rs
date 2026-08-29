@@ -336,6 +336,34 @@ impl<B: NeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel
         self.state_layout_impl()
     }
 
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        topology.validate().map_err(Error::backend)?;
+        let layer_count = self.state_layout_impl()?.len();
+        let global_layer_end = state
+            .global_layer_offset()
+            .checked_add(state.layout().len())
+            .ok_or_else(|| Error::backend("Moshi owned state range overflowed"))?;
+        if global_layer_end > layer_count {
+            return Err(Error::backend(format!(
+                "Moshi owns state layers {}..{global_layer_end}, outside {layer_count} layers",
+                state.global_layer_offset()
+            )));
+        }
+        Ok(eredu_runtime::ModelStateIdentity {
+            model_family: self.config.family().into(),
+            effective_model_type: self.config.effective_model_type().as_str().into(),
+            architecture_fingerprint: self.config.architecture_fingerprint().into(),
+            layer_count,
+            global_layer_start: state.global_layer_offset(),
+            sink_tokens: 0,
+            topology,
+        })
+    }
+
     fn parameter_description(
         &self,
         context: &<B::Tensor as Tensor>::Context,

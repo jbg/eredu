@@ -954,10 +954,9 @@ impl<G, A> ArchitecturePartition<G, A> {
         architecture: &M,
         group_ranges: impl IntoIterator<Item = (N, Range<usize>)>,
         ownership: PartitionOwnership,
-        state: Option<PartitionState>,
         local_geometry: G,
         boundary_schema: A,
-        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+        parameters: &ArchitectureParameterDescription,
     ) -> Result<Self, ArchitecturePartitionError>
     where
         B: eredu_nn::NeuralBackend,
@@ -969,16 +968,31 @@ impl<G, A> ArchitecturePartition<G, A> {
     {
         let (graph, unit_layout) = canonical_architecture_layout::<B, S, M>(architecture)?;
         boundary_schema.wire_schema()?;
-        Self::new(
+        if parameters.graph() != &graph {
+            return Err(ArchitecturePartitionError::ArchitectureGraphMismatch);
+        }
+        if parameters.unit_layout() != &unit_layout {
+            return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
+        }
+        let complete_state = architecture
+            .state_layout()
+            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
+        let plan = architecture.state_partition_plan(&complete_state);
+        let mut partition = Self::new(
             graph,
             unit_layout,
             group_ranges,
             ownership,
-            state,
+            None,
             local_geometry,
             boundary_schema,
-            parameter_bindings,
-        )
+            std::iter::empty(),
+        )?;
+        partition.state = partition
+            .resolve_state_partition(&complete_state, &plan)
+            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
+        partition.parameter_bindings = parameters.select_owned(&partition);
+        Ok(partition)
     }
 
     /// Creates one validated rank-local architecture partition after the
@@ -1115,6 +1129,27 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Returns rank-local state geometry when this partition owns mutable state.
     pub const fn state(&self) -> Option<&PartitionState> {
         self.state.as_ref()
+    }
+
+    /// Derives prompt-cache identity from this partition's canonical state.
+    pub fn prompt_cache_identity<B, M>(
+        &self,
+        architecture: &M,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, ArchitecturePartitionError>
+    where
+        B: eredu_nn::NeuralBackend,
+        M: crate::ArchitectureParameters<B>,
+        M::DefinitionError: std::fmt::Display,
+    {
+        let state = self
+            .state()
+            .ok_or(ArchitecturePartitionError::MissingArchitectureState)?;
+        architecture
+            .state_identity(state, topology)
+            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?
+            .prompt_cache_identity(state.layout())
+            .map_err(|error| ArchitecturePartitionError::PromptCacheIdentity(error.to_string()))
     }
 
     /// Resolves the architecture-authored state plan for this realized partition.
@@ -1548,6 +1583,15 @@ pub enum ArchitecturePartitionError {
     /// count, or unit path.
     #[error("neutral architecture topology is invalid: {0}")]
     ArchitectureTopology(String),
+    /// The architecture could not declare or partition its mutable state.
+    #[error("neutral architecture state is invalid: {0}")]
+    ArchitectureState(String),
+    /// The realized partition owns no mutable architecture state.
+    #[error("architecture partition owns no mutable state")]
+    MissingArchitectureState,
+    /// The architecture state could not be converted to prompt-cache identity.
+    #[error("architecture prompt-cache identity is invalid: {0}")]
+    PromptCacheIdentity(String),
     /// A neutral architecture exposed an empty stable unit path.
     #[error("neutral architecture unit {group}:{index} has an empty path")]
     EmptyArchitectureUnitPath {

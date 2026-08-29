@@ -13,7 +13,7 @@ use std::{
 use crate::backend::error::Error;
 use eredu_runtime::{
     ArchitecturePartition, ArchitecturePartitionError, ExecutionGraph, ExecutionGroupSpec,
-    ExecutionUnitLayout, OwnedParameterGroupSpec, PartitionOwnership, PartitionState, StateLayout,
+    ExecutionUnitLayout, PartitionOwnership,
 };
 
 /// Semantic role of one placed execution group.
@@ -450,9 +450,8 @@ impl PlacedExecutionDag {
         &self,
         architecture: &M,
         pp_rank: usize,
-        state: Option<(StateLayout, usize)>,
         local_geometry: G,
-        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
     ) -> Result<ArchitecturePartition<G, A>, Error>
     where
         B: eredu_nn::NeuralBackend,
@@ -467,10 +466,9 @@ impl PlacedExecutionDag {
         self.realize_architecture_partition_with_boundary::<B, S, M, G, A>(
             architecture,
             pp_rank,
-            state,
             local_geometry,
             boundary_schema,
-            parameter_bindings,
+            parameters,
         )
     }
 
@@ -479,10 +477,9 @@ impl PlacedExecutionDag {
         &self,
         architecture: &M,
         pp_rank: usize,
-        state: Option<(StateLayout, usize)>,
         local_geometry: G,
         boundary_schema: A,
-        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
     ) -> Result<ArchitecturePartition<G, A>, Error>
     where
         B: eredu_nn::NeuralBackend,
@@ -517,18 +514,13 @@ impl PlacedExecutionDag {
         let owns_output = self.groups[self.semantic.output()].merge_destination == pp_rank;
         let ownership = PartitionOwnership::new(owns_input, owns_output, static_roles)
             .map_err(placement_partition_error)?;
-        let state = state
-            .map(|(layout, offset)| PartitionState::new(layout, offset))
-            .transpose()
-            .map_err(placement_partition_error)?;
         ArchitecturePartition::from_architecture::<B, S, M, _>(
             architecture,
             group_ranges,
             ownership,
-            state,
             local_geometry,
             boundary_schema,
-            parameter_bindings,
+            parameters,
         )
         .map_err(placement_partition_error)
     }
@@ -778,6 +770,22 @@ mod tests {
             .map_err(|error| error.to_string())
         }
 
+        fn state_identity(
+            &self,
+            state: &eredu_runtime::PartitionState,
+            topology: eredu_core::cache::PromptCacheTopology,
+        ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+            Ok(eredu_runtime::ModelStateIdentity {
+                model_family: "placement_fixture".into(),
+                effective_model_type: "placement_fixture".into(),
+                architecture_fingerprint: "placement_fixture".into(),
+                layer_count: self.unit_counts.iter().sum(),
+                global_layer_start: state.global_layer_offset(),
+                sink_tokens: 0,
+                topology,
+            })
+        }
+
         fn parameter_description(
             &self,
             _context: &Stream,
@@ -926,11 +934,24 @@ mod tests {
     fn realize_partition<G, A: eredu_runtime::ArchitectureBoundary>(
         placed: &PlacedExecutionDag,
         pp_rank: usize,
-        state: Option<(StateLayout, usize)>,
         local_geometry: G,
         boundary_schema: A,
         parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<ArchitecturePartition<G, A>, Error> {
+        let architecture = FixtureArchitecture::new(placed);
+        let parameter_bindings = parameter_bindings.into_iter().collect::<Vec<_>>();
+        let expected = parameter_bindings
+            .iter()
+            .map(|owned| owned.group().clone())
+            .collect::<Vec<_>>();
+        let parameters = ArchitectureParameterDescription::new(
+            &architecture.graph,
+            &ExecutionUnitLayout::new(&architecture.graph, architecture.unit_counts.clone())
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            expected,
+            parameter_bindings,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
         placed.realize_architecture_partition_with_boundary::<
             MlxNeuralBackend,
             MlxHybridState,
@@ -938,12 +959,11 @@ mod tests {
             _,
             _,
         >(
-            &FixtureArchitecture::new(placed),
+            &architecture,
             pp_rank,
-            state,
             local_geometry,
             boundary_schema,
-            parameter_bindings,
+            &parameters,
         )
     }
 
@@ -992,17 +1012,6 @@ mod tests {
         .unwrap()
     }
 
-    fn state_layout(layers: usize) -> StateLayout {
-        StateLayout::new(
-            eredu_core::LayerSchedule::new(
-                layers,
-                vec![eredu_core::cache::LayerCachePolicy::NoState; layers],
-            )
-            .unwrap(),
-        )
-        .unwrap()
-    }
-
     fn partition_fixture() -> PlacedExecutionDag {
         PlacedExecutionDag::plan(
             2,
@@ -1024,7 +1033,6 @@ mod tests {
         let partition = realize_partition(
             &placed,
             1,
-            Some((state_layout(2), 7)),
             Geometry("family-local"),
             eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             [OwnedParameterGroupSpec::new(
@@ -1055,8 +1063,8 @@ mod tests {
             partition.ownership().static_roles(),
             ["vision.output", "text.input", "text.output"]
         );
-        assert_eq!(partition.state().unwrap().global_layer_offset(), 7);
-        assert_eq!(partition.state().unwrap().global_layers(), 7..9);
+        assert_eq!(partition.state().unwrap().global_layer_offset(), 0);
+        assert_eq!(partition.state().unwrap().global_layers(), 0..6);
         assert_eq!(partition.local_geometry(), &Geometry("family-local"));
         assert!(partition
             .boundary_schema()
@@ -1073,7 +1081,6 @@ mod tests {
         let ingress = realize_partition(
             &placed,
             0,
-            None,
             (),
             eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             std::iter::empty(),
@@ -1112,7 +1119,6 @@ mod tests {
         let output = realize_partition(
             &placed,
             1,
-            None,
             (),
             eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             [embedding.clone()],
@@ -1133,17 +1139,15 @@ mod tests {
         prediction.first_owner_static_roles.clear();
         prediction.last_owner_static_roles.clear();
         let missing_role = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
-        assert!(matches!(
-            realize_partition(
-                &missing_role,
-                1,
-                None,
-                (),
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
-                [embedding]
-            ),
-            Err(Error::Parallel(message)) if message.contains("non-local parameter owner")
-        ));
+        let output = realize_partition(
+            &missing_role,
+            1,
+            (),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
+            [embedding],
+        )
+        .unwrap();
+        assert!(output.parameter_bindings().is_empty());
     }
 
     #[test]
@@ -1152,23 +1156,6 @@ mod tests {
         let error = realize_partition(
             &placed,
             1,
-            Some((state_layout(2), usize::MAX)),
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
-            std::iter::empty(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Parallel(message)
-                if message.starts_with("invalid architecture partition placement:")
-                    && message.contains("overflowed usize")
-        ));
-
-        let error = realize_partition(
-            &placed,
-            1,
-            None,
             (),
             eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             [
@@ -1186,8 +1173,7 @@ mod tests {
         assert!(matches!(
             error,
             Error::Parallel(message)
-                if message.starts_with("invalid architecture partition placement:")
-                    && message.contains("shared.weight")
+                if message.contains("shared.weight")
         ));
     }
 
@@ -1306,7 +1292,6 @@ mod tests {
         let merge = realize_partition(
             &graph,
             0,
-            None,
             (),
             eredu_runtime::NoAuxiliaryBoundarySchema::new(8),
             std::iter::empty(),

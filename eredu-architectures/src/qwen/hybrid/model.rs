@@ -183,6 +183,19 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
         self.state_layout_impl()
     }
 
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+        state_identity(
+            &self.config,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+
     fn parameter_description(
         &self,
         context: &<B::Tensor as Tensor>::Context,

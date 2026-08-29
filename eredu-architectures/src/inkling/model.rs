@@ -388,7 +388,20 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+        Ok(self.state_layouts()?.composite().clone())
+    }
+
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+        state_identity(
+            &self.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
     }
 
     fn parameter_description(
@@ -1244,7 +1257,13 @@ where
         &self,
         layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(1, layout)
+        let target_layers = layout
+            .segments()
+            .iter()
+            .find(|segment| segment.id().as_str() == super::TARGET_STATE_SEGMENT)
+            .map(|segment| segment.layers().end)
+            .unwrap_or(layout.len());
+        crate::transport::pipeline_with_output_state(1, target_layers, layout)
     }
 
     fn model_identity(&self) -> &str {

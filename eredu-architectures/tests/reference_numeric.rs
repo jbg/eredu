@@ -6350,6 +6350,10 @@ fn moshi_numeric_rejects_out_of_range_tokens_before_cache_mutation() {
 struct SinkDecoderConfig(qwen::ModelArgs);
 
 impl decoder::Config for SinkDecoderConfig {
+    fn model_family(&self) -> &'static str {
+        "sink_decoder_fixture"
+    }
+
     fn model_identity(&self) -> &str {
         decoder::Config::model_identity(&self.0)
     }

@@ -1459,6 +1459,10 @@ struct ProjectionLayoutConfig {
 }
 
 impl decoder::Config for ProjectionLayoutConfig {
+    fn model_family(&self) -> &'static str {
+        "projection_layout_fixture"
+    }
+
     fn model_identity(&self) -> &str {
         &self.args.model_type
     }

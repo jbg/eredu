@@ -258,9 +258,11 @@ group-length agreement, and the contiguity required by `PartitionState` before
 a backend receives rank-local geometry. Backends must consume the resolved plan;
 they must not extend a decoder range to the end of the state layout or infer
 prediction-state ownership from pipeline rank position.
-MLX pipeline composition therefore realizes an ownership-only partition first,
-resolves the architecture plan against that partition, and attaches the exact
-resulting state layout and global offset to the executable partition.
+`ArchitecturePartition::from_architecture` resolves this plan and selects the
+partition's architecture-declared parameter groups as one neutral lifecycle.
+MLX pipeline composition supplies physical group placement and family-owned
+local geometry; it does not create an ownership probe or populate state in a
+second pass.
 
 The ordinary Qwen decoder, block, and layered lifecycle are dense construction
 surfaces and require only `NeuralBackend`. Concrete adapters that dynamically
@@ -633,9 +635,11 @@ runtime. When a family owns additional state outside the ordinary layered
 target, its architecture publishes the target, prediction placement, and
 composite persistence layout together; the backend consumes that value without
 reassembling segments or recovering offsets from layer-count fields. Pipeline
-prompt-cache identity and target or embedded-prediction cache allocation use
-the realized architecture's rank-local layout; they do not recreate a global
-layout from family arguments after tensor-parallel placement. Composite
+prompt-cache identity is derived by the neutral partition operation from
+`ArchitectureParameters::state_identity` and the partition's exact
+`PartitionState`; MLX lowers only its parallel topology. Target or
+embedded-prediction cache allocation uses that identity and does not recreate
+a global layout, offsets, or family identity after placement. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
 assembled by the architecture before a backend consumes them. Architecture
 capability construction consumes that same composite layout for admission
