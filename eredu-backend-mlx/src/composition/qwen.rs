@@ -1366,10 +1366,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
             "Qwen GGUF loader received a different prepared model".into(),
         ));
     };
-    let is_moe = args.is_moe();
-    let translate =
-        |name: &str| eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe);
-    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let configs = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::qwen::with_checkpoint_formats(args, configs)
         .map_err(Error::ArchitectureModel)?;
     Ok(PreparedQwenGguf { args })
@@ -1388,9 +1385,7 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             source.plan().checkpoint(),
-            |name| {
-                eredu_architectures::qwen::translate_gguf_weight_name(name, prepared.args.is_moe())
-            },
+            source.plan().tensor_mapping(),
             options.max_mapped_shards(),
         )?);
     let model = load_neutral_qwen_parallel(
@@ -1419,9 +1414,7 @@ pub(crate) fn load_qwen_gguf_model(
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             source.plan().checkpoint(),
-            |name| {
-                eredu_architectures::qwen::translate_gguf_weight_name(name, prepared.args.is_moe())
-            },
+            source.plan().tensor_mapping(),
             residency.max_mapped_shards(),
         )?);
     let args = prepared.args;

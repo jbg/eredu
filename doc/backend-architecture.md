@@ -728,8 +728,12 @@ or select a second catalog after admission. Every admitted artifact plan
 retains the normalized `ModelKind`; SafeTensors plans additionally retain typed
 family geometry and the checkpoint schema, while GGUF plans retain the exact
 `GgufArchitecture`, typed family geometry, and architecture-derived main
-checkpoint schema. Core keeps the corresponding `ValidatedGguf` proof intact
-inside `ModelArtifact` until the selected backend consumes it; materializers do
+checkpoint schema. GGUF plans also retain the complete canonical mapping from
+each physical tensor output to its logical parameter name. Translation and
+collision detection therefore happen once during architecture admission; they
+are not family-dispatched again during backend materialization. Core keeps the
+corresponding `ValidatedGguf` proof intact inside `ModelArtifact` until the
+selected backend consumes it; materializers do
 not downgrade that proof to an unvalidated checkpoint handle and rerun the
 architecture parser or regenerate the main checkpoint schema. Backend
 composition may enrich a clone of retained geometry with native encoding
@@ -737,8 +741,9 @@ descriptors, while composite families retain their separately admitted companion
 schema; neither operation replaces the retained main artifact plan. Portable
 architecture admission derives that companion geometry,
 validates the companion against its exact family-owned GGUF schema, and retains
-both the typed composite configuration and schema in the artifact architecture
-plan. A concrete backend pairs that proof with its native payload wrapper and
+the typed composite configuration, schema, and canonical tensor mapping in the
+artifact architecture plan. A concrete backend pairs that proof with its native
+payload wrapper and
 passes the pair through complete, tensor-parallel, and distributed-stage
 composition. It does not repeat companion family parsing or regenerate the
 companion checkpoint schema. For Gemma 4, Inkling, Muse-Glimmer, and
@@ -874,9 +879,10 @@ family-specific structural admission, declares composite requirements, and
 validates each resolved companion's family identity, shared geometry, translated
 tensor names, and exact checkpoint schema. The handoff contains the primary plus
 the exact resolved companion checkpoint handles and an architecture plan with
-typed companion geometry and schema. Backends may wrap those portable handles
-and add native encoding, operator, or device compatibility checks, but do not
-rescan directories, select companions, repeat either portable admission layer,
+typed companion geometry, schema, and physical-to-logical mappings. Backends
+may wrap those portable handles and lower their admitted logical names into
+native encoding descriptors, operator checks, or device compatibility checks,
+but do not rescan directories, select companions, repeat either portable admission layer,
 or parse facade-owned tokenizer and EOS metadata.
 
 GGUF reader failures remain typed through shard and portable artifact error
@@ -931,6 +937,8 @@ External assistants cross that factory boundary as an architecture-owned
 assistant family, normalized configuration, checkpoint format, and strict
 SafeTensors or GGUF layout before a backend is selected. SafeTensors plans
 retain the admitted header catalog, architecture schema, and exact resolution.
+A GGUF assistant plan retains the admitted portable checkpoint, resolution,
+and canonical tensor mapping.
 A concrete backend reopens the payload only through a catalog-bound source,
 revalidates both the catalog and resolution, and rejects tensors changed after
 preparation before constructing a native module. Concrete backends consume

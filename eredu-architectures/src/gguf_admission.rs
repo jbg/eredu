@@ -15,11 +15,57 @@ pub(crate) fn resolve(
     checkpoint: &Checkpoint,
 ) -> Result<(GgufArchitecturePlan, CheckpointValidation), String> {
     let (model, plan, validation) = resolve_family(architecture, checkpoint)?;
+    let tensor_mapping = canonical_tensor_mapping(checkpoint, &model)?;
     let validation = validation.unwrap_or_else(|| validate_gguf_plan(checkpoint, &plan));
     Ok((
-        GgufArchitecturePlan::new(architecture, model, plan),
+        GgufArchitecturePlan::new(architecture, model, plan, tensor_mapping),
         validation,
     ))
+}
+
+fn canonical_tensor_mapping(
+    checkpoint: &Checkpoint,
+    model: &GgufModelConfig,
+) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
+    let mapping = match model {
+        GgufModelConfig::DeepSeekV3(_) => {
+            checkpoint.translated_outputs(crate::deepseek::translate_v3_gguf_weight_name)
+        }
+        GgufModelConfig::DeepSeekV4(_) => {
+            checkpoint.translated_outputs(crate::deepseek::translate_v4_gguf_weight_name)
+        }
+        GgufModelConfig::Gemma4(_) => {
+            checkpoint.translated_outputs(crate::gemma4::translate_gguf_weight_name)
+        }
+        GgufModelConfig::GptOss(_) => {
+            checkpoint.translated_outputs(crate::gpt_oss::translate_gguf_weight_name)
+        }
+        GgufModelConfig::Inkling(args) => checkpoint.translated_outputs(|name| {
+            crate::inkling::translate_gguf_weight_name_for_model(name, args)
+        }),
+        GgufModelConfig::KimiLinear(_) => {
+            checkpoint.translated_outputs(crate::kimi_linear::translate_gguf_weight_name)
+        }
+        GgufModelConfig::Lfm2(args) => checkpoint.translated_outputs(|name| {
+            crate::lfm2::translate_gguf_weight_name(name, args.has_sparse_moe_layers())
+        }),
+        GgufModelConfig::Llama(_) => {
+            checkpoint.translated_outputs(crate::llama::translate_gguf_weight_name)
+        }
+        GgufModelConfig::MuseGlimmer(_) => {
+            checkpoint.translated_outputs(crate::muse_glimmer::translate_text_gguf_name)
+        }
+        GgufModelConfig::NemotronH(_) => {
+            checkpoint.translated_outputs(crate::nemotron_h::translate_gguf_weight_name)
+        }
+        GgufModelConfig::Qwen(args) => checkpoint.translated_outputs(|name| {
+            crate::qwen::translate_gguf_weight_name(name, args.is_moe())
+        }),
+        GgufModelConfig::QwenHybrid(_) => {
+            checkpoint.translated_outputs(crate::qwen::hybrid::translate_gguf_weight_name)
+        }
+    };
+    mapping.map_err(|error| error.to_string())
 }
 
 fn resolve_family(
@@ -52,14 +98,12 @@ fn resolve_family(
         GgufArchitecture::DeepSeek2 => {
             let args = crate::deepseek::parse_v3_gguf(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            translated(checkpoint, crate::deepseek::translate_v3_gguf_weight_name)?;
             let plan = crate::deepseek::v3_gguf_plan(&args)?;
             Ok((GgufModelConfig::DeepSeekV3(args), plan, None))
         }
         GgufArchitecture::DeepSeek4 => {
             let args =
                 crate::deepseek::parse_v4_gguf(&metadata).map_err(|error| error.to_string())?;
-            translated(checkpoint, crate::deepseek::translate_v4_gguf_weight_name)?;
             let plan = crate::deepseek::v4_gguf_plan(&args)?;
             Ok((GgufModelConfig::DeepSeekV4(args), plan, None))
         }
@@ -76,7 +120,6 @@ fn resolve_family(
             Ok((GgufModelConfig::Gemma4(family), plan, None))
         }
         GgufArchitecture::GptOss => {
-            translated(checkpoint, crate::gpt_oss::translate_gguf_weight_name)?;
             let args = crate::gpt_oss::model_args_from_gguf_catalog(&metadata)
                 .map_err(|error| error.to_string())?;
             let plan = crate::gpt_oss::gguf_plan(&args)?;
@@ -92,17 +135,12 @@ fn resolve_family(
         GgufArchitecture::KimiLinear => {
             let args = crate::kimi_linear::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            translated(checkpoint, crate::kimi_linear::translate_gguf_weight_name)?;
             let plan = crate::kimi_linear::gguf_plan(&args)?;
             Ok((GgufModelConfig::KimiLinear(args), plan, None))
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let args = crate::lfm2::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            let is_moe = args.has_sparse_moe_layers();
-            translated(checkpoint, |name| {
-                crate::lfm2::translate_gguf_weight_name(name, is_moe)
-            })?;
             let plan = crate::lfm2::gguf_plan(&args)?;
             Ok((GgufModelConfig::Lfm2(args), plan, None))
         }
@@ -116,7 +154,6 @@ fn resolve_family(
                     checkpoint.physical_tensor_count()
                 ));
             }
-            translated(checkpoint, crate::llama::translate_gguf_weight_name)?;
             let plan = crate::llama::gguf_plan(&args)?;
             Ok((GgufModelConfig::Llama(args), plan, None))
         }
@@ -129,16 +166,12 @@ fn resolve_family(
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let args = crate::nemotron_h::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            translated(checkpoint, crate::nemotron_h::translate_gguf_weight_name)?;
             let plan = crate::nemotron_h::gguf_plan(&args)?;
             Ok((GgufModelConfig::NemotronH(args), plan, None))
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let args = crate::qwen::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            translated(checkpoint, |name| {
-                crate::qwen::translate_gguf_weight_name(name, args.is_moe())
-            })?;
             let plan = crate::qwen::gguf_plan(&args)?;
             Ok((GgufModelConfig::Qwen(args), plan, None))
         }
@@ -156,28 +189,14 @@ fn resolve_family(
             if args.is_moe() != is_moe {
                 return Err("Qwen3-VL GGUF architecture and expert geometry disagree".into());
             }
-            translated(checkpoint, |name| {
-                crate::qwen::translate_gguf_weight_name(name, is_moe)
-            })?;
             let plan = crate::qwen::gguf_plan(&args)?;
             Ok((GgufModelConfig::Qwen(args), plan, None))
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
             let parsed = crate::qwen::hybrid::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            translated(checkpoint, crate::qwen::hybrid::translate_gguf_weight_name)?;
             let plan = crate::qwen::hybrid::gguf_plan(&parsed.text)?;
             Ok((GgufModelConfig::QwenHybrid(parsed), plan, None))
         }
     }
-}
-
-fn translated(
-    checkpoint: &Checkpoint,
-    translate: impl FnMut(&str) -> String,
-) -> Result<(), String> {
-    checkpoint
-        .translated_outputs(translate)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
 }

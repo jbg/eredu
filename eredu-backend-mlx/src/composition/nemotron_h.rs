@@ -2046,8 +2046,7 @@ pub(crate) fn prepare_gguf(
             "Nemotron-H GGUF loader received a different prepared model".into(),
         ));
     };
-    let translate = eredu_architectures::nemotron_h::translate_gguf_weight_name;
-    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let configs = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::nemotron_h::with_checkpoint_formats(args, configs)
         .map_err(Error::ArchitectureModel)?;
     Ok(PreparedGguf { args })
@@ -2067,7 +2066,7 @@ pub(crate) fn load_nemotron_h_gguf_model(
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        eredu_architectures::nemotron_h::translate_gguf_weight_name,
+        source.plan().tensor_mapping(),
         residency.max_mapped_shards(),
     )?);
     let (store, args, materialization) = match quantization {
@@ -2106,7 +2105,7 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        eredu_architectures::nemotron_h::translate_gguf_weight_name,
+        source.plan().tensor_mapping(),
         options.max_mapped_shards(),
     )?);
     let model = load_neutral_parallel(

@@ -287,19 +287,16 @@ impl MlxParameterMaterializationContext {
 
 /// Opens a backend-neutral GGUF source from the MLX checkpoint handle used by
 /// high-level model composition.
-pub fn open_gguf_checkpoint_source<F>(
+pub fn open_gguf_checkpoint_source(
     checkpoint: GgufCheckpoint,
     plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
-    translate: F,
+    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
     max_cached_readers: usize,
-) -> Result<NeutralGgufWeightStore, WeightStoreError>
-where
-    F: FnMut(&str) -> String,
-{
+) -> Result<NeutralGgufWeightStore, WeightStoreError> {
     NeutralGgufWeightStoreBuilder::default()
         .max_cached_readers(max_cached_readers)
         .map_err(neutral_store_error)?
-        .add_checkpoint(checkpoint.catalog().clone(), plan, translate)
+        .add_checkpoint(checkpoint.catalog().clone(), plan, tensor_mapping)
         .map_err(neutral_store_error)?
         .build()
         .map_err(neutral_store_error)
@@ -355,8 +352,15 @@ where
     F: FnMut(&str) -> String,
 {
     let plan = gguf_test_plan(checkpoint.catalog());
+    let tensor_mapping = checkpoint
+        .catalog()
+        .translated_outputs(translate)
+        .map_err(|error| WeightStoreError::Gguf {
+            key: String::new(),
+            message: error.to_string(),
+        })?;
     NeutralGgufWeightStoreBuilder::default()
-        .add_checkpoint(checkpoint.catalog().clone(), &plan, translate)
+        .add_checkpoint(checkpoint.catalog().clone(), &plan, &tensor_mapping)
         .map_err(neutral_store_error)?
         .build()
         .map_err(neutral_store_error)
@@ -1538,20 +1542,24 @@ mod tests {
         let first_plan = gguf_test_plan(first.catalog());
         let first_plan =
             eredu_checkpoint::validation::resolve_gguf_plan(first.catalog(), &first_plan).unwrap();
+        let first_mapping = first
+            .catalog()
+            .translated_outputs(|_| "shared.weight".into())
+            .unwrap();
         let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-            .add_resolved_checkpoint(first.catalog().clone(), &first_plan, |_| {
-                "shared.weight".into()
-            })
+            .add_resolved_checkpoint(first.catalog().clone(), &first_plan, &first_mapping)
             .unwrap();
         let second = GgufCheckpoint::open(second).unwrap();
         let second_plan = gguf_test_plan(second.catalog());
         let second_plan =
             eredu_checkpoint::validation::resolve_gguf_plan(second.catalog(), &second_plan)
                 .unwrap();
+        let second_mapping = second
+            .catalog()
+            .translated_outputs(|_| "shared.weight".into())
+            .unwrap();
         let error = builder
-            .add_resolved_checkpoint(second.catalog().clone(), &second_plan, |_| {
-                "shared.weight".into()
-            })
+            .add_resolved_checkpoint(second.catalog().clone(), &second_plan, &second_mapping)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -1602,8 +1610,12 @@ mod tests {
         )
         .unwrap();
         let checkpoint = GgufCheckpoint::open(path).unwrap();
+        let tensor_mapping = checkpoint
+            .catalog()
+            .translated_outputs(str::to_string)
+            .unwrap();
         let store = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-            .add_checkpoint(checkpoint.catalog().clone(), &plan, str::to_string)
+            .add_checkpoint(checkpoint.catalog().clone(), &plan, &tensor_mapping)
             .unwrap()
             .build()
             .unwrap();

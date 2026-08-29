@@ -654,6 +654,7 @@ pub struct GgufArchitecturePlan {
     architecture: GgufArchitecture,
     model: GgufModelConfig,
     checkpoint: GgufCheckpointPlan,
+    tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
 }
 
 impl GgufArchitecturePlan {
@@ -661,11 +662,13 @@ impl GgufArchitecturePlan {
         architecture: GgufArchitecture,
         model: GgufModelConfig,
         checkpoint: GgufCheckpointPlan,
+        tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     ) -> Self {
         Self {
             architecture,
             model,
             checkpoint,
+            tensor_mapping,
         }
     }
 
@@ -687,6 +690,11 @@ impl GgufArchitecturePlan {
     /// Complete expected GGUF catalog derived from the normalized geometry.
     pub const fn checkpoint(&self) -> &GgufCheckpointPlan {
         &self.checkpoint
+    }
+
+    /// Canonical physical-to-logical tensor mapping resolved during admission.
+    pub fn tensor_mapping(&self) -> &[eredu_gguf::TranslatedTensorLayout] {
+        &self.tensor_mapping
     }
 }
 
@@ -1432,11 +1440,18 @@ mod tests {
             .unwrap();
 
         let inspection = inspect_artifact(&path).unwrap();
-        let GgufModelConfig::Llama(args) =
-            inspection.architecture_plan().gguf_plan().unwrap().model()
-        else {
+        let plan = inspection.architecture_plan().gguf_plan().unwrap();
+        let GgufModelConfig::Llama(args) = plan.model() else {
             panic!("expected Llama GGUF plan");
         };
         assert_eq!(args.vocab_size, 1);
+        assert_eq!(plan.tensor_mapping().len(), tensors.len());
+        let query = plan
+            .tensor_mapping()
+            .iter()
+            .find(|mapped| mapped.physical_name == "blk.0.attn_q.weight")
+            .unwrap();
+        assert_eq!(query.original_name, "blk.0.attn_q.weight");
+        assert_eq!(query.layout.name, "model.layers.0.self_attn.q_proj.weight");
     }
 }

@@ -84,9 +84,11 @@ impl MlxDrafter {
                     ExternalAssistantCheckpoint::Gguf {
                         checkpoint,
                         resolution,
+                        tensor_mapping,
                     } => load_assistant_gguf(
                         checkpoint,
                         resolution,
+                        tensor_mapping,
                         config,
                         options,
                         stream,
@@ -116,9 +118,11 @@ impl MlxDrafter {
                     ExternalAssistantCheckpoint::Gguf {
                         checkpoint,
                         resolution,
+                        tensor_mapping,
                     } => load_dflash_gguf(
                         checkpoint,
                         resolution,
+                        tensor_mapping,
                         config,
                         options,
                         stream,

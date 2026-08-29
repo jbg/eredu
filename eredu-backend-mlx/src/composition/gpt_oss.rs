@@ -1564,8 +1564,7 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
             "GPT-OSS GGUF loader received a different prepared model".into(),
         ));
     };
-    let translate = eredu_architectures::gpt_oss::translate_gguf_weight_name;
-    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let configs = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::gpt_oss::with_checkpoint_formats(args, configs)
         .map_err(Error::ArchitectureModel)?;
     Ok(PreparedGptOssGguf { args })
@@ -1584,7 +1583,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        eredu_architectures::gpt_oss::translate_gguf_weight_name,
+        source.plan().tensor_mapping(),
         residency.max_mapped_shards(),
     )?);
     let expert_options = residency.expert_cache();
@@ -1625,7 +1624,7 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        eredu_architectures::gpt_oss::translate_gguf_weight_name,
+        source.plan().tensor_mapping(),
         options.max_mapped_shards(),
     )?);
     let model = load_neutral_parallel_with_store(

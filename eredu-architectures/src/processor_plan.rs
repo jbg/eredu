@@ -2295,6 +2295,7 @@ mod tests {
                 architecture,
                 crate::configuration::GgufModelConfig::Llama(args),
                 checkpoint,
+                Vec::new(),
             ),
         )
     }

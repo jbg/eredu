@@ -34,6 +34,7 @@ pub enum GgufMediaProjectorConfig {
 pub struct GgufMediaProjectorPlan {
     model: GgufMediaProjectorConfig,
     checkpoint: GgufCheckpointPlan,
+    tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
 }
 
 impl GgufMediaProjectorPlan {
@@ -45,6 +46,11 @@ impl GgufMediaProjectorPlan {
     /// Exact companion checkpoint schema proven by portable inspection.
     pub const fn checkpoint(&self) -> &GgufCheckpointPlan {
         &self.checkpoint
+    }
+
+    /// Canonical physical-to-logical tensor mapping resolved during admission.
+    pub fn tensor_mapping(&self) -> &[eredu_gguf::TranslatedTensorLayout] {
+        &self.tensor_mapping
     }
 
     pub(crate) fn bind_qwen_token_ids(
@@ -144,7 +150,6 @@ pub(crate) fn resolve_media_projector(
                 crate::qwen::vl::model_args_from_gguf_parts(text.clone(), &model_metadata, vision)
                     .map_err(|error| error.to_string())?;
             let checkpoint = crate::qwen::vision::gguf_plan(&model.vision, model.text.hidden_size)?;
-            validate_qwen_translation(projector, &model.vision)?;
             (GgufMediaProjectorConfig::Qwen3VlPending(model), checkpoint)
         }
         GgufModelConfig::QwenHybrid(parsed) => {
@@ -156,13 +161,6 @@ pub(crate) fn resolve_media_projector(
             let model = crate::qwen::hybrid::with_gguf_vision_projector(parsed.clone(), vision)
                 .map_err(|error| error.to_string())?;
             let checkpoint = crate::qwen::hybrid::conditional_projector_gguf_plan(&model)?;
-            validate_qwen_translation(
-                projector,
-                model
-                    .vision
-                    .as_ref()
-                    .ok_or("admitted Qwen3.5 projector omitted its vision geometry")?,
-            )?;
             (GgufMediaProjectorConfig::Qwen35Pending(model), checkpoint)
         }
         _ => {
@@ -175,20 +173,53 @@ pub(crate) fn resolve_media_projector(
     validate_gguf_plan(projector, &checkpoint)
         .into_loader_result()
         .map_err(|failure| strict_failure("media-projector GGUF", failure))?;
-    Ok(GgufMediaProjectorPlan { model, checkpoint })
+    let tensor_mapping = canonical_projector_mapping(projector, &model)?;
+    Ok(GgufMediaProjectorPlan {
+        model,
+        checkpoint,
+        tensor_mapping,
+    })
 }
 
-fn validate_qwen_translation(
+fn canonical_projector_mapping(
     projector: &Checkpoint,
-    vision: &crate::qwen::vision::VisionConfig,
-) -> Result<(), String> {
-    let deepstack = vision.deepstack_layers();
-    projector
-        .translated_outputs(|name| {
-            crate::qwen::vision::translate_gguf_weight_name(name, &deepstack)
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    model: &GgufMediaProjectorConfig,
+) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
+    let mapping = match model {
+        GgufMediaProjectorConfig::Gemma4(_) => {
+            projector.translated_outputs(crate::gemma4::translate_mmproj_weight_name)
+        }
+        GgufMediaProjectorConfig::Inkling(_) => {
+            projector.translated_outputs(crate::inkling::translate_mmproj_weight_name)
+        }
+        GgufMediaProjectorConfig::MuseGlimmer(_) => {
+            projector.translated_outputs(crate::muse_glimmer::translate_projector_gguf_name)
+        }
+        GgufMediaProjectorConfig::Qwen3Vl(model) => {
+            let deepstack = model.vision.deepstack_layers();
+            projector.translated_outputs(|name| {
+                crate::qwen::vision::translate_gguf_weight_name(name, &deepstack)
+            })
+        }
+        GgufMediaProjectorConfig::Qwen3VlPending(model) => {
+            let deepstack = model.vision.deepstack_layers();
+            projector.translated_outputs(|name| {
+                crate::qwen::vision::translate_gguf_weight_name(name, &deepstack)
+            })
+        }
+        GgufMediaProjectorConfig::Qwen35(model)
+        | GgufMediaProjectorConfig::Qwen35Pending(model) => {
+            let deepstack = model
+                .vision
+                .as_ref()
+                .ok_or("admitted Qwen3.5 projector omitted its vision geometry")?
+                .deepstack_layers();
+            projector.translated_outputs(|name| {
+                crate::qwen::hybrid::translate_vision_gguf_weight_name(name, &deepstack)
+            })
+        }
+    };
+    mapping.map_err(|error| error.to_string())
 }
 
 fn metadata(checkpoint: &Checkpoint) -> HashMap<String, MetadataValue> {
@@ -336,6 +367,7 @@ mod tests {
             GgufArchitecture::MuseGlimmer,
             GgufModelConfig::MuseGlimmer(args),
             checkpoint,
+            Vec::new(),
         )
     }
 

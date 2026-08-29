@@ -2516,7 +2516,7 @@ pub fn load_gguf(
     let model = match source.model() {
         eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) => {
             let linear_formats =
-                gguf_quantization_configs(checkpoint, deepseek::translate_v4_gguf_weight_name)?
+                gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?
                     .into_iter()
                     .map(|(name, format)| (name, format.into()))
                     .collect();
@@ -2525,7 +2525,7 @@ pub fn load_gguf(
             let store = Arc::new(open_gguf_checkpoint_source(
                 checkpoint.clone(),
                 source.plan().checkpoint(),
-                deepseek::translate_v4_gguf_weight_name,
+                source.plan().tensor_mapping(),
                 residency.max_mapped_shards(),
             )?);
             DeepSeekModel::load_v4(
@@ -2539,7 +2539,7 @@ pub fn load_gguf(
         }
         eredu_architectures::configuration::GgufModelConfig::DeepSeekV3(args) => {
             let linear_formats =
-                gguf_quantization_configs(checkpoint, deepseek::translate_v3_gguf_weight_name)?
+                gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?
                     .into_iter()
                     .map(|(name, format)| (name, format.into()))
                     .collect();
@@ -2548,7 +2548,7 @@ pub fn load_gguf(
             let store = Arc::new(open_gguf_checkpoint_source(
                 checkpoint.clone(),
                 source.plan().checkpoint(),
-                deepseek::translate_v3_gguf_weight_name,
+                source.plan().tensor_mapping(),
                 residency.max_mapped_shards(),
             )?);
             DeepSeekModel::load_v3(

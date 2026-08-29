@@ -1014,27 +1014,23 @@ pub fn prepare_gguf_pipeline(
         ));
     };
     let args = args.clone();
-    let is_moe = args.text.is_moe();
-    let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
-    let text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
-    let deepstack = args.vision.deepstack_layers();
-    let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
+    let text_formats = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let vision_formats = gguf_quantization_configs(
         projector.checkpoint(),
-        translate_vision,
+        projector.plan().tensor_mapping(),
     )?;
     let args = vl::with_checkpoint_formats(&args, text_formats, vision_formats)
         .map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        translate_text,
+        source.plan().tensor_mapping(),
         max_mapped_shards,
     )?);
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         projector.checkpoint().clone(),
         projector.plan().checkpoint(),
-        translate_vision,
+        projector.plan().tensor_mapping(),
         max_mapped_shards,
     )?);
     Ok((

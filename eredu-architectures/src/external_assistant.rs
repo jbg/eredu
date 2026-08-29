@@ -35,6 +35,8 @@ pub enum ExternalAssistantCheckpoint {
         checkpoint: Checkpoint,
         /// Exact architecture layout selected during admission.
         resolution: ResolvedCheckpointPlan,
+        /// Canonical physical-to-logical tensor mapping resolved during admission.
+        tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     },
 }
 
@@ -118,6 +120,7 @@ pub fn prepare_external_assistant(
                 &inspection,
                 || gemma4::assistant_safetensors_plan(&config),
                 || gemma4::assistant_gguf_plan(&config),
+                gemma4::translate_assistant_gguf_weight_name,
             )?;
             Ok(ExternalAssistantPreparationPlan::Gemma4(
                 Gemma4AssistantPreparationPlan { checkpoint, config },
@@ -138,6 +141,7 @@ pub fn prepare_external_assistant(
                 &inspection,
                 || muse_glimmer::dflash_safetensors_plan(&config),
                 || muse_glimmer::dflash_gguf_plan(&config),
+                muse_glimmer::translate_dflash_gguf_weight_name,
             )?;
             Ok(ExternalAssistantPreparationPlan::MuseGlimmer(
                 MuseGlimmerAssistantPreparationPlan { checkpoint, config },
@@ -151,6 +155,7 @@ fn prepared_checkpoint(
     inspection: &eredu_core::ArtifactInspection,
     safetensors_plan: impl FnOnce() -> Result<SafetensorsCheckpointPlan, String>,
     gguf_plan: impl FnOnce() -> Result<eredu_checkpoint::schema::GgufCheckpointPlan, String>,
+    gguf_translate: impl FnMut(&str) -> String,
 ) -> Result<ExternalAssistantCheckpoint, ArtifactError> {
     match inspection.format() {
         ArtifactFormat::SafeTensors => {
@@ -181,9 +186,13 @@ fn prepared_checkpoint(
                     "external assistant checkpoint contract did not resolve: {validation:?}"
                 ))
             })?;
+            let tensor_mapping = checkpoint
+                .translated_outputs(gguf_translate)
+                .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
             Ok(ExternalAssistantCheckpoint::Gguf {
                 checkpoint: checkpoint.clone(),
                 resolution,
+                tensor_mapping,
             })
         }
     }

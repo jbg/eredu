@@ -583,11 +583,11 @@ fn prepare_hybrid_gguf_store(
         }
         None => primary.clone(),
     };
-    let text_formats = gguf_quantization_configs(checkpoint, hybrid::translate_gguf_weight_name)?;
+    let text_formats = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let text: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        hybrid::translate_gguf_weight_name,
+        source.plan().tensor_mapping(),
         max_mapped_shards,
     )?);
     if parsed.text.variant == hybrid::HybridVariant::Qwen3Next {
@@ -600,16 +600,17 @@ fn prepare_hybrid_gguf_store(
             .map_err(Error::ArchitectureModel)?;
         return Ok((parsed, text));
     };
-    let vision = parsed.vision.as_ref().ok_or_else(|| {
+    parsed.vision.as_ref().ok_or_else(|| {
         Error::ArchitectureModel("admitted Qwen3.5 projector omitted its vision geometry".into())
     })?;
-    let deepstack = vision.deepstack_layers();
-    let translate = |name: &str| hybrid::translate_vision_gguf_weight_name(name, &deepstack);
-    let vision_formats = gguf_quantization_configs(projector.checkpoint(), translate)?;
+    let vision_formats = gguf_quantization_configs(
+        projector.checkpoint(),
+        projector.plan().tensor_mapping(),
+    )?;
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         projector.checkpoint().clone(),
         projector.plan().checkpoint(),
-        translate,
+        projector.plan().tensor_mapping(),
         max_mapped_shards,
     )?);
     let parsed = hybrid::conditional_with_checkpoint_formats(

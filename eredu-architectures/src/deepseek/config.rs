@@ -1776,6 +1776,7 @@ mod tests {
             crate::GgufArchitecture::DeepSeek4,
             crate::configuration::GgufModelConfig::DeepSeekV4(args),
             checkpoint,
+            Vec::new(),
         );
         assert_eq!(
             crate::preparation::prepared_gguf_capabilities(&plan).embedded_draft_layers(),

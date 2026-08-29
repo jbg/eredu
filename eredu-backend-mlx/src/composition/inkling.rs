@@ -2399,30 +2399,21 @@ fn open_gguf_store(
         }
         None => primary_args.clone(),
     };
-    let translation_args = args.clone();
-    let text_formats = gguf_quantization_configs(checkpoint, |name| {
-        eredu_architectures::inkling::translate_gguf_weight_name_for_model(name, &translation_args)
-    })?;
+    let text_formats = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::inkling::with_checkpoint_formats(&args, text_formats)
         .map_err(Error::ArchitectureModel)?;
-    let translation_args = args.clone();
     let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
         .add_checkpoint(
             checkpoint.catalog().clone(),
             source.plan().checkpoint(),
-            move |name| {
-                eredu_architectures::inkling::translate_gguf_weight_name_for_model(
-                    name,
-                    &translation_args,
-                )
-            },
+            source.plan().tensor_mapping(),
         )?;
     if let Some(projector) = projector {
         builder = builder.add_checkpoint(
             projector.checkpoint().catalog().clone(),
             projector.plan().checkpoint(),
-            eredu_architectures::inkling::translate_mmproj_weight_name,
+            projector.plan().tensor_mapping(),
         )?;
     }
     let store: SharedCheckpointSource = Arc::new(builder.build()?);

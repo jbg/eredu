@@ -106,16 +106,14 @@ impl GgufWeightStoreBuilder {
         Ok(self)
     }
 
-    /// Resolves an architecture contract and adds only its selected layout.
-    pub fn add_checkpoint<F>(
+    /// Resolves an architecture contract and adds only its selected layout
+    /// under the canonical mapping retained by architecture admission.
+    pub fn add_checkpoint(
         self,
         checkpoint: Checkpoint,
         plan: &crate::schema::GgufCheckpointPlan,
-        translate: F,
-    ) -> Result<Self, StoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
+        tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    ) -> Result<Self, StoreError> {
         let resolved =
             resolve_gguf_plan(&checkpoint, plan).map_err(|validation| StoreError::Gguf {
                 key: String::new(),
@@ -124,19 +122,27 @@ impl GgufWeightStoreBuilder {
                     plan.identity
                 ),
             })?;
-        self.add_resolved_checkpoint(checkpoint, &resolved, translate)
+        self.add_resolved_checkpoint(checkpoint, &resolved, tensor_mapping)
     }
 
-    /// Adds a checkpoint using an already resolved, fail-closed contract.
-    pub fn add_resolved_checkpoint<F>(
+    /// Adds a checkpoint using an already resolved, fail-closed contract and
+    /// its admitted canonical tensor mapping.
+    pub fn add_resolved_checkpoint(
         mut self,
         checkpoint: Checkpoint,
         resolved: &ResolvedCheckpointPlan,
-        mut translate: F,
-    ) -> Result<Self, StoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
+        tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    ) -> Result<Self, StoreError> {
+        let mut names = BTreeMap::new();
+        for mapped in tensor_mapping {
+            let key = (mapped.physical_name.as_str(), mapped.original_name.as_str());
+            if names.insert(key, mapped.layout.name.as_str()).is_some() {
+                return Err(gguf_error(
+                    &mapped.layout.name,
+                    "admitted GGUF tensor mapping contains a duplicate source output",
+                ));
+            }
+        }
         let checkpoint_index = self.checkpoints.len();
         for shard in checkpoint.shards() {
             for tensor in shard.tensors() {
@@ -157,7 +163,15 @@ impl GgufWeightStoreBuilder {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 for output in tensor.outputs() {
-                    let name = translate(&output.name);
+                    let name = names
+                        .get(&(physical_name.as_str(), output.name.as_str()))
+                        .ok_or_else(|| {
+                            gguf_error(
+                                &output.name,
+                                "admitted GGUF tensor mapping omits a catalog output",
+                            )
+                        })?
+                        .to_string();
                     if unclaimed {
                         self.unclaimed_keys.insert(name);
                         continue;
@@ -942,11 +956,36 @@ mod tests {
     fn test_store(path: &Path) -> GgufWeightStore {
         let checkpoint = Checkpoint::open(path).unwrap();
         let plan = test_plan(&checkpoint);
+        let tensor_mapping = checkpoint.translated_outputs(str::to_owned).unwrap();
         GgufWeightStore::builder()
-            .add_checkpoint(checkpoint, &plan, str::to_owned)
+            .add_checkpoint(checkpoint, &plan, &tensor_mapping)
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn store_requires_the_admitted_mapping_for_every_catalog_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dense.gguf");
+        write_tensor(
+            &path,
+            "projection.weight",
+            &[1],
+            GgmlType::F32,
+            &1.0_f32.to_le_bytes(),
+        );
+        let checkpoint = Checkpoint::open(path).unwrap();
+        let plan = test_plan(&checkpoint);
+
+        let error = GgufWeightStore::builder()
+            .add_checkpoint(checkpoint, &plan, &[])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Gguf { message, .. }
+                if message.contains("mapping omits a catalog output")
+        ));
     }
 
     #[test]
@@ -1047,8 +1086,9 @@ mod tests {
             .unwrap();
         let checkpoint = Checkpoint::open(&path).unwrap();
         let plan = test_plan(&checkpoint);
+        let tensor_mapping = checkpoint.translated_outputs(str::to_owned).unwrap();
         let store = GgufWeightStore::builder()
-            .add_checkpoint(checkpoint, &plan, str::to_owned)
+            .add_checkpoint(checkpoint, &plan, &tensor_mapping)
             .unwrap()
             .build()
             .unwrap();

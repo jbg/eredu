@@ -1323,7 +1323,6 @@ pub(crate) struct PreparedGguf {
 pub(crate) fn prepare_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGguf, Error> {
-    let is_moe = source.architecture() == eredu_architectures::GgufArchitecture::Lfm2Moe;
     if !matches!(
         source.architecture(),
         eredu_architectures::GgufArchitecture::Lfm2
@@ -1340,9 +1339,7 @@ pub(crate) fn prepare_gguf(
             "LFM2 GGUF loader received a different prepared model".into(),
         ));
     };
-    let translate =
-        |name: &str| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe);
-    let configs = gguf_quantization_configs(checkpoint, translate)?;
+    let configs = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::lfm2::with_checkpoint_formats(args, configs)
         .map_err(Error::ArchitectureModel)?;
     Ok(PreparedGguf { args })
@@ -1359,11 +1356,10 @@ pub(crate) fn load_lfm2_gguf_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
-    let is_moe = prepared.args.has_sparse_moe_layers();
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        move |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe),
+        source.plan().tensor_mapping(),
         residency.max_mapped_shards(),
     )?);
     let (store, args, materialization) = match quantization {
@@ -1399,11 +1395,10 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
 ) -> Result<Lfm2Model, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
-    let is_moe = prepared.args.has_sparse_moe_layers();
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
-        move |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe),
+        source.plan().tensor_mapping(),
         options.max_mapped_shards(),
     )?);
     let model = load_neutral_parallel(

@@ -10,7 +10,7 @@
 //! Multimodal encoder, projection, merge, finalization, and decoder groups use
 //! one validated placement DAG with topology-planned payload routes.
 
-use eredu_architectures::{llama::ModelArgs as LlamaModelArgs, muse_glimmer, GgufArchitecture};
+use eredu_architectures::{llama::ModelArgs as LlamaModelArgs, muse_glimmer};
 use eredu_checkpoint::{store::WeightStoreDiagnostics, WeightQuantization};
 use eredu_core::{
     MaterializationRoute, ModelArtifact, ModelPreparationPlan, PreparedInputIdentity,
@@ -13912,7 +13912,7 @@ pub fn load_pipeline_model_with_options(
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        eredu_architectures::deepseek::translate_v4_gguf_weight_name,
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_neutral_deepseek_v4_pipeline(
@@ -13933,7 +13933,7 @@ pub fn load_pipeline_model_with_options(
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        eredu_architectures::llama::translate_gguf_weight_name,
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_llama_pipeline(
@@ -13979,7 +13979,7 @@ pub fn load_pipeline_model_with_options(
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        eredu_architectures::deepseek::translate_v3_gguf_weight_name,
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_neutral_deepseek_v3_pipeline(
@@ -14015,16 +14015,13 @@ pub fn load_pipeline_model_with_options(
                     )
                 }
                 FamilyBinding::Qwen => {
-                    let is_moe = architecture == GgufArchitecture::Qwen3Moe;
                     let prepared =
                         crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
                     let args = prepared.args;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        move |name| {
-                            eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe)
-                        },
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_qwen_pipeline(
@@ -14066,7 +14063,7 @@ pub fn load_pipeline_model_with_options(
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        gpt_oss::translate_gguf_weight_name,
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_gpt_oss_pipeline(
@@ -14084,13 +14081,10 @@ pub fn load_pipeline_model_with_options(
                 }
                 FamilyBinding::Lfm2 => {
                     let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
-                    let is_moe = architecture == GgufArchitecture::Lfm2Moe;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        move |name| {
-                            eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe)
-                        },
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_lfm2_pipeline(
@@ -14111,7 +14105,7 @@ pub fn load_pipeline_model_with_options(
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        eredu_architectures::nemotron_h::translate_gguf_weight_name,
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_nemotron_h_pipeline(
@@ -14166,7 +14160,7 @@ pub fn load_pipeline_model_with_options(
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         admitted.plan().checkpoint(),
-                        eredu_architectures::kimi_linear::translate_gguf_weight_name,
+                        admitted.plan().tensor_mapping(),
                         max_mapped_shards,
                     )?);
                     load_kimi_linear_pipeline(

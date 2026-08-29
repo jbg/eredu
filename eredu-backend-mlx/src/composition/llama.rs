@@ -837,7 +837,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             source.plan().checkpoint(),
-            eredu_architectures::llama::translate_gguf_weight_name,
+            source.plan().tensor_mapping(),
             options.max_mapped_shards(),
         )?);
     let model =
@@ -859,7 +859,7 @@ pub(crate) fn load_llama_gguf_model(
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             source.plan().checkpoint(),
-            eredu_architectures::llama::translate_gguf_weight_name,
+            source.plan().tensor_mapping(),
             residency.max_mapped_shards(),
         )?);
     let args = prepared.args;

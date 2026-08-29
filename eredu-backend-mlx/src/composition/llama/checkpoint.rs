@@ -32,10 +32,8 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
             "Llama GGUF loader received a different prepared model".into(),
         ));
     };
-    let quantized_weight_configs = gguf_quantization_configs(
-        checkpoint,
-        eredu_architectures::llama::translate_gguf_weight_name,
-    )?;
+    let quantized_weight_configs =
+        gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::llama::with_checkpoint_formats(args, quantized_weight_configs)
         .map_err(Error::ArchitectureModel)?;
 

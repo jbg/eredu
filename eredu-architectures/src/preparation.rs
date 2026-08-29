@@ -818,6 +818,7 @@ mod tests {
             GgufArchitecture::DeepSeek2,
             crate::configuration::GgufModelConfig::DeepSeekV3(args),
             checkpoint,
+            Vec::new(),
         );
         assert_dense_capabilities(prepared_gguf_capabilities(&gguf));
     }
@@ -843,6 +844,7 @@ mod tests {
             GgufArchitecture::KimiLinear,
             crate::configuration::GgufModelConfig::KimiLinear(kimi),
             checkpoint,
+            Vec::new(),
         );
         assert_dense_capabilities(prepared_gguf_capabilities(&plan));
 
@@ -855,6 +857,7 @@ mod tests {
             GgufArchitecture::Inkling,
             crate::configuration::GgufModelConfig::Inkling(inkling),
             checkpoint,
+            Vec::new(),
         );
         assert_dense_capabilities(prepared_gguf_capabilities(&plan));
     }

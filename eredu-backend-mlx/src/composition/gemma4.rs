@@ -385,6 +385,7 @@ pub fn load_assistant_safetensors(
 pub fn load_assistant_gguf(
     checkpoint: eredu_gguf::Checkpoint,
     resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
+    tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     source_config: eredu_architectures::gemma4::AssistantConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
@@ -406,10 +407,7 @@ pub fn load_assistant_gguf(
     }
     let mlx_checkpoint = GgufCheckpoint::from_portable(checkpoint.clone());
     let metadata = gguf_metadata(&mlx_checkpoint);
-    let formats = gguf_quantization_configs(
-        &mlx_checkpoint,
-        eredu_architectures::gemma4::translate_assistant_gguf_weight_name,
-    )?;
+    let formats = gguf_quantization_configs(&mlx_checkpoint, &tensor_mapping)?;
     let source_config = source_config
         .with_checkpoint_formats(formats)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -421,9 +419,7 @@ pub fn load_assistant_gguf(
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(options.weight_residency.max_mapped_shards())?
-            .add_resolved_checkpoint(checkpoint, &resolution, |name| {
-                eredu_architectures::gemma4::translate_assistant_gguf_weight_name(name)
-            })?
+            .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
             .build()?,
     );
     let (store, config) = if let Some(requested) = quantization {
@@ -2152,10 +2148,7 @@ pub fn open_pipeline_gguf_store(
         }
         None => family.clone(),
     };
-    let formats = gguf_quantization_configs(
-        checkpoint,
-        eredu_architectures::gemma4::translate_gguf_weight_name,
-    )?;
+    let formats = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
     let args = eredu_architectures::gemma4::with_checkpoint_formats(&args, formats)
         .map_err(Error::ArchitectureModel)?;
     let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
@@ -2163,13 +2156,13 @@ pub fn open_pipeline_gguf_store(
         .add_checkpoint(
             checkpoint.catalog().clone(),
             source.plan().checkpoint(),
-            eredu_architectures::gemma4::translate_gguf_weight_name,
+            source.plan().tensor_mapping(),
         )?;
     let builder = if let Some(projector) = projector {
         builder.add_checkpoint(
             projector.checkpoint().catalog().clone(),
             projector.plan().checkpoint(),
-            eredu_architectures::gemma4::translate_mmproj_weight_name,
+            projector.plan().tensor_mapping(),
         )?
     } else {
         builder

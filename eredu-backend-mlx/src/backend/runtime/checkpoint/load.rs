@@ -34,20 +34,21 @@ pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadat
         .collect()
 }
 
-/// Extracts affine quantization configurations from translated GGUF tensors.
-pub fn gguf_affine_configs<F>(
+/// Lowers affine GGUF encodings under an admitted canonical tensor mapping.
+pub fn gguf_affine_configs(
     checkpoint: &GgufCheckpoint,
-    mut translate: F,
-) -> Result<HashMap<String, AffineQuantization>, Error>
-where
-    F: FnMut(&str) -> String,
-{
+    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+) -> Result<HashMap<String, AffineQuantization>, Error> {
     let mut configs = HashMap::new();
     for tensor in checkpoint.catalog().tensors() {
         let Some((bits, group_size)) = tensor.affine() else {
             continue;
         };
-        let weight_name = translate(&tensor.outputs()[0].name);
+        let weight_name = canonical_gguf_name(
+            tensor_mapping,
+            &tensor.descriptor().name,
+            &tensor.outputs()[0].name,
+        )?;
         let group_size = i32::try_from(group_size).map_err(|_| {
             Error::Quantization(format!(
                 "GGUF group size {group_size} does not fit in an i32"
@@ -63,15 +64,13 @@ where
     Ok(configs)
 }
 
-/// Exact per-weight runtime formats for mixed affine and native-block GGUF files.
-pub fn gguf_quantization_configs<F>(
+/// Lowers exact mixed affine and native-block GGUF encodings under an admitted
+/// canonical tensor mapping.
+pub fn gguf_quantization_configs(
     checkpoint: &GgufCheckpoint,
-    mut translate: F,
-) -> Result<HashMap<String, WeightQuantization>, Error>
-where
-    F: FnMut(&str) -> String,
-{
-    let mut configs = gguf_affine_configs(checkpoint, &mut translate)?
+    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+) -> Result<HashMap<String, WeightQuantization>, Error> {
+    let mut configs = gguf_affine_configs(checkpoint, tensor_mapping)?
         .into_iter()
         .map(|(name, config)| (name, config.into()))
         .collect::<HashMap<_, _>>();
@@ -79,7 +78,8 @@ where
         for tensor in shard.tensors() {
             let descriptor = tensor.descriptor();
             if tensor.is_mxfp4() {
-                let weight_name = translate(&descriptor.name);
+                let weight_name =
+                    canonical_gguf_name(tensor_mapping, &descriptor.name, &descriptor.name)?;
                 if configs
                     .insert(weight_name.clone(), WeightQuantization::MxFp4)
                     .is_some()
@@ -95,7 +95,8 @@ where
             {
                 continue;
             }
-            let weight_name = translate(&descriptor.name);
+            let weight_name =
+                canonical_gguf_name(tensor_mapping, &descriptor.name, &descriptor.name)?;
             let config = WeightQuantization::GgufIQuant {
                 ggml_type: descriptor.ggml_type,
                 endian: shard.endian(),
@@ -108,6 +109,24 @@ where
         }
     }
     Ok(configs)
+}
+
+fn canonical_gguf_name(
+    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    physical_name: &str,
+    original_name: &str,
+) -> Result<String, Error> {
+    tensor_mapping
+        .iter()
+        .find(|mapped| {
+            mapped.physical_name == physical_name && mapped.original_name == original_name
+        })
+        .map(|mapped| mapped.layout.name.clone())
+        .ok_or_else(|| {
+            Error::ArchitectureModel(format!(
+                "admitted GGUF tensor mapping omits {physical_name:?} output {original_name:?}"
+            ))
+        })
 }
 
 /// Accumulates strict checkpoint-loading diagnostics across one or more files.
@@ -483,7 +502,11 @@ mod tests {
             .unwrap();
 
         let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
-        let configs = gguf_quantization_configs(&checkpoint, str::to_string).unwrap();
+        let tensor_mapping = checkpoint
+            .catalog()
+            .translated_outputs(str::to_string)
+            .unwrap();
+        let configs = gguf_quantization_configs(&checkpoint, &tensor_mapping).unwrap();
         for (name, expected) in names.iter().zip(formats) {
             assert!(matches!(
                 configs[name],
@@ -515,7 +538,11 @@ mod tests {
         .unwrap();
 
         let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
-        let configs = gguf_quantization_configs(&checkpoint, str::to_string).unwrap();
+        let tensor_mapping = checkpoint
+            .catalog()
+            .translated_outputs(str::to_string)
+            .unwrap();
+        let configs = gguf_quantization_configs(&checkpoint, &tensor_mapping).unwrap();
         assert!(matches!(
             configs["projection.weight"],
             WeightQuantization::Affine(config) if config.group_size == 32 && config.bits == 4
