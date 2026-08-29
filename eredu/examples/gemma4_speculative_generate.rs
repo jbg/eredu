@@ -7,8 +7,8 @@ use std::{
 use eredu::{
     api::{
         default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
-        LocalModel, LocalPreparedChatInput, LocalPreparedChatMtpGenerationRequest, PreparedChat,
-        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions,
+        LocalModel, LocalPreparedChatInput, LocalPreparedChatSpeculativeGenerationRequest,
+        PreparedChat, PreparedChatGenerationSettings, PreparedChatSpeculativeGenerationOptions,
     },
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
     GenerationConfigOverrides, TextGenerationConfig,
@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     );
     println!("{}", greedy.text);
 
-    let mtp = run_mtp(&target_dir, &assistant_dir, &prepared, max_tokens)?;
+    let mtp = run_speculative(&target_dir, &assistant_dir, &prepared, max_tokens)?;
     println!("\n=== mtp ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -131,7 +131,7 @@ fn run_greedy(
     })
 }
 
-fn run_mtp(
+fn run_speculative(
     target_dir: &Path,
     assistant_dir: &Path,
     prepared: &PreparedChat,
@@ -151,25 +151,27 @@ fn run_mtp(
     if !drafting.is_enabled() {
         anyhow::bail!("external drafting plan was not realized");
     }
-    let output = target.generate_prepared_chat_mtp(LocalPreparedChatMtpGenerationRequest {
-        input: LocalPreparedChatInput::rendered_prompt(prepared),
-        drafting: &mut drafting,
-        settings: PreparedChatGenerationSettings {
-            overrides: GenerationConfigOverrides {
-                temperature: Some(0.0),
-                max_new_tokens: Some(max_tokens),
-                ..Default::default()
+    let output = target.generate_prepared_chat_speculative(
+        LocalPreparedChatSpeculativeGenerationRequest {
+            input: LocalPreparedChatInput::rendered_prompt(prepared),
+            drafting: &mut drafting,
+            settings: PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    temperature: Some(0.0),
+                    max_new_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+                ..PreparedChatGenerationSettings::default()
             },
-            ..PreparedChatGenerationSettings::default()
+            options: PreparedChatSpeculativeGenerationOptions {
+                max_draft_tokens: NonZeroUsize::new(3).unwrap(),
+                ..PreparedChatSpeculativeGenerationOptions::default()
+            },
+            caller_stop_sequences: &[],
+            cancellation: GenerationCancellationToken::new(),
+            on_event: |_| {},
         },
-        options: PreparedChatMtpGenerationOptions {
-            max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-            ..PreparedChatMtpGenerationOptions::default()
-        },
-        caller_stop_sequences: &[],
-        cancellation: GenerationCancellationToken::new(),
-        on_event: |_| {},
-    })?;
+    )?;
     let mut generated = output.token_ids;
     let stats = output.stats;
     if generated

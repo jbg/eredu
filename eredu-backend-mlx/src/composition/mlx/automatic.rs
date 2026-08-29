@@ -8,12 +8,13 @@ use eredu_core::{
     CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
     ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
     ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, MtpCapability,
-    MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics,
-    QuantizationRequest, RealizedDrafting, RealtimeBackend, RealtimeInputFrame,
-    RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling, RealtimeSpeechConfig,
-    ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend, Submission, TransferTelemetry,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, Observed,
+    PhysicalMemorySemantics, QuantizationRequest, RealizedDrafting, RealtimeBackend,
+    RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
+    RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry, SpeculativeCapability,
+    SpeculativeDecodingTelemetry, SpeculativeDraftSource, SpeculativeGenerationBackend,
+    SpeculativeStats, Submission, TransferTelemetry, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -516,13 +517,13 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
     ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
         let capability =
-            <MlxBackend<'static> as SpeculativeGenerationBackend>::mtp_capability(target);
+            <MlxBackend<'static> as SpeculativeGenerationBackend>::speculative_capability(target);
         match &plan.drafting {
             DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
             DraftingPlan::Embedded { .. } => {
                 if capability
-                    != (MtpCapability::Ready {
-                        checkpoint: MtpCheckpointKind::Embedded,
+                    != (SpeculativeCapability::Ready {
+                        draft_source: SpeculativeDraftSource::Embedded,
                     })
                 {
                     return Err(AutomaticPlanningError::Invalid(format!(
@@ -533,8 +534,8 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
             }
             DraftingPlan::External { placement, .. } => {
                 if capability
-                    != (MtpCapability::Ready {
-                        checkpoint: MtpCheckpointKind::Separate,
+                    != (SpeculativeCapability::Ready {
+                        draft_source: SpeculativeDraftSource::Separate,
                     })
                 {
                     return Err(AutomaticPlanningError::Invalid(format!(
@@ -621,8 +622,8 @@ pub fn expert_cache_telemetry(report: &ExpertCacheReport) -> ExpertCacheTelemetr
 }
 
 /// Converts neutral speculative statistics into the stable telemetry document.
-pub fn mtp_telemetry(stats: &MtpStats) -> MtpTelemetry {
-    MtpTelemetry {
+pub fn speculative_decoding_telemetry(stats: &SpeculativeStats) -> SpeculativeDecodingTelemetry {
+    SpeculativeDecodingTelemetry {
         execution_topology: stats.execution_topology.to_string(),
         target_tokens: stats.target_tokens,
         draft_tokens: stats.draft_tokens,

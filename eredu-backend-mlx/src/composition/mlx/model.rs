@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
-use eredu_core::MtpCapability;
+use eredu_core::SpeculativeCapability;
 use safemlx::{error::Exception, Array, Stream};
 
 use crate::backend::error::Error;
@@ -285,13 +285,13 @@ impl Executable {
         }
     }
 
-    /// Reports how this model architecture exposes MTP weights.
-    pub fn mtp_capability(&self) -> MtpCapability {
+    /// Reports how this model architecture exposes speculative drafting weights.
+    pub fn speculative_capability(&self) -> SpeculativeCapability {
         self.architecture_capability_estimate()
             .ok()
-            .and_then(|estimate| estimate.mtp_checkpoint_kind())
-            .map_or(MtpCapability::Unavailable, |checkpoint| {
-                MtpCapability::Ready { checkpoint }
+            .and_then(|estimate| estimate.speculative_draft_source())
+            .map_or(SpeculativeCapability::Unavailable, |draft_source| {
+                SpeculativeCapability::Ready { draft_source }
             })
     }
 

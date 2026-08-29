@@ -4,7 +4,7 @@ use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
-    DraftingPlan, ExternalDraftArtifact, MtpCapability, SpeculativeGenerationBackend,
+    DraftingPlan, ExternalDraftArtifact, SpeculativeCapability, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationOutput, TokenizerCompatibilityProof,
 };
@@ -20,8 +20,8 @@ use eredu_text::{
 use super::{
     LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChat, PreparedChatError,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-    PreparedChatInput, PreparedChatMtpBatchRequest, PreparedChatMtpError,
-    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint, TextDecoderError,
+    PreparedChatInput, PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
+    PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest, TextDecoderError,
     TextMetadataError, TextModelError,
 };
 use crate::{
@@ -229,28 +229,28 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Reports fail-closed speculative support for this backend model session.
-    pub fn mtp_capability(&self) -> MtpCapability
+    pub fn speculative_capability(&self) -> SpeculativeCapability
     where
         B: SpeculativeGenerationBackend,
     {
-        B::mtp_capability(&self.runtime)
+        B::speculative_capability(&self.runtime)
     }
 
     /// Generates one structured response using embedded or external drafting.
-    pub fn generate_prepared_chat_mtp<'a, F>(
+    pub fn generate_prepared_chat_speculative<'a, F>(
         &mut self,
-        request: PreparedChatMtpGenerationRequest<
+        request: PreparedChatSpeculativeGenerationRequest<
             'a,
             B,
             <B as SpeculativeGenerationBackend>::Drafter,
             F,
         >,
-    ) -> Result<SpeculativeGenerationOutput, PreparedChatMtpError<B::Error>>
+    ) -> Result<SpeculativeGenerationOutput, PreparedChatSpeculativeError<B::Error>>
     where
         B: SpeculativeGenerationBackend,
         F: FnMut(SemanticEvent),
     {
-        let PreparedChatMtpGenerationRequest {
+        let PreparedChatSpeculativeGenerationRequest {
             input,
             drafting,
             settings,
@@ -282,11 +282,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             },
             eredu_runtime::RunSpeculativeGeneration::new(options.scheduler),
         )
-        .map_err(PreparedChatMtpError::Backend)?;
+        .map_err(PreparedChatSpeculativeError::Backend)?;
         let request: Result<[SpeculativeGenerationOutput; 1], _> = output.requests.try_into();
         match request {
             Ok([request]) => Ok(request),
-            Err(requests) => Err(PreparedChatMtpError::OutputCardinality {
+            Err(requests) => Err(PreparedChatSpeculativeError::OutputCardinality {
                 expected: 1,
                 actual: requests.len(),
             }),
@@ -294,14 +294,18 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Generates independent prepared chats through one fair speculative scheduler.
-    pub fn generate_prepared_chat_mtp_batch<'a>(
+    pub fn generate_prepared_chat_speculative_batch<'a>(
         &mut self,
-        request: PreparedChatMtpBatchRequest<'a, B, <B as SpeculativeGenerationBackend>::Drafter>,
-    ) -> Result<SpeculativeGenerationBatchOutput, PreparedChatMtpError<B::Error>>
+        request: PreparedChatSpeculativeBatchRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+        >,
+    ) -> Result<SpeculativeGenerationBatchOutput, PreparedChatSpeculativeError<B::Error>>
     where
         B: SpeculativeGenerationBackend,
     {
-        let PreparedChatMtpBatchRequest {
+        let PreparedChatSpeculativeBatchRequest {
             drafting,
             lanes,
             scheduler,
@@ -334,7 +338,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             },
             eredu_runtime::RunSpeculativeGeneration::new(scheduler),
         )
-        .map_err(PreparedChatMtpError::Backend)
+        .map_err(PreparedChatSpeculativeError::Backend)
     }
 
     #[allow(clippy::type_complexity)]
@@ -348,11 +352,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         (
             B::Prompt,
             eredu_core::TextGenerationConfig,
-            eredu_core::generation::MtpConfig,
+            eredu_core::generation::SpeculativeConfig,
             PreparedChatSpeculativeConstraint,
             Box<dyn eredu_core::SpeculativeSemanticState>,
         ),
-        PreparedChatMtpError<B::Error>,
+        PreparedChatSpeculativeError<B::Error>,
     > {
         let prepared_chat = input.prepared_chat();
         let semantic_plan = match prepared_chat.semantic_support() {
@@ -361,7 +365,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 .expect("supported prepared chats carry a semantic runtime plan")
                 .clone(),
             crate::runtime::chat::SemanticSupport::Unsupported { reason } => {
-                return Err(PreparedChatMtpError::Semantic(format!(
+                return Err(PreparedChatSpeculativeError::Semantic(format!(
                     "prepared chat does not have an executable semantic plan: {reason}"
                 )));
             }
@@ -374,7 +378,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             semantic_plan,
             caller_stop_sequences,
         )
-        .map_err(|error| PreparedChatMtpError::Semantic(error.to_string()))?;
+        .map_err(|error| PreparedChatSpeculativeError::Semantic(error.to_string()))?;
         let eos_token_ids = prepared_chat.eos_token_ids().to_vec();
         let (generation, max_tokens) = self.resolve_text_generation_settings(settings)?;
         let temperature = generation.sampling().temperature;
@@ -382,14 +386,14 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             PreparedChatInput::RenderedPrompt(prepared_chat) => {
                 let token_ids = self.encode(prepared_chat.rendered_prompt(), false)?;
                 B::prepare_text_prompt(self.runtime.backend(), token_ids)
-                    .map_err(PreparedChatMtpError::Backend)?
+                    .map_err(PreparedChatSpeculativeError::Backend)?
             }
             PreparedChatInput::PreparedBackendInput { prompt, .. } => prompt,
         };
         Ok((
             prompt,
             generation,
-            eredu_core::generation::MtpConfig {
+            eredu_core::generation::SpeculativeConfig {
                 max_tokens: max_tokens.get(),
                 max_draft_tokens: max_draft_tokens.get(),
                 temperature,

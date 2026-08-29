@@ -39,8 +39,8 @@ use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTo
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, FinishReason,
     GenerationCancellationToken, InputExtent, InputMetadataKey, InputModality, ModelRuntime,
-    MtpCapability, MtpCheckpointKind, MtpConfig, ObservationRequest, SemanticEvent,
-    SpeculativeDraft, SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest,
+    ObservationRequest, SemanticEvent, SpeculativeCapability, SpeculativeConfig, SpeculativeDraft,
+    SpeculativeDraftSource, SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest,
     SpeculativeGenerationLane, SpeculativeOutputError, SpeculativeSemanticState,
     SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter, TokenFilterController,
     TokenOutput as _,
@@ -158,7 +158,7 @@ impl SpeculativeSemanticState for TokenOnlySemanticState {
 fn run_neutral_embedded_mtp<'world>(
     runtime: &mut ModelRuntime<MlxBackend<'world>>,
     prompt: crate::composition::mlx::MlxModelInput,
-    config: MtpConfig,
+    config: SpeculativeConfig,
 ) -> eredu_core::SpeculativeGenerationOutput {
     let sampling = eredu_core::resolve_generation_config(
         None,
@@ -704,7 +704,7 @@ fn pipeline_ring_worker() {
             ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
         assert_eq!(model.model_family(), expected_model_family);
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
-        let expected_mtp_capability = model.mtp_capability_for_test();
+        let expected_speculative_capability = model.speculative_capability_for_test();
         let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
         if std::env::var_os(OPAQUE_TEXT_GENERATION).is_some() {
             let sampling = eredu_core::resolve_generation_config(
@@ -732,8 +732,10 @@ fn pipeline_ring_worker() {
             expected_effective_model_type
         );
         assert_eq!(
-            <MlxBackend<'_> as eredu_core::SpeculativeGenerationBackend>::mtp_capability(&runtime),
-            expected_mtp_capability
+            <MlxBackend<'_> as eredu_core::SpeculativeGenerationBackend>::speculative_capability(
+                &runtime
+            ),
+            expected_speculative_capability
         );
         use crate::backend::runtime::media::input::{InputPayload, ModelInput};
         let capability_tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
@@ -917,7 +919,7 @@ fn pipeline_ring_worker() {
             let output = run_neutral_embedded_mtp(
                 &mut runtime,
                 ModelInput::new(&parts).into(),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -1557,9 +1559,9 @@ fn pipeline_ring_worker() {
             | FixtureFamily::Qwen35MoeMultimodal
     ) {
         assert_eq!(
-            model.mtp_capability(),
-            MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded
+            model.speculative_capability(),
+            SpeculativeCapability::Ready {
+                draft_source: SpeculativeDraftSource::Embedded
             }
         );
         assert_eq!(model.stage_info().owns_embedded_mtp, pipeline_rank == 1);
@@ -1570,9 +1572,9 @@ fn pipeline_ring_worker() {
         assert_eq!(model.stage_info().global_embedded_mtp_layers, 1);
     } else if matches!(family, FixtureFamily::Gemma | FixtureFamily::MuseGlimmer) {
         assert_eq!(
-            model.mtp_capability(),
-            MtpCapability::Unsupported {
-                checkpoint: MtpCheckpointKind::Separate,
+            model.speculative_capability(),
+            SpeculativeCapability::Unsupported {
+                draft_source: SpeculativeDraftSource::Separate,
                 architecture: model.model_family().canonical_name().into(),
             }
         );

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 4;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = 5;
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -443,7 +443,7 @@ pub struct ExpertCacheTelemetry {
 
 /// Speculative-decoding observations for one request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MtpTelemetry {
+pub struct SpeculativeDecodingTelemetry {
     /// Stable target/assistant execution-placement topology label.
     pub execution_topology: String,
     /// Target tokens evaluated.
@@ -512,7 +512,7 @@ pub struct ExecutionTelemetry {
     pub expert_cache: Option<ExpertCacheTelemetry>,
     /// Speculative-decoding observations.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mtp: Option<MtpTelemetry>,
+    pub speculative: Option<SpeculativeDecodingTelemetry>,
 }
 
 /// Owned input to one automatic planning session.

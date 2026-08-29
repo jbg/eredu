@@ -10,7 +10,8 @@ use crate::{
     backend::runtime::media::input::ModelInput,
     composition::mlx::{
         speculative::{
-            scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
+            scheduler::SpeculativeComponentTimings, MlxSpeculativeCompletion,
+            SpeculativeExecutionStreams,
         },
         MlxModelInput,
     },
@@ -229,11 +230,11 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
     type Verification = EmbeddedVerification;
     type Logits = Array;
     type Context<'a>
-        = MtpExecutionStreams<'a>
+        = SpeculativeExecutionStreams<'a>
     where
         Self: 'a;
     type Completion = MlxSpeculativeCompletion;
-    type Telemetry = MtpComponentTimings;
+    type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
 
     fn max_proposals(&self) -> usize {
@@ -244,7 +245,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
         &mut self,
         input: MlxModelInput,
         cache: &mut Self::Cache,
-        streams: MtpExecutionStreams<'context>,
+        streams: SpeculativeExecutionStreams<'context>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
     where
         Self: 'context,
@@ -284,7 +285,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
         state: &Self::TargetState,
         last_token: u32,
         proposal_capacity: usize,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
         let mut draft_cache = DraftStateTransaction::fork(&state.draft_cache);
         let fused_logits = self.target.fused_draft_logits(
@@ -307,7 +308,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
         let stream = streams.draft();
         if let Some(logits) = &state.fused_logits {
@@ -343,7 +344,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
         let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
         if streams.crosses_devices() {
@@ -363,7 +364,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
     fn verification_logits<'a>(
         output: &Self::Verification,
         index: usize,
-        streams: MtpExecutionStreams<'a>,
+        streams: SpeculativeExecutionStreams<'a>,
     ) -> Result<Array, Exception>
     where
         Self: 'a,
@@ -382,7 +383,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
         let stream = streams.target();
         let input_len = output.inputs.as_array().dim(1) as usize;

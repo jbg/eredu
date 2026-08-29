@@ -14,12 +14,13 @@ use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Pars
 use eredu::{
     api::{
         benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
-        inspect_local_model, local_device_plan, local_mtp_telemetry, reset_local_allocator_peak,
-        LocalBackendFactory, LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
-        LocalModel, LocalMtpComponentTimingGuard, LocalPreparedChatGenerationRequest,
-        LocalPreparedChatInput, LocalPreparedChatMtpGenerationRequest, LocalRuntimeConfiguration,
-        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions, ResidencyPlan,
-        TextDecoder, TextModelError,
+        inspect_local_model, local_device_plan, local_speculative_decoding_telemetry,
+        reset_local_allocator_peak, LocalBackendFactory, LocalDevice,
+        LocalExpertCacheBenchmarkSample, LocalInspectionOptions, LocalModel,
+        LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
+        LocalPreparedChatSpeculativeGenerationRequest, LocalRuntimeConfiguration,
+        LocalSpeculativeComponentTimingGuard, PreparedChatGenerationSettings,
+        PreparedChatSpeculativeGenerationOptions, ResidencyPlan, TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -27,11 +28,11 @@ use eredu::{
     AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan, DraftingPlan,
     ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, SemanticEvent,
+    HardwareProfile, ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry,
+    PlanExplanationLevel, QuantizationRequest, SemanticEvent, SpeculativeSchedulerOptions,
     TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
-use eredu_core::{residency::CacheEvictionPolicy, speculative::MtpStats};
+use eredu_core::{residency::CacheEvictionPolicy, speculative::SpeculativeStats};
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use serde::{Deserialize, Serialize};
@@ -141,13 +142,13 @@ impl FromStr for CliDevice {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-enum MtpDraftDevice {
+enum SpeculativeDraftDevice {
     #[default]
     Target,
     Device(CliDevice),
 }
 
-impl fmt::Display for MtpDraftDevice {
+impl fmt::Display for SpeculativeDraftDevice {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Target => formatter.write_str("target"),
@@ -156,7 +157,7 @@ impl fmt::Display for MtpDraftDevice {
     }
 }
 
-impl FromStr for MtpDraftDevice {
+impl FromStr for SpeculativeDraftDevice {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
@@ -263,22 +264,22 @@ struct Cli {
 
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
-    mtp_draft_tokens: usize,
+    speculative_draft_tokens: usize,
 
-    /// Disable same-request optimistic MTP lookahead for equivalent A/B runs.
+    /// Disable same-request optimistic speculative lookahead for equivalent A/B runs.
     #[arg(long)]
-    disable_mtp_lookahead: bool,
+    disable_speculative_lookahead: bool,
 
-    /// Keep MTP lookahead enabled even when retained work does not cover discards.
+    /// Keep speculative lookahead enabled even when retained work does not cover discards.
     #[arg(long)]
-    disable_mtp_adaptive_lookahead: bool,
+    disable_speculative_adaptive_lookahead: bool,
 
-    /// External MTP assistant placement: `target`, `cpu`, or `gpu:N`.
+    /// External assistant placement: `target`, `cpu`, or `gpu:N`.
     ///
     /// `target` reuses the main execution stream. An explicit device creates
     /// a distinct draft stream even when it names the main physical device.
     #[arg(long, default_value = "target", value_name = "PLACEMENT")]
-    mtp_draft_device: MtpDraftDevice,
+    speculative_draft_device: SpeculativeDraftDevice,
 
     /// Prompt text. Reads the prompt from stdin when omitted and stdin is piped.
     #[arg(value_name = "PROMPT")]
@@ -471,10 +472,10 @@ struct Cli {
 const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
     "draft_model",
     "mlx_cache_limit_bytes",
-    "mtp_draft_tokens",
-    "disable_mtp_lookahead",
-    "disable_mtp_adaptive_lookahead",
-    "mtp_draft_device",
+    "speculative_draft_tokens",
+    "disable_speculative_lookahead",
+    "disable_speculative_adaptive_lookahead",
+    "speculative_draft_device",
     "quantize",
     "quantization_mode",
     "quantization_group_size",
@@ -576,22 +577,24 @@ impl AutomaticCliOverrides {
             args.mapped_shards = original.mapped_shards;
         }
         if self.contains("draft_model") {
-            args.mtp_draft_tokens = original.mtp_draft_tokens;
-            args.disable_mtp_lookahead = original.disable_mtp_lookahead;
-            args.disable_mtp_adaptive_lookahead = original.disable_mtp_adaptive_lookahead;
-            args.mtp_draft_device = original.mtp_draft_device;
+            args.speculative_draft_tokens = original.speculative_draft_tokens;
+            args.disable_speculative_lookahead = original.disable_speculative_lookahead;
+            args.disable_speculative_adaptive_lookahead =
+                original.disable_speculative_adaptive_lookahead;
+            args.speculative_draft_device = original.speculative_draft_device;
         } else {
-            if self.contains("mtp_draft_tokens") {
-                args.mtp_draft_tokens = original.mtp_draft_tokens;
+            if self.contains("speculative_draft_tokens") {
+                args.speculative_draft_tokens = original.speculative_draft_tokens;
             }
-            if self.contains("disable_mtp_lookahead") {
-                args.disable_mtp_lookahead = original.disable_mtp_lookahead;
+            if self.contains("disable_speculative_lookahead") {
+                args.disable_speculative_lookahead = original.disable_speculative_lookahead;
             }
-            if self.contains("disable_mtp_adaptive_lookahead") {
-                args.disable_mtp_adaptive_lookahead = original.disable_mtp_adaptive_lookahead;
+            if self.contains("disable_speculative_adaptive_lookahead") {
+                args.disable_speculative_adaptive_lookahead =
+                    original.disable_speculative_adaptive_lookahead;
             }
-            if self.contains("mtp_draft_device") {
-                args.mtp_draft_device = original.mtp_draft_device;
+            if self.contains("speculative_draft_device") {
+                args.speculative_draft_device = original.speculative_draft_device;
             }
         }
     }
@@ -1831,15 +1834,15 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
         args.expert_cache_eviction = expert.eviction_policy.into();
     }
     match plan.drafting {
-        DraftingPlan::Disabled => args.mtp_draft_tokens = 0,
+        DraftingPlan::Disabled => args.speculative_draft_tokens = 0,
         DraftingPlan::Embedded {
             max_draft_tokens,
             lookahead,
             adaptive_lookahead,
         } => {
-            args.mtp_draft_tokens = max_draft_tokens;
-            args.disable_mtp_lookahead = !lookahead;
-            args.disable_mtp_adaptive_lookahead = !adaptive_lookahead;
+            args.speculative_draft_tokens = max_draft_tokens;
+            args.disable_speculative_lookahead = !lookahead;
+            args.disable_speculative_adaptive_lookahead = !adaptive_lookahead;
         }
         DraftingPlan::External { .. } => {
             bail!("single-device automatic planning cannot apply an external drafting plan")
@@ -1897,7 +1900,7 @@ fn apply_automatic_report(
     overrides.restore(args, original);
     validate_args(args)?;
     let embedded_mtp = draft_model_path.is_none()
-        && args.mtp_draft_tokens > 0
+        && args.speculative_draft_tokens > 0
         && model_advertises_embedded_mtp(model_path);
     report.plan = cli_execution_plan(args, draft_model_path, embedded_mtp)?;
     if !overrides.is_empty() {
@@ -2067,7 +2070,7 @@ fn main() -> Result<()> {
     let prompt = read_prompt(args.prompt.as_deref())?;
 
     let configured_embedded_mtp = draft_model_path.is_none()
-        && args.mtp_draft_tokens > 0
+        && args.speculative_draft_tokens > 0
         && model_advertises_embedded_mtp(&model_path);
     let execution_plan = match automatic_report.as_ref() {
         Some(report) => report.plan.clone(),
@@ -2083,7 +2086,10 @@ fn main() -> Result<()> {
         }
         if let Some(path) = &draft_model_path {
             eprintln!("draft_model: {}", path.display());
-            eprintln!("mtp_draft_device: {}", args.mtp_draft_device);
+            eprintln!(
+                "speculative_draft_device: {}",
+                args.speculative_draft_device
+            );
         }
         let mut stderr = io::stderr().lock();
         writeln!(stderr, "execution_plan:")?;
@@ -2240,7 +2246,7 @@ fn main() -> Result<()> {
     let mut output_ids = Vec::with_capacity(max_tokens);
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
-    let mut mtp_stats: Option<MtpStats> = None;
+    let mut speculative_stats: Option<SpeculativeStats> = None;
     let mut decoder = model.text_decoder(true);
     let mut streamed_text = String::new();
     let mut reasoning_stream = ReasoningStream::default();
@@ -2260,12 +2266,14 @@ fn main() -> Result<()> {
     let mut stderr = stderr.lock();
 
     let drafting_enabled = drafting.is_enabled();
-    let _component_timing_guard = args.verbose.then(LocalMtpComponentTimingGuard::enable);
-    let scheduler_options = MtpSchedulerOptions {
-        adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
-        ..MtpSchedulerOptions::default()
+    let _component_timing_guard = args
+        .verbose
+        .then(LocalSpeculativeComponentTimingGuard::enable);
+    let scheduler_options = SpeculativeSchedulerOptions {
+        adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
+        ..SpeculativeSchedulerOptions::default()
     }
-    .with_lookahead(!args.disable_mtp_lookahead);
+    .with_lookahead(!args.disable_speculative_lookahead);
     let mut prepared_finish_reason = None;
     if prepared_chat.is_some() && args.mirostat_v2 {
         bail!("Mirostat V2 is not represented by the portable prepared-chat sampling contract");
@@ -2290,13 +2298,13 @@ fn main() -> Result<()> {
         if drafting.is_enabled() {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output =
-                model.generate_prepared_chat_mtp(LocalPreparedChatMtpGenerationRequest {
+            let output = model.generate_prepared_chat_speculative(
+                LocalPreparedChatSpeculativeGenerationRequest {
                     input: LocalPreparedChatInput::rendered_prompt(prepared),
                     drafting: &mut drafting,
                     settings,
-                    options: PreparedChatMtpGenerationOptions {
-                        max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens).expect(
+                    options: PreparedChatSpeculativeGenerationOptions {
+                        max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens).expect(
                             "planned speculative execution validates non-zero draft tokens",
                         ),
                         scheduler: scheduler_options,
@@ -2324,9 +2332,10 @@ fn main() -> Result<()> {
                             }
                         }
                     },
-                })?;
+                },
+            )?;
             output_ids = output.token_ids;
-            mtp_stats = Some(output.stats);
+            speculative_stats = Some(output.stats);
             prepared_finish_reason = Some(output.finish_reason);
         } else {
             let cancellation = GenerationCancellationToken::new();
@@ -2445,10 +2454,13 @@ fn main() -> Result<()> {
             output_ids.len(),
             total_elapsed,
         )?;
-        if let Some(stats) = &mtp_stats {
-            eprintln!("mtp_execution_topology: {}", stats.execution_topology);
+        if let Some(stats) = &speculative_stats {
             eprintln!(
-                "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}, mtp_optimistic_blocks: {}, mtp_optimistic_bonus_tokens: {}, mtp_optimistic_bonus_matches: {}, mtp_optimistic_bonus_mismatches: {}, mtp_consumed_optimistic_tokens: {}, mtp_reused_optimistic_blocks: {}, mtp_reused_optimistic_tokens: {}, mtp_discarded_optimistic_blocks: {}, mtp_discarded_optimistic_tokens: {}, mtp_adaptive_lookahead_disabled: {}, mtp_cross_request_draft_opportunities: {}",
+                "speculative_execution_topology: {}",
+                stats.execution_topology
+            );
+            eprintln!(
+                "speculative_rounds: {}, speculative_draft_tokens: {}, speculative_accepted_tokens: {}, speculative_accept_rate: {:.3}, speculative_optimistic_blocks: {}, speculative_optimistic_bonus_tokens: {}, speculative_optimistic_bonus_matches: {}, speculative_optimistic_bonus_mismatches: {}, speculative_consumed_optimistic_tokens: {}, speculative_reused_optimistic_blocks: {}, speculative_reused_optimistic_tokens: {}, speculative_discarded_optimistic_blocks: {}, speculative_discarded_optimistic_tokens: {}, speculative_adaptive_lookahead_disabled: {}, speculative_cross_request_draft_opportunities: {}",
                 stats.rounds,
                 stats.draft_tokens,
                 stats.accepted_tokens,
@@ -2466,20 +2478,20 @@ fn main() -> Result<()> {
                 stats.cross_request_draft_opportunities,
             );
             eprintln!(
-                "mtp_optimistic_draft_time: {:.3} s, mtp_verification_in_flight_time: {:.3} s",
+                "speculative_optimistic_draft_time: {:.3} s, speculative_verification_in_flight_time: {:.3} s",
                 stats.optimistic_draft_time.as_secs_f64(),
                 stats.verification_in_flight_time.as_secs_f64(),
             );
             if stats.component_timings_collected {
                 eprintln!(
-                    "mtp_draft_context_time: {:.3} s, mtp_draft_assistant_time: {:.3} s, mtp_draft_head_time: {:.3} s, mtp_target_verification_time: {:.3} s",
+                    "speculative_draft_context_time: {:.3} s, speculative_draft_assistant_time: {:.3} s, speculative_draft_head_time: {:.3} s, speculative_target_verification_time: {:.3} s",
                     stats.draft_context_time.as_secs_f64(),
                     stats.draft_assistant_time.as_secs_f64(),
                     stats.draft_head_time.as_secs_f64(),
                     stats.target_verification_time.as_secs_f64(),
                 );
             }
-            eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
+            eprintln!("speculative_accept_lens: {:?}", stats.accept_lens);
         }
         eprintln!(
             "mlx_peak_memory: {}",
@@ -2588,7 +2600,9 @@ fn main() -> Result<()> {
             allocator: allocator_telemetry,
             residency,
             expert_cache,
-            mtp: mtp_stats.as_ref().map(local_mtp_telemetry),
+            speculative: speculative_stats
+                .as_ref()
+                .map(local_speculative_decoding_telemetry),
         };
         let json = serde_json::to_vec_pretty(&telemetry)
             .context("failed to serialize execution telemetry")?;
@@ -2628,24 +2642,24 @@ fn cli_execution_plan(
         ResidencyPlan::FullyResident
     };
     let drafting = if let Some(path) = draft_model {
-        let placement = match args.mtp_draft_device {
-            MtpDraftDevice::Target => DraftPlacementPlan::Target,
-            MtpDraftDevice::Device(device) => DraftPlacementPlan::Device {
+        let placement = match args.speculative_draft_device {
+            SpeculativeDraftDevice::Target => DraftPlacementPlan::Target,
+            SpeculativeDraftDevice::Device(device) => DraftPlacementPlan::Device {
                 device: device_plan(device)?,
             },
         };
         DraftingPlan::External {
             model: path.display().to_string(),
             placement,
-            max_draft_tokens: args.mtp_draft_tokens,
-            lookahead: !args.disable_mtp_lookahead,
-            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+            max_draft_tokens: args.speculative_draft_tokens,
+            lookahead: !args.disable_speculative_lookahead,
+            adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
         }
     } else if embedded_mtp {
         DraftingPlan::Embedded {
-            max_draft_tokens: args.mtp_draft_tokens,
-            lookahead: !args.disable_mtp_lookahead,
-            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+            max_draft_tokens: args.speculative_draft_tokens,
+            lookahead: !args.disable_speculative_lookahead,
+            adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
         }
     } else {
         DraftingPlan::Disabled
@@ -2734,16 +2748,17 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.auto_benchmark_timeout_seconds == 0 {
         bail!("--auto-benchmark-timeout-seconds must be greater than zero");
     }
-    if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
-        bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
+    if args.draft_model.is_some() && args.speculative_draft_tokens == 0 {
+        bail!("--speculative-draft-tokens must be greater than zero when --draft-model is used");
     }
     if args.raw && args.draft_model.is_some() {
         bail!("--draft-model requires prepared-chat generation and cannot be used with --raw");
     }
-    if args.mtp_draft_device != MtpDraftDevice::Target && args.draft_model.is_none() {
+    if args.speculative_draft_device != SpeculativeDraftDevice::Target && args.draft_model.is_none()
+    {
         bail!(
-            "--mtp-draft-device {} requires an external --draft-model",
-            args.mtp_draft_device,
+            "--speculative-draft-device {} requires an external --draft-model",
+            args.speculative_draft_device,
         );
     }
     if args
@@ -2941,7 +2956,7 @@ fn resolve_model(
                 select_revision(&repo.revisions, requested_revision).with_context(|| {
                     format!("could not select a cached revision for Hugging Face model {repo_id:?}")
                 })?;
-            let path = if gguf_role == CachedGgufRole::MtpDraft
+            let path = if gguf_role == CachedGgufRole::SpeculativeDraft
                 && !revision.files.iter().any(|file| {
                     file.file_path
                         .extension()
@@ -2985,7 +3000,7 @@ fn resolve_model_pair(
         Some(resolve_model(
             draft_spec,
             requested_revision,
-            CachedGgufRole::MtpDraft,
+            CachedGgufRole::SpeculativeDraft,
         )?),
     ))
 }
@@ -3094,7 +3109,7 @@ enum QuantizationMatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CachedGgufRole {
     Target,
-    MtpDraft,
+    SpeculativeDraft,
 }
 
 fn select_cached_gguf(
@@ -3188,8 +3203,12 @@ fn select_cached_gguf_pair_from_revisions<'a>(
     ordered.into_iter().find_map(|revision| {
         let target =
             select_cached_gguf(revision, target_quantization, CachedGgufRole::Target).ok()?;
-        let draft =
-            select_cached_gguf(revision, draft_quantization, CachedGgufRole::MtpDraft).ok()?;
+        let draft = select_cached_gguf(
+            revision,
+            draft_quantization,
+            CachedGgufRole::SpeculativeDraft,
+        )
+        .ok()?;
         Some((revision, target, draft))
     })
 }
@@ -3274,7 +3293,7 @@ fn gguf_role_matches(stem: &str, role: CachedGgufRole) -> bool {
         || stem.starts_with("dflash_");
     match role {
         CachedGgufRole::Target => !mtp_sidecar && !stem.starts_with("mmproj-"),
-        CachedGgufRole::MtpDraft => mtp_sidecar,
+        CachedGgufRole::SpeculativeDraft => mtp_sidecar,
     }
 }
 
@@ -3359,10 +3378,10 @@ mod tests {
         should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
         validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
         write_timing_report, AutoMode, AutoPlanCacheKey, AutomaticCliOverrides, CachedGgufRole,
-        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, MtpDraftDevice,
-        MtpSchedulerOptions, NativeToolSupport, QuantizationRequest, ReasoningOutput,
-        ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
-        WeightTransformationPlan,
+        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, NativeToolSupport,
+        QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel,
+        SemanticEvent, SemanticSupport, SpeculativeDraftDevice, SpeculativeSchedulerOptions,
+        StopReason, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -3586,8 +3605,8 @@ mod tests {
         assert!(args.expert_cache);
         assert_eq!(args.device_budget_bytes, Some(1 << 30));
         assert_eq!(args.expert_cache_device_budget_bytes, Some(256 << 20));
-        assert_eq!(args.mtp_draft_tokens, 3);
-        assert!(!args.disable_mtp_lookahead);
+        assert_eq!(args.speculative_draft_tokens, 3);
+        assert!(!args.disable_speculative_lookahead);
         assert!(matches!(
             plan.residency,
             ResidencyPlan::LayerwiseHost { .. }
@@ -4130,16 +4149,16 @@ mod tests {
         assert!("gpu:one".parse::<CliDevice>().is_err());
 
         assert_eq!(
-            "target".parse::<MtpDraftDevice>().unwrap(),
-            MtpDraftDevice::Target
+            "target".parse::<SpeculativeDraftDevice>().unwrap(),
+            SpeculativeDraftDevice::Target
         );
         assert_eq!(
-            "cpu".parse::<MtpDraftDevice>().unwrap(),
-            MtpDraftDevice::Device(CliDevice::Cpu)
+            "cpu".parse::<SpeculativeDraftDevice>().unwrap(),
+            SpeculativeDraftDevice::Device(CliDevice::Cpu)
         );
         assert_eq!(
-            "gpu:3".parse::<MtpDraftDevice>().unwrap(),
-            MtpDraftDevice::Device(CliDevice::Gpu(3))
+            "gpu:3".parse::<SpeculativeDraftDevice>().unwrap(),
+            SpeculativeDraftDevice::Device(CliDevice::Gpu(3))
         );
 
         let defaults = Cli::try_parse_from(["eredu", "--model", "model-id", "prompt"]).unwrap();
@@ -4153,7 +4172,10 @@ mod tests {
         };
         assert_eq!(defaults.device, expected_default);
         assert!(device_plan(defaults.device).is_ok());
-        assert_eq!(defaults.mtp_draft_device, MtpDraftDevice::Target);
+        assert_eq!(
+            defaults.speculative_draft_device,
+            SpeculativeDraftDevice::Target
+        );
 
         let cpu_target =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--device", "cpu", "prompt"])
@@ -4163,13 +4185,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_mtp_draft_devices_require_external_drafter() {
+    fn explicit_speculative_draft_devices_require_external_drafter() {
         for device in ["cpu", "gpu:0", "gpu:3"] {
             let without_drafter = Cli::try_parse_from([
                 "eredu",
                 "--model",
                 "model-id",
-                "--mtp-draft-device",
+                "--speculative-draft-device",
                 device,
                 "prompt",
             ])
@@ -4185,7 +4207,7 @@ mod tests {
                 "model-id",
                 "--draft-model",
                 "draft-id",
-                "--mtp-draft-device",
+                "--speculative-draft-device",
                 device,
                 "prompt",
             ])
@@ -4195,27 +4217,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_mtp_lookahead_controls() {
+    fn parses_speculative_lookahead_controls() {
         let args = Cli::try_parse_from([
             "eredu",
             "--model",
             "model-id",
             "--draft-model",
             "draft-id",
-            "--disable-mtp-lookahead",
-            "--disable-mtp-adaptive-lookahead",
+            "--disable-speculative-lookahead",
+            "--disable-speculative-adaptive-lookahead",
             "--verbose",
             "prompt",
         ])
         .unwrap();
 
-        assert!(args.disable_mtp_lookahead);
-        assert!(args.disable_mtp_adaptive_lookahead);
-        let options = MtpSchedulerOptions {
-            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
-            ..MtpSchedulerOptions::default()
+        assert!(args.disable_speculative_lookahead);
+        assert!(args.disable_speculative_adaptive_lookahead);
+        let options = SpeculativeSchedulerOptions {
+            adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
+            ..SpeculativeSchedulerOptions::default()
         }
-        .with_lookahead(!args.disable_mtp_lookahead);
+        .with_lookahead(!args.disable_speculative_lookahead);
         assert_eq!(options.lookahead_blocks, 0);
         assert!(!options.adaptive_lookahead);
     }
@@ -4385,7 +4407,7 @@ mod tests {
             target
         );
         assert_eq!(
-            select_cached_gguf_path(&files, "Q8_0", CachedGgufRole::MtpDraft).unwrap(),
+            select_cached_gguf_path(&files, "Q8_0", CachedGgufRole::SpeculativeDraft).unwrap(),
             draft
         );
     }
@@ -4400,7 +4422,7 @@ mod tests {
         ];
 
         assert_eq!(
-            select_unique_cached_gguf(&revision, CachedGgufRole::MtpDraft).unwrap(),
+            select_unique_cached_gguf(&revision, CachedGgufRole::SpeculativeDraft).unwrap(),
             Some(Path::new("main/dflash-kquant.gguf").into())
         );
         assert_eq!(
@@ -4411,7 +4433,7 @@ mod tests {
                     .map(|file| file.file_path.as_path())
                     .collect::<Vec<_>>(),
                 "dflash-kquant",
-                CachedGgufRole::MtpDraft,
+                CachedGgufRole::SpeculativeDraft,
             )
             .unwrap(),
             Path::new("main/dflash-kquant.gguf")
@@ -4426,7 +4448,7 @@ mod tests {
             cached_file("main/dflash-Q8_0.gguf", "blobs/q8"),
         ];
 
-        let error = select_unique_cached_gguf(&revision, CachedGgufRole::MtpDraft)
+        let error = select_unique_cached_gguf(&revision, CachedGgufRole::SpeculativeDraft)
             .unwrap_err()
             .to_string();
         assert!(error.contains("multiple draft GGUF files"));
@@ -4453,8 +4475,13 @@ mod tests {
             Path::new("target/model-UD-Q4_K_M.gguf")
         );
         assert_eq!(
-            select_cached_gguf_from_revisions(&revisions, None, "Q8_0", CachedGgufRole::MtpDraft,)
-                .unwrap(),
+            select_cached_gguf_from_revisions(
+                &revisions,
+                None,
+                "Q8_0",
+                CachedGgufRole::SpeculativeDraft,
+            )
+            .unwrap(),
             Path::new("assistant/MTP/mtp-assistant-Q8_0.gguf")
         );
     }

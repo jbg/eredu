@@ -477,7 +477,7 @@ fn ordinary_auto_activation_masks_and_commits_a_token_past_the_trigger() {
 }
 
 #[test]
-fn canonical_mtp_history_activates_inside_a_prefixed_token() {
+fn canonical_speculative_history_activates_inside_a_prefixed_token() {
     let plan = boundary_plan();
     let vocab_size = SYNTHETIC_VOCAB_SIZE + BOUNDARY_TOKENS.len();
     let mut values = vec![-100.0f32; vocab_size];
@@ -498,7 +498,7 @@ fn canonical_mtp_history_activates_inside_a_prefixed_token() {
 }
 
 #[test]
-fn optimistic_mtp_fork_validates_trigger_and_argument_bytes_in_one_token() {
+fn optimistic_speculative_fork_validates_trigger_and_argument_bytes_in_one_token() {
     let plan = boundary_plan();
     let vocab_size = SYNTHETIC_VOCAB_SIZE + BOUNDARY_TOKENS.len();
     let mut values = vec![-100.0f32; vocab_size];

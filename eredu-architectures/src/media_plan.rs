@@ -2290,8 +2290,8 @@ mod tests {
         assert_eq!(
             crate::capability::gemma4(&args)
                 .unwrap()
-                .mtp_checkpoint_kind(),
-            Some(eredu_core::MtpCheckpointKind::Separate)
+                .speculative_draft_source(),
+            Some(eredu_core::SpeculativeDraftSource::Separate)
         );
 
         let projected = TestInputPart {
@@ -2415,15 +2415,15 @@ mod tests {
         assert_eq!(
             crate::capability::qwen_hybrid(&args)
                 .unwrap()
-                .mtp_checkpoint_kind(),
+                .speculative_draft_source(),
             None
         );
         args.text.mtp_num_hidden_layers = 2;
         assert_eq!(
             crate::capability::qwen_hybrid(&args)
                 .unwrap()
-                .mtp_checkpoint_kind(),
-            Some(eredu_core::MtpCheckpointKind::Embedded)
+                .speculative_draft_source(),
+            Some(eredu_core::SpeculativeDraftSource::Embedded)
         );
     }
 

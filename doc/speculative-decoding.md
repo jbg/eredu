@@ -1,13 +1,17 @@
 # Speculative decoding and multi-token prediction
 
-`eredu` supports lossless multi-token prediction (MTP) with either an
-external assistant model or prediction heads embedded in the target
-checkpoint. The target model always verifies proposals; accepted output has the
-same target distribution as the corresponding non-speculative path.
+`eredu` supports lossless speculative decoding with either an external
+assistant model or multi-token-prediction (MTP) heads embedded in the target
+checkpoint. The target model always verifies proposals; accepted output has
+the same target distribution as the corresponding non-speculative path.
 
 Prepared chat, native tools, sampling penalties, stochastic acceptance,
 cancellation, and semantic events use the same generation pipeline with or
-without MTP.
+without speculative decoding.
+
+The shared public execution API uses `Speculative*` terminology. `Mtp*` is
+reserved for architecture and checkpoint concepts that specifically represent
+embedded prediction heads.
 
 ## Assistants
 
@@ -26,8 +30,8 @@ its metadata may describe omitted companion prediction weights but does not
 advertise an embedded-draft capability. The usable proposal depth is capped by
 the checkpoint's validated capability.
 
-Applications should query `mtp_capability` or run model inspection instead of
-assuming support from a family name.
+Applications should query `speculative_capability` or run model inspection
+instead of assuming support from a family name.
 
 Embedded and external assistants use one neutral scheduling path. Each model
 form provides a `SpeculativeExecutor`; MLX prepares concrete executors, caches,
@@ -41,14 +45,14 @@ parallel set of generation wrappers.
 The prepared-chat client surface is backend-generic. A backend implements
 `SpeculativeGenerationBackend`, supplies its own associated drafter type and
 typed execution-resource visitor handoff, and then uses the same
-`LoadedModel<B>::generate_prepared_chat_mtp` and batch APIs.
+`LoadedModel<B>::generate_prepared_chat_speculative` and batch APIs.
 Applications using the selected backend instead receive an opaque
 `LocalDrafting` alongside `LocalModel` and call
-`LocalModel::generate_prepared_chat_mtp`; neither the native drafter nor its
-error type crosses the facade.
-`MtpCapability` and `MtpCheckpointKind` are portable core values; absence of the
-capability implementation fails at the type boundary rather than silently
-falling back to ordinary generation.
+`LocalModel::generate_prepared_chat_speculative`; neither the native drafter
+nor its error type crosses the facade. `SpeculativeCapability` and
+`SpeculativeDraftSource` are portable core values; absence of the capability
+implementation fails at the type boundary rather than silently falling back to
+ordinary generation.
 
 ## Execution placement
 
@@ -111,10 +115,10 @@ not use same-request optimistic lookahead. Mirostat V2 remains available only
 on the explicit low-level MLX sampling API; it is not part of the portable
 prepared-chat sampling schema.
 
-`MtpSchedulerOptions::with_lookahead(false)` disables only the optional branch;
-the same drafting, verification, acceptance, cache commit, callback, and
-statistics pipeline remains in use. This is the reference setting for output
-equivalence and performance comparisons.
+`SpeculativeSchedulerOptions::with_lookahead(false)` disables only the optional
+branch; the same drafting, verification, acceptance, cache commit, callback,
+and statistics pipeline remains in use. This is the reference setting for
+output equivalence and performance comparisons.
 
 By default, per-request lookahead can disable itself after enough resolved
 branches when no proposals are reused or discarded proposals outnumber reused
@@ -134,10 +138,10 @@ remaining branch event.
 
 ## Diagnostics
 
-MTP reports proposal and acceptance counts plus optional work that was drafted,
-consumed as a target bonus, reused, or discarded. It also reports bonus
-matches/mismatches, adaptive disablement, and time spent drafting or waiting for
-verification.
+Speculative decoding reports proposal and acceptance counts plus optional work
+that was drafted, consumed as a target bonus, reused, or discarded. It also
+reports bonus matches/mismatches, adaptive disablement, and time spent drafting
+or waiting for verification.
 
 These timings are diagnostic. In particular, time inside the in-flight
 verification interval can include host scheduling of assistant work and should

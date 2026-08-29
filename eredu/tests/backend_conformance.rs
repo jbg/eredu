@@ -19,8 +19,9 @@ use eredu::{
         ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, Media,
         ModelChatTemplate, MultimodalRequest, MultimodalSegment, PreparedChat, PreparedChatError,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpError,
-        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, RgbImage,
+        PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
+        PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationOptions,
+        PreparedChatSpeculativeGenerationRequest, RgbImage,
     },
     AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
     AutomaticPlanningError, BackendDescriptor, BackendId, CacheStateStrategy, CapabilityError,
@@ -28,11 +29,12 @@ use eredu::{
     DraftingPlan, EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides,
     HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
     InputModalities, InputTokenCount, ModelCapabilities, ModelKind, ModelResourceProfile,
-    MtpCapability, MtpCheckpointKind, ObservationSet, ObservationValue, Observed, ParallelAxis,
-    ParallelTopology, PhysicalMemorySemantics, RealtimeFrameConvention, RealtimeSampling,
-    RealtimeSpeechConfig, ResidencyPlan, RuntimeStateEstimate, SemanticEvent, SessionCapabilities,
-    SpeculativeDraft, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
-    StaticMemoryReport, TextGenerationConfig, TokenFilter, TokenOutput, AUTOMATIC_SCHEMA_VERSION,
+    ObservationSet, ObservationValue, Observed, ParallelAxis, ParallelTopology,
+    PhysicalMemorySemantics, RealtimeFrameConvention, RealtimeSampling, RealtimeSpeechConfig,
+    ResidencyPlan, RuntimeStateEstimate, SemanticEvent, SessionCapabilities, SpeculativeCapability,
+    SpeculativeDraft, SpeculativeDraftSource, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationOutput, StaticMemoryReport, TextGenerationConfig, TokenFilter,
+    TokenOutput, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::{
     checkpoint::TensorDtype,
@@ -857,9 +859,9 @@ impl SpeculativeSampling for MockSpeculativeSampling {
 impl SpeculativeGenerationBackend for MockBackend {
     type Drafter = MockDrafter;
 
-    fn mtp_capability(_: &ModelRuntime<Self>) -> MtpCapability {
-        MtpCapability::Ready {
-            checkpoint: MtpCheckpointKind::Embedded,
+    fn speculative_capability(_: &ModelRuntime<Self>) -> SpeculativeCapability {
+        SpeculativeCapability::Ready {
+            draft_source: SpeculativeDraftSource::Embedded,
         }
     }
 
@@ -1079,12 +1081,12 @@ fn speculative_client_code<B: SpeculativeGenerationBackend>(
     prepared: &PreparedChat,
 ) -> (SpeculativeGenerationOutput, Vec<SemanticEvent>) {
     assert!(matches!(
-        model.mtp_capability(),
-        MtpCapability::Ready { .. }
+        model.speculative_capability(),
+        SpeculativeCapability::Ready { .. }
     ));
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
+        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
             input: PreparedChatInput::rendered_prompt(prepared),
             drafting: SpeculativeDraft::Embedded,
             settings: PreparedChatGenerationSettings {
@@ -1094,7 +1096,7 @@ fn speculative_client_code<B: SpeculativeGenerationBackend>(
                 },
                 ..Default::default()
             },
-            options: PreparedChatMtpGenerationOptions::default(),
+            options: PreparedChatSpeculativeGenerationOptions::default(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |event| events.push(event),
@@ -1109,9 +1111,9 @@ fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
 ) -> (SpeculativeGenerationBatchOutput, Vec<SemanticEvent>) {
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
+        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
             drafting: SpeculativeDraft::Embedded,
-            lanes: vec![PreparedChatMtpBatchLane {
+            lanes: vec![PreparedChatSpeculativeBatchLane {
                 input: PreparedChatInput::rendered_prompt(prepared),
                 settings: PreparedChatGenerationSettings {
                     overrides: GenerationConfigOverrides {
@@ -1139,27 +1141,28 @@ fn assert_single_lane_speculative_cardinality_is_validated(
         (vec![NO_SPECULATIVE_RESULTS_PROMPT_TOKEN], 0),
         (vec![MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN], 2),
     ] {
-        let result = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-            input: PreparedChatInput::prepared_backend_input(prepared, prompt),
-            drafting: SpeculativeDraft::Embedded,
-            settings: PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    max_new_tokens: Some(2),
+        let result =
+            model.generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                input: PreparedChatInput::prepared_backend_input(prepared, prompt),
+                drafting: SpeculativeDraft::Embedded,
+                settings: PreparedChatGenerationSettings {
+                    overrides: GenerationConfigOverrides {
+                        max_new_tokens: Some(2),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-            options: PreparedChatMtpGenerationOptions::default(),
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
-        });
+                options: PreparedChatSpeculativeGenerationOptions::default(),
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
+            });
         let Err(error) = result else {
             panic!("malformed backend cardinality must be rejected");
         };
         assert!(matches!(
             error,
-            PreparedChatMtpError::OutputCardinality {
+            PreparedChatSpeculativeError::OutputCardinality {
                 expected: 1,
                 actual: observed,
             } if observed == actual

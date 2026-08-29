@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use crate::rotary::RopeValue;
 use eredu_core::{
     CacheStateStrategy, CapabilityError, EstimationCompleteness, InputModalities,
-    ModelCapabilities, MtpCheckpointKind, ObservationKind, Observed, SlidingWindowLayerCount,
+    ModelCapabilities, ObservationKind, Observed, SlidingWindowLayerCount, SpeculativeDraftSource,
     StateMemoryLayout,
 };
 use eredu_runtime::StateLayout as RuntimeStateLayout;
@@ -750,7 +750,7 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
 pub struct CapabilityEstimate {
     capabilities: ModelCapabilities,
     state_layout: StateMemoryLayout,
-    mtp_checkpoint: Option<MtpCheckpointKind>,
+    draft_source: Option<SpeculativeDraftSource>,
 }
 
 impl CapabilityEstimate {
@@ -766,11 +766,11 @@ impl CapabilityEstimate {
 
     /// Architecture-declared checkpoint form for executable draft weights.
     ///
-    /// `None` means that this exact normalized configuration exposes no MTP
-    /// graph. Concrete backends decide whether they implement the declared
-    /// graph; they do not infer family policy themselves.
-    pub const fn mtp_checkpoint_kind(&self) -> Option<MtpCheckpointKind> {
-        self.mtp_checkpoint
+    /// `None` means that this exact normalized configuration exposes no
+    /// speculative drafting graph. Concrete backends decide whether they
+    /// implement the declared graph; they do not infer family policy themselves.
+    pub const fn speculative_draft_source(&self) -> Option<SpeculativeDraftSource> {
+        self.draft_source
     }
 
     /// Splits the estimate into its portable capability and state values.
@@ -797,20 +797,20 @@ fn finish(model_type: String, spec: Spec) -> CapabilityEstimate {
             estimation,
         },
         state_layout,
-        mtp_checkpoint: None,
+        draft_source: None,
     }
 }
 
-fn with_mtp_checkpoint(
+fn with_speculative_draft_source(
     mut estimate: CapabilityEstimate,
-    checkpoint: Option<MtpCheckpointKind>,
+    draft_source: Option<SpeculativeDraftSource>,
 ) -> CapabilityEstimate {
-    estimate.mtp_checkpoint = checkpoint;
+    estimate.draft_source = draft_source;
     estimate
 }
 
-fn embedded_mtp_checkpoint(layers: i32) -> Option<MtpCheckpointKind> {
-    (layers > 0).then_some(MtpCheckpointKind::Embedded)
+fn embedded_mtp_draft_source(layers: i32) -> Option<SpeculativeDraftSource> {
+    (layers > 0).then_some(SpeculativeDraftSource::Embedded)
 }
 
 /// Derives Llama/Mistral capabilities from normalized architecture policy.
@@ -839,25 +839,25 @@ pub fn qwen_vl(args: &crate::qwen::vl::ModelArgs) -> Result<CapabilityEstimate, 
 pub fn muse_glimmer(
     args: &crate::muse_glimmer::DecoderConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(args.model_type.clone(), muse_glimmer_spec(args)?),
-        Some(MtpCheckpointKind::Separate),
+        Some(SpeculativeDraftSource::Separate),
     ))
 }
 
 /// Derives DeepSeek-V3 capabilities from normalized architecture policy.
 pub fn deepseek_v3(args: &crate::deepseek::V3Args) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(args.model_type.clone(), neutral_deepseek_v3_spec(args)?),
-        embedded_mtp_checkpoint(args.num_nextn_predict_layers),
+        embedded_mtp_draft_source(args.num_nextn_predict_layers),
     ))
 }
 
 /// Derives DeepSeek-V4 capabilities from normalized architecture policy.
 pub fn deepseek_v4(args: &crate::deepseek::V4Args) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(args.model_type.clone(), neutral_deepseek_v4_spec(args)?),
-        embedded_mtp_checkpoint(args.num_nextn_predict_layers),
+        embedded_mtp_draft_source(args.num_nextn_predict_layers),
     ))
 }
 
@@ -875,12 +875,12 @@ pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, C
 
 /// Derives Gemma 4 capabilities from its complete normalized family policy.
 pub fn gemma4(args: &crate::gemma4::FamilyConfig) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(
             args.model_type.clone(),
             gemma4_spec(&args.text, args.input_modalities())?,
         ),
-        Some(MtpCheckpointKind::Separate),
+        Some(SpeculativeDraftSource::Separate),
     ))
 }
 
@@ -890,9 +890,9 @@ pub fn inkling(args: &crate::inkling::ModelArgs) -> Result<CapabilityEstimate, C
         .mtp_config
         .as_ref()
         .map_or(0, |mtp| mtp.num_nextn_predict_layers);
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(args.model_type.clone(), inkling_spec(args)?),
-        embedded_mtp_checkpoint(layers),
+        embedded_mtp_draft_source(layers),
     ))
 }
 
@@ -905,9 +905,9 @@ pub fn lfm2(args: &crate::lfm2::ModelArgs) -> Result<CapabilityEstimate, Capabil
 pub fn nemotron_h(
     args: &crate::nemotron_h::ModelArgs,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(args.model_type.clone(), nemotron_spec(args)?),
-        embedded_mtp_checkpoint(args.num_nextn_predict_layers),
+        embedded_mtp_draft_source(args.num_nextn_predict_layers),
     ))
 }
 
@@ -915,12 +915,12 @@ pub fn nemotron_h(
 pub fn qwen_hybrid(
     args: &crate::qwen::hybrid::ParsedHybridConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(
             args.text.model_type.clone(),
             qwen_hybrid_spec(&args.text, args.vision.is_some())?,
         ),
-        embedded_mtp_checkpoint(args.text.mtp_num_hidden_layers),
+        embedded_mtp_draft_source(args.text.mtp_num_hidden_layers),
     ))
 }
 
@@ -928,9 +928,9 @@ pub fn qwen_hybrid(
 pub fn qwen_hybrid_text(
     args: &crate::qwen::hybrid::HybridConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_mtp_checkpoint(
+    Ok(with_speculative_draft_source(
         finish(args.model_type.clone(), qwen_hybrid_spec(args, false)?),
-        embedded_mtp_checkpoint(args.mtp_num_hidden_layers),
+        embedded_mtp_draft_source(args.mtp_num_hidden_layers),
     ))
 }
 

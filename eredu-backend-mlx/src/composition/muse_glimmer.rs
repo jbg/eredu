@@ -342,7 +342,7 @@ pub fn load_dflash_gguf(
     Ok(MuseGlimmerDFlashModel { config, module })
 }
 
-pub struct MuseGlimmerMtpOutput {
+pub struct MuseGlimmerSpeculativeOutput {
     pub logits: crate::MlxTensor,
     pub target_states: Vec<crate::MlxTensor>,
 }
@@ -721,7 +721,7 @@ impl MuseGlimmerModel {
         state: &mut MlxKeyValueState,
         target_layers: &[usize],
         stream: &Stream,
-    ) -> Result<MuseGlimmerMtpOutput, Error> {
+    ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
         if matches!(
             self.execution,
             Execution::ParallelResident(_) | Execution::ParallelBounded(_)
@@ -824,7 +824,7 @@ impl MuseGlimmerModel {
                 .transpose()
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?
                 .unwrap_or_default();
-            return Ok(MuseGlimmerMtpOutput {
+            return Ok(MuseGlimmerSpeculativeOutput {
                 logits,
                 target_states,
             });
@@ -884,7 +884,7 @@ impl MuseGlimmerModel {
             .transpose()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?
             .unwrap_or_default();
-        Ok(MuseGlimmerMtpOutput {
+        Ok(MuseGlimmerSpeculativeOutput {
             logits: result.0,
             target_states,
         })
@@ -1432,7 +1432,7 @@ impl MuseGlimmerModel {
         state: &mut MlxKeyValueState,
         target_layers: &[usize],
         stream: &Stream,
-    ) -> Result<MuseGlimmerMtpOutput, Error> {
+    ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
         let parts = [DecoderInputPart::Text(tokens)];
         self.forward_with_taps(
             ModelInput {
@@ -1462,7 +1462,7 @@ impl MuseGlimmerModel {
         state: &mut MlxKeyValueState,
         target_layers: &[usize],
         stream: &Stream,
-    ) -> Result<MuseGlimmerMtpOutput, Error> {
+    ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
         let parts = prepared
             .tokens

@@ -3,27 +3,27 @@
 use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
 #[cfg(test)]
-use eredu_core::generation::MtpRequestPhase;
+use eredu_core::generation::SpeculativeRequestPhase;
 #[cfg(test)]
 use eredu_core::{
     resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
     SpeculativeOptimisticBranch, SpeculativeProposal,
 };
 #[cfg(test)]
-use eredu_core::{MtpSchedulerStats, SpeculativeRequestTable};
-use eredu_core::{MtpStats, SpeculativeExecutor, SpeculativeTelemetry};
-#[cfg(test)]
 use eredu_core::{
     SpeculativeCallbackPublisher, SpeculativeDriverError, SpeculativeOutputError,
     SpeculativeOutputRuntime, SpeculativeSampling, SpeculativeSemanticConstraint,
     SpeculativeSemanticState,
 };
+use eredu_core::{SpeculativeExecutor, SpeculativeStats, SpeculativeTelemetry};
+#[cfg(test)]
+use eredu_core::{SpeculativeRequestTable, SpeculativeSchedulerStats};
 use safemlx::{error::Exception, Array};
 #[cfg(test)]
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
 
 use crate::composition::mlx::{
-    speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+    speculative::{MlxSpeculativeCompletion, SpeculativeExecutionStreams},
     MlxModelInput,
 };
 #[cfg(test)]
@@ -34,15 +34,15 @@ use crate::{
 };
 #[cfg(test)]
 use eredu_core::generation::{
-    FinishReason, GenerationCancellationToken, GenerationSequence, MtpConfig, MtpSchedulerOptions,
-    SemanticEvent,
+    FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
+    SpeculativeConfig, SpeculativeSchedulerOptions,
 };
 #[cfg(test)]
-use eredu_core::{generation::MtpRequestId, InputModality};
+use eredu_core::{generation::SpeculativeRequestId, InputModality};
 
-/// Component timings accumulated by an architecture-specific MTP backend.
+/// Component timings accumulated by an architecture-specific speculative backend.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct MtpComponentTimings {
+pub struct SpeculativeComponentTimings {
     /// Committed-context encoding and assistant K/V projection.
     pub draft_context: Duration,
     /// Assistant proposal-block execution.
@@ -57,18 +57,18 @@ thread_local! {
     static COMPONENT_TIMING_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Scoped opt-in for device-timeline MTP component profiling.
+/// Scoped opt-in for device-timeline speculative component profiling.
 ///
 /// Schedulers created while this guard is alive collect architecture-level
 /// timings. Timestamp boundaries add profiling overhead, so normal generation
 /// leaves them disabled. The guard is intentionally bound to its creating
 /// thread and restores the previous setting when dropped.
-pub struct MtpComponentTimingGuard {
+pub struct SpeculativeComponentTimingGuard {
     previous: bool,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-impl MtpComponentTimingGuard {
+impl SpeculativeComponentTimingGuard {
     /// Enables component profiling for schedulers created on this thread.
     pub fn enable() -> Self {
         let previous = COMPONENT_TIMING_ENABLED.replace(true);
@@ -79,7 +79,7 @@ impl MtpComponentTimingGuard {
     }
 }
 
-impl Drop for MtpComponentTimingGuard {
+impl Drop for SpeculativeComponentTimingGuard {
     fn drop(&mut self) {
         COMPONENT_TIMING_ENABLED.set(self.previous);
     }
@@ -89,8 +89,8 @@ pub(crate) fn component_timing_enabled() -> bool {
     COMPONENT_TIMING_ENABLED.get()
 }
 
-impl MtpComponentTimings {
-    fn add_to(self, stats: &mut MtpStats) {
+impl SpeculativeComponentTimings {
+    fn add_to(self, stats: &mut SpeculativeStats) {
         stats.draft_context_time += self.draft_context;
         stats.draft_assistant_time += self.draft_assistant;
         stats.draft_head_time += self.draft_head;
@@ -98,8 +98,8 @@ impl MtpComponentTimings {
     }
 }
 
-impl SpeculativeTelemetry for MtpComponentTimings {
-    fn record(self, stats: &mut MtpStats) {
+impl SpeculativeTelemetry for SpeculativeComponentTimings {
+    fn record(self, stats: &mut SpeculativeStats) {
         self.add_to(stats);
     }
 }
@@ -112,9 +112,9 @@ pub trait MlxSpeculativeRuntime<'a>:
     SpeculativeExecutor<
         Input = MlxModelInput,
         Logits = Array,
-        Context<'a> = MtpExecutionStreams<'a>,
+        Context<'a> = SpeculativeExecutionStreams<'a>,
         Completion = MlxSpeculativeCompletion,
-        Telemetry = MtpComponentTimings,
+        Telemetry = SpeculativeComponentTimings,
         Error = Exception,
     > + 'a
 {
@@ -124,9 +124,9 @@ impl<'a, T> MlxSpeculativeRuntime<'a> for T where
     T: SpeculativeExecutor<
             Input = MlxModelInput,
             Logits = Array,
-            Context<'a> = MtpExecutionStreams<'a>,
+            Context<'a> = SpeculativeExecutionStreams<'a>,
             Completion = MlxSpeculativeCompletion,
-            Telemetry = MtpComponentTimings,
+            Telemetry = SpeculativeComponentTimings,
             Error = Exception,
         > + 'a
 {
@@ -142,7 +142,7 @@ type CommittedOutputRuntime<'a, S> = SpeculativeOutputRuntime<
 #[cfg(test)]
 fn plain_runtime<'a, S, F>(
     sampler: S,
-    config: &MtpConfig,
+    config: &SpeculativeConfig,
     mut on_token: F,
 ) -> CommittedOutputRuntime<'a, S>
 where
@@ -163,7 +163,7 @@ where
 #[cfg(test)]
 fn semantic_runtime<'a, S, F>(
     sampler: S,
-    config: &MtpConfig,
+    config: &SpeculativeConfig,
     semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: F,
@@ -191,9 +191,9 @@ type MlxRequestTable<'a, B, S> = SpeculativeRequestTable<
 >;
 
 #[cfg(test)]
-pub struct MtpRequestOutput<S> {
+pub struct SpeculativeRequestOutput<S> {
     pub token_ids: Vec<u32>,
-    pub stats: MtpStats,
+    pub stats: SpeculativeStats,
     pub sampler: S,
     pub finish_reason: Option<FinishReason>,
     #[cfg(test)]
@@ -201,12 +201,12 @@ pub struct MtpRequestOutput<S> {
 }
 
 #[cfg(test)]
-pub struct MtpScheduleOutput<S> {
-    pub requests: Vec<MtpRequestOutput<S>>,
-    pub scheduler: MtpSchedulerStats,
+pub struct SpeculativeScheduleOutput<S> {
+    pub requests: Vec<SpeculativeRequestOutput<S>>,
+    pub scheduler: SpeculativeSchedulerStats,
 }
 
-/// Test harness for exercising the neutral fair MTP request table with MLX values.
+/// Test harness for exercising the neutral fair speculative request table with MLX values.
 ///
 /// MLX streams already provide asynchronous device queues. The scheduler stays
 /// deliberately single-threaded: it submits lazy target graphs, performs CPU
@@ -214,19 +214,19 @@ pub struct MtpScheduleOutput<S> {
 /// Model parameters are shared through the backend; every request owns its
 /// cache, target state, sampler, PRNG substreams, output, and statistics.
 #[cfg(test)]
-struct MlxMtpScheduler<'a, B, S>
+struct MlxSpeculativeScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
 {
     backend: &'a mut B,
-    streams: MtpExecutionStreams<'a>,
+    streams: SpeculativeExecutionStreams<'a>,
     component_timing: bool,
     requests: MlxRequestTable<'a, B, S>,
 }
 
 #[cfg(test)]
-impl<'a, B, S> MlxMtpScheduler<'a, B, S>
+impl<'a, B, S> MlxSpeculativeScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
@@ -234,8 +234,8 @@ where
     /// Creates a scheduler over shared model parameters and explicit streams.
     pub fn new(
         backend: &'a mut B,
-        streams: MtpExecutionStreams<'a>,
-        options: MtpSchedulerOptions,
+        streams: SpeculativeExecutionStreams<'a>,
+        options: SpeculativeSchedulerOptions,
     ) -> Result<Self, Exception> {
         let requests = SpeculativeRequestTable::new(options, streams.topology())
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -255,11 +255,11 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: MtpConfig,
+        config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
         on_token: F,
-    ) -> Result<MtpRequestId, Exception>
+    ) -> Result<SpeculativeRequestId, Exception>
     where
         F: FnMut(u32) -> Result<(), Exception> + 'a,
     {
@@ -274,12 +274,12 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: MtpConfig,
+        config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
         semantic: Box<dyn SpeculativeSemanticState>,
         on_event: F,
-    ) -> Result<MtpRequestId, Exception>
+    ) -> Result<SpeculativeRequestId, Exception>
     where
         F: FnMut(SemanticEvent) + 'a,
     {
@@ -301,13 +301,13 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: MtpConfig,
+        config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
         semantic: Box<dyn SpeculativeSemanticState>,
         cancellation: GenerationCancellationToken,
         on_event: F,
-    ) -> Result<MtpRequestId, Exception>
+    ) -> Result<SpeculativeRequestId, Exception>
     where
         F: FnMut(SemanticEvent) + 'a,
     {
@@ -319,10 +319,10 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: MtpConfig,
+        config: SpeculativeConfig,
         prng_key: Option<Array>,
         runtime: CommittedOutputRuntime<'a, S>,
-    ) -> Result<MtpRequestId, Exception> {
+    ) -> Result<SpeculativeRequestId, Exception> {
         config
             .validate()
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -349,7 +349,7 @@ where
 
     /// Returns the current phase for a submitted request.
     #[cfg(test)]
-    pub fn phase(&self, id: MtpRequestId) -> Option<MtpRequestPhase> {
+    pub fn phase(&self, id: SpeculativeRequestId) -> Option<SpeculativeRequestPhase> {
         self.requests.phase(id)
     }
 
@@ -358,7 +358,7 @@ where
     /// An in-flight target transaction is resolved to a safe cache boundary
     /// before the request enters `Cancelled`; other requests continue.
     #[cfg(test)]
-    pub fn cancel(&mut self, id: MtpRequestId) -> Result<(), Exception> {
+    pub fn cancel(&mut self, id: SpeculativeRequestId) -> Result<(), Exception> {
         self.requests.cancel(id).map_err(speculative_driver_error)
     }
 
@@ -384,19 +384,19 @@ where
     }
 
     /// Consumes a finished scheduler and returns results in submission order.
-    pub fn finish(self) -> Result<MtpScheduleOutput<S>, Exception> {
+    pub fn finish(self) -> Result<SpeculativeScheduleOutput<S>, Exception> {
         let output = self.requests.finish().map_err(speculative_driver_error)?;
-        Ok(MtpScheduleOutput {
+        Ok(SpeculativeScheduleOutput {
             requests: output
                 .requests
                 .into_iter()
-                .map(|request| MtpRequestOutput {
+                .map(|request| SpeculativeRequestOutput {
                     token_ids: request.token_ids,
                     stats: request.stats,
                     sampler: request.sampler.into_inner(),
                     finish_reason: request.finish_reason,
                     #[cfg(test)]
-                    cancelled: request.phase == MtpRequestPhase::Cancelled,
+                    cancelled: request.phase == SpeculativeRequestPhase::Cancelled,
                 })
                 .collect(),
             scheduler: output.scheduler,
@@ -414,11 +414,11 @@ fn generate<'runtime, B, S>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
-    config: &MtpConfig,
+    config: &SpeculativeConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
     stream: &'runtime Stream,
-) -> Result<(Vec<u32>, MtpStats), Exception>
+) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone + 'runtime,
@@ -430,7 +430,7 @@ where
         config,
         prng_key,
         sampler,
-        MtpExecutionStreams::single(stream),
+        SpeculativeExecutionStreams::single(stream),
     )
 }
 
@@ -439,11 +439,11 @@ fn generate_with_streams<'runtime, B, S>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
-    config: &MtpConfig,
+    config: &SpeculativeConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    streams: MtpExecutionStreams<'runtime>,
-) -> Result<(Vec<u32>, MtpStats), Exception>
+    streams: SpeculativeExecutionStreams<'runtime>,
+) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone + 'runtime,
@@ -456,7 +456,7 @@ where
         prng_key,
         sampler,
         streams,
-        MtpSchedulerOptions::default(),
+        SpeculativeSchedulerOptions::default(),
         |_| Ok(()),
     )
 }
@@ -469,13 +469,13 @@ fn generate_tokens<'runtime, B, S, F>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
-    config: &MtpConfig,
+    config: &SpeculativeConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    streams: MtpExecutionStreams<'runtime>,
-    options: MtpSchedulerOptions,
+    streams: SpeculativeExecutionStreams<'runtime>,
+    options: SpeculativeSchedulerOptions,
     on_token: F,
-) -> Result<(Vec<u32>, MtpStats), Exception>
+) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone + 'runtime,
@@ -520,7 +520,7 @@ where
 fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
     if input.parts.is_empty() {
         return Err(Exception::custom(
-            "MTP input must contain at least one part",
+            "speculative input must contain at least one part",
         ));
     }
     if input
@@ -532,19 +532,21 @@ fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
         for part in input.parts {
             let InputPayload::TokenIds(ids) = part.payload() else {
                 return Err(Exception::custom(
-                    "MTP text input must contain token-id payloads",
+                    "speculative text input must contain token-id payloads",
                 ));
             };
             if ids.ndim() != 2 {
                 return Err(Exception::custom(format!(
-                    "MTP text token ids must have rank 2, got {:?}",
+                    "speculative text token ids must have rank 2, got {:?}",
                     ids.shape()
                 )));
             }
             tokens = tokens.saturating_add(ids.dim(1));
         }
         if tokens == 0 {
-            return Err(Exception::custom("MTP text input contains no tokens"));
+            return Err(Exception::custom(
+                "speculative text input contains no tokens",
+            ));
         }
     }
     Ok(())
@@ -742,9 +744,9 @@ mod tests {
         type CacheCheckpoint = usize;
         type Verification = Array;
         type Logits = Array;
-        type Context<'a> = MtpExecutionStreams<'a>;
+        type Context<'a> = SpeculativeExecutionStreams<'a>;
         type Completion = MlxSpeculativeCompletion;
-        type Telemetry = MtpComponentTimings;
+        type Telemetry = SpeculativeComponentTimings;
         type Error = Exception;
 
         fn max_proposals(&self) -> usize {
@@ -759,7 +761,7 @@ mod tests {
             &mut self,
             _input: MlxModelInput,
             cache: &mut Self::Cache,
-            streams: MtpExecutionStreams<'context>,
+            streams: SpeculativeExecutionStreams<'context>,
         ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
         where
             Self: 'context,
@@ -781,7 +783,7 @@ mod tests {
             state: &Self::TargetState,
             last_token: u32,
             proposal_capacity: usize,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<Self::DraftState, Exception> {
             self.draft_capacities.push(proposal_capacity);
             let _ = (state, last_token);
@@ -797,7 +799,7 @@ mod tests {
             &mut self,
             state: &mut Self::DraftState,
             _last_token: u32,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<Array, Exception> {
             let stream = streams.draft();
             self.record("draft", stream)?;
@@ -820,7 +822,7 @@ mod tests {
             &mut self,
             input_tokens: &[u32],
             cache: &mut Self::Cache,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
             let input_len = input_tokens.len();
             let stream = streams.target();
@@ -862,7 +864,7 @@ mod tests {
         fn verification_logits<'a>(
             output: &Self::Verification,
             index: usize,
-            streams: MtpExecutionStreams<'a>,
+            streams: SpeculativeExecutionStreams<'a>,
         ) -> Result<Array, Exception>
         where
             Self: 'a,
@@ -877,7 +879,7 @@ mod tests {
             cache: &mut Self::Cache,
             checkpoint: Self::CacheCheckpoint,
             verified_inputs: usize,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
             if verified_inputs != output.dim(1) as usize {
                 self.record("cache_truncate", streams.target())?;
@@ -904,9 +906,9 @@ mod tests {
         type CacheCheckpoint = usize;
         type Verification = Array;
         type Logits = Array;
-        type Context<'a> = MtpExecutionStreams<'a>;
+        type Context<'a> = SpeculativeExecutionStreams<'a>;
         type Completion = MlxSpeculativeCompletion;
-        type Telemetry = MtpComponentTimings;
+        type Telemetry = SpeculativeComponentTimings;
         type Error = Exception;
 
         fn max_proposals(&self) -> usize {
@@ -917,7 +919,7 @@ mod tests {
             &mut self,
             input: MlxModelInput,
             cache: &mut Self::Cache,
-            streams: MtpExecutionStreams<'context>,
+            streams: SpeculativeExecutionStreams<'context>,
         ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
         where
             Self: 'context,
@@ -930,7 +932,7 @@ mod tests {
             state: &Self::TargetState,
             last_token: u32,
             proposal_capacity: usize,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<Self::DraftState, Exception> {
             self.inner
                 .begin_proposal(state, last_token, proposal_capacity, streams)
@@ -940,7 +942,7 @@ mod tests {
             &mut self,
             state: &mut Self::DraftState,
             last_token: u32,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<Array, Exception> {
             self.inner.proposal_logits(state, last_token, streams)
         }
@@ -953,7 +955,7 @@ mod tests {
             &mut self,
             input_tokens: &[u32],
             cache: &mut Self::Cache,
-            streams: MtpExecutionStreams<'_>,
+            streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
             self.inner.submit_verification(input_tokens, cache, streams)
         }
@@ -961,7 +963,7 @@ mod tests {
         fn verification_logits<'a>(
             output: &Self::Verification,
             index: usize,
-            streams: MtpExecutionStreams<'a>,
+            streams: SpeculativeExecutionStreams<'a>,
         ) -> Result<Array, Exception>
         where
             Self: 'a,
@@ -976,7 +978,7 @@ mod tests {
             _cache: &mut Self::Cache,
             _checkpoint: Self::CacheCheckpoint,
             _verified_inputs: usize,
-            _streams: MtpExecutionStreams<'_>,
+            _streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
             Err(Exception::custom("injected commit failure"))
         }
@@ -1003,17 +1005,17 @@ mod tests {
             let parts = [InputPart::text_token_ids(&prompt)];
             let mut cache = 0;
             let mut backend = scripted_backend();
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::single(context.stream()),
-                MtpSchedulerOptions::default().with_lookahead(false),
+                SpeculativeExecutionStreams::single(context.stream()),
+                SpeculativeSchedulerOptions::default().with_lookahead(false),
             )
             .unwrap();
             scheduler
                 .submit_with_semantics(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -1035,8 +1037,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_canonical_mtp_and_lookahead_mtp_have_identical_semantics() {
-        fn run_mtp(lookahead: bool) -> (Vec<u32>, Vec<SemanticEvent>, FinishReason) {
+    fn ordinary_canonical_and_speculative_lookahead_have_identical_semantics() {
+        fn run_speculative(lookahead: bool) -> (Vec<u32>, Vec<SemanticEvent>, FinishReason) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
@@ -1045,17 +1047,17 @@ mod tests {
             let callback = Rc::clone(&events);
             let mut cache = 0;
             let mut backend = scripted_backend();
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-                MtpSchedulerOptions::default().with_lookahead(lookahead),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
             )
             .unwrap();
             scheduler
                 .submit_with_semantics(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 5,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -1074,8 +1076,8 @@ mod tests {
             (request.token_ids, events, finish_reason)
         }
 
-        let canonical = run_mtp(false);
-        let lookahead = run_mtp(true);
+        let canonical = run_speculative(false);
+        let lookahead = run_speculative(true);
         assert_eq!(lookahead, canonical);
 
         let mut ordinary = TestSemanticState::default();
@@ -1106,17 +1108,17 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let callback_events = Rc::clone(&events);
         let mut backend = scripted_backend();
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(stream, draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(stream, draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 6,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -1168,17 +1170,17 @@ mod tests {
         let parts = [InputPart::text_token_ids(&prompt)];
         let mut cache = 0;
         let mut backend = scripted_backend();
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::single(stream),
-            MtpSchedulerOptions::default().with_lookahead(false),
+            SpeculativeExecutionStreams::single(stream),
+            SpeculativeSchedulerOptions::default().with_lookahead(false),
         )
         .unwrap();
         scheduler
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 6,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -1242,17 +1244,17 @@ mod tests {
         let mut cache = 0;
         let mut backend = scripted_backend();
         backend.bonus_token = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 8,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -1296,13 +1298,13 @@ mod tests {
         let mut cache_a = 0;
         let mut cache_b = 0;
         let mut backend = scripted_backend();
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 5,
             max_draft_tokens: 2,
             temperature: 0.0,
@@ -1396,10 +1398,10 @@ mod tests {
         let callback_cancellation = cancellation.clone();
         let mut cache = 0;
         let mut backend = scripted_backend();
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::single(context.stream()),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::single(context.stream()),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
 
@@ -1407,7 +1409,7 @@ mod tests {
             .submit_with_semantics_cancellable(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -1455,24 +1457,24 @@ mod tests {
         fn run(
             max_tokens: usize,
             eos_token_ids: Vec<u32>,
-        ) -> (Vec<u32>, FinishReason, MtpStats, usize) {
+        ) -> (Vec<u32>, FinishReason, SpeculativeStats, usize) {
             let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let stream = context.stream();
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
             let parts = [InputPart::text_token_ids(&prompt)];
             let mut cache = 0;
             let mut backend = scripted_backend();
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::single(stream),
-                MtpSchedulerOptions::default().with_lookahead(false),
+                SpeculativeExecutionStreams::single(stream),
+                SpeculativeSchedulerOptions::default().with_lookahead(false),
             )
             .unwrap();
             scheduler
                 .submit_with_semantics(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -1523,17 +1525,17 @@ mod tests {
         let mut cache = 0;
         let mut backend = scripted_backend();
         backend.reject_first = true;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::single(stream),
-            MtpSchedulerOptions::default().with_lookahead(false),
+            SpeculativeExecutionStreams::single(stream),
+            SpeculativeSchedulerOptions::default().with_lookahead(false),
         )
         .unwrap();
         scheduler
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 2,
                     max_draft_tokens: 2,
                     temperature: 1.0,
@@ -1567,17 +1569,17 @@ mod tests {
         let mut backend = CommitFailBackend {
             inner: scripted_backend(),
         };
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::single(stream),
-            MtpSchedulerOptions::default().with_lookahead(false),
+            SpeculativeExecutionStreams::single(stream),
+            SpeculativeSchedulerOptions::default().with_lookahead(false),
         )
         .unwrap();
         let id = scheduler
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 6,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -1606,7 +1608,7 @@ mod tests {
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let input = ModelInput::new(&parts);
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 3,
             max_draft_tokens: 2,
             temperature: 0.0,
@@ -1630,8 +1632,8 @@ mod tests {
             &config,
             None,
             &mut DefaultSampler,
-            MtpExecutionStreams::single(stream),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::single(stream),
+            SpeculativeSchedulerOptions::default(),
             |token| {
                 emitted.push(token);
                 Ok(())
@@ -1654,7 +1656,7 @@ mod tests {
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let input = ModelInput::new(&parts);
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 3,
             max_draft_tokens: 2,
             temperature: 0.0,
@@ -1679,7 +1681,7 @@ mod tests {
             &config,
             None,
             &mut DefaultSampler,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -1705,7 +1707,7 @@ mod tests {
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let input = ModelInput::new(&parts);
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 4,
             max_draft_tokens: 4,
             temperature: 1.0,
@@ -1732,7 +1734,7 @@ mod tests {
             &config,
             Some(key),
             &mut sampler,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -1742,13 +1744,13 @@ mod tests {
     }
 
     #[test]
-    fn mirostat_v2_mtp_commits_accepted_target_distributions() {
+    fn mirostat_v2_speculative_commits_accepted_target_distributions() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let input = ModelInput::new(&parts);
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 4,
             max_draft_tokens: 4,
             temperature: 1.0,
@@ -1786,13 +1788,13 @@ mod tests {
     }
 
     #[test]
-    fn mirostat_v2_mtp_commits_replacement_not_rejected_draft() {
+    fn mirostat_v2_speculative_commits_replacement_not_rejected_draft() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let input = ModelInput::new(&parts);
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 2,
             max_draft_tokens: 4,
             temperature: 1.0,
@@ -1836,17 +1838,17 @@ mod tests {
         let second_device = ExecutionContext::new(Device::new(DeviceType::Cpu, 1));
 
         assert_eq!(
-            MtpExecutionStreams::single(target.stream()).topology(),
+            SpeculativeExecutionStreams::single(target.stream()).topology(),
             SpeculativeExecutionTopology::Single
         );
         assert_eq!(
-            MtpExecutionStreams::new(target.stream(), second_stream.stream())
+            SpeculativeExecutionStreams::new(target.stream(), second_stream.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(
-            MtpExecutionStreams::new(target.stream(), second_device.stream())
+            SpeculativeExecutionStreams::new(target.stream(), second_device.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::CrossDeviceSplit
@@ -1857,7 +1859,7 @@ mod tests {
     fn same_device_event_handoffs_order_both_cpu_stream_directions() {
         let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let streams = MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap();
+        let streams = SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap();
         assert_eq!(
             streams.topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
@@ -1869,7 +1871,7 @@ mod tests {
         let target_handoff = streams.wait_for_target_outputs([&target_output]).unwrap();
         assert!(
             !target_handoff.is_complete().unwrap(),
-            "the MTP target-to-draft handoff blocked the host"
+            "the speculative target-to-draft handoff blocked the host"
         );
 
         let draft_output = target_output
@@ -1901,9 +1903,10 @@ mod tests {
         let second_gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
 
-        let single = MtpExecutionStreams::single(target.stream());
-        let same_device = MtpExecutionStreams::new(target.stream(), second_gpu.stream()).unwrap();
-        let cross_device = MtpExecutionStreams::new(target.stream(), cpu.stream()).unwrap();
+        let single = SpeculativeExecutionStreams::single(target.stream());
+        let same_device =
+            SpeculativeExecutionStreams::new(target.stream(), second_gpu.stream()).unwrap();
+        let cross_device = SpeculativeExecutionStreams::new(target.stream(), cpu.stream()).unwrap();
 
         assert_eq!(single.topology(), SpeculativeExecutionTopology::Single);
         assert!(!single.is_split());
@@ -1944,17 +1947,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -2006,11 +2009,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit Metal MTP event handoff test; run on a Metal host"]
-    fn same_gpu_mtp_handoff_does_not_synchronize_the_producer_stream() {
+    #[ignore = "explicit Metal speculative event handoff test; run on a Metal host"]
+    fn same_gpu_speculative_handoff_does_not_synchronize_the_producer_stream() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let streams = MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap();
+        let streams = SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap();
         assert_eq!(
             streams.topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
@@ -2026,7 +2029,7 @@ mod tests {
         let handoff = streams.wait_for_target_outputs([&produced]).unwrap();
         assert!(
             !handoff.is_complete().unwrap(),
-            "the same-device MTP handoff waited for target completion on the host"
+            "the same-device speculative handoff waited for target completion on the host"
         );
 
         let consumed = produced.square(draft.stream()).unwrap();
@@ -2053,17 +2056,17 @@ mod tests {
                 draft_capacities: Vec::new(),
             };
             let mut cache = 0;
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-                MtpSchedulerOptions::default().with_lookahead(lookahead),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
             )
             .unwrap();
             scheduler
                 .submit(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 8,
                         max_draft_tokens: 2,
                         temperature: 1.0,
@@ -2108,17 +2111,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -2171,17 +2174,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         let id = scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 6,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -2199,7 +2202,7 @@ mod tests {
 
         let request = scheduler.requests.request(id).unwrap();
         assert_eq!(request.sequence().tokens(), &[1, 2, 0, 0]);
-        assert_eq!(request.phase(), MtpRequestPhase::ReadyToDraft);
+        assert_eq!(request.phase(), SpeculativeRequestPhase::ReadyToDraft);
         let retained = request.block().unwrap();
         assert_eq!(retained.proposals.len(), 1);
         assert_eq!(retained.proposals[0].token, 1);
@@ -2250,8 +2253,8 @@ mod tests {
     fn mismatching_bonus_restores_exact_non_lookahead_state() {
         #[allow(clippy::type_complexity)]
         fn run(
-            options: MtpSchedulerOptions,
-        ) -> (Vec<u32>, Vec<u32>, usize, MtpStats, CountingSampler) {
+            options: SpeculativeSchedulerOptions,
+        ) -> (Vec<u32>, Vec<u32>, usize, SpeculativeStats, CountingSampler) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
@@ -2270,9 +2273,9 @@ mod tests {
             let mut callback_tokens = Vec::new();
             let request;
             {
-                let mut scheduler = MlxMtpScheduler::new(
+                let mut scheduler = MlxSpeculativeScheduler::new(
                     &mut backend,
-                    MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                    SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                     options,
                 )
                 .unwrap();
@@ -2280,7 +2283,7 @@ mod tests {
                     .submit(
                         &mut cache,
                         ModelInput::new(&parts),
-                        MtpConfig {
+                        SpeculativeConfig {
                             max_tokens: 7,
                             max_draft_tokens: 2,
                             temperature: 0.0,
@@ -2306,13 +2309,13 @@ mod tests {
             )
         }
 
-        let without = run(MtpSchedulerOptions {
+        let without = run(SpeculativeSchedulerOptions {
             max_in_flight_verifications: 1,
             max_optimistic_branches: 0,
             lookahead_blocks: 0,
-            ..MtpSchedulerOptions::default()
+            ..SpeculativeSchedulerOptions::default()
         });
-        let with = run(MtpSchedulerOptions::default());
+        let with = run(SpeculativeSchedulerOptions::default());
 
         assert_eq!(with.0, without.0);
         assert_eq!(with.1, without.1);
@@ -2332,7 +2335,7 @@ mod tests {
 
     #[test]
     fn history_derived_sampler_matches_non_lookahead_execution() {
-        fn run(options: MtpSchedulerOptions) -> (Vec<u32>, Vec<usize>) {
+        fn run(options: SpeculativeSchedulerOptions) -> (Vec<u32>, Vec<usize>) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
@@ -2353,9 +2356,9 @@ mod tests {
                 .top_p(1.0)
                 .min_p(0.0)
                 .penalties(1.2, -1, 0.1, 0.1);
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2363,7 +2366,7 @@ mod tests {
                 .submit(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 7,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -2379,13 +2382,13 @@ mod tests {
             (request.token_ids, request.stats.accept_lens)
         }
 
-        let without = run(MtpSchedulerOptions {
+        let without = run(SpeculativeSchedulerOptions {
             max_in_flight_verifications: 1,
             max_optimistic_branches: 0,
             lookahead_blocks: 0,
-            ..MtpSchedulerOptions::default()
+            ..SpeculativeSchedulerOptions::default()
         });
-        let with = run(MtpSchedulerOptions::default());
+        let with = run(SpeculativeSchedulerOptions::default());
         assert_eq!(with, without);
     }
 
@@ -2393,9 +2396,9 @@ mod tests {
     fn stochastic_match_and_mismatch_ignore_interleaving_and_branch_slots() {
         fn run(
             seed: u64,
-            options: MtpSchedulerOptions,
+            options: SpeculativeSchedulerOptions,
             with_peer: bool,
-        ) -> (Vec<u32>, Vec<usize>, MtpStats) {
+        ) -> (Vec<u32>, Vec<usize>, SpeculativeStats) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
@@ -2414,13 +2417,13 @@ mod tests {
             };
             let mut cache_a = 0;
             let mut cache_b = 0;
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
-            let config = MtpConfig {
+            let config = SpeculativeConfig {
                 max_tokens: 8,
                 max_draft_tokens: 2,
                 temperature: 1.0,
@@ -2457,21 +2460,21 @@ mod tests {
             )
         }
 
-        let no_lookahead = MtpSchedulerOptions {
+        let no_lookahead = SpeculativeSchedulerOptions {
             max_in_flight_verifications: 1,
             max_optimistic_branches: 0,
             lookahead_blocks: 0,
-            ..MtpSchedulerOptions::default()
+            ..SpeculativeSchedulerOptions::default()
         };
         let mut saw_match = false;
         let mut saw_mismatch = false;
         for seed in 0..64 {
-            let with = run(seed, MtpSchedulerOptions::default(), false);
+            let with = run(seed, SpeculativeSchedulerOptions::default(), false);
             if with.2.optimistic_bonus_matches == 0 && with.2.optimistic_bonus_mismatches == 0 {
                 continue;
             }
             let without = run(seed, no_lookahead, false);
-            let interleaved = run(seed, MtpSchedulerOptions::default(), true);
+            let interleaved = run(seed, SpeculativeSchedulerOptions::default(), true);
             assert_eq!((&with.0, &with.1), (&without.0, &without.1));
             assert_eq!((&with.0, &with.1), (&interleaved.0, &interleaved.1));
             saw_match |= with.2.optimistic_bonus_matches > 0;
@@ -2504,17 +2507,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         let id = scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -2530,7 +2533,10 @@ mod tests {
         scheduler.step().unwrap();
         scheduler.step().unwrap();
         scheduler.step().unwrap();
-        assert_eq!(scheduler.phase(id), Some(MtpRequestPhase::ReadyToDraft));
+        assert_eq!(
+            scheduler.phase(id),
+            Some(SpeculativeRequestPhase::ReadyToDraft)
+        );
         scheduler.cancel(id).unwrap();
         let output = scheduler.finish().unwrap();
 
@@ -2558,17 +2564,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         let id = scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -2584,7 +2590,7 @@ mod tests {
         scheduler.step().unwrap();
         assert_eq!(
             scheduler.phase(id),
-            Some(MtpRequestPhase::OptimisticDraftReady)
+            Some(SpeculativeRequestPhase::OptimisticDraftReady)
         );
         scheduler.step().unwrap();
         scheduler.cancel(id).unwrap();
@@ -2601,7 +2607,7 @@ mod tests {
 
     #[test]
     fn rejection_matches_execution_with_lookahead_disabled() {
-        fn run(options: MtpSchedulerOptions) -> (Vec<u32>, usize, MtpStats) {
+        fn run(options: SpeculativeSchedulerOptions) -> (Vec<u32>, usize, SpeculativeStats) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
@@ -2617,9 +2623,9 @@ mod tests {
                 draft_capacities: Vec::new(),
             };
             let mut cache = 0;
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2627,7 +2633,7 @@ mod tests {
                 .submit(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 5,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -2644,13 +2650,13 @@ mod tests {
             (output.token_ids, cache, output.stats)
         }
 
-        let without = run(MtpSchedulerOptions {
+        let without = run(SpeculativeSchedulerOptions {
             max_in_flight_verifications: 1,
             max_optimistic_branches: 0,
             lookahead_blocks: 0,
-            ..MtpSchedulerOptions::default()
+            ..SpeculativeSchedulerOptions::default()
         });
-        let with = run(MtpSchedulerOptions::default());
+        let with = run(SpeculativeSchedulerOptions::default());
         assert_eq!(with.0, without.0);
         assert_eq!(with.1, without.1);
         assert_eq!(with.2.accept_lens, without.2.accept_lens);
@@ -2675,17 +2681,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 1,
                     temperature: 0.0,
@@ -2728,17 +2734,17 @@ mod tests {
         let mut callback_b = Vec::new();
         let output;
         {
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-                MtpSchedulerOptions::default(),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeSchedulerOptions::default(),
             )
             .unwrap();
             scheduler
                 .submit(
                     &mut cache_a,
                     ModelInput::new(&parts_a),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 6,
                         max_draft_tokens: 1,
                         temperature: 0.0,
@@ -2756,7 +2762,7 @@ mod tests {
                 .submit(
                     &mut cache_b,
                     ModelInput::new(&parts_b),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 5,
                         max_draft_tokens: 1,
                         temperature: 0.0,
@@ -2802,17 +2808,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 5,
                     max_draft_tokens: 1,
                     temperature: 0.0,
@@ -2857,17 +2863,17 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 3,
                     max_draft_tokens: 1,
                     temperature: 0.0,
@@ -2908,7 +2914,7 @@ mod tests {
             },
             assumed_prefix: vec![1, 2],
         };
-        let mut stats = MtpStats::default();
+        let mut stats = SpeculativeStats::default();
         let error = resolve_optimistic_branch(Some(branch), &[1, 0], Some(0), false, &mut stats)
             .err()
             .unwrap();
@@ -2943,17 +2949,17 @@ mod tests {
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions::default(),
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
             .submit(
                 &mut cache_a,
                 ModelInput::new(&parts_a),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 6,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -2968,7 +2974,7 @@ mod tests {
             .submit(
                 &mut cache_b,
                 ModelInput::new(&parts_b),
-                MtpConfig {
+                SpeculativeConfig {
                     max_tokens: 6,
                     max_draft_tokens: 2,
                     temperature: 0.0,
@@ -3023,14 +3029,14 @@ mod tests {
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
-        let mut scheduler = MlxMtpScheduler::new(
+        let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-            MtpSchedulerOptions {
+            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeSchedulerOptions {
                 max_in_flight_verifications: 2,
                 max_optimistic_branches: 1,
                 lookahead_blocks: 1,
-                ..MtpSchedulerOptions::default()
+                ..SpeculativeSchedulerOptions::default()
             },
         )
         .unwrap();
@@ -3039,7 +3045,7 @@ mod tests {
                 .submit(
                     cache,
                     ModelInput::new(parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 5,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -3088,13 +3094,13 @@ mod tests {
             let mut cache_b = 0;
             let events = Rc::new(RefCell::new(Vec::new()));
             let callback = Rc::clone(&events);
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
-                MtpSchedulerOptions::default(),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeSchedulerOptions::default(),
             )
             .unwrap();
-            let config = MtpConfig {
+            let config = SpeculativeConfig {
                 max_tokens: 5,
                 max_draft_tokens: 2,
                 temperature: 1.0,
@@ -3139,7 +3145,7 @@ mod tests {
 
     #[test]
     fn adaptive_disabling_stops_unproductive_branches_without_changing_output() {
-        fn run(options: MtpSchedulerOptions) -> (Vec<u32>, usize, MtpStats) {
+        fn run(options: SpeculativeSchedulerOptions) -> (Vec<u32>, usize, SpeculativeStats) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
@@ -3155,9 +3161,9 @@ mod tests {
                 draft_capacities: Vec::new(),
             };
             let mut cache = 0;
-            let mut scheduler = MlxMtpScheduler::new(
+            let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -3165,7 +3171,7 @@ mod tests {
                 .submit(
                     &mut cache,
                     ModelInput::new(&parts),
-                    MtpConfig {
+                    SpeculativeConfig {
                         max_tokens: 10,
                         max_draft_tokens: 2,
                         temperature: 0.0,
@@ -3181,11 +3187,11 @@ mod tests {
             (request.token_ids, cache, request.stats)
         }
 
-        let adaptive = run(MtpSchedulerOptions {
+        let adaptive = run(SpeculativeSchedulerOptions {
             adaptive_lookahead_min_blocks: 2,
-            ..MtpSchedulerOptions::default()
+            ..SpeculativeSchedulerOptions::default()
         });
-        let disabled = run(MtpSchedulerOptions::default().with_lookahead(false));
+        let disabled = run(SpeculativeSchedulerOptions::default().with_lookahead(false));
 
         assert_eq!(adaptive.0, disabled.0);
         assert_eq!(adaptive.1, disabled.1);
@@ -3197,17 +3203,17 @@ mod tests {
 
     #[test]
     fn empty_stats_have_zero_acceptance_rate() {
-        assert_eq!(MtpStats::default().accept_rate(), 0.0);
+        assert_eq!(SpeculativeStats::default().accept_rate(), 0.0);
     }
 
     #[test]
     fn component_timings_accumulate_without_overwriting_scheduler_stats() {
-        let mut stats = MtpStats {
+        let mut stats = SpeculativeStats {
             rounds: 7,
             draft_context_time: Duration::from_millis(2),
-            ..MtpStats::default()
+            ..SpeculativeStats::default()
         };
-        MtpComponentTimings {
+        SpeculativeComponentTimings {
             draft_context: Duration::from_millis(3),
             draft_assistant: Duration::from_millis(5),
             draft_head: Duration::from_millis(7),
@@ -3226,10 +3232,10 @@ mod tests {
     fn component_timing_guard_is_scoped_and_nested() {
         assert!(!component_timing_enabled());
         {
-            let _outer = MtpComponentTimingGuard::enable();
+            let _outer = SpeculativeComponentTimingGuard::enable();
             assert!(component_timing_enabled());
             {
-                let _inner = MtpComponentTimingGuard::enable();
+                let _inner = SpeculativeComponentTimingGuard::enable();
                 assert!(component_timing_enabled());
             }
             assert!(component_timing_enabled());
@@ -3239,38 +3245,38 @@ mod tests {
 
     #[test]
     fn adaptive_lookahead_uses_deterministic_reuse_accounting() {
-        let options = MtpSchedulerOptions {
+        let options = SpeculativeSchedulerOptions {
             adaptive_lookahead_min_blocks: 4,
-            ..MtpSchedulerOptions::default()
+            ..SpeculativeSchedulerOptions::default()
         };
-        let mut profitable = MtpStats {
+        let mut profitable = SpeculativeStats {
             optimistic_draft_blocks: 4,
             reused_optimistic_tokens: 3,
             discarded_optimistic_tokens: 2,
-            ..MtpStats::default()
+            ..SpeculativeStats::default()
         };
         profitable.update_adaptive_lookahead(options);
         assert!(!profitable.adaptive_lookahead_disabled);
 
-        let mut unprofitable = MtpStats {
+        let mut unprofitable = SpeculativeStats {
             optimistic_draft_blocks: 4,
             reused_optimistic_tokens: 1,
             discarded_optimistic_tokens: 2,
-            ..MtpStats::default()
+            ..SpeculativeStats::default()
         };
         unprofitable.update_adaptive_lookahead(options);
         assert!(unprofitable.adaptive_lookahead_disabled);
 
-        let mut no_reuse = MtpStats {
+        let mut no_reuse = SpeculativeStats {
             optimistic_draft_blocks: 4,
-            ..MtpStats::default()
+            ..SpeculativeStats::default()
         };
         no_reuse.update_adaptive_lookahead(options);
         assert!(no_reuse.adaptive_lookahead_disabled);
 
         let mut disabled_policy = unprofitable.clone();
         disabled_policy.adaptive_lookahead_disabled = false;
-        disabled_policy.update_adaptive_lookahead(MtpSchedulerOptions {
+        disabled_policy.update_adaptive_lookahead(SpeculativeSchedulerOptions {
             adaptive_lookahead: false,
             ..options
         });

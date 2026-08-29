@@ -81,7 +81,7 @@ reasons.
 ## Validate the complete path
 
 Tests should cover preparation, tokenizer analysis, constraints, ordinary and
-MTP generation, cancellation, malformed output, and event ordering. Include a
+Speculative generation, cancellation, malformed output, and event ordering. Include a
 checkpoint-backed ignored test only when fixture-level behavior cannot prove a
 required property; it must use a caller-supplied local path and must never
 download a checkpoint.

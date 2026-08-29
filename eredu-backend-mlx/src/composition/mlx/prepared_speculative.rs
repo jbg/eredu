@@ -1,9 +1,9 @@
 //! Whole-session MLX speculative generation capability.
 
 use eredu_core::{
-    generation::{GenerationCancellationToken, MtpConfig, SemanticEvent},
-    GenerationSequence, ModelRuntime, MtpCapability, PreparedSpeculativeLane,
-    SpeculativeCallbackPublisher, SpeculativeDraft, SpeculativeGenerationBackend,
+    generation::{GenerationCancellationToken, SemanticEvent, SpeculativeConfig},
+    GenerationSequence, ModelRuntime, PreparedSpeculativeLane, SpeculativeCallbackPublisher,
+    SpeculativeCapability, SpeculativeDraft, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
     SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
@@ -17,7 +17,7 @@ use super::{
     speculative::{
         embedded::DistributedEmbeddedMtpSampler,
         scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
-        MlxDrafter, MlxDrafterKind, MlxSpeculativeSampling, MtpExecutionStreams,
+        MlxDrafter, MlxDrafterKind, MlxSpeculativeSampling, SpeculativeExecutionStreams,
     },
     Executable, MlxBackend, MlxModelInput,
 };
@@ -27,8 +27,8 @@ use crate::backend::runtime::generation::sampler::SpeculativeSampler;
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
 
-    fn mtp_capability(runtime: &ModelRuntime<Self>) -> MtpCapability {
-        runtime.session().mtp_capability()
+    fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability {
+        runtime.session().speculative_capability()
     }
 
     fn with_speculative_execution<C, V>(
@@ -52,7 +52,7 @@ struct MlxSpeculativeSession<'runtime, 'world> {
 
 struct MlxSpeculativeLaneRuntime<'a, C> {
     input: MlxModelInput,
-    config: MtpConfig,
+    config: SpeculativeConfig,
     prng_key: Option<Array>,
     sampler: MlxPreparedSampler<C>,
     semantic: Box<dyn SpeculativeSemanticState>,
@@ -67,7 +67,7 @@ fn run_speculative_batch<'a, B, C, S>(
     lanes: Vec<MlxSpeculativeLaneRuntime<'a, C>>,
     caches: &'a mut [B::Cache],
     wrap_sampler: impl Fn(MlxPreparedSampler<C>) -> Result<S, Exception>,
-    streams: MtpExecutionStreams<'a>,
+    streams: SpeculativeExecutionStreams<'a>,
     visitor: impl SpeculativeGenerationVisitor,
 ) -> Result<SpeculativeGenerationBatchOutput, Exception>
 where
@@ -77,7 +77,7 @@ where
 {
     if caches.len() != lanes.len() {
         return Err(Exception::custom(format!(
-            "MTP cache has {} lanes but the request has {} lanes",
+            "speculative cache has {} lanes but the request has {} lanes",
             caches.len(),
             lanes.len()
         )));
@@ -155,7 +155,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         ))
     }
 
-    /// Validates the observable target/assistant contract used by external MTP.
+    /// Validates the observable target/assistant contract used by external drafting.
     ///
     /// Repository names and revisions are deliberately not compatibility keys.
     /// The validation covers the target architecture, shared tensor geometry,
@@ -239,7 +239,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         self.validate_drafter_compatibility(drafter)?;
         let target_stream = self.runtime.backend().stream().clone();
         let draft_stream = drafter.stream().clone();
-        let streams = MtpExecutionStreams::new(&target_stream, &draft_stream)?;
+        let streams = SpeculativeExecutionStreams::new(&target_stream, &draft_stream)?;
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes)?;
         let lane_count = prepared_lanes.len();
         let model = match self.runtime.session_mut().speculative_parts_mut()? {
@@ -305,7 +305,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 | Executable::Qwen35(_, _, _)),
                 kind,
             ) => Err(Error::Speculative(format!(
-                "MTP runtime adapter is unavailable for model type {} ({:?})",
+                "speculative runtime adapter is unavailable for model type {} ({:?})",
                 model.effective_model_type(),
                 kind
             ))),
@@ -324,7 +324,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let stream = self.runtime.backend().stream().clone();
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes)?;
         let lane_count = prepared_lanes.len();
-        let streams = MtpExecutionStreams::single(&stream);
+        let streams = SpeculativeExecutionStreams::single(&stream);
         match self.runtime.session_mut().speculative_parts_mut()? {
             MlxSpeculativeSessionParts::Complete { model, execution } => {
                 if let Some(execution) = execution {
@@ -436,7 +436,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                         | Executable::Qwen3VlMoe(_, _, _)) => Err(Error::Speculative(format!(
                             "distributed prepared-chat embedded MTP is unavailable for model type {} ({:?})",
                             model.effective_model_type(),
-                            model.mtp_capability()
+                            model.speculative_capability()
                         ))),
                     };
                 }
@@ -542,7 +542,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             | Executable::Qwen3VlMoe(_, _, _)) => Err(Error::Speculative(format!(
                 "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
                 model.effective_model_type(),
-                model.mtp_capability()
+                model.speculative_capability()
             ))),
                 }
             }

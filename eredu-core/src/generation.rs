@@ -322,7 +322,7 @@ pub fn resolve_optimistic_reuse(
 
 /// Options shared by speculative multi-token backends.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MtpConfig {
+pub struct SpeculativeConfig {
     /// Maximum number of output tokens, including terminal tokens.
     pub max_tokens: usize,
     /// Maximum assistant proposals per verification round.
@@ -333,7 +333,7 @@ pub struct MtpConfig {
     pub eos_token_ids: Vec<u32>,
 }
 
-impl Default for MtpConfig {
+impl Default for SpeculativeConfig {
     fn default() -> Self {
         Self {
             max_tokens: 256,
@@ -344,7 +344,7 @@ impl Default for MtpConfig {
     }
 }
 
-impl MtpConfig {
+impl SpeculativeConfig {
     /// Validates backend-independent speculative settings.
     pub fn validate(&self) -> Result<(), GenerationError> {
         if self.max_draft_tokens == 0 {
@@ -359,7 +359,7 @@ impl MtpConfig {
 
 /// Bounded fair-scheduler settings for speculative requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MtpSchedulerOptions {
+pub struct SpeculativeSchedulerOptions {
     /// Maximum retained target verification transactions.
     pub max_in_flight_verifications: usize,
     /// Maximum retained optimistic branches.
@@ -372,7 +372,7 @@ pub struct MtpSchedulerOptions {
     pub adaptive_lookahead_min_blocks: usize,
 }
 
-impl Default for MtpSchedulerOptions {
+impl Default for SpeculativeSchedulerOptions {
     fn default() -> Self {
         Self {
             max_in_flight_verifications: 1,
@@ -384,7 +384,7 @@ impl Default for MtpSchedulerOptions {
     }
 }
 
-impl MtpSchedulerOptions {
+impl SpeculativeSchedulerOptions {
     /// Enables or disables same-request optimistic lookahead.
     pub fn with_lookahead(mut self, enabled: bool) -> Self {
         self.lookahead_blocks = usize::from(enabled);
@@ -417,9 +417,9 @@ impl MtpSchedulerOptions {
 
 /// Stable speculative scheduler request identifier.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub struct MtpRequestId(usize);
+pub struct SpeculativeRequestId(usize);
 
-impl MtpRequestId {
+impl SpeculativeRequestId {
     /// Creates an identifier from its stable scheduler insertion index.
     pub const fn new(index: usize) -> Self {
         Self(index)
@@ -434,7 +434,7 @@ impl MtpRequestId {
 /// Explicit speculative request/round state.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MtpRequestPhase {
+pub enum SpeculativeRequestPhase {
     /// Target prompt prefill and first-token sampling.
     Prefill,
     /// Committed target state is ready to seed proposals.
@@ -457,7 +457,7 @@ pub enum MtpRequestPhase {
 
 /// Result of requesting cancellation at a speculative submission boundary.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MtpCancellationDisposition {
+pub enum SpeculativeCancellationDisposition {
     /// The request was already terminal.
     AlreadyTerminal,
     /// No backend submission is retained, so cancellation completed now.
@@ -468,22 +468,22 @@ pub enum MtpCancellationDisposition {
 
 /// Validated backend-neutral lifecycle of one speculative request.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MtpRequestLifecycle {
-    phase: MtpRequestPhase,
+pub struct SpeculativeRequestLifecycle {
+    phase: SpeculativeRequestPhase,
     cancellation_pending: bool,
 }
 
-impl Default for MtpRequestLifecycle {
+impl Default for SpeculativeRequestLifecycle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MtpRequestLifecycle {
+impl SpeculativeRequestLifecycle {
     /// Starts a request at prompt prefill.
     pub const fn new() -> Self {
         Self {
-            phase: MtpRequestPhase::Prefill,
+            phase: SpeculativeRequestPhase::Prefill,
             cancellation_pending: false,
         }
     }
@@ -491,7 +491,7 @@ impl MtpRequestLifecycle {
     /// Creates a request completed before backend submission.
     pub const fn completed() -> Self {
         Self {
-            phase: MtpRequestPhase::Completed,
+            phase: SpeculativeRequestPhase::Completed,
             cancellation_pending: false,
         }
     }
@@ -499,13 +499,13 @@ impl MtpRequestLifecycle {
     /// Creates a request cancelled before backend submission.
     pub const fn cancelled() -> Self {
         Self {
-            phase: MtpRequestPhase::Cancelled,
+            phase: SpeculativeRequestPhase::Cancelled,
             cancellation_pending: false,
         }
     }
 
     /// Current lifecycle phase.
-    pub const fn phase(&self) -> MtpRequestPhase {
+    pub const fn phase(&self) -> SpeculativeRequestPhase {
         self.phase
     }
 
@@ -518,7 +518,7 @@ impl MtpRequestLifecycle {
     pub const fn is_terminal(&self) -> bool {
         matches!(
             self.phase,
-            MtpRequestPhase::Completed | MtpRequestPhase::Cancelled
+            SpeculativeRequestPhase::Completed | SpeculativeRequestPhase::Cancelled
         )
     }
 
@@ -526,71 +526,72 @@ impl MtpRequestLifecycle {
     pub fn request_cancellation(
         &mut self,
         submission_retained: bool,
-    ) -> Result<MtpCancellationDisposition, GenerationError> {
+    ) -> Result<SpeculativeCancellationDisposition, GenerationError> {
         if self.is_terminal() {
-            return Ok(MtpCancellationDisposition::AlreadyTerminal);
+            return Ok(SpeculativeCancellationDisposition::AlreadyTerminal);
         }
         if submission_retained {
             self.cancellation_pending = true;
-            Ok(MtpCancellationDisposition::Deferred)
+            Ok(SpeculativeCancellationDisposition::Deferred)
         } else {
-            self.transition(MtpRequestPhase::Cancelled)?;
-            Ok(MtpCancellationDisposition::CancelNow)
+            self.transition(SpeculativeRequestPhase::Cancelled)?;
+            Ok(SpeculativeCancellationDisposition::CancelNow)
         }
     }
 
     /// Applies one legal lifecycle transition.
-    pub fn transition(&mut self, next: MtpRequestPhase) -> Result<(), GenerationError> {
+    pub fn transition(&mut self, next: SpeculativeRequestPhase) -> Result<(), GenerationError> {
         let allowed = matches!(
             (self.phase, next),
-            (MtpRequestPhase::Prefill, MtpRequestPhase::ReadyToDraft)
-                | (MtpRequestPhase::Prefill, MtpRequestPhase::Completed)
-                | (MtpRequestPhase::Prefill, MtpRequestPhase::Cancelled)
-                | (
-                    MtpRequestPhase::ReadyToDraft,
-                    MtpRequestPhase::ReadyToSubmitVerification
-                )
-                | (MtpRequestPhase::ReadyToDraft, MtpRequestPhase::Completed)
-                | (MtpRequestPhase::ReadyToDraft, MtpRequestPhase::Cancelled)
-                | (
-                    MtpRequestPhase::ReadyToSubmitVerification,
-                    MtpRequestPhase::TargetVerificationInFlight
-                )
-                | (
-                    MtpRequestPhase::ReadyToSubmitVerification,
-                    MtpRequestPhase::Cancelled
-                )
-                | (
-                    MtpRequestPhase::TargetVerificationInFlight,
-                    MtpRequestPhase::OptimisticDraftInProgress
-                )
-                | (
-                    MtpRequestPhase::TargetVerificationInFlight,
-                    MtpRequestPhase::VerificationResolution
-                )
-                | (
-                    MtpRequestPhase::OptimisticDraftInProgress,
-                    MtpRequestPhase::OptimisticDraftReady
-                )
-                | (
-                    MtpRequestPhase::OptimisticDraftReady,
-                    MtpRequestPhase::VerificationResolution
-                )
-                | (
-                    MtpRequestPhase::VerificationResolution,
-                    MtpRequestPhase::ReadyToDraft
-                )
-                | (
-                    MtpRequestPhase::VerificationResolution,
-                    MtpRequestPhase::Completed
-                )
-                | (
-                    MtpRequestPhase::VerificationResolution,
-                    MtpRequestPhase::Cancelled
-                )
+            (
+                SpeculativeRequestPhase::Prefill,
+                SpeculativeRequestPhase::ReadyToDraft
+            ) | (
+                SpeculativeRequestPhase::Prefill,
+                SpeculativeRequestPhase::Completed
+            ) | (
+                SpeculativeRequestPhase::Prefill,
+                SpeculativeRequestPhase::Cancelled
+            ) | (
+                SpeculativeRequestPhase::ReadyToDraft,
+                SpeculativeRequestPhase::ReadyToSubmitVerification
+            ) | (
+                SpeculativeRequestPhase::ReadyToDraft,
+                SpeculativeRequestPhase::Completed
+            ) | (
+                SpeculativeRequestPhase::ReadyToDraft,
+                SpeculativeRequestPhase::Cancelled
+            ) | (
+                SpeculativeRequestPhase::ReadyToSubmitVerification,
+                SpeculativeRequestPhase::TargetVerificationInFlight
+            ) | (
+                SpeculativeRequestPhase::ReadyToSubmitVerification,
+                SpeculativeRequestPhase::Cancelled
+            ) | (
+                SpeculativeRequestPhase::TargetVerificationInFlight,
+                SpeculativeRequestPhase::OptimisticDraftInProgress
+            ) | (
+                SpeculativeRequestPhase::TargetVerificationInFlight,
+                SpeculativeRequestPhase::VerificationResolution
+            ) | (
+                SpeculativeRequestPhase::OptimisticDraftInProgress,
+                SpeculativeRequestPhase::OptimisticDraftReady
+            ) | (
+                SpeculativeRequestPhase::OptimisticDraftReady,
+                SpeculativeRequestPhase::VerificationResolution
+            ) | (
+                SpeculativeRequestPhase::VerificationResolution,
+                SpeculativeRequestPhase::ReadyToDraft
+            ) | (
+                SpeculativeRequestPhase::VerificationResolution,
+                SpeculativeRequestPhase::Completed
+            ) | (
+                SpeculativeRequestPhase::VerificationResolution,
+                SpeculativeRequestPhase::Cancelled
+            )
         );
         if !allowed {
-            return Err(GenerationError::InvalidMtpPhaseTransition {
+            return Err(GenerationError::InvalidSpeculativePhaseTransition {
                 from: self.phase,
                 to: next,
             });
@@ -840,13 +841,15 @@ pub enum GenerationError {
     #[error("speculative verification already retains an optimistic branch")]
     OptimisticBranchAlreadyPresent,
     /// A speculative request identifier does not belong to this table.
-    #[error("unknown MTP request id {index}")]
-    UnknownMtpRequest {
+    #[error("unknown speculative request id {index}")]
+    UnknownSpeculativeRequest {
         /// Requested stable insertion index.
         index: usize,
     },
     /// A promoted proposal block no longer fits the canonical request budget.
-    #[error("promoted MTP block has {proposed} proposals but canonical capacity is {capacity}")]
+    #[error(
+        "promoted speculative block has {proposed} proposals but canonical capacity is {capacity}"
+    )]
     ProposalCapacityExceeded {
         /// Proposals retained by the promoted block.
         proposed: usize,
@@ -854,19 +857,19 @@ pub enum GenerationError {
         capacity: usize,
     },
     /// A speculative request table was consumed before reaching terminal state.
-    #[error("cannot finish an MTP scheduler with active requests")]
+    #[error("cannot finish a speculative scheduler with active requests")]
     ActiveSpeculativeRequests,
     /// A terminal speculative request did not retain its canonical finish reason.
-    #[error("completed MTP request {index} has no finish reason")]
-    MissingMtpFinishReason {
+    #[error("completed speculative request {index} has no finish reason")]
+    MissingSpeculativeFinishReason {
         /// Stable request insertion index.
         index: usize,
     },
     /// No assistant proposal may be generated per round.
-    #[error("MTP max_draft_tokens must be positive")]
+    #[error("speculative max_draft_tokens must be positive")]
     ZeroDraftTokens,
     /// The selected backend cannot submit an assistant proposal.
-    #[error("MTP backend does not permit any draft tokens")]
+    #[error("speculative backend does not permit any draft tokens")]
     NoBackendDraftCapacity,
     /// Temperature is NaN, infinite, or negative.
     #[error("temperature must be finite and non-negative, got {0}")]
@@ -902,27 +905,27 @@ pub enum GenerationError {
     #[error("max_new_tokens must be positive when supplied")]
     ZeroTokenBudget,
     /// Scheduler cannot retain any target transaction.
-    #[error("MTP max_in_flight_verifications must be positive")]
+    #[error("speculative max_in_flight_verifications must be positive")]
     ZeroInFlightVerifications,
     /// Current scheduler supports no more than one lookahead block.
-    #[error("MTP scheduler currently supports at most one lookahead block")]
+    #[error("speculative scheduler currently supports at most one lookahead block")]
     TooManyLookaheadBlocks,
     /// Lookahead was enabled with no branch capacity.
-    #[error("MTP lookahead requires at least one optimistic branch slot")]
+    #[error("speculative lookahead requires at least one optimistic branch slot")]
     LookaheadWithoutBranchCapacity,
     /// Adaptive lookahead needs a non-zero observation window.
-    #[error("MTP adaptive_lookahead_min_blocks must be positive")]
+    #[error("speculative adaptive_lookahead_min_blocks must be positive")]
     ZeroAdaptiveLookaheadWindow,
     /// Active requests expose no legal scheduler action.
-    #[error("MTP scheduler reached a non-terminal state with no eligible operation")]
+    #[error("speculative scheduler reached a non-terminal state with no eligible operation")]
     StalledSpeculativeSchedule,
     /// The requested speculative lifecycle edge is invalid.
-    #[error("invalid MTP request phase transition from {from:?} to {to:?}")]
-    InvalidMtpPhaseTransition {
+    #[error("invalid speculative request phase transition from {from:?} to {to:?}")]
+    InvalidSpeculativePhaseTransition {
         /// Current phase.
-        from: MtpRequestPhase,
+        from: SpeculativeRequestPhase,
         /// Requested phase.
-        to: MtpRequestPhase,
+        to: SpeculativeRequestPhase,
     },
 }
 
@@ -1033,12 +1036,12 @@ mod tests {
             ),
             Err(GenerationError::InvalidFrequencyPenalty(value)) if value.is_nan()
         ));
-        assert!(MtpConfig::default().validate().is_ok());
-        assert!(MtpSchedulerOptions::default().validate().is_ok());
+        assert!(SpeculativeConfig::default().validate().is_ok());
+        assert!(SpeculativeSchedulerOptions::default().validate().is_ok());
         assert!(matches!(
-            MtpSchedulerOptions {
+            SpeculativeSchedulerOptions {
                 max_in_flight_verifications: 0,
-                ..MtpSchedulerOptions::default()
+                ..SpeculativeSchedulerOptions::default()
             }
             .validate(),
             Err(GenerationError::ZeroInFlightVerifications)
@@ -1049,10 +1052,10 @@ mod tests {
             serde_json::from_str::<ResolvedGenerationConfig>(&config_json).unwrap(),
             resolved
         );
-        let options = MtpSchedulerOptions::default();
+        let options = SpeculativeSchedulerOptions::default();
         let options_json = serde_json::to_string(&options).unwrap();
         assert_eq!(
-            serde_json::from_str::<MtpSchedulerOptions>(&options_json).unwrap(),
+            serde_json::from_str::<SpeculativeSchedulerOptions>(&options_json).unwrap(),
             options
         );
     }
@@ -1075,28 +1078,32 @@ mod tests {
 
     #[test]
     fn speculative_request_lifecycle_defers_cancellation_exactly() {
-        let mut lifecycle = MtpRequestLifecycle::new();
-        lifecycle.transition(MtpRequestPhase::ReadyToDraft).unwrap();
+        let mut lifecycle = SpeculativeRequestLifecycle::new();
         lifecycle
-            .transition(MtpRequestPhase::ReadyToSubmitVerification)
+            .transition(SpeculativeRequestPhase::ReadyToDraft)
             .unwrap();
         lifecycle
-            .transition(MtpRequestPhase::TargetVerificationInFlight)
+            .transition(SpeculativeRequestPhase::ReadyToSubmitVerification)
+            .unwrap();
+        lifecycle
+            .transition(SpeculativeRequestPhase::TargetVerificationInFlight)
             .unwrap();
         assert_eq!(
             lifecycle.request_cancellation(true).unwrap(),
-            MtpCancellationDisposition::Deferred
+            SpeculativeCancellationDisposition::Deferred
         );
         assert!(lifecycle.cancellation_pending());
         lifecycle
-            .transition(MtpRequestPhase::VerificationResolution)
+            .transition(SpeculativeRequestPhase::VerificationResolution)
             .unwrap();
-        lifecycle.transition(MtpRequestPhase::Cancelled).unwrap();
+        lifecycle
+            .transition(SpeculativeRequestPhase::Cancelled)
+            .unwrap();
         assert!(lifecycle.is_terminal());
         assert!(!lifecycle.cancellation_pending());
         assert!(matches!(
-            lifecycle.transition(MtpRequestPhase::ReadyToDraft),
-            Err(GenerationError::InvalidMtpPhaseTransition { .. })
+            lifecycle.transition(SpeculativeRequestPhase::ReadyToDraft),
+            Err(GenerationError::InvalidSpeculativePhaseTransition { .. })
         ));
     }
 }

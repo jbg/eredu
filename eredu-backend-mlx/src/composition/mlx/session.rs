@@ -32,7 +32,7 @@ use crate::{
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
-use eredu_core::MtpCapability;
+use eredu_core::SpeculativeCapability;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use super::{
@@ -540,10 +540,10 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Reports how the session-owned model exposes speculative weights.
-    pub fn mtp_capability(&self) -> MtpCapability {
+    pub fn speculative_capability(&self) -> SpeculativeCapability {
         match &self.inner {
-            MlxSessionKind::Complete(model) => model.mtp_capability(),
-            MlxSessionKind::Pipeline(model, _) => model.mtp_capability(),
+            MlxSessionKind::Complete(model) => model.speculative_capability(),
+            MlxSessionKind::Pipeline(model, _) => model.speculative_capability(),
         }
     }
 
@@ -697,7 +697,7 @@ impl<'a> MlxModelSession<'a> {
                         "drafter {:?} is incompatible with target {} ({:?})",
                         drafter.kind(),
                         model.effective_model_type(),
-                        model.mtp_capability()
+                        model.speculative_capability()
                     )))
                 }
             },

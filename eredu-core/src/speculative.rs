@@ -7,8 +7,9 @@ use crate::{
     },
     generation::{
         FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
-        MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase,
-        MtpSchedulerOptions, SemanticEvent, SpeculativeRound, TokenTerminalSignals,
+        SemanticEvent, SpeculativeCancellationDisposition, SpeculativeConfig, SpeculativeRequestId,
+        SpeculativeRequestLifecycle, SpeculativeRequestPhase, SpeculativeRound,
+        SpeculativeSchedulerOptions, TokenTerminalSignals,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ pub struct SpeculativeGenerationOutput {
     /// Portable terminal reason selected by the generation lifecycle.
     pub finish_reason: FinishReason,
     /// Portable speculative execution telemetry.
-    pub stats: MtpStats,
+    pub stats: SpeculativeStats,
 }
 
 /// Completed speculative requests plus aggregate fair-scheduler telemetry.
@@ -37,7 +38,7 @@ pub struct SpeculativeGenerationBatchOutput {
     /// Per-request results in submission order.
     pub requests: Vec<SpeculativeGenerationOutput>,
     /// Aggregate scheduler telemetry.
-    pub scheduler: MtpSchedulerStats,
+    pub scheduler: SpeculativeSchedulerStats,
 }
 
 /// One independently executable lane in a speculative batch.
@@ -51,7 +52,7 @@ where
     /// Fully resolved portable sampling configuration and random seed.
     pub generation: TextGenerationConfig,
     /// Resolved token budget, proposal width, temperature, and EOS ids.
-    pub config: MtpConfig,
+    pub config: SpeculativeConfig,
     /// Portable canonical grammar state.
     pub constraint: C,
     /// Transactional decoded semantic parser state.
@@ -88,7 +89,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
     type Drafter;
 
     /// Reports fail-closed speculative support for the selected model session.
-    fn mtp_capability(runtime: &ModelRuntime<Self>) -> MtpCapability;
+    fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability;
 
     /// Prepares native execution resources and lends them to neutral orchestration.
     fn with_speculative_execution<C, V>(
@@ -127,28 +128,28 @@ impl std::fmt::Display for SpeculativeExecutionTopology {
 /// How a model exposes speculative draft-token weights.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MtpCheckpointKind {
+pub enum SpeculativeDraftSource {
     /// Drafting weights live in a separately prepared model.
     Separate,
     /// Drafting weights are embedded in the selected target model.
     Embedded,
 }
 
-/// Fail-closed multi-token-prediction capability of a prepared model session.
+/// Fail-closed speculative-decoding capability of a prepared model session.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MtpCapability {
+pub enum SpeculativeCapability {
     /// The model does not advertise executable draft weights.
     Unavailable,
-    /// Speculative execution is available with the stated checkpoint form.
+    /// Speculative execution is available with the stated draft source.
     Ready {
         /// Location of the drafting weights.
-        checkpoint: MtpCheckpointKind,
+        draft_source: SpeculativeDraftSource,
     },
     /// Draft weights exist, but this backend cannot execute them.
     Unsupported {
         /// Location of the drafting weights.
-        checkpoint: MtpCheckpointKind,
+        draft_source: SpeculativeDraftSource,
         /// Stable architecture identity reported by the backend.
         architecture: String,
     },
@@ -156,7 +157,7 @@ pub enum MtpCapability {
 
 /// Statistics collected from one speculative sequence.
 #[derive(Debug, Clone, Default)]
-pub struct MtpStats {
+pub struct SpeculativeStats {
     /// Relationship between the request's target and draft execution placements.
     pub execution_topology: SpeculativeExecutionTopology,
     /// Target tokens evaluated during prefill and verification.
@@ -215,7 +216,7 @@ pub struct MtpStats {
     pub elapsed: Duration,
 }
 
-impl MtpStats {
+impl SpeculativeStats {
     /// Fraction of proposed tokens accepted by the target.
     pub fn accept_rate(&self) -> f64 {
         if self.draft_tokens == 0 {
@@ -226,7 +227,7 @@ impl MtpStats {
     }
 
     /// Re-evaluates whether optional lookahead remains profitable.
-    pub fn update_adaptive_lookahead(&mut self, options: MtpSchedulerOptions) {
+    pub fn update_adaptive_lookahead(&mut self, options: SpeculativeSchedulerOptions) {
         if !options.adaptive_lookahead
             || self.adaptive_lookahead_disabled
             || self.optimistic_draft_blocks < options.adaptive_lookahead_min_blocks
@@ -240,7 +241,7 @@ impl MtpStats {
 
 /// Aggregate bounded-scheduler telemetry.
 #[derive(Debug, Clone, Default)]
-pub struct MtpSchedulerStats {
+pub struct SpeculativeSchedulerStats {
     /// Relationship between scheduler target and draft placements.
     pub execution_topology: SpeculativeExecutionTopology,
     /// Total scheduler operations.
@@ -256,14 +257,14 @@ pub struct MtpSchedulerStats {
 /// Backend telemetry that can contribute to portable speculative statistics.
 ///
 /// Implementations translate backend-specific measurements into the stable
-/// semantic counters and durations owned by [`MtpStats`].
+/// semantic counters and durations owned by [`SpeculativeStats`].
 pub trait SpeculativeTelemetry: Default {
     /// Records one completed backend observation.
-    fn record(self, stats: &mut MtpStats);
+    fn record(self, stats: &mut SpeculativeStats);
 }
 
 impl SpeculativeTelemetry for () {
-    fn record(self, _stats: &mut MtpStats) {}
+    fn record(self, _stats: &mut SpeculativeStats) {}
 }
 
 /// Backend-owned first-token output and assistant seed state.
@@ -454,7 +455,7 @@ where
     /// Backend-owned prepared model input.
     pub input: E::Input,
     /// Validated speculative generation controls.
-    pub config: MtpConfig,
+    pub config: SpeculativeConfig,
     /// Canonical sampling, constraint, publication, and cancellation state.
     pub runtime: SpeculativeOutputRuntime<S, C, P>,
     /// Independent target and draft random streams.
@@ -786,7 +787,7 @@ pub trait SpeculativeSemanticState {
     fn take_events(&mut self) -> Vec<crate::generation::SemanticEvent>;
 }
 
-/// Optional transactional semantic state shared by plain and structured MTP.
+/// Optional transactional semantic state shared by plain and structured speculative decoding.
 pub struct SpeculativeSemanticConstraint {
     state: Option<Box<dyn SpeculativeSemanticState>>,
 }
@@ -1268,7 +1269,7 @@ pub struct PublishedSpeculativeVerification<TargetState, DraftState, Distributio
     /// Canonical target randomness after resolution.
     pub target_randomness: Option<RandomState>,
     /// Updated portable request telemetry.
-    pub stats: MtpStats,
+    pub stats: SpeculativeStats,
     /// Backend component telemetry observed at exact completion.
     pub telemetry: T,
     /// Request continuation selected after publication.
@@ -1300,8 +1301,8 @@ pub fn resolve_commit_and_publish<'a, E, S, C, P>(
     runtime: &mut SpeculativeOutputRuntime<S, C, P>,
     target_randomness: Option<&S::RandomState>,
     temperature: f32,
-    mut stats: MtpStats,
-    options: MtpSchedulerOptions,
+    mut stats: SpeculativeStats,
+    options: SpeculativeSchedulerOptions,
     context: E::Context<'a>,
 ) -> PublishedSpeculativeResult<E, S>
 where
@@ -1392,9 +1393,9 @@ pub fn cancel_pending_verification<'a, E, S, C, P>(
     cache: &mut E::Cache,
     pending: PendingSpeculativeVerification<E, S::Distribution>,
     runtime: &mut SpeculativeOutputRuntime<S, C, P>,
-    mut stats: MtpStats,
+    mut stats: SpeculativeStats,
     context: E::Context<'a>,
-) -> Result<(MtpStats, E::Telemetry), SpeculativeDriverError<E::Error>>
+) -> Result<(SpeculativeStats, E::Telemetry), SpeculativeDriverError<E::Error>>
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
@@ -1427,7 +1428,7 @@ pub fn resolve_optimistic_branch<S, D>(
     canonical_prefix: &[u32],
     bonus: Option<u32>,
     terminal: bool,
-    stats: &mut MtpStats,
+    stats: &mut SpeculativeStats,
 ) -> Result<SpeculativeContinuation<S, D>, GenerationError> {
     let Some(branch) = branch else {
         return Ok(SpeculativeContinuation::None);
@@ -1487,14 +1488,20 @@ pub fn resolve_optimistic_branch<S, D>(
     })
 }
 
-fn discard_branch<S, D>(stats: &mut MtpStats, branch: Option<SpeculativeOptimisticBranch<S, D>>) {
+fn discard_branch<S, D>(
+    stats: &mut SpeculativeStats,
+    branch: Option<SpeculativeOptimisticBranch<S, D>>,
+) {
     if let Some(branch) = branch {
         stats.discarded_optimistic_tokens += branch.block.proposals.len();
         stats.discarded_optimistic_blocks += 1;
     }
 }
 
-fn discard_continuation<S, D>(stats: &mut MtpStats, continuation: SpeculativeContinuation<S, D>) {
+fn discard_continuation<S, D>(
+    stats: &mut SpeculativeStats,
+    continuation: SpeculativeContinuation<S, D>,
+) {
     if let SpeculativeContinuation::Promoted(block) = continuation {
         stats.discarded_optimistic_tokens += block.proposals.len();
         stats.discarded_optimistic_blocks += 1;
@@ -1555,18 +1562,18 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
-    id: MtpRequestId,
+    id: SpeculativeRequestId,
     cache: &'cache mut E::Cache,
-    config: MtpConfig,
+    config: SpeculativeConfig,
     runtime: SpeculativeOutputRuntime<S, C, P>,
     target_randomness: Option<S::RandomState>,
     draft_randomness: Option<S::DraftRandomness>,
-    stats: MtpStats,
+    stats: SpeculativeStats,
     started: Instant,
     target_state: Option<E::TargetState>,
     block: Option<SpeculativeDraftBlock<E::DraftState, S::Distribution>>,
     pending: Option<PendingSpeculativeVerification<E, S::Distribution>>,
-    lifecycle: MtpRequestLifecycle,
+    lifecycle: SpeculativeRequestLifecycle,
 }
 
 impl<'cache, E, S, C, P> SpeculativeRequest<'cache, E, S, C, P>
@@ -1577,17 +1584,17 @@ where
     P: SpeculativePublisher<C>,
 {
     /// Stable insertion-order identity.
-    pub const fn id(&self) -> MtpRequestId {
+    pub const fn id(&self) -> SpeculativeRequestId {
         self.id
     }
 
     /// Current validated lifecycle phase.
-    pub const fn phase(&self) -> MtpRequestPhase {
+    pub const fn phase(&self) -> SpeculativeRequestPhase {
         self.lifecycle.phase()
     }
 
     /// Portable request statistics.
-    pub const fn stats(&self) -> &MtpStats {
+    pub const fn stats(&self) -> &SpeculativeStats {
         &self.stats
     }
 
@@ -1613,7 +1620,7 @@ where
 
     fn transition(
         &mut self,
-        next: MtpRequestPhase,
+        next: SpeculativeRequestPhase,
     ) -> Result<(), SpeculativeDriverError<E::Error>> {
         self.lifecycle
             .transition(next)
@@ -1626,8 +1633,9 @@ where
             .request_cancellation(self.pending.is_some())
             .map_err(SpeculativeDriverError::Generation)?
         {
-            MtpCancellationDisposition::AlreadyTerminal | MtpCancellationDisposition::Deferred => {}
-            MtpCancellationDisposition::CancelNow => {
+            SpeculativeCancellationDisposition::AlreadyTerminal
+            | SpeculativeCancellationDisposition::Deferred => {}
+            SpeculativeCancellationDisposition::CancelNow => {
                 self.block = None;
                 self.runtime
                     .cancel()
@@ -1652,7 +1660,7 @@ where
             > + 'context,
     {
         let optimistic_eligible = if self.lifecycle.phase()
-            != MtpRequestPhase::TargetVerificationInFlight
+            != SpeculativeRequestPhase::TargetVerificationInFlight
             || !optimistic_execution_available
         {
             false
@@ -1706,7 +1714,7 @@ where
                     .saturating_sub(self.runtime.sequence().tokens().len()),
             );
         if target_count == 0 {
-            self.transition(MtpRequestPhase::Completed)?;
+            self.transition(SpeculativeRequestPhase::Completed)?;
             self.stats.elapsed = self.started.elapsed();
             return Ok(false);
         }
@@ -1779,7 +1787,7 @@ where
         }
         executor.take_telemetry()?.record(&mut self.stats);
         self.block = Some(block);
-        self.transition(MtpRequestPhase::ReadyToSubmitVerification)?;
+        self.transition(SpeculativeRequestPhase::ReadyToSubmitVerification)?;
         Ok(additional > 0)
     }
 
@@ -1809,7 +1817,7 @@ where
         let pending = submit_verification_transaction(executor, self.cache, last, block, context)?;
         self.stats.target_tokens += pending.submitted_tokens();
         self.pending = Some(pending);
-        self.transition(MtpRequestPhase::TargetVerificationInFlight)
+        self.transition(SpeculativeRequestPhase::TargetVerificationInFlight)
     }
 
     fn draft_optimistic<'context>(
@@ -1826,7 +1834,7 @@ where
             > + 'context,
     {
         let started = Instant::now();
-        self.transition(MtpRequestPhase::OptimisticDraftInProgress)?;
+        self.transition(SpeculativeRequestPhase::OptimisticDraftInProgress)?;
         let pending = self
             .pending
             .as_mut()
@@ -1868,13 +1876,13 @@ where
                 assumed_prefix: history,
             })
             .map_err(SpeculativeDriverError::Generation)?;
-        self.transition(MtpRequestPhase::OptimisticDraftReady)
+        self.transition(SpeculativeRequestPhase::OptimisticDraftReady)
     }
 
     fn resolve_verification<'context>(
         &mut self,
         executor: &mut E,
-        options: MtpSchedulerOptions,
+        options: SpeculativeSchedulerOptions,
         context: E::Context<'context>,
     ) -> Result<(), SpeculativeDriverError<E::Error>>
     where
@@ -1885,7 +1893,7 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        self.transition(MtpRequestPhase::VerificationResolution)?;
+        self.transition(SpeculativeRequestPhase::VerificationResolution)?;
         let pending = self
             .pending
             .take()
@@ -1901,7 +1909,7 @@ where
             )?;
             telemetry.record(&mut stats);
             self.stats = stats;
-            self.transition(MtpRequestPhase::Cancelled)?;
+            self.transition(SpeculativeRequestPhase::Cancelled)?;
             self.stats.elapsed = self.started.elapsed();
             return Ok(());
         }
@@ -1923,14 +1931,14 @@ where
         match published.status {
             SpeculativePublicationStatus::Continue(continuation) => {
                 self.block = continuation.into_block();
-                self.transition(MtpRequestPhase::ReadyToDraft)?;
+                self.transition(SpeculativeRequestPhase::ReadyToDraft)?;
             }
             SpeculativePublicationStatus::Completed => {
-                self.transition(MtpRequestPhase::Completed)?;
+                self.transition(SpeculativeRequestPhase::Completed)?;
                 self.stats.elapsed = self.started.elapsed();
             }
             SpeculativePublicationStatus::Cancelled => {
-                self.transition(MtpRequestPhase::Cancelled)?;
+                self.transition(SpeculativeRequestPhase::Cancelled)?;
                 self.stats.elapsed = self.started.elapsed();
             }
         }
@@ -1941,17 +1949,17 @@ where
 /// One completed request returned in stable submission order.
 pub struct CompletedSpeculativeRequest<S> {
     /// Stable request identity.
-    pub id: MtpRequestId,
+    pub id: SpeculativeRequestId,
     /// Canonical generated token sequence.
     pub token_ids: Vec<u32>,
     /// Portable request telemetry.
-    pub stats: MtpStats,
+    pub stats: SpeculativeStats,
     /// Final backend sampling state.
     pub sampler: S,
     /// Terminal reason selected by the canonical sequence.
     pub finish_reason: Option<FinishReason>,
     /// Terminal lifecycle phase.
-    pub phase: MtpRequestPhase,
+    pub phase: SpeculativeRequestPhase,
 }
 
 /// Completed request table and aggregate fair-scheduler telemetry.
@@ -1959,7 +1967,7 @@ pub struct CompletedSpeculativeSchedule<S> {
     /// Requests in stable submission order.
     pub requests: Vec<CompletedSpeculativeRequest<S>>,
     /// Aggregate scheduler telemetry.
-    pub scheduler: MtpSchedulerStats,
+    pub scheduler: SpeculativeSchedulerStats,
 }
 
 /// Canonical table and action coordinator for speculative requests.
@@ -1972,7 +1980,7 @@ where
 {
     schedule: SpeculativeSchedule,
     requests: Vec<SpeculativeRequest<'cache, E, S, C, P>>,
-    stats: MtpSchedulerStats,
+    stats: SpeculativeSchedulerStats,
 }
 
 impl<'cache, E, S, C, P> SpeculativeRequestTable<'cache, E, S, C, P>
@@ -1984,26 +1992,29 @@ where
 {
     /// Creates an empty validated request table.
     pub fn new(
-        options: MtpSchedulerOptions,
+        options: SpeculativeSchedulerOptions,
         topology: SpeculativeExecutionTopology,
     ) -> Result<Self, GenerationError> {
         Ok(Self {
             schedule: SpeculativeSchedule::new(options)?,
             requests: Vec::new(),
-            stats: MtpSchedulerStats {
+            stats: SpeculativeSchedulerStats {
                 execution_topology: topology,
-                ..MtpSchedulerStats::default()
+                ..SpeculativeSchedulerStats::default()
             },
         })
     }
 
     /// Returns one request by stable identity.
-    pub fn request(&self, id: MtpRequestId) -> Option<&SpeculativeRequest<'cache, E, S, C, P>> {
+    pub fn request(
+        &self,
+        id: SpeculativeRequestId,
+    ) -> Option<&SpeculativeRequest<'cache, E, S, C, P>> {
         self.requests.get(id.index())
     }
 
     /// Returns one request's current phase.
-    pub fn phase(&self, id: MtpRequestId) -> Option<MtpRequestPhase> {
+    pub fn phase(&self, id: SpeculativeRequestId) -> Option<SpeculativeRequestPhase> {
         self.request(id).map(SpeculativeRequest::phase)
     }
 
@@ -2015,7 +2026,7 @@ where
     }
 
     /// Validated scheduler options.
-    pub const fn options(&self) -> MtpSchedulerOptions {
+    pub const fn options(&self) -> SpeculativeSchedulerOptions {
         self.schedule.options()
     }
 
@@ -2026,12 +2037,12 @@ where
         executor: &mut E,
         cache: &'cache mut E::Cache,
         input: E::Input,
-        config: MtpConfig,
+        config: SpeculativeConfig,
         mut runtime: SpeculativeOutputRuntime<S, C, P>,
         randomness: SpeculativeRandomness<S::RandomState, S::DraftRandomness>,
         component_timings_collected: bool,
         context: E::Context<'context>,
-    ) -> Result<MtpRequestId, SpeculativeDriverError<E::Error>>
+    ) -> Result<SpeculativeRequestId, SpeculativeDriverError<E::Error>>
     where
         E: 'context,
         S: SpeculativeSampling<
@@ -2048,21 +2059,21 @@ where
                 GenerationError::NoBackendDraftCapacity,
             ));
         }
-        let id = MtpRequestId::new(self.requests.len());
+        let id = SpeculativeRequestId::new(self.requests.len());
         let started = Instant::now();
-        let mut stats = MtpStats {
+        let mut stats = SpeculativeStats {
             execution_topology: self.stats.execution_topology,
             component_timings_collected,
-            ..MtpStats::default()
+            ..SpeculativeStats::default()
         };
         let (target_randomness, draft_randomness) = (randomness.target, randomness.draft);
         let (target_state, lifecycle) = if runtime.cancellation().is_cancelled() {
             runtime.cancel().map_err(SpeculativeDriverError::Output)?;
             stats.elapsed = started.elapsed();
-            (None, MtpRequestLifecycle::cancelled())
+            (None, SpeculativeRequestLifecycle::cancelled())
         } else if runtime.sequence().is_finished() {
             stats.elapsed = started.elapsed();
-            (None, MtpRequestLifecycle::completed())
+            (None, SpeculativeRequestLifecycle::completed())
         } else {
             let prefill = executor.prefill(input, cache, context)?;
             stats.target_tokens = prefill.evaluated_tokens;
@@ -2098,14 +2109,14 @@ where
             stats.emitted_tokens = 1;
             let lifecycle = if cancelled {
                 stats.elapsed = started.elapsed();
-                MtpRequestLifecycle::cancelled()
+                SpeculativeRequestLifecycle::cancelled()
             } else if reason.is_some() {
                 stats.elapsed = started.elapsed();
-                MtpRequestLifecycle::completed()
+                SpeculativeRequestLifecycle::completed()
             } else {
-                let mut lifecycle = MtpRequestLifecycle::new();
+                let mut lifecycle = SpeculativeRequestLifecycle::new();
                 lifecycle
-                    .transition(MtpRequestPhase::ReadyToDraft)
+                    .transition(SpeculativeRequestPhase::ReadyToDraft)
                     .map_err(SpeculativeDriverError::Generation)?;
                 lifecycle
             };
@@ -2144,9 +2155,12 @@ where
     }
 
     /// Requests cancellation without releasing an exact in-flight transaction.
-    pub fn cancel(&mut self, id: MtpRequestId) -> Result<(), SpeculativeDriverError<E::Error>> {
+    pub fn cancel(
+        &mut self,
+        id: SpeculativeRequestId,
+    ) -> Result<(), SpeculativeDriverError<E::Error>> {
         let request = self.requests.get_mut(id.index()).ok_or_else(|| {
-            SpeculativeDriverError::Generation(GenerationError::UnknownMtpRequest {
+            SpeculativeDriverError::Generation(GenerationError::UnknownSpeculativeRequest {
                 index: id.index(),
             })
         })?;
@@ -2303,7 +2317,7 @@ where
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SpeculativeCandidate {
     /// Current validated request phase.
-    pub phase: MtpRequestPhase,
+    pub phase: SpeculativeRequestPhase,
     /// Whether this request may start exact optimistic work now.
     pub optimistic_eligible: bool,
 }
@@ -2328,13 +2342,13 @@ pub enum SpeculativeAction {
 
 /// Backend-neutral fair action selector for speculative requests.
 pub struct SpeculativeSchedule {
-    options: MtpSchedulerOptions,
+    options: SpeculativeSchedulerOptions,
     cursor: usize,
 }
 
 impl SpeculativeSchedule {
     /// Creates a validated schedule.
-    pub fn new(options: MtpSchedulerOptions) -> Result<Self, GenerationError> {
+    pub fn new(options: SpeculativeSchedulerOptions) -> Result<Self, GenerationError> {
         Ok(Self {
             options: options.validate()?,
             cursor: 0,
@@ -2342,7 +2356,7 @@ impl SpeculativeSchedule {
     }
 
     /// Validated scheduler options.
-    pub const fn options(&self) -> MtpSchedulerOptions {
+    pub const fn options(&self) -> SpeculativeSchedulerOptions {
         self.options
     }
 
@@ -2354,7 +2368,7 @@ impl SpeculativeSchedule {
         if candidates.iter().all(|candidate| {
             matches!(
                 candidate.phase,
-                MtpRequestPhase::Completed | MtpRequestPhase::Cancelled
+                SpeculativeRequestPhase::Completed | SpeculativeRequestPhase::Cancelled
             )
         }) {
             return Ok(None);
@@ -2364,21 +2378,21 @@ impl SpeculativeSchedule {
             .filter(|candidate| {
                 matches!(
                     candidate.phase,
-                    MtpRequestPhase::TargetVerificationInFlight
-                        | MtpRequestPhase::OptimisticDraftInProgress
-                        | MtpRequestPhase::OptimisticDraftReady
-                        | MtpRequestPhase::VerificationResolution
+                    SpeculativeRequestPhase::TargetVerificationInFlight
+                        | SpeculativeRequestPhase::OptimisticDraftInProgress
+                        | SpeculativeRequestPhase::OptimisticDraftReady
+                        | SpeculativeRequestPhase::VerificationResolution
                 )
             })
             .count();
         let optimistic = candidates
             .iter()
-            .filter(|candidate| candidate.phase == MtpRequestPhase::OptimisticDraftReady)
+            .filter(|candidate| candidate.phase == SpeculativeRequestPhase::OptimisticDraftReady)
             .count();
 
         if in_flight < self.options.max_in_flight_verifications {
             if let Some(index) = self.select(candidates, |candidate| {
-                candidate.phase == MtpRequestPhase::ReadyToSubmitVerification
+                candidate.phase == SpeculativeRequestPhase::ReadyToSubmitVerification
             }) {
                 return Ok(Some(SpeculativeAction::SubmitVerification(index)));
             }
@@ -2388,14 +2402,14 @@ impl SpeculativeSchedule {
                 && self.options.lookahead_blocks > 0
             {
                 if let Some(index) = self.select(candidates, |candidate| {
-                    candidate.phase == MtpRequestPhase::TargetVerificationInFlight
+                    candidate.phase == SpeculativeRequestPhase::TargetVerificationInFlight
                         && candidate.optimistic_eligible
                 }) {
                     return Ok(Some(SpeculativeAction::DraftOptimistic(index)));
                 }
             }
             if let Some(index) = self.select(candidates, |candidate| {
-                candidate.phase == MtpRequestPhase::ReadyToDraft
+                candidate.phase == SpeculativeRequestPhase::ReadyToDraft
             }) {
                 return Ok(Some(SpeculativeAction::DraftCommitted {
                     index,
@@ -2405,14 +2419,14 @@ impl SpeculativeSchedule {
             if let Some(index) = self.select(candidates, |candidate| {
                 matches!(
                     candidate.phase,
-                    MtpRequestPhase::TargetVerificationInFlight
-                        | MtpRequestPhase::OptimisticDraftReady
+                    SpeculativeRequestPhase::TargetVerificationInFlight
+                        | SpeculativeRequestPhase::OptimisticDraftReady
                 )
             }) {
                 return Ok(Some(SpeculativeAction::ResolveVerification(index)));
             }
         } else if let Some(index) = self.select(candidates, |candidate| {
-            candidate.phase == MtpRequestPhase::ReadyToDraft
+            candidate.phase == SpeculativeRequestPhase::ReadyToDraft
         }) {
             return Ok(Some(SpeculativeAction::DraftCommitted {
                 index,
@@ -2446,14 +2460,14 @@ mod tests {
     type TransactionTrace = Rc<RefCell<Vec<&'static str>>>;
 
     #[test]
-    fn mtp_capability_schema_round_trips_without_backend_identity() {
-        let capability = MtpCapability::Unsupported {
-            checkpoint: MtpCheckpointKind::Embedded,
+    fn speculative_capability_schema_round_trips_without_backend_identity() {
+        let capability = SpeculativeCapability::Unsupported {
+            draft_source: SpeculativeDraftSource::Embedded,
             architecture: "future_decoder".into(),
         };
         let json = serde_json::to_string(&capability).unwrap();
         assert_eq!(
-            serde_json::from_str::<MtpCapability>(&json).unwrap(),
+            serde_json::from_str::<SpeculativeCapability>(&json).unwrap(),
             capability
         );
         assert!(!json.contains("mlx"));
@@ -2997,9 +3011,10 @@ mod tests {
 
     #[test]
     fn portable_schedule_is_fair_and_respects_retained_capacity() {
-        let mut schedule = SpeculativeSchedule::new(MtpSchedulerOptions::default()).unwrap();
+        let mut schedule =
+            SpeculativeSchedule::new(SpeculativeSchedulerOptions::default()).unwrap();
         let ready = SpeculativeCandidate {
-            phase: MtpRequestPhase::ReadyToSubmitVerification,
+            phase: SpeculativeRequestPhase::ReadyToSubmitVerification,
             optimistic_eligible: false,
         };
         assert_eq!(
@@ -3012,11 +3027,11 @@ mod tests {
         );
 
         let in_flight = SpeculativeCandidate {
-            phase: MtpRequestPhase::TargetVerificationInFlight,
+            phase: SpeculativeRequestPhase::TargetVerificationInFlight,
             optimistic_eligible: false,
         };
         let draft = SpeculativeCandidate {
-            phase: MtpRequestPhase::ReadyToDraft,
+            phase: SpeculativeRequestPhase::ReadyToDraft,
             optimistic_eligible: false,
         };
         assert_eq!(
@@ -3033,10 +3048,10 @@ mod tests {
         let mut executor = MockExecutor::default();
         let mut first_cache = Vec::new();
         let mut second_cache = Vec::new();
-        let options = MtpSchedulerOptions::default().with_lookahead(false);
+        let options = SpeculativeSchedulerOptions::default().with_lookahead(false);
         let mut table =
             SpeculativeRequestTable::new(options, SpeculativeExecutionTopology::Single).unwrap();
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 3,
             max_draft_tokens: 2,
             temperature: 0.7,
@@ -3074,8 +3089,14 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(table.phase(first), Some(MtpRequestPhase::ReadyToDraft));
-        assert_eq!(table.phase(second), Some(MtpRequestPhase::ReadyToDraft));
+        assert_eq!(
+            table.phase(first),
+            Some(SpeculativeRequestPhase::ReadyToDraft)
+        );
+        assert_eq!(
+            table.phase(second),
+            Some(SpeculativeRequestPhase::ReadyToDraft)
+        );
         table.step(&mut executor, false, ()).unwrap();
         table.step(&mut executor, false, ()).unwrap();
         assert!(table.request(first).unwrap().has_pending_verification());
@@ -3085,10 +3106,10 @@ mod tests {
         let output = table.finish().unwrap();
         assert_eq!(output.requests.len(), 2);
         assert_eq!(output.requests[0].id, first);
-        assert_eq!(output.requests[0].phase, MtpRequestPhase::Cancelled);
+        assert_eq!(output.requests[0].phase, SpeculativeRequestPhase::Cancelled);
         assert_eq!(output.requests[0].token_ids, [1]);
         assert_eq!(output.requests[1].id, second);
-        assert_eq!(output.requests[1].phase, MtpRequestPhase::Completed);
+        assert_eq!(output.requests[1].phase, SpeculativeRequestPhase::Completed);
         assert_eq!(output.requests[1].token_ids, [1, 1, 0]);
         assert!(output.scheduler.cross_request_draft_opportunities > 0);
         assert_eq!(first_cache, [4, 1]);
@@ -3099,14 +3120,14 @@ mod tests {
     fn request_table_applies_optimistic_actions_without_backend_scheduler_state() {
         let mut executor = MockExecutor::default();
         let mut cache = Vec::new();
-        let config = MtpConfig {
+        let config = SpeculativeConfig {
             max_tokens: 5,
             max_draft_tokens: 2,
             temperature: 0.7,
             eos_token_ids: Vec::new(),
         };
         let mut table = SpeculativeRequestTable::new(
-            MtpSchedulerOptions::default(),
+            SpeculativeSchedulerOptions::default(),
             SpeculativeExecutionTopology::SameDeviceSplit,
         )
         .unwrap();
@@ -3129,10 +3150,13 @@ mod tests {
         table.step(&mut executor, true, ()).unwrap();
         table.step(&mut executor, true, ()).unwrap();
         table.step(&mut executor, true, ()).unwrap();
-        assert_eq!(table.phase(id), Some(MtpRequestPhase::OptimisticDraftReady));
+        assert_eq!(
+            table.phase(id),
+            Some(SpeculativeRequestPhase::OptimisticDraftReady)
+        );
         table.run(&mut executor, true, ()).unwrap();
         let output = table.finish().unwrap();
-        assert_eq!(output.requests[0].phase, MtpRequestPhase::Completed);
+        assert_eq!(output.requests[0].phase, SpeculativeRequestPhase::Completed);
         assert!(output.requests[0].stats.optimistic_draft_blocks > 0);
         assert!(output.requests[0].stats.discarded_optimistic_blocks > 0);
         assert_eq!(output.scheduler.peak_optimistic_branches, 1);
@@ -3181,8 +3205,8 @@ mod tests {
             &mut runtime,
             Some(&0),
             0.7,
-            MtpStats::default(),
-            MtpSchedulerOptions::default(),
+            SpeculativeStats::default(),
+            SpeculativeSchedulerOptions::default(),
             (),
         )
         .unwrap();
@@ -3238,7 +3262,7 @@ mod tests {
             &mut cache,
             pending,
             &mut runtime,
-            MtpStats::default(),
+            SpeculativeStats::default(),
             (),
         )
         .unwrap();

@@ -7,7 +7,7 @@ pub mod external;
 /// MLX semantic-generation resource adapter over the portable runtime driver.
 pub mod scheduler;
 
-pub use scheduler::MtpComponentTimingGuard;
+pub use scheduler::SpeculativeComponentTimingGuard;
 
 use eredu_core::{
     Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
@@ -196,13 +196,13 @@ impl MlxDrafter {
 
 /// Target and assistant streams assigned to one speculative session.
 #[derive(Debug, Clone, Copy)]
-pub struct MtpExecutionStreams<'a> {
+pub struct SpeculativeExecutionStreams<'a> {
     target: &'a Stream,
     draft: &'a Stream,
     topology: SpeculativeExecutionTopology,
 }
 
-impl<'a> MtpExecutionStreams<'a> {
+impl<'a> SpeculativeExecutionStreams<'a> {
     /// Creates an execution assignment and classifies its device topology.
     pub fn new(target: &'a Stream, draft: &'a Stream) -> Result<Self, Exception> {
         let topology = if target == draft {
@@ -280,7 +280,7 @@ impl<'a> MtpExecutionStreams<'a> {
     ) -> Result<Event, Exception> {
         if self.topology != SpeculativeExecutionTopology::SameDeviceSplit {
             return Err(Exception::custom(format!(
-                "MTP {direction} event handoff requires distinct streams on one device, got {}",
+                "speculative {direction} event handoff requires distinct streams on one device, got {}",
                 self.topology
             )));
         }
@@ -365,7 +365,7 @@ where
     type RandomState = RandomState;
     type DraftRandomness = Array;
     type Context<'a>
-        = MtpExecutionStreams<'a>
+        = SpeculativeExecutionStreams<'a>
     where
         Self: 'a;
     type Error = Exception;
@@ -572,7 +572,7 @@ where
 
 fn sampling_stream<'a>(
     placement: SamplingPlacement,
-    context: MtpExecutionStreams<'a>,
+    context: SpeculativeExecutionStreams<'a>,
 ) -> &'a Stream {
     match placement {
         SamplingPlacement::Target => context.target(),
@@ -604,7 +604,8 @@ fn probability_at(probabilities: &Array, token: u32, stream: &Stream) -> Result<
 }
 
 fn uniform(state: Option<&mut RandomState>, stream: &Stream) -> Result<f32, Exception> {
-    let state = state.ok_or_else(|| Exception::custom("stochastic MTP requires a PRNG key"))?;
+    let state = state
+        .ok_or_else(|| Exception::custom("stochastic speculative decoding requires a PRNG key"))?;
     let key = state.next_key(stream)?;
     Ok(random::uniform::<_, f32>(0.0, 1.0, &[1], &key, stream)?.item::<f32>(stream))
 }

@@ -15,14 +15,15 @@ use crate::{
         media::input::ModelInput,
     },
     composition::{
-        gemma4::{Gemma4AssistantModel, Gemma4Model, Gemma4MtpOutput},
+        gemma4::{Gemma4AssistantModel, Gemma4Model, Gemma4SpeculativeOutput},
         mlx::{
             speculative::{
-                scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
+                scheduler::SpeculativeComponentTimings, MlxSpeculativeCompletion,
+                SpeculativeExecutionStreams,
             },
             MlxModelInput,
         },
-        muse_glimmer::{MuseGlimmerDFlashModel, MuseGlimmerModel, MuseGlimmerMtpOutput},
+        muse_glimmer::{MuseGlimmerDFlashModel, MuseGlimmerModel, MuseGlimmerSpeculativeOutput},
     },
     MlxTensor,
 };
@@ -51,7 +52,7 @@ pub struct MuseDraftState {
 }
 
 pub struct MuseVerification {
-    output: MuseGlimmerMtpOutput,
+    output: MuseGlimmerSpeculativeOutput,
     inputs: Array,
 }
 
@@ -96,7 +97,7 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
 
     fn state_on_draft_stream(
         state: &MuseTargetState,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<MuseTargetState, Exception> {
         if !streams.is_split() {
             return Ok(state.clone());
@@ -127,7 +128,7 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
     fn target_embeddings_on_draft(
         &mut self,
         ids: &Array,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
         let hidden = self
             .target
@@ -150,7 +151,7 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
     fn target_logits_on_draft(
         &mut self,
         states: &Array,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
         let states = if !streams.is_split() {
             states.clone()
@@ -183,7 +184,7 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
 
     fn target_state(
         &self,
-        output: &MuseGlimmerMtpOutput,
+        output: &MuseGlimmerSpeculativeOutput,
         draft_context: Option<eredu_architectures::muse_glimmer::DFlashContext<MlxTensor>>,
         cache_len: i32,
         stream: &safemlx::Stream,
@@ -206,11 +207,11 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
     type Verification = MuseVerification;
     type Logits = Array;
     type Context<'a>
-        = MtpExecutionStreams<'a>
+        = SpeculativeExecutionStreams<'a>
     where
         Self: 'a;
     type Completion = MlxSpeculativeCompletion;
-    type Telemetry = MtpComponentTimings;
+    type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
 
     fn max_proposals(&self) -> usize {
@@ -221,7 +222,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         &mut self,
         input: MlxModelInput,
         cache: &mut Self::Cache,
-        streams: MtpExecutionStreams<'context>,
+        streams: SpeculativeExecutionStreams<'context>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
     where
         Self: 'context,
@@ -252,7 +253,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         state: &Self::TargetState,
         last_token: u32,
         proposal_capacity: usize,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
         let maximum = self.max_proposals();
         if proposal_capacity == 0 || proposal_capacity > maximum {
@@ -305,7 +306,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         &mut self,
         state: &mut Self::DraftState,
         _last_token: u32,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
         if state.cursor >= state.proposal_capacity {
             return Err(Exception::custom("Muse-Glimmer DFlash block is exhausted"));
@@ -327,7 +328,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
         let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
         if streams.crosses_devices() {
@@ -356,7 +357,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
     fn verification_logits<'a>(
         output: &Self::Verification,
         index: usize,
-        streams: MtpExecutionStreams<'a>,
+        streams: SpeculativeExecutionStreams<'a>,
     ) -> Result<Array, Exception>
     where
         Self: 'a,
@@ -375,7 +376,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
         let input_len = output.inputs.dim(1) as usize;
         if verified_inputs > input_len
@@ -436,7 +437,7 @@ fn dflash_block_token_ids(anchor: u32, mask: u32, proposal_capacity: usize) -> V
 }
 
 pub struct Gemma4Verification {
-    output: Gemma4MtpOutput,
+    output: Gemma4SpeculativeOutput,
     inputs: Array,
 }
 
@@ -452,7 +453,7 @@ impl<'a> Gemma4ExternalExecutor<'a> {
     }
 
     fn state_at(
-        output: &Gemma4MtpOutput,
+        output: &Gemma4SpeculativeOutput,
         row: i32,
         cache_len: i32,
         stream: &safemlx::Stream,
@@ -485,7 +486,7 @@ impl<'a> Gemma4ExternalExecutor<'a> {
 
     fn state_on_draft_stream(
         state: &Gemma4TargetState,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Gemma4TargetState, Exception> {
         if !streams.is_split() {
             return Ok(state.clone());
@@ -529,11 +530,11 @@ impl<'a> Gemma4ExternalExecutor<'a> {
     fn proposal_embedding(
         &mut self,
         token: u32,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
         let embedding = self
             .target
-            .embed_mtp_token(token, streams.target())
+            .embed_draft_token(token, streams.target())
             .map_err(|error| Exception::custom(error.to_string()))?
             .into_array();
         if !streams.is_split() {
@@ -559,11 +560,11 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
     type Verification = Gemma4Verification;
     type Logits = Array;
     type Context<'a>
-        = MtpExecutionStreams<'a>
+        = SpeculativeExecutionStreams<'a>
     where
         Self: 'a;
     type Completion = MlxSpeculativeCompletion;
-    type Telemetry = MtpComponentTimings;
+    type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
 
     fn max_proposals(&self) -> usize {
@@ -578,7 +579,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         &mut self,
         input: MlxModelInput,
         cache: &mut Self::Cache,
-        streams: MtpExecutionStreams<'context>,
+        streams: SpeculativeExecutionStreams<'context>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
     where
         Self: 'context,
@@ -586,7 +587,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         input.with_borrowed(|input: ModelInput<'_>| {
             let output = self
                 .target
-                .prefill_mtp(input, cache, streams.target())
+                .prefill_speculative(input, cache, streams.target())
                 .map_err(|error| Exception::custom(error.to_string()))?;
             let sequence = output.logits.as_array().dim(-2);
             if sequence <= 0 {
@@ -610,7 +611,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         state: &Self::TargetState,
         _last_token: u32,
         _proposal_capacity: usize,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
         let state = Self::state_on_draft_stream(state, streams)?;
         let shared_kv = state
@@ -637,7 +638,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
         let embedding = self.proposal_embedding(last_token, streams)?;
         self.assistant
@@ -656,7 +657,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
         let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
         if streams.crosses_devices() {
@@ -664,7 +665,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         }
         let output = self
             .target
-            .verify_mtp(
+            .verify_speculative(
                 &MlxTensor::from_array(inputs.clone()),
                 cache,
                 streams.target(),
@@ -680,7 +681,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
     fn verification_logits<'a>(
         output: &Self::Verification,
         index: usize,
-        streams: MtpExecutionStreams<'a>,
+        streams: SpeculativeExecutionStreams<'a>,
     ) -> Result<Array, Exception>
     where
         Self: 'a,
@@ -699,7 +700,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
-        streams: MtpExecutionStreams<'_>,
+        streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
         let input_len = output.inputs.dim(1) as usize;
         if verified_inputs == 0 || verified_inputs > input_len {
@@ -725,7 +726,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
             .try_index_device((.., ..verified_inputs as i32), streams.target())?;
         let replayed = self
             .target
-            .verify_mtp(&MlxTensor::from_array(retained), cache, streams.target())
+            .verify_speculative(&MlxTensor::from_array(retained), cache, streams.target())
             .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(SpeculativeCommit {
             state: Self::state_at(

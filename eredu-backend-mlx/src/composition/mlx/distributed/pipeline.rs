@@ -125,7 +125,7 @@ use eredu_core::{
     residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
-    MtpCapability, MtpCheckpointKind,
+    SpeculativeCapability, SpeculativeDraftSource,
 };
 use eredu_runtime::DenseDiskStreamReport;
 use eredu_runtime::ExecutionGroupReadySet;
@@ -9753,57 +9753,73 @@ pub struct PipelineModel {
     last_placed_ingress_schedule: PlacedIngressScheduleReport,
 }
 
-fn pipeline_mtp_capability(
-    checkpoint: Option<MtpCheckpointKind>,
+fn pipeline_speculative_capability(
+    draft_source: Option<SpeculativeDraftSource>,
     global_embedded_mtp_layers: usize,
     model_kind: ModelKind,
-) -> MtpCapability {
-    match checkpoint {
-        Some(MtpCheckpointKind::Embedded) if global_embedded_mtp_layers > 0 => {
-            MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
+) -> SpeculativeCapability {
+    match draft_source {
+        Some(SpeculativeDraftSource::Embedded) if global_embedded_mtp_layers > 0 => {
+            SpeculativeCapability::Ready {
+                draft_source: SpeculativeDraftSource::Embedded,
             }
         }
-        Some(checkpoint) => MtpCapability::Unsupported {
-            checkpoint,
+        Some(draft_source) => SpeculativeCapability::Unsupported {
+            draft_source,
             architecture: model_kind.canonical_name().into(),
         },
-        None => MtpCapability::Unavailable,
+        None => SpeculativeCapability::Unavailable,
     }
 }
 
 #[cfg(test)]
 #[test]
-fn pipeline_mtp_capability_distinguishes_unsupported_weights_from_absence() {
+fn pipeline_speculative_capability_distinguishes_unsupported_weights_from_absence() {
     assert_eq!(
-        pipeline_mtp_capability(Some(MtpCheckpointKind::Separate), 0, ModelKind::Gemma4),
-        MtpCapability::Unsupported {
-            checkpoint: MtpCheckpointKind::Separate,
+        pipeline_speculative_capability(
+            Some(SpeculativeDraftSource::Separate),
+            0,
+            ModelKind::Gemma4
+        ),
+        SpeculativeCapability::Unsupported {
+            draft_source: SpeculativeDraftSource::Separate,
             architecture: "gemma4".into(),
         }
     );
     assert_eq!(
-        pipeline_mtp_capability(Some(MtpCheckpointKind::Separate), 0, ModelKind::MuseGlimmer),
-        MtpCapability::Unsupported {
-            checkpoint: MtpCheckpointKind::Separate,
+        pipeline_speculative_capability(
+            Some(SpeculativeDraftSource::Separate),
+            0,
+            ModelKind::MuseGlimmer
+        ),
+        SpeculativeCapability::Unsupported {
+            draft_source: SpeculativeDraftSource::Separate,
             architecture: "muse_glimmer".into(),
         }
     );
     assert_eq!(
-        pipeline_mtp_capability(None, 0, ModelKind::Llama),
-        MtpCapability::Unavailable
+        pipeline_speculative_capability(None, 0, ModelKind::Llama),
+        SpeculativeCapability::Unavailable
     );
     assert_eq!(
-        pipeline_mtp_capability(Some(MtpCheckpointKind::Embedded), 0, ModelKind::Inkling),
-        MtpCapability::Unsupported {
-            checkpoint: MtpCheckpointKind::Embedded,
+        pipeline_speculative_capability(
+            Some(SpeculativeDraftSource::Embedded),
+            0,
+            ModelKind::Inkling
+        ),
+        SpeculativeCapability::Unsupported {
+            draft_source: SpeculativeDraftSource::Embedded,
             architecture: "inkling".into(),
         }
     );
     assert_eq!(
-        pipeline_mtp_capability(Some(MtpCheckpointKind::Embedded), 1, ModelKind::Inkling),
-        MtpCapability::Ready {
-            checkpoint: MtpCheckpointKind::Embedded,
+        pipeline_speculative_capability(
+            Some(SpeculativeDraftSource::Embedded),
+            1,
+            ModelKind::Inkling
+        ),
+        SpeculativeCapability::Ready {
+            draft_source: SpeculativeDraftSource::Embedded,
         }
     );
 }
@@ -10686,12 +10702,12 @@ impl PipelineModel {
     /// Reports the complete pipeline's prediction support.
     /// Predictor weights remain stage-local, but every rank must advertise the
     /// same capability because speculative execution is a collective session.
-    pub fn mtp_capability(&self) -> MtpCapability {
-        pipeline_mtp_capability(
+    pub fn speculative_capability(&self) -> SpeculativeCapability {
+        pipeline_speculative_capability(
             self.stage
                 .capability_estimate()
                 .ok()
-                .and_then(|estimate| estimate.mtp_checkpoint_kind()),
+                .and_then(|estimate| estimate.speculative_draft_source()),
             self.info.global_embedded_mtp_layers,
             self.info.model_kind,
         )

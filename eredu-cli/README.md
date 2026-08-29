@@ -105,13 +105,14 @@ an external compatible assistant with `--draft-model`:
 ```sh
 eredu --model /path/to/target \
   --draft-model /path/to/assistant \
-  --mtp-draft-device cpu --mtp-draft-tokens 3 \
+  --speculative-draft-device cpu --speculative-draft-tokens 3 \
   "Explain speculative decoding."
 ```
 
 Speculative generation requires a recognized executable chat protocol and is
 not available with `--raw`. See [Speculative decoding and
-MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md) for compatibility and placement rules.
+MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md) for
+compatibility and placement rules.
 
 ## Native tool calls
 

@@ -231,10 +231,10 @@ impl MlxModel {
 
     /// Reports speculative-weight readiness to backend integration tests.
     #[cfg(test)]
-    pub fn mtp_capability_for_test(&self) -> eredu_core::MtpCapability {
+    pub fn speculative_capability_for_test(&self) -> eredu_core::SpeculativeCapability {
         match &self.inner {
-            MlxModelKind::Complete(model) => model.mtp_capability(),
-            MlxModelKind::Pipeline(model) => model.mtp_capability(),
+            MlxModelKind::Complete(model) => model.speculative_capability(),
+            MlxModelKind::Pipeline(model) => model.speculative_capability(),
         }
     }
 

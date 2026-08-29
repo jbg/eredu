@@ -62,16 +62,16 @@ impl LocalBackendFactory {
     }
 }
 
-/// Scoped opt-in for selected-backend MTP component timing.
-pub struct LocalMtpComponentTimingGuard {
-    _inner: eredu_backend_mlx::MtpComponentTimingGuard,
+/// Scoped opt-in for selected-backend speculative component timing.
+pub struct LocalSpeculativeComponentTimingGuard {
+    _inner: eredu_backend_mlx::SpeculativeComponentTimingGuard,
 }
 
-impl LocalMtpComponentTimingGuard {
+impl LocalSpeculativeComponentTimingGuard {
     /// Enables component timing until the returned guard is dropped.
     pub fn enable() -> Self {
         Self {
-            _inner: eredu_backend_mlx::MtpComponentTimingGuard::enable(),
+            _inner: eredu_backend_mlx::SpeculativeComponentTimingGuard::enable(),
         }
     }
 }
@@ -223,7 +223,7 @@ pub struct LocalPreparedChatGenerationRequest<'a, F> {
 }
 
 /// Request for speculative semantic generation through the local facade.
-pub struct LocalPreparedChatMtpGenerationRequest<'a, F> {
+pub struct LocalPreparedChatSpeculativeGenerationRequest<'a, F> {
     /// Text-only or facade-prepared multimodal prompt.
     pub input: LocalPreparedChatInput<'a>,
     /// Opaque drafting realization loaded with the target model.
@@ -231,7 +231,7 @@ pub struct LocalPreparedChatMtpGenerationRequest<'a, F> {
     /// Portable sampling configuration, token limit, and random seed.
     pub settings: super::PreparedChatGenerationSettings,
     /// Proposal-block and scheduler controls.
-    pub options: super::PreparedChatMtpGenerationOptions,
+    pub options: super::PreparedChatSpeculativeGenerationOptions,
     /// Additional decoded text sequences that terminate generation.
     pub caller_stop_sequences: &'a [String],
     /// Cooperative cancellation token.
@@ -257,25 +257,30 @@ fn map_prepared_chat_error(
     }
 }
 
-fn map_prepared_chat_mtp_error(
-    error: super::PreparedChatMtpError<eredu_backend_mlx::backend::error::Error>,
-) -> super::PreparedChatMtpError<LocalBackendError> {
+fn map_prepared_chat_speculative_error(
+    error: super::PreparedChatSpeculativeError<eredu_backend_mlx::backend::error::Error>,
+) -> super::PreparedChatSpeculativeError<LocalBackendError> {
     match error {
-        super::PreparedChatMtpError::Backend(error) => super::PreparedChatMtpError::Backend(
-            LocalBackendError::new("prepared-chat speculative generation", error),
-        ),
-        super::PreparedChatMtpError::Generation(error) => {
-            super::PreparedChatMtpError::Generation(error)
+        super::PreparedChatSpeculativeError::Backend(error) => {
+            super::PreparedChatSpeculativeError::Backend(LocalBackendError::new(
+                "prepared-chat speculative generation",
+                error,
+            ))
         }
-        super::PreparedChatMtpError::Text(error) => super::PreparedChatMtpError::Text(error),
-        super::PreparedChatMtpError::Constraint(error) => {
-            super::PreparedChatMtpError::Constraint(error)
+        super::PreparedChatSpeculativeError::Generation(error) => {
+            super::PreparedChatSpeculativeError::Generation(error)
         }
-        super::PreparedChatMtpError::Semantic(error) => {
-            super::PreparedChatMtpError::Semantic(error)
+        super::PreparedChatSpeculativeError::Text(error) => {
+            super::PreparedChatSpeculativeError::Text(error)
         }
-        super::PreparedChatMtpError::OutputCardinality { expected, actual } => {
-            super::PreparedChatMtpError::OutputCardinality { expected, actual }
+        super::PreparedChatSpeculativeError::Constraint(error) => {
+            super::PreparedChatSpeculativeError::Constraint(error)
+        }
+        super::PreparedChatSpeculativeError::Semantic(error) => {
+            super::PreparedChatSpeculativeError::Semantic(error)
+        }
+        super::PreparedChatSpeculativeError::OutputCardinality { expected, actual } => {
+            super::PreparedChatSpeculativeError::OutputCardinality { expected, actual }
         }
     }
 }
@@ -499,8 +504,8 @@ impl LocalModel {
     }
 
     /// Reports fail-closed speculative support for this local session.
-    pub fn mtp_capability(&self) -> eredu_core::MtpCapability {
-        self.inner.mtp_capability()
+    pub fn speculative_capability(&self) -> eredu_core::SpeculativeCapability {
+        self.inner.speculative_capability()
     }
 
     /// Generates one constrained semantic response.
@@ -523,12 +528,12 @@ impl LocalModel {
     }
 
     /// Generates one constrained response using opaque drafting resources.
-    pub fn generate_prepared_chat_mtp<F>(
+    pub fn generate_prepared_chat_speculative<F>(
         &mut self,
-        request: LocalPreparedChatMtpGenerationRequest<'_, F>,
+        request: LocalPreparedChatSpeculativeGenerationRequest<'_, F>,
     ) -> Result<
         eredu_core::SpeculativeGenerationOutput,
-        super::PreparedChatMtpError<LocalBackendError>,
+        super::PreparedChatSpeculativeError<LocalBackendError>,
     >
     where
         F: FnMut(eredu_core::generation::SemanticEvent),
@@ -538,12 +543,12 @@ impl LocalModel {
             .inner
             .as_speculative_draft()
             .ok_or_else(|| {
-                super::PreparedChatMtpError::Semantic(
+                super::PreparedChatSpeculativeError::Semantic(
                     "the execution plan did not enable speculative drafting".into(),
                 )
             })?;
         self.inner
-            .generate_prepared_chat_mtp(super::PreparedChatMtpGenerationRequest {
+            .generate_prepared_chat_speculative(super::PreparedChatSpeculativeGenerationRequest {
                 input: request.input.into_backend(),
                 drafting,
                 settings: request.settings,
@@ -552,7 +557,7 @@ impl LocalModel {
                 cancellation: request.cancellation,
                 on_event: request.on_event,
             })
-            .map_err(map_prepared_chat_mtp_error)
+            .map_err(map_prepared_chat_speculative_error)
     }
 
     /// Tokenizes and prepares a portable multimodal request.
@@ -1245,8 +1250,10 @@ pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
 }
 
 /// Converts neutral speculative statistics into portable execution telemetry.
-pub fn local_mtp_telemetry(stats: &eredu_core::speculative::MtpStats) -> crate::MtpTelemetry {
-    eredu_backend_mlx::mtp_telemetry(stats)
+pub fn local_speculative_decoding_telemetry(
+    stats: &eredu_core::speculative::SpeculativeStats,
+) -> crate::SpeculativeDecodingTelemetry {
+    eredu_backend_mlx::speculative_decoding_telemetry(stats)
 }
 
 fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, LocalBackendError> {

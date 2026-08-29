@@ -9,10 +9,10 @@ use eredu::{
     api::{
         default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
         LocalDevice, LocalModel, LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
-        LocalPreparedChatMtpGenerationRequest, NativeToolSupport, ParallelToolCallPolicy,
-        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions, ToolChoice,
+        LocalPreparedChatSpeculativeGenerationRequest, NativeToolSupport, ParallelToolCallPolicy,
+        PreparedChatGenerationSettings, PreparedChatSpeculativeGenerationOptions, ToolChoice,
     },
-    DraftPlacementPlan, DraftingPlan, ExecutionPlan, MtpSchedulerOptions, SemanticEvent,
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, SemanticEvent, SpeculativeSchedulerOptions,
 };
 use serde_json::json;
 
@@ -81,11 +81,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..PreparedChatGenerationSettings::default()
     };
-    let scheduler = MtpSchedulerOptions {
+    let scheduler = SpeculativeSchedulerOptions {
         max_in_flight_verifications: 1,
         max_optimistic_branches: 1,
         lookahead_blocks: 1,
-        ..MtpSchedulerOptions::default()
+        ..SpeculativeSchedulerOptions::default()
     };
     let mut events = Vec::<SemanticEvent>::new();
 
@@ -94,11 +94,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("external drafting plan was not realized".into());
         }
         model
-            .generate_prepared_chat_mtp(LocalPreparedChatMtpGenerationRequest {
+            .generate_prepared_chat_speculative(LocalPreparedChatSpeculativeGenerationRequest {
                 input: LocalPreparedChatInput::rendered_prompt(&prepared),
                 drafting: &mut drafting,
                 settings,
-                options: PreparedChatMtpGenerationOptions {
+                options: PreparedChatSpeculativeGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),
                     scheduler,
                 },

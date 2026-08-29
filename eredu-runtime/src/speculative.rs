@@ -33,7 +33,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         executor: &'a mut E,
-        options: eredu_core::generation::MtpSchedulerOptions,
+        options: eredu_core::generation::SpeculativeSchedulerOptions,
         topology: eredu_core::SpeculativeExecutionTopology,
         optimistic_execution_available: bool,
         component_timings_collected: bool,
@@ -54,7 +54,8 @@ where
     pub fn submit(
         &mut self,
         lane: PreparedSpeculativeLane<'a, E, S, C, P>,
-    ) -> Result<eredu_core::generation::MtpRequestId, SpeculativeDriverError<E::Error>> {
+    ) -> Result<eredu_core::generation::SpeculativeRequestId, SpeculativeDriverError<E::Error>>
+    {
         self.requests.submit(
             self.executor,
             lane.cache,
@@ -85,15 +86,15 @@ where
     /// Returns the current portable phase for one lane.
     pub fn phase(
         &self,
-        id: eredu_core::generation::MtpRequestId,
-    ) -> Option<eredu_core::generation::MtpRequestPhase> {
+        id: eredu_core::generation::SpeculativeRequestId,
+    ) -> Option<eredu_core::generation::SpeculativeRequestPhase> {
         self.requests.phase(id)
     }
 
     /// Requests cancellation at the next exact safe boundary.
     pub fn cancel(
         &mut self,
-        id: eredu_core::generation::MtpRequestId,
+        id: eredu_core::generation::SpeculativeRequestId,
     ) -> Result<(), SpeculativeDriverError<E::Error>> {
         self.requests.cancel(id)
     }
@@ -119,12 +120,12 @@ where
 /// terminal outputs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunSpeculativeGeneration {
-    options: eredu_core::generation::MtpSchedulerOptions,
+    options: eredu_core::generation::SpeculativeSchedulerOptions,
 }
 
 impl RunSpeculativeGeneration {
     /// Creates a driver with facade-selected scheduling and lookahead controls.
-    pub const fn new(options: eredu_core::generation::MtpSchedulerOptions) -> Self {
+    pub const fn new(options: eredu_core::generation::SpeculativeSchedulerOptions) -> Self {
         Self { options }
     }
 }
@@ -165,7 +166,7 @@ impl SpeculativeGenerationVisitor for RunSpeculativeGeneration {
             .map(|request| -> Result<_, SpeculativeDriverError<E::Error>> {
                 let finish_reason = request.finish_reason.ok_or_else(|| {
                     SpeculativeDriverError::Generation(
-                        eredu_core::generation::GenerationError::MissingMtpFinishReason {
+                        eredu_core::generation::GenerationError::MissingSpeculativeFinishReason {
                             index: request.id.index(),
                         },
                     )

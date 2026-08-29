@@ -44,9 +44,10 @@ pub use crate::runtime::chat::{
 };
 pub use request::{
     PreparedChatError, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
-    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
-    PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpGenerationOptions,
-    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint,
+    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatSpeculativeBatchLane,
+    PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
+    PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationOptions,
+    PreparedChatSpeculativeGenerationRequest,
 };
 #[cfg(feature = "mlx")]
 pub use selected::*;
@@ -70,13 +71,13 @@ pub use eredu_core::{
     HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, InspectionIssue,
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity, Media,
     MediaBinding, MediaRequestError, ModelCapabilities, ModelInspectionReport,
-    ModelResourceProfile, MtpTelemetry, MultimodalRequest, MultimodalSegment, ObservationKind,
-    Observed, PhysicalMemorySemantics, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    ModelResourceProfile, MultimodalRequest, MultimodalSegment, ObservationKind, Observed,
+    PhysicalMemorySemantics, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
     ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount,
-    SpeculativeDraft, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
-    StateMemoryAssumptions, StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest,
-    TokenizedMultimodalSegment, TransferTelemetry, Video, VideoSampling, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    SpeculativeDecodingTelemetry, SpeculativeDraft, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationOutput, StateMemoryAssumptions, StaticMemoryReport, TimingTelemetry,
+    TokenizedMultimodalRequest, TokenizedMultimodalSegment, TransferTelemetry, Video,
+    VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 pub use portable::{

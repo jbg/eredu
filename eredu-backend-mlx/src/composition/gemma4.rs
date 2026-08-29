@@ -448,7 +448,7 @@ pub fn load_assistant_gguf(
 }
 
 /// Ordinary target outputs retained by the neutral speculative adapter.
-pub struct Gemma4MtpOutput {
+pub struct Gemma4SpeculativeOutput {
     pub logits: crate::MlxTensor,
     pub hidden: crate::MlxTensor,
     pub shared_kv: eredu_architectures::gemma4::SharedAttentionStates<crate::MlxTensor>,
@@ -863,7 +863,7 @@ impl Gemma4Model {
         )
     }
 
-    pub fn embed_mtp_token(
+    pub fn embed_draft_token(
         &mut self,
         token: u32,
         stream: &Stream,
@@ -889,30 +889,30 @@ impl Gemma4Model {
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
-    fn mtp_output(
+    fn speculative_output(
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut MlxHybridState,
         stream: &Stream,
-    ) -> Result<Gemma4MtpOutput, Error> {
+    ) -> Result<Gemma4SpeculativeOutput, Error> {
         let (logits, forward, hidden) = self.forward_with_capture(input, state, stream)?;
-        Ok(Gemma4MtpOutput {
+        Ok(Gemma4SpeculativeOutput {
             logits,
             hidden,
             shared_kv: forward.shared_attention_states().clone(),
         })
     }
 
-    pub fn prefill_mtp(
+    pub fn prefill_speculative(
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut MlxHybridState,
         stream: &Stream,
-    ) -> Result<Gemma4MtpOutput, Error> {
+    ) -> Result<Gemma4SpeculativeOutput, Error> {
         input::validate(typed)?;
         let prepared = PreparedParts::new(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
-        self.mtp_output(
+        self.speculative_output(
             ModelInput {
                 parts: &parts,
                 vision: prepared.vision_input(),
@@ -925,14 +925,14 @@ impl Gemma4Model {
         )
     }
 
-    pub fn verify_mtp(
+    pub fn verify_speculative(
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut MlxHybridState,
         stream: &Stream,
-    ) -> Result<Gemma4MtpOutput, Error> {
+    ) -> Result<Gemma4SpeculativeOutput, Error> {
         let parts = [DecoderInputPart::Text(tokens)];
-        self.mtp_output(
+        self.speculative_output(
             ModelInput {
                 parts: &parts,
                 vision: None,

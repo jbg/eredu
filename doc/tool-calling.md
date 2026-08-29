@@ -58,9 +58,9 @@ different tools without sharing mutable parser state.
 Choose one cohesive generation call:
 
 - `generate_prepared_chat` for ordinary constrained generation;
-- `generate_prepared_chat_mtp` with the opaque `LocalDrafting` loaded from the
+- `generate_prepared_chat_speculative` with the opaque `LocalDrafting` loaded from the
   same execution plan; or
-- `generate_prepared_chat_mtp_batch` for independently scheduled requests.
+- `generate_prepared_chat_speculative_batch` for independently scheduled requests.
 
 The batch API and explicit `SpeculativeDraft` variants are backend-generic
 infrastructure. The selected application facade keeps the native drafter and

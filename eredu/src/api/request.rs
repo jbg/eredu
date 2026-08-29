@@ -6,8 +6,8 @@ use eredu_core::{
     generation::{
         FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
     },
-    MtpSchedulerOptions, SpeculativeDraft, SpeculativeOutputError, SpeculativeSemanticState,
-    TokenFilter, TokenFilterController,
+    SpeculativeDraft, SpeculativeOutputError, SpeculativeSchedulerOptions,
+    SpeculativeSemanticState, TokenFilter, TokenFilterController,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
@@ -149,27 +149,27 @@ pub(super) enum PreparedChatSetupError {
     Semantic(String),
 }
 
-/// MTP-specific controls for one prepared-chat request.
+/// Speculative-decoding controls for one prepared-chat request.
 #[derive(Debug, Clone, Copy)]
-pub struct PreparedChatMtpGenerationOptions {
+pub struct PreparedChatSpeculativeGenerationOptions {
     /// Maximum assistant proposals verified in one target block.
     pub max_draft_tokens: NonZeroUsize,
     /// Canonical scheduler controls.
-    pub scheduler: MtpSchedulerOptions,
+    pub scheduler: SpeculativeSchedulerOptions,
 }
 
-impl Default for PreparedChatMtpGenerationOptions {
+impl Default for PreparedChatSpeculativeGenerationOptions {
     fn default() -> Self {
         Self {
             max_draft_tokens: NonZeroUsize::new(4).expect("4 is non-zero"),
-            scheduler: MtpSchedulerOptions::default(),
+            scheduler: SpeculativeSchedulerOptions::default(),
         }
     }
 }
 
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
-pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
+pub enum PreparedChatSpeculativeError<E: std::error::Error + Send + Sync + 'static> {
     /// The selected backend failed prompt preparation or speculative execution.
     #[error("selected backend failed prepared-chat speculative generation: {0}")]
     Backend(#[source] E),
@@ -197,8 +197,9 @@ pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
     },
 }
 
-/// One speculative MTP response from a [`PreparedChat`].
-pub struct PreparedChatMtpGenerationRequest<'a, B: eredu_core::TextGenerationBackend, D, F> {
+/// One speculative response from a [`PreparedChat`].
+pub struct PreparedChatSpeculativeGenerationRequest<'a, B: eredu_core::TextGenerationBackend, D, F>
+{
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a, B>,
     /// Embedded or separately loaded draft-model selection.
@@ -206,7 +207,7 @@ pub struct PreparedChatMtpGenerationRequest<'a, B: eredu_core::TextGenerationBac
     /// Portable sampling configuration, token limit, and random seed.
     pub settings: PreparedChatGenerationSettings,
     /// Proposal-block and scheduler controls.
-    pub options: PreparedChatMtpGenerationOptions,
+    pub options: PreparedChatSpeculativeGenerationOptions,
     /// Additional decoded text sequences that terminate generation.
     pub caller_stop_sequences: &'a [String],
     /// One-shot cooperative-cancellation token for this request.
@@ -215,14 +216,14 @@ pub struct PreparedChatMtpGenerationRequest<'a, B: eredu_core::TextGenerationBac
     pub on_event: F,
 }
 
-/// One independently executable lane in a prepared-chat MTP batch.
+/// One independently executable lane in a prepared-chat speculative batch.
 ///
 /// Every lane owns portable sampling, a random root, stop configuration, and
 /// callback. The facade constructs its constraint and decoder/parser pipeline
 /// before dispatch; the backend allocates only its execution cache and sampling
 /// state. Lanes are shared by the external-assistant and embedded-head drafting
 /// strategies.
-pub struct PreparedChatMtpBatchLane<'a, B: eredu_core::TextGenerationBackend> {
+pub struct PreparedChatSpeculativeBatchLane<'a, B: eredu_core::TextGenerationBackend> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a, B>,
     /// Portable sampling configuration, token limit, and independent random root.
@@ -237,14 +238,14 @@ pub struct PreparedChatMtpBatchLane<'a, B: eredu_core::TextGenerationBackend> {
     pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
 
-/// Cohesive fair-scheduler request for independent prepared-chat MTP lanes.
-pub struct PreparedChatMtpBatchRequest<'a, B: eredu_core::TextGenerationBackend, D> {
+/// Cohesive fair-scheduler request for independent prepared-chat speculative lanes.
+pub struct PreparedChatSpeculativeBatchRequest<'a, B: eredu_core::TextGenerationBackend, D> {
     /// Embedded or separately loaded draft-model selection.
     pub drafting: SpeculativeDraft<'a, D>,
     /// Independently executable prepared-chat lanes.
-    pub lanes: Vec<PreparedChatMtpBatchLane<'a, B>>,
+    pub lanes: Vec<PreparedChatSpeculativeBatchLane<'a, B>>,
     /// Bounded scheduler and optimistic-lookahead controls.
-    pub scheduler: MtpSchedulerOptions,
+    pub scheduler: SpeculativeSchedulerOptions,
 }
 
 /// Facade-prepared speculative grammar state consumed by a backend sampler.
