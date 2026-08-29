@@ -16,7 +16,7 @@ use eredu_nn::{LinearFormatSpec, ParameterMetadata, ParameterVisitor, Parameteri
 #[derive(Debug, Clone)]
 pub struct ParallelModelInfo<T> {
     topology: T,
-    model_type: String,
+    effective_model_type: String,
     owned_tensors: Vec<String>,
     local_parameter_bytes: u64,
     global_parameter_bytes: u64,
@@ -29,7 +29,7 @@ impl<T> ParallelModelInfo<T> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         topology: T,
-        model_type: impl Into<String>,
+        effective_model_type: impl Into<String>,
         owned_tensors: Vec<String>,
         local_parameter_bytes: u64,
         global_parameter_bytes: u64,
@@ -38,7 +38,7 @@ impl<T> ParallelModelInfo<T> {
     ) -> Self {
         Self {
             topology,
-            model_type: model_type.into(),
+            effective_model_type: effective_model_type.into(),
             owned_tensors,
             local_parameter_bytes,
             global_parameter_bytes,
@@ -55,9 +55,9 @@ impl<T> ParallelModelInfo<T> {
         self.topology.clone()
     }
 
-    /// Returns the architecture's normalized model type.
-    pub fn model_type(&self) -> &str {
-        &self.model_type
+    /// Returns the parsed implementation or nested text-model type.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
     }
 
     /// Returns exact checkpoint targets owned or replicated by this rank.
@@ -1289,7 +1289,7 @@ mod tests {
             8,
         );
         assert_eq!(info.topology(), (2, 1));
-        assert_eq!(info.model_type(), "generic");
+        assert_eq!(info.effective_model_type(), "generic");
         assert_eq!(info.owned_tensors(), ["layer.weight"]);
         assert_eq!(info.local_parameter_bytes(), 10);
         assert_eq!(info.global_parameter_bytes(), 20);

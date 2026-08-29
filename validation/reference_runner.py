@@ -306,7 +306,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA was requested but torch.cuda.is_available() is false")
 
-        model_type = probe.get("model", {}).get("model_type")
+        model_type = probe.get("model", {}).get("effective_model_type")
         compatibility_patches = apply_reference_compatibility_patches(model_type)
 
         load_kwargs = {

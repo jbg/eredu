@@ -2041,7 +2041,7 @@ fn load_conditional_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_model_type(parsed.text.model_type.clone());
+    metadata.set_effective_model_type(parsed.text.model_type.clone());
     metadata.set_quantization(parsed.text.quantization);
     metadata.set_materialization(materialization);
     let state_layout = architecture
@@ -2122,7 +2122,7 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_model_type(parsed.text.model_type.clone());
+    metadata.set_effective_model_type(parsed.text.model_type.clone());
     metadata.set_quantization(parsed.text.quantization);
     metadata.set_materialization(materialization);
     let state_layout = architecture

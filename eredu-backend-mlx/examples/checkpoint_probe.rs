@@ -28,7 +28,7 @@ use eredu_text::tokenizer::Tokenizer;
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use serde::Serialize;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const DEFAULT_PROMPT: &str = "The capital of France is";
 
 #[derive(Debug, Parser)]
@@ -119,7 +119,7 @@ struct ProbeReport {
 struct ModelReport {
     checkpoint_path: String,
     model_family: String,
-    model_type: String,
+    effective_model_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,7 +306,7 @@ fn main() -> Result<()> {
         model: ModelReport {
             checkpoint_path: args.model.display().to_string(),
             model_family,
-            model_type: effective_model_type,
+            effective_model_type,
         },
         runtime: RuntimeReport {
             crate_name: env!("CARGO_PKG_NAME"),

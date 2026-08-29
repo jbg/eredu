@@ -406,7 +406,7 @@ pub fn load(
             bindings(&unit, store, unit_recipes.as_ref())
         },
     )?;
-    metadata.set_model_type(target_config.effective_model_type().as_str());
+    metadata.set_effective_model_type(target_config.effective_model_type().as_str());
     metadata.set_quantization(target_config.native_quantization());
     metadata.set_materialization(materialization);
     let state_layout = architecture.state_layout()?;
@@ -518,7 +518,7 @@ fn load_parallel(
             )
         },
     )?;
-    metadata.set_model_type(target_config.effective_model_type().as_str());
+    metadata.set_effective_model_type(target_config.effective_model_type().as_str());
     metadata.set_quantization(target_config.native_quantization());
     metadata.set_materialization(materialization);
     let execution = if residency.is_fully_resident() {

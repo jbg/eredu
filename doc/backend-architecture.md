@@ -327,7 +327,11 @@ Loaded facade models, backend models, and sessions preserve these as two distinc
 `effective_model_type()` returns the parsed implementation or nested text-model
 type. The portable `LoadedTextModelConfig` requires both identities, and the
 facade carries the resolved family through artifact loading rather than exposing
-the effective type under the ambiguous legacy `model_type` name. Complete-model
+the effective type under the ambiguous legacy `model_type` name. Portable
+capability records, execution telemetry, rank-local parallel summaries, and
+layerwise residency metadata likewise expose this identity only as
+`effective_model_type`; serialized telemetry and capability records use that
+same unambiguous key. Complete-model
 materialization stores the already resolved `ModelKind`
 alongside the concrete model implementation; it does not reconstruct family
 identity from the effective type. Distributed composition carries that same

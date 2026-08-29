@@ -1650,7 +1650,7 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.model_type.clone());
     metadata.set_quantization(args.quantization);
     metadata.set_materialization(materialization);
     let state_layout = architecture
@@ -1803,7 +1803,7 @@ fn load_parallel_store(
             shard_layer_bindings(bindings, store, &unit_sharding)
         },
     )?;
-    metadata.set_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.model_type.clone());
     metadata.set_quantization(args.quantization);
     let local_parameter_bytes = metadata
         .static_device_bytes()

@@ -111,8 +111,8 @@ pub enum EstimationCompleteness {
 /// Capabilities derived from validated model configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
-    /// Effective architecture/model type.
-    pub model_type: String,
+    /// Parsed implementation or nested text-model type.
+    pub effective_model_type: String,
     /// Original trained context before a supported extension.
     pub native_max_context: Observed<u64>,
     /// Maximum positions accepted by the prepared model.
@@ -897,13 +897,16 @@ mod tests {
         assert_eq!(state.assumptions.requested_positions, 7);
         assert_eq!(state.context_state_bytes, 512);
         let capabilities = ModelCapabilities {
-            model_type: "mock".into(),
+            effective_model_type: "mock".into(),
             native_max_context: Observed::exact(16, "mock"),
             effective_max_context: Observed::exact(16, "mock"),
             state_strategy: CacheStateStrategy::FullKv,
             modalities: InputModalities::TEXT,
             estimation: EstimationCompleteness::Complete,
         };
+        let serialized = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(serialized["effective_model_type"], "mock");
+        assert!(serialized.get("model_type").is_none());
         assert!(matches!(
             apply_admission_policy(
                 &capabilities,
@@ -926,7 +929,7 @@ mod tests {
     #[test]
     fn admission_rejections_are_portable_and_fail_closed() {
         let capabilities = ModelCapabilities {
-            model_type: "mock".into(),
+            effective_model_type: "mock".into(),
             native_max_context: Observed::exact(8, "mock"),
             effective_max_context: Observed::exact(8, "mock"),
             state_strategy: CacheStateStrategy::FullKv,

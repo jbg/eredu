@@ -430,7 +430,7 @@ impl MultimodalPreparationBackend for MockBackend {
 impl ModelCapabilityBackend for MockBackend {
     fn model_capabilities(_: &ModelRuntime<Self>) -> Result<ModelCapabilities, CapabilityError> {
         Ok(ModelCapabilities {
-            model_type: "mistral".into(),
+            effective_model_type: "mistral".into(),
             native_max_context: Observed::exact(32, "mock configuration"),
             effective_max_context: Observed::exact(32, "mock configuration"),
             state_strategy: CacheStateStrategy::FullKv,
@@ -1041,7 +1041,10 @@ fn multimodal_client_code<B: MultimodalPreparationBackend>(model: &LoadedModel<B
 
 fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, prepared: &B::Prompt) {
     let capabilities = model.capabilities().unwrap();
-    assert_eq!(capabilities.model_type, model.effective_model_type());
+    assert_eq!(
+        capabilities.effective_model_type,
+        model.effective_model_type()
+    );
     assert_eq!(model.count_token_ids(&[1, 2]).unwrap().model_positions, 2);
     assert_eq!(model.count_text("hello", false).unwrap().text_tokens, 1);
     let input = model.count_prepared_input(prepared).unwrap();

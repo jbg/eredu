@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 5;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = 6;
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -479,8 +479,8 @@ pub struct SpeculativeDecodingTelemetry {
 pub struct ExecutionTelemetry {
     /// Version of this serialized telemetry schema.
     pub schema_version: u32,
-    /// Runtime model type.
-    pub model_type: String,
+    /// Parsed implementation or nested text-model type used by the runtime.
+    pub effective_model_type: String,
     /// Concrete execution choices used by the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<ExecutionPlan>,
@@ -1442,6 +1442,34 @@ mod tests {
         );
         let unavailable = serde_json::to_value(Observed::<u64>::unavailable("unknown")).unwrap();
         assert!(unavailable.get("value").is_none());
+    }
+
+    #[test]
+    fn execution_telemetry_serializes_effective_model_type_without_legacy_key() {
+        let telemetry = ExecutionTelemetry {
+            schema_version: AUTOMATIC_SCHEMA_VERSION,
+            effective_model_type: "gemma4_text".into(),
+            plan: None,
+            plan_explanation: None,
+            hardware: None,
+            resources: None,
+            prompt_tokens: 1,
+            generated_tokens: 1,
+            stop_reason: "length".into(),
+            timing: TimingTelemetry::new(Duration::ZERO, Duration::ZERO, None, 1, Duration::ZERO),
+            allocator: None,
+            residency: None,
+            expert_cache: None,
+            speculative: None,
+        };
+
+        let encoded = serde_json::to_value(&telemetry).unwrap();
+        assert_eq!(encoded["effective_model_type"], "gemma4_text");
+        assert!(encoded.get("model_type").is_none());
+        assert_eq!(
+            serde_json::from_value::<ExecutionTelemetry>(encoded).unwrap(),
+            telemetry
+        );
     }
 
     #[test]

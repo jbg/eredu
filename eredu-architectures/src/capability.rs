@@ -779,7 +779,7 @@ impl CapabilityEstimate {
     }
 }
 
-fn finish(model_type: String, spec: Spec) -> CapabilityEstimate {
+fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
     let (native_max_context, effective_max_context, state_strategy, modalities, state_layout) =
         spec;
     let estimation = if modalities.image || modalities.audio || modalities.video {
@@ -789,7 +789,7 @@ fn finish(model_type: String, spec: Spec) -> CapabilityEstimate {
     };
     CapabilityEstimate {
         capabilities: ModelCapabilities {
-            model_type,
+            effective_model_type,
             native_max_context,
             effective_max_context,
             state_strategy,

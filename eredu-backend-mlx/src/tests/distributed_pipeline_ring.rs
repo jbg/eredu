@@ -757,7 +757,10 @@ fn pipeline_ring_worker() {
         let capabilities =
             <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::model_capabilities(&runtime)
                 .unwrap();
-        assert_eq!(capabilities.model_type, expected_effective_model_type);
+        assert_eq!(
+            capabilities.effective_model_type,
+            expected_effective_model_type
+        );
         let counted = <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::count_prepared_input(
             &runtime,
             &capability_input,

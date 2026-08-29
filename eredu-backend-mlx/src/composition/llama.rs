@@ -98,7 +98,7 @@ fn load_neutral_llama(
         weights_stream,
         |_| false,
     )?;
-    metadata.set_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.model_type.clone());
     metadata.set_quantization(args.weight_quantization());
     metadata.set_materialization(materialization);
     let state_layout = architecture
@@ -753,7 +753,7 @@ fn load_neutral_llama_parallel(
             shard_layer_bindings(bindings, store, &unit_binding_layout)
         },
     )?;
-    metadata.set_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.model_type.clone());
     metadata.set_quantization(args.weight_quantization());
     let local_parameter_bytes = metadata
         .static_device_bytes()

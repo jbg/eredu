@@ -2583,7 +2583,7 @@ fn main() -> Result<()> {
         let expert_cache = model.expert_cache_telemetry()?;
         let telemetry = ExecutionTelemetry {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
-            model_type: model.effective_model_type().into(),
+            effective_model_type: model.effective_model_type().into(),
             plan: Some(plan),
             plan_explanation: Some(plan_explanation),
             hardware: hardware_profile,

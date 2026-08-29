@@ -291,7 +291,7 @@ pub fn load_neutral_with_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.model_type.clone());
     metadata.set_quantization(args.quantization);
     metadata.set_materialization(materialization);
     let state_layout = architecture
@@ -434,7 +434,7 @@ fn load_neutral_parallel_with_store(
             shard_layer_bindings(bindings, store, &unit_local_layout)
         },
     )?;
-    metadata.set_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.model_type.clone());
     metadata.set_quantization(args.quantization);
     let local_parameter_bytes = metadata
         .static_device_bytes()

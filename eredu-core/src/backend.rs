@@ -1702,7 +1702,7 @@ mod tests {
             _: &ModelRuntime<Self>,
         ) -> Result<ModelCapabilities, CapabilityError> {
             Ok(ModelCapabilities {
-                model_type: "mock".into(),
+                effective_model_type: "mock".into(),
                 native_max_context: crate::Observed::exact(64, "mock configuration"),
                 effective_max_context: crate::Observed::exact(64, "mock configuration"),
                 state_strategy: crate::CacheStateStrategy::FullKv,
@@ -1923,7 +1923,7 @@ mod tests {
     fn model_capability_extension_observes_the_selected_mock_session() {
         let runtime = ModelRuntime::prepare(Mock, 10).unwrap();
         let capabilities = Mock::model_capabilities(&runtime).unwrap();
-        assert_eq!(capabilities.model_type, "mock");
+        assert_eq!(capabilities.effective_model_type, "mock");
         let input = Mock::count_prepared_input(&runtime, &vec![1, 2, 3]).unwrap();
         assert_eq!(input.model_positions, 3);
         let state = Mock::estimate_runtime_state(&runtime, input, 2, 1).unwrap();

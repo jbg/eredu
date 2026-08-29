@@ -631,7 +631,7 @@ pub enum ExecutionResidency {
 /// Inspectable backend-neutral parameter-residency metadata for a layered model.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
-    model_type: String,
+    effective_model_type: String,
     quantization: Option<eredu_checkpoint::WeightQuantization>,
     layer_count: usize,
     static_device_bytes: u64,
@@ -647,7 +647,7 @@ impl LayerwiseModelMetadata {
     /// Creates one complete metadata snapshot before optional materialization telemetry.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        model_type: impl Into<String>,
+        effective_model_type: impl Into<String>,
         quantization: Option<eredu_checkpoint::WeightQuantization>,
         layer_count: usize,
         static_device_bytes: u64,
@@ -658,7 +658,7 @@ impl LayerwiseModelMetadata {
         device_layer_capacity: usize,
     ) -> Self {
         Self {
-            model_type: model_type.into(),
+            effective_model_type: effective_model_type.into(),
             quantization,
             layer_count,
             static_device_bytes,
@@ -671,9 +671,9 @@ impl LayerwiseModelMetadata {
         }
     }
 
-    /// Replaces the normalized model identity after checkpoint resolution.
-    pub fn set_model_type(&mut self, model_type: impl Into<String>) {
-        self.model_type = model_type.into();
+    /// Replaces the parsed implementation identity after checkpoint resolution.
+    pub fn set_effective_model_type(&mut self, effective_model_type: impl Into<String>) {
+        self.effective_model_type = effective_model_type.into();
     }
 
     /// Replaces checkpoint-native packed quantization metadata.
@@ -689,9 +689,9 @@ impl LayerwiseModelMetadata {
         self.materialization = materialization;
     }
 
-    /// Returns the checkpoint model type supplied by the architecture.
-    pub fn model_type(&self) -> &str {
-        &self.model_type
+    /// Returns the parsed implementation or nested text-model type.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
     }
 
     /// Returns checkpoint-native packed quantization metadata, if present.
@@ -877,12 +877,12 @@ mod tests {
             6,
             2,
         );
-        metadata.set_model_type("llama");
+        metadata.set_effective_model_type("llama");
         metadata.set_quantization(Some(eredu_checkpoint::WeightQuantization::Affine(
             eredu_checkpoint::AffineQuantization::default(),
         )));
 
-        assert_eq!(metadata.model_type(), "llama");
+        assert_eq!(metadata.effective_model_type(), "llama");
         assert_eq!(metadata.layer_count(), 4);
         assert_eq!(metadata.static_device_bytes(), 10);
         assert_eq!(metadata.layer_parameter_bytes(), 20);
