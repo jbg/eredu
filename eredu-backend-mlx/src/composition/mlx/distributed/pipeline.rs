@@ -9392,16 +9392,11 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Nemotron-H partition has no runtime state".into()))?;
-        let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::cache::prompt_cache_topology(topology)
-        } else {
-            Default::default()
-        };
         let complete = eredu_architectures::nemotron_h::state_identity(
             self.args(),
             state.layout(),
             state.global_layer_offset(),
-            topology_identity,
+            crate::backend::cache::prompt_cache_topology(topology),
         )
         .map_err(|error| Error::Parallel(error.to_string()))?
         .prompt_cache_identity(state.layout())

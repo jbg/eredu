@@ -1441,6 +1441,11 @@ fn pipeline_ring_worker() {
     let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
     let (model_family, effective_model_type) = family.descriptor_names();
     let identity = model.prompt_cache_model_identity().unwrap();
+    assert_eq!(
+        identity.topology,
+        crate::backend::cache::prompt_cache_topology(topology),
+        "rank {expected_rank} cache identity lost its distributed topology"
+    );
     if qwen_hybrid_prompt_cache {
         if pipeline_rank == 0 {
             assert_eq!(identity.global_layer_start..identity.global_layer_end, 0..1);
