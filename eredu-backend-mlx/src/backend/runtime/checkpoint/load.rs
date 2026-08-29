@@ -10,12 +10,14 @@ use std::{
 
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use memmap2::MmapOptions;
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+use safemlx::module::ModuleParameters;
 use safemlx::{
-    module::{FlattenedModuleParamMut, ModuleParameters},
-    native_quantization::NativeQuantizationFormat,
-    ops::GgufCheckpoint,
-    transforms::async_eval_with_event,
-    Array, Stream,
+    module::FlattenedModuleParamMut, native_quantization::NativeQuantizationFormat,
+    ops::GgufCheckpoint, transforms::async_eval_with_event, Array, Stream,
 };
 use safetensors::SafeTensors;
 use serde::Deserialize;
@@ -151,16 +153,37 @@ impl StrictLoadReport {
 
     /// Validates a partial strict load while leaving an independently managed
     /// parameter class untouched.
+    #[cfg(all(
+        test,
+        any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+    ))]
     pub(crate) fn finish_excluding<M, F>(self, model: &M, excluded: F) -> Result<(), Error>
     where
         M: ModuleParameters + ?Sized,
         F: Fn(&str) -> bool,
     {
-        let mut missing = model
-            .parameters()
-            .flatten()
-            .keys()
-            .map(|key| key.to_string())
+        self.finish_parameter_names(
+            model
+                .parameters()
+                .flatten()
+                .keys()
+                .map(|key| key.to_string()),
+            excluded,
+        )
+    }
+
+    /// Validates the report against names from an explicit parameter topology.
+    pub(crate) fn finish_parameter_names<I, F>(
+        self,
+        parameter_names: I,
+        excluded: F,
+    ) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = String>,
+        F: Fn(&str) -> bool,
+    {
+        let mut missing = parameter_names
+            .into_iter()
             .filter(|key| !excluded(key))
             .filter(|key| !self.loaded.contains(key))
             .collect::<Vec<_>>();

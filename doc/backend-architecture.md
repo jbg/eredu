@@ -346,11 +346,15 @@ segment is not reserved, however: an architecture may itself declare
 Backend operators expose architecture parameter identities through their
 neutral `Parameterized` topology, including when native storage uses private
 module slots. Generic binding, residency, and distributed-planning utilities
-consume those exact identities and never normalize path segments; private
-native topology must not widen or rewrite the checkpoint contract. Backend
-loading traverses that declared topology, so any canonical identity-to-private
-slot association is fixed when the operator is constructed rather than
-inferred from a checkpoint name. Load-time quantization consumes explicit
+accept that topology rather than a backend module's raw physical parameter
+tree, consume its exact identities, and never normalize path segments. A
+backend-only physical slot is excluded explicitly by the operator's topology
+mapping; its name, shape, neighboring slots, or storage dtype never determine
+whether it is checkpoint-backed. Private native topology must not widen or
+rewrite the checkpoint contract. Backend loading traverses the declared
+topology, so any canonical identity-to-private slot association is fixed when
+the operator is constructed rather than inferred from a checkpoint name.
+Load-time quantization consumes explicit
 weight, scale, and optional affine-bias relationships from the same topology;
 the strict loader neither derives companion names nor treats backend-only
 placeholder slots as checkpoint-backed parameters. An architecture identity
@@ -1204,7 +1208,8 @@ composition:
   prefix stripping, prefix rewriting, unused-prefix exemptions, or implicit
   parameter-name expansion. Load-time quantization receives exact companion
   destinations through architecture parameter metadata, and backend-only
-  native sentinels are absent from that topology rather than marked as loaded.
+  native sentinels are explicitly excluded by the operator's topology mapping
+  rather than inferred from native names, shapes, or dtypes or marked as loaded.
   Selective partition loading likewise requires
   exact checkpoint keys in its placement plan; neither surface invents family
   aliases or exposes parsers for physical family checkpoint names. Distributed

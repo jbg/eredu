@@ -3716,7 +3716,7 @@ fn execute_pipeline_layer_range_with<C, L, F, O>(
     mut forward_layer: F,
 ) -> Result<Array, Error>
 where
-    L: ModuleParameters + Clone,
+    L: Parameterized<crate::MlxTensor> + Clone,
     F: FnMut(&mut C, usize, &mut L, &Array, &mut PipelineLayerCache, &Stream) -> Result<O, Error>,
     O: IntoPipelineLayerForward,
 {

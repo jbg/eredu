@@ -13,14 +13,11 @@ use eredu_runtime::{ParameterGroupSpec, ParameterRole, WeightBinding, WeightBind
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use safemlx::{
-    module::{FlattenedModuleParamRef, ModuleParameters},
-    Array, Dtype, Stream,
-};
+use safemlx::{module::FlattenedModuleParamRef, Array, Stream};
 
 use crate::{
     backend::error::Error,
-    backend::nn::shared::neutral_parameter_refs,
+    backend::nn::shared::{neutral_parameter_refs, neutral_parameter_refs_mut},
     backend::runtime::checkpoint::binding_plan::{BindingPlan, BindingPlanError, PlannedBinding},
     backend::runtime::checkpoint::load::{
         load_array_quantized_strict, QuantizedLoadRecipe, StrictLoadReport,
@@ -62,48 +59,20 @@ pub fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool
     targets.contains(name)
 }
 
-/// Whether a flattened module parameter has checkpoint-backed storage.
-///
-/// Native GGML modules expose a one-element `scales` parameter solely to keep
-/// the public quantized-module shape compatible with affine quantization. The
-/// packed `u8` weight contains its own quantization metadata, so that sentinel
-/// must not become a residency or distributed-planning member. Affine packed
-/// weights use a non-`u8` storage dtype and retain their real companions.
-pub fn is_materialized_module_parameter(
-    name: &str,
-    parameter: &Array,
-    parameters: &FlattenedModuleParamRef<'_>,
-) -> bool {
-    let weight_names = if name == "scales" {
-        Some(["inner.weight".to_string(), "weight".to_string()])
-    } else {
-        name.strip_suffix(".scales")
-            .map(|prefix| [format!("{prefix}.inner.weight"), format!("{prefix}.weight")])
-    };
-    let weight_dtype = weight_names
-        .as_ref()
-        .and_then(|names| names.iter().find_map(|name| parameters.get(name.as_str())))
-        .map(|weight| weight.dtype());
-    !is_native_scale_sentinel(name, parameter.shape(), weight_dtype)
-}
-
-fn is_native_scale_sentinel(name: &str, shape: &[i32], weight_dtype: Option<Dtype>) -> bool {
-    (name == "scales" || name.ends_with(".scales"))
-        && shape == [1]
-        && weight_dtype == Some(Dtype::Uint8)
-}
-
 /// Builds exact full-tensor residency bindings for an unloaded module.
 ///
 /// Every module parameter must resolve to exactly one checkpoint key and have
 /// the same shape. Binding names are local module parameter names so a lease
 /// can later populate a freshly constructed module without architecture-aware
 /// rewriting.
-pub fn build_module_bindings(
-    module: &impl ModuleParameters,
+pub fn build_module_bindings<M>(
+    module: &M,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
     build_module_bindings_excluding(module, prefix, store, |_| false)
 }
 
@@ -112,13 +81,14 @@ pub fn build_module_bindings(
 /// The predicate receives module-local flattened names and runs before any
 /// checkpoint lookup, allowing independently managed parameter groups to use a
 /// different checkpoint layout.
-pub fn build_module_bindings_excluding<F>(
-    module: &impl ModuleParameters,
+pub fn build_module_bindings_excluding<M, F>(
+    module: &M,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     exclude: F,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
 where
+    M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     build_module_bindings_with_recipes_excluding(module, prefix, store, BTreeMap::new(), exclude)
@@ -129,12 +99,15 @@ where
 /// Recipe keys use the module-local flattened parameter names. Every override
 /// is shape- and dtype-checked against the unloaded runtime parameter before
 /// residency initialization.
-pub fn build_module_bindings_with_recipes(
-    module: &impl ModuleParameters,
+pub fn build_module_bindings_with_recipes<M>(
+    module: &M,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
-) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
     build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
 }
 
@@ -198,12 +171,15 @@ impl ModuleBindingPlan {
 }
 
 /// Builds a complete module binding plan including derived-weight recipes.
-pub fn build_module_binding_plan_with_recipes(
-    module: &impl ModuleParameters,
+pub fn build_module_binding_plan_with_recipes<M>(
+    module: &M,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
-) -> Result<ModuleBindingPlan, ModuleBindingError> {
+) -> Result<ModuleBindingPlan, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
     build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, |_| false)
 }
 
@@ -384,21 +360,20 @@ fn is_mapping_capacity_error(error: &ModuleBindingError) -> bool {
 
 /// Populates an unloaded module from materialized local-name bindings while
 /// permitting an independently managed parameter class to remain unloaded.
-pub fn populate_module_from_arrays_excluding<F>(
-    module: &mut (impl ModuleParameters + ?Sized),
+pub fn populate_module_from_arrays_excluding<M, F>(
+    module: &mut M,
     arrays: &BTreeMap<String, Array>,
     excluded: F,
 ) -> Result<(), ModuleBindingError>
 where
+    M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     let expected = {
-        let params = module.parameters().flatten();
+        let params = neutral_parameter_refs(module, false).flatten();
         params
             .iter()
-            .filter(|(name, parameter)| {
-                !excluded(name) && is_materialized_module_parameter(name, parameter, &params)
-            })
+            .filter(|(name, _)| !excluded(name))
             .map(|(name, _)| name.to_string())
             .collect::<BTreeSet<_>>()
     };
@@ -423,7 +398,7 @@ where
             unexpected,
         });
     }
-    let mut params = module.parameters_mut().flatten();
+    let mut params = neutral_parameter_refs_mut(module).flatten();
     for (name, parameter) in &mut params {
         if !expected.contains(name.as_ref()) {
             continue;
@@ -454,14 +429,14 @@ pub(crate) fn populate_module_from_dense_arrays_quantized_excluding<M, F>(
     excluded: F,
 ) -> Result<(), Error>
 where
-    M: ModuleParameters + Parameterized<crate::MlxTensor>,
+    M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     quantization.validate()?;
     let recipes = quantized_load_recipes(module, quantization)?;
     let mut report = StrictLoadReport::default();
     {
-        let mut parameters = module.parameters_mut().flatten();
+        let mut parameters = neutral_parameter_refs_mut(module).flatten();
         for (name, value) in arrays {
             load_array_quantized_strict(
                 &mut parameters,
@@ -474,7 +449,11 @@ where
             )?;
         }
     }
-    report.finish_excluding(module, excluded)
+    let parameter_names = neutral_parameter_refs(module, false)
+        .flatten()
+        .into_keys()
+        .map(|name| name.to_string());
+    report.finish_parameter_names(parameter_names, excluded)
 }
 
 fn quantized_load_recipes<M>(
@@ -546,14 +525,15 @@ where
 }
 
 /// Builds bindings while excluding parameters managed by another loader.
-pub fn build_module_bindings_with_recipes_excluding<F>(
-    module: &impl ModuleParameters,
+pub fn build_module_bindings_with_recipes_excluding<M, F>(
+    module: &M,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
 where
+    M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, exclude)?
@@ -561,18 +541,19 @@ where
 }
 
 /// Builds a derived binding plan while excluding independently managed parameters.
-pub fn build_module_binding_plan_with_recipes_excluding<F>(
-    module: &impl ModuleParameters,
+pub fn build_module_binding_plan_with_recipes_excluding<M, F>(
+    module: &M,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<ModuleBindingPlan, ModuleBindingError>
 where
+    M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     build_flattened_module_binding_plan_with_recipes_excluding(
-        module.parameters().flatten(),
+        neutral_parameter_refs(module, false).flatten(),
         prefix,
         store,
         recipes,
@@ -593,20 +574,11 @@ where
     let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut local_names = params
         .iter()
-        .filter(|(name, parameter)| {
-            !exclude(name) && is_materialized_module_parameter(name, parameter, &params)
-        })
+        .filter(|(name, _)| !exclude(name))
         .map(|(name, _)| name.to_string())
         .collect::<Vec<_>>();
     local_names.sort();
-    recipes.retain(|name, _| {
-        if exclude(name) {
-            return false;
-        }
-        params
-            .get(name.as_str())
-            .is_none_or(|parameter| is_materialized_module_parameter(name, parameter, &params))
-    });
+    recipes.retain(|name, _| !exclude(name));
     let mut claimed = BTreeMap::<String, String>::new();
     let mut planned = Vec::with_capacity(local_names.len());
     let mut logical_targets = BTreeMap::new();
@@ -738,30 +710,32 @@ where
 /// `Array::clone` only clones the MLX handle; it does not copy the resident
 /// allocation. The caller must therefore keep `lease` alive through forward
 /// execution and synchronize before releasing it.
-pub fn populate_module_from_lease(
-    module: &mut impl ModuleParameters,
+pub fn populate_module_from_lease<M>(
+    module: &mut M,
     lease: &ResidentUnitLease,
-) -> Result<(), ModuleBindingError> {
+) -> Result<(), ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
     populate_module_from_lease_excluding(module, lease, |_| false)
 }
 
 /// Assigns non-excluded module parameters from a protected resident unit.
-pub fn populate_module_from_lease_excluding<F>(
-    module: &mut impl ModuleParameters,
+pub fn populate_module_from_lease_excluding<M, F>(
+    module: &mut M,
     lease: &ResidentUnitLease,
     excluded: F,
 ) -> Result<(), ModuleBindingError>
 where
+    M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
     let resident_names = lease.binding_names().collect::<BTreeSet<_>>();
     let expected_names = {
-        let params = module.parameters().flatten();
+        let params = neutral_parameter_refs(module, false).flatten();
         params
             .iter()
-            .filter(|(name, parameter)| {
-                !excluded(name) && is_materialized_module_parameter(name, parameter, &params)
-            })
+            .filter(|(name, _)| !excluded(name))
             .map(|(name, _)| name.to_string())
             .collect::<BTreeSet<_>>()
     };
@@ -784,7 +758,7 @@ where
         });
     }
 
-    let mut params = module.parameters_mut().flatten();
+    let mut params = neutral_parameter_refs_mut(module).flatten();
     for (name, parameter) in &mut params {
         if !expected_names.contains(name.as_ref()) {
             continue;
@@ -969,9 +943,85 @@ mod tests {
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_checkpoint::AffineQuantization;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use eredu_nn::{LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
+    use eredu_nn::{
+        LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterMetadata,
+        ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    };
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
+
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn architecture_scale_matching_native_sentinel_shape_is_bound() {
+        struct Module {
+            weight: crate::MlxTensor,
+            scales: crate::MlxTensor,
+            weight_spec: ParameterSpec,
+            scales_spec: ParameterSpec,
+        }
+
+        impl Parameterized<crate::MlxTensor> for Module {
+            fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+            where
+                V: ParameterVisitor<'a, crate::MlxTensor>,
+            {
+                visitor.visit(
+                    ParameterMetadata::from_spec(&self.weight_spec, true),
+                    &self.weight,
+                );
+                visitor.visit(
+                    ParameterMetadata::from_spec(&self.scales_spec, true),
+                    &self.scales,
+                );
+            }
+
+            fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+            where
+                V: ParameterVisitorMut<'a, crate::MlxTensor>,
+            {
+                visitor.visit_mut(
+                    ParameterMetadata::from_spec(&self.weight_spec, true),
+                    &mut self.weight,
+                );
+                visitor.visit_mut(
+                    ParameterMetadata::from_spec(&self.scales_spec, true),
+                    &mut self.scales,
+                );
+            }
+
+            fn set_trainable(&mut self, _trainable: bool) {}
+        }
+
+        let module = Module {
+            weight: crate::MlxTensor::from_array(Array::from_slice(&[1u8, 2, 3, 4], &[4])),
+            scales: crate::MlxTensor::from_array(Array::from_slice(&[0.5f32], &[1])),
+            weight_spec: ParameterSpec::trainable("weight").unwrap(),
+            scales_spec: ParameterSpec::trainable("scales").unwrap(),
+        };
+        let store = MemoryWeightStore::from_safetensors([
+            (
+                "weight".to_owned(),
+                safetensors::Dtype::U8,
+                vec![4],
+                vec![1, 2, 3, 4],
+            ),
+            (
+                "scales".to_owned(),
+                safetensors::Dtype::F32,
+                vec![1],
+                0.5f32.to_le_bytes().to_vec(),
+            ),
+        ])
+        .unwrap();
+
+        let names = build_module_bindings(&module, "", &store)
+            .unwrap()
+            .into_iter()
+            .map(|binding| binding.name().to_owned())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(names, BTreeSet::from(["scales".into(), "weight".into()]));
+    }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
