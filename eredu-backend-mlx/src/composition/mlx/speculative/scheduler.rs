@@ -1868,11 +1868,10 @@ mod tests {
         let lhs = Array::ones::<f32>(&[1024, 1024], target.stream()).unwrap();
         let rhs = Array::ones::<f32>(&[1024, 1024], target.stream()).unwrap();
         let target_output = lhs.matmul(&rhs, target.stream()).unwrap();
+        // CPU work may finish before it can be observed as incomplete. The
+        // final value below proves ordering; the explicit Metal test proves
+        // that a same-device handoff does not synchronize its producer.
         let target_handoff = streams.wait_for_target_outputs([&target_output]).unwrap();
-        assert!(
-            !target_handoff.is_complete().unwrap(),
-            "the speculative target-to-draft handoff blocked the host"
-        );
 
         let draft_output = target_output
             .add(Array::from_f32(1.0), draft.stream())
