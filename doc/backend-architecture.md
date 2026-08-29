@@ -604,7 +604,13 @@ append-only pooling streams, and named segment boundaries and lifetimes.
 Concrete backends derive native cache objects directly from those policies;
 cache advancement and advertised embedded-draft limits likewise come from the
 constructed architecture graph and its state layout. Parsed model-family
-arguments are not a second source of execution or state geometry. Pipeline
+arguments are not a second source of execution or state geometry. Backend
+composition obtains the layout through `ArchitectureParameters::state_layout`
+on the realized architecture before transferring that architecture into its
+runtime. When a family owns additional state outside the ordinary layered
+target, its architecture publishes the target, prediction placement, and
+composite persistence layout together; the backend consumes that value without
+reassembling segments or recovering offsets from layer-count fields. Pipeline
 prompt-cache identity and target or embedded-prediction cache allocation use
 the realized architecture's rank-local layout; they do not recreate a global
 layout from family arguments after tensor-parallel placement. Composite

@@ -1588,7 +1588,7 @@ impl Gemma4PipelinePartition {
     }
 
     fn ingress_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        eredu_architectures::gemma4::state_layout(&self.args().text)
+        eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
@@ -5751,7 +5751,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let full = eredu_architectures::deepseek::v3::state_layout(self.args())
+        let full = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let layout = full
             .slice(self.range())
@@ -7421,23 +7421,24 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))?;
-        let prediction = inkling_partition_owns_prediction_state(self.partition.ownership())
-            .then(|| self.partition.local_geometry().prediction_state())
-            .flatten()
-            .map(eredu_runtime::PartitionState::layout);
-        let state_layout = eredu_architectures::inkling::composite_state_layout(
-            partition_state.layout(),
-            prediction,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let state = self
+            .architecture
+            .state_layouts()
+            .and_then(|layouts| {
+                layouts.partition(
+                    partition_state,
+                    inkling_partition_owns_prediction_state(self.partition.ownership()),
+                )
+            })
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         eredu_architectures::inkling::state_identity(
             self.args(),
-            &state_layout,
-            partition_state.global_layer_offset(),
+            state.layout(),
+            state.global_layer_offset(),
             crate::backend::cache::prompt_cache_topology(topology),
         )
         .map_err(|error| Error::Parallel(error.to_string()))?
-        .prompt_cache_identity(&state_layout)
+        .prompt_cache_identity(state.layout())
         .map_err(|error| Error::Parallel(error.to_string()))
     }
 }

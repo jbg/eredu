@@ -409,7 +409,7 @@ pub fn load(
     metadata.set_model_type(target_config.effective_model_type().as_str());
     metadata.set_quantization(target_config.native_quantization());
     metadata.set_materialization(materialization);
-    let state_layout = moshi::state_layout(&target_config)?;
+    let state_layout = architecture.state_layout()?;
     let execution = if options.weight_residency.layers().is_fully_resident() {
         Execution::Resident(LayerwiseRuntime::new_policy_first(
             policy.into_resident(

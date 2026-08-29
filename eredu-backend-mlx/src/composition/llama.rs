@@ -101,6 +101,9 @@ fn load_neutral_llama(
     metadata.set_model_type(args.model_type.clone());
     metadata.set_quantization(args.weight_quantization());
     metadata.set_materialization(materialization);
+    let state_layout = architecture
+        .state_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
         LlamaExecution::Resident(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -114,8 +117,7 @@ fn load_neutral_llama(
         LlamaExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
     };
     Ok(LlamaModel {
-        state_layout: eredu_architectures::llama::state_layout(&args)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        state_layout,
         args,
         metadata,
         parallel_info: None,

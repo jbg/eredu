@@ -1818,6 +1818,9 @@ fn load_store(
     metadata.set_model_type(args.model_type.clone());
     metadata.set_quantization(args.text.weight_quantization);
     metadata.set_materialization(materialization);
+    let state_layout = architecture
+        .state_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if residency.is_fully_resident() {
         Execution::Resident(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -1831,8 +1834,7 @@ fn load_store(
         Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
     };
     Ok(Gemma4Model {
-        state_layout: eredu_architectures::gemma4::state_layout(&args.text)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        state_layout,
         args,
         metadata,
         execution,

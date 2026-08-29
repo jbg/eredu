@@ -294,6 +294,9 @@ pub fn load_neutral_with_store(
     metadata.set_model_type(args.model_type.clone());
     metadata.set_quantization(args.quantization);
     metadata.set_materialization(materialization);
+    let state_layout = architecture
+        .state_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
         GptOssExecution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -306,8 +309,6 @@ pub fn load_neutral_with_store(
     } else {
         GptOssExecution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
-    let state_layout = eredu_architectures::gpt_oss::state_layout(&args)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(GptOssModel {
         args,
         state_layout,

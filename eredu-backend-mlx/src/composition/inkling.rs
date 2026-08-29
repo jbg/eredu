@@ -375,9 +375,7 @@ fn forward_mtp_draft_parallel_architecture(
 /// One neutral Inkling object shared by resident and bounded execution.
 pub struct InklingModel {
     args: ModelArgs,
-    state_layout: eredu_runtime::StateLayout,
-    mtp_state_layout: Option<eredu_runtime::StateLayout>,
-    prompt_state_layout: eredu_runtime::StateLayout,
+    state_layouts: eredu_architectures::inkling::InklingStateLayouts,
     metadata: eredu_runtime::LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
@@ -410,11 +408,15 @@ impl InklingModel {
     }
 
     fn mtp_state(&self) -> Result<Option<MlxHybridState>, Error> {
-        self.mtp_state_layout
-            .clone()
-            .map(|layout| {
-                MlxHybridState::device_with_global_layer_start(layout, self.state_layout.len())
-                    .map_err(Into::into)
+        self.state_layouts
+            .prediction()
+            .cloned()
+            .map(|state| {
+                MlxHybridState::device_with_global_layer_start(
+                    state.layout().clone(),
+                    state.global_layer_offset(),
+                )
+                .map_err(Into::into)
             })
             .transpose()
     }
@@ -425,7 +427,7 @@ impl InklingModel {
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
         eredu_architectures::inkling::state_identity(
             &self.args,
-            &self.prompt_state_layout,
+            self.state_layouts.composite(),
             0,
             topology,
         )
@@ -433,12 +435,12 @@ impl InklingModel {
     }
 
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
-        Ok(self.prompt_state_layout.layer_prefix_offsets())
+        Ok(self.state_layouts.composite().layer_prefix_offsets())
     }
 
     pub fn new_cache(&self) -> InklingState {
         InklingState {
-            target: MlxHybridState::device(self.state_layout.clone())
+            target: MlxHybridState::device(self.state_layouts.target().clone())
                 .expect("validated Inkling state must be realizable"),
             mtp: self
                 .mtp_state()
@@ -461,19 +463,20 @@ impl InklingModel {
                 });
                 Ok(InklingState {
                     target: MlxHybridState::paged(
-                        self.state_layout.clone(),
+                        self.state_layouts.target().clone(),
                         manager.clone(),
                         rank,
                     )?,
                     mtp: self
-                        .mtp_state_layout
-                        .clone()
-                        .map(|layout| {
+                        .state_layouts
+                        .prediction()
+                        .cloned()
+                        .map(|state| {
                             MlxHybridState::paged_with_global_layer_start(
-                                layout,
+                                state.layout().clone(),
                                 manager.clone(),
                                 rank,
-                                self.state_layout.len(),
+                                state.global_layer_offset(),
                             )
                         })
                         .transpose()?,
@@ -485,7 +488,7 @@ impl InklingModel {
     pub fn prompt_cache_layer_layout(
         &self,
     ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.prompt_state_layout.layers().clone())
+        Ok(self.state_layouts.composite().layers().clone())
     }
 
     pub(crate) fn prompt_identity(
@@ -498,7 +501,7 @@ impl InklingModel {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
         self.prompt_state_identity(topology)?
-            .prompt_cache_identity(&self.prompt_state_layout)
+            .prompt_cache_identity(self.state_layouts.composite())
             .map_err(|error| Error::Parallel(error.to_string()))
     }
 
@@ -529,8 +532,9 @@ impl InklingModel {
         let offsets = self.prompt_cache_layer_prefix_offsets()?;
         let processed = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("prompt-cache prefix length exceeds i32".into()))?;
-        let target_len = self.state_layout.len();
-        let mut target = MlxHybridState::paged(self.state_layout.clone(), manager.clone(), rank)?;
+        let target_len = self.state_layouts.target().len();
+        let mut target =
+            MlxHybridState::paged(self.state_layouts.target().clone(), manager.clone(), rank)?;
         target.restore_prompt_cache_state_range(
             &mut tensors,
             0..target_len,
@@ -538,15 +542,16 @@ impl InklingModel {
             &offsets[..target_len],
         )?;
         let mtp = self
-            .mtp_state_layout
-            .clone()
-            .map(|layout| {
-                let len = layout.len();
+            .state_layouts
+            .prediction()
+            .cloned()
+            .map(|prediction| {
+                let len = prediction.layout().len();
                 let mut state = MlxHybridState::paged_with_global_layer_start(
-                    layout,
+                    prediction.layout().clone(),
                     manager.clone(),
                     rank,
-                    target_len,
+                    prediction.global_layer_offset(),
                 )?;
                 state.restore_prompt_cache_state_range(
                     &mut tensors,
@@ -582,7 +587,7 @@ impl InklingModel {
         let processed = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("prompt-cache prefix length exceeds i32".into()))?;
         let offsets = self.prompt_cache_layer_prefix_offsets()?;
-        let target_len = self.state_layout.len();
+        let target_len = self.state_layouts.target().len();
         let manager = state
             .target
             .residency_manager()
@@ -657,7 +662,7 @@ impl InklingModel {
                     .into(),
             ));
         }
-        if state.target.layout() != &self.state_layout {
+        if state.target.layout() != self.state_layouts.target() {
             return Err(Error::ArchitectureModel(
                 "Inkling cache layout mismatch".into(),
             ));
@@ -812,7 +817,7 @@ impl InklingModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
-        if state.target.layout() != &self.state_layout {
+        if state.target.layout() != self.state_layouts.target() {
             return Err(Error::ArchitectureModel(
                 "Inkling cache layout mismatch".into(),
             ));
@@ -981,7 +986,7 @@ impl InklingModel {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
-        if state.target.layout() != &self.state_layout {
+        if state.target.layout() != self.state_layouts.target() {
             return Err(Error::Parallel(
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
@@ -1015,7 +1020,7 @@ impl InklingModel {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
-        if state.target.layout() != &self.state_layout {
+        if state.target.layout() != self.state_layouts.target() {
             return Err(Error::Parallel(
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
@@ -1138,7 +1143,7 @@ impl InklingModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
-        if state.target.layout() != &self.state_layout {
+        if state.target.layout() != self.state_layouts.target() {
             return Err(Error::Parallel(
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
@@ -1289,7 +1294,7 @@ impl InklingModel {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        if state.target.layout() != &self.state_layout {
+        if state.target.layout() != self.state_layouts.target() {
             return Err(Error::Parallel(
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
@@ -2034,6 +2039,9 @@ fn load_store(
     metadata.set_model_type(args.model_type.clone());
     metadata.set_quantization(args.text_config.weight_quantization);
     metadata.set_materialization(materialization);
+    let state_layouts = architecture
+        .state_layouts()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if layer_policy.is_fully_resident() {
         Execution::Resident(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -2046,19 +2054,8 @@ fn load_store(
     } else {
         Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
     };
-    let state_layout = eredu_architectures::inkling::state_layout(&args)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let prompt_state_layout = eredu_architectures::inkling::composite_state_layout(
-        &state_layout,
-        mtp_state_layout.as_ref(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(InklingModel {
-        state_layout,
-        mtp_state_layout,
-        prompt_state_layout,
+        state_layouts,
         args,
         metadata,
         execution,
@@ -2096,8 +2093,8 @@ fn load_parallel_store(
     let mut architecture =
         NeutralArchitecture::new_parallel(args.clone(), Arc::clone(&geometry), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let state_layout = architecture
-        .state_layout()
+    let state_layouts = architecture
+        .state_layouts()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
@@ -2231,18 +2228,9 @@ fn load_parallel_store(
     } else {
         Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
-    let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let prompt_state_layout = eredu_architectures::inkling::composite_state_layout(
-        &state_layout,
-        mtp_state_layout.as_ref(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(InklingModel {
         args,
-        state_layout,
-        mtp_state_layout,
-        prompt_state_layout,
+        state_layouts,
         metadata,
         execution,
         expert_cache: None,

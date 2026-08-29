@@ -14,13 +14,14 @@ use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
     LayeredPartitionOutput, ModelStateIdentity, OwnedParameterGroupSpec,
     ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
+    PartitionState, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
-    layer_parameter_groups, mtp_parameter_groups, mtp_state_layout, state_layout,
-    static_parameter_groups, vision_layer_parameter_groups, AudioInput, AudioTower, DecoderLayer,
-    LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
+    composite_state_layout, layer_parameter_groups, mtp_parameter_groups, mtp_state_layout,
+    state_layout, static_parameter_groups, vision_layer_parameter_groups, AudioInput, AudioTower,
+    DecoderLayer, LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
 
 /// Canonical static-role identity for the embedded prediction modules and
@@ -310,6 +311,79 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<Arc<LocalGeometry>>,
 }
 
+/// Architecture-owned target, embedded-prediction, and composite state geometry.
+#[derive(Debug, Clone)]
+pub struct InklingStateLayouts {
+    target: StateLayout,
+    prediction: Option<PartitionState>,
+    composite: StateLayout,
+}
+
+impl InklingStateLayouts {
+    fn new(target: StateLayout, prediction: Option<PartitionState>) -> Result<Self, Error> {
+        if prediction
+            .as_ref()
+            .is_some_and(|state| state.global_layer_offset() != target.len())
+        {
+            return Err(Error::backend(
+                "Inkling prediction state does not follow target state",
+            ));
+        }
+        let composite =
+            composite_state_layout(&target, prediction.as_ref().map(PartitionState::layout))
+                .map_err(Error::backend)?;
+        Ok(Self {
+            target,
+            prediction,
+            composite,
+        })
+    }
+
+    /// Returns the target decoder layout for this realization.
+    pub const fn target(&self) -> &StateLayout {
+        &self.target
+    }
+
+    /// Returns embedded-prediction state and its architecture-global placement.
+    pub const fn prediction(&self) -> Option<&PartitionState> {
+        self.prediction.as_ref()
+    }
+
+    /// Returns the complete target-plus-prediction persistence layout.
+    pub const fn composite(&self) -> &StateLayout {
+        &self.composite
+    }
+
+    /// Selects and assembles the exact state owned by one pipeline partition.
+    pub fn partition(
+        &self,
+        target: &PartitionState,
+        include_prediction: bool,
+    ) -> Result<PartitionState, Error> {
+        let range = target.global_layers();
+        let expected = self.target.slice(range.clone()).map_err(Error::backend)?;
+        if target.layout() != &expected {
+            return Err(Error::backend(
+                "Inkling partition target state differs from architecture geometry",
+            ));
+        }
+        let prediction = include_prediction
+            .then_some(self.prediction.as_ref())
+            .flatten();
+        if let Some(prediction) = prediction {
+            if prediction.global_layer_offset() != range.end {
+                return Err(Error::backend(
+                    "Inkling prediction state is not contiguous with the target partition",
+                ));
+            }
+        }
+        let layout =
+            composite_state_layout(target.layout(), prediction.map(PartitionState::layout))
+                .map_err(Error::backend)?;
+        PartitionState::new(layout, target.global_layer_offset()).map_err(Error::backend)
+    }
+}
+
 impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
@@ -538,6 +612,20 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             Some(geometry) => Ok(geometry.state_layout().clone()),
             None => state_layout(&self.args).map_err(Error::backend),
         }
+    }
+
+    /// Returns every state layout consumed by execution and persistence.
+    pub fn state_layouts(&self) -> Result<InklingStateLayouts, Error> {
+        let target = self.state_layout_impl()?;
+        let prediction = match &self.parallel_geometry {
+            Some(geometry) => geometry.prediction_state().cloned(),
+            None => mtp_state_layout(&self.args)
+                .map_err(Error::backend)?
+                .map(|layout| PartitionState::new(layout, target.len()))
+                .transpose()
+                .map_err(Error::backend)?,
+        };
+        InklingStateLayouts::new(target, prediction)
     }
 
     /// Shares validated planner-derived geometry with backend residency policy.
@@ -1717,5 +1805,49 @@ where
                 auxiliary: eredu_runtime::NoAuxiliaryBoundary,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod state_layout_tests {
+    use super::*;
+
+    fn layouts() -> InklingStateLayouts {
+        let args = ModelArgs::from_hf_json(
+            br#"{"text_config":{"hidden_size":16,"num_hidden_layers":4,"vocab_size":32,
+            "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"d_rel":2,
+            "intermediate_size":24,"n_routed_experts":2,"num_experts_per_tok":1,
+            "n_shared_experts":1},"mtp_config":{"num_nextn_predict_layers":2,
+            "num_key_value_heads":1,"head_dim":8,"sconv_kernel_size":3}}"#,
+        )
+        .unwrap();
+        let target = state_layout(&args).unwrap();
+        let prediction = mtp_state_layout(&args)
+            .unwrap()
+            .map(|layout| PartitionState::new(layout, target.len()).unwrap());
+        InklingStateLayouts::new(target, prediction).unwrap()
+    }
+
+    #[test]
+    fn output_partition_appends_architecture_placed_prediction_state() {
+        let layouts = layouts();
+        let target = PartitionState::new(layouts.target().slice(2..4).unwrap(), 2).unwrap();
+        let state = layouts.partition(&target, true).unwrap();
+
+        assert_eq!(state.global_layers(), 2..6);
+        assert_eq!(state.layout().segments()[0].layers(), 0..2);
+        assert_eq!(state.layout().segments()[1].layers(), 2..4);
+    }
+
+    #[test]
+    fn interior_partition_cannot_claim_noncontiguous_prediction_state() {
+        let layouts = layouts();
+        let target = PartitionState::new(layouts.target().slice(0..2).unwrap(), 0).unwrap();
+
+        assert!(layouts.partition(&target, true).is_err());
+        assert_eq!(
+            layouts.partition(&target, false).unwrap().global_layers(),
+            0..2
+        );
     }
 }
