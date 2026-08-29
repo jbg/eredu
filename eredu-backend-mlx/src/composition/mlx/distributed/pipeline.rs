@@ -12786,36 +12786,42 @@ fn decoder_partition_state_layout(
         .map_err(|error| Error::Parallel(error.to_string()))
 }
 
-fn partition_state_end(
-    ownership: &eredu_runtime::PartitionOwnership,
-    decoder_end: usize,
-    complete_state_len: usize,
-) -> usize {
-    if ownership.owns_output() {
-        complete_state_len
-    } else {
-        decoder_end
-    }
+fn architecture_partition_state_layout<A, S, G, X>(
+    architecture: &A,
+    complete: &eredu_runtime::StateLayout,
+    partition: &eredu_runtime::ArchitecturePartition<G, X>,
+) -> Result<(eredu_runtime::StateLayout, usize), Error>
+where
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+{
+    let plan = <A as LayeredArchitecture<MlxNeuralBackend, S>>::state_partition_plan(
+        architecture,
+        complete,
+    );
+    let state = partition
+        .resolve_state_partition(complete, &plan)
+        .map_err(|error| Error::Parallel(error.to_string()))?
+        .ok_or_else(|| Error::Parallel("architecture partition owns no mutable state".into()))?;
+    Ok((state.layout().clone(), state.global_layer_offset()))
 }
 
-fn partition_owns_prediction_state(
-    ownership: &eredu_runtime::PartitionOwnership,
-    prediction_units: usize,
+fn partition_owns_architecture_units<G, X>(
+    partition: &eredu_runtime::ArchitecturePartition<G, X>,
+    units: impl IntoIterator<Item = (usize, Range<usize>)>,
 ) -> bool {
-    ownership.owns_output() && prediction_units != 0
-}
-
-#[cfg(test)]
-#[test]
-fn prediction_state_and_extent_follow_realized_output_ownership() {
-    let input_owner = eredu_runtime::PartitionOwnership::new(true, false, ["embedding"]).unwrap();
-    let output_owner = eredu_runtime::PartitionOwnership::new(false, true, ["output"]).unwrap();
-
-    assert_eq!(partition_state_end(&input_owner, 7, 11), 7);
-    assert_eq!(partition_state_end(&output_owner, 7, 11), 11);
-    assert!(!partition_owns_prediction_state(&input_owner, 2));
-    assert!(partition_owns_prediction_state(&output_owner, 2));
-    assert!(!partition_owns_prediction_state(&output_owner, 0));
+    let mut units = units.into_iter().peekable();
+    units.peek().is_some()
+        && units.all(|(group, required)| {
+            partition
+                .groups()
+                .iter()
+                .find(|owned| owned.group_index() == group)
+                .is_some_and(|owned| {
+                    let local = owned.global_units();
+                    local.start <= required.start && local.end >= required.end
+                })
+        })
 }
 
 fn local_architecture_parameter_bindings<G, A>(
@@ -18381,9 +18387,11 @@ fn load_nemotron_h_pipeline(
             Arc::clone(&geometry),
             std::iter::empty(),
         )?;
-    let owned_state_end =
-        partition_state_end(ownership_probe.ownership(), range.end, runtime_state.len());
-    let local_state = decoder_partition_state_layout(&runtime_state, range.start..owned_state_end)?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &runtime_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -18393,7 +18401,7 @@ fn load_nemotron_h_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
@@ -18420,8 +18428,12 @@ fn load_nemotron_h_pipeline(
         .range()
         .map(|global_layer| stage.build_unit(decoder_group, global_layer, stream))
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp =
-        partition_owns_prediction_state(stage.partition.ownership(), prediction_units.len());
+    let owns_mtp = partition_owns_architecture_units(
+        &stage.partition,
+        prediction_units
+            .iter()
+            .map(|(group, units)| (*group, units.clone())),
+    );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -19528,8 +19540,12 @@ fn load_neutral_qwen_hybrid_pipeline(
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp =
-        partition_owns_prediction_state(stage.partition.ownership(), prediction_units.len());
+    let owns_mtp = partition_owns_architecture_units(
+        &stage.partition,
+        prediction_units
+            .iter()
+            .map(|(group, index)| (*group, *index..*index + 1)),
+    );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -19954,9 +19970,11 @@ fn load_neutral_qwen_conditional_pipeline(
             architecture.shared_parallel_geometry(),
             std::iter::empty(),
         )?;
-    let state_end =
-        partition_state_end(ownership_probe.ownership(), range.end, complete_state.len());
-    let local_state = decoder_partition_state_layout(&complete_state, range.start..state_end)?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &complete_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -19967,7 +19985,7 @@ fn load_neutral_qwen_conditional_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             architecture.shared_parallel_geometry(),
             local_parameter_groups,
         )?;
@@ -19998,8 +20016,12 @@ fn load_neutral_qwen_conditional_pipeline(
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp =
-        partition_owns_prediction_state(stage.partition.ownership(), prediction_units.len());
+    let owns_mtp = partition_owns_architecture_units(
+        &stage.partition,
+        prediction_units
+            .iter()
+            .map(|(group, index)| (*group, *index..*index + 1)),
+    );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -21019,9 +21041,11 @@ fn load_neutral_inkling_pipeline(
             Arc::clone(&geometry),
             std::iter::empty(),
         )?;
-    let ownership = ownership_probe.ownership();
-    let state_end = partition_state_end(ownership, range.end, runtime_state.len());
-    let local_state = decoder_partition_state_layout(&runtime_state, range.start..state_end)?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &runtime_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21031,7 +21055,7 @@ fn load_neutral_inkling_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
@@ -22079,7 +22103,12 @@ fn load_neutral_deepseek_v3_pipeline(
             geometry,
             local_parameter_groups,
         )?;
-    let owns_mtp = partition_owns_prediction_state(partition.ownership(), prediction_units.len());
+    let owns_mtp = partition_owns_architecture_units(
+        &partition,
+        prediction_units
+            .iter()
+            .map(|(group, index)| (*group, *index..*index + 1)),
+    );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     let static_roles = parameter_description.select_static_roles(&partition);
@@ -22518,7 +22547,12 @@ fn load_neutral_deepseek_v4_pipeline(
         geometry,
         local_parameter_groups,
     )?;
-    let owns_mtp = partition_owns_prediction_state(partition.ownership(), prediction_units.len());
+    let owns_mtp = partition_owns_architecture_units(
+        &partition,
+        prediction_units
+            .iter()
+            .map(|(group, index)| (*group, *index..*index + 1)),
+    );
     info.owns_embedded_mtp = owns_mtp;
     info.embedded_mtp_layers = if owns_mtp { prediction_units.len() } else { 0 };
     let static_roles = parameter_description.select_static_roles(&partition);

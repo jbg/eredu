@@ -249,6 +249,16 @@ its temporal decoder across the pipeline with the pinned embedding and output
 modules, while its ordered depth predictions run on the output owner and own no
 pinned static roles.
 
+Mutable-state partitioning is a separate architecture declaration over the
+complete `StateLayout`. Every layered architecture publishes an
+`ArchitectureStatePartitionPlan` whose rules either align an exact state range
+with one execution group's unit indices or attach that range to the realized
+output owner. The runtime validates complete, non-overlapping coverage,
+group-length agreement, and the contiguity required by `PartitionState` before
+a backend receives rank-local geometry. Backends must consume the resolved plan;
+they must not extend a decoder range to the end of the state layout or infer
+prediction-state ownership from pipeline rank position.
+
 The ordinary Qwen decoder, block, and layered lifecycle are dense construction
 surfaces and require only `NeuralBackend`. Concrete adapters that dynamically
 admit both dense and Qwen MoE configurations use the separate routed Qwen
@@ -417,12 +427,13 @@ MTP unit, checkpoint root, and cache identity of every sparse unit in this
 catalog; backend adapters filter catalog units against the realized partition
 using that canonical group-local owner address, without recovering placement
 from flattened cache identities, target-layer counts, or inferred MTP ownership.
-Pipeline logits and persistent prediction-state attachment likewise follow the
-realized partition's output flag and architecture-declared static roles; a
-stage's raw layer-range endpoint is not an ownership signal. Backend stage
-metadata exposes these as `owns_input` and `owns_output` from the realized
-partition; pipeline coordinates describe transport adjacency, not boundary
-ownership.
+Pipeline logits follow the realized partition's output flag. Persistent state,
+including prediction segments, follows the architecture's resolved state
+partition plan, while prediction modules follow their realized execution-group
+or architecture-declared static-role ownership. A stage's raw layer-range
+endpoint is not an ownership signal. Backend stage metadata exposes input and
+output ownership from the realized partition; pipeline coordinates describe
+transport adjacency, not boundary ownership.
 Concrete backends lower catalog entries into native storage and may apply the
 declared unit path to a rank-local placement; they do not rebuild the schedule,
 instantiate a family block to discover expert parameters, or match parameter

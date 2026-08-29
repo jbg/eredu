@@ -1520,6 +1520,13 @@ where
         }
     }
 
+    fn state_partition_plan(
+        &self,
+        layout: &eredu_runtime::StateLayout,
+    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
+        crate::transport::pipeline_state(1, layout)
+    }
+
     fn model_identity(&self) -> &str {
         &self.args.model_type
     }

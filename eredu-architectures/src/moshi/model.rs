@@ -584,6 +584,18 @@ where
         group_transport(group)
     }
 
+    fn state_partition_plan(
+        &self,
+        layout: &eredu_runtime::StateLayout,
+    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
+        let temporal_layers = layout
+            .segments()
+            .first()
+            .map(|segment| segment.layers().end)
+            .unwrap_or(0);
+        crate::transport::pipeline_with_output_state(0, temporal_layers, layout)
+    }
+
     fn model_identity(&self) -> &str {
         self.config.architecture_fingerprint()
     }

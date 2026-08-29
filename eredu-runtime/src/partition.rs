@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
 use crate::{
+    ArchitectureStatePartitionError, ArchitectureStatePartitionPlan, ArchitectureStatePlacement,
     ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, LayeredForwardState,
     LayeredPartitionInput, LayeredPartitionOutput, ParameterGroupSpec,
     PartitionedLayeredArchitecture, RuntimeState, StateLayout,
@@ -1116,6 +1117,111 @@ impl<G, A> ArchitecturePartition<G, A> {
         self.state.as_ref()
     }
 
+    /// Resolves the architecture-authored state plan for this realized partition.
+    ///
+    /// The current partition representation stores one contiguous global state
+    /// interval. A valid plan may describe multiple semantic ranges, but the
+    /// ranges selected by any one partition must be adjacent.
+    pub fn resolve_state_partition(
+        &self,
+        complete: &StateLayout,
+        plan: &ArchitectureStatePartitionPlan,
+    ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
+        if plan.rules().is_empty() {
+            return Err(ArchitectureStatePartitionError::EmptyPlan);
+        }
+
+        let mut rules = plan.rules().iter().collect::<Vec<_>>();
+        rules.sort_by_key(|rule| rule.layers().start);
+        let mut frontier = 0usize;
+        for rule in &rules {
+            let layers = rule.layers();
+            if layers.is_empty() {
+                return Err(ArchitectureStatePartitionError::EmptyRange {
+                    start: layers.start,
+                    end: layers.end,
+                });
+            }
+            if layers.end > complete.len() {
+                return Err(ArchitectureStatePartitionError::RangeOutOfBounds {
+                    start: layers.start,
+                    end: layers.end,
+                    layers: complete.len(),
+                });
+            }
+            if layers.start < frontier {
+                return Err(ArchitectureStatePartitionError::OverlappingRange {
+                    start: layers.start,
+                    frontier,
+                });
+            }
+            if layers.start > frontier {
+                return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
+            }
+            if let ArchitectureStatePlacement::GroupUnits { group } = rule.placement() {
+                let units = self
+                    .unit_layout
+                    .group_range(group)
+                    .ok_or(ArchitectureStatePartitionError::UnknownGroup { group })?
+                    .len();
+                if layers.len() != units {
+                    return Err(ArchitectureStatePartitionError::GroupLengthMismatch {
+                        group,
+                        start: layers.start,
+                        end: layers.end,
+                        units,
+                    });
+                }
+            }
+            frontier = layers.end;
+        }
+        if frontier != complete.len() {
+            return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
+        }
+
+        let mut selected = Vec::new();
+        for rule in plan.rules() {
+            let layers = rule.layers();
+            match rule.placement() {
+                ArchitectureStatePlacement::GroupUnits { group } => {
+                    if let Some(owned) = self
+                        .groups
+                        .iter()
+                        .find(|owned| owned.group_index() == group)
+                    {
+                        let units = owned.global_units();
+                        selected.push(layers.start + units.start..layers.start + units.end);
+                    }
+                }
+                ArchitectureStatePlacement::OutputOwner if self.ownership.owns_output() => {
+                    selected.push(layers);
+                }
+                ArchitectureStatePlacement::OutputOwner => {}
+            }
+        }
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        selected.sort_by_key(|layers| layers.start);
+        let start = selected[0].start;
+        let mut end = selected[0].end;
+        for layers in selected.iter().skip(1) {
+            if layers.start != end {
+                return Err(ArchitectureStatePartitionError::DiscontiguousSelection {
+                    frontier: end,
+                    start: layers.start,
+                });
+            }
+            end = layers.end;
+        }
+        let layout = complete
+            .slice(start..end)
+            .map_err(|error| ArchitectureStatePartitionError::InvalidLayout(error.to_string()))?;
+        PartitionState::new(layout, start)
+            .map(Some)
+            .map_err(|error| ArchitectureStatePartitionError::InvalidLayout(error.to_string()))
+    }
+
     /// Returns family-owned rank-local construction geometry.
     pub const fn local_geometry(&self) -> &G {
         &self.local_geometry
@@ -1651,6 +1757,79 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn state_plan_partition(
+        primary: Range<usize>,
+        ownership: PartitionOwnership,
+    ) -> ArchitecturePartition<(), ()> {
+        let graph = graph();
+        ArchitecturePartition::new(
+            graph.clone(),
+            layout(&graph),
+            [("primary", primary)],
+            ownership,
+            None,
+            (),
+            (),
+            [],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn architecture_state_plan_attaches_declared_tail_to_output_owner() {
+        let complete = state_layout(6);
+        let plan = ArchitectureStatePartitionPlan::new([
+            crate::ArchitectureStatePartitionRule::group_units(0, 0..4),
+            crate::ArchitectureStatePartitionRule::output_owner(4..6),
+        ]);
+        let interior = state_plan_partition(
+            1..3,
+            PartitionOwnership::new(false, false, std::iter::empty::<&str>()).unwrap(),
+        );
+        let output = state_plan_partition(
+            3..4,
+            PartitionOwnership::new(false, true, std::iter::empty::<&str>()).unwrap(),
+        );
+
+        assert_eq!(
+            interior
+                .resolve_state_partition(&complete, &plan)
+                .unwrap()
+                .unwrap()
+                .global_layers(),
+            1..3
+        );
+        assert_eq!(
+            output
+                .resolve_state_partition(&complete, &plan)
+                .unwrap()
+                .unwrap()
+                .global_layers(),
+            3..6
+        );
+    }
+
+    #[test]
+    fn architecture_state_plan_rejects_noncontiguous_local_state() {
+        let complete = state_layout(6);
+        let plan = ArchitectureStatePartitionPlan::new([
+            crate::ArchitectureStatePartitionRule::output_owner(0..2),
+            crate::ArchitectureStatePartitionRule::group_units(0, 2..6),
+        ]);
+        let output = state_plan_partition(
+            3..4,
+            PartitionOwnership::new(false, true, std::iter::empty::<&str>()).unwrap(),
+        );
+
+        assert_eq!(
+            output.resolve_state_partition(&complete, &plan),
+            Err(ArchitectureStatePartitionError::DiscontiguousSelection {
+                frontier: 2,
+                start: 5,
+            })
+        );
     }
 
     fn parameter_description(

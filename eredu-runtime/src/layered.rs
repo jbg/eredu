@@ -376,6 +376,9 @@ where
     /// Declares transport and physical placement semantics for one canonical group slot.
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport;
 
+    /// Declares how the complete mutable-state layout is divided among realized partitions.
+    fn state_partition_plan(&self, layout: &StateLayout) -> crate::ArchitectureStatePartitionPlan;
+
     /// Stable architecture compatibility identity.
     fn model_identity(&self) -> &str;
 

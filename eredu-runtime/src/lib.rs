@@ -144,9 +144,11 @@ pub use residency::{
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use state::{
-    DeviceState, LayerRuntimeState, ModelStateIdentity, ResettableRuntimeLayerState,
-    ResettableRuntimeState, RuntimeLayerState, RuntimeState, RuntimeStateComponents, StateError,
-    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, DEFAULT_STATE_SEGMENT_ID,
+    ArchitectureStatePartitionError, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ArchitectureStatePlacement, DeviceState, LayerRuntimeState,
+    ModelStateIdentity, ResettableRuntimeLayerState, ResettableRuntimeState, RuntimeLayerState,
+    RuntimeState, RuntimeStateComponents, StateError, StateLayout, StateSegmentId,
+    StateSegmentLifetime, StateSegmentSpec, DEFAULT_STATE_SEGMENT_ID,
 };
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,

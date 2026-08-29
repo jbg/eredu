@@ -15,6 +15,152 @@ use eredu_core::{
 };
 use eredu_nn::NeuralBackend;
 
+/// Architecture-declared placement of one contiguous mutable-state range.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArchitectureStatePlacement {
+    /// Partition the state range in lockstep with one execution group's units.
+    GroupUnits {
+        /// Canonical execution-group slot.
+        group: usize,
+    },
+    /// Attach the complete state range to the realized architecture output owner.
+    OutputOwner,
+}
+
+/// One architecture-authored rule in a mutable-state partition plan.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArchitectureStatePartitionRule {
+    layers: Range<usize>,
+    placement: ArchitectureStatePlacement,
+}
+
+impl ArchitectureStatePartitionRule {
+    /// Aligns a state range one-for-one with an execution group's unit indices.
+    pub fn group_units(group: usize, layers: Range<usize>) -> Self {
+        Self {
+            layers,
+            placement: ArchitectureStatePlacement::GroupUnits { group },
+        }
+    }
+
+    /// Attaches a complete state range to the architecture output owner.
+    pub fn output_owner(layers: Range<usize>) -> Self {
+        Self {
+            layers,
+            placement: ArchitectureStatePlacement::OutputOwner,
+        }
+    }
+
+    /// Returns the architecture-global state-layer range governed by this rule.
+    pub fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+
+    /// Returns the rule's neutral placement semantics.
+    pub const fn placement(&self) -> ArchitectureStatePlacement {
+        self.placement
+    }
+}
+
+/// Complete architecture-authored mutable-state partition policy.
+///
+/// Resolution validates that the rules cover the supplied [`StateLayout`]
+/// exactly once and that unit-aligned ranges match their execution groups.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArchitectureStatePartitionPlan {
+    rules: Vec<ArchitectureStatePartitionRule>,
+}
+
+impl ArchitectureStatePartitionPlan {
+    /// Collects the architecture's state placement rules in declaration order.
+    pub fn new(rules: impl IntoIterator<Item = ArchitectureStatePartitionRule>) -> Self {
+        Self {
+            rules: rules.into_iter().collect(),
+        }
+    }
+
+    /// Returns the declared state placement rules.
+    pub fn rules(&self) -> &[ArchitectureStatePartitionRule] {
+        &self.rules
+    }
+}
+
+/// Invalid architecture-authored mutable-state partition policy.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ArchitectureStatePartitionError {
+    /// The plan contains no placement rules.
+    #[error("architecture state partition plan must contain at least one rule")]
+    EmptyPlan,
+    /// A rule selected no state layers.
+    #[error("architecture state partition rule has empty range {start}..{end}")]
+    EmptyRange {
+        /// Inclusive invalid range start.
+        start: usize,
+        /// Exclusive invalid range end.
+        end: usize,
+    },
+    /// A rule selected state layers outside the complete layout.
+    #[error("architecture state partition range {start}..{end} exceeds the {layers}-layer layout")]
+    RangeOutOfBounds {
+        /// Inclusive invalid range start.
+        start: usize,
+        /// Exclusive invalid range end.
+        end: usize,
+        /// Complete state-layout length.
+        layers: usize,
+    },
+    /// Two rules selected the same state layer.
+    #[error(
+        "architecture state partition range starts at {start}, before prior frontier {frontier}"
+    )]
+    OverlappingRange {
+        /// Inclusive overlapping range start.
+        start: usize,
+        /// End of the preceding declared range.
+        frontier: usize,
+    },
+    /// No rule selected one or more state layers.
+    #[error("architecture state layer {layer} is not assigned by the partition plan")]
+    UnassignedLayer {
+        /// First state layer without a rule.
+        layer: usize,
+    },
+    /// A unit-aligned rule named a nonexistent execution group.
+    #[error("architecture state partition references unknown execution group {group}")]
+    UnknownGroup {
+        /// Missing canonical execution-group slot.
+        group: usize,
+    },
+    /// A unit-aligned state range and its execution group have different lengths.
+    #[error(
+        "architecture state range {start}..{end} has {} layers but group {group} has {units} units",
+        end - start
+    )]
+    GroupLengthMismatch {
+        /// Canonical execution-group slot.
+        group: usize,
+        /// Inclusive state-range start.
+        start: usize,
+        /// Exclusive state-range end.
+        end: usize,
+        /// Execution-group unit count.
+        units: usize,
+    },
+    /// This partition's selected state ranges cannot use the contiguous state representation.
+    #[error(
+        "architecture state partition selects discontiguous ranges ending at {frontier} and starting at {start}"
+    )]
+    DiscontiguousSelection {
+        /// End of the preceding selected range.
+        frontier: usize,
+        /// Start of the next selected range.
+        start: usize,
+    },
+    /// The selected state layout could not be sliced from the complete layout.
+    #[error("architecture state partition layout is invalid: {0}")]
+    InvalidLayout(String),
+}
+
 /// Stable name assigned to the implicit segment of a simple state layout.
 pub const DEFAULT_STATE_SEGMENT_ID: &str = "state";
 

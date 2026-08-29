@@ -823,6 +823,15 @@ mod tests {
             }
         }
 
+        fn state_partition_plan(
+            &self,
+            layout: &eredu_runtime::StateLayout,
+        ) -> eredu_runtime::ArchitectureStatePartitionPlan {
+            eredu_runtime::ArchitectureStatePartitionPlan::new([
+                eredu_runtime::ArchitectureStatePartitionRule::output_owner(0..layout.len()),
+            ])
+        }
+
         fn model_identity(&self) -> &str {
             "placement-fixture"
         }

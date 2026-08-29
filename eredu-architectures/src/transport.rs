@@ -2,8 +2,35 @@
 
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParallelSubgroup,
+    ArchitectureMergeDestination, ArchitectureParallelSubgroup, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, StateLayout,
 };
+
+/// Unit-aligned state owned by one pipeline-distributed execution group.
+pub(crate) fn pipeline_state(group: usize, layout: &StateLayout) -> ArchitectureStatePartitionPlan {
+    ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+        group,
+        0..layout.len(),
+    )])
+}
+
+/// Unit-aligned primary state followed by state attached to the output owner.
+pub(crate) fn pipeline_with_output_state(
+    group: usize,
+    primary_layers: usize,
+    layout: &StateLayout,
+) -> ArchitectureStatePartitionPlan {
+    let mut rules = vec![ArchitectureStatePartitionRule::group_units(
+        group,
+        0..primary_layers,
+    )];
+    if primary_layers < layout.len() {
+        rules.push(ArchitectureStatePartitionRule::output_owner(
+            primary_layers..layout.len(),
+        ));
+    }
+    ArchitectureStatePartitionPlan::new(rules)
+}
 
 /// Standard pipeline-balanced text-decoder transport.
 pub(crate) fn decoder() -> ArchitectureGroupTransport {
