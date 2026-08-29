@@ -26,11 +26,20 @@ jobs:
       - name: Install MLX CPU build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
+          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev libclang-dev
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Check language-model crates, examples, and CLI with the locked MSRV
-        run: cargo check --locked -p eredu-text -p eredu -p eredu-backend-mlx --all-targets -p eredu-cli
+      - name: Check the portable workspace with the locked MSRV
+        run: cargo check --locked --workspace --all-targets --no-default-features
+      - name: Check every CPU-compatible optional surface with the locked MSRV
+        run: |
+          cargo check --locked -p safemlx-sys --no-default-features --features "accelerate,metal,generate-bindings"
+          cargo check --locked -p safemlx --all-targets --no-default-features --features "accelerate,metal,safetensors"
+          cargo check --locked -p safemlx-tests --all-targets --no-default-features --features metal
+          cargo check --locked -p eredu-text --all-targets --all-features
+          cargo check --locked -p eredu-backend-mlx --all-targets --no-default-features --features "accelerate,metal,image,codec"
+          cargo check --locked -p eredu --all-targets --no-default-features --features "mlx,metal,image,audio,onig,esaxx_fast"
+          cargo check --locked -p eredu-cli --all-targets
 
   cpu:
     runs-on: ubuntu-22.04
@@ -65,12 +74,13 @@ jobs:
           cargo test --locked -p eredu --lib runtime::generation::streaming::tests::
 
   cuda-build:
+    name: Rust 1.89 CUDA and NCCL compatibility
     runs-on: ubuntu-22.04
     env:
       SAFEMLX_CUDA_ARCHITECTURES: "80"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
       - name: Install NVIDIA repository
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
@@ -83,26 +93,28 @@ jobs:
             liblapack-dev \
             liblapacke-dev \
             libcudnn9-dev-cuda-12 \
+            libnccl-dev \
             cuda-compiler-12-9 \
             cuda-libraries-dev-12-9
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "/usr/local/cuda-12.9/bin" >> "$GITHUB_PATH"
-      - name: Build and link safemlx with CUDA
+      - name: Build and link safemlx with CUDA and NCCL
         # Some generated CUDA translation units are memory-intensive. Keep the
         # native build serialized so standard hosted runners do not OOM.
         run: |
-          cargo test -j 1 -p safemlx --no-default-features --features cuda --lib --no-run
-          cargo test -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
+          cargo test -j 1 --locked -p safemlx --no-default-features --features "nccl,safetensors" --lib --no-run
+          cargo test -j 1 --locked -p safemlx --features nccl --test events --no-run --no-default-features
+          cargo test -j 1 --locked -p safemlx-tests --no-default-features --features nccl --no-run
       - name: Compile facade and MLX backend tests and residency example with CUDA
         run: |
-          cargo test -j 1 -p eredu --no-default-features --features cuda --lib --no-run
-          cargo test -j 1 -p eredu-backend-mlx --features cuda --lib --no-run
-          cargo check -j 1 -p eredu-backend-mlx --features cuda --example llama_residency
+          cargo test -j 1 --locked -p eredu --no-default-features --features "nccl,image,audio" --lib --no-run
+          cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --no-run
+          cargo check -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency
       - name: Compile the CUDA codec backend
-        run: cargo test -j 1 -p eredu-backend-mlx --features "cuda,codec" --test mimi_codec --no-run
+        run: cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image,codec" --test mimi_codec --no-run
       - name: Check the CUDA language-model CLI
-        run: cargo check -j 1 -p eredu-cli --no-default-features --features cuda
+        run: cargo check -j 1 --locked -p eredu-cli --no-default-features --features nccl
 
   cuda-gpu-smoke:
     if: github.event_name == 'workflow_dispatch'

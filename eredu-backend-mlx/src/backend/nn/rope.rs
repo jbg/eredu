@@ -10,7 +10,7 @@ use safemlx::{
     ops::{
         arange, concatenate_axis, cos,
         indexing::{NewAxis, TryIndexOp},
-        sin, which,
+        r#where, sin,
     },
     Array, Stream,
 };
@@ -70,7 +70,7 @@ impl FrequencyScaledRope {
 
         // First pass: scale low frequencies (long wavelengths) by factor
         let is_low = wavelens.gt(Array::from_f32(low_freq_wavelen), stream)?;
-        let freqs = which(
+        let freqs = r#where(
             &is_low,
             &freqs.multiply(Array::from_f32(factor), stream)?,
             &freqs,
@@ -98,7 +98,7 @@ impl FrequencyScaledRope {
             .add(&smooth_factors, stream)?;
         let smooth_freqs = freqs.divide(&denom, stream)?;
 
-        let freqs = which(&is_medium, &smooth_freqs, &freqs, stream)?;
+        let freqs = r#where(&is_medium, &smooth_freqs, &freqs, stream)?;
 
         Ok(Self {
             dimensions: dims,

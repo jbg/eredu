@@ -4,7 +4,7 @@ use crate::module::{Module, Param};
 use crate::{
     array,
     error::{Exception, Result},
-    ops::{abs, erf, exp, logsumexp_axis, maximum, minimum, multiply, sqrt, tanh, which},
+    ops::{abs, erf, exp, logsumexp_axis, maximum, minimum, multiply, r#where, sqrt, tanh},
     Array,
 };
 use safemlx_internal_macros::{generate_builder, Buildable, Builder};
@@ -82,7 +82,7 @@ pub fn log_softmax(
 /// This is:
 ///
 /// ```rust, ignore
-/// which(x.gt(0), x, alpha * (exp(x) - 1))
+/// where(x.gt(0), x, alpha * (exp(x) - 1))
 /// ```
 ///
 /// # Params
@@ -97,7 +97,7 @@ pub fn elu(
     let stream = stream.as_ref();
     let x = x.as_ref();
     let alpha = array!(alpha.into().unwrap_or(1.0));
-    which(
+    r#where(
         &x.gt(&array!(0.0), stream)?,
         x,
         alpha.multiply(exp(x, stream)?.subtract(array!(1.0), stream)?, stream)?,

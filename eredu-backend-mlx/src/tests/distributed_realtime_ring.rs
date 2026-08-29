@@ -227,7 +227,10 @@ fn moshi_ring_model_parity_worker() {
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
     )
     .unwrap();
-    assert_eq!(replicated.model().model_type(), expected_profile);
+    assert_eq!(
+        replicated.model().effective_model_type().as_str(),
+        expected_profile
+    );
     let config = replicated.model().config().clone();
     let expected = run_forced_and_greedy_sequence(&mut replicated);
     drop(replicated);
@@ -246,7 +249,10 @@ fn moshi_ring_model_parity_worker() {
         ),
     )
     .unwrap();
-    assert_eq!(parallel.model().model_type(), expected_profile);
+    assert_eq!(
+        parallel.model().effective_model_type().as_str(),
+        expected_profile
+    );
     assert_eq!(parallel.model().config(), &config);
     let actual = run_forced_and_greedy_sequence(&mut parallel);
     assert_eq!(actual, expected, "rank {expected_rank} TP output drifted");

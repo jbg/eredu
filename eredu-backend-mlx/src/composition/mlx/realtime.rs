@@ -67,11 +67,6 @@ impl MlxRealtimeModel {
         self.model.config().effective_model_type()
     }
 
-    /// Returns the loaded realtime model family as a model type string.
-    pub fn model_type(&self) -> &'static str {
-        self.effective_model_type().as_str()
-    }
-
     /// Returns the normalized Moshi-family configuration.
     pub fn config(&self) -> &MoshiConfig {
         self.model.config()

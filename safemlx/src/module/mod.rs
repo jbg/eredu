@@ -1,8 +1,7 @@
 //! This mod defines the traits for neural network modules and parameters.
 //!
-//! This is to separate the trait definitions from the implementations, which are in the `mlx-nn`
-//! crate. This also allows using the `safemlx_macros::ModuleParameters` derive macro in crates other
-//! than `mlx-nn`.
+//! Keeping these traits separate from the neural-network modules also allows downstream crates to
+//! use the `safemlx_macros::ModuleParameters` derive macro for their own module implementations.
 
 #[allow(clippy::module_inception)]
 mod module;

@@ -712,17 +712,6 @@ pub fn r#where(
     })
 }
 
-/// Alias for [`where()`].
-#[generate_macro]
-pub fn which(
-    condition: impl AsRef<Array>,
-    a: impl AsRef<Array>,
-    b: impl AsRef<Array>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
-    r#where(condition, a, b, stream)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{array, Dtype};
@@ -1051,24 +1040,24 @@ mod tests {
     }
 
     #[test]
-    fn test_which() {
+    fn test_where() {
         let stream = crate::test_stream();
         let condition = Array::from_slice(&[true, false, true], &[3]);
         let a = Array::from_slice(&[1, 2, 3], &[3]);
         let b = Array::from_slice(&[4, 5, 6], &[3]);
-        let c = which(&condition, &a, &b, stream).unwrap();
+        let c = r#where(&condition, &a, &b, stream).unwrap();
 
         let c_data: Vec<i32> = crate::array::eval_vec(&c);
         assert_eq!(c_data, [1, 5, 3]);
     }
 
     #[test]
-    fn test_which_invalid_broadcast() {
+    fn test_where_invalid_broadcast() {
         let stream = crate::test_stream();
         let condition = Array::from_slice(&[true, false, true], &[3]);
         let a = Array::from_slice(&[1, 2, 3], &[3]);
         let b = Array::from_slice(&[4, 5, 6, 7], &[4]);
-        let c = which(&condition, &a, &b, stream);
+        let c = r#where(&condition, &a, &b, stream);
         assert!(c.is_err());
     }
 
