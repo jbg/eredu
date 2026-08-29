@@ -97,6 +97,10 @@ impl RealtimeBackend for MlxRealtimeAdapter {
         self.backend.model_identity(model)
     }
 
+    fn session_capabilities(&self, model: &Self::Model) -> eredu_core::SessionCapabilities {
+        self.backend.session_capabilities(model)
+    }
+
     fn model_identity_mismatch(
         &self,
         expected: &Self::ModelIdentity,

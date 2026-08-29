@@ -1195,6 +1195,8 @@ pub trait RealtimeBackend {
     fn name(&self) -> &str;
     /// Returns the complete model identity.
     fn model_identity(&self, model: &Self::Model) -> Self::ModelIdentity;
+    /// Returns fail-closed capabilities of the exact loaded realtime session.
+    fn session_capabilities(&self, model: &Self::Model) -> crate::SessionCapabilities;
     /// Describes the first material difference between two model identities.
     fn model_identity_mismatch(
         &self,
@@ -1315,6 +1317,10 @@ impl<B: RealtimeBackend> RealtimeModel<B> {
     /// Portable codec-token geometry.
     pub fn speech_config(&self) -> RealtimeSpeechConfig {
         self.backend.speech_config(&self.model)
+    }
+    /// Fail-closed capabilities of the exact loaded realtime session.
+    pub fn session_capabilities(&self) -> crate::SessionCapabilities {
+        self.backend.session_capabilities(&self.model)
     }
     /// Consumes the runtime into backend and model values.
     pub fn into_parts(self) -> (B, B::Model) {
@@ -1811,6 +1817,13 @@ mod tests {
         fn model_identity(&self, model: &u64) -> u64 {
             *model
         }
+        fn session_capabilities(&self, _: &u64) -> crate::SessionCapabilities {
+            crate::SessionCapabilities {
+                persistent_cache: true,
+                output_observation: true,
+                activation_inspection: false,
+            }
+        }
         fn speech_config(&self, _: &u64) -> RealtimeSpeechConfig {
             RealtimeSpeechConfig::new(
                 2,
@@ -1903,6 +1916,14 @@ mod tests {
         let model = load_realtime_model_with_options(MockBackend, 37, 0).unwrap();
         assert_eq!(*model.model(), 37);
         assert_eq!(model.backend().name(), "mock-realtime");
+        assert_eq!(
+            model.session_capabilities(),
+            crate::SessionCapabilities {
+                persistent_cache: true,
+                output_observation: true,
+                activation_inspection: false,
+            }
+        );
     }
 
     #[test]

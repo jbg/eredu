@@ -23,6 +23,12 @@ load policy:
 - `required_session_capabilities`: fail-closed requirements for the realized
   session.
 
+The same requirement applies to realtime loading. MLX Moshi and PersonaPlex
+routes report persistent request cache and portable output observation, but not
+named activation inspection; an unsupported requirement fails before checkpoint
+payload materialization. Loaded realtime models expose the admitted report with
+`LocalRealtimeModel::session_capabilities`.
+
 These facade-owned options are configured with builders and queried with
 accessors. They do not contain an MLX device or parallel context. Applications
 derive them from a portable `ExecutionPlan` with

@@ -82,6 +82,11 @@ impl MlxRealtimeModel {
         self.model.source_config().artifact_profile()
     }
 
+    /// Returns fail-closed capabilities of this realtime session route.
+    pub const fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        realtime_session_capabilities()
+    }
+
     /// Returns parameter topology, residency, quantization, and materialization metadata.
     pub fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
         self.model.metadata()
@@ -330,6 +335,7 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
         preparation: Self::Preparation,
         options: Self::LoadOptions,
     ) -> Result<Self::Model, Self::Error> {
+        validate_realtime_session_requirements(&options)?;
         let model =
             materialize_realtime_model(preparation, options, &self.stream, &self.weights_stream)?;
         if let Some(topology) = model.model.topology() {
@@ -352,6 +358,21 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
         }
         Ok(model)
     }
+}
+
+const fn realtime_session_capabilities() -> eredu_core::SessionCapabilities {
+    eredu_core::SessionCapabilities {
+        persistent_cache: true,
+        output_observation: true,
+        activation_inspection: false,
+    }
+}
+
+fn validate_realtime_session_requirements(options: &ModelLoadOptions) -> Result<(), Error> {
+    options
+        .required_session_capabilities
+        .validate(&realtime_session_capabilities())?;
+    Ok(())
 }
 
 fn realtime_sampler(top_k: Option<usize>) -> Result<GenerationSampler, Error> {
@@ -1001,6 +1022,10 @@ impl RealtimeBackend for MlxRealtimeBackend {
         MlxRealtimeModelIdentity::new(model)
     }
 
+    fn session_capabilities(&self, model: &Self::Model) -> eredu_core::SessionCapabilities {
+        model.session_capabilities()
+    }
+
     fn model_identity_mismatch(
         &self,
         expected: &Self::ModelIdentity,
@@ -1230,6 +1255,28 @@ mod tests {
     fn prepare(path: &Path) -> RealtimePreparationPlan {
         eredu_architectures::moshi::prepare_realtime_model(path)
             .unwrap_or_else(|error| panic!("prepare realtime artifact {}: {error}", path.display()))
+    }
+
+    #[test]
+    fn realtime_session_capabilities_fail_closed_for_activation_inspection() {
+        let available = realtime_session_capabilities();
+        assert!(available.persistent_cache);
+        assert!(available.output_observation);
+        assert!(!available.activation_inspection);
+
+        let options = ModelLoadOptions::default().with_required_session_capabilities(
+            eredu_core::SessionCapabilities {
+                activation_inspection: true,
+                ..eredu_core::SessionCapabilities::default()
+            },
+        );
+        let error = validate_realtime_session_requirements(&options).unwrap_err();
+        match error {
+            Error::SessionCapability(error) => {
+                assert_eq!(error.capability(), "activation_inspection")
+            }
+            error => panic!("expected session capability error, got {error:?}"),
+        }
     }
 
     const TINY_NATIVE_CONFIG: &str = r#"{

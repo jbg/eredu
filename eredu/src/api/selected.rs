@@ -877,6 +877,11 @@ impl LocalRealtimeModel {
     pub fn speech_config(&self) -> crate::RealtimeSpeechConfig {
         self.inner.speech_config()
     }
+
+    /// Fail-closed capabilities of the exact loaded realtime session.
+    pub fn session_capabilities(&self) -> crate::SessionCapabilities {
+        self.inner.session_capabilities()
+    }
 }
 
 /// Request-local selected-backend state released from a realtime scheduler.

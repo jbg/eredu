@@ -1737,6 +1737,14 @@ impl RealtimeBackend for MockRealtimeBackend {
         *model
     }
 
+    fn session_capabilities(&self, _: &Self::Model) -> SessionCapabilities {
+        SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: false,
+        }
+    }
+
     fn speech_config(&self, _: &Self::Model) -> RealtimeSpeechConfig {
         RealtimeSpeechConfig::new(
             2,
@@ -1839,6 +1847,9 @@ fn assert_realtime_conformance() {
     let mut model = load_realtime_model_with_options(MockRealtimeBackend, 23, 0).unwrap();
     assert_eq!(model.backend().name(), "portable-mock-realtime");
     assert_eq!(*model.model(), 23);
+    assert!(model.session_capabilities().persistent_cache);
+    assert!(model.session_capabilities().output_observation);
+    assert!(!model.session_capabilities().activation_inspection);
     assert_eq!(model.speech_config().generated_audio_codebooks(), 1);
 
     let limits = SchedulerLimits::with_execution_bounds(1, 2, 1, 1, 1, usize::MAX).unwrap();

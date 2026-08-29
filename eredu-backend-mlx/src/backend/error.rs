@@ -27,6 +27,10 @@ pub enum Error {
     #[error(transparent)]
     Artifact(#[from] eredu_core::artifact::ArtifactError),
 
+    /// The selected realtime session lacks a required capability.
+    #[error(transparent)]
+    SessionCapability(#[from] eredu_core::SessionCapabilityError),
+
     /// Invalid backend-neutral cache identity, geometry, or state policy.
     #[error(transparent)]
     CachePolicy(#[from] eredu_core::cache::CachePolicyError),

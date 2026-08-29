@@ -161,6 +161,11 @@ topology executors finalize logits through
 logits-owning rank before submitting its completion. Realtime applications
 likewise exchange portable host token frames and observations through
 `RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
+Realtime backends report the exact loaded route's fail-closed
+`SessionCapabilities`; realtime loading validates requested capabilities before
+checkpoint payload materialization just as ordinary model loading does. A
+realtime route must not advertise named activation inspection unless it exposes
+the corresponding inspection contract.
 Distributed inspection is rank-local: every rank participates in the same
 production collective and point-to-point execution, each rank returns only the
 globally named units it owns, and only the logits-owning rank returns
