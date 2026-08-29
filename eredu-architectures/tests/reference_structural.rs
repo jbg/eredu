@@ -4,9 +4,9 @@ use std::{cell::RefCell, collections::BTreeMap};
 
 use eredu_architectures::{
     decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
-    gpt_oss,
+    gemma4, gpt_oss,
     llama::{self, LayeredInput, ModelArgs},
-    moshi, qwen,
+    moshi, muse_glimmer, qwen,
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
@@ -70,6 +70,9 @@ impl Tensor for ReferenceTensor {
     }
 
     fn unloaded_f32(shape: &[i32], _: &()) -> Result<Self, Error> {
+        Ok(Self(shape.to_vec()))
+    }
+    fn unloaded_i32(shape: &[i32], _: &()) -> Result<Self, Error> {
         Ok(Self(shape.to_vec()))
     }
     fn from_f32_slice(_: &[f32], shape: &[i32], _: &()) -> Result<Self, Error> {
@@ -2982,4 +2985,92 @@ fn moshi_decision_domains_include_exact_released_padding_rows() {
             config.audio_vocabulary_size() as usize + 1
         );
     }
+}
+
+#[test]
+fn external_assistant_safetensors_schemas_equal_neutral_parameter_topology() {
+    let gemma_config = gemma4::AssistantConfig::from_json(
+        br#"{
+          "model_type":"gemma4_assistant","backbone_hidden_size":32,
+          "use_ordered_embeddings":false,"tie_word_embeddings":false,"block_size":4,
+          "text_config":{"model_type":"gemma4_text","hidden_size":32,
+            "num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+            "vocab_size":32,"max_position_embeddings":128,
+            "tie_word_embeddings":false,"attention_k_eq_v":false,
+            "layer_types":["full_attention"]}
+        }"#,
+    )
+    .unwrap();
+    let gemma = gemma4::Assistant::<ReferenceBackend>::new(gemma_config.clone(), &()).unwrap();
+    assert_assistant_plan_matches_topology(
+        &gemma,
+        gemma4::assistant_safetensors_plan(&gemma_config).unwrap(),
+    );
+    let mut tied_value = serde_json::from_slice::<serde_json::Value>(
+        br#"{
+          "model_type":"gemma4_assistant","backbone_hidden_size":32,
+          "use_ordered_embeddings":false,"tie_word_embeddings":false,"block_size":4,
+          "text_config":{"model_type":"gemma4_text","hidden_size":32,
+            "num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+            "vocab_size":32,"max_position_embeddings":128,
+            "tie_word_embeddings":false,"attention_k_eq_v":false,
+            "layer_types":["full_attention"]}
+        }"#,
+    )
+    .unwrap();
+    tied_value["tie_word_embeddings"] = true.into();
+    let tied_config =
+        gemma4::AssistantConfig::from_json(&serde_json::to_vec(&tied_value).unwrap()).unwrap();
+    let tied = gemma4::Assistant::<ReferenceBackend>::new(tied_config.clone(), &()).unwrap();
+    assert_assistant_plan_matches_topology(
+        &tied,
+        gemma4::assistant_safetensors_plan(&tied_config).unwrap(),
+    );
+    tied_value["tie_word_embeddings"] = false.into();
+    tied_value["use_ordered_embeddings"] = true.into();
+    tied_value["num_centroids"] = 4.into();
+    tied_value["centroid_intermediate_top_k"] = 2.into();
+    let ordered_config =
+        gemma4::AssistantConfig::from_json(&serde_json::to_vec(&tied_value).unwrap()).unwrap();
+    let ordered = gemma4::Assistant::<ReferenceBackend>::new(ordered_config.clone(), &()).unwrap();
+    assert_assistant_plan_matches_topology(
+        &ordered,
+        gemma4::assistant_safetensors_plan(&ordered_config).unwrap(),
+    );
+    let dflash_config = muse_glimmer::DFlashConfig::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+          "model_type":"muse_glimmer_assistant","hidden_size":6656,
+          "intermediate_size":19968,"num_hidden_layers":5,"num_attention_heads":32,
+          "num_key_value_heads":8,"head_dim":128,"rms_norm_eps":0.000001,
+          "max_position_embeddings":131072,"sliding_window":2048,"block_size":16,
+          "mask_token_id":201818,"target_layer_ids":[1,13,25,37,49],
+          "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+            "sliding_attention","sliding_attention"],
+          "hidden_act":"silu","attention_dropout":0.0,
+          "rope_parameters":{"rope_theta":500000.0}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let dflash = muse_glimmer::DFlash::<ReferenceBackend>::new(dflash_config.clone(), &()).unwrap();
+    assert_assistant_plan_matches_topology(
+        &dflash,
+        muse_glimmer::dflash_safetensors_plan(&dflash_config).unwrap(),
+    );
+}
+
+fn assert_assistant_plan_matches_topology<M: Parameterized<ReferenceTensor>>(
+    module: &M,
+    plan: eredu_checkpoint::schema::SafetensorsCheckpointPlan,
+) {
+    assert!(plan.layout_groups.is_empty());
+    let declared = plan
+        .common_tensors
+        .into_iter()
+        .map(|tensor| (tensor.key, tensor.shape))
+        .collect::<BTreeMap<_, _>>();
+    let actual = topology(module).into_iter().collect::<BTreeMap<_, _>>();
+    assert_eq!(declared, actual);
 }

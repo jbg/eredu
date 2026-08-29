@@ -10,8 +10,9 @@ pub mod text;
 pub mod vision;
 
 pub use assistant::{
-    dflash_gguf_plan, translate_dflash_gguf_weight_name, DFlash, DFlashCompatibility,
-    DFlashCompatibilityError, DFlashConfig, DFlashConfigError, DFlashContext, DFlashLayerContext,
+    dflash_gguf_plan, dflash_safetensors_plan, translate_dflash_gguf_weight_name, DFlash,
+    DFlashCompatibility, DFlashCompatibilityError, DFlashConfig, DFlashConfigError, DFlashContext,
+    DFlashLayerContext,
 };
 pub use checkpoint::{
     expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,

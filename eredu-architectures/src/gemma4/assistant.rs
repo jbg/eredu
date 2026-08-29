@@ -3,8 +3,12 @@
 use std::collections::HashMap;
 
 use eredu_checkpoint::{
-    schema::{GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint, TensorOperation},
-    LinearFormat, WeightQuantization,
+    schema::{
+        matrix_for_linear_format, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+        GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+        StoredDtypeConstraint, TensorOperation,
+    },
+    LinearFormat, StoredDtype, WeightQuantization,
 };
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
@@ -394,6 +398,95 @@ impl AssistantConfig {
             target_publisher_layers: target_publisher_layers.into_boxed_slice(),
         })
     }
+}
+
+/// Builds the strict released assistant SafeTensors catalog.
+pub fn assistant_safetensors_plan(
+    config: &AssistantConfig,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    config.validate().map_err(|error| error.to_string())?;
+    let family = super::FamilyConfig {
+        model_type: "gemma4".into(),
+        text: config.text_config.clone(),
+        vision: None,
+        image_token_id: None,
+        video_token_id: None,
+        audio: None,
+        audio_token_id: None,
+    };
+    let base = super::checkpoint::safetensors_plan(&family)?;
+    let mut common = base.common_tensors;
+    for tensor in &mut common {
+        if let Some(canonical) = tensor.aliases.first().cloned() {
+            tensor.key = canonical;
+        }
+        tensor.aliases.clear();
+    }
+    if config.use_ordered_embeddings {
+        common.retain(|tensor| !tensor.key.starts_with("lm_head."));
+    }
+    if !config.tie_word_embeddings && !config.use_ordered_embeddings {
+        common.retain(|tensor| !tensor.key.starts_with("model.embed_tokens."));
+    }
+
+    let hidden = usize::try_from(config.text_config.hidden_size)
+        .map_err(|_| "Gemma 4 assistant hidden size is invalid".to_string())?;
+    let backbone = usize::try_from(config.backbone_hidden_size)
+        .map_err(|_| "Gemma 4 assistant target width is invalid".to_string())?;
+    let format = |name: &str| {
+        config
+            .quantization
+            .map(LinearFormat::from)
+            .unwrap_or_else(|| config.text_config.linear_format_for(name))
+    };
+    let mut add_matrix = |name: &str, shape: Vec<usize>| -> Result<(), String> {
+        common.extend(
+            matrix_for_linear_format(
+                name,
+                std::iter::empty::<String>(),
+                shape,
+                format(name),
+                None,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        Ok(())
+    };
+    add_matrix(
+        "pre_projection.weight",
+        vec![
+            hidden,
+            backbone
+                .checked_mul(2)
+                .ok_or("assistant input width overflows")?,
+        ],
+    )?;
+    add_matrix("post_projection.weight", vec![backbone, hidden])?;
+    if config.use_ordered_embeddings {
+        let centroids = usize::try_from(config.num_centroids)
+            .map_err(|_| "Gemma 4 assistant centroid count is invalid".to_string())?;
+        let vocabulary = usize::try_from(config.text_config.vocab_size)
+            .map_err(|_| "Gemma 4 assistant vocabulary is invalid".to_string())?;
+        common.extend([
+            SafetensorsTensorConstraint::required(
+                "masked_embedding.centroids.weight",
+                vec![centroids, hidden],
+                StoredDtypeConstraint::Floating,
+            ),
+            SafetensorsTensorConstraint::required(
+                "masked_embedding.token_ordering",
+                vec![vocabulary],
+                StoredDtypeConstraint::Exact(StoredDtype::I32),
+            ),
+        ]);
+    }
+    SafetensorsCheckpointPlan::new(
+        "Gemma 4 assistant SafeTensors",
+        common,
+        base.layout_groups,
+        CatalogPolicy::strict(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Builds the strict released assistant GGUF catalog.
@@ -809,6 +902,29 @@ mod tests {
             .layer_schedule
             .iter()
             .all(|policy| policy.key_value == AttentionStateSource::Shared));
+    }
+
+    #[test]
+    fn safetensors_plan_uses_exact_neutral_assistant_identities() {
+        let config = AssistantConfig::from_json(CONFIG.as_bytes()).unwrap();
+        let plan = assistant_safetensors_plan(&config).unwrap();
+        let names = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(plan.catalog_policy.strict);
+        assert!(plan
+            .common_tensors
+            .iter()
+            .all(|tensor| tensor.aliases.is_empty()));
+        assert!(names.contains("model.layers.0.self_attn.q_proj.weight"));
+        assert!(names.contains("pre_projection.weight"));
+        assert!(names.contains("post_projection.weight"));
+        assert!(!names
+            .iter()
+            .any(|name| name.starts_with("model.language_model.")));
     }
 
     #[test]

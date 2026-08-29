@@ -2,10 +2,13 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu_checkpoint::validation::{resolve_gguf_plan, ResolvedCheckpointPlan};
+use eredu_checkpoint::{
+    schema::SafetensorsCheckpointPlan,
+    validation::{resolve_gguf_plan, resolve_safetensors_plan, ResolvedCheckpointPlan},
+};
 use eredu_core::{
-    artifact::ArtifactError, ArtifactFormat, LoadingProtocol, ModelConfiguration,
-    ModelConfigurationResolver, ResolvedModelConfiguration,
+    artifact::ArtifactError, checkpoint::TensorCatalog, ArtifactFormat, LoadingProtocol,
+    ModelConfiguration, ModelConfigurationResolver, ResolvedModelConfiguration,
 };
 use eredu_gguf::{Checkpoint, MetadataValue};
 use serde_json::Value;
@@ -17,8 +20,14 @@ use crate::{gemma4, muse_glimmer};
 pub enum ExternalAssistantCheckpoint {
     /// Header-inspected Hugging Face SafeTensors directory.
     SafeTensors {
-        /// Submitted artifact directory. Backends may open weight payloads here.
+        /// Submitted artifact directory containing the admitted payload members.
         source: PathBuf,
+        /// Exact header catalog admitted during neutral preparation.
+        catalog: TensorCatalog,
+        /// Strict architecture schema used to revalidate the reopened source.
+        plan: SafetensorsCheckpointPlan,
+        /// Exact physical layout selected during neutral admission.
+        resolution: ResolvedCheckpointPlan,
     },
     /// Header-inspected and architecture-admitted GGUF checkpoint.
     Gguf {
@@ -79,9 +88,9 @@ impl ExternalAssistantPreparationPlan {
 /// Inspects and admits an external draft assistant without selecting a backend.
 ///
 /// Configuration, container format, family dispatch, GGUF metadata, and the
-/// strict GGUF tensor contract are fixed here. Concrete backends receive only
-/// this plan and may open or map the selected weight payloads during
-/// materialization.
+/// strict tensor contract and resolved layout are fixed here. Concrete
+/// backends receive only this plan and may open or map the selected weight
+/// payloads during materialization after revalidating that admission.
 pub fn prepare_external_assistant(
     source: impl AsRef<std::path::Path>,
 ) -> Result<ExternalAssistantPreparationPlan, ArtifactError> {
@@ -105,8 +114,11 @@ pub fn prepare_external_assistant(
                 )
                 .map_err(invalid_assistant)?,
             };
-            let checkpoint =
-                prepared_checkpoint(&inspection, || gemma4::assistant_gguf_plan(&config))?;
+            let checkpoint = prepared_checkpoint(
+                &inspection,
+                || gemma4::assistant_safetensors_plan(&config),
+                || gemma4::assistant_gguf_plan(&config),
+            )?;
             Ok(ExternalAssistantPreparationPlan::Gemma4(
                 Gemma4AssistantPreparationPlan { checkpoint, config },
             ))
@@ -122,8 +134,11 @@ pub fn prepare_external_assistant(
                 )
                 .map_err(invalid_assistant)?,
             };
-            let checkpoint =
-                prepared_checkpoint(&inspection, || muse_glimmer::dflash_gguf_plan(&config))?;
+            let checkpoint = prepared_checkpoint(
+                &inspection,
+                || muse_glimmer::dflash_safetensors_plan(&config),
+                || muse_glimmer::dflash_gguf_plan(&config),
+            )?;
             Ok(ExternalAssistantPreparationPlan::MuseGlimmer(
                 MuseGlimmerAssistantPreparationPlan { checkpoint, config },
             ))
@@ -134,12 +149,28 @@ pub fn prepare_external_assistant(
 
 fn prepared_checkpoint(
     inspection: &eredu_core::ArtifactInspection,
+    safetensors_plan: impl FnOnce() -> Result<SafetensorsCheckpointPlan, String>,
     gguf_plan: impl FnOnce() -> Result<eredu_checkpoint::schema::GgufCheckpointPlan, String>,
 ) -> Result<ExternalAssistantCheckpoint, ArtifactError> {
     match inspection.format() {
-        ArtifactFormat::SafeTensors => Ok(ExternalAssistantCheckpoint::SafeTensors {
-            source: inspection.path().to_owned(),
-        }),
+        ArtifactFormat::SafeTensors => {
+            let plan = safetensors_plan().map_err(ArtifactError::InvalidArtifact)?;
+            let resolution = resolve_safetensors_plan(
+                &crate::configuration::PortableSafetensorsCatalog(inspection.tensors()),
+                &plan,
+            )
+            .map_err(|validation| {
+                invalid_assistant(format!(
+                    "external assistant checkpoint contract did not resolve: {validation:?}"
+                ))
+            })?;
+            Ok(ExternalAssistantCheckpoint::SafeTensors {
+                source: inspection.path().to_owned(),
+                catalog: inspection.tensors().clone(),
+                plan,
+                resolution,
+            })
+        }
         ArtifactFormat::Gguf => {
             let checkpoint = inspection
                 .gguf_checkpoint()
@@ -251,9 +282,9 @@ impl ModelConfigurationResolver for AssistantConfigurations {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
+    use eredu_checkpoint::schema::StoredDtypeConstraint;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     const GEMMA_ASSISTANT: &str = r#"{
       "model_type":"gemma4_assistant","backbone_hidden_size":32,
@@ -265,23 +296,41 @@ mod tests {
         "attention_k_eq_v":false,"layer_types":["full_attention"]}
     }"#;
 
-    fn safetensors_artifact(config: &str) -> tempfile::TempDir {
+    type TestTensor = (String, Vec<usize>, Vec<u8>);
+
+    fn gemma_tensors() -> Vec<TestTensor> {
+        let config = gemma4::AssistantConfig::from_json(GEMMA_ASSISTANT.as_bytes()).unwrap();
+        let plan = gemma4::assistant_safetensors_plan(&config).unwrap();
+        assert!(plan.layout_groups.is_empty());
+        plan.common_tensors
+            .into_iter()
+            .map(|tensor| {
+                assert_eq!(tensor.dtype, StoredDtypeConstraint::Floating);
+                let elements = tensor.shape.iter().product::<usize>();
+                (tensor.key, tensor.shape, vec![0; elements * 4])
+            })
+            .collect()
+    }
+
+    fn safetensors_artifact(config: &str, tensors: Vec<TestTensor>) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("config.json"), config).unwrap();
-        let header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
-        let mut weights =
-            std::fs::File::create(directory.path().join("model.safetensors")).unwrap();
-        weights
-            .write_all(&(header.len() as u64).to_le_bytes())
-            .unwrap();
-        weights.write_all(header).unwrap();
-        weights.write_all(&[0; 4]).unwrap();
+        let views = tensors
+            .iter()
+            .map(|(name, shape, bytes)| {
+                (
+                    name.as_str(),
+                    TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(views, None, &directory.path().join("model.safetensors")).unwrap();
         directory
     }
 
     #[test]
     fn safetensors_assistant_is_dispatched_before_backend_materialization() {
-        let artifact = safetensors_artifact(GEMMA_ASSISTANT);
+        let artifact = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
         let preparation = prepare_external_assistant(artifact.path()).unwrap();
         let ExternalAssistantPreparationPlan::Gemma4(plan) = preparation else {
             panic!("Gemma assistant was dispatched to the wrong family");
@@ -290,14 +339,50 @@ mod tests {
         assert_eq!(config.model_type, "gemma4_assistant");
         assert!(matches!(
             checkpoint,
-            ExternalAssistantCheckpoint::SafeTensors { source }
+            ExternalAssistantCheckpoint::SafeTensors {
+                source,
+                catalog,
+                resolution,
+                ..
+            }
                 if source == artifact.path()
+                    && catalog.len() == resolution.source_keys().len()
+        ));
+    }
+
+    #[test]
+    fn safetensors_assistant_rejects_missing_extra_and_malformed_tensors_during_preparation() {
+        let mut missing = gemma_tensors();
+        missing.pop();
+        let missing = safetensors_artifact(GEMMA_ASSISTANT, missing);
+        assert!(matches!(
+            prepare_external_assistant(missing.path()),
+            Err(ArtifactError::InvalidArtifact(_))
+        ));
+
+        let mut extra = gemma_tensors();
+        extra.push(("undeclared.weight".into(), vec![1], vec![0; 4]));
+        let extra = safetensors_artifact(GEMMA_ASSISTANT, extra);
+        assert!(matches!(
+            prepare_external_assistant(extra.path()),
+            Err(ArtifactError::InvalidArtifact(_))
+        ));
+
+        let mut malformed = gemma_tensors();
+        malformed[0].1.push(1);
+        let malformed = safetensors_artifact(GEMMA_ASSISTANT, malformed);
+        assert!(matches!(
+            prepare_external_assistant(malformed.path()),
+            Err(ArtifactError::InvalidArtifact(_))
         ));
     }
 
     #[test]
     fn ordinary_model_cannot_cross_the_external_assistant_boundary() {
-        let artifact = safetensors_artifact(r#"{"model_type":"llama"}"#);
+        let artifact = safetensors_artifact(
+            r#"{"model_type":"llama"}"#,
+            vec![("weight".into(), vec![1], vec![0; 4])],
+        );
         assert!(matches!(
             prepare_external_assistant(artifact.path()),
             Err(ArtifactError::UnsupportedModelType(model_type)) if model_type == "llama"

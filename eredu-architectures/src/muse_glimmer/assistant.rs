@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use eredu_checkpoint::{
     schema::{
-        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-        TensorOperation,
+        matrix_for_linear_format, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+        GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+        StoredDtypeConstraint, TensorOperation,
     },
     WeightQuantization,
 };
@@ -361,6 +362,88 @@ impl DFlashConfig {
             .map(Into::into)
             .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
     }
+}
+
+/// Builds the strict released DFlash SafeTensors catalog.
+pub fn dflash_safetensors_plan(config: &DFlashConfig) -> Result<SafetensorsCheckpointPlan, String> {
+    fn add_matrix(
+        config: &DFlashConfig,
+        tensors: &mut Vec<SafetensorsTensorConstraint>,
+        name: String,
+        shape: Vec<usize>,
+    ) -> Result<(), String> {
+        let format = config.linear_format_for(&name);
+        tensors.extend(
+            matrix_for_linear_format(name, std::iter::empty::<String>(), shape, format, None)
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(())
+    }
+
+    config
+        .validate_released()
+        .map_err(|error| error.to_string())?;
+    let dimension = |value: i32, name: &str| {
+        usize::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("DFlash {name} must be positive"))
+    };
+    let hidden = dimension(config.hidden_size, "hidden size")?;
+    let intermediate = dimension(config.intermediate_size, "intermediate size")?;
+    let head = dimension(config.head_dim, "head width")?;
+    let query = dimension(config.num_attention_heads, "query heads")?
+        .checked_mul(head)
+        .ok_or_else(|| "DFlash query width overflows".to_string())?;
+    let key_value = dimension(config.num_key_value_heads, "KV heads")?
+        .checked_mul(head)
+        .ok_or_else(|| "DFlash KV width overflows".to_string())?;
+    let encoded = hidden
+        .checked_mul(config.target_layer_ids.len())
+        .ok_or_else(|| "DFlash encoder width overflows".to_string())?;
+    let vector = |name: String, shape: Vec<usize>| {
+        SafetensorsTensorConstraint::required(name, shape, StoredDtypeConstraint::Floating)
+    };
+    let mut tensors = vec![
+        vector("encoder.output_norm_enc.weight".into(), vec![hidden]),
+        vector("norm.weight".into(), vec![hidden]),
+    ];
+    add_matrix(
+        config,
+        &mut tensors,
+        "encoder.fc.weight".into(),
+        vec![hidden, encoded],
+    )?;
+    for layer in 0..config.num_hidden_layers as usize {
+        let root = format!("layers.{layer}");
+        tensors.extend([
+            vector(format!("{root}.input_layernorm.weight"), vec![hidden]),
+            vector(
+                format!("{root}.post_attention_layernorm.weight"),
+                vec![hidden],
+            ),
+            vector(format!("{root}.self_attn.q_norm.weight"), vec![head]),
+            vector(format!("{root}.self_attn.k_norm.weight"), vec![head]),
+        ]);
+        for (local, shape) in [
+            ("self_attn.q_proj.weight", vec![query, hidden]),
+            ("self_attn.k_proj.weight", vec![key_value, hidden]),
+            ("self_attn.v_proj.weight", vec![key_value, hidden]),
+            ("self_attn.o_proj.weight", vec![hidden, query]),
+            ("mlp.gate_proj.weight", vec![intermediate, hidden]),
+            ("mlp.up_proj.weight", vec![intermediate, hidden]),
+            ("mlp.down_proj.weight", vec![hidden, intermediate]),
+        ] {
+            add_matrix(config, &mut tensors, format!("{root}.{local}"), shape)?;
+        }
+    }
+    SafetensorsCheckpointPlan::new(
+        "Muse-Glimmer DFlash SafeTensors",
+        tensors,
+        Vec::new(),
+        CatalogPolicy::strict(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Builds the strict released DFlash GGUF tensor catalog.
@@ -1077,6 +1160,23 @@ mod tests {
         assert_eq!(config.block_size, 16);
         assert_eq!(context_append_start(Some(7), 3, 10).unwrap(), 7);
         assert!(context_append_start(Some(6), 3, 10).is_err());
+    }
+
+    #[test]
+    fn safetensors_plan_is_strict_and_uses_dflash_parameter_identities() {
+        let config = DFlashConfig::from_hf_json(&released()).unwrap();
+        let plan = dflash_safetensors_plan(&config).unwrap();
+        let names = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(plan.catalog_policy.strict);
+        assert!(names.contains("encoder.fc.weight"));
+        assert!(names.contains("encoder.output_norm_enc.weight"));
+        assert!(names.contains("layers.4.mlp.down_proj.weight"));
+        assert!(names.contains("norm.weight"));
     }
 
     #[test]

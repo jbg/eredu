@@ -54,8 +54,8 @@ use crate::backend::{
                 MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
             },
             layerwise::{
-                open_safetensors_weight_store, quantize_parameterized_module_store,
-                quantize_parameterized_store, shard_layer_bindings,
+                quantize_parameterized_module_store, quantize_parameterized_store,
+                shard_layer_bindings,
             },
         },
         media::input,
@@ -328,7 +328,7 @@ impl Gemma4AssistantModel {
 
 /// Loads the released SafeTensors assistant into the backend-neutral module.
 pub fn load_assistant_safetensors(
-    model_dir: &Path,
+    store: SharedCheckpointSource,
     source_config: eredu_architectures::gemma4::AssistantConfig,
     options: crate::backend::ModelLoadOptions,
     stream: &Stream,
@@ -363,8 +363,6 @@ pub fn load_assistant_safetensors(
         })
         .transpose()?
         .unwrap_or_else(|| source_config.clone());
-    let store =
-        open_safetensors_weight_store(model_dir, options.weight_residency.max_mapped_shards())?;
     let store = if let Some(requested) = requested {
         let source = NeutralAssistant::new(source_config, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;

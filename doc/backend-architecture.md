@@ -928,11 +928,15 @@ binding rather than echoing the plan's requested identifier.
 
 External assistants cross that factory boundary as an architecture-owned
 `ExternalAssistantPreparationPlan`. Architecture inspection fixes the
-assistant family, normalized configuration, checkpoint format, and strict GGUF
-layout before a backend is selected. Concrete backends consume the retained
-SafeTensors payload source or admitted portable GGUF checkpoint; they do not
-receive a raw assistant path, reopen configuration or metadata for dispatch, or
-duplicate assistant admission.
+assistant family, normalized configuration, checkpoint format, and strict
+SafeTensors or GGUF layout before a backend is selected. SafeTensors plans
+retain the admitted header catalog, architecture schema, and exact resolution.
+A concrete backend reopens the payload only through a catalog-bound source,
+revalidates both the catalog and resolution, and rejects tensors changed after
+preparation before constructing a native module. Concrete backends consume
+that retained proof or the admitted portable GGUF checkpoint; they do not
+receive an unrestricted assistant store, reopen configuration or metadata for
+dispatch, bind against raw native topology, or duplicate assistant admission.
 
 `eredu::api::local_device_plan` maps the facade's CPU or accelerator choice to
 the currently selected local backend and rejects accelerator choices when that

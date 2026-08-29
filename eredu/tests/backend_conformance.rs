@@ -1200,9 +1200,7 @@ fn write_loadable_text_artifact(root: &std::path::Path) {
 
 fn write_loadable_assistant_artifact(root: &std::path::Path) {
     write_loadable_text_artifact(root);
-    std::fs::write(
-        root.join("config.json"),
-        r#"{
+    let config = r#"{
           "model_type":"gemma4_assistant","backbone_hidden_size":32,
           "use_ordered_embeddings":false,"tie_word_embeddings":false,"block_size":4,
           "text_config":{"model_type":"gemma4_text","hidden_size":32,
@@ -1210,9 +1208,35 @@ fn write_loadable_assistant_artifact(root: &std::path::Path) {
             "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
             "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":false,
             "attention_k_eq_v":false,"layer_types":["full_attention"]}
-        }"#,
-    )
-    .unwrap();
+        }"#;
+    std::fs::write(root.join("config.json"), config).unwrap();
+
+    let config = eredu_architectures::gemma4::AssistantConfig::from_json(config.as_bytes())
+        .expect("assistant fixture configuration is valid");
+    let plan = eredu_architectures::gemma4::assistant_safetensors_plan(&config)
+        .expect("assistant fixture has a strict checkpoint plan");
+    assert!(plan.layout_groups.is_empty());
+    let mut offset = 0usize;
+    let mut header = serde_json::Map::new();
+    for tensor in plan.common_tensors {
+        let bytes = tensor.shape.iter().product::<usize>() * std::mem::size_of::<f32>();
+        header.insert(
+            tensor.key,
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": tensor.shape,
+                "data_offsets": [offset, offset + bytes]
+            }),
+        );
+        offset += bytes;
+    }
+    let header = serde_json::to_vec(&header).unwrap();
+    let mut weights = std::fs::File::create(root.join("model.safetensors")).unwrap();
+    weights
+        .write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    weights.write_all(&header).unwrap();
+    weights.write_all(&vec![0; offset]).unwrap();
 }
 
 fn replace_with_incompatible_tokenizer(root: &std::path::Path) {

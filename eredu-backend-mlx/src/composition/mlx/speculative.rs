@@ -66,14 +66,20 @@ impl MlxDrafter {
             ExternalAssistantPreparationPlan::Gemma4(plan) => {
                 let (checkpoint, config) = plan.into_parts();
                 let model = match checkpoint {
-                    ExternalAssistantCheckpoint::SafeTensors { source } => {
-                        load_assistant_safetensors(
+                    ExternalAssistantCheckpoint::SafeTensors {
+                        source,
+                        catalog,
+                        plan,
+                        resolution,
+                    } => {
+                        let store = crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
                             &source,
-                            config,
-                            options,
-                            stream,
-                            weights_stream,
-                        )?
+                            catalog,
+                            &plan,
+                            &resolution,
+                            options.weight_residency.max_mapped_shards(),
+                        )?;
+                        load_assistant_safetensors(store, config, options, stream, weights_stream)?
                     }
                     ExternalAssistantCheckpoint::Gguf {
                         checkpoint,
@@ -92,8 +98,20 @@ impl MlxDrafter {
             ExternalAssistantPreparationPlan::MuseGlimmer(plan) => {
                 let (checkpoint, config) = plan.into_parts();
                 let model = match checkpoint {
-                    ExternalAssistantCheckpoint::SafeTensors { source } => {
-                        load_dflash_safetensors(&source, config, options, stream, weights_stream)?
+                    ExternalAssistantCheckpoint::SafeTensors {
+                        source,
+                        catalog,
+                        plan,
+                        resolution,
+                    } => {
+                        let store = crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
+                            &source,
+                            catalog,
+                            &plan,
+                            &resolution,
+                            options.weight_residency.max_mapped_shards(),
+                        )?;
+                        load_dflash_safetensors(store, config, options, stream, weights_stream)?
                     }
                     ExternalAssistantCheckpoint::Gguf {
                         checkpoint,

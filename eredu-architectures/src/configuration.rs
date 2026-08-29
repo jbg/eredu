@@ -729,7 +729,7 @@ impl SafetensorsArchitecturePlan {
     }
 }
 
-struct PortableSafetensorsCatalog<'a>(&'a TensorCatalog);
+pub(crate) struct PortableSafetensorsCatalog<'a>(pub(crate) &'a TensorCatalog);
 
 impl SafetensorsCatalog for PortableSafetensorsCatalog<'_> {
     fn keys(&self) -> Vec<String> {

@@ -7,6 +7,7 @@ use std::{
 
 use crate::backend::error::Error;
 use eredu_checkpoint::{
+    schema::SafetensorsCheckpointPlan,
     store::{
         CheckpointLease, CheckpointSource, EncodedTensorLease, SafetensorsWeightStore,
         SharedCheckpointSource, StoreError, TensorMetadata, TensorReadRequest,
@@ -37,12 +38,7 @@ impl PreparedSafetensorsArtifact {
         catalog: TensorCatalog,
         max_mapped_shards: usize,
     ) -> Result<Self, Error> {
-        let store = SafetensorsWeightStore::open_with_max_mapped_shards(&path, max_mapped_shards)?;
-        validate_prepared_catalog(&catalog, &store)?;
-        let store: SharedCheckpointSource = Arc::new(PreparedCatalogSource {
-            catalog,
-            source: Arc::new(store),
-        });
+        let store = open_catalog_bound_store(&path, catalog, max_mapped_shards)?;
         let resolution = eredu_checkpoint::validation::resolve_safetensors_plan(
             store.as_ref(),
             architecture.checkpoint(),
@@ -79,6 +75,44 @@ impl PreparedSafetensorsArtifact {
     pub fn store(&self) -> SharedCheckpointSource {
         Arc::clone(&self.store)
     }
+}
+
+/// Reopens an assistant checkpoint through its admitted catalog and strict schema.
+pub(crate) fn open_prepared_safetensors_checkpoint(
+    path: &Path,
+    catalog: TensorCatalog,
+    plan: &SafetensorsCheckpointPlan,
+    admitted_resolution: &eredu_checkpoint::validation::ResolvedCheckpointPlan,
+    max_mapped_shards: usize,
+) -> Result<SharedCheckpointSource, Error> {
+    let store = open_catalog_bound_store(path, catalog, max_mapped_shards)?;
+    let resolution = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
+        .map_err(|failure| {
+        Error::ArchitectureModel(format!(
+            "prepared external-assistant SafeTensors contract did not revalidate: {failure:?}"
+        ))
+    })?;
+    if &resolution != admitted_resolution {
+        return Err(changed_artifact(
+            "strict external-assistant layout resolution differs from preparation",
+        ));
+    }
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolution),
+    ))
+}
+
+fn open_catalog_bound_store(
+    path: &Path,
+    catalog: TensorCatalog,
+    max_mapped_shards: usize,
+) -> Result<SharedCheckpointSource, Error> {
+    let store = SafetensorsWeightStore::open_with_max_mapped_shards(path, max_mapped_shards)?;
+    validate_prepared_catalog(&catalog, &store)?;
+    Ok(Arc::new(PreparedCatalogSource {
+        catalog,
+        source: Arc::new(store),
+    }))
 }
 
 struct PreparedCatalogSource {
@@ -228,7 +262,14 @@ fn encoded_dtype_name(dtype: &StoredDtype) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedCatalogSource, PreparedSafetensorsArtifact};
+    use super::{
+        open_prepared_safetensors_checkpoint, PreparedCatalogSource, PreparedSafetensorsArtifact,
+    };
+    use eredu_checkpoint::schema::{
+        CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+        StoredDtypeConstraint,
+    };
+    use eredu_checkpoint::store::{SafetensorsWeightStore, SharedCheckpointSource};
     use eredu_core::{
         checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage},
         LoadingProtocol, ModelConfiguration,
@@ -340,5 +381,35 @@ mod tests {
                 .contains("authoritative preparation catalog"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn external_assistant_store_revalidates_the_prepared_catalog_before_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        write_tensor(directory.path(), &[0.0]);
+        let catalog = catalog_for(directory.path(), vec![1], 4);
+        let plan = SafetensorsCheckpointPlan::new(
+            "test assistant",
+            vec![SafetensorsTensorConstraint::required(
+                "weight",
+                vec![1],
+                StoredDtypeConstraint::Floating,
+            )],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        )
+        .unwrap();
+        let source: SharedCheckpointSource =
+            std::sync::Arc::new(SafetensorsWeightStore::open(directory.path()).unwrap());
+        let resolution =
+            eredu_checkpoint::validation::resolve_safetensors_plan(source.as_ref(), &plan).unwrap();
+
+        write_tensor(directory.path(), &[0.0, 0.0]);
+        let error =
+            open_prepared_safetensors_checkpoint(directory.path(), catalog, &plan, &resolution, 1)
+                .err()
+                .expect("changed assistant catalog must be rejected");
+
+        assert!(error.to_string().contains("changed after preparation"));
     }
 }
