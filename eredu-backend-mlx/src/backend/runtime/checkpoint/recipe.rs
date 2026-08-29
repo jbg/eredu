@@ -15,7 +15,7 @@ use safemlx::{
 };
 
 use crate::backend::runtime::checkpoint::store::{
-    MlxParameterMaterializationContext, PendingWeightMaterialization, WeightStoreError,
+    MlxParameterMaterializationContext, PendingWeightMaterialization,
 };
 
 /// Converts an MLX scalar type into the backend-neutral recipe representation.
@@ -208,13 +208,11 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
     ) -> Result<Array, WeightRecipeError> {
         match self {
             Self::Source { key, selection } => {
-                let lease = store
-                    .acquire_lease(TensorReadRequest {
-                        key: key.clone(),
-                        selection: selection.clone(),
-                        policy: ReadPolicy::RequireBounded,
-                    })
-                    .map_err(crate::backend::runtime::checkpoint::store::neutral_store_error)?;
+                let lease = store.acquire_lease(TensorReadRequest {
+                    key: key.clone(),
+                    selection: selection.clone(),
+                    policy: ReadPolicy::RequireBounded,
+                })?;
                 let lease = context.weight_lease(lease)?;
                 let pending = if borrow_sources {
                     lease.prepare_borrowed_materialization(stream)?
@@ -417,8 +415,8 @@ fn materialize_inputs(
                         && !pending.is_empty()
                         && matches!(
                             &error,
-                            WeightRecipeError::WeightStore(
-                                WeightStoreError::CapacityExhausted { .. }
+                            WeightRecipeError::CheckpointStore(
+                                eredu_checkpoint::store::StoreError::CapacityExhausted { .. }
                             )
                         ) =>
                 {
@@ -565,9 +563,14 @@ pub enum WeightRecipeError {
     /// A transition-rate normalization contained zero or a positive value.
     #[error("log(-x) derived-weight input must contain only negative values")]
     NonNegativeNegLogInput,
-    /// Checkpoint storage failed.
+    /// Backend-neutral checkpoint inspection or lease acquisition failed.
     #[error(transparent)]
-    WeightStore(#[from] crate::backend::runtime::checkpoint::store::WeightStoreError),
+    CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
+    /// MLX checkpoint materialization failed.
+    #[error(transparent)]
+    CheckpointMaterialization(
+        #[from] crate::backend::runtime::checkpoint::store::CheckpointMaterializationError,
+    ),
     /// MLX transformation or synchronization failed.
     #[error(transparent)]
     Mlx(#[from] safemlx::error::Exception),

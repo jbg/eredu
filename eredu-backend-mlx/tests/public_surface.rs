@@ -5,7 +5,7 @@ use eredu_backend_mlx::backend::{
     runtime::{
         cache::state::MlxKeyValueState,
         checkpoint::quantization::{CheckpointQuantizationOptions, CheckpointQuantizationReport},
-        checkpoint::store::WeightStoreError,
+        checkpoint::store::CheckpointMaterializationError,
         generation::sampler::{MlxSamplingBackend, Sampler as BackendSampler, SpeculativeSampler},
     },
     topology::{DeviceAssignment, MlxParallelContext},
@@ -25,7 +25,7 @@ fn reusable_backend_modules_are_rooted_directly_under_backend() {
     assert_public_type::<MlxBackend<'static>>();
     assert_public_type::<MlxNeuralBackend>();
     assert_public_type::<MlxKeyValueState>();
-    assert_public_type::<WeightStoreError>();
+    assert_public_type::<CheckpointMaterializationError>();
 }
 
 #[test]

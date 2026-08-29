@@ -83,9 +83,15 @@ pub enum Error {
     #[error(transparent)]
     ModuleBinding(#[from] crate::backend::runtime::checkpoint::binding::ModuleBindingError),
 
-    /// Persistent checkpoint catalog, mapping, or materialization failure.
+    /// Backend-neutral checkpoint catalog, mapping, or I/O failure.
     #[error(transparent)]
-    WeightStore(#[from] crate::backend::runtime::checkpoint::store::WeightStoreError),
+    CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
+
+    /// MLX checkpoint tensor conversion or materialization failure.
+    #[error(transparent)]
+    CheckpointMaterialization(
+        #[from] crate::backend::runtime::checkpoint::store::CheckpointMaterializationError,
+    ),
 
     /// Invalid checkpoint-derived weight recipe.
     #[error(transparent)]
@@ -163,12 +169,6 @@ impl From<eredu_checkpoint::validation::StrictLoadFailure> for Error {
             missing: error.missing,
             unused: error.unused,
         }
-    }
-}
-
-impl From<eredu_checkpoint::store::StoreError> for Error {
-    fn from(error: eredu_checkpoint::store::StoreError) -> Self {
-        Self::WeightStore(crate::backend::runtime::checkpoint::store::neutral_store_error(error))
     }
 }
 

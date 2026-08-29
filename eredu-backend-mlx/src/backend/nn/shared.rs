@@ -1393,9 +1393,11 @@ impl TransferBackend for MlxNeuralBackend {
 /// MLX failure while lowering a neutral checkpoint lease or recipe.
 #[derive(Debug, thiserror::Error)]
 pub enum MlxParameterError {
-    /// Encoded lease acquisition or MLX submission failed.
+    /// Neutral lease conversion or MLX checkpoint submission failed.
     #[error(transparent)]
-    Store(#[from] crate::backend::runtime::checkpoint::store::WeightStoreError),
+    CheckpointMaterialization(
+        #[from] crate::backend::runtime::checkpoint::store::CheckpointMaterializationError,
+    ),
     /// A neutral derived-weight recipe could not be lowered.
     #[error(transparent)]
     Recipe(#[from] crate::backend::runtime::checkpoint::recipe::WeightRecipeError),

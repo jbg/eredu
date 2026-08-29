@@ -26,7 +26,7 @@ use crate::{
         recipe_dtype_from_mlx, MlxWeightRecipeExt, WeightRecipeError,
     },
     backend::runtime::checkpoint::store::{
-        MlxParameterMaterializationContext, WeightMaterialization, WeightStoreError,
+        MlxParameterMaterializationContext, WeightMaterialization,
     },
     backend::runtime::residency::manager::ResidentUnitLease,
 };
@@ -315,13 +315,11 @@ fn submit_module_binding(
         };
         Ok(WeightMaterialization::submit_retained(output, sources)?)
     } else {
-        let lease = store
-            .acquire_lease(TensorReadRequest {
-                key: binding.checkpoint_key().to_owned(),
-                selection: binding.selection().clone(),
-                policy: ReadPolicy::RequireBounded,
-            })
-            .map_err(crate::backend::runtime::checkpoint::store::neutral_store_error)?;
+        let lease = store.acquire_lease(TensorReadRequest {
+            key: binding.checkpoint_key().to_owned(),
+            selection: binding.selection().clone(),
+            policy: ReadPolicy::RequireBounded,
+        })?;
         Ok(context
             .weight_lease(lease)?
             .materialize(source_stream, execution_stream)?)
@@ -351,10 +349,11 @@ fn finish_module_binding(
 fn is_mapping_capacity_error(error: &ModuleBindingError) -> bool {
     matches!(
         error,
-        ModuleBindingError::WeightStore(WeightStoreError::CapacityExhausted { .. })
-            | ModuleBindingError::WeightRecipe(WeightRecipeError::WeightStore(
-                WeightStoreError::CapacityExhausted { .. }
-            ))
+        ModuleBindingError::CheckpointStore(
+            eredu_checkpoint::store::StoreError::CapacityExhausted { .. },
+        ) | ModuleBindingError::WeightRecipe(WeightRecipeError::CheckpointStore(
+            eredu_checkpoint::store::StoreError::CapacityExhausted { .. },
+        ))
     )
 }
 
@@ -652,9 +651,7 @@ where
             });
         }
 
-        let metadata = store
-            .source_metadata(&checkpoint_key)
-            .map_err(crate::backend::runtime::checkpoint::store::neutral_store_error)?;
+        let metadata = store.source_metadata(&checkpoint_key)?;
         let expected_shape = parameter
             .shape()
             .iter()
@@ -915,9 +912,14 @@ pub enum ModuleBindingError {
         /// Failed calculation.
         context: &'static str,
     },
-    /// Persistent checkpoint inspection failed.
+    /// Backend-neutral checkpoint inspection or lease acquisition failed.
     #[error(transparent)]
-    WeightStore(#[from] crate::backend::runtime::checkpoint::store::WeightStoreError),
+    CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
+    /// MLX checkpoint materialization failed.
+    #[error(transparent)]
+    CheckpointMaterialization(
+        #[from] crate::backend::runtime::checkpoint::store::CheckpointMaterializationError,
+    ),
     /// Derived-weight metadata validation failed.
     #[error(transparent)]
     WeightRecipe(#[from] crate::backend::runtime::checkpoint::recipe::WeightRecipeError),

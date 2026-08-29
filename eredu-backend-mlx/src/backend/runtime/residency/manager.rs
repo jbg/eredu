@@ -27,7 +27,8 @@ use crate::{
     backend::residency::sample_allocator_memory,
     backend::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::runtime::checkpoint::store::{
-        MlxParameterMaterializationContext, PendingWeightMaterialization, WeightStoreError,
+        CheckpointMaterializationError, MlxParameterMaterializationContext,
+        PendingWeightMaterialization,
     },
 };
 use eredu_core::residency::{
@@ -218,9 +219,12 @@ pub enum ResidencyError {
         /// Calculation that overflowed.
         context: &'static str,
     },
-    /// Persistent store validation or materialization failed.
+    /// Backend-neutral checkpoint inspection or lease acquisition failed.
     #[error(transparent)]
-    WeightStore(#[from] WeightStoreError),
+    CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
+    /// MLX checkpoint materialization failed.
+    #[error(transparent)]
+    CheckpointMaterialization(#[from] CheckpointMaterializationError),
     /// An MLX copy or evaluation failed.
     #[error("MLX {operation} failed for residency unit {id}: {source}")]
     Mlx {
@@ -686,10 +690,7 @@ impl ResidencyManager {
             offload,
             units,
             active_window,
-            self.inner
-                .store
-                .source_diagnostics()
-                .map_err(crate::backend::runtime::checkpoint::store::neutral_store_error)?,
+            self.inner.store.source_diagnostics()?,
         ))
     }
 
@@ -1363,13 +1364,11 @@ fn materialize_host_buffers(
                 pending.into_parts()
             }
             None => {
-                let lease = store
-                    .acquire_lease(eredu_checkpoint::store::TensorReadRequest {
-                        key: binding.checkpoint_key().to_owned(),
-                        selection: binding.selection().clone(),
-                        policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
-                    })
-                    .map_err(crate::backend::runtime::checkpoint::store::neutral_store_error)?;
+                let lease = store.acquire_lease(eredu_checkpoint::store::TensorReadRequest {
+                    key: binding.checkpoint_key().to_owned(),
+                    selection: binding.selection().clone(),
+                    policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
+                })?;
                 let lease = context.weight_lease(lease)?;
                 let pending = lease.prepare_materialization(source_stream, source_stream)?;
                 (pending.output().clone(), vec![pending])
@@ -1456,13 +1455,12 @@ fn prepare_from_disk(
                     }
                 }
                 None => {
-                    let lease = store
-                        .acquire_lease(eredu_checkpoint::store::TensorReadRequest {
+                    let lease =
+                        store.acquire_lease(eredu_checkpoint::store::TensorReadRequest {
                             key: binding.checkpoint_key().to_owned(),
                             selection: binding.selection().clone(),
                             policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
-                        })
-                        .map_err(crate::backend::runtime::checkpoint::store::neutral_store_error)?;
+                        })?;
                     let lease = context.weight_lease(lease)?;
                     let pending = lease.prepare_materialization(source_stream, execution_stream)?;
                     let output = pending.output().clone();
@@ -1509,11 +1507,14 @@ fn prepare_from_disk(
 fn is_mapping_capacity_error(error: &ResidencyError) -> bool {
     matches!(
         error,
-        ResidencyError::WeightStore(WeightStoreError::CapacityExhausted { .. })
-            | ResidencyError::Recipe {
-                source: WeightRecipeError::WeightStore(WeightStoreError::CapacityExhausted { .. }),
-                ..
-            }
+        ResidencyError::CheckpointStore(
+            eredu_checkpoint::store::StoreError::CapacityExhausted { .. }
+        ) | ResidencyError::Recipe {
+            source: WeightRecipeError::CheckpointStore(
+                eredu_checkpoint::store::StoreError::CapacityExhausted { .. }
+            ),
+            ..
+        }
     )
 }
 
@@ -2399,8 +2400,8 @@ mod tests {
         );
         assert!(matches!(
             manager.initialize(),
-            Err(ResidencyError::WeightStore(
-                WeightStoreError::UnsupportedStoredDtype { .. }
+            Err(ResidencyError::CheckpointMaterialization(
+                CheckpointMaterializationError::UnsupportedStoredDtype { .. }
             ))
         ));
         let report = manager.report().unwrap();
