@@ -72,6 +72,7 @@ const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
 const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
+const QWEN_HYBRID_PROMPT_CACHE: &str = "EREDU_PIPELINE_QWEN_HYBRID_PROMPT_CACHE";
 
 fn input_part(
     modality: InputModality,
@@ -1407,8 +1408,33 @@ fn pipeline_ring_worker() {
         assert_final_logits_close(actual, expected, family.comparison_tolerance());
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
+    let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
+    if qwen_hybrid_prompt_cache {
+        let prompt = crate::native::Array::from_slice(&prefix_ids, &[1, prompt_length]);
+        let parts = [text_input_part(&prompt)];
+        model
+            .prefill_embedded_mtp_cache_for_test(
+                crate::backend::runtime::media::input::ModelInput::new(&parts),
+                &mut cache,
+                &execution,
+                &stream,
+            )
+            .unwrap();
+    }
     let (model_family, effective_model_type) = family.descriptor_names();
     let identity = model.prompt_cache_model_identity().unwrap();
+    if qwen_hybrid_prompt_cache {
+        if pipeline_rank == 0 {
+            assert_eq!(identity.global_layer_start..identity.global_layer_end, 0..1);
+            assert_eq!(identity.state_segments.len(), 1);
+        } else {
+            assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..3);
+            assert_eq!(identity.layer_prefix_offsets, [0, -1]);
+            assert_eq!(identity.state_segments.len(), 2);
+            assert_eq!(identity.state_segments[1].id(), "prediction");
+            assert_eq!(identity.state_segments[1].layers(), 1..2);
+        }
+    }
     let descriptor = PromptCacheDescriptor {
         model_family: model_family.into(),
         effective_model_type: effective_model_type.into(),
@@ -1454,6 +1480,28 @@ fn pipeline_ring_worker() {
         .load_prompt_cache(&prompt_cache_root, &descriptor, &prefix_ids, paged, &stream)
         .unwrap();
     assert_eq!(manifest.topology, descriptor.topology);
+    if qwen_hybrid_prompt_cache && pipeline_rank == 1 {
+        assert!(manifest.blocks.iter().any(|block| block.global_layer == 2));
+    }
+    if qwen_hybrid_prompt_cache {
+        let restored_manifest = model
+            .save_prompt_cache(
+                &mut cache,
+                prompt_cache_root.join("restored"),
+                descriptor.clone(),
+                &prefix_ids,
+                &PromptCacheOptions::default(),
+                &stream,
+            )
+            .unwrap();
+        if pipeline_rank == 1 {
+            assert!(restored_manifest
+                .blocks
+                .iter()
+                .any(|block| block.global_layer == 2));
+        }
+        return;
+    }
     let restored = forward_pipeline_model(
         &mut model,
         (pipeline_rank == 0).then_some(&token),
@@ -5906,6 +5954,18 @@ fn ring_two_process_qwen35_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::Qwen35);
 }
 
+/// Verifies output-owned Qwen Hybrid prediction state is persisted and restored
+/// with the target prompt cache instead of being truncated to the decoder range.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen35_prompt_cache_round_trip_includes_mtp() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35,
+        WorkerMode::QwenHybridPromptCache,
+    );
+}
+
 /// Verifies Qwen3-Next TP=2 + PP=2 across recurrent and full-attention stages,
 /// including rank-local state, persistence, and synchronized generation.
 #[test]
@@ -6865,6 +6925,7 @@ enum WorkerMode {
     OpaqueInklingMtp,
     OpaqueGemma4Media,
     OpaqueGemma4MediaInspection,
+    QwenHybridPromptCache,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -7084,6 +7145,9 @@ fn run_ring_pipeline_processes(
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_GEMMA4_MEDIA, "1");
                 command.env(OPAQUE_INSPECTION, "1");
+            }
+            WorkerMode::QwenHybridPromptCache => {
+                command.env(QWEN_HYBRID_PROMPT_CACHE, "1");
             }
         }
         children.children.push(command.spawn().unwrap());

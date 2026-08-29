@@ -258,6 +258,9 @@ group-length agreement, and the contiguity required by `PartitionState` before
 a backend receives rank-local geometry. Backends must consume the resolved plan;
 they must not extend a decoder range to the end of the state layout or infer
 prediction-state ownership from pipeline rank position.
+MLX pipeline composition therefore realizes an ownership-only partition first,
+resolves the architecture plan against that partition, and attaches the exact
+resulting state layout and global offset to the executable partition.
 
 The ordinary Qwen decoder, block, and layered lifecycle are dense construction
 surfaces and require only `NeuralBackend`. Concrete adapters that dynamically

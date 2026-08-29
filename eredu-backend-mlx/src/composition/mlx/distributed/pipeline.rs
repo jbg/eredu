@@ -5132,21 +5132,17 @@ where
 fn qwen_hybrid_pipeline_prompt_cache_identity(
     args: &eredu_architectures::qwen::hybrid::HybridConfig,
     topology: MlxParallelContext,
-    range: Range<usize>,
-    _ownership: &eredu_runtime::PartitionOwnership,
-    complete: &eredu_runtime::StateLayout,
+    state: &eredu_runtime::PartitionState,
 ) -> Result<PromptCacheModelIdentity, Error> {
-    let layout = complete
-        .slice(range.clone())
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let layout = state.layout();
     eredu_architectures::qwen::hybrid::state_identity(
         args,
-        &layout,
-        range.start,
+        layout,
+        state.global_layer_offset(),
         crate::backend::cache::prompt_cache_topology(topology),
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-    .prompt_cache_identity(&layout)
+    .prompt_cache_identity(layout)
     .map_err(|error| Error::Parallel(error.to_string()))
 }
 
@@ -5180,28 +5176,26 @@ fn qwen_hybrid_pipeline_cache_identity_preserves_prediction_frontiers() {
     )
     .unwrap();
 
-    let identity = qwen_hybrid_pipeline_prompt_cache_identity(
-        &parsed.text,
-        topology,
-        1..2,
-        &eredu_runtime::PartitionOwnership::new(false, true, std::iter::empty::<&str>()).unwrap(),
-        &complete,
-    )
-    .unwrap();
+    let output_state =
+        eredu_runtime::PartitionState::new(complete.slice(1..4).unwrap(), 1).unwrap();
+    let identity =
+        qwen_hybrid_pipeline_prompt_cache_identity(&parsed.text, topology, &output_state).unwrap();
 
     assert_eq!(identity.layer_count, 4);
-    assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..2);
-    assert_eq!(identity.layer_prefix_offsets, [0]);
-    assert_eq!(identity.layer_layout.len(), 1);
+    assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..4);
+    assert_eq!(identity.layer_prefix_offsets, [0, -1, -1]);
+    assert_eq!(identity.layer_layout.len(), 3);
+    assert_eq!(identity.state_segments.len(), 2);
+    assert_eq!(identity.state_segments[0].id(), "target");
+    assert_eq!(identity.state_segments[0].layers(), 0..1);
+    assert_eq!(identity.state_segments[1].id(), "prediction");
+    assert_eq!(identity.state_segments[1].layers(), 1..3);
 
-    let interior = qwen_hybrid_pipeline_prompt_cache_identity(
-        &parsed.text,
-        topology,
-        0..1,
-        &eredu_runtime::PartitionOwnership::new(false, false, std::iter::empty::<&str>()).unwrap(),
-        &complete,
-    )
-    .unwrap();
+    let interior_state =
+        eredu_runtime::PartitionState::new(complete.slice(0..1).unwrap(), 0).unwrap();
+    let interior =
+        qwen_hybrid_pipeline_prompt_cache_identity(&parsed.text, topology, &interior_state)
+            .unwrap();
     assert_eq!(interior.global_layer_start..interior.global_layer_end, 0..1);
     assert_eq!(interior.layer_layout.len(), 1);
 }
@@ -5253,7 +5247,7 @@ fn gemma4_pipeline_cache_identity_does_not_reslice_rank_local_layout() {
     let range = args.text.pipeline_layer_ranges(2).unwrap()[1].clone();
     assert!(range.start > 0);
     let complete = eredu_architectures::gemma4::state_layout(&args.text).unwrap();
-    let local = decoder_partition_state_layout(&complete, range.clone()).unwrap();
+    let local = complete.slice(range.clone()).unwrap();
     let topology = MlxParallelContext::for_rank(
         1,
         1,
@@ -8656,15 +8650,10 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        qwen_hybrid_pipeline_prompt_cache_identity(
-            &self.args().text,
-            topology,
-            self.range().clone(),
-            self.partition.ownership(),
-            &layout,
-        )
+        let state = self.partition.state().ok_or_else(|| {
+            Error::Parallel("conditional Qwen partition has no runtime state".into())
+        })?;
+        qwen_hybrid_pipeline_prompt_cache_identity(&self.args().text, topology, state)
     }
 }
 
@@ -10239,6 +10228,22 @@ impl PipelineModel {
                 Ok(cache)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn prefill_embedded_mtp_cache_for_test(
+        &mut self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+        cache: &mut PipelineCache,
+        execution: &crate::backend::MlxDistributedSession<'_>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let tokens = pipeline_mtp_token_identity(input, stream)?;
+        let tokens = crate::MlxTensor::from_array(tokens);
+        let mut target = PipelineEmbeddedMtpTarget::new(self, execution);
+        let output = target.prefill_target(input, cache, stream)?;
+        target.prefill_draft_cache(&output, &tokens, cache, stream)?;
+        Ok(())
     }
 
     /// Returns aggregate cache-residency telemetry for a paged stage cache.
@@ -12777,15 +12782,6 @@ where
     Ok(())
 }
 
-fn decoder_partition_state_layout(
-    complete: &eredu_runtime::StateLayout,
-    layers: Range<usize>,
-) -> Result<eredu_runtime::StateLayout, Error> {
-    complete
-        .slice(layers)
-        .map_err(|error| Error::Parallel(error.to_string()))
-}
-
 fn architecture_partition_state_layout<A, S, G, X>(
     architecture: &A,
     complete: &eredu_runtime::StateLayout,
@@ -12804,6 +12800,165 @@ where
         .map_err(|error| Error::Parallel(error.to_string()))?
         .ok_or_else(|| Error::Parallel("architecture partition owns no mutable state".into()))?;
     Ok((state.layout().clone(), state.global_layer_offset()))
+}
+
+#[cfg(test)]
+mod state_partition_conformance_tests {
+    use super::*;
+
+    fn assert_family_partitions<A, S>(architecture: &A)
+    where
+        A: eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>,
+        <A as LayeredArchitecture<MlxNeuralBackend, S>>::Error: std::fmt::Display,
+        S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    {
+        let complete = eredu_runtime::ArchitectureParameters::state_layout(architecture)
+            .unwrap_or_else(|error| panic!("family state layout failed: {error}"));
+        assert_eq!(complete.len(), 3);
+        let placement = prediction_architecture_transport::<A, S>(architecture, 2).unwrap();
+        for (rank, expected) in [0..1, 1..3].into_iter().enumerate() {
+            let probe = placement
+                .realize_architecture_partition::<MlxNeuralBackend, S, _, _, _>(
+                    architecture,
+                    rank,
+                    None,
+                    (),
+                    std::iter::empty(),
+                )
+                .unwrap();
+            let (local, offset) =
+                architecture_partition_state_layout::<A, S, _, _>(architecture, &complete, &probe)
+                    .unwrap();
+            assert_eq!(offset..offset + local.len(), expected);
+        }
+    }
+
+    fn qwen_args() -> eredu_architectures::qwen::hybrid::HybridConfig {
+        eredu_architectures::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "vocab_size": 8,
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 16,
+            "intermediate_size": 16,
+            "num_experts": 0,
+            "tie_word_embeddings": true,
+            "layer_types": ["full_attention", "full_attention"]
+        }))
+        .unwrap()
+        .text
+    }
+
+    fn deepseek_v3_args() -> eredu_architectures::deepseek::V3Args {
+        eredu_architectures::deepseek::parse_v3_config(&serde_json::json!({
+            "model_type": "deepseek_v3",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "moe_intermediate_size": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "vocab_size": 8,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 64,
+            "rope_theta": 10000.0,
+            "q_lora_rank": null,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 2,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 2,
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 2,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "num_nextn_predict_layers": 1,
+            "split_kv_b": false,
+            "tie_word_embeddings": false
+        }))
+        .unwrap()
+    }
+
+    fn deepseek_v4_args() -> eredu_architectures::deepseek::V4Args {
+        eredu_architectures::deepseek::parse_v4_config(&serde_json::json!({
+            "model_type": "deepseek_v4",
+            "hidden_size": 16,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "q_lora_rank": 8,
+            "o_lora_rank": 8,
+            "o_groups": 2,
+            "vocab_size": 16,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 64,
+            "sliding_window": 8,
+            "compress_ratios": [0, 4, 0],
+            "index_n_heads": 2,
+            "index_head_dim": 4,
+            "index_topk": 2,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 2,
+            "hc_eps": 0.000001,
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 1,
+            "num_hash_layers": 1,
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "num_nextn_predict_layers": 1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn qwen_hybrid_pipeline_resolves_family_state_plan() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let architecture =
+            eredu_architectures::qwen::hybrid::LayeredModel::<MlxNeuralBackend>::new(
+                qwen_args(),
+                &stream,
+            )
+            .unwrap();
+        assert_family_partitions::<_, MlxHybridState>(&architecture);
+    }
+
+    #[test]
+    fn deepseek_v3_pipeline_resolves_family_state_plan() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let architecture = eredu_architectures::deepseek::v3::Model::<MlxNeuralBackend>::new(
+            deepseek_v3_args(),
+            &stream,
+        )
+        .unwrap();
+        assert_family_partitions::<_, MlxHybridState>(&architecture);
+    }
+
+    #[test]
+    fn deepseek_v4_pipeline_resolves_family_state_plan() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let architecture = eredu_architectures::deepseek::v4::Model::<MlxNeuralBackend>::new(
+            deepseek_v4_args(),
+            &stream,
+        )
+        .unwrap();
+        assert_family_partitions::<
+            _,
+            eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+        >(&architecture);
+    }
 }
 
 fn partition_owns_architecture_units<G, X>(
@@ -14563,17 +14718,21 @@ fn load_llama_pipeline(
     let complete_state = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state.clone(), range.start)),
+            None,
             geometry.clone(),
             std::iter::empty(),
         )?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &complete_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -14584,7 +14743,7 @@ fn load_llama_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             geometry,
             local_bindings,
         )?;
@@ -14835,7 +14994,6 @@ fn load_qwen_pipeline(
         .unwrap()
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = stage
         .architecture
         .as_ref()
@@ -14846,9 +15004,15 @@ fn load_qwen_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
-            Some((local_state.clone(), range.start)),
+            None,
             geometry.clone(),
             std::iter::empty(),
+        )?;
+    let (local_state, state_offset) =
+        architecture_partition_state_layout::<_, PipelineRangeState<'_>, _, _>(
+            stage.architecture.as_ref().unwrap(),
+            &complete_state,
+            &ownership_probe,
         )?;
     let parameter_description = stage
         .architecture
@@ -14863,7 +15027,7 @@ fn load_qwen_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             geometry,
             local_bindings,
         )?;
@@ -15183,17 +15347,22 @@ fn load_muse_glimmer_pipeline(
     let complete_state = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxKeyValueState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state.clone(), range.start)),
+            None,
             geometry.clone(),
             std::iter::empty(),
         )?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<
+        _,
+        MlxKeyValueState,
+        _,
+        _,
+    >(&architecture, &complete_state, &ownership_probe)?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -15204,7 +15373,7 @@ fn load_muse_glimmer_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxKeyValueState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             geometry,
             local_bindings,
         )?;
@@ -15649,7 +15818,11 @@ fn load_neutral_qwen_vl_pipeline(
             architecture.shared_parallel_geometry(),
             std::iter::empty(),
         )?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &complete_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -15660,7 +15833,7 @@ fn load_neutral_qwen_vl_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             architecture.shared_parallel_geometry(),
             local_parameter_groups,
         )?;
@@ -17309,7 +17482,6 @@ fn load_gpt_oss_pipeline(
         .unwrap()
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = stage
         .architecture
         .as_ref()
@@ -17320,9 +17492,15 @@ fn load_gpt_oss_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
-            Some((local_state.clone(), range.start)),
+            None,
             geometry.clone(),
             std::iter::empty(),
+        )?;
+    let (local_state, state_offset) =
+        architecture_partition_state_layout::<_, PipelineRangeState<'_>, _, _>(
+            stage.architecture.as_ref().unwrap(),
+            &complete_state,
+            &probe,
         )?;
     let parameter_description = binding_parameter_description;
     let bindings = local_architecture_parameter_bindings(&parameter_description, &probe);
@@ -17331,7 +17509,7 @@ fn load_gpt_oss_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             geometry,
             bindings,
         )?;
@@ -17843,7 +18021,11 @@ fn load_lfm2_pipeline(
             Arc::clone(&geometry),
             std::iter::empty(),
         )?;
-    let local_state = decoder_partition_state_layout(&runtime_state, range.clone())?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &runtime_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -17854,7 +18036,7 @@ fn load_lfm2_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
@@ -19231,15 +19413,11 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        qwen_hybrid_pipeline_prompt_cache_identity(
-            self.args(),
-            topology,
-            self.range().clone(),
-            self.partition.ownership(),
-            &complete,
-        )
+        let state = self
+            .partition
+            .state()
+            .ok_or_else(|| Error::Parallel("Qwen hybrid partition has no runtime state".into()))?;
+        qwen_hybrid_pipeline_prompt_cache_identity(self.args(), topology, state)
     }
 }
 
@@ -19498,17 +19676,21 @@ fn load_neutral_qwen_hybrid_pipeline(
     }
     let complete_state = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state.clone(), range.start)),
+            None,
             geometry.clone(),
             std::iter::empty(),
         )?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &complete_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -19519,7 +19701,7 @@ fn load_neutral_qwen_hybrid_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             geometry,
             local_bindings,
         )?;
@@ -20465,7 +20647,11 @@ fn load_kimi_linear_pipeline(
             Arc::clone(&geometry),
             std::iter::empty(),
         )?;
-    let local_state = decoder_partition_state_layout(&runtime_state, range.clone())?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &runtime_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -20476,7 +20662,7 @@ fn load_kimi_linear_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
@@ -21455,7 +21641,11 @@ fn load_neutral_gemma4_pipeline(
             Arc::clone(&geometry),
             std::iter::empty(),
         )?;
-    let local_state = decoder_partition_state_layout(&runtime_state, range.clone())?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &runtime_state,
+        &ownership_probe,
+    )?;
     let parameter_description = architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21465,7 +21655,7 @@ fn load_neutral_gemma4_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             Arc::clone(&geometry),
             local_parameter_groups,
         )?;
@@ -22081,17 +22271,21 @@ fn load_neutral_deepseek_v3_pipeline(
     let complete_state = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state.clone(), range.start)),
+            None,
             geometry.clone(),
             std::iter::empty(),
         )?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<_, MlxHybridState, _, _>(
+        &architecture,
+        &complete_state,
+        &ownership_probe,
+    )?;
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
@@ -22099,7 +22293,7 @@ fn load_neutral_deepseek_v3_pipeline(
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
-            Some((local_state, range.start)),
+            Some((local_state, state_offset)),
             geometry,
             local_parameter_groups,
         )?;
@@ -22517,7 +22711,6 @@ fn load_neutral_deepseek_v4_pipeline(
     let complete_state = architecture
         .state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info.placement.realize_architecture_partition::<
         MlxNeuralBackend,
@@ -22528,10 +22721,16 @@ fn load_neutral_deepseek_v4_pipeline(
     >(
         &architecture,
         info.pipeline_stage,
-        Some((local_state.clone(), range.start)),
+        None,
         geometry.clone(),
         std::iter::empty(),
     )?;
+    let (local_state, state_offset) = architecture_partition_state_layout::<
+        _,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
+        _,
+        _,
+    >(&architecture, &complete_state, &ownership_probe)?;
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info.placement.realize_architecture_partition::<
@@ -22543,7 +22742,7 @@ fn load_neutral_deepseek_v4_pipeline(
     >(
         &architecture,
         info.pipeline_stage,
-        Some((local_state, range.start)),
+        Some((local_state, state_offset)),
         geometry,
         local_parameter_groups,
     )?;
