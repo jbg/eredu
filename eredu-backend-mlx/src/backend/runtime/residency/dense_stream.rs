@@ -119,6 +119,7 @@ mod tests {
     use std::{
         sync::{mpsc, Condvar, Mutex},
         thread,
+        time::{Duration, Instant},
     };
 
     #[derive(Default)]
@@ -304,16 +305,26 @@ mod tests {
         gate.wait_for_starts(1);
         prefetch.submit(&ids[1]).unwrap();
 
-        let (started_tx, started_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let submitting = Arc::clone(&prefetch);
         let required = ids[2].clone();
         let submitter = thread::spawn(move || {
-            started_tx.send(()).unwrap();
             let outcome = submitting.submit(&required);
             result_tx.send(outcome).unwrap();
         });
-        started_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while prefetch.report().unwrap().backpressure_count() == 0 {
+            if Instant::now() >= deadline {
+                gate.release();
+                result_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+                submitter.join().unwrap();
+                panic!("third submission did not encounter the full prefetch queue");
+            }
+            thread::yield_now();
+        }
         gate.release();
         result_rx.recv().unwrap().unwrap();
         submitter.join().unwrap();
@@ -328,7 +339,7 @@ mod tests {
         assert_eq!(report.started(), 3);
         assert_eq!(report.completed(), 3);
         assert_eq!(report.failed(), 0);
-        assert!(report.backpressure_count() >= 1);
+        assert_eq!(report.backpressure_count(), 1);
     }
 
     #[test]

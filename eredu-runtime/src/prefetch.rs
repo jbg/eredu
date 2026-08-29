@@ -59,8 +59,7 @@ impl BackgroundPrefetchWorker {
         id: &OffloadUnitId,
         resident: bool,
     ) -> Result<(), BackgroundPrefetchWorkerError> {
-        let started = Instant::now();
-        let mut backpressured = false;
+        let mut backpressure_started: Option<Instant> = None;
         loop {
             let mut state = self
                 .shared
@@ -69,13 +68,16 @@ impl BackgroundPrefetchWorker {
                 .map_err(|_| BackgroundPrefetchWorkerError::StatePoisoned)?;
             match state.admit(id.clone(), resident) {
                 PrefetchAdmission::Coalesced => {
-                    if backpressured {
-                        state.record_backpressure(started.elapsed());
+                    if let Some(started) = backpressure_started {
+                        state.finish_backpressure(started.elapsed());
                     }
                     return Ok(());
                 }
                 PrefetchAdmission::AtCapacity => {
-                    backpressured = true;
+                    if backpressure_started.is_none() {
+                        state.begin_backpressure();
+                        backpressure_started = Some(Instant::now());
+                    }
                     drop(
                         self.shared
                             .1
@@ -84,8 +86,8 @@ impl BackgroundPrefetchWorker {
                     );
                 }
                 PrefetchAdmission::Admitted(work) => {
-                    if backpressured {
-                        state.record_backpressure(started.elapsed());
+                    if let Some(started) = backpressure_started {
+                        state.finish_backpressure(started.elapsed());
                     }
                     if self.sender.send(WorkerMessage::WorkAvailable).is_ok() {
                         return Ok(());

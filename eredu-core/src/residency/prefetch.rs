@@ -70,12 +70,12 @@ impl BackgroundPrefetchReport {
         self.peak_queue_occupancy
     }
 
-    /// Submissions that waited for admission capacity.
+    /// Submissions that encountered full admission capacity.
     pub const fn backpressure_count(self) -> u64 {
         self.backpressure_count
     }
 
-    /// Time spent waiting for admission capacity.
+    /// Cumulative wait time for resolved backpressure events.
     pub const fn backpressure_duration(self) -> Duration {
         self.backpressure_duration
     }
@@ -364,9 +364,13 @@ impl<E> PrefetchExecutionState<E> {
         Ok(PrefetchDemandResolution::Unscheduled)
     }
 
-    /// Records one submission that waited for bounded admission.
-    pub fn record_backpressure(&mut self, duration: Duration) {
+    /// Records a submission when it first encounters bounded admission capacity.
+    pub fn begin_backpressure(&mut self) {
         self.report.backpressure_count = self.report.backpressure_count.saturating_add(1);
+    }
+
+    /// Records how long one backpressured submission waited before resolving.
+    pub fn finish_backpressure(&mut self, duration: Duration) {
         self.report.backpressure_duration =
             self.report.backpressure_duration.saturating_add(duration);
     }
@@ -625,13 +629,17 @@ mod tests {
     #[test]
     fn report_serialization_round_trip_preserves_stable_fields() {
         let mut state = PrefetchExecutionState::<()>::new(3).unwrap();
-        state.record_backpressure(Duration::from_millis(7));
+        state.begin_backpressure();
+        assert_eq!(state.report().backpressure_count(), 1);
+        assert_eq!(state.report().backpressure_duration(), Duration::ZERO);
+        state.finish_backpressure(Duration::from_millis(7));
         state.admit(id("layer.0"), false);
         let report = state.report();
         let encoded = serde_json::to_string(&report).unwrap();
         let decoded: BackgroundPrefetchReport = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, report);
         assert_eq!(decoded.queue_capacity(), 3);
+        assert_eq!(decoded.backpressure_count(), 1);
         assert_eq!(decoded.backpressure_duration(), Duration::from_millis(7));
     }
 }
