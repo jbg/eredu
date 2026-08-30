@@ -74,7 +74,7 @@ impl CatalogTensor {
         self.affine
     }
 
-    /// Whether this physical tensor expands into MLX MXFP4 weight and scale arrays.
+    /// Whether this physical tensor expands into packed MXFP4 weights and scales.
     pub fn is_mxfp4(&self) -> bool {
         self.descriptor.ggml_type == crate::GgmlType::MxFp4
     }
@@ -596,7 +596,7 @@ impl TensorMaterializer {
         })
     }
 
-    /// Materialize a bounded selection along one MLX tensor axis.
+    /// Materialize a bounded selection along one logical row-major tensor axis.
     pub fn converted_tensor_selected(
         &mut self,
         name: &str,

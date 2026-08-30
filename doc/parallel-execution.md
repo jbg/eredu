@@ -4,24 +4,21 @@
 expert parallelism (EP) through one Cartesian topology. Each process has exact
 coordinates and subgroup membership for the axes that apply to its model.
 
-All supported families use the ordinary architecture-erased loader. Build the
-canonical `eredu::ParallelTopology` in core terms, bind its process rank
-to an MLX device with
-`eredu_backend_mlx::backend::topology::MlxParallelContext`, and pass that
-context through
-`eredu_backend_mlx::backend::config::ModelLoadOptions::with_parallel` in
-backend-specific tooling. Application clients normally submit the portable
-topology through an `ExecutionPlan` and let the `eredu` facade realize it.
+All supported families use the ordinary architecture-erased loader.
+Application clients submit a canonical `eredu::ParallelTopology` through an
+`ExecutionPlan` and let the `eredu` facade realize it. Backend-specific tooling
+binds the resulting process rank to its process-local device and passes that
+context to the backend loader.
 Unsupported combinations fail preflight before checkpoint payloads are
 materialized; there are no public family-specific parallel loaders.
 
 `ParallelTopology` derives world size from its tensor, pipeline, expert, and
 data dimensions. `ParallelRankTopology` owns coordinate mapping, subgroup
 membership, pipeline neighbors, balanced layer/expert ownership, and pure
-preflight planning. The MLX `MlxParallelContext` adds only a process-local
-device assignment. Device-bound topology types live under `backend::topology`,
-not the flat application-facing adapter. Native groups, arrays, transfers, and
-exact completions stay in the selected MLX session.
+preflight planning. A concrete backend adds only its process-local device and
+communication bindings. Native groups, tensors, transfers, and exact
+completions stay in the selected session. MLX backend tooling is described in
+its [implementation architecture](../eredu-backend-mlx/doc/architecture.md).
 
 ## Topology matrix
 
@@ -63,10 +60,9 @@ intermediate widths, recurrent groups, experts, modality towers, and output
 biases can have different ownership. Uneven supported partitions are recorded
 in the rank-local cache and prompt-cache identity.
 
-Applications should select the process-local device with
-`distributed::device_for_local_rank`. A global rank is not a local GPU index;
-launchers commonly restrict each process with `CUDA_VISIBLE_DEVICES`, making
-the process-local index zero.
+Backend tooling must distinguish a global process rank from a process-local
+device index. Launchers may remap device visibility, so a backend must use its
+local-rank device mapping rather than treating the global rank as an index.
 
 ## Pipeline parallelism
 

@@ -47,18 +47,17 @@ evaluation, graph transforms, and I/O.
 - The `distributed` module wraps MLX groups, collectives, point-to-point
   operations, and variable-count all-to-all.
 
-See the workspace documentation for the [completion-event
-contract](https://github.com/jbg/eredu/blob/main/doc/completion-events.md), [asynchronous device
-timing](https://github.com/jbg/eredu/blob/main/doc/device-timing.md), [host-transfer
-buffers](https://github.com/jbg/eredu/blob/main/doc/host-transfer-buffers.md), and [platform
-setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md).
+See the [`safemlx` implementation
+guides](https://github.com/jbg/eredu/blob/main/safemlx/doc/README.md) for
+completion events, asynchronous device timing, and host-transfer buffers.
 
 ## Platforms
 
 Eredu's MLX implementation supports Apple silicon on macOS and selected Apple
 device targets, x86-64 Linux with CPU or CUDA, and native x86-64 Windows with
 CPU or CUDA. Backend prerequisites and application-bundling requirements are
-documented in [Platform setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md).
+documented in the MLX backend's [platform setup
+guide](https://github.com/jbg/eredu/blob/main/eredu-backend-mlx/doc/platforms.md).
 
 The minimum supported Rust version is 1.89.
 

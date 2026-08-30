@@ -22,7 +22,7 @@ use crate::{
 /// Stable, extensible description of an execution backend.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendDescriptor {
-    /// Backend implementation name, such as `mlx` or `iree`.
+    /// Backend implementation name, such as `example-backend`.
     pub name: String,
     /// Backend implementation version.
     pub version: String,

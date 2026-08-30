@@ -1,8 +1,8 @@
 # Cancellation and bounded execution
 
 Eredu schedulers cancel cooperatively at submission and publication
-boundaries. They do not claim to interrupt an executing kernel or a committed
-Metal, CUDA, CPU, or distributed operation.
+boundaries. They do not claim to interrupt an executing kernel or another
+operation already committed to a backend device or distributed transport.
 
 ## Work lifecycle
 

@@ -35,9 +35,10 @@
 //! additional typed conversion, such as [`Array::item`], take a stream for that
 //! conversion.
 //! [`transforms::async_eval_with_event`] explicitly submits selected outputs and
-//! returns a backend-independent [`Event`]. A compatible [`Stream`] can enqueue
-//! an event wait without blocking the host; constructing a consumer graph is
-//! still lazy, so it must be evaluated after the dependency is inserted.
+//! returns an [`Event`] independent of the selected MLX device backend. A
+//! compatible [`Stream`] can enqueue an event wait without blocking the host;
+//! constructing a consumer graph is still lazy, so it must be evaluated after
+//! the dependency is inserted.
 //!
 //! ```rust
 //! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));

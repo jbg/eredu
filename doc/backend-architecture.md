@@ -20,47 +20,29 @@ eredu-core        eredu-checkpoint        eredu-nn
 
 The neutral crates contain no native accelerator dependency under any feature.
 `eredu-codec` owns backend-neutral neural audio codec architectures and depends
-on the neutral tensor contracts in `eredu-nn`. `eredu-backend-mlx` depends on
-`eredu-codec` only when its optional `codec` feature is enabled; the codec crate
-does not acquire an MLX feature or dependency in the other direction.
+on the neutral tensor contracts in `eredu-nn`. A concrete backend may depend on
+`eredu-codec` for an optional codec binding; the codec crate does not acquire a
+backend feature or dependency in the other direction.
 `eredu-gguf` is likewise a backend-neutral storage dependency. Backends that
 execute nonlinear GGUF IQ blocks consume their canonical values through the
 typed `IQuantCodebook` API; generated table modules remain private and cannot
 serve as an undocumented cross-crate integration surface.
 The `eredu` facade is also portable when built with
-`default-features = false`. The supported `mlx` feature selects the optional
-`eredu-backend-mlx` adapter. The weak `metal` feature forwards the backend
-crate's `accelerate` and `metal` capabilities, while `cuda` forwards its `cuda`
-capability; neither capability feature selects the backend. Metal and CUDA are
-mutually exclusive, and both
-the facade and direct backend crate reject selecting them together before the
-native build runs. Direct facade consumers select `mlx,cuda` for CUDA. The
-`eredu-cli` convenience feature `cuda` selects both on their behalf, but its
-Metal-enabled defaults must still be disabled. The backend crate itself has no
-default features and disables the
-`safemlx` defaults, so direct backend users select native execution support
-explicitly. The `safemlx-tests` package likewise exposes separate `metal` and
-`cuda` platform features. Its default selects Metal, so CUDA CI disables
-package defaults before selecting `cuda`; the test package's dependency on
-`safemlx` itself enables only backend-neutral SafeTensors support. The facade
-exposes a flat, application-facing local adapter under `eredu::api`; it does not
-reproduce the implementation crate's backend or composition module tree.
+`default-features = false`. Concrete adapter and native-platform features stay
+optional; capability features configure an enabled adapter rather than making
+portable contracts depend on it. The facade exposes a flat,
+application-facing local adapter under `eredu::api`; it does not reproduce an
+implementation crate's backend or composition module tree. The current MLX
+feature mapping and native build requirements are documented with the
+[MLX backend](../eredu-backend-mlx/doc/README.md).
+
 Backend-internal
 fixtures and composition tests are crate-private unit tests; published crates
 expose no test-support feature or fixture namespace. The facade does not
-directly depend on `eredu-nn` or `eredu-checkpoint`. Direct MLX backend users
-also enable `image` and `audio` as needed; the facade forwards those same
-capability features through the optional adapter without selecting it. Shared
-media-processing infrastructure is compiled whenever either capability is
-enabled; there is no capability-less `media` feature. Backend feature
-diagnostics name the active public spelling. Cargo features are all published,
-selectable API; none of these feature names imply privacy.
-
-The `eredu-cli` executable requires its public `mlx` feature. Its `metal` and
-`cuda` convenience features both imply `mlx`, and `nccl` implies `cuda`.
-Consequently, every named CLI feature is independently valid, while checking
-the package with no features omits the executable instead of compiling a
-target whose implementation cannot run.
+directly depend on `eredu-nn` or `eredu-checkpoint`. Media processing is enabled
+only through concrete image or audio capabilities. Backend feature diagnostics
+name the active public spelling; published Cargo features are selectable API,
+not a privacy mechanism.
 
 The facade root and `api` namespace expose portable application concepts plus
 the opaque selected-backend adapter. `LocalBackendFactory`, `LocalModel`,
@@ -105,40 +87,20 @@ selected-local-backend API owns device-plan creation, process runtime
 configuration, allocator telemetry, and diagnostic benchmarks, while
 `LocalModel::synchronize` is the sole application-facing synchronization entry
 point. These APIs do not expose native tensors, streams, devices, or random
-state. Direct native access remains an explicit backend-author escape
-hatch under `eredu-backend-mlx::native`; it is not an application dependency.
-Its `LocalLoadOptions` and `LocalInspectionOptions` are facade-owned values
-containing only neutral quantization, residency, and session-capability policy.
-They are converted to MLX load policy inside the adapter; native device-bound
-parallel contexts are selected only by backend tooling. `LocalBackendError`
-similarly records facade operation context and a diagnostic message without
-exporting `safemlx` exception or I/O variants. Portable execution plans remain
-the application surface for device and topology selection.
-Backend-generic sampling policy lives in `eredu-runtime`; the canonical MLX
-realization and raw-array adapters live in the reusable
-`eredu-backend-mlx::backend` hierarchy. The `native` namespace supplies the
-arrays, streams, and random state required by raw sampling signatures.
-Backend configuration, errors, topology, prepared models, neural operators,
-supported cache-state types, and runtime facilities are organized in their
-leaf `backend` ownership modules. Backend authors use the public neutral cache
-contracts and the supported `backend::runtime::cache::state` realizations.
-Composition-owned model sessions, inputs, outputs, inspection policy,
-realtime types, and prompt helpers are exposed under `native`. The flat root
-exports application adapters from private implementation modules.
-The backend's flat `MlxRealtimeAdapter` has no native-handle accessors and
-exists so the facade can own a concrete implementation; facade-owned wrappers
-expose only portable frames, scheduling identities, limits, lifecycle state,
-and telemetry. Concrete causal sessions, exact completion types, speculative
-drafters, and owned model inputs also live under `eredu-backend-mlx::native`;
-callers of the flat backend use their neutral trait interfaces and inferred
-associated types.
-Raw completion submission remains crate-private. The flat adapter keeps native
-borrowed model-input views private and returns model logits through the
-backend-owned `MlxTensor` handle.
-Facade examples follow the same rule and construct selected local sessions
-through `eredu::api`. Backend-author probes that intentionally manipulate MLX
-tensors, streams, distributed groups, caches, or checkpoint packing live as
-`eredu-backend-mlx` examples and depend downward on neutral contracts.
+state. Direct native access remains an explicit backend-author escape hatch in
+the implementation crate; it is not an application dependency.
+`LocalLoadOptions` and `LocalInspectionOptions` contain only neutral
+quantization, residency, and session-capability policy, while native
+device-bound contexts are selected only by backend tooling. `LocalBackendError`
+records facade operation context and a diagnostic message without exporting
+native error variants. Portable execution plans remain the application surface
+for device and topology selection.
+
+Backend-generic sampling policy lives in `eredu-runtime`; concrete sampling,
+cache-state, session, completion, and model-input types stay in the selected
+backend. Facade examples construct local sessions through `eredu::api`, while
+backend-author probes that manipulate native resources live with their
+implementation and depend downward on neutral contracts.
 All selected sessions expose completed outputs through
 `BackendSession::observe_output`; backends retain native tensors internally and
 materialize portable `ObservationSet` records only when explicitly requested.
@@ -260,9 +222,9 @@ they must not extend a decoder range to the end of the state layout or infer
 prediction-state ownership from pipeline rank position.
 `ArchitecturePartition::from_architecture` resolves this plan and selects the
 partition's architecture-declared parameter groups as one neutral lifecycle.
-MLX pipeline composition supplies physical group placement and family-owned
-local geometry; it does not create an ownership probe or populate state in a
-second pass.
+Backend pipeline composition supplies physical group placement and consumes
+family-owned local geometry; it does not create an ownership probe or populate
+state in a second pass.
 
 The ordinary Qwen decoder, block, and layered lifecycle are dense construction
 surfaces and require only `NeuralBackend`. Concrete adapters that dynamically
@@ -488,14 +450,15 @@ parsing the projector and consumed unchanged by inspection, checkpoint
 planning, and execution.
 Qwen projector admission also produces its GGUF checkpoint plan from the
 admitted family composite. Family eligibility, required vision mode, and
-decoder/projector width compatibility are architecture policy; MLX structural
-validation and materialization consume that composite plan without rebuilding
-those rules from independently parsed text and projector configurations.
+decoder/projector width compatibility are architecture policy; backend
+structural validation and materialization consume that composite plan without
+rebuilding those rules from independently parsed text and projector
+configurations.
 Packed recipes expose format semantics rather than a concrete accelerator's
 storage units. In particular, canonical MXFP4 expert recipes describe logical
 F4 values regardless of whether a source stores byte blocks or integer words;
-the MLX adapter lowers those terminal recipes to the U32 geometry required by
-its affine kernels before constructing runtime bindings.
+a backend adapter lowers those terminal recipes to the storage geometry
+required by its kernels before constructing runtime bindings.
 
 Parameter-class selection follows the architecture's validated parameter
 description. Backends select exact targets by semantic role, retain the
@@ -584,12 +547,13 @@ GPT-OSS, LFM2, Kimi Linear, Nemotron-H, Muse-Glimmer, Inkling, Gemma 4, and
 DeepSeek V3/V4 expose family-specific realization entry points over their
 constructed neutral architectures. These entry points select routed units,
 preserve canonical parameter formats, and apply planner-derived local widths
-before MLX sees the plan. MLX family adapters accept the plan rather than the
+before a backend sees the plan. Family adapters accept the plan rather than the
 family configuration or parallel topology when creating their native dispatch
-assignment. The MLX assignment type is only a validated lowering of the plan's
-owner map; it exposes no independent balanced, round-robin, or explicit policy
-engine. DeepSeek pipeline unit factories install the plan before constructing
-target or prediction units, and tensor-parallel expert-cache selection derives
+assignment. A backend assignment type is only a validated lowering of the
+plan's owner map; it exposes no independent balanced, round-robin, or explicit
+policy engine. DeepSeek pipeline unit factories install the plan before
+constructing target or prediction units, and tensor-parallel expert-cache
+selection derives
 its local width from the same plan entries rather than from family arguments.
 Distributed expert callbacks also
 carry whether the requested result is globally complete or a rank-local
@@ -647,7 +611,7 @@ composite persistence layout together; the backend consumes that value without
 reassembling segments or recovering offsets from layer-count fields. Pipeline
 prompt-cache identity is derived by the neutral partition operation from
 `ArchitectureParameters::state_identity` and the partition's exact
-`PartitionState`; MLX lowers only its parallel topology. Target or
+`PartitionState`; a backend lowers only its parallel topology. Target or
 embedded-prediction cache allocation uses that identity and does not recreate
 a global layout, offsets, or family identity after placement. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
@@ -732,21 +696,20 @@ selection likewise use the decoder group count from that description, before
 constructing any rank-local units.
 Rank-local materialization traverses the canonical units exposed by its
 `ArchitecturePartition`, so composite vision, target, and prediction ordering
-is never restated by a backend loader. Every MLX distributed family loader
+is never restated by a backend loader. Every distributed family loader
 registers tensor-parallel groups from the complete architecture parameter
 description; it does not enumerate static, media, decoder, or prediction
 parameters independently. The same description supplies the ownership used by
 pipeline-stage materialization, preventing tensor and pipeline planning from
 drifting apart. Conditional Qwen pipeline boundaries come from the constructed
 architecture, including hidden width and DeepStack activation cardinality,
-rather than being re-derived from family arguments in MLX.
+rather than being re-derived from family arguments in backend composition.
 
-The MLX backend materializes every active expert-parallel axis through its
-single distributed-stage loader. Pure EP, PP+EP, TP+EP, and TP+PP+EP therefore
-share architecture capability validation, expert assignment, residency, and
-execution; there is no separate family-dispatched EP model loader. The same
-path covers every architecture whose neutral parallel plan declares EP,
-including multimodal and hybrid-state MoE families.
+Pure EP, PP+EP, TP+EP, and TP+PP+EP must share the architecture's capability
+validation, expert assignment, residency plan, and execution declarations. A
+backend must not introduce a separate family-dispatched ownership policy for
+one topology combination; the same neutral plan covers multimodal and
+hybrid-state MoE families.
 
 Artifact inspection also consumes architecture-derived input modalities from
 that exact normalized configuration. Backends translate those neutral flags
@@ -897,8 +860,8 @@ backend namespace. Checkpoint catalog, selection, mapping, and I/O failures
 likewise retain `eredu-checkpoint`'s `StoreError`; a concrete backend error
 covers only failures introduced while converting or materializing a neutral
 lease. In particular, GGUF metadata, descriptors, encoded spans, and selection
-plans are imported from `eredu-gguf`; MLX GGUF APIs expose only their
-backend-owned checkpoints, materializers, and materialized tensors.
+plans are imported from `eredu-gguf`; backend GGUF APIs expose only their owned
+checkpoints, materializers, and materialized tensors.
 
 Neutral contracts use associated concrete types for these values. They do not
 use `Any`, untyped pointers, string-dispatched operations, or erased calls in
@@ -949,19 +912,6 @@ configuration, checkpoint metadata, companion selection, or route.
 
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
-Each concrete backend keeps one exhaustive realization descriptor per
-normalized family for the artifact formats and materializers it actually
-implements. The MLX descriptor binds GGUF availability, complete or
-distributed-stage tensor parallelism, independent expert-cache loading, and
-load-time quantization in one place. It also selects the MLX composition used
-by replicated, complete tensor-parallel, and distributed-stage materializers.
-Preflight and loader dispatch consume those typed bindings instead of
-independently matching the architecture registry; exact GGUF architecture
-variants remain data interpreted inside the selected family composition, not a
-second backend dispatch matrix. Adding a normalized family therefore requires
-one explicit MLX availability decision; adding a genuinely new MLX
-implementation extends the binding enum, whose exhaustive consumers are
-compiler checked.
 `BackendProvider::create_session` consumes a `PreparedModel`, so an executable
 cannot be paired with a cache or session created by another backend.
 
@@ -1072,7 +1022,8 @@ and dMel geometry, placeholder tokens, valid audio prefixes, and decoder spans.
 Muse-Glimmer likewise uses one architecture input-part plan for text and native
 image/video tensors; the plan owns the placeholder span, validated grid, and
 checkpoint-convention video policy while rejecting projected embeddings and
-audio. MLX does not reconstruct modality, spatial-merging, or artifact policy.
+audio. Backends do not reconstruct modality, spatial-merging, or artifact
+policy.
 
 Layered model execution topology follows the same ownership rule. Loaders and
 materializers derive execution graphs and per-group unit counts through
@@ -1081,10 +1032,10 @@ residency, parallel planning, parameter accounting, state allocation, and unit
 construction consume that layout together with the architecture's required
 state-independent parameter contract. They do not reconstruct a family's group
 order, dependencies, layer counts, or flat-to-group mapping from configuration.
-This keeps every backend realization aligned with architecture execution. MLX
-composition traverses the layout's flat ordinals and resolves each unit through
-its canonical group-local address; tensor-parallel accounting uses the layout
-carried by `ArchitectureParameterDescription`, and load-time quantization
+This keeps every backend realization aligned with architecture execution.
+Backend composition traverses the layout's flat ordinals and resolves each
+unit through its canonical group-local address; tensor-parallel accounting uses
+the layout carried by `ArchitectureParameterDescription`, and load-time quantization
 requires its source and target layouts to match before visiting any units.
 Family output projections also own output-vocabulary policy, including removal
 of checkpoint padding after serial or tensor-parallel projection. Backend
@@ -1243,84 +1194,13 @@ consensus submissions with exact completion. Unsupported operations report an
 explicit absent capability. Communicator construction, sharding, movement, and
 collective tensor math remain backend-specific.
 
-## MLX implementation
+## Concrete implementations
 
-The complete concrete implementation lives in `eredu-backend-mlx`, split
-between public reusable backend mechanics and private family/backend
-composition:
-
-- reusable public mechanics are rooted directly at
-  `eredu_backend_mlx::backend::{nn, runtime, ...}`. The dedicated MLX crate
-  does not repeat its backend name as another module layer;
-- `backend::MlxBackend` is the provider used internally by the selected facade and privately owns
-  execution and weight-materialization streams. Its production inherent API
-  neither accepts nor returns native handles; callers that deliberately
-  construct backend-native sessions do so through `eredu_backend_mlx::native`.
-  `backend::nn::shared::MlxNeuralBackend` is
-  the distinct zero-sized selector that implements the neutral neural,
-  parameter, submission, and transfer traits for architecture specialization.
-- `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and
-  is the sole MLX implementation of `eredu_nn::Tensor`;
-- `native::MlxModelSession` composition owns the executable model, cache,
-  processor state, and optional distributed context. The prepared
-  `backend::MlxModel` wrapper exposes neutral capabilities and telemetry while
-  keeping its executable kind and architecture-specific payload private.
-- neural-network modules implement reusable MLX tensor operations;
-- runtime modules implement checkpoint materialization, sampling, caches,
-  residency workers, media processing, and collectives. Their production
-  checkpoint API consumes exact local parameter identities and
-  architecture-derived bindings and recipes. Strict module loading performs no
-  prefix stripping, prefix rewriting, unused-prefix exemptions, or implicit
-  parameter-name expansion. Load-time quantization receives exact companion
-  destinations through architecture parameter metadata, and backend-only
-  native sentinels are explicitly excluded by the operator's topology mapping
-  rather than inferred from native names, shapes, or dtypes or marked as loaded.
-  Selective partition loading likewise requires
-  exact checkpoint keys in its placement plan; neither surface invents family
-  aliases or exposes parsers for physical family checkpoint names. Distributed
-  sharding resolves each non-alias binding solely by its exact
-  architecture-logical target and rejects missing or unmatched targets during
-  admission;
-- GGUF family selection and portable family-specific structural admission are
-  architecture-registry concerns. MLX composition resolves the already
-  admitted spelling through the same registry, trusts the retained portable
-  schema proof, validates only native encoding and operator compatibility, and
-  passes an admitted source to resident,
-  tensor-parallel, pipeline, or expert family loaders. Reusable backend runtime
-  modules neither parse `general.architecture` nor invoke family composition;
-- generic layerwise policy construction derives its execution graph and unit
-  layout directly from the concrete neutral architecture before binding
-  checkpoint units; composition cannot supply or reconstruct that layout.
-  Unit-binding adapters receive the validated architecture-flat ordinal,
-  group-local address, and canonical `unit_path`. Composite-family recipe
-  selection accepts that flat ordinal unchanged; architecture-owned recipe
-  catalogs translate optional media and prediction units into checkpoint-local
-  identities instead of backend binders reconstructing group order or layer
-  counts. Group ownership and parameter roots remain authoritative in the
-  address and path;
-- Moshi binding enumerates stable `Parameterized` identities and consumes its
-  architecture-owned canonical recipe publication; composition does not use
-  native module reflection to rediscover parameter names or aliases; and
-- MLX events provide exact completion while retaining arrays and source
-  resources required by submitted work.
-
-Model-family definitions, equations, checkpoint schemas, and state geometry
-remain in `eredu-architectures`. The backend crate owns only the MLX binding,
-materialization, and execution adapters. `eredu` delegates through neutral
-contracts and exposes only the narrow selected-backend types needed by
-applications; the backend crate never depends upward on the facade.
-
-The adapter translates native failures into structured backend errors and
-populates portable capability, inspection, memory, admission, and telemetry
-reports. MLX arrays, streams, devices, events, groups, and exceptions do not
-appear in core or generic facade signatures.
-Collective capability is reported only by an MLX backend instance with an
-attached world communicator. MLX device reports conservatively leave activation
-inspection unsupported because named observation coverage depends on both the
-loaded model and the session topology. Explicit replicated-session inspection
-dispatches family observers implemented by MLX composition through the same
-erased session path; missing family/cache pairs fail before execution instead
-of falling back to an uninstrumented pass.
+Concrete adapters document their public implementation surfaces, native
+features, platform requirements, and realization details with the crate that
+owns them. See the current
+[MLX backend architecture](../eredu-backend-mlx/doc/architecture.md) for one
+implementation of these contracts.
 
 Backend-neutral `TextGenerationConfig` also selects standard or Mirostat V2
 sampling. The chosen backend owns the corresponding logits, random state, and

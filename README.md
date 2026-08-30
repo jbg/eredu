@@ -86,7 +86,7 @@ example application.
 - [Parallel execution](doc/parallel-execution.md)
 - [Native tool calling](doc/tool-calling.md)
 - [Speculative decoding and MTP](doc/speculative-decoding.md)
-- [Platform setup](doc/platforms.md)
+- [MLX backend and platform setup](eredu-backend-mlx/doc/README.md)
 - [CLI guide](eredu-cli/README.md)
 
 All published crates are pre-1.0, so applications should expect API changes

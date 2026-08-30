@@ -6,7 +6,7 @@ checkpoint without loading tensor payloads, then materialize individual
 tensors or selections on demand.
 
 Use it for checkpoint tooling, validation, conversion, or as the storage layer
-for a runtime. It does not depend on MLX.
+for a runtime. It does not depend on a concrete execution backend.
 
 ## Features
 

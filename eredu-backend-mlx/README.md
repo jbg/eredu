@@ -15,6 +15,9 @@ Applications that use only loading, chat, and generation should normally use
 the `eredu` facade. The implementation crate is a direct dependency only for
 backend development and backend-specific low-level tooling.
 
+See the [MLX backend documentation](doc/README.md) for implementation
+architecture, native platform setup, and low-level `safemlx` guides.
+
 ```rust,no_run
 use eredu_backend_mlx::{
     backend::config::ModelLoadOptions,
@@ -70,22 +73,5 @@ backend-neutral driver in `eredu-evaluation`.
 
 Backend-specific reference-fixture generators used by the Moshi and
 PersonaPlex parity examples live in `validation/` and are packaged with this
-crate. Reusable evidence schemas, comparison policy, and reports remain in
-`eredu-evaluation`.
-
-Completed text-session outputs are materialized through the neutral
-`BackendSession::observe_output` contract. Explicit instrumented passes bind
-the architecture's named activation points to `InspectableBackendSession`.
-Parity policy and numerical comparison remain in `eredu-evaluation`; the
-backend owns only execution and host observation.
-
-MLX device enumeration reports only device capabilities. Exact session
-capabilities are derived from the inspected architecture, residency policy,
-and topology before checkpoint payloads are materialized, then verified again
-on the realized session. Activation inspection executes the production forward
-path for resident, bounded, tensor-parallel, and pipeline/Cartesian sessions.
-Observer replacements are returned from every named activation point,
-including final logits, independently of family and topology.
-Distributed results are rank-local: ranks report the global activation paths
-they own, and only the final/logits-owning rank reports `model.logits`; no
-implicit host gather is performed.
+crate. See the general [evaluation architecture](../doc/evaluation.md) for the
+portable observation, evidence, comparison, and reporting contracts.

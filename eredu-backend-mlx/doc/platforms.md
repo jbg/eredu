@@ -1,4 +1,4 @@
-# Platform setup
+# MLX backend platform setup
 
 Eredu's default MLX backend builds a native MLX C library through its
 `safemlx-sys` implementation crate. The first build can take longer because

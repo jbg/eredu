@@ -1,8 +1,8 @@
 # eredu-core
 
 `eredu-core` provides backend-neutral contracts and orchestration for
-language-model runtimes. It has no dependency on MLX, `safemlx`, Metal, CUDA, or
-another accelerator runtime.
+language-model runtimes. It has no dependency on a concrete accelerator
+runtime.
 
 Most applications should use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Use this crate
 directly when implementing an execution backend or reusing its portable

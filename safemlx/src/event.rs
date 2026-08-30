@@ -5,7 +5,7 @@ use crate::{
 };
 use std::time::Duration;
 
-/// Execution backend which owns an [`Event`].
+/// MLX device backend which owns an [`Event`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventBackend {
     /// No backend identity because the event was complete when created.
@@ -18,7 +18,7 @@ pub enum EventBackend {
     Cuda,
 }
 
-/// A backend-independent, single-shot MLX completion event.
+/// A single-shot completion event independent of the selected MLX device backend.
 ///
 /// Events are produced by [`crate::transforms::async_eval_with_event`], which
 /// explicitly submits the requested lazy graphs for evaluation. Merely

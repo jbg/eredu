@@ -23,21 +23,18 @@ load policy:
 - `required_session_capabilities`: fail-closed requirements for the realized
   session.
 
-The same requirement applies to realtime loading. MLX Moshi and PersonaPlex
-routes report persistent request cache and portable output observation, but not
-named activation inspection; an unsupported requirement fails before checkpoint
-payload materialization. Loaded realtime models expose the admitted report with
-`LocalRealtimeModel::session_capabilities`.
+The same requirement applies to realtime loading. An unsupported requirement
+fails before checkpoint payload materialization. Loaded realtime models expose
+the admitted report with `LocalRealtimeModel::session_capabilities`; exact
+capability coverage is documented by the selected backend.
 
 These facade-owned options are configured with builders and queried with
-accessors. They do not contain an MLX device or parallel context. Applications
+accessors. They do not contain a native device or parallel context. Applications
 derive them from a portable `ExecutionPlan` with
 `LocalInspectionOptions::for_execution_plan` when inspection must exactly
 match a planned load. Backend-author tooling that binds native distributed
-groups uses `eredu-backend-mlx` directly.
-
-Non-replicated distributed topologies use the same architecture-erased loader
-with an MLX parallel context.
+groups uses the selected implementation crate directly. Non-replicated
+distributed topologies still use the same architecture-erased loader.
 
 ## Weight residency
 
@@ -60,9 +57,10 @@ A dedicated same-device transfer stream and completion leases allow the next
 group to be prepared while the current group executes. A narrow window may
 still stall when a needed transfer does not complete in time.
 
-On Apple silicon, “host” and “device” are logical tiers in the same unified
-physical memory. Host-layerwise placement can control executable working sets
-and lifetimes, but it does not add RAM.
+Some backends expose logical host and device tiers that share the same physical
+memory. Host-layerwise placement can still control executable working sets and
+lifetimes, but it does not create additional physical capacity; consult the
+selected backend's platform guide.
 
 ### Dense disk streaming
 
@@ -108,7 +106,7 @@ same approach for selected expert banks.
 Dense quantization requires nonempty matrix geometry. Expert-bank leading
 dimensions are flattened with checked shape arithmetic, so banks whose total
 element count exceeds a 32-bit integer retain their geometry; only a flattened
-row count that MLX cannot represent is rejected.
+row count that the selected quantization operator cannot represent is rejected.
 
 Checkpoint-native packed weights remain native. GGUF K-quant, IQ, affine, and
 MXFP4 tensors, or native block-FP8 SafeTensors, are never silently transcoded
@@ -190,5 +188,5 @@ separate because they have different budgets and lifetimes.
 
 Static parameter estimates do not include activations, KV or recurrent state,
 kernel memory, allocator caches, checkpoint mappings, all temporary workspaces,
-or opaque backend-driver allocations. Use MLX allocator statistics and process
-memory observation alongside Eredu reports when sizing an application.
+or opaque backend-driver allocations. Use backend allocator statistics and
+process memory observation alongside Eredu reports when sizing an application.

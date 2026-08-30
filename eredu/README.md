@@ -110,7 +110,7 @@ values.
 - [Speculative decoding and MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md)
 - [Native tool calling](https://github.com/jbg/eredu/blob/main/doc/tool-calling.md)
 - [Parallel execution](https://github.com/jbg/eredu/blob/main/doc/parallel-execution.md)
-- [Platform setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md)
+- [MLX backend and platform setup](https://github.com/jbg/eredu/blob/main/eredu-backend-mlx/doc/README.md)
 - [Eredu CLI](https://github.com/jbg/eredu/blob/main/eredu-cli/README.md)
 
 The minimum supported Rust version is 1.89.

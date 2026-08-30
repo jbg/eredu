@@ -62,5 +62,5 @@ event handles. Distributed schedulers perform their own descriptor and success
 consensus before publishing a result.
 
 Completion events do not physically cancel kernels or committed command
-buffers. Submitted-work cancellation is described in [Cancellation and bounded
-execution](cancellation.md).
+buffers. Eredu's submitted-work cancellation contract is described in
+[Cancellation and bounded execution](../../doc/cancellation.md).

@@ -3800,7 +3800,7 @@ mod selective_state_space_reference_tests {
 /// Implementations must preserve backend-native execution semantics. None of
 /// these operations imply host materialization or synchronization.
 pub trait Tensor: Clone + Debug + Sized + 'static {
-    /// Backend execution context, such as an MLX stream.
+    /// Backend execution context, such as a stream or command queue.
     type Context: ?Sized;
 
     /// Logical tensor shape maintained without materializing tensor values.

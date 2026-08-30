@@ -18,7 +18,8 @@ relevant model, execution, or platform guide here.
   assistants, stream placement, and lookahead behavior.
 - [Cancellation and bounded execution](cancellation.md): scheduler lifecycle and
   the boundary between cooperative cancellation and submitted backend work.
-- [PersonaPlex quantization evaluation](personaplex-evaluation.md): the audio
+- [PersonaPlex quantization
+  evaluation](../eredu-evaluation/doc/personaplex-quantization.md): the audio
   comparison and blinded-listening tools in `eredu-evaluation`.
 - [Evaluation and observation architecture](evaluation.md): portable evidence,
   backend parity, activation inspection, distribution metrics, and performance
@@ -26,23 +27,11 @@ relevant model, execution, or platform guide here.
 
 ## Runtime and backends
 
-- [Language-model backend architecture](backend-architecture.md): the neutral
-  core contract, MLX adapter, ownership boundary, and future backend path.
-- [Platform setup](platforms.md): native prerequisites for Apple, Linux, CUDA,
-  and Windows builds.
-
-## MLX implementation references
-
-These guides describe lower-level primitives used by Eredu's default backend.
-Applications normally encounter them only when integrating directly with MLX
-execution or implementing backend components.
-
-- [Completion events](completion-events.md): graph submission, host observation,
-  and same-device stream dependencies.
-- [Asynchronous device timing](device-timing.md): execution-timeline timestamp
-  boundaries, backend accuracy, and nonblocking profiling.
-- [Host-transfer buffers](host-transfer-buffers.md): storage selection,
-  ownership, and asynchronous copy rules.
+- [Language-model backend architecture](backend-architecture.md): neutral
+  contracts, ownership boundaries, and the path for another backend.
+- [MLX backend documentation](../eredu-backend-mlx/doc/README.md): concrete
+  adapter architecture, native platform setup, and low-level implementation
+  references.
 
 ## Maintainer references
 

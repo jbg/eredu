@@ -2,9 +2,9 @@
 
 `transforms::async_eval_timed(outputs, stream)` submits a lazy MLX graph between
 two stream-ordered timestamp boundaries and returns a `TimedEvaluation`. The
-submission call never waits for the measured work. Applications can continue
-constructing or submitting target and draft graphs, poll with `try_elapsed`,
-and call `elapsed` only when they actually need the duration.
+submission call never waits for the measured work. Callers can continue
+constructing or submitting other graphs, poll with `try_elapsed`, and call
+`elapsed` only when they actually need the duration.
 
 ```rust,ignore
 let context_time = async_eval_timed([&context], &stream)?;
@@ -31,7 +31,7 @@ The output graph must be rooted on exactly the stream passed to
 Dependencies may execute on other streams; waits encoded on the measured stream
 are honored without a host wait. Unrelated work already queued on the measured
 stream is outside the starting boundary. Treatment of dependency waits and idle
-gaps after that boundary is backend-specific:
+gaps after that boundary depends on the selected device backend.
 
 This is execution-timeline time, not Rust graph-construction or completion
 callback wall time. Backend details are:

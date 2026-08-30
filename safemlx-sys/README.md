@@ -22,7 +22,7 @@ packed-quantization support required by Eredu's MLX backend.
 
 Native compilers, CMake, platform libraries, CUDA/cuDNN setup, Apple deployment
 targets, and `mlx.metallib` bundling are covered in [Platform
-setup](https://github.com/jbg/eredu/blob/main/doc/platforms.md).
+setup](https://github.com/jbg/eredu/blob/main/eredu-backend-mlx/doc/platforms.md).
 
 ## Features
 

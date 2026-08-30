@@ -11,6 +11,8 @@ include = [
     "src/**",
     "tests/**",
     "scripts/*.py",
+    "doc/**",
+    "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ]

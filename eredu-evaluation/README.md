@@ -1,8 +1,8 @@
 # eredu-evaluation
 
 `eredu-evaluation` owns backend-independent evidence, comparison, statistics,
-and evaluation drivers. It is not tied to PersonaPlex, realtime execution, or
-MLX.
+and evaluation drivers. It is not tied to one model family, execution mode, or
+backend.
 
 The crate currently provides:
 
@@ -13,7 +13,7 @@ The crate currently provides:
   centered-logit RMSE, top-1 agreement, and top-k overlap;
 - reusable latency and deadline summaries;
 - a text-checkpoint artifact adapter and the `eredu-parity` command used by the
-  CUDA validation workflow; and
+  cross-backend validation workflow; and
 - the PersonaPlex dense-versus-quantized driver and blinded suite tooling.
 
 Concrete backends do not implement evaluation policy. They implement ordinary
@@ -21,4 +21,5 @@ output observation and, where supported, named activation inspection through
 the neutral core contracts. Backend-specific examples may select a device and
 load artifacts, but comparisons and thresholds belong here.
 
-See [the evaluation architecture guide](https://github.com/jbg/eredu/blob/main/doc/evaluation.md).
+See the [evaluation architecture guide](https://github.com/jbg/eredu/blob/main/doc/evaluation.md)
+and the [PersonaPlex quantization evaluation guide](doc/personaplex-quantization.md).

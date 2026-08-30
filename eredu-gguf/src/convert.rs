@@ -69,7 +69,7 @@ pub struct AffineTensor {
     pub biases: Vec<u16>,
 }
 
-/// Logical MLX MXFP4 representation reconstructed from GGML type 39 blocks.
+/// Logical packed MXFP4 representation reconstructed from GGML type 39 blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxFp4Tensor {
     pub weight_shape: Vec<u64>,
@@ -310,8 +310,8 @@ fn normalize_dense(raw: &[u8], dtype: DenseDtype, endian: Endian) -> Vec<u8> {
     out
 }
 
-/// Converts a GGML affine-compatible encoding into MLX's generic packed
-/// weight/scales/biases representation.
+/// Converts a GGML affine-compatible encoding into the canonical packed
+/// weight, scale, and bias representation.
 ///
 /// Native-capable formats normally bypass this expansion. This explicit
 /// conversion remains available to portable backends and differential tests.

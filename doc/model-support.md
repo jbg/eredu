@@ -39,9 +39,9 @@ Structural inspection reads configuration and bounded checkpoint headers,
 validates processor metadata and required media artifacts, and applies the
 requested quantization, residency, and topology preflight. Text inspection
 reconstructs tokenizer, template, and EOS metadata and behaviorally probes
-semantic output and native tools. Neither step creates an MLX stream or loads
-weight payloads. `is_loadable()` is the fail-closed structural result for the
-selected backend options.
+semantic output and native tools. Neither step creates a backend execution
+queue or loads weight payloads. `is_loadable()` is the fail-closed structural
+result for the selected backend options.
 
 ## Family matrix
 
@@ -94,7 +94,7 @@ before materialization. Tokenizer and chat-template selection use checkpoint
 sidecars. Multimodal models additionally require their processor configuration
 and media-tower weights.
 
-Recognized stored formats include dense F32/F16/BF16, MLX affine and MXFP4
+Recognized stored formats include dense F32/F16/BF16, packed affine and MXFP4
 layouts, family-specific packed experts, and native dynamic E4M3 block-FP8 for
 the supported DeepSeek and Qwen hybrid paths. A stored packed format is kept in
 its native representation; it is not silently requantized.

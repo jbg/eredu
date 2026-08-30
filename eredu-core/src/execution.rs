@@ -16,7 +16,7 @@ pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
 /// Stable, extensible identity of an execution backend.
 ///
 /// Core deliberately does not enumerate implementations. Values such as
-/// `mlx`, `iree`, or `slang` are registered by their backend adapters.
+/// Concrete implementations are registered by their backend adapters.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct BackendId(String);

@@ -8,7 +8,7 @@ execution equations.
 Architecture implementations are generic over the traits from `eredu-nn`.
 Concrete backends retain control of tensors, storage, graph construction,
 kernel fusion, streams, caches, and collectives. This keeps every model family
-available without enabling MLX, CUDA, or another native runtime.
+available without enabling a concrete backend or native runtime.
 
 Most applications should use
 [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Backend authors and

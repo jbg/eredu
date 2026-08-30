@@ -34,9 +34,9 @@ Applications should query `speculative_capability` or run model inspection
 instead of assuming support from a family name.
 
 Embedded and external assistants use one neutral scheduling path. Each model
-form provides a `SpeculativeExecutor`; MLX prepares concrete executors, caches,
-sampling state, streams, and completions, then lends them through
-`SpeculativeGenerationVisitor`. The facade-selected
+form provides a `SpeculativeExecutor`; the selected backend prepares concrete
+executors, caches, sampling state, queues, and completions, then lends them
+through `SpeculativeGenerationVisitor`. The facade-selected
 `eredu-runtime::SpeculativeScheduler` owns token or semantic publication,
 request lifecycles, fair action selection, verification resolution, and final
 statistics. Embedded heads do not maintain a second acceptance loop or a
@@ -56,12 +56,11 @@ ordinary generation.
 
 ## Execution placement
 
-Prepared-chat requests do not accept streams. The target retains the execution
-placement selected when it was loaded; an external assistant independently
-retains its load-time placement. The MLX implementation's drafter loading
-requires its tokenizer as an
-explicit portable input; the backend fingerprints it but never discovers or
-parses tokenizer sidecars. The MLX adapter classifies that pair as:
+Prepared-chat requests do not accept backend queues. The target retains the
+execution placement selected when it was loaded; an external assistant
+independently retains its load-time placement. Drafter loading receives the
+tokenizer as an explicit portable input; the backend fingerprints it but never
+discovers or parses tokenizer sidecars. The execution pair is classified as:
 
 | Placement | Behavior |
 | --- | --- |
@@ -111,9 +110,9 @@ Promotion requires:
 
 External Gemma assistants and the portable history-derived sampler satisfy
 these rules. Embedded predictors whose commit advances target-owned state do
-not use same-request optimistic lookahead. Mirostat V2 remains available only
-on the explicit low-level MLX sampling API; it is not part of the portable
-prepared-chat sampling schema.
+not use same-request optimistic lookahead. Mirostat V2 remains available
+through the lower-level backend-generic sampling API; it is not part of the
+portable prepared-chat sampling schema.
 
 `SpeculativeSchedulerOptions::with_lookahead(false)` disables only the optional
 branch; the same drafting, verification, acceptance, cache commit, callback,

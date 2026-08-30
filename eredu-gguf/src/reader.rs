@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// A non-empty selection along one MLX/row-major tensor axis.
+/// A non-empty selection along one logical row-major tensor axis.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorSelection {
     /// Select the half-open range `start..end` on `axis`.
@@ -47,7 +47,7 @@ impl SelectionAlignment {
         self.block_bytes
     }
 
-    /// Required selection boundary multiple on the selected MLX axis.
+    /// Required selection boundary multiple on the selected row-major axis.
     ///
     /// This is the GGUF block length when selecting the fastest physical
     /// dimension and one for every other dimension.
@@ -270,10 +270,10 @@ struct RelativeEncodedSpan {
 
 /// Metadata-only physical read plan for a single-axis tensor selection.
 ///
-/// GGUF dimensions are fastest-moving first while MLX dimensions are
-/// row-major. The plan records that axis translation, validates native block
-/// alignment, describes the exact encoded reads as a compact repeated pattern,
-/// and carries the descriptor expected by conversion after compaction.
+/// GGUF dimensions are fastest-moving first while logical tensor dimensions
+/// are row-major. The plan records that axis translation, validates native
+/// block alignment, describes the exact encoded reads as a compact repeated
+/// pattern, and carries the descriptor expected by conversion after compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorSelectionPlan {
     selection: TensorSelection,
@@ -343,7 +343,7 @@ impl TensorSelectionPlan {
                     return Err(Error::tensor(
                         &tensor.name,
                         format!(
-                            "selection range {start}..{end} exceeds MLX axis {logical_axis} dimension {dimension}"
+                            "selection range {start}..{end} exceeds row-major axis {logical_axis} dimension {dimension}"
                         ),
                     ));
                 }
@@ -353,7 +353,7 @@ impl TensorSelectionPlan {
                     return Err(Error::tensor(
                         &tensor.name,
                         format!(
-                            "selection range {start}..{end} on MLX axis {logical_axis} must align to {selected_axis_multiple}-value GGUF blocks"
+                            "selection range {start}..{end} on row-major axis {logical_axis} must align to {selected_axis_multiple}-value GGUF blocks"
                         ),
                     ));
                 }
@@ -369,7 +369,7 @@ impl TensorSelectionPlan {
                     return Err(Error::tensor(
                         &tensor.name,
                         format!(
-                            "selection indices {indices:?} exceed MLX axis {logical_axis} dimension {dimension}"
+                            "selection indices {indices:?} exceed row-major axis {logical_axis} dimension {dimension}"
                         ),
                     ));
                 }
@@ -380,7 +380,7 @@ impl TensorSelectionPlan {
                         return Err(Error::tensor(
                             &tensor.name,
                             format!(
-                                "selection indices on MLX axis {logical_axis} must contain complete {selected_axis_multiple}-value GGUF blocks"
+                                "selection indices on row-major axis {logical_axis} must contain complete {selected_axis_multiple}-value GGUF blocks"
                             ),
                         ));
                     }
@@ -397,7 +397,7 @@ impl TensorSelectionPlan {
                             return Err(Error::tensor(
                                 &tensor.name,
                                 format!(
-                                    "selection indices on MLX axis {logical_axis} must preserve every complete aligned {selected_axis_multiple}-value GGUF block"
+                                    "selection indices on row-major axis {logical_axis} must preserve every complete aligned {selected_axis_multiple}-value GGUF block"
                                 ),
                             ));
                         }
@@ -540,7 +540,7 @@ impl TensorSelectionPlan {
         &self.selection
     }
 
-    /// Selected MLX/row-major axis.
+    /// Selected logical row-major axis.
     pub fn logical_axis(&self) -> usize {
         self.selection.axis()
     }
