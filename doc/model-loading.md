@@ -105,6 +105,11 @@ Bounded policies transform admitted tensor or row selections rather than
 materializing the entire dense checkpoint. Independent expert caches use the
 same approach for selected expert banks.
 
+Dense quantization requires nonempty matrix geometry. Expert-bank leading
+dimensions are flattened with checked shape arithmetic, so banks whose total
+element count exceeds a 32-bit integer retain their geometry; only a flattened
+row count that MLX cannot represent is rejected.
+
 Checkpoint-native packed weights remain native. GGUF K-quant, IQ, affine, and
 MXFP4 tensors, or native block-FP8 SafeTensors, are never silently transcoded
 into a requested format. An incompatible transformation fails during preflight.

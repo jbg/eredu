@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    num::NonZeroI32,
     path::{Path, PathBuf},
 };
 
@@ -80,6 +81,64 @@ pub struct QuantizedTensor {
     pub biases: Option<Array>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuantizationMatrixGeometry {
+    leading_size: NonZeroI32,
+    input_dims: NonZeroI32,
+}
+
+impl QuantizationMatrixGeometry {
+    fn from_shape(shape: &[i32]) -> Result<Self, Error> {
+        let Some((&input_dims, leading_dims)) = shape.split_last() else {
+            return Err(Error::Quantization(
+                "quantization requires a tensor with at least two dimensions".into(),
+            ));
+        };
+        if leading_dims.is_empty() {
+            return Err(Error::Quantization(
+                "quantization requires a tensor with at least two dimensions".into(),
+            ));
+        }
+        let input_dims = positive_dimension(input_dims).ok_or_else(|| {
+            Error::Quantization(format!(
+                "quantization input dimension must be nonzero, got shape {shape:?}"
+            ))
+        })?;
+        let leading_size = leading_dims.iter().try_fold(1_i32, |size, &dimension| {
+            let dimension = positive_dimension(dimension).ok_or_else(|| {
+                Error::Quantization(format!(
+                    "quantization leading dimensions must be nonzero, got shape {shape:?}"
+                ))
+            })?;
+            size.checked_mul(dimension.get()).ok_or_else(|| {
+                Error::Quantization(format!(
+                    "quantization leading geometry cannot be flattened into an MLX matrix: {shape:?}"
+                ))
+            })
+        })?;
+        let leading_size = NonZeroI32::new(leading_size).ok_or_else(|| {
+            Error::Quantization("quantization leading geometry must be nonzero".into())
+        })?;
+        Ok(Self {
+            leading_size,
+            input_dims,
+        })
+    }
+}
+
+fn positive_dimension(dimension: i32) -> Option<NonZeroI32> {
+    NonZeroI32::new(dimension).filter(|_| dimension > 0)
+}
+
+fn packed_dimension(input_dims: NonZeroI32, bits: NonZeroI32) -> Result<NonZeroI32, Error> {
+    i64::from(input_dims.get())
+        .checked_mul(i64::from(bits.get()))
+        .and_then(|bits| bits.checked_div(32))
+        .and_then(|values| i32::try_from(values).ok())
+        .and_then(NonZeroI32::new)
+        .ok_or_else(|| Error::Quantization("quantized packed dimension overflow".into()))
+}
+
 impl QuantizedTensor {
     /// Associates packed arrays with the architecture-declared identities.
     pub fn into_named_arrays(
@@ -130,34 +189,38 @@ pub fn quantize_tensor(
             weight.dtype()
         )));
     }
-    let input_dims = weight.dim(-1);
-    if input_dims % config.group_size() != 0 || input_dims % 32 != 0 {
+    let geometry = QuantizationMatrixGeometry::from_shape(weight.shape())?;
+    let input_dims = geometry.input_dims;
+    let group_size = positive_dimension(config.group_size())
+        .ok_or_else(|| Error::Quantization("quantization group size must be positive".into()))?;
+    let bits = positive_dimension(config.bits())
+        .ok_or_else(|| Error::Quantization("quantization bit width must be positive".into()))?;
+    if input_dims.get() % group_size.get() != 0 || input_dims.get() % 32 != 0 {
         return Err(Error::Quantization(format!(
             "input dimension {} must be divisible by group_size {} and 32",
-            input_dims,
-            config.group_size()
+            input_dims, group_size
         )));
     }
     let original_shape = weight.shape();
-    let leading_size = weight.size() as i32 / input_dims;
     let matrix = if weight.ndim() == 2 {
         weight.clone()
     } else {
-        weight.reshape(&[leading_size, input_dims], stream)?
+        weight.reshape(&[geometry.leading_size.get(), input_dims.get()], stream)?
     };
-    let arrays =
-        ops::quantize_with_mode(&matrix, config.group_size(), config.bits(), mode, stream)?;
-    let restore_shape = |array: Array, last_dim: i32| -> Result<Array, Error> {
+    let packed_dims = packed_dimension(input_dims, bits)?;
+    let group_dims = NonZeroI32::new(input_dims.get() / group_size.get()).ok_or_else(|| {
+        Error::Quantization("quantization group dimension must be nonzero".into())
+    })?;
+    let arrays = ops::quantize_with_mode(&matrix, group_size.get(), bits.get(), mode, stream)?;
+    let restore_shape = |array: Array, last_dim: NonZeroI32| -> Result<Array, Error> {
         if weight.ndim() == 2 {
             Ok(array)
         } else {
             let mut shape = original_shape[..original_shape.len() - 1].to_vec();
-            shape.push(last_dim);
+            shape.push(last_dim.get());
             Ok(array.reshape(&shape, stream)?)
         }
     };
-    let packed_dims = ops::quantized_packed_dimension(input_dims, config.bits());
-    let group_dims = input_dims / config.group_size();
     Ok(QuantizedTensor {
         weight: restore_shape(arrays.weight, packed_dims)?,
         scales: restore_shape(arrays.scales, group_dims)?,
@@ -518,6 +581,19 @@ mod tests {
             .contains("cannot be produced by dense quantization"));
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn quantize_tensor_rejects_zero_width_without_panicking() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weight = Array::from_slice(&[] as &[f32], &[2, 0]);
+
+        let error =
+            quantize_tensor(&weight, AffineQuantization::default(), context.stream()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("input dimension must be nonzero"));
+    }
+
     #[test]
     fn planned_config_is_written_without_backend_metadata_rewrites() {
         let suffix = SystemTime::now()
@@ -590,6 +666,41 @@ mod tests {
         assert!(AffineQuantization::new(32, 5).is_ok());
         assert!(AffineQuantization::new(32, 6).is_ok());
         assert!(AffineQuantization::new(32, 7).is_err());
+    }
+
+    #[test]
+    fn quantization_geometry_rejects_empty_dimensions() {
+        let error = QuantizationMatrixGeometry::from_shape(&[2, 0]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("input dimension must be nonzero"));
+
+        let error = QuantizationMatrixGeometry::from_shape(&[0, 2, 32]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("leading dimensions must be nonzero"));
+    }
+
+    #[test]
+    fn quantization_geometry_preserves_large_expert_banks() {
+        let shape = [256, 65_536, 65_536];
+        let geometry = QuantizationMatrixGeometry::from_shape(&shape).unwrap();
+
+        assert!(
+            shape
+                .iter()
+                .map(|&dimension| i64::from(dimension))
+                .product::<i64>()
+                > i64::from(i32::MAX)
+        );
+        assert_eq!(geometry.leading_size.get(), 16_777_216);
+        assert_eq!(geometry.input_dims.get(), 65_536);
+    }
+
+    #[test]
+    fn quantization_geometry_rejects_unrepresentable_flattened_rows() {
+        let error = QuantizationMatrixGeometry::from_shape(&[46_341, 46_341, 32]).unwrap_err();
+        assert!(error.to_string().contains("cannot be flattened"));
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
