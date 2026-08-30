@@ -1117,6 +1117,21 @@ fn assert_geometry_identity_error<T>(result: Result<T, Error>, family: &str) {
 }
 
 #[test]
+fn shared_decoder_lifecycle_validates_before_construction() {
+    let mut args = tiny_args();
+    args.num_hidden_layers = -1;
+    let error = llama::LayeredModel::<ReferenceBackend>::new(args, &())
+        .err()
+        .expect("negative decoder layer count must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("num_hidden_layers must be positive, got -1"),
+        "unexpected validation error: {error}"
+    );
+}
+
+#[test]
 fn shared_decoder_parallel_geometry_rejects_cross_config_reuse() {
     let llama_args = tiny_args();
     let llama_layout = llama_parallel_layout(&llama_args, 0..32, 2, 1);

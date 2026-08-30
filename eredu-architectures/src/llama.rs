@@ -15,8 +15,8 @@ pub use config::{
 pub use crate::decoder::{
     cache_layout, cache_layout_with_key_value_heads, create_caches,
     layer_parallel_parameter_groups, state_layout, static_parallel_parameter_groups,
-    validate_caches, Attention, AttentionInput, AttentionProjection, Config, Decoder,
-    ForwardContext, LayeredInput, Mlp, Model, StaticModules, TransformerBlock,
+    validate_caches, Attention, AttentionInput, AttentionProjection, Config, ForwardContext,
+    LayeredInput, Mlp, StaticModules, TransformerBlock,
 };
 
 use eredu_nn::Error;

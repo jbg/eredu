@@ -6523,54 +6523,60 @@ struct ForwardResult {
     prefill: Vec<f32>,
     decode: Vec<f32>,
     retained: Vec<i32>,
-    sliding_calls: usize,
 }
 
 fn forward(model_type: &str, tied: bool) -> Result<ForwardResult, Error> {
     let args =
         qwen::model_args_from_config_value(&config(model_type, tied)).map_err(Error::backend)?;
     let context = NumericContext::default();
-    let mut decoder = qwen::new_routed_decoder::<NumericBackend>(&args, &context)?;
-    let mut head = (!tied)
-        .then(|| {
-            NumericBackend::linear(
-                LinearSpec {
-                    input: args.hidden_size,
-                    output: args.vocab_size,
-                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
-                    bias: None,
-                    format: dense_linear_format(),
-                },
-                &context,
-            )
-        })
-        .transpose()?;
-    let mut caches = qwen::create_caches(&args, |_, window| NumericCache::new(window))?;
+    let architecture = qwen::RoutedLayeredModel::<NumericBackend>::new(args.clone(), &context)?;
+    let units = (0..usize::try_from(args.num_hidden_layers).map_err(Error::backend)?)
+        .map(|layer| architecture.construct_unit(layer, &context))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut state =
+        DeviceState::<NumericBackend, _>::create(qwen::state_layout(&args)?, |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })?;
+    let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
 
     let prefill_tokens = NumericTensor::token_ids(&[1, 4, 2]);
-    let mask = NumericBackend::causal_mask(3, 0, None, &context)?;
-    let hidden = decoder.embed(&prefill_tokens, &context)?;
-    let hidden = decoder.forward_embedded(hidden, Some(&mask), true, &mut caches, &context)?;
-    let prefill_logits = match &mut head {
-        Some(head) => head.forward(&hidden, &context)?,
-        None => decoder.embeddings.as_linear(&hidden, &context)?,
-    };
+    let prefill_logits = runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &prefill_tokens,
+                mask: None,
+            },
+            &mut state,
+            &context,
+        )
+        .map_err(Error::backend)?;
 
     let decode_tokens = NumericTensor::token_ids(&[3]);
-    let hidden = decoder.forward(&decode_tokens, None, &mut caches, &context)?;
-    let decode_logits = match &mut head {
-        Some(head) => head.forward(&hidden, &context)?,
-        None => decoder.embeddings.as_linear(&hidden, &context)?,
-    };
-    let cache_state = caches
-        .iter()
-        .map(|cache| cache.as_ref().unwrap().retained())
-        .collect();
+    let decode_logits = runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &decode_tokens,
+                mask: None,
+            },
+            &mut state,
+            &context,
+        )
+        .map_err(Error::backend)?;
+    let cache_state = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            state
+                .layer(layer)
+                .map_err(Error::backend)?
+                .attention
+                .as_ref()
+                .map(NumericCache::retained)
+                .ok_or_else(|| Error::backend(format!("Qwen layer {layer} has no attention cache")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ForwardResult {
         prefill: prefill_logits.data,
         decode: decode_logits.data,
         retained: cache_state,
-        sliding_calls: context.sliding_attention_calls.get(),
     })
 }
 
@@ -6633,7 +6639,6 @@ fn numerical_qwen2_qwen3_and_moe_prefill_decode_goldens() {
                 vec![4]
             }
         );
-        assert_eq!(result.sliding_calls, usize::from(model_type == "qwen2"));
     }
 }
 
@@ -6642,9 +6647,6 @@ fn dense_qwen_construction_rejects_moe_configuration() {
     let args = qwen::model_args_from_config_value(&config("qwen3_moe", false)).unwrap();
     let context = NumericContext::default();
     let errors = [
-        qwen::new_decoder::<NumericBackend>(&args, &context)
-            .err()
-            .unwrap(),
         qwen::new_block::<NumericBackend>(&args, 0, &context)
             .err()
             .unwrap(),

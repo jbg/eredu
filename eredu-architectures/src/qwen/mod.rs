@@ -39,14 +39,8 @@ use eredu_runtime::{ModelStateIdentity, StateLayout};
 /// Dense Qwen decoder block.
 pub type TransformerBlock<B> = crate::decoder::TransformerBlock<B>;
 
-/// Dense Qwen transformer body.
-pub type Decoder<B> = crate::decoder::Decoder<B>;
-
 /// Qwen decoder block selected dynamically between dense and routed feed-forward policy.
 pub type RoutedTransformerBlock<B> = crate::decoder::TransformerBlock<B, FeedForward<B>>;
-
-/// Qwen transformer body selected dynamically between dense and routed feed-forward policy.
-pub type RoutedDecoder<B> = crate::decoder::Decoder<B, FeedForward<B>>;
 
 fn assemble_block<B: NeuralBackend, F>(
     args: &ModelArgs,
@@ -82,14 +76,6 @@ fn assemble_block<B: NeuralBackend, F>(
             context,
         )?,
     })
-}
-
-/// Builds one unloaded resident Qwen decoder body.
-pub fn new_decoder<B: NeuralBackend>(
-    args: &ModelArgs,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<Decoder<B>, Error> {
-    crate::decoder::Decoder::new_with_factory::<ModelArgs, QwenBlockFactory>(args, context)
 }
 
 /// Statically dispatched dense Qwen block construction policy.
@@ -171,14 +157,6 @@ where
     }
 }
 
-/// Builds a Qwen body for a backend adapter that dynamically admits dense or MoE configuration.
-pub fn new_routed_decoder<B: RoutedNeuralBackend>(
-    args: &ModelArgs,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<RoutedDecoder<B>, Error> {
-    crate::decoder::Decoder::new_with_factory::<ModelArgs, RoutedQwenBlockFactory>(args, context)
-}
-
 /// Builds a Qwen block for a backend adapter that dynamically admits dense or MoE configuration.
 pub fn new_routed_block<B: RoutedNeuralBackend>(
     args: &ModelArgs,
@@ -231,7 +209,6 @@ mod tests {
         args: ModelArgs,
         context: &<B::Tensor as Tensor>::Context,
     ) {
-        let _: Result<Decoder<B>, Error> = new_decoder::<B>(&args, context);
         let _: Result<TransformerBlock<B>, Error> = new_block::<B>(&args, 0, context);
         let _: Result<LayeredModel<B>, Error> = LayeredModel::<B>::new(args, context);
     }

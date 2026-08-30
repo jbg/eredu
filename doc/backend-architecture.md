@@ -1158,6 +1158,10 @@ Core separates logical policy from physical storage:
   authoritative fingerprint covering all construction, equation, state, and
   encoding policy; the shared decoder does not synthesize compatibility
   identities from a partial policy subset.
+- Shared-decoder construction and execution enter through `LayeredModel`,
+  which validates and retains the authoritative architecture configuration.
+  Unit construction, cache policy, and forward execution reuse those retained
+  arguments rather than accepting an independent configuration.
 
 A backend supplies concrete tensors, host buffers, mapped payloads, files,
 workers, native transfer objects, and allocation observations. It applies core
