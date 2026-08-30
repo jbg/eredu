@@ -236,8 +236,8 @@ index 01cc415a00cda8e776d81d1f16b0012953de8f9e..0bb84dd5f559df73ac4bae53671f82d0
 +      const std::vector<size_t>& send_counts,
 +      const std::vector<size_t>& recv_counts,
 +      Stream stream) override {
-+    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
-+    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    auto send = ::mlx::core::distributed::detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = ::mlx::core::distributed::detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
 +    auto* input_ptr = input.data<char>();
 +    auto* output_ptr = output.data<char>();
 +    auto& encoder = cpu::get_command_encoder(stream);
@@ -570,8 +570,8 @@ index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389
 +      const std::vector<size_t>& send_counts,
 +      const std::vector<size_t>& recv_counts,
 +      Stream stream) override {
-+    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
-+    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    auto send = ::mlx::core::distributed::detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = ::mlx::core::distributed::detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
 +    std::vector<int> send_sizes;
 +    std::vector<int> send_offsets;
 +    std::vector<int> recv_sizes;
@@ -665,8 +665,8 @@ index faaee3183a6a99efad02616a6e19924b3e801527..4b31514a7e3f4b32455528d9e31fa9b7
 +      const std::vector<size_t>& send_counts,
 +      const std::vector<size_t>& recv_counts,
 +      Stream stream) override {
-+    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
-+    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    auto send = ::mlx::core::distributed::detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = ::mlx::core::distributed::detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
 +    if (send.sizes[rank_] != recv.sizes[rank_]) {
 +      throw std::invalid_argument(
 +          "[nccl::all_to_all_v] Self send and receive byte counts must match.");
@@ -1045,8 +1045,8 @@ index ea40042844bf6da909b3a37d5457fcc0aa88c041..ee0b17deb5efb83d80fd9d6a68f9046b
 +      const std::vector<size_t>& send_counts,
 +      const std::vector<size_t>& recv_counts,
 +      Stream stream) override {
-+    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
-+    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    auto send = ::mlx::core::distributed::detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = ::mlx::core::distributed::detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
 +    if (send.sizes[rank_] != recv.sizes[rank_]) {
 +      throw std::invalid_argument(
 +          "[ring::all_to_all_v] Self send and receive byte counts must match.");

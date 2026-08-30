@@ -2983,6 +2983,13 @@ trait PipelinePartitionMetadata {
         self.dense_layers().is_some()
     }
 
+    fn persisted_prompt_cache_identity(
+        &self,
+        identity: PromptCacheModelIdentity,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        Ok(identity)
+    }
+
     fn new_cache_layers(
         &self,
         identity: &PromptCacheModelIdentity,
@@ -5941,6 +5948,18 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
 
     fn expert_cache(&self) -> Option<&ExpertCache> {
         self.expert_storage.cache()
+    }
+
+    fn persisted_prompt_cache_identity(
+        &self,
+        identity: PromptCacheModelIdentity,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        // V4 prediction state is allocated transactionally and is not
+        // populated by an ordinary target-only prefill. Persist the target
+        // segment, matching the state actually owned by `PipelineCache::layers`.
+        identity
+            .select_state_segment(eredu_architectures::deepseek::TARGET_STATE_SEGMENT)
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn new_cache_layers(
@@ -9634,6 +9653,7 @@ impl PipelineModel {
         info.concurrent_residency_peak_bytes = info.planned_owned_parameter_bytes;
         info.observed_concurrent_residency_peak_bytes = info.local_parameter_bytes as u64;
         let cache_identity = stage.prompt_cache_model_identity(topology)?;
+        let cache_identity = stage.persisted_prompt_cache_identity(cache_identity)?;
         if cache_identity.global_layer_start != info.global_layer_range.start
             || cache_identity.global_layer_end < info.global_layer_range.end
             || cache_identity.layer_layout.len()
