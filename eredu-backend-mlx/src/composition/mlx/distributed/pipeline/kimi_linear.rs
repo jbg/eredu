@@ -250,7 +250,6 @@ impl PipelineForward for KimiLinearPipelinePartition {
 }
 
 /// An executable, rank-local piece of a pipeline-parallel model.
-
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_kimi_linear(
     spec: &eredu_nn::GatedProductExpertBankSpec,
