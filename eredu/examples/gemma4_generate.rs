@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eredu::{
     api::{
         default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
-        LocalModel,
+        LocalModel, ModelKind,
     },
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
     let (mut model, _) = planned.into_parts();
 
     let prepared = model.prepare_chat(ChatTemplateRequest {
-        messages: vec![gemma4_message(&prompt, model.model_id())],
+        messages: vec![gemma4_message(&prompt, model.model_family())],
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
     })?;
@@ -69,8 +69,8 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
-    if model_type == "gemma4" || model_type == "gemma4_text" {
+fn gemma4_message(prompt: &str, model_family: ModelKind) -> serde_json::Value {
+    if model_family == ModelKind::Gemma4 {
         serde_json::json!({
             "role": "user",
             "content": [{"type": "text", "text": prompt, "content": prompt}],
@@ -110,4 +110,28 @@ fn default_e4b_snapshot() -> Option<PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .find(|path| path.join("config.json").exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma4_message_uses_typed_content_parts() {
+        assert_eq!(
+            gemma4_message("hello", ModelKind::Gemma4),
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "hello", "content": "hello"}],
+            })
+        );
+    }
+
+    #[test]
+    fn non_gemma4_message_uses_plain_content() {
+        assert_eq!(
+            gemma4_message("hello", ModelKind::Llama),
+            serde_json::json!({"role": "user", "content": "hello"})
+        );
+    }
 }
