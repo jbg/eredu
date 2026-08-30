@@ -13,6 +13,7 @@ use eredu_core::{
     Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
     SpeculativeRandomness, SpeculativeSampling, TokenizerCompatibilityProof,
 };
+use eredu_runtime::SpeculativeSampler;
 use safemlx::{
     error::Exception,
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
@@ -23,12 +24,13 @@ use safemlx::{
 
 use crate::{
     backend::error::Error,
-    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::runtime::generation::MlxSamplingBackend,
     backend::ModelLoadOptions,
     composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
     composition::muse_glimmer::{
         load_dflash_gguf, load_dflash_safetensors, MuseGlimmerDFlashModel,
     },
+    MlxTensor,
 };
 
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
@@ -338,7 +340,7 @@ pub struct MlxSpeculativeSampling<S> {
 }
 
 impl<S> MlxSpeculativeSampling<S> {
-    /// Wraps one facade sampling policy for MLX execution.
+    /// Wraps one runtime sampling policy for MLX execution.
     pub const fn new(inner: S) -> Self {
         Self { inner }
     }
@@ -357,7 +359,7 @@ impl<S> MlxSpeculativeSampling<S> {
 
 impl<S> SpeculativeSampling for MlxSpeculativeSampling<S>
 where
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone,
 {
     type Logits = Array;
     type Distribution = Array;
@@ -371,15 +373,15 @@ where
     type Error = Exception;
 
     fn supports_exact_optimistic_promotion(&self) -> bool {
-        self.inner.supports_exact_optimistic_promotion()
+        SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(&self.inner)
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
-        self.inner.grammar_is_complete()
+        SpeculativeSampler::<MlxSamplingBackend>::grammar_is_complete(&mut self.inner)
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
-        self.inner.prefix_is_complete(history)
+        SpeculativeSampler::<MlxSamplingBackend>::prefix_is_complete(&self.inner, history)
     }
 
     fn initialize_randomness<'a>(
@@ -447,12 +449,14 @@ where
     where
         Self: 'a,
     {
-        self.inner.process_logits(
-            logits,
+        SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+            &mut self.inner,
+            &MlxTensor::from_array(logits.clone()),
             temperature,
             history,
             sampling_stream(placement, context),
         )
+        .map(MlxTensor::into_array)
     }
 
     fn sample<'a>(
@@ -467,11 +471,15 @@ where
         Self: 'a,
     {
         let stream = sampling_stream(placement, context);
-        let token = self
-            .inner
-            .sample_processed(distribution, temperature, randomness, stream)?;
-        eval([&token])?;
-        Ok(token.item::<u32>(stream))
+        let token = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
+            &self.inner,
+            &MlxTensor::from_array(distribution.clone()),
+            temperature,
+            randomness,
+            stream,
+        )?;
+        eval([token.as_array()])?;
+        Ok(token.into_array().item::<u32>(stream))
     }
 
     fn decide_proposal<'a>(
@@ -488,10 +496,15 @@ where
     {
         let stream = context.target();
         if temperature == 0.0 {
-            let chosen = self
-                .inner
-                .sample_processed(target, 0.0, None, stream)?
-                .item::<u32>(stream);
+            let chosen = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
+                &self.inner,
+                &MlxTensor::from_array(target.clone()),
+                0.0,
+                None,
+                stream,
+            )?
+            .into_array()
+            .item::<u32>(stream);
             return Ok(if chosen == proposed {
                 ProposalDecision::Accept
             } else {
@@ -523,10 +536,15 @@ where
         } else {
             residual.log(stream)?
         };
-        let replacement = self
-            .inner
-            .sample_processed(&logits, temperature, randomness, stream)?
-            .item::<u32>(stream);
+        let replacement = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
+            &self.inner,
+            &MlxTensor::from_array(logits),
+            temperature,
+            randomness,
+            stream,
+        )?
+        .into_array()
+        .item::<u32>(stream);
         Ok(ProposalDecision::Reject(replacement))
     }
 
@@ -540,8 +558,12 @@ where
     where
         Self: 'a,
     {
-        self.inner
-            .commit_token(distribution, token, sampling_stream(placement, context))
+        SpeculativeSampler::<MlxSamplingBackend>::commit_token(
+            &mut self.inner,
+            &MlxTensor::from_array(distribution.clone()),
+            token,
+            sampling_stream(placement, context),
+        )
     }
 
     fn prepare_verification<'a>(

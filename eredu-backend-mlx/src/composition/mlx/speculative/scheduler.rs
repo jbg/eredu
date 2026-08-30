@@ -28,9 +28,10 @@ use crate::composition::mlx::{
 };
 #[cfg(test)]
 use crate::{
-    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input::{InputPayload, ModelInput},
     composition::mlx::speculative::MlxSpeculativeSampling,
+    MlxTensor,
 };
 #[cfg(test)]
 use eredu_core::generation::{
@@ -39,6 +40,8 @@ use eredu_core::generation::{
 };
 #[cfg(test)]
 use eredu_core::{generation::SpeculativeRequestId, InputModality};
+#[cfg(test)]
+use eredu_runtime::SpeculativeSampler;
 
 /// Component timings accumulated by an architecture-specific speculative backend.
 #[derive(Debug, Clone, Copy, Default)]
@@ -146,7 +149,7 @@ fn plain_runtime<'a, S, F>(
     mut on_token: F,
 ) -> CommittedOutputRuntime<'a, S>
 where
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone,
     F: FnMut(u32) -> Result<(), Exception> + 'a,
 {
     SpeculativeOutputRuntime::new(
@@ -169,7 +172,7 @@ fn semantic_runtime<'a, S, F>(
     on_event: F,
 ) -> CommittedOutputRuntime<'a, S>
 where
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone,
     F: FnMut(SemanticEvent) + 'a,
 {
     SpeculativeOutputRuntime::new(
@@ -217,7 +220,7 @@ pub struct SpeculativeScheduleOutput<S> {
 struct MlxSpeculativeScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
-    S: SpeculativeSampler + Clone + 'a,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     backend: &'a mut B,
     streams: SpeculativeExecutionStreams<'a>,
@@ -229,7 +232,7 @@ where
 impl<'a, B, S> MlxSpeculativeScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
-    S: SpeculativeSampler + Clone + 'a,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     /// Creates a scheduler over shared model parameters and explicit streams.
     pub fn new(
@@ -421,7 +424,7 @@ fn generate<'runtime, B, S>(
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone + 'runtime,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
 {
     generate_with_streams(
         backend,
@@ -446,7 +449,7 @@ fn generate_with_streams<'runtime, B, S>(
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone + 'runtime,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
 {
     generate_tokens(
         backend,
@@ -478,7 +481,7 @@ fn generate_tokens<'runtime, B, S, F>(
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone + 'runtime,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
     F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     validate_input(input)?;
@@ -586,18 +589,18 @@ mod tests {
         committed: Vec<u32>,
     }
 
-    impl SpeculativeSampler for CountingSampler {
+    impl SpeculativeSampler<MlxSamplingBackend> for CountingSampler {
         fn supports_exact_optimistic_promotion(&self) -> bool {
             true
         }
 
         fn process_logits(
             &mut self,
-            logits: &Array,
+            logits: &MlxTensor,
             _temperature: f32,
             history: &[u32],
             _stream: &Stream,
-        ) -> Result<Array, Exception> {
+        ) -> Result<MlxTensor, Exception> {
             self.process_calls += 1;
             self.histories.push(history.to_vec());
             Ok(logits.clone())
@@ -605,7 +608,7 @@ mod tests {
 
         fn commit_token(
             &mut self,
-            _processed_logits: &Array,
+            _processed_logits: &MlxTensor,
             token: u32,
             _stream: &Stream,
         ) -> Result<(), Exception> {
@@ -620,29 +623,39 @@ mod tests {
         complete_after: usize,
     }
 
-    impl SpeculativeSampler for GrammarCountingSampler {
+    impl SpeculativeSampler<MlxSamplingBackend> for GrammarCountingSampler {
         fn supports_exact_optimistic_promotion(&self) -> bool {
             true
         }
 
         fn process_logits(
             &mut self,
-            logits: &Array,
+            logits: &MlxTensor,
             temperature: f32,
             history: &[u32],
             stream: &Stream,
-        ) -> Result<Array, Exception> {
-            self.inner
-                .process_logits(logits, temperature, history, stream)
+        ) -> Result<MlxTensor, Exception> {
+            SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+                &mut self.inner,
+                logits,
+                temperature,
+                history,
+                stream,
+            )
         }
 
         fn commit_token(
             &mut self,
-            processed_logits: &Array,
+            processed_logits: &MlxTensor,
             token: u32,
             stream: &Stream,
         ) -> Result<(), Exception> {
-            self.inner.commit_token(processed_logits, token, stream)
+            SpeculativeSampler::<MlxSamplingBackend>::commit_token(
+                &mut self.inner,
+                processed_logits,
+                token,
+                stream,
+            )
         }
 
         fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
@@ -695,19 +708,22 @@ mod tests {
     #[derive(Clone, Copy, Default)]
     struct UniformSampler;
 
-    impl SpeculativeSampler for UniformSampler {
+    impl SpeculativeSampler<MlxSamplingBackend> for UniformSampler {
         fn supports_exact_optimistic_promotion(&self) -> bool {
             true
         }
 
         fn process_logits(
             &mut self,
-            logits: &Array,
+            logits: &MlxTensor,
             _temperature: f32,
             _history: &[u32],
             stream: &Stream,
-        ) -> Result<Array, Exception> {
-            logits.multiply(Array::from_f32(0.0), stream)
+        ) -> Result<MlxTensor, Exception> {
+            logits
+                .as_array()
+                .multiply(Array::from_f32(0.0), stream)
+                .map(MlxTensor::from_array)
         }
     }
 
@@ -1218,13 +1234,14 @@ mod tests {
         for expected in [1u32, 2, 0] {
             let mut values = [0.0f32; 3];
             values[expected as usize] = 10.0;
-            let logits = Array::from_slice(&values, &[1, 3]);
+            let logits = MlxTensor::from_array(Array::from_slice(&values, &[1, 3]));
             let processed = ordinary
                 .process_logits(&logits, 0.0, &ordinary_tokens, stream)
                 .unwrap();
             let chosen = ordinary
                 .sample_processed(&processed, 0.0, None, stream)
                 .unwrap()
+                .into_array()
                 .item::<u32>(stream);
             ordinary.commit_token(&processed, chosen, stream).unwrap();
             ordinary_tokens.push(chosen);
@@ -2894,8 +2911,16 @@ mod tests {
 
     #[test]
     fn adaptive_sampler_does_not_claim_exact_optimistic_promotion() {
-        assert!(GenerationSampler::new().supports_exact_optimistic_promotion());
-        assert!(!MirostatV2Sampler::default().supports_exact_optimistic_promotion());
+        assert!(
+            SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
+                &GenerationSampler::new()
+            )
+        );
+        assert!(
+            !SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
+                &MirostatV2Sampler::default()
+            )
+        );
     }
 
     #[test]

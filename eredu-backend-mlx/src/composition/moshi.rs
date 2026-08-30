@@ -35,7 +35,7 @@ use crate::backend::{
                 shard_layer_bindings,
             },
         },
-        generation::sampler::MlxSamplingBackend,
+        generation::MlxSamplingBackend,
     },
     ModelLoadOptions,
 };

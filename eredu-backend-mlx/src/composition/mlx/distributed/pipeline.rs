@@ -6250,7 +6250,7 @@ impl PipelineModel {
     /// point-to-point activation traffic.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_and_synchronize_token<
-        S: crate::backend::runtime::generation::sampler::Sampler,
+        S: eredu_runtime::Sampler<crate::backend::runtime::generation::MlxSamplingBackend>,
     >(
         &self,
         logits: Option<&Array>,
@@ -6295,8 +6295,16 @@ impl PipelineModel {
             } else {
                 logits.clone()
             };
-            vec![sampler
-                .sample(&logits, temperature, prng_state, execution.stream())?
+            vec![eredu_runtime::Sampler::<
+                crate::backend::runtime::generation::MlxSamplingBackend,
+            >::sample(
+                sampler,
+                &crate::MlxTensor::from_array(logits),
+                temperature,
+                prng_state,
+                execution.stream(),
+            )?
+                .into_array()
                 .reshape(&[batch_size, 1], execution.stream())?
                 .as_dtype(Dtype::Uint32, execution.stream())?]
         } else {
@@ -6672,7 +6680,9 @@ impl PipelineModel {
 #[cfg(test)]
 impl PipelineModel {
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: crate::backend::runtime::generation::sampler::Sampler>(
+    pub fn sample_and_synchronize<
+        S: eredu_runtime::Sampler<crate::backend::runtime::generation::MlxSamplingBackend>,
+    >(
         &self,
         logits: Option<&Array>,
         step: PipelineStep,

@@ -6,7 +6,7 @@ use eredu_backend_mlx::backend::{
         cache::state::MlxKeyValueState,
         checkpoint::quantization::{CheckpointQuantizationOptions, CheckpointQuantizationReport},
         checkpoint::store::CheckpointMaterializationError,
-        generation::sampler::{MlxSamplingBackend, Sampler as BackendSampler, SpeculativeSampler},
+        generation::MlxSamplingBackend,
     },
     topology::{DeviceAssignment, MlxParallelContext},
     MlxBackend, MlxCompletion, MlxModel, MlxModelConfig,
@@ -29,10 +29,8 @@ fn reusable_backend_modules_are_rooted_directly_under_backend() {
 }
 
 #[test]
-fn reusable_sampling_api_is_rooted_under_backend() {
+fn reusable_sampling_primitives_are_rooted_under_backend() {
     assert_public_type::<MlxSamplingBackend>();
-    assert_public_type::<dyn BackendSampler>();
-    assert_public_type::<dyn SpeculativeSampler>();
 }
 
 #[test]

@@ -35,16 +35,18 @@ let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?
 Reusable low-level mechanics are rooted directly under
 `eredu_backend_mlx::backend`, including neural and runtime facilities.
 Backend-generic sampling policies come from `eredu-runtime`, while
-`backend::runtime::generation::sampler` provides the MLX realization and its
-raw-array adapters.
+`backend::runtime::generation::MlxSamplingBackend` implements the native
+sampling primitives those policies require. Runtime `Sampler` and
+`SpeculativeSampler` implementations bind to it through `MlxTensor`; the MLX
+backend does not define parallel policy traits.
 
 The `native` module is a deliberate escape hatch for devices, device-bound
 streams, allocator state, random state, low-level arrays, and platform setup
 needed by concrete MLX tooling. It supplies the native types required by raw
-sampling signatures alongside composition-owned model sessions, inputs,
-outputs, inspection policy, and realtime types. Backend configuration, errors,
-topology, prepared models, and reusable runtime facilities are organized under
-`backend`. Backend-generic sampling APIs exchange `MlxTensor` values.
+operations alongside composition-owned model sessions, inputs, outputs,
+inspection policy, and realtime types. Backend configuration, errors, topology,
+prepared models, and reusable runtime facilities are organized under `backend`.
+Backend-generic sampling APIs exchange `MlxTensor` values.
 
 ## Features
 

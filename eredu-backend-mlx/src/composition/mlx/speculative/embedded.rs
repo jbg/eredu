@@ -1,12 +1,12 @@
 //! MLX executor adapter for checkpoint-embedded prediction heads.
 
 use eredu_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
-use eredu_runtime::DraftStateTransaction;
+use eredu_runtime::{DraftStateTransaction, SpeculativeSampler};
 use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
     backend::error::Error,
-    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input::ModelInput,
     composition::mlx::{
         speculative::{
@@ -43,40 +43,51 @@ impl<'a, S> DistributedEmbeddedMtpSampler<'a, S> {
     }
 }
 
-impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler<'_, S> {
+impl<S: SpeculativeSampler<MlxSamplingBackend>> SpeculativeSampler<MlxSamplingBackend>
+    for DistributedEmbeddedMtpSampler<'_, S>
+{
     fn supports_exact_optimistic_promotion(&self) -> bool {
         false
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
-        self.sampler.grammar_is_complete()
+        SpeculativeSampler::<MlxSamplingBackend>::grammar_is_complete(&mut self.sampler)
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
-        self.sampler.prefix_is_complete(history)
+        SpeculativeSampler::<MlxSamplingBackend>::prefix_is_complete(&self.sampler, history)
     }
 
     fn process_logits(
         &mut self,
-        logits: &Array,
+        logits: &MlxTensor,
         temperature: f32,
         history: &[u32],
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.sampler
-            .process_logits(logits, temperature, history, stream)
+    ) -> Result<MlxTensor, Exception> {
+        SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+            &mut self.sampler,
+            logits,
+            temperature,
+            history,
+            stream,
+        )
     }
 
     fn sample_processed(
         &self,
-        logits: &Array,
+        logits: &MlxTensor,
         temperature: f32,
         prng_state: Option<&mut safemlx::random::RandomState>,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let sampled = self
-            .sampler
-            .sample_processed(logits, temperature, prng_state, stream)?;
+    ) -> Result<MlxTensor, Exception> {
+        let sampled = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
+            &self.sampler,
+            logits,
+            temperature,
+            prng_state,
+            stream,
+        )?;
         // Pipeline MTP publishes identical complete logits to every rank before
         // sampling. The speculative scheduler also advances the same sampler
         // and PRNG state on every rank, so sampling locally is the exact
@@ -88,11 +99,16 @@ impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler
 
     fn commit_token(
         &mut self,
-        processed_logits: &Array,
+        processed_logits: &MlxTensor,
         token: u32,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        self.sampler.commit_token(processed_logits, token, stream)
+        SpeculativeSampler::<MlxSamplingBackend>::commit_token(
+            &mut self.sampler,
+            processed_logits,
+            token,
+            stream,
+        )
     }
 }
 

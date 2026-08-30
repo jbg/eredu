@@ -6,7 +6,7 @@
 
 use eredu_runtime::{
     LocalModelLayout, LocalTensorLayout, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, ShardingPolicy, TensorPlacement,
+    ParameterRole, Sampler, ShardingPolicy, TensorPlacement,
 };
 
 use safemlx::{
@@ -18,8 +18,9 @@ use safemlx::{
 use crate::{
     backend::error::Error,
     backend::runtime::distributed::{completion::synchronize_outputs, topology::PlacementPlan},
-    backend::runtime::generation::sampler::Sampler,
+    backend::runtime::generation::MlxSamplingBackend,
     backend::MlxParallelContext,
+    MlxTensor,
 };
 use eredu_core::balanced_contiguous_range;
 
@@ -38,8 +39,8 @@ pub struct SynchronizedToken {
 /// optional value lets pipeline stages avoid retaining full logits while TP and
 /// EP callers may pass their identical complete logits on every rank.
 #[allow(clippy::too_many_arguments)]
-pub fn sample_and_synchronize<S: Sampler>(
-    logits: Option<&Array>,
+pub fn sample_and_synchronize<S: Sampler<MlxSamplingBackend>>(
+    logits: Option<&MlxTensor>,
     batch_size: i32,
     sampler: &mut S,
     temperature: f32,
@@ -66,19 +67,19 @@ pub fn sample_and_synchronize<S: Sampler>(
                 "sampling rank {sampling_rank} requires complete logits"
             ))
         })?;
-        if logits.dim(0) != batch_size {
+        if logits.as_array().dim(0) != batch_size {
             return Err(Error::Parallel(format!(
                 "sampling logits batch {} does not match declared batch {batch_size}",
-                logits.dim(0)
+                logits.as_array().dim(0)
             )));
         }
-        let logits = if logits.ndim() == 3 {
-            logits.try_index_device((.., -1, ..), stream)?
+        let logits = if logits.as_array().ndim() == 3 {
+            MlxTensor::from_array(logits.as_array().try_index_device((.., -1, ..), stream)?)
         } else {
             logits.clone()
         };
-        sampler
-            .sample(&logits, temperature, prng_state, stream)?
+        Sampler::<MlxSamplingBackend>::sample(sampler, &logits, temperature, prng_state, stream)?
+            .into_array()
             .reshape(&[batch_size, 1], stream)?
             .as_dtype(Dtype::Uint32, stream)?
     } else {

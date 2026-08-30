@@ -40,7 +40,7 @@ use crate::{
     backend::runtime::{
         cache::state::{MlxKeyValueState, MlxKeyValueTransactionBranch},
         checkpoint::artifact::LoadedArtifactIdentity,
-        generation::sampler::MlxSamplingBackend,
+        generation::MlxSamplingBackend,
     },
     backend::ModelLoadOptions,
     backend::{

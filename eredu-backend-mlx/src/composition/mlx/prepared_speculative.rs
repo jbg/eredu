@@ -8,7 +8,7 @@ use eredu_core::{
     SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
     SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
 };
-use eredu_runtime::{ConstrainedSampler, GenerationSampler};
+use eredu_runtime::{ConstrainedSampler, GenerationSampler, SpeculativeSampler};
 use safemlx::{error::Exception, Array};
 
 use super::{
@@ -22,7 +22,7 @@ use super::{
     Executable, MlxBackend, MlxModelInput,
 };
 use crate::backend::error::Error;
-use crate::backend::runtime::generation::sampler::SpeculativeSampler;
+use crate::backend::runtime::generation::MlxSamplingBackend;
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
@@ -73,7 +73,7 @@ fn run_speculative_batch<'a, B, C, S>(
 where
     B: MlxSpeculativeRuntime<'a>,
     C: SpeculativeTokenFilterController + 'a,
-    S: SpeculativeSampler + Clone + 'a,
+    S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     if caches.len() != lanes.len() {
         return Err(Exception::custom(format!(

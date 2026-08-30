@@ -5,6 +5,7 @@ use eredu_core::{
     BackendError, CollectiveScope, DistributedBackend, DistributedCapabilities, DistributedSession,
     DistributedSessionDescriptor, ParallelAxis, ParallelCoordinates, Submission, ValueDescriptor,
 };
+use eredu_runtime::Sampler;
 use safemlx::{
     distributed::{self, Group},
     Array, Dtype, Stream,
@@ -18,7 +19,7 @@ use crate::{
             parallel::{sample_and_synchronize, ParallelExecutionContext, SynchronizedToken},
             topology::ParallelCommunicators,
         },
-        generation::sampler::Sampler,
+        generation::MlxSamplingBackend,
     },
 };
 
@@ -211,9 +212,9 @@ impl<'a> MlxDistributedSession<'a> {
 
     /// Samples on the canonical final-stage rank and synchronizes generation globally.
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: Sampler>(
+    pub fn sample_and_synchronize<S: Sampler<MlxSamplingBackend>>(
         &self,
-        logits: Option<&Array>,
+        logits: Option<&MlxTensor>,
         batch_size: i32,
         sampler: &mut S,
         temperature: f32,
@@ -240,9 +241,9 @@ impl<'a> MlxDistributedSession<'a> {
 
     /// Samples on an explicitly selected world rank and synchronizes globally.
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize_on_rank<S: Sampler>(
+    pub fn sample_and_synchronize_on_rank<S: Sampler<MlxSamplingBackend>>(
         &self,
-        logits: Option<&Array>,
+        logits: Option<&MlxTensor>,
         batch_size: i32,
         sampler: &mut S,
         temperature: f32,

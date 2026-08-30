@@ -8,7 +8,8 @@ use eredu_core::{
 };
 use eredu_nn::Tensor as _;
 use eredu_runtime::{
-    ActivationObserver as RuntimeActivationObserver, GenerationSampler, MirostatV2Sampler,
+    ActivationObserver as RuntimeActivationObserver, GenerationSampler, MirostatV2Sampler, Sampler,
+    SamplingBackend,
 };
 use ref_cast::RefCast;
 use safemlx::{
@@ -21,7 +22,7 @@ use std::path::Path;
 
 use crate::{
     backend::nn::tensor::{TokenValidationBatch, TokenValidationScope},
-    backend::runtime::generation::sampler::Sampler,
+    backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input,
     backend::{error::Error, MlxModelKind},
     composition::mlx::distributed::pipeline::{
@@ -325,14 +326,18 @@ enum MlxTextSampler {
 impl MlxTextSampler {
     fn sample(
         &mut self,
-        logits: &Array,
+        logits: &MlxTensor,
         temperature: f32,
         random: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
+    ) -> Result<MlxTensor, Exception> {
         match self {
-            Self::Standard(sampler) => sampler.sample(logits, temperature, random, stream),
-            Self::MirostatV2(sampler) => sampler.sample(logits, temperature, random, stream),
+            Self::Standard(sampler) => {
+                Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
+            }
+            Self::MirostatV2(sampler) => {
+                Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
+            }
         }
     }
 }
@@ -342,19 +347,15 @@ struct FilteredTextSampler<'a> {
     filter: &'a TokenFilter,
 }
 
-impl Sampler for FilteredTextSampler<'_> {
+impl Sampler<MlxSamplingBackend> for FilteredTextSampler<'_> {
     fn sample(
         &mut self,
-        logits: &Array,
+        logits: &MlxTensor,
         temperature: f32,
         random: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let logits = crate::backend::runtime::generation::sampler::apply_token_filter(
-            logits,
-            self.filter,
-            stream,
-        )?;
+    ) -> Result<MlxTensor, Exception> {
+        let logits = MlxSamplingBackend::apply_token_filter(logits, self.filter, stream)?;
         self.sampler.sample(&logits, temperature, random, stream)
     }
 }
@@ -867,7 +868,7 @@ impl<'a> MlxModelSession<'a> {
     /// Samples on the canonical rank and synchronizes the result for this
     /// distributed model session.
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: Sampler>(
+    pub fn sample_and_synchronize<S: Sampler<MlxSamplingBackend>>(
         &self,
         logits: Option<&MlxTensor>,
         batch_size: i32,
@@ -879,10 +880,9 @@ impl<'a> MlxModelSession<'a> {
         let distributed = self.distributed.as_ref().ok_or_else(|| {
             Error::Parallel("sampling synchronization requires a distributed model session".into())
         })?;
-        let logits = logits.map(MlxTensor::as_array);
         match &self.inner {
             MlxSessionKind::Pipeline(model, _) => model.sample_and_synchronize_token(
-                logits,
+                logits.map(MlxTensor::as_array),
                 batch_size,
                 sampler,
                 temperature,
@@ -1574,7 +1574,14 @@ fn sample_text_submission(
             .output
             .logits()
             .ok_or_else(|| Error::Parallel("local text generation requires model logits".into()))?;
-        sampler.sample(logits.as_array(), *temperature, prng.as_mut(), &stream)?
+        Sampler::<MlxSamplingBackend>::sample(
+            &mut sampler,
+            logits,
+            *temperature,
+            prng.as_mut(),
+            &stream,
+        )?
+        .into_array()
     };
     let sampled = MlxCompletion::submission(token)?;
     Ok(Submission {

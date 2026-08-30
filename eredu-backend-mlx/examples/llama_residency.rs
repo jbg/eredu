@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Instant};
 use clap::Parser;
 use eredu_backend_mlx::backend::{
     config::ModelLoadOptions,
-    runtime::{generation::sampler::Sampler, media::input::ModelInput},
+    runtime::{generation::MlxSamplingBackend, media::input::ModelInput},
 };
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 use eredu_core::{
@@ -14,7 +14,7 @@ use eredu_core::{
     BackendProvider as _, BackendSession as _,
 };
 use eredu_runtime::{
-    DefaultSampler, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
+    DefaultSampler, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, Sampler, WeightResidency,
 };
 
 #[derive(Debug, Parser)]
@@ -162,7 +162,9 @@ fn main() -> anyhow::Result<()> {
     let decode_started = Instant::now();
     let mut sampler = DefaultSampler;
     for _ in 0..args.decode_tokens {
-        let token = sampler.sample(logits.as_array(), 0.0, None, stream)?;
+        let token =
+            Sampler::<MlxSamplingBackend>::sample(&mut sampler, &logits, 0.0, None, stream)?
+                .into_array();
         stream.synchronize()?;
         let token = token.reshape(&[1, 1], stream)?;
         logits = session

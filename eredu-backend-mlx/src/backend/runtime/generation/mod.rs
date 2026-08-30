@@ -1,6 +1,5 @@
-//! MLX token-sampling implementations.
+//! MLX token-sampling primitives.
 
 mod backend;
 
-/// Token sampling policies over MLX arrays.
-pub mod sampler;
+pub use backend::MlxSamplingBackend;

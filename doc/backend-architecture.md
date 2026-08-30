@@ -96,11 +96,14 @@ records facade operation context and a diagnostic message without exporting
 native error variants. Portable execution plans remain the application surface
 for device and topology selection.
 
-Backend-generic sampling policy lives in `eredu-runtime`; concrete sampling,
-cache-state, session, completion, and model-input types stay in the selected
-backend. Facade examples construct local sessions through `eredu::api`, while
-backend-author probes that manipulate native resources live with their
-implementation and depend downward on neutral contracts.
+Backend-generic sampling policy lives in `eredu-runtime`. Concrete backends
+implement `SamplingBackend` primitives and bind the runtime-owned `Sampler` and
+`SpeculativeSampler` traits directly; they do not publish backend-local policy
+traits or compatibility re-exports. Concrete cache-state, session, completion,
+and model-input types stay in the selected backend. Facade examples construct
+local sessions through `eredu::api`, while backend-author probes that
+manipulate native resources live with their implementation and depend downward
+on neutral contracts.
 All selected sessions expose completed outputs through
 `BackendSession::observe_output`; backends retain native tensors internally and
 materialize portable `ObservationSet` records only when explicitly requested.
