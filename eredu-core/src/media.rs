@@ -236,7 +236,7 @@ pub enum Media {
 /// One ordered portable model-input segment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MultimodalSegment {
-    /// Text encoded by the tokenizer attached to `LoadedModel`.
+    /// Text to encode with [`MultimodalRequest::tokenize`].
     Text(String),
     /// Text already represented as tokenizer vocabulary IDs.
     TokenIds(Vec<u32>),
