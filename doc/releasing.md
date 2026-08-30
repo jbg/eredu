@@ -36,11 +36,12 @@ This catches:
 - new publishable crates or dependency changes that are missing from the
   declared order.
 
-The release-package CI job runs this validation on Ubuntu with the CPU MLX
-prerequisites. Archive unit tests are compiled and doctests run without default
-features, while Cargo's normal package verification still compiles each crate's
-default packaged targets. Packaging does not need an Apple or NVIDIA runner:
-target-native Metal and CUDA coverage remains in the platform workflows.
+The release-package CI job runs this validation on Ubuntu with both the minimum
+supported Rust version and stable, using the CPU MLX prerequisites. Archive unit
+tests are compiled and doctests run without default features, while Cargo's
+normal package verification still compiles each crate's default packaged
+targets. Packaging does not need an Apple or NVIDIA runner: target-native Metal
+and CUDA coverage remains in the platform workflows.
 
 The manually dispatched `Native release gate` workflow must pass before
 publication. Its macOS job first proves that native MLX execution is available;

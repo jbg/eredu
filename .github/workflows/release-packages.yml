@@ -25,11 +25,18 @@ permissions:
 
 jobs:
   package:
-    name: Package publishable crates
+    name: Package publishable crates (${{ matrix.rust }})
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.89.0", stable]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - if: matrix.rust == '1.89.0'
+        uses: dtolnay/rust-toolchain@1.89.0
+      - if: matrix.rust == 'stable'
+        uses: dtolnay/rust-toolchain@stable
       - name: Install native CPU build dependencies
         run: |
           sudo apt-get update
