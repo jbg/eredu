@@ -4,7 +4,10 @@ use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, RecipeCatalog},
     schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan},
     store::{StoreError, TensorMetadata},
-    validation::{CatalogTensorMetadata, SafetensorsCatalog, StrictLoadFailure},
+    validation::{
+        resolve_safetensors_plan, CatalogTensorMetadata, CheckpointValidation,
+        ResolvedCheckpointPlan, SafetensorsCatalog, StrictLoadFailure,
+    },
     StoredDtype,
 };
 use eredu_core::{
@@ -492,11 +495,11 @@ fn resolve_gguf_architecture(
         .map_err(ArtifactError::InvalidArtifact)?;
     validation
         .into_loader_result()
-        .map_err(gguf_validation_error)?;
+        .map_err(checkpoint_validation_error)?;
     Ok(plan)
 }
 
-fn gguf_validation_error(failure: StrictLoadFailure) -> ArtifactError {
+fn checkpoint_validation_error(failure: StrictLoadFailure) -> ArtifactError {
     let mut details = failure
         .missing
         .into_iter()
@@ -504,6 +507,15 @@ fn gguf_validation_error(failure: StrictLoadFailure) -> ArtifactError {
         .collect::<Vec<_>>();
     details.extend(failure.unused);
     ArtifactError::InvalidArtifact(details.join("; "))
+}
+
+fn invalid_checkpoint_validation(validation: CheckpointValidation) -> ArtifactError {
+    match validation.into_loader_result() {
+        Err(failure) => checkpoint_validation_error(failure),
+        Ok(()) => ArtifactError::InvalidArtifact(
+            "checkpoint layout resolution failed without validation diagnostics".into(),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -631,6 +643,7 @@ pub struct SafetensorsArchitecturePlan {
     kind: ModelKind,
     model: SafetensorsModelConfig,
     checkpoint: SafetensorsCheckpointPlan,
+    checkpoint_resolution: Option<ResolvedCheckpointPlan>,
     moshi_recipes: Option<AtomicRecipeSet>,
 }
 
@@ -729,25 +742,34 @@ impl SafetensorsArchitecturePlan {
         &self.checkpoint
     }
 
+    /// Exact physical layout selected and proven during catalog admission.
+    ///
+    /// This is absent on a configuration-only plan that has not yet been
+    /// finalized against an artifact catalog.
+    pub const fn checkpoint_resolution(&self) -> Option<&ResolvedCheckpointPlan> {
+        self.checkpoint_resolution.as_ref()
+    }
+
     /// Canonical Moshi binding recipes proven against the admitted catalog.
     pub const fn moshi_recipes(&self) -> Option<&AtomicRecipeSet> {
         self.moshi_recipes.as_ref()
     }
 
     pub(crate) fn admit_catalog(&mut self, tensors: &TensorCatalog) -> Result<(), ArtifactError> {
-        let SafetensorsModelConfig::Moshi(config) = &self.model else {
-            return Ok(());
-        };
         let catalog = PortableSafetensorsCatalog(tensors);
-        self.moshi_recipes = Some(
-            crate::moshi::admit_checkpoint(config, &self.checkpoint, &catalog).map_err(
+        self.checkpoint_resolution = Some(
+            resolve_safetensors_plan(&catalog, &self.checkpoint)
+                .map_err(invalid_checkpoint_validation)?,
+        );
+        if let SafetensorsModelConfig::Moshi(config) = &self.model {
+            self.moshi_recipes = Some(crate::moshi::canonical_recipes(config, &catalog).map_err(
                 |error| {
                     ArtifactError::InvalidArchitecturePlan(format!(
-                        "invalid Moshi checkpoint preparation: {error}"
+                        "invalid Moshi checkpoint recipes: {error}"
                     ))
                 },
-            )?,
-        );
+            )?);
+        }
         Ok(())
     }
 }
@@ -928,6 +950,7 @@ fn resolve_safetensors_architecture(
         kind,
         model,
         checkpoint,
+        checkpoint_resolution: None,
         moshi_recipes: None,
     })
 }
@@ -970,8 +993,55 @@ pub fn inspect_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_checkpoint::schema::{SafetensorsTensorConstraint, StoredDtypeConstraint};
     use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
     use std::{collections::BTreeMap, fs::File};
+
+    fn test_catalog(plan: &SafetensorsCheckpointPlan) -> TensorCatalog {
+        let constraints = plan.common_tensors.iter().chain(
+            plan.layout_groups
+                .iter()
+                .filter_map(|group| group.variants.first())
+                .flat_map(|variant| variant.tensors.iter()),
+        );
+        TensorCatalog::new(constraints.map(test_descriptor)).unwrap()
+    }
+
+    fn test_descriptor(
+        tensor: &SafetensorsTensorConstraint,
+    ) -> eredu_core::checkpoint::TensorDescriptor {
+        let stored = match &tensor.dtype {
+            StoredDtypeConstraint::Exact(dtype) => dtype,
+            StoredDtypeConstraint::OneOf(dtypes) => dtypes.first().unwrap(),
+            StoredDtypeConstraint::Floating => &StoredDtype::F32,
+        };
+        eredu_core::checkpoint::TensorDescriptor {
+            name: tensor.key.clone(),
+            shape: tensor.shape.clone(),
+            dtype: match stored {
+                StoredDtype::Bool => TensorDtype::Bool,
+                StoredDtype::U8 => TensorDtype::U8,
+                StoredDtype::I8 => TensorDtype::I8,
+                StoredDtype::I16 => TensorDtype::I16,
+                StoredDtype::U16 => TensorDtype::U16,
+                StoredDtype::F16 => TensorDtype::F16,
+                StoredDtype::BF16 => TensorDtype::Bf16,
+                StoredDtype::I32 => TensorDtype::I32,
+                StoredDtype::U32 => TensorDtype::U32,
+                StoredDtype::F32 => TensorDtype::F32,
+                StoredDtype::F64 => TensorDtype::F64,
+                StoredDtype::I64 => TensorDtype::I64,
+                StoredDtype::U64 => TensorDtype::U64,
+                StoredDtype::C64 => TensorDtype::Complex64,
+                StoredDtype::F8E4M3 => TensorDtype::Encoded("F8_E4M3".into()),
+                StoredDtype::F4 => TensorDtype::Encoded("F4".into()),
+                StoredDtype::F8E8M0 => TensorDtype::Encoded("F8_E8M0".into()),
+                StoredDtype::F8E5M2 => TensorDtype::Encoded("F8_E5M2".into()),
+                StoredDtype::Other(name) => TensorDtype::Encoded(name.clone()),
+            },
+            storage: None,
+        }
+    }
 
     fn qwen_vl_config() -> Value {
         serde_json::json!({
@@ -1075,12 +1145,18 @@ mod tests {
             .resolve_safetensors(&qwen_vl_config())
             .unwrap()
             .into_parts();
+        let tensors = test_catalog(
+            resolved_plan
+                .safetensors_architecture()
+                .unwrap()
+                .checkpoint(),
+        );
         let plan = MODEL_CONFIGURATIONS
             .artifact_plan(
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
-                &TensorCatalog::new([]).unwrap(),
+                &tensors,
                 None,
                 resolved_plan,
             )
@@ -1097,12 +1173,18 @@ mod tests {
             .resolve_safetensors(&qwen_vl_config())
             .unwrap()
             .into_parts();
+        let next_tensors = test_catalog(
+            next_resolved_plan
+                .safetensors_architecture()
+                .unwrap()
+                .checkpoint(),
+        );
         let next = MODEL_CONFIGURATIONS
             .artifact_plan(
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &next_configuration,
-                &TensorCatalog::new([]).unwrap(),
+                &next_tensors,
                 None,
                 next_resolved_plan,
             )
@@ -1156,6 +1238,67 @@ mod tests {
         assert!(matches!(
             MODEL_CONFIGURATIONS.resolve_safetensors(&malformed),
             Err(ArtifactError::InvalidArtifact(_))
+        ));
+    }
+
+    #[test]
+    fn portable_safetensors_admission_validates_non_moshi_checkpoint_schema() {
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "intermediate_size": 8,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 8,
+            "max_position_embeddings": 32,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "mlp_bias": false
+        });
+        let (configuration, resolved_plan) = MODEL_CONFIGURATIONS
+            .resolve_safetensors(&config)
+            .unwrap()
+            .into_parts();
+        let catalog = test_catalog(
+            resolved_plan
+                .safetensors_architecture()
+                .unwrap()
+                .checkpoint(),
+        );
+        let admitted = MODEL_CONFIGURATIONS
+            .artifact_plan(
+                Path::new("fixture"),
+                ArtifactFormat::SafeTensors,
+                &configuration,
+                &catalog,
+                None,
+                resolved_plan.clone(),
+            )
+            .unwrap();
+        assert!(admitted
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint_resolution()
+            .is_some());
+
+        let error = MODEL_CONFIGURATIONS
+            .artifact_plan(
+                Path::new("fixture"),
+                ArtifactFormat::SafeTensors,
+                &configuration,
+                &TensorCatalog::new([]).unwrap(),
+                None,
+                resolved_plan,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidArtifact(detail)
+                if detail.contains("model.embed_tokens.weight")
         ));
     }
 

@@ -39,15 +39,14 @@ impl PreparedSafetensorsArtifact {
         max_mapped_shards: usize,
     ) -> Result<Self, Error> {
         let store = open_catalog_bound_store(&path, catalog, max_mapped_shards)?;
-        let resolution = eredu_checkpoint::validation::resolve_safetensors_plan(
-            store.as_ref(),
-            architecture.checkpoint(),
-        )
-        .map_err(|failure| {
-            Error::ArchitectureModel(format!(
-                "prepared SafeTensors checkpoint contract did not resolve: {failure:?}"
-            ))
-        })?;
+        let resolution = architecture
+            .checkpoint_resolution()
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "prepared SafeTensors artifact omitted its admitted checkpoint layout".into(),
+                )
+            })?
+            .clone();
         let store = eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolution);
         Ok(Self {
             configuration,

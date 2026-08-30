@@ -9,21 +9,10 @@ use serde_json::Value;
 
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
+use super::realization::FamilyRealization;
 #[cfg(test)]
 use super::ModelLoadOptions;
 use crate::backend::error::Error;
-use eredu_checkpoint::validation::SafetensorsCatalog;
-
-use super::realization::FamilyRealization;
-
-pub use eredu_checkpoint::validation::{
-    CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
-    CheckpointValidation as StructuralValidation,
-};
-
-pub(crate) trait StructuralSafetensorsCatalog: SafetensorsCatalog {}
-
-impl<T> StructuralSafetensorsCatalog for T where T: SafetensorsCatalog + ?Sized {}
 
 /// Native view of the GGUF source admitted by portable inspection.
 ///
@@ -331,13 +320,6 @@ pub(crate) fn inspected_session_capabilities(
     })
 }
 
-pub fn validate_safetensors(
-    plan: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
-    store: &(impl StructuralSafetensorsCatalog + ?Sized),
-) -> StructuralValidation {
-    eredu_checkpoint::validation::validate_safetensors_plan(store, plan.checkpoint())
-}
-
 #[cfg(test)]
 mod admission_policy_tests {
     use super::*;
@@ -642,98 +624,6 @@ mod admission_policy_tests {
             ),
         )
         .unwrap();
-    }
-}
-
-#[cfg(test)]
-mod catalog_policy_tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use eredu_checkpoint::{validation::CatalogTensorMetadata, StoredDtype};
-
-    #[derive(Clone)]
-    struct TestCatalog(BTreeMap<String, Vec<usize>>);
-
-    impl SafetensorsCatalog for TestCatalog {
-        fn keys(&self) -> Vec<String> {
-            self.0.keys().cloned().collect()
-        }
-
-        fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
-            let shape = self
-                .0
-                .get(key)
-                .ok_or_else(|| format!("unknown test tensor {key:?}"))?;
-            Ok(CatalogTensorMetadata {
-                shape: shape.clone(),
-                stored_dtype: StoredDtype::F32,
-            })
-        }
-    }
-
-    fn llama_catalog() -> TestCatalog {
-        let mut tensors = BTreeMap::from([
-            ("model.embed_tokens.weight".into(), vec![8, 4]),
-            ("model.norm.weight".into(), vec![4]),
-            ("lm_head.weight".into(), vec![8, 4]),
-        ]);
-        for (suffix, shape) in [
-            ("self_attn.q_proj.weight", vec![4, 4]),
-            ("self_attn.k_proj.weight", vec![4, 4]),
-            ("self_attn.v_proj.weight", vec![4, 4]),
-            ("self_attn.o_proj.weight", vec![4, 4]),
-            ("mlp.gate_proj.weight", vec![8, 4]),
-            ("mlp.up_proj.weight", vec![8, 4]),
-            ("mlp.down_proj.weight", vec![4, 8]),
-            ("input_layernorm.weight", vec![4]),
-            ("post_attention_layernorm.weight", vec![4]),
-        ] {
-            tensors.insert(format!("model.layers.0.{suffix}"), shape);
-        }
-        TestCatalog(tensors)
-    }
-
-    #[test]
-    fn residency_cannot_weaken_the_architecture_catalog_contract() {
-        let resolved = eredu_core::ModelConfigurationResolver::resolve_safetensors(
-            &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
-            &serde_json::json!({
-                "model_type": "llama",
-                "hidden_size": 4,
-                "num_hidden_layers": 1,
-                "intermediate_size": 8,
-                "num_attention_heads": 1,
-                "num_key_value_heads": 1,
-                "head_dim": 4,
-                "rms_norm_eps": 0.00001,
-                "vocab_size": 8,
-                "max_position_embeddings": 32,
-                "tie_word_embeddings": false,
-                "attention_bias": false,
-                "mlp_bias": false
-            }),
-        )
-        .unwrap();
-        let plan = resolved
-            .architecture_plan
-            .safetensors_architecture()
-            .unwrap();
-        let catalog = llama_catalog();
-        assert_eq!(
-            validate_safetensors(plan, &catalog),
-            StructuralValidation::Exact
-        );
-
-        let mut with_extra = catalog.clone();
-        with_extra.0.insert("unrelated.weight".into(), vec![1]);
-        let StructuralValidation::Invalid(issues) = validate_safetensors(plan, &with_extra) else {
-            panic!("strict Llama catalog accepted an unexpected tensor");
-        };
-        assert!(issues.iter().any(|issue| {
-            issue.kind == StructuralIssueKind::UnexpectedTensor
-                && issue.tensor_name.as_deref() == Some("unrelated.weight")
-        }));
     }
 }
 

@@ -1174,22 +1174,44 @@ fn assert_single_lane_speculative_cardinality_is_validated(
 }
 
 fn write_loadable_text_artifact(root: &std::path::Path) {
-    std::fs::write(
-        root.join("config.json"),
-        r#"{
+    let config = r#"{
           "model_type":"mistral","eos_token_id":0,"hidden_size":16,
           "num_hidden_layers":2,"intermediate_size":32,
           "num_attention_heads":4,"rms_norm_eps":0.00001,"vocab_size":64
-        }"#,
+        }"#;
+    std::fs::write(root.join("config.json"), config).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_config(
+        &serde_json::from_str(config).unwrap(),
     )
     .unwrap();
-    let header = br#"{"token_embd.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+    let checkpoint = resolved.architecture.checkpoint();
+    let mut offset = 0usize;
+    let mut header = serde_json::Map::new();
+    for tensor in checkpoint.common_tensors.iter().chain(
+        checkpoint
+            .layout_groups
+            .iter()
+            .filter_map(|group| group.variants.first())
+            .flat_map(|variant| variant.tensors.iter()),
+    ) {
+        let bytes = tensor.shape.iter().product::<usize>() * std::mem::size_of::<f32>();
+        header.insert(
+            tensor.key.clone(),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": tensor.shape,
+                "data_offsets": [offset, offset + bytes]
+            }),
+        );
+        offset += bytes;
+    }
+    let header = serde_json::to_vec(&header).unwrap();
     let mut weights = std::fs::File::create(root.join("model.safetensors")).unwrap();
     weights
         .write_all(&(header.len() as u64).to_le_bytes())
         .unwrap();
-    weights.write_all(header).unwrap();
-    weights.write_all(&[0; 4]).unwrap();
+    weights.write_all(&header).unwrap();
+    weights.write_all(&vec![0; offset]).unwrap();
 
     let vocabulary = [("[UNK]".to_owned(), 0), ("hello".to_owned(), 1)]
         .into_iter()

@@ -9,7 +9,6 @@ mod model;
 mod parallel;
 pub mod personaplex_prompt;
 
-pub(crate) use artifact::admit_checkpoint;
 pub use artifact::{prepare_realtime_model, RealtimePreparationError, RealtimePreparationPlan};
 pub use checkpoint::{canonical_recipes, safetensors_plan};
 pub use config::{

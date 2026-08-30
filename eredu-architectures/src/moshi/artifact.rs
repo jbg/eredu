@@ -120,7 +120,7 @@ pub fn prepare_realtime_model(
 
 /// Proves the strict physical schema and canonical recipe publication as one
 /// architecture-owned checkpoint admission.
-pub(crate) fn admit_checkpoint<C>(
+fn admit_checkpoint<C>(
     config: &MoshiConfig,
     checkpoint_plan: &SafetensorsCheckpointPlan,
     catalog: &C,

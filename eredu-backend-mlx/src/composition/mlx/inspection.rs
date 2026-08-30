@@ -9,39 +9,13 @@ use crate::composition::mlx::structural;
 #[cfg(test)]
 use eredu_architectures::GgufArchitecture;
 use eredu_core::{
-    checkpoint::{TensorCatalog, TensorDtype},
-    ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, InputModalities, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
-    ModelInspectionReport, Observed,
+    checkpoint::TensorDtype, ArtifactFormat, ArtifactModality, ArtifactTensorEncoding,
+    InputModalities, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    InspectionRequirement, InspectionSeverity, ModelInspectionReport, Observed,
 };
 use safemlx::ops::GgufCheckpoint;
 
 use super::*;
-
-struct InspectedSafetensorsCatalog<'a>(&'a TensorCatalog);
-
-impl eredu_checkpoint::validation::SafetensorsCatalog for InspectedSafetensorsCatalog<'_> {
-    fn keys(&self) -> Vec<String> {
-        self.0
-            .descriptors()
-            .map(|tensor| tensor.name.clone())
-            .collect()
-    }
-
-    fn metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::validation::CatalogTensorMetadata, String> {
-        let tensor = self
-            .0
-            .get(key)
-            .ok_or_else(|| format!("unknown checkpoint tensor {key:?}"))?;
-        Ok(eredu_checkpoint::validation::CatalogTensorMetadata {
-            shape: tensor.shape.clone(),
-            stored_dtype: inspected_stored_dtype(&tensor.dtype),
-        })
-    }
-}
 
 fn inspected_stored_dtype(dtype: &TensorDtype) -> eredu_checkpoint::StoredDtype {
     use eredu_checkpoint::StoredDtype;
@@ -144,12 +118,12 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     let configuration = portable.configuration();
     let architecture_plan = portable.architecture_plan();
     let catalog = portable.tensors();
-    let inspected_catalog = InspectedSafetensorsCatalog(catalog);
-
     report.container = InspectionReadiness::Ready;
     report.model_family = Some(configuration.family.clone());
     report.architecture = Some(configuration.effective_model_type.clone());
     report.architecture_support = InspectionReadiness::Ready;
+    report.structural_binding = InspectionReadiness::Ready;
+    report.model_loadability = InspectionReadiness::Ready;
     report.tensor_count = Some(catalog.len());
     let mut shards = BTreeSet::new();
     let mut encodings = BTreeSet::new();
@@ -199,16 +173,6 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
         Ok(capabilities) => {
             record_embedded_drafting(&mut report, capabilities);
             report.expected_modalities = artifact_modalities(capabilities.input_modalities());
-            apply_structural_validation(
-                &mut report,
-                structural::validate_safetensors(
-                    architecture_plan.safetensors_architecture().expect(
-                        "SafeTensors inspection must retain its validated architecture plan",
-                    ),
-                    &inspected_catalog,
-                ),
-                path,
-            );
             match options
                 .load
                 .preparation_policy()
@@ -518,77 +482,6 @@ fn reject_portable_gguf(
     });
 }
 
-fn apply_structural_validation(
-    report: &mut ModelInspectionReport,
-    validation: structural::StructuralValidation,
-    path: &Path,
-) {
-    use structural::{StructuralIssueKind, StructuralValidation};
-
-    let push = |report: &mut ModelInspectionReport,
-                issue: structural::StructuralIssue,
-                severity| {
-        let code = match issue.kind {
-            StructuralIssueKind::MissingTensor => InspectionIssueCode::MissingRequiredTensor,
-            StructuralIssueKind::UnexpectedTensor => InspectionIssueCode::ConflictingTensorLayout,
-            StructuralIssueKind::ConflictingLayout => InspectionIssueCode::ConflictingTensorLayout,
-            StructuralIssueKind::ShapeMismatch => InspectionIssueCode::TensorShapeMismatch,
-            StructuralIssueKind::UnsupportedEncoding => {
-                InspectionIssueCode::UnsupportedTensorEncoding
-            }
-            StructuralIssueKind::CompanionMismatch => {
-                InspectionIssueCode::QuantizationCompanionMismatch
-            }
-            StructuralIssueKind::InvalidGeometry => InspectionIssueCode::InvalidLayerOrExpertCount,
-            StructuralIssueKind::ValidationUnavailable => {
-                InspectionIssueCode::ValidationUnavailableUntilLoad
-            }
-        };
-        report.issues.push(InspectionIssue {
-            code,
-            severity,
-            detail: issue.detail,
-            path: Some(path.to_path_buf()),
-            metadata_key: issue.metadata_key,
-            tensor_name: issue.tensor_name,
-            tensor_type_code: issue.tensor_type_code,
-        });
-    };
-
-    match validation {
-        StructuralValidation::Exact => {
-            if report.structural_binding == InspectionReadiness::Unverified {
-                report.structural_binding = InspectionReadiness::Ready;
-            }
-            if report.model_loadability == InspectionReadiness::Unverified {
-                report.model_loadability = InspectionReadiness::Ready;
-            }
-        }
-        StructuralValidation::Invalid(issues) => {
-            report.structural_binding = InspectionReadiness::Invalid;
-            report.model_loadability = InspectionReadiness::Invalid;
-            for issue in issues {
-                push(report, issue, InspectionSeverity::Error);
-            }
-        }
-        StructuralValidation::Unverified(issue) => {
-            if matches!(
-                report.structural_binding,
-                InspectionReadiness::Ready | InspectionReadiness::Unverified
-            ) {
-                report.structural_binding = InspectionReadiness::Unverified;
-            }
-            if matches!(
-                report.model_loadability,
-                InspectionReadiness::Ready | InspectionReadiness::Unverified
-            ) {
-                report.model_loadability = InspectionReadiness::Unverified;
-            }
-            push(report, issue, InspectionSeverity::Warning);
-        }
-    }
-}
-
 fn inspect_gguf_projector(
     report: &mut ModelInspectionReport,
     path: &Path,
@@ -763,14 +656,35 @@ mod tests {
             serde_json::to_vec(config).unwrap(),
         )
         .unwrap();
-        let bytes = 0.0_f32.to_le_bytes();
-        let view = TensorView::new(Dtype::F32, vec![1], &bytes).unwrap();
-        serialize_to_file(
-            [("model.language_model.embed_tokens.weight", view)],
-            None,
-            &root.join("model.safetensors"),
-        )
-        .unwrap();
+        let resolved = eredu_architectures::configuration::resolve_model_config(config).unwrap();
+        let checkpoint = resolved.architecture.checkpoint();
+        let tensors = checkpoint
+            .common_tensors
+            .iter()
+            .chain(
+                checkpoint
+                    .layout_groups
+                    .iter()
+                    .filter_map(|group| group.variants.first())
+                    .flat_map(|variant| variant.tensors.iter()),
+            )
+            .map(|tensor| {
+                assert!(tensor.dtype.accepts(&eredu_checkpoint::StoredDtype::F32));
+                let elements = tensor.shape.iter().product::<usize>();
+                (
+                    tensor.key.clone(),
+                    tensor.shape.clone(),
+                    vec![0; elements * 4],
+                )
+            })
+            .collect::<Vec<_>>();
+        let views = tensors.iter().map(|(name, shape, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+            )
+        });
+        serialize_to_file(views, None, &root.join("model.safetensors")).unwrap();
     }
 
     fn qwen_vl_config() -> serde_json::Value {
