@@ -305,7 +305,10 @@ its architecture-owned canonical family name and round-trips through
 `ModelKind::resolve_family`. Nested `text_config.model_type` normalization is
 available only to outer wrapper identities explicitly admitted by that closed
 registry; an unknown outer `model_type` is rejected even when its nested text
-identity is known. External assistant admission remains separate: its closed
+identity is known. A known outer wrapper and nested text identity must also
+resolve to the same canonical family; the preliminary identity resolver rejects
+the configuration before returning a contradictory family. External assistant
+admission remains separate: its closed
 resolver explicitly selects the ordinary family tokenizer contract carried by
 the admitted assistant plan, without admitting assistant identities as ordinary
 models. Before invoking that resolver, `eredu-core` applies only

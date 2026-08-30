@@ -519,18 +519,32 @@ struct TextConfigMetadata {
     model_type: Option<String>,
 }
 
-fn effective_model_type(metadata: &ConfigMetadata) -> String {
+fn effective_model_type(
+    metadata: &ConfigMetadata,
+    declared_kind: ModelKind,
+) -> Result<String, ArtifactError> {
     if matches!(
         metadata.model_type.as_str(),
         "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
     ) {
-        metadata
+        let effective_model_type = metadata
             .text_config
             .as_ref()
             .and_then(|text| text.model_type.clone())
-            .unwrap_or_else(|| metadata.model_type.clone())
+            .unwrap_or_else(|| metadata.model_type.clone());
+        let effective_kind = ModelKind::resolve_model_type(&effective_model_type)?;
+        if effective_kind != declared_kind {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "declared model type {:?} resolves to family {:?}, but nested text model type {:?} resolves to family {:?}",
+                metadata.model_type,
+                declared_kind.canonical_name(),
+                effective_model_type,
+                effective_kind.canonical_name()
+            )));
+        }
+        Ok(effective_model_type)
     } else {
-        metadata.model_type.clone()
+        Ok(metadata.model_type.clone())
     }
 }
 
@@ -545,11 +559,12 @@ pub struct ResolvedModelIdentity {
     pub effective_model_type: String,
 }
 
-/// Resolves family aliases and nested wrappers without parsing family geometry.
+/// Resolves compatible family aliases and nested wrappers without parsing
+/// family geometry.
 pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, ArtifactError> {
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
-    let effective_model_type = effective_model_type(&metadata);
-    let kind = ModelKind::resolve_model_type(&effective_model_type)?;
+    let kind = ModelKind::resolve_model_type(&metadata.model_type)?;
+    let effective_model_type = effective_model_type(&metadata, kind)?;
     Ok(ResolvedModelIdentity {
         model_type: metadata.model_type,
         effective_model_type,
@@ -1191,6 +1206,20 @@ mod tests {
             error,
             ArtifactError::UnsupportedModelType(model_type)
                 if model_type == "third_party_wrapper"
+        ));
+    }
+
+    #[test]
+    fn known_wrapper_cannot_delegate_to_a_different_nested_text_family() {
+        let error = resolve_model_identity(&serde_json::json!({
+            "model_type": "qwen3_vl",
+            "text_config": { "model_type": "llama" }
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidArtifact(message)
+                if message.contains("but nested text model type \"llama\" resolves to family \"llama\"")
         ));
     }
 
