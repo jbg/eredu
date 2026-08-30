@@ -297,6 +297,9 @@ typed state. Artifact enrichment carries that state forward while adding any
 processor sidecars or GGUF companions; it does not reconstruct it from the
 portable configuration. Core routes the protocol and resolves companion paths;
 it neither recognizes family strings nor exposes an exhaustive family type.
+SafeTensors assistant admission requires explicit, agreeing outer and nested
+model identities; architecture normalization occurs only after both identities
+have been validated and cannot supply or disregard identity evidence.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
 in `eredu-architectures`; core does not publish a parallel serialized model or

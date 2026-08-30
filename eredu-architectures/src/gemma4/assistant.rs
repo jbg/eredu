@@ -98,7 +98,6 @@ impl AssistantCompatibility {
 
 #[derive(Debug, Deserialize)]
 struct AssistantSource {
-    #[serde(default = "default_model_type")]
     model_type: String,
     backbone_hidden_size: i32,
     #[serde(default)]
@@ -116,9 +115,8 @@ struct AssistantSource {
     quantization: Option<WeightQuantization>,
 }
 
-fn default_model_type() -> String {
-    "gemma4_assistant".into()
-}
+const ASSISTANT_MODEL_TYPE: &str = "gemma4_assistant";
+const ASSISTANT_TEXT_MODEL_TYPE: &str = "gemma4_text";
 
 const fn default_num_centroids() -> i32 {
     2048
@@ -163,7 +161,7 @@ impl AssistantConfig {
     /// Parses and validates a released assistant configuration.
     pub fn from_json(bytes: &[u8]) -> Result<Self, AssistantConfigError> {
         let source: AssistantSource = serde_json::from_slice(bytes)?;
-        if source.model_type != "gemma4_assistant" {
+        if source.model_type != ASSISTANT_MODEL_TYPE {
             return Err(AssistantConfigError::Invalid(format!(
                 "unsupported Gemma 4 assistant model_type {:?}",
                 source.model_type
@@ -173,6 +171,19 @@ impl AssistantConfig {
         let object = text_value.as_object_mut().ok_or_else(|| {
             AssistantConfigError::Invalid("assistant text_config must be an object".into())
         })?;
+        let text_model_type = object
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AssistantConfigError::Invalid(
+                    "Gemma 4 assistant text_config is missing string model_type".into(),
+                )
+            })?;
+        if text_model_type != ASSISTANT_TEXT_MODEL_TYPE {
+            return Err(AssistantConfigError::Invalid(format!(
+                "unsupported Gemma 4 assistant text_config.model_type {text_model_type:?}"
+            )));
+        }
         object.insert(
             "model_type".into(),
             serde_json::Value::String("gemma4".into()),
@@ -256,7 +267,7 @@ impl AssistantConfig {
                 )
             })?;
         let config = Self {
-            model_type: default_model_type(),
+            model_type: ASSISTANT_MODEL_TYPE.into(),
             backbone_hidden_size: i32::try_from(integer("embedding_length_out")?).map_err(
                 |_| AssistantConfigError::Invalid("assistant target width exceeds i32".into()),
             )?,
@@ -902,6 +913,28 @@ mod tests {
             .layer_schedule
             .iter()
             .all(|policy| policy.key_value == AttentionStateSource::Shared));
+    }
+
+    #[test]
+    fn rejects_missing_or_conflicting_assistant_identities() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value.as_object_mut().unwrap().remove("model_type");
+        assert!(AssistantConfig::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["model_type"] = "gemma4".into();
+        assert!(AssistantConfig::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["text_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_type");
+        assert!(AssistantConfig::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["text_config"]["model_type"] = "llama".into();
+        assert!(AssistantConfig::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 
     #[test]

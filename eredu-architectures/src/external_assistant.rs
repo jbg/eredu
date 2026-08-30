@@ -387,6 +387,25 @@ mod tests {
     }
 
     #[test]
+    fn safetensors_assistant_admission_rejects_missing_or_conflicting_identities() {
+        let mut missing: Value = serde_json::from_str(GEMMA_ASSISTANT).unwrap();
+        missing.as_object_mut().unwrap().remove("model_type");
+        let missing = safetensors_artifact(&missing.to_string(), gemma_tensors());
+        assert!(matches!(
+            prepare_external_assistant(missing.path()),
+            Err(ArtifactError::InvalidArtifact(_))
+        ));
+
+        let mut conflicting: Value = serde_json::from_str(GEMMA_ASSISTANT).unwrap();
+        conflicting["text_config"]["model_type"] = "llama".into();
+        let conflicting = safetensors_artifact(&conflicting.to_string(), gemma_tensors());
+        assert!(matches!(
+            prepare_external_assistant(conflicting.path()),
+            Err(ArtifactError::InvalidArtifact(_))
+        ));
+    }
+
+    #[test]
     fn ordinary_model_cannot_cross_the_external_assistant_boundary() {
         let artifact = safetensors_artifact(
             r#"{"model_type":"llama"}"#,
