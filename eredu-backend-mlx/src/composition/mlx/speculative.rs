@@ -17,13 +17,14 @@ use eredu_runtime::SpeculativeSampler;
 use safemlx::{
     error::Exception,
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
-    random::{self, RandomState},
+    random,
     transforms::{async_eval_with_event, eval},
     Array, Event, Stream,
 };
 
 use crate::{
     backend::error::Error,
+    backend::random::RandomState,
     backend::runtime::generation::MlxSamplingBackend,
     backend::ModelLoadOptions,
     composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
@@ -431,7 +432,7 @@ where
     where
         Self: 'a,
     {
-        Ok(RandomState::from_key(random::split_key_at(
+        Ok(RandomState::from_key(crate::backend::random::split_key_at(
             root,
             position,
             context.draft(),

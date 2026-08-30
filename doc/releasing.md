@@ -77,7 +77,7 @@ available in the registry index before continuing:
 
 1. `eredu-gguf`
 2. `safemlx-internal-macros`
-3. `safemlx-macros`
+3. `eredu-backend-mlx-macros`
 4. `safemlx-sys`
 5. `eredu-nn-macros`
 6. `eredu-checkpoint`

@@ -68,7 +68,9 @@ fn cartesian_ring_worker() {
         return;
     };
     let expected_rank: usize = expected_rank.to_string_lossy().parse().unwrap();
-    let world = distributed::init(true, Backend::Ring).unwrap();
+    let world = crate::backend::runtime::distributed::Group::native(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    );
     assert_eq!(world.rank(), expected_rank);
     assert_eq!(world.size(), 4);
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
@@ -102,19 +104,29 @@ fn cartesian_ring_worker() {
     let empty =
         crate::native::ops::zeros_dtype(&[0, 3], crate::native::Dtype::Float32, &stream).unwrap();
     let empty_counts = [0usize; 4];
-    let empty =
-        distributed::all_to_all_v(&empty, &empty_counts, &empty_counts, &world, &stream).unwrap();
+    let empty = crate::backend::runtime::distributed::all_to_all_v(
+        &empty,
+        &empty_counts,
+        &empty_counts,
+        &world,
+        &stream,
+    )
+    .unwrap();
     assert_eq!(empty.shape(), &[0, 3]);
     empty.evaluated().unwrap();
-    let after_exchange =
-        distributed::all_sum(&scalar(expected_rank as i32 + 1), &world, &stream).unwrap();
+    let after_exchange = crate::backend::runtime::distributed::all_sum(
+        &scalar(expected_rank as i32 + 1),
+        &world,
+        &stream,
+    )
+    .unwrap();
     assert_eq!(values(&after_exchange), vec![10]);
 
     // TP+PP: TP groups are [0, 1] and [2, 3]; pipeline lanes are [0, 2]
     // and [1, 3]. Both axes are logical subgroups under Ring.
     {
         let execution = crate::native::backend(&stream, &stream)
-            .communication_for_topology(topology(expected_rank, 2, 2, 1), &world)
+            .communication_for_topology(topology(expected_rank, 2, 2, 1), world.native_group())
             .unwrap();
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
@@ -149,7 +161,7 @@ fn cartesian_ring_worker() {
     // TP+EP: TP groups are [0, 2] and [1, 3]; EP groups are [0, 1] and [2, 3].
     {
         let execution = crate::native::backend(&stream, &stream)
-            .communication_for_topology(topology(expected_rank, 2, 1, 2), &world)
+            .communication_for_topology(topology(expected_rank, 2, 1, 2), world.native_group())
             .unwrap();
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
@@ -218,7 +230,7 @@ fn cartesian_ring_worker() {
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.
     {
         let execution = crate::native::backend(&stream, &stream)
-            .communication_for_topology(topology(expected_rank, 1, 2, 2), &world)
+            .communication_for_topology(topology(expected_rank, 1, 2, 2), world.native_group())
             .unwrap();
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
@@ -262,7 +274,9 @@ fn cartesian_triple_ring_worker() {
         return;
     };
     let expected_rank: usize = expected_rank.to_string_lossy().parse().unwrap();
-    let world = distributed::init(true, Backend::Ring).unwrap();
+    let world = crate::backend::runtime::distributed::Group::native(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    );
     assert_eq!((world.rank(), world.size()), (expected_rank, 8));
     let topology = MlxParallelContext::for_rank(
         expected_rank,
@@ -274,7 +288,7 @@ fn cartesian_triple_ring_worker() {
     .unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let execution = crate::native::backend(&stream, &stream)
-        .communication_for_topology(topology, &world)
+        .communication_for_topology(topology, world.native_group())
         .unwrap();
     let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
 

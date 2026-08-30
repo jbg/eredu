@@ -297,11 +297,9 @@ pub fn sliding_window_prefill_attention(
 #[cfg(test)]
 mod tests {
     use super::{indexed_sparse_attention, sliding_window_prefill_attention};
-    use safemlx::{
-        fast::ScaledDotProductAttentionMask, Array, Device, DeviceType, ExecutionContext,
-    };
+    use safemlx::{fast::ScaledDotProductAttentionMask, Array, Device, DeviceType};
 
-    use crate::backend::nn::tensor::create_causal_mask;
+    use crate::backend::{nn::tensor::create_causal_mask, ExecutionContext};
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

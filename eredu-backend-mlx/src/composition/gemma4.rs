@@ -24,11 +24,12 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{NewAxis, TryIndexOp},
-        maximum, pad, GgufCheckpoint, PadWidth,
+        maximum, pad, PadWidth,
     },
     Array, Stream,
 };
 
+use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
@@ -969,7 +970,7 @@ impl Gemma4Model {
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if state.layout() != &self.state_layout {
@@ -992,7 +993,7 @@ impl Gemma4Model {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if state.layout() != &self.state_layout {
@@ -1017,7 +1018,7 @@ impl Gemma4Model {
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1041,7 +1042,7 @@ impl Gemma4Model {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1067,7 +1068,7 @@ impl Gemma4Model {
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1161,7 +1162,7 @@ impl Gemma4Model {
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if let Some(expert_cache) = self.expert_cache.take() {

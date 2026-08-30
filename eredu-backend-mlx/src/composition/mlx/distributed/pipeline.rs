@@ -38,16 +38,12 @@ use std::{
     sync::Arc,
 };
 
+use crate::backend::runtime::distributed::{self as distributed, Group};
 use eredu_core::cache::{
     validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
     PromptCacheModelIdentity, PromptCacheOptions,
 };
-use safemlx::{
-    distributed::{self, Group},
-    error::Exception,
-    module::ModuleParameters,
-    Array, Dtype, Stream,
-};
+use safemlx::{error::Exception, Array, Dtype, Stream};
 
 use crate::composition::mlx::realization::{FamilyBinding, FamilyRealization};
 use crate::{
@@ -107,6 +103,7 @@ use crate::{
             vl::QwenVlPipelineBindings,
         },
     },
+    module::ModuleParameters,
 };
 
 use eredu_architectures::ModelKind;
@@ -6257,7 +6254,7 @@ impl PipelineModel {
         batch_size: i32,
         sampler: &mut S,
         temperature: f32,
-        prng_state: Option<&mut safemlx::random::RandomState>,
+        prng_state: Option<&mut crate::backend::random::RandomState>,
         finished: bool,
         execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
@@ -6688,7 +6685,7 @@ impl PipelineModel {
         step: PipelineStep,
         sampler: &mut S,
         temperature: f32,
-        prng_state: Option<&mut safemlx::random::RandomState>,
+        prng_state: Option<&mut crate::backend::random::RandomState>,
         finished: bool,
         execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {

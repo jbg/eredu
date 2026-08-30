@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 use crate::composition::mlx::structural;
 #[cfg(test)]
 use eredu_architectures::GgufArchitecture;
@@ -13,7 +14,6 @@ use eredu_core::{
     InputModalities, InspectionIssue, InspectionIssueCode, InspectionReadiness,
     InspectionRequirement, InspectionSeverity, ModelInspectionReport, Observed,
 };
-use safemlx::ops::GgufCheckpoint;
 
 use super::*;
 

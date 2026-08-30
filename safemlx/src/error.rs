@@ -34,9 +34,9 @@ pub enum IoError {
     #[error("Unsupported file format")]
     UnsupportedFormat,
 
-    /// Invalid or unsupported GGUF data
-    #[error("invalid GGUF file: {0}")]
-    InvalidGguf(String),
+    /// Invalid or unsupported serialized data
+    #[error("invalid serialized data: {0}")]
+    InvalidFormat(String),
 
     /// Unable to open file
     #[error("Unable to open file")]
@@ -50,10 +50,6 @@ pub enum IoError {
     #[error(transparent)]
     NulError(#[from] NulError),
 
-    /// Error with unfalttening the loaded optimizer state
-    #[error(transparent)]
-    Unflatten(#[from] UnflattenError),
-
     /// Exception
     #[error(transparent)]
     Exception(#[from] Exception),
@@ -62,12 +58,6 @@ pub enum IoError {
 impl From<Infallible> for IoError {
     fn from(_: Infallible) -> Self {
         unreachable!()
-    }
-}
-
-impl From<eredu_gguf::Error> for IoError {
-    fn from(error: eredu_gguf::Error) -> Self {
-        Self::InvalidGguf(error.to_string())
     }
 }
 
@@ -104,36 +94,6 @@ pub enum AsSliceError {
     /// Exception
     #[error(transparent)]
     Exception(#[from] Exception),
-}
-
-/// Error with unflattening a loaded optimizer state
-#[derive(Debug, PartialEq, Error)]
-pub enum UnflattenError {
-    /// Expecting next (key, value) pair, found none
-    #[error("Expecting next (key, value) pair, found none")]
-    ExpectingNextPair,
-
-    /// The key is not in a valid format
-    #[error("Invalid key")]
-    InvalidKey,
-}
-
-/// Error with loading an optimizer state
-#[derive(Debug, PartialEq, Error)]
-pub enum OptimizerStateLoadError {
-    /// Error with io operations
-    #[error(transparent)]
-    Io(#[from] IoError),
-
-    /// Error with unflattening the optimizer state
-    #[error(transparent)]
-    Unflatten(#[from] UnflattenError),
-}
-
-impl From<Infallible> for OptimizerStateLoadError {
-    fn from(_: Infallible) -> Self {
-        unreachable!()
-    }
 }
 
 cfg_safetensors! {
@@ -279,72 +239,6 @@ pub(crate) fn get_and_clear_closure_error() -> Option<Exception> {
 #[track_caller]
 pub(crate) fn get_and_clear_last_mlx_error() -> Option<RawException> {
     take_last_mlx_error().map(|what| RawException { what })
-}
-
-/// Error with building a cross-entropy loss function
-#[derive(Debug, Clone, PartialEq, Error)]
-pub enum CrossEntropyBuildError {
-    /// Label smoothing factor must be in the range [0, 1)
-    #[error("Label smoothing factor must be in the range [0, 1)")]
-    InvalidLabelSmoothingFactor,
-}
-
-impl From<CrossEntropyBuildError> for Exception {
-    fn from(value: CrossEntropyBuildError) -> Self {
-        Exception::custom(format!("{value}"))
-    }
-}
-
-/// Error with building a RmsProp optimizer
-#[derive(Debug, Clone, PartialEq, Error)]
-pub enum RmsPropBuildError {
-    /// Alpha must be non-negative
-    #[error("alpha must be non-negative")]
-    NegativeAlpha,
-
-    /// Epsilon must be non-negative
-    #[error("epsilon must be non-negative")]
-    NegativeEpsilon,
-}
-
-/// Error with building an AdaDelta optimizer
-#[derive(Debug, Clone, PartialEq, Error)]
-pub enum AdaDeltaBuildError {
-    /// Rho must be non-negative
-    #[error("rho must be non-negative")]
-    NegativeRho,
-
-    /// Epsilon must be non-negative
-    #[error("epsilon must be non-negative")]
-    NegativeEps,
-}
-
-/// Error with building an Adafactor optimizer.
-#[derive(Debug, Clone, PartialEq, Error)]
-pub enum AdafactorBuildError {
-    /// Either learning rate is provided or relative step is set to true.
-    #[error("Either learning rate is provided or relative step is set to true")]
-    LrIsNoneAndRelativeStepIsFalse,
-}
-
-/// Error with building a dropout layer
-#[derive(Debug, Clone, PartialEq, Error)]
-pub enum DropoutBuildError {
-    /// Dropout probability must be in the range [0, 1)
-    #[error("Dropout probability must be in the range [0, 1)")]
-    InvalidProbability,
-}
-
-/// Error with building a MultiHeadAttention module
-#[derive(Debug, PartialEq, Error)]
-pub enum MultiHeadAttentionBuildError {
-    /// Invalid number of heads
-    #[error("Invalid number of heads: {0}")]
-    InvalidNumHeads(i32),
-
-    /// Exceptions
-    #[error(transparent)]
-    Exception(#[from] Exception),
 }
 
 /// The dtype is not a float-point type

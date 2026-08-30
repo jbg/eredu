@@ -21,7 +21,7 @@ from typing import Any
 RELEASE_ORDER = (
     "eredu-gguf",
     "safemlx-internal-macros",
-    "safemlx-macros",
+    "eredu-backend-mlx-macros",
     "safemlx-sys",
     "eredu-nn-macros",
     "eredu-checkpoint",

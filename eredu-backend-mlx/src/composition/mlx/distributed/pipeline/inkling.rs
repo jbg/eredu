@@ -1,5 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
@@ -7,7 +8,7 @@ use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
     LayeredArchitecture, ParallelLayeredArchitecture,
 };
-use safemlx::{distributed::Group, error::Exception, Array, Stream};
+use safemlx::{error::Exception, Array, Stream};
 
 use crate::{
     backend::{

@@ -626,8 +626,10 @@ mod tests {
     #[test]
     fn bitwise_view_preserves_checkpoint_bytes() {
         let (_dir, store) = fixture();
-        let context =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let context = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Cpu,
+            0,
+        ));
         let recipe = DerivedWeightRecipe::View {
             input: Box::new(DerivedWeightRecipe::source("left", TensorSelection::Full)),
             dtype: RecipeDtype::U8,
@@ -673,8 +675,10 @@ mod tests {
     #[ignore = "requires local MLX Metal execution"]
     fn mlx_lowered_mxfp4_recipe_materializes_u32_storage() {
         let (_dir, store) = fixture();
-        let context =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let context = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Gpu,
+            0,
+        ));
         let logical = DerivedWeightRecipe::View {
             input: Box::new(DerivedWeightRecipe::source("left", TensorSelection::Full)),
             dtype: RecipeDtype::F4,

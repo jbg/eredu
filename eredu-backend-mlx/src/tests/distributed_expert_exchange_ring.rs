@@ -10,7 +10,6 @@ use std::{
 
 use crate::native::{
     distributed::{self, Backend},
-    module::Param,
     ops::concatenate_axis,
     transforms::{async_eval_with_event, eval},
     Array, Device, DeviceType, Stream,
@@ -26,6 +25,7 @@ use crate::{
         },
         residency::expert_cache::{ExpertCache, ExpertCatalogEntry, ExpertRouteBatch},
     },
+    module::Param,
 };
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
 use eredu_core::{residency::OffloadConfig, ParallelRankTopology, ParallelTopology};
@@ -202,7 +202,9 @@ fn expert_exchange_ring_worker() {
         return;
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
-    let group = distributed::init(true, Backend::Ring).unwrap();
+    let group = crate::backend::runtime::distributed::Group::native(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    );
     assert_eq!(group.rank(), expected_rank);
     assert_eq!(group.size(), 2);
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));

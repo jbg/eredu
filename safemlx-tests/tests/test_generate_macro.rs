@@ -18,7 +18,7 @@ fn foo(
 #[test]
 fn test_foo() {
     let stream =
-        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 
     assert_eq!(foo!(1, 2, stream = &stream), 3);
     assert_eq!(foo!(1, 2, c = Some(3), stream = &stream), 6);
@@ -49,7 +49,7 @@ fn bar<T: Into<i32>>(
 fn test_bar() {
     // Without specifying dtype, the default is i32.
     let stream =
-        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 
     let result = bar!(1, 2, stream = &stream);
     assert_eq!(result, 3);
@@ -134,7 +134,7 @@ fn baz(
 #[test]
 fn test_baz() {
     let stream =
-        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
 
     assert_eq!(baz!(b = 1, stream = &stream), 1);
     assert_eq!(baz!(a = Some(2), b = 1, stream = &stream), 3);

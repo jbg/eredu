@@ -9,7 +9,9 @@ use eredu_nn::{
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
 };
-use safemlx::{module::Param, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
+
+use crate::module::Param;
 
 use crate::backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts};
 use crate::backend::nn::shared::MlxNeuralBackend;
@@ -604,8 +606,9 @@ where
 )]
 mod tests {
     use super::*;
+    use crate::backend::ExecutionContext;
     use eredu_nn::{GatedProductExpertLayout, RoutingResult};
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
 
     fn localized_qwen_spec() -> GatedProductExpertBankSpec {
         let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({

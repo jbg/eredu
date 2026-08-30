@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
+use crate::backend::runtime::distributed::Group;
 use eredu_architectures::deepseek::{self, V3Args, V4Args};
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
@@ -9,7 +10,7 @@ use eredu_runtime::{
     LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole,
     RuntimeLayerState, RuntimeState, StateSegmentId, WeightResidency,
 };
-use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::backend::runtime::{
     distributed::parallel::ParallelBuildContext, execution::layerwise::shard_layer_bindings,

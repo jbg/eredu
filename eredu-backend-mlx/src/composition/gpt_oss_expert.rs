@@ -5,7 +5,8 @@ use eredu_nn::{GatedProductExpertBankOperator, GatedProductExpertBankSpec};
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
 };
-use safemlx::{distributed::Group, Array, Stream};
+use safemlx::{Array, Stream};
+use crate::backend::runtime::distributed::Group;
 
 use crate::backend::{
     error::Error,

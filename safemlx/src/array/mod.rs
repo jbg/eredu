@@ -219,7 +219,7 @@ impl Array {
     ///
     /// The byte representation of `values` must match `dtype`. The checked byte
     /// count and alignment must match the supplied shape.
-    pub(crate) unsafe fn try_from_owned_host_data<T: 'static>(
+    pub unsafe fn try_from_owned_host_data<T: 'static>(
         mut values: Vec<T>,
         shape: &[i32],
         dtype: Dtype,

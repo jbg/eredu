@@ -6,41 +6,6 @@ use crate::{
     utils::{guard::Guarded, runtime_lock, SUCCESS},
 };
 
-/// Explicit execution context for MLX operations.
-///
-/// A context owns the stream used to schedule work. Construct it from an
-/// explicit device instead of relying on MLX's process- or thread-local default
-/// device/stream state.
-#[derive(Debug)]
-pub struct ExecutionContext {
-    device: Device,
-    stream: Stream,
-}
-
-impl ExecutionContext {
-    /// Create a context with a new stream on `device`.
-    pub fn new(device: Device) -> Self {
-        let stream = Stream::new_with_device(&device);
-        Self { device, stream }
-    }
-
-    /// The device associated with this context.
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    /// The stream associated with this context.
-    pub fn stream(&self) -> &Stream {
-        &self.stream
-    }
-}
-
-impl AsRef<Stream> for ExecutionContext {
-    fn as_ref(&self) -> &Stream {
-        &self.stream
-    }
-}
-
 /// A stream of evaluation attached to a particular device.
 ///
 /// Typically, this is used via the `stream:` parameter on MLX operations.
@@ -168,13 +133,6 @@ mod tests {
 
         // Assert that CPU and GPU streams are not equal
         assert_ne!(cpu_stream, gpu_stream);
-    }
-
-    #[test]
-    fn execution_context_can_be_used_as_stream() {
-        let ctx = ExecutionContext::new(crate::Device::new(crate::DeviceType::Cpu, 0));
-        let array = crate::Array::zeros::<f32>(&[2], &ctx).unwrap();
-        assert_eq!(array.shape(), &[2]);
     }
 
     #[test]

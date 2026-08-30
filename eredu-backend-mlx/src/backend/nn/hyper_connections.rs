@@ -4,13 +4,14 @@
 //! streams.  Keeping the numerical definition here avoids embedding a second
 //! implementation in target and speculative-decoder code.
 
+use eredu_backend_mlx_macros::ModuleParameters;
 use safemlx::{
     error::Exception,
-    macros::ModuleParameters,
-    module::Param,
     ops::{einsum, indexing::TryIndexOp, matmul, mean_axis, rsqrt, sigmoid, softmax_axis},
     Array, Dtype, Stream,
 };
+
+use crate::module::Param;
 
 /// The three tensors produced by one hyper-connection split.
 #[derive(Debug, Clone)]
@@ -25,6 +26,7 @@ pub struct HyperConnectionSplit {
 
 /// Trainable multi-stream hyper-connection.
 #[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct HyperConnection {
     /// Number of residual streams.
     pub streams: i32,
@@ -157,6 +159,7 @@ pub fn expand(
 
 /// Final learned collapse from multiple residual streams to one hidden state.
 #[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct HyperHead {
     /// Number of residual streams.
     pub streams: i32,
@@ -368,7 +371,8 @@ fn normalize_axis(
 #[cfg(test)]
 mod tests {
     use super::split_sinkhorn;
-    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+    use crate::backend::ExecutionContext;
+    use safemlx::{Array, Device, DeviceType};
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

@@ -12,10 +12,17 @@ pub mod hyper_connections;
 pub mod layers;
 /// Linear layers, embeddings, and language-model heads.
 pub mod linear;
+/// Backend-owned module parameter traversal.
+pub mod module;
 /// Mixture-of-experts routing and packed expert implementations.
 pub mod moe;
+pub(crate) mod native_quantization;
+pub(crate) mod nested;
+pub(crate) mod primitives;
+pub(crate) mod quantization;
 /// Rotary position-embedding variants and initialization.
 pub mod rope;
+pub(crate) mod routing;
 /// Backend-neutral architecture operators specialized to MLX.
 pub mod shared;
 /// Shared tensor and attention-mask helpers.

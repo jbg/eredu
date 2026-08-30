@@ -1,11 +1,11 @@
 # safemlx
 
-`safemlx` is the low-level MLX implementation used by Eredu's default backend.
-It provides arrays and operations, lazy graph evaluation, transforms,
-reusable MLX neural-network primitives, optimizers, quantization helpers,
-checkpoint I/O, streams, and distributed collectives. It does not own concrete
-model architectures or end-to-end encoder/decoder stacks; those belong in
-`eredu-architectures` and backend composition.
+`safemlx` provides safe, low-level Rust bindings to MLX: arrays and native
+operations, devices and streams, lazy graph evaluation, function transforms,
+native serialization, and accelerator/runtime facilities. It deliberately
+contains no neural-network layers, models, optimizers, checkpoint policy, or
+other framework abstractions. Eredu's MLX-specific abstractions live in
+`eredu-backend-mlx`.
 
 Most applications should use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Depend on this crate
 directly only when building MLX-specific operations or backend components.
@@ -43,11 +43,8 @@ evaluation, graph transforms, and I/O.
   or same-device stream ordering without a whole-stream drain.
 - Typed host-transfer buffers provide explicit CPU, Metal shared, CUDA pinned,
   or CUDA managed storage policies.
-- `GgufCheckpoint` validates a complete sharded GGUF catalog before materializing
-  individual tensors.
-- Supported packed GGUF weights can execute without a persistent dense copy.
 - The `distributed` module wraps MLX groups, collectives, point-to-point
-  operations, and variable-count all-to-all.
+  operations, and their native execution semantics.
 
 See the [`safemlx` implementation
 guides](https://github.com/jbg/eredu/blob/main/safemlx/doc/README.md) for

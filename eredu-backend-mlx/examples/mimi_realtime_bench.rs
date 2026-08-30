@@ -1,10 +1,8 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu_backend_mlx::{codec::mimi::load, MlxTensor};
+use eredu_backend_mlx::{codec::mimi::load, native::ExecutionContext, MlxTensor};
 use eredu_nn::Tensor;
-use safemlx::{
-    ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType, ExecutionContext,
-};
+use safemlx::{ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType};
 
 const SAMPLE_RATE: f64 = 24_000.0;
 const FRAME_RATE: f64 = 12.5;

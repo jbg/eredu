@@ -1,12 +1,13 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::backend::runtime::distributed::Group;
 use eredu_architectures::{muse_glimmer as muse_glimmer_arch, ModelKind};
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
     LayeredArchitecture, ParallelLayeredArchitecture,
 };
-use safemlx::{distributed::Group, error::Exception, Array, Stream};
+use safemlx::{error::Exception, Array, Stream};
 
 use crate::{
     backend::{

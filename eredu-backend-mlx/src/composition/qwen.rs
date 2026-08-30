@@ -664,7 +664,7 @@ impl QwenModel {
         &mut self,
         inputs: &Array,
         cache: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
         if let Some(expert_cache) = self.expert_cache.take() {
@@ -719,7 +719,7 @@ impl QwenModel {
         &mut self,
         inputs: &Array,
         cache: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
@@ -899,7 +899,7 @@ impl QwenModel {
         inputs: &Array,
         mask: Option<&Array>,
         cache: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         mut execute: F,
         stream: &Stream,
     ) -> Result<Array, Error>
@@ -918,7 +918,7 @@ impl QwenModel {
         inputs: &Array,
         mask: Option<&Array>,
         cache: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         provider: &mut P,
         stream: &Stream,
     ) -> Result<Array, Error>
@@ -939,7 +939,7 @@ impl QwenModel {
                     hidden: &crate::MlxTensor,
                     state: &mut MlxKeyValueState,
                     forward: &mut eredu_architectures::qwen::ForwardContext<crate::MlxTensor>,
-                    parallel: &safemlx::distributed::Group,
+                    parallel: &crate::backend::runtime::distributed::Group,
                     context: &Stream| {
             <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
                 MlxNeuralBackend,

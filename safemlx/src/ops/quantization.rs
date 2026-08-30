@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn test_quantized_matmul() {
         let stream = crate::test_stream();
-        let mut random_state = random::RandomState::with_seed(0).unwrap();
+        let mut random_state = random::TestKeys::with_seed(0).unwrap();
 
         let group_size = 64;
         let bits = 4;
@@ -607,7 +607,7 @@ mod tests {
         let stream = crate::test_stream();
         use crate::ops::{gather_mm, gather_qmm, swap_axes};
 
-        let mut random_state = random::RandomState::with_seed(0).unwrap();
+        let mut random_state = random::TestKeys::with_seed(0).unwrap();
 
         let group_size = 64;
         let bits = 4;

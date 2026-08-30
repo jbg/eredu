@@ -447,7 +447,7 @@ impl LlamaModel {
         &mut self,
         inputs: &Array,
         cache: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
@@ -486,7 +486,7 @@ impl LlamaModel {
         &mut self,
         inputs: &Array,
         cache: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {

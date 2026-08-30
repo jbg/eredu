@@ -1,13 +1,9 @@
 extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, ItemEnum, ItemFn};
+use syn::{parse_macro_input, ItemEnum, ItemFn};
 
-mod derive_buildable;
-mod derive_builder;
-mod generate_builder;
 mod generate_macro;
-mod shared;
 
 #[doc(hidden)]
 #[proc_macro]
@@ -59,154 +55,6 @@ pub fn generate_test_cases(input: TokenStream) -> TokenStream {
         #input
         #tests
     })
-}
-
-/// Generates a builder struct for the given struct.
-///
-/// This macro should be used in conjunction with the `#[derive(Buildable)]` derive macro.
-/// See the [`Buildable`] macro for more information.
-#[doc(hidden)]
-#[proc_macro]
-pub fn generate_builder(input: TokenStream) -> TokenStream {
-    // let input = parse_macro_input!(input as ItemStruct);
-    let input = parse_macro_input!(input as DeriveInput);
-    let builder = generate_builder::expand_generate_builder(&input).unwrap();
-    quote::quote! {
-        #input
-        #builder
-    }
-    .into()
-}
-
-/// Derive `safemlx::builder::Buildable` for a struct. When used with the `generate_builder` macro,
-/// a builder struct `<Struct>Builder` will be generated.
-///
-/// # Attributes
-///
-/// ## `#[buildable]`
-///
-/// ### Arguments
-///
-/// - `builder`: Path to the builder struct. Default to `<Struct>Builder` if not provided.
-/// - `root`: Path to the root module. Default to `::safemlx` if not provided.
-///
-/// ## `#[builder]`
-///
-/// **Note**: This attribute has no effect if NOT used with the `generate_builder` macro.
-///
-/// ### Arguments when applied on struct
-///
-/// - `build_with`: Function ident to build the struct.
-/// - `root`: Path to the root module. Default to `::safemlx` if not provided.
-/// - `err`: Type of error to return when build fails. Default to `std::convert::Infallible`
-///   if not provided.
-/// - `default_infallible`: Whether the default error type is infallible. Default to `err.is_none()`
-///   if not provided. When `true`, the generated `<Struct>::new()` method will unwrap the build result
-///   and return `<Struct>`. When `false`, the generated `<Struct>::new()` method will return `Result<<Struct>, Err>`.
-///
-/// ### Arguments when applied on field
-///
-/// - `optional`: Whether the field is optional. Default to `false` if not provided.
-/// - `default`: Path to the default value for the field. This is required if the field is optional.
-/// - `rename`: Rename the field in the builder struct.
-/// - `ignore`: Ignore the field in the builder struct.
-/// - `ty_override`: Override the type of the field in the builder struct.
-/// - `skip_setter`: Skip the setter method for the field in the builder struct.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use safemlx_internal_macros::*;
-/// use safemlx::builder::{Buildable, Builder};
-///
-/// generate_builder! {
-///     /// Test struct for the builder generation.
-///     #[derive(Debug, Buildable)]
-///     #[builder(build_with = build_test_struct)]
-///     struct TestStruct {
-///         #[builder(optional, default = TestStruct::DEFAULT_OPT_FIELD_1)]
-///         opt_field_1: i32,
-///         #[builder(optional, default = TestStruct::DEFAULT_OPT_FIELD_2)]
-///         opt_field_2: i32,
-///         mandatory_field_1: i32,
-///
-///         #[builder(ignore)]
-///         ignored_field: String,
-///     }
-/// }
-///
-/// fn build_test_struct(
-///     builder: TestStructBuilder,
-/// ) -> std::result::Result<TestStruct, std::convert::Infallible> {
-///     Ok(TestStruct {
-///         opt_field_1: builder.opt_field_1,
-///         opt_field_2: builder.opt_field_2,
-///         mandatory_field_1: builder.mandatory_field_1,
-///         ignored_field: String::from("ignored"),
-///     })
-/// }
-///
-/// impl TestStruct {
-///     pub const DEFAULT_OPT_FIELD_1: i32 = 1;
-///     pub const DEFAULT_OPT_FIELD_2: i32 = 2;
-/// }
-///
-/// #[test]
-/// fn test_generated_builder() {
-///     let test_struct = <TestStruct as Buildable>::Builder::new(4)
-///         .opt_field_1(2)
-///         .opt_field_2(3)
-///         .build()
-///         .unwrap();
-///
-///     assert_eq!(test_struct.opt_field_1, 2);
-///     assert_eq!(test_struct.opt_field_2, 3);
-///     assert_eq!(test_struct.mandatory_field_1, 4);
-///     assert_eq!(test_struct.ignored_field, String::from("ignored"));
-/// }
-/// ```
-#[doc(hidden)]
-#[proc_macro_derive(Buildable, attributes(buildable, builder))]
-pub fn derive_buildable(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let builder = derive_buildable::expand_derive_buildable(input).unwrap();
-    TokenStream::from(builder)
-}
-
-/// Derive `safemlx::builder::Builder` trait for a struct and generate the following methods:
-///
-/// - `<Struct>Builder::new(mandatory_fields)`: Create a new builder with the mandatory fields.
-/// - setter methods for each optinal field
-/// - `<Struct>::new(mandatory_fields)`: Create the struct from the builder with the mandatory fields.
-///
-/// # Attributes
-///
-/// ## `#[builder]`
-///
-/// ### Arguments when applied on struct
-///
-/// - `build_with`: Function ident to build the struct.
-/// - `root`: Path to the root module. Default to `::safemlx` if not provided.
-/// - `err`: Type of error to return when build fails. Default to `std::convert::Infallible`
-///   if not provided.
-/// - `default_infallible`: Whether the default error type is infallible. Default to `err.is_none()`
-///   if not provided. When `true`, the generated `<Struct>::new()` method will unwrap the build result
-///   and return `<Struct>`. When `false`, the generated `<Struct>::new()` method will return `Result<<Struct>, Err>`.
-///
-/// ### Arguments when applied on field
-///
-/// - `optional`: Whether the field is optional. Default to `false` if not provided.
-/// - `default`: Path to the default value for the field. This is required if the field is optional.
-/// - `rename`: Rename the field in the builder struct.
-/// - `ignore`: Ignore the field in the builder struct.
-/// - `ty_override`: Override the type of the field in the builder struct.
-/// - `skip_setter`: Skip the setter method for the field in the builder struct.
-#[doc(hidden)]
-#[proc_macro_derive(Builder, attributes(builder))]
-pub fn derive_builder(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let builder = derive_builder::expand_derive_builder(input).unwrap();
-    TokenStream::from(builder)
 }
 
 /// Generate a macro that expands to the given function for ergonomic purposes.

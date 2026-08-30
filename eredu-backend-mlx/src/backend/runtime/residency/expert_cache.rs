@@ -748,7 +748,8 @@ impl ExpertCache {
                 .ge(Array::from_int(0), stream)?
                 .logical_and(below_span, stream)?
         };
-        let invalid = valid.logical_not(stream)?.count_nonzero(stream)?;
+        let invalid =
+            crate::backend::compaction::count_nonzero(&valid.logical_not(stream)?, stream)?;
         let flat = if routed_ids.dtype() == Dtype::Int32 {
             flat_routes
         } else {

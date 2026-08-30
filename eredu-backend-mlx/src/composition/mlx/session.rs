@@ -15,13 +15,13 @@ use ref_cast::RefCast;
 use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
-    random::RandomState,
     Array, Dtype, Stream,
 };
 use std::path::Path;
 
 use crate::{
     backend::nn::tensor::{TokenValidationBatch, TokenValidationScope},
+    backend::random::RandomState,
     backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input,
     backend::{error::Error, MlxModelKind},
@@ -1627,7 +1627,8 @@ fn pipeline_submission(
 
 #[cfg(test)]
 mod tests {
-    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+    use crate::backend::ExecutionContext;
+    use safemlx::{Array, Device, DeviceType};
 
     use crate::backend::nn::tensor::validate_token_domain;
 

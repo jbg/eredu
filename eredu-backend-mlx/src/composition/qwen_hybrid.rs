@@ -295,7 +295,7 @@ impl QwenConditionalPipelineBindings {
         architecture: &mut ConditionalArchitecture,
         typed: input::ModelInput<'_>,
         offset: i32,
-        parallel: Option<&safemlx::distributed::Group>,
+        parallel: Option<&crate::backend::runtime::distributed::Group>,
         stream: &Stream,
     ) -> Result<hybrid::ConditionalPipelineVisionState<crate::MlxTensor>, Error> {
         let parsed = architecture.parsed().clone();

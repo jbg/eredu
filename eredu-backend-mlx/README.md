@@ -33,7 +33,10 @@ let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?
 ```
 
 Reusable low-level mechanics are rooted directly under
-`eredu_backend_mlx::backend`, including neural and runtime facilities.
+`eredu_backend_mlx::backend`, including neural modules, quantization,
+checkpoint materialization, mutable execution state, logical distributed
+subgroups, axis-aware collectives, and runtime facilities.
+`safemlx` beneath this boundary contains only safe wrappers over native MLX.
 Backend-generic sampling policies come from `eredu-runtime`, while
 `backend::runtime::generation::MlxSamplingBackend` implements the native
 sampling primitives those policies require. Runtime `Sampler` and

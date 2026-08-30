@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::backend::runtime::distributed::Group;
 use eredu_architectures::{llama::ModelArgs as LlamaModelArgs, ModelKind};
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_runtime::{ArchitectureBoundary, ArchitectureParameters};
-use safemlx::{distributed::Group, error::Exception, Array, Stream};
+use safemlx::{error::Exception, Array, Stream};
 
 use crate::{
     backend::{

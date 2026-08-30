@@ -10,14 +10,15 @@ use eredu_runtime::{
 };
 
 use safemlx::{
-    distributed::{self, Group},
     ops::{indexing::TryIndexOp, ones, zeros},
     Array, Dtype, Stream,
 };
 
 use crate::{
     backend::error::Error,
-    backend::runtime::distributed::{completion::synchronize_outputs, topology::PlacementPlan},
+    backend::runtime::distributed::{
+        self as distributed, completion::synchronize_outputs, topology::PlacementPlan, Group,
+    },
     backend::runtime::generation::MlxSamplingBackend,
     backend::MlxParallelContext,
     MlxTensor,
@@ -44,7 +45,7 @@ pub fn sample_and_synchronize<S: Sampler<MlxSamplingBackend>>(
     batch_size: i32,
     sampler: &mut S,
     temperature: f32,
-    prng_state: Option<&mut safemlx::random::RandomState>,
+    prng_state: Option<&mut crate::backend::random::RandomState>,
     finished: bool,
     sampling_rank: usize,
     group: &Group,
@@ -555,7 +556,11 @@ impl<'a> ParallelExecutionContext<'a> {
     /// Sums a replicated result across the TP subgroup or returns it unchanged.
     pub fn all_sum(&self, value: &Array) -> Result<Array, Error> {
         match self.group {
-            Some(group) => Ok(safemlx::distributed::all_sum(value, group, self.stream)?),
+            Some(group) => Ok(crate::backend::runtime::distributed::all_sum(
+                value,
+                group,
+                self.stream,
+            )?),
             None => Ok(value.clone()),
         }
     }

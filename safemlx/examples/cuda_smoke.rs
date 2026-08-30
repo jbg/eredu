@@ -1,13 +1,13 @@
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+    use safemlx::{Array, Device, DeviceType, Stream};
 
     if !safemlx::cuda::is_available()? {
         return Err("MLX was built with CUDA, but no CUDA device is available".into());
     }
 
-    let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let gpu = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
     let b = Array::from_slice(&[5.0f32, 6.0, 7.0, 8.0], &[2, 2]);
 

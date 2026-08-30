@@ -3171,6 +3171,7 @@ mod tests {
     use crate::backend::runtime::cache::residency::{
         open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
     };
+    use crate::backend::ExecutionContext;
     use eredu_core::cache::{
         CacheRankIdentity, CacheRepresentation, PromptCacheDescriptor, PromptCacheModelIdentity,
         PromptCacheOptions, PromptCacheTopology,
@@ -3180,7 +3181,7 @@ mod tests {
         fast::ScaledDotProductAttentionMask,
         ops::{indexing::TryIndexOp, zeros_dtype},
         transforms::eval,
-        Array, Device, DeviceType, Dtype, ExecutionContext,
+        Array, Device, DeviceType, Dtype,
     };
 
     #[test]

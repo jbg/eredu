@@ -1071,7 +1071,7 @@ impl GptOssModel {
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
         if let Some(expert_cache) = self.expert_cache.take() {
@@ -1113,7 +1113,7 @@ impl GptOssModel {
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
@@ -1208,7 +1208,7 @@ impl GptOssModel {
         inputs: &Array,
         mask: Option<&Array>,
         cache: &mut Cache,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         provider: &mut P,
         stream: &Stream,
     ) -> Result<Array, Error>
@@ -1230,7 +1230,7 @@ impl GptOssModel {
              hidden: &crate::MlxTensor,
              state: &mut Cache,
              forward: &mut eredu_architectures::gpt_oss::ForwardContext<crate::MlxTensor>,
-             parallel: &safemlx::distributed::Group,
+             parallel: &crate::backend::runtime::distributed::Group,
              context: &Stream| {
                 <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
                     MlxNeuralBackend,

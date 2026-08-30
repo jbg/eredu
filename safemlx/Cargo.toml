@@ -21,11 +21,8 @@ targets = [
 ]
 
 [dependencies]
-eredu-gguf.workspace = true
 safemlx-sys = { workspace = true, default-features = false }
 safemlx-internal-macros.workspace = true
-safemlx-macros.workspace = true
-dyn-clone = "1"
 half = "2"
 num-complex = "0.4"
 num_enum = "0.7"
@@ -35,7 +32,6 @@ smallvec = "1"
 strum = { version = "0.28", features = ["derive"] }
 thiserror.workspace = true
 parking_lot = "0.12"
-itertools.workspace = true
 
 # optional dependencies
 safetensors = { version = "0.8", optional = true }
@@ -45,10 +41,6 @@ bytemuck = { version = "1", optional = true, features = ["extern_crate_std"] }
 pretty_assertions = "1"
 float_eq = "1"
 tempfile = "3"
-
-[[bench]]
-name = "native_quantization"
-harness = false
 
 [features]
 default = ["accelerate", "metal"]

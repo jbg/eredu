@@ -3,27 +3,30 @@
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::{GatedProductActivation, GatedProductPolicy, TensorParallelExpertOutput};
 
+use eredu_backend_mlx_macros::ModuleParameters;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use ref_cast::RefCast;
 use safemlx::{
     error::Exception,
-    macros::ModuleParameters,
-    module::Param,
-    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     ops::{
-        arange, argpartition_axis, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode,
-        gather_route_values, grouped_matmul,
+        arange, argpartition_axis, concatenate_axis, gather_qmm_with_mode,
         indexing::{scatter_single, take_along_axis, topk_axis, NewAxis, TryIndexOp},
         matmul, mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
-        sigmoid, softmax_axis, sum_axis, topk_route_plan, zeros_dtype, GroupedRoutePlan,
-        QuantizationMode,
+        sigmoid, softmax_axis, sum_axis, zeros_dtype, QuantizationMode,
     },
     Array, Dtype, Stream,
 };
 
-use crate::MlxTensor;
+use crate::{
+    module::Param,
+    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
+    MlxTensor,
+};
 
 use super::layers::{relu2, silu};
+use super::routing::{
+    gather_grouped_rows, gather_route_values, grouped_matmul, topk_route_plan, GroupedRoutePlan,
+};
 
 /// Applies one affine- or MXFP4-packed expert projection to expert-major rows.
 ///
@@ -164,7 +167,7 @@ impl TopKRouterScoreFunction {
             Self::Softmax => softmax_axis(logits, -1, true, stream),
             Self::SelectedSoftmax => Ok(logits),
             Self::Sigmoid => sigmoid(logits, stream),
-            Self::SqrtSoftplus => safemlx::nn::softplus(logits, stream)?.sqrt(stream),
+            Self::SqrtSoftplus => super::layers::softplus(logits, stream)?.sqrt(stream),
         }
     }
 }
@@ -202,8 +205,9 @@ pub struct TopKRouterConfig {
     pub route_scale: bool,
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
 /// Reusable top-k router for sparse MoE layers.
+#[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct TopKRouter {
     /// Number of selected experts per token.
     pub top_k: i32,
@@ -802,8 +806,9 @@ pub fn weighted_route_sum(
     sum_axis(ordered, 1, false, stream)
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
 /// Packed routed ReLU2 expert bank with dense, affine, MXFP4, or GGUF-native IQ storage.
+#[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct PackedRelu2Experts {
     /// Number of routed experts.
     pub num_experts: i32,
@@ -1080,8 +1085,9 @@ impl PackedRelu2Experts {
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
 
-#[derive(Debug, Clone, ModuleParameters)]
 /// Packed gated-product expert bank with optional MLX affine or MXFP4 projections.
+#[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct PackedGatedProductExperts {
     /// Number of experts.
     pub num_experts: i32,
@@ -1419,7 +1425,9 @@ impl PackedGatedProductExperts {
                 )?,
                 stream,
             )?,
-            GatedProductActivation::GeluApproximate => safemlx::nn::gelu_approximate(gate, stream)?,
+            GatedProductActivation::GeluApproximate => {
+                super::layers::gelu_approximate(gate, stream)?
+            }
         };
         let activated = gate.multiply(up, stream)?;
         let output = if self.native_fp8_e8m0 {
@@ -1542,7 +1550,8 @@ impl PackedGatedProductExperts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safemlx::{module::Param, transforms::eval, Device, DeviceType, ExecutionContext};
+    use crate::{backend::ExecutionContext, module::Param};
+    use safemlx::{transforms::eval, Device, DeviceType};
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

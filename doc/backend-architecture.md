@@ -19,11 +19,16 @@ eredu-core        eredu-checkpoint        eredu-nn
 ```
 
 The neutral crates contain no native accelerator dependency under any feature.
-`safemlx` is a low-level implementation dependency of `eredu-backend-mlx`. It
-owns safe MLX arrays, operations, streams, collectives, graph transforms, and
-reusable neural-network primitives, but no concrete model architecture or
-complete encoder/decoder stack. Model-family construction and equations remain
-in `eredu-architectures`; MLX-specific realization remains in
+`safemlx` is the native-binding dependency of `eredu-backend-mlx`. It owns safe
+wrappers for MLX arrays, operations, devices, streams, collectives, graph
+transforms, serialization, and accelerator/runtime handles. It owns no
+framework abstractions: neural-network modules, quantization policy, mutable
+execution state, GGUF materialization, and composed backend operations belong
+to `eredu-backend-mlx`. This includes logical distributed subgroups and
+axis-aware gathers composed over MLX's native collective primitives;
+`safemlx::distributed` exposes only MLX-native groups and communication calls.
+Model-family construction and equations remain in
+`eredu-architectures`; MLX-specific realization remains in
 `eredu-backend-mlx`.
 `eredu-codec` owns backend-neutral neural audio codec architectures and depends
 on the neutral tensor contracts in `eredu-nn`. A concrete backend may depend on

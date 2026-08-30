@@ -34,17 +34,11 @@ use safemlx::ops::{
     matmul, maximum, r#where, sigmoid, softmax_axis,
 };
 use safemlx::{
-    builder::Builder,
-    distributed::Group,
-    fast::ScaledDotProductAttentionMask,
-    module::{Module, ModuleParam, ModuleParamMut, ModuleParamRef, ModuleParameters},
-    nested::NestedValue,
-    nn,
-    quantization::MaybeQuantized,
-    Array, Dtype, Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer,
-    Stream,
+    fast::ScaledDotProductAttentionMask, Array, Dtype, Event, HostTransferBuffer,
+    HostTransferPolicy, ImmutableHostTransferBuffer, Stream,
 };
 
+use crate::backend::runtime::distributed::Group;
 use crate::backend::{
     nn::{
         self as common,
@@ -57,6 +51,12 @@ use crate::backend::{
     },
 };
 use crate::MlxTensor;
+use crate::{
+    module::{Module, ModuleParam, ModuleParamMut, ModuleParamRef, ModuleParameters},
+    nested::NestedValue,
+    nn,
+    quantization::MaybeQuantized,
+};
 
 fn bind_linear_companion(weight: &ParameterSpec, mut companion: ParameterSpec) -> ParameterSpec {
     companion.linear_companion_of = Some(weight.id.clone());
@@ -1612,7 +1612,9 @@ impl NeuralBackend for MlxNeuralBackend {
         let mask = compute(valid.expand_dims(-1, context))?;
         let zero_value = compute(safemlx::ops::zeros_like(&value, context))?;
         let value = compute(safemlx::ops::r#where(&mask, &value, &zero_value, context))?;
-        compute_tensor(safemlx::distributed::all_sum(&value, parallel, context))
+        compute_tensor(crate::backend::runtime::distributed::all_sum(
+            &value, parallel, context,
+        ))
     }
 
     fn vocabulary_parallel_project(
@@ -1639,7 +1641,7 @@ impl NeuralBackend for MlxNeuralBackend {
             })
             .collect::<Result<Vec<_>, _>>()?;
         compute_tensor(
-            safemlx::distributed::all_gather_uneven_axis(
+            crate::backend::distributed::all_gather_uneven_axis(
                 &local, -1, &widths, parallel, context,
             )
             .map_err(|error| {
@@ -1679,7 +1681,7 @@ impl NeuralBackend for MlxNeuralBackend {
             })
             .collect::<Result<Vec<_>, _>>()?;
         compute_tensor(
-            safemlx::distributed::all_gather_uneven_axis(
+            crate::backend::distributed::all_gather_uneven_axis(
                 &local, -1, &widths, parallel, context,
             )
             .map_err(|error| {
@@ -2569,7 +2571,7 @@ impl NeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(safemlx::distributed::all_sum(
+        compute_tensor(crate::backend::runtime::distributed::all_sum(
             value.as_array(),
             parallel,
             context,
@@ -2924,12 +2926,14 @@ mod neutral_semantic_operator_tests {
     };
     use safemlx::{
         ops::{quantize_with_mode, QuantizationMode},
-        quantization::MaybeQuantized,
         transforms::async_eval_with_event,
-        Array, Device, DeviceType, Dtype, ExecutionContext,
+        Array, Device, DeviceType, Dtype,
     };
 
-    use crate::backend::nn::tensor::TokenValidationScope;
+    use crate::{
+        backend::{nn::tensor::TokenValidationScope, ExecutionContext},
+        quantization::MaybeQuantized,
+    };
 
     use super::{MlxEmbedding, MlxLinear, MlxNeuralBackend, MlxTensor};
 

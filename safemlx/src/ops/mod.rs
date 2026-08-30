@@ -1,15 +1,12 @@
 //! Operations
 
 mod arithmetic;
-mod compact;
 mod conversion;
 mod convolution;
 mod cumulative;
 mod factory;
-mod gguf;
 mod io;
 mod logical;
-mod moe;
 mod other;
 mod quantization;
 mod reduction;
@@ -19,17 +16,11 @@ mod sort;
 pub mod indexing;
 
 pub use arithmetic::*;
-pub use compact::*;
 pub use conversion::*;
 pub use convolution::*;
 pub use cumulative::*;
 pub use factory::*;
-pub use gguf::{
-    GgufAffineTensor, GgufArray, GgufCheckpoint, GgufMaterializer, GgufMxFp4Tensor, GgufRawTensor,
-    GgufTensor, GgufTensorIter,
-};
 pub use logical::*;
-pub use moe::*;
 pub use other::*;
 pub use quantization::*;
 pub use reduction::*;

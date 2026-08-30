@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    marker::PhantomData,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -13,12 +14,13 @@ use eredu_core::{
     balanced_contiguous_range, ParallelAxis, ParallelRankTopology, SubgroupMembership,
 };
 use eredu_runtime::TensorPlacement;
-use safemlx::{distributed::Group, Array, Stream};
+use safemlx::{distributed::Group as NativeGroup, Array, Stream};
 
 use crate::{
     backend::error::Error, backend::runtime::checkpoint::store::MlxParameterMaterializationContext,
 };
 
+use crate::backend::runtime::distributed::Group;
 #[cfg(test)]
 use crate::backend::DeviceAssignment;
 use crate::backend::MlxParallelContext;
@@ -33,10 +35,11 @@ use safemlx::{Device, DeviceType};
 /// original group without splitting it.
 pub struct ParallelCommunicators<'a> {
     topology: MlxParallelContext,
-    world: &'a Group,
+    world: Group,
     tensor: AxisCommunicator,
     pipeline: AxisCommunicator,
     expert: AxisCommunicator,
+    _world: PhantomData<&'a NativeGroup>,
 }
 
 struct AxisCommunicator {
@@ -60,7 +63,7 @@ impl std::fmt::Debug for ParallelCommunicators<'_> {
 
 impl<'a> ParallelCommunicators<'a> {
     /// Validates the world group and materializes every required native subgroup.
-    pub fn new(topology: MlxParallelContext, world: &'a Group) -> Result<Self, Error> {
+    pub fn new(topology: MlxParallelContext, world: &'a NativeGroup) -> Result<Self, Error> {
         if world.rank() != topology.global_rank || world.size() != topology.world_size {
             return Err(Error::Parallel(format!(
                 "parallel topology expects world rank {}/{} but received {}/{}",
@@ -70,15 +73,17 @@ impl<'a> ParallelCommunicators<'a> {
                 world.size()
             )));
         }
-        let tensor = Self::materialize(topology, world, ParallelAxis::Tensor)?;
-        let pipeline = Self::materialize(topology, world, ParallelAxis::Pipeline)?;
-        let expert = Self::materialize(topology, world, ParallelAxis::Expert)?;
+        let world = Group::native(world);
+        let tensor = Self::materialize(topology, &world, ParallelAxis::Tensor)?;
+        let pipeline = Self::materialize(topology, &world, ParallelAxis::Pipeline)?;
+        let expert = Self::materialize(topology, &world, ParallelAxis::Expert)?;
         Ok(Self {
             topology,
             world,
             tensor,
             pipeline,
             expert,
+            _world: PhantomData,
         })
     }
 
@@ -133,7 +138,7 @@ impl<'a> ParallelCommunicators<'a> {
 
     /// Returns the global communication group.
     pub const fn world(&self) -> &Group {
-        self.world
+        &self.world
     }
 
     /// Returns the native group for a non-singleton axis.
@@ -147,7 +152,7 @@ impl<'a> ParallelCommunicators<'a> {
         if communicator.membership.size == 1 {
             None
         } else if communicator.membership.size == self.topology.world_size {
-            Some(self.world)
+            Some(&self.world)
         } else {
             communicator.native.as_ref()
         }

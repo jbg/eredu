@@ -813,12 +813,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
-name = "dyn-clone"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
-
-[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -881,6 +875,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu-architectures",
+ "eredu-backend-mlx-macros",
  "eredu-checkpoint",
  "eredu-codec",
  "eredu-core",
@@ -889,13 +884,16 @@ dependencies = [
  "eredu-nn",
  "eredu-runtime",
  "eredu-text",
+ "float_eq",
  "half",
  "image",
  "libc",
  "memmap2",
+ "pretty_assertions",
  "ref-cast",
  "rustfft",
  "safemlx",
+ "safemlx-internal-macros",
  "safetensors",
  "serde",
  "serde_json",
@@ -903,6 +901,15 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "eredu-backend-mlx-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2820,11 +2827,8 @@ name = "safemlx"
 version = "0.2.0"
 dependencies = [
  "bytemuck",
- "dyn-clone",
- "eredu-gguf",
  "float_eq",
  "half",
- "itertools 0.15.0",
  "num-complex",
  "num-traits",
  "num_enum",
@@ -2832,7 +2836,6 @@ dependencies = [
  "paste",
  "pretty_assertions",
  "safemlx-internal-macros",
- "safemlx-macros",
  "safemlx-sys",
  "safetensors",
  "smallvec",
@@ -2846,15 +2849,6 @@ name = "safemlx-internal-macros"
 version = "0.1.2"
 dependencies = [
  "itertools 0.15.0",
- "proc-macro2",
- "quote",
- "syn 3.0.3",
-]
-
-[[package]]
-name = "safemlx-macros"
-version = "0.1.2"
-dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",

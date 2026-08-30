@@ -1,8 +1,9 @@
 //! MLX executor adapter for checkpoint-embedded prediction heads.
 
+use crate::backend::runtime::distributed::Group;
 use eredu_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 use eredu_runtime::{DraftStateTransaction, SpeculativeSampler};
-use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
     backend::error::Error,
@@ -78,7 +79,7 @@ impl<S: SpeculativeSampler<MlxSamplingBackend>> SpeculativeSampler<MlxSamplingBa
         &self,
         logits: &MlxTensor,
         temperature: f32,
-        prng_state: Option<&mut safemlx::random::RandomState>,
+        prng_state: Option<&mut crate::backend::random::RandomState>,
         stream: &Stream,
     ) -> Result<MlxTensor, Exception> {
         let sampled = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(

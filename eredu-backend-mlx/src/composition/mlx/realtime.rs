@@ -29,14 +29,15 @@ use eredu_runtime::{
     RuntimeState, SequentialDecisionPlan,
 };
 use safemlx::{
-    distributed::Group,
     ops::{indexing::TryIndexOp, stack_axis},
-    random::{self, RandomState},
+    random,
     transforms::async_eval_with_event,
     Array, Dtype, Event, Stream,
 };
 
+use crate::backend::runtime::distributed::Group;
 use crate::{
+    backend::random::RandomState,
     backend::runtime::{
         cache::state::{MlxKeyValueState, MlxKeyValueTransactionBranch},
         checkpoint::artifact::LoadedArtifactIdentity,
@@ -1693,8 +1694,10 @@ mod tests {
     fn moshi_mlx_scheduler_transaction_rollback_release_resume() {
         let directory = tempfile::tempdir().expect("tiny scheduler artifact directory");
         write_tiny_native_artifact(directory.path(), None);
-        let execution =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let execution = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Gpu,
+            0,
+        ));
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = load_realtime_model_with_options(
@@ -1837,8 +1840,10 @@ mod tests {
     #[test]
     #[ignore = "requires local MLX Metal execution"]
     fn mlx_realtime_input_domains_are_deferred_and_strict() {
-        let execution =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let execution = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Gpu,
+            0,
+        ));
         let stream = execution.stream();
         let config = eredu_architectures::moshi::MoshiConfig::from_json(TINY_NATIVE_CONFIG)
             .expect("tiny native Moshi config");
@@ -2070,8 +2075,10 @@ mod tests {
             Path::new(&reference_path).is_file(),
             "{reference_env} is not a file"
         );
-        let execution =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let execution = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Gpu,
+            0,
+        ));
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = backend
@@ -2307,8 +2314,10 @@ mod tests {
         );
         let fixture_path = std::env::var_os("EREDU_PERSONAPLEX_TEACHER_FIXTURE")
             .expect("EREDU_PERSONAPLEX_TEACHER_FIXTURE must accompany the model fixture");
-        let execution =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let execution = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Gpu,
+            0,
+        ));
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let fixture = Array::load_safetensors(Path::new(&fixture_path), execution.stream())
             .expect("load PersonaPlex parity fixture");
@@ -2343,8 +2352,10 @@ mod tests {
         );
         let fixture_path = std::env::var_os("EREDU_MOSHI_TEACHER_FIXTURE")
             .expect("EREDU_MOSHI_TEACHER_FIXTURE must accompany the model fixture");
-        let execution =
-            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let execution = crate::backend::ExecutionContext::new(safemlx::Device::new(
+            safemlx::DeviceType::Gpu,
+            0,
+        ));
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = load_realtime_model_with_options(

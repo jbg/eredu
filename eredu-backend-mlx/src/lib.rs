@@ -22,12 +22,50 @@ mod composition;
 
 pub use adapter::*;
 
+pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn, quantization};
+pub(crate) use safemlx::{ops, transforms, Array, Dtype, Stream};
+
+#[cfg(test)]
+pub(crate) mod macros {
+    pub(crate) use eredu_backend_mlx_macros::*;
+}
+
+#[cfg(test)]
+pub(crate) use safemlx::{array, Device, DeviceType};
+
+#[cfg(test)]
+pub(crate) fn test_stream() -> &'static Stream {
+    Box::leak(Box::new(Stream::new_with_device(&safemlx::Device::new(
+        safemlx::DeviceType::Cpu,
+        0,
+    ))))
+}
+
+#[cfg(test)]
+pub(crate) mod array {
+    use safemlx::{Array, ArrayElement};
+
+    pub(crate) fn eval_vec<T>(array: &Array) -> Vec<T>
+    where
+        T: ArrayElement + Clone,
+    {
+        array.evaluated().unwrap().as_slice::<T>().to_vec()
+    }
+
+    pub(crate) fn eval_equal_values(lhs: &Array, rhs: &Array) -> bool {
+        let lhs = lhs.evaluated().unwrap();
+        let rhs = rhs.evaluated().unwrap();
+        lhs.equal_values(&rhs)
+    }
+}
+
 /// Native MLX handles and composition-owned integrations for backend tooling.
 ///
 /// This namespace supports explicit device, stream, memory, tensor, model
 /// session, inspection, drafting, and realtime integration work. Reusable MLX
 /// backend facilities are organized under [`backend`].
 pub mod native {
+    pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
         MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,

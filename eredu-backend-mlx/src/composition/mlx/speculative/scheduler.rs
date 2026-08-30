@@ -559,8 +559,9 @@ fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
 mod tests {
     use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+    use crate::backend::ExecutionContext;
     use eredu_core::{SpeculativeCommit, SpeculativePrefill, Submission};
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
 
     use super::*;
     use crate::backend::runtime::media::input::InputPart;

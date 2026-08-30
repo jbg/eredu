@@ -1030,7 +1030,7 @@ impl KimiLinearModel {
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         mut execute: F,
         stream: &Stream,
     ) -> Result<Array, Error>
@@ -1055,7 +1055,7 @@ impl KimiLinearModel {
              hidden: &crate::MlxTensor,
              state: &mut MlxHybridState,
              forward: &mut eredu_architectures::kimi_linear::ForwardContext<crate::MlxTensor>,
-             parallel: &safemlx::distributed::Group,
+             parallel: &crate::backend::runtime::distributed::Group,
              context: &Stream| {
                 <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
                     MlxNeuralBackend,
@@ -1118,7 +1118,7 @@ impl KimiLinearModel {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let input = eredu_architectures::decoder::LayeredInput {
@@ -1146,7 +1146,7 @@ impl KimiLinearModel {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {

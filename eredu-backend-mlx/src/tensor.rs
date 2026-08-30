@@ -1,3 +1,4 @@
+use crate::nn;
 use eredu_nn::{
     multimodal::{MaskedOutputProjectionInput, MultiAxisRotaryLayout, MultiAxisRotarySpec},
     AttentionMask, Error, Index, PadMode, Tensor,
@@ -6,7 +7,6 @@ use ref_cast::RefCast;
 use safemlx::{
     argmin_axis,
     fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask},
-    nn,
     ops::{
         addmm, argpartition_axis, concatenate_axis, conv1d, conv2d, conv_transpose1d, full,
         indexing::{put_along_axis, ArrayIndex, ArrayIndexOp, NewAxis, TryIndexOp},
@@ -686,13 +686,14 @@ impl Tensor for MlxTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ExecutionContext;
     use eredu_nn::multimodal::{
         masked_output_projection, multi_axis_rotary_embeddings, project_flattened_patches,
         reference_flattened_patch_projection, reference_masked_output_projection,
         reference_multi_axis_rotary_embeddings, FlattenedPatchSpec, MaskedOutputProjectionInput,
         MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
     };
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
 
     fn close(actual: &Array, expected: &[f32]) {
         let actual = actual.evaluated().unwrap();

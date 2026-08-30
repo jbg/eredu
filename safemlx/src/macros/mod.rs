@@ -5,5 +5,3 @@ mod internal;
 
 mod array;
 mod assert;
-
-pub use safemlx_macros::*;

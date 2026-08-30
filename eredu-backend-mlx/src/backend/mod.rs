@@ -2,15 +2,19 @@
 
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub mod cache;
+mod compaction;
 pub mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 /// Errors produced by MLX model loading and execution.
 pub mod error;
+mod execution;
 #[cfg(any(feature = "image", feature = "audio"))]
 mod media;
 /// Reusable MLX neural-network building blocks.
 pub mod nn;
+/// Stateful random-key ownership for backend sessions.
+pub mod random;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
 /// MLX-only tensor, checkpoint, execution, and residency infrastructure.
@@ -20,6 +24,7 @@ pub mod topology;
 pub(crate) use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub(crate) use distributed::MlxDistributedSession;
+pub use execution::ExecutionContext;
 #[cfg(test)]
 pub(crate) use topology::DeviceAssignment;
 pub(crate) use topology::MlxParallelContext;
@@ -483,8 +488,9 @@ impl<'a> BackendProvider for MlxBackend<'a> {
 )]
 mod tests {
     use super::{device_capabilities, MlxBackend, MlxDeviceIdentity};
+    use crate::backend::ExecutionContext;
     use eredu_core::BackendProvider as _;
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
 
     #[test]
     fn collective_capability_requires_an_attached_world() {

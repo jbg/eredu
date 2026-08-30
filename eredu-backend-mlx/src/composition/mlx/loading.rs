@@ -985,7 +985,7 @@ fn reject_complete_tensor_parallel_quantization(
 }
 
 pub fn validate_gguf_quantization_source(
-    source: &safemlx::ops::GgufCheckpoint,
+    source: &crate::backend::runtime::checkpoint::gguf::GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
 ) -> Result<(), Error> {

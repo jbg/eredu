@@ -13,7 +13,7 @@ use eredu_runtime::{ParameterGroupSpec, ParameterRole, WeightBinding, WeightBind
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use safemlx::{module::FlattenedModuleParamRef, Array, Stream};
+use safemlx::{Array, Stream};
 
 use crate::{
     backend::error::Error,
@@ -29,6 +29,7 @@ use crate::{
         MlxParameterMaterializationContext, WeightMaterialization,
     },
     backend::runtime::residency::manager::ResidentUnitLease,
+    module::FlattenedModuleParamRef,
 };
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -941,6 +942,8 @@ pub enum ModuleBindingError {
 )]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use crate::{backend::ExecutionContext, module::ModuleParameters};
     use eredu_checkpoint::store::MemoryWeightStore;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_checkpoint::AffineQuantization;
@@ -950,7 +953,7 @@ mod tests {
         ParameterSpec, ParameterVisitor, ParameterVisitorMut,
     };
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]

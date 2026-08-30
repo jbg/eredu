@@ -25,12 +25,10 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use safemlx::{
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufTensor},
-    transforms::async_eval_with_event,
-    Array, Event, Stream,
-};
+use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Event, Stream};
 use safetensors::tensor::{Dtype, TensorView};
+
+use super::gguf::{GgufCheckpoint, GgufTensor};
 
 #[cfg(test)]
 use eredu_checkpoint::gguf_store::GgufPhysicalSelection;

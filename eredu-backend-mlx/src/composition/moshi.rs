@@ -246,7 +246,7 @@ impl MoshiModel {
         input: moshi::Input<'a, Array>,
         state: &mut MlxKeyValueState,
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, S>,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error>
     where

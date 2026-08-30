@@ -730,13 +730,13 @@ pub struct NemotronHModel {
 /// Collective context adapter for the same neutral embedded-MTP target.
 pub struct NemotronHTensorMtpTarget<'a> {
     model: &'a mut NemotronHModel,
-    group: &'a safemlx::distributed::Group,
+    group: &'a crate::backend::runtime::distributed::Group,
 }
 
 impl<'a> NemotronHTensorMtpTarget<'a> {
     pub const fn new(
         model: &'a mut NemotronHModel,
-        group: &'a safemlx::distributed::Group,
+        group: &'a crate::backend::runtime::distributed::Group,
     ) -> Self {
         Self { model, group }
     }
@@ -1183,7 +1183,7 @@ impl NemotronHModel {
         &mut self,
         input: eredu_architectures::nemotron_h::EmbeddedInput<'_, Array>,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = match &input {
@@ -1404,7 +1404,7 @@ impl NemotronHModel {
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         mut execute: F,
         stream: &Stream,
     ) -> Result<Array, Error>
@@ -1424,7 +1424,7 @@ impl NemotronHModel {
              hidden: &crate::MlxTensor,
              state: &mut MlxHybridState,
              forward: &mut eredu_architectures::nemotron_h::ForwardContext<crate::MlxTensor>,
-             parallel: &safemlx::distributed::Group,
+             parallel: &crate::backend::runtime::distributed::Group,
              context: &Stream| {
                 architecture.forward_unit_parallel_with_provider(
                     group_index,
@@ -1459,7 +1459,7 @@ impl NemotronHModel {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        tensor_group: Option<&safemlx::distributed::Group>,
+        tensor_group: Option<&crate::backend::runtime::distributed::Group>,
         mut execute: F,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
@@ -1481,7 +1481,7 @@ impl NemotronHModel {
         tokens: &Array,
         depth: usize,
         cache: &mut MlxHybridState,
-        tensor_group: Option<&safemlx::distributed::Group>,
+        tensor_group: Option<&crate::backend::runtime::distributed::Group>,
         mut execute: F,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
@@ -1501,7 +1501,7 @@ impl NemotronHModel {
         &mut self,
         input: eredu_architectures::nemotron_h::EmbeddedInput<'a, Array>,
         cache: &mut MlxHybridState,
-        tensor_group: Option<&safemlx::distributed::Group>,
+        tensor_group: Option<&crate::backend::runtime::distributed::Group>,
         execute: &mut F,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
@@ -1527,7 +1527,7 @@ impl NemotronHModel {
                             forward: &mut eredu_architectures::nemotron_h::ForwardContext<
                     crate::MlxTensor,
                 >,
-                            parallel: &safemlx::distributed::Group,
+                            parallel: &crate::backend::runtime::distributed::Group,
                             context: &Stream| {
                     architecture.forward_unit_parallel_with_provider(
                         group_index,
@@ -1608,7 +1608,7 @@ impl NemotronHModel {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let input = eredu_architectures::nemotron_h::EmbeddedInput::target(
@@ -1636,7 +1636,7 @@ impl NemotronHModel {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {

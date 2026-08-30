@@ -189,7 +189,7 @@ impl QwenVlPipelineBindings {
         typed: input::ModelInput<'_>,
         offset: i32,
         delta: Option<&Array>,
-        parallel: Option<&safemlx::distributed::Group>,
+        parallel: Option<&crate::backend::runtime::distributed::Group>,
         stream: &Stream,
     ) -> Result<vl::PipelineVisionState<crate::MlxTensor>, Error> {
         let args = architecture.args().clone();

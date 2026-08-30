@@ -51,19 +51,16 @@ use safemlx_sys::mlx_closure_value_and_grad;
 
 use crate::{
     error::{get_and_clear_closure_error, Result},
-    module::ModuleParamRef,
     utils::{guard::Guarded, runtime_lock, Closure, VectorArray, SUCCESS},
     Array, Event, Stream, TimedEvaluation,
 };
 
 pub mod compile;
 mod grad;
-mod keyed_value_and_grad;
 mod transform_guard;
 mod value_and_grad;
 
 pub use grad::*;
-pub use keyed_value_and_grad::*;
 pub use value_and_grad::*;
 
 /// Return `inputs` unchanged while making them depend on `dependencies`.
@@ -93,13 +90,6 @@ pub fn eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
     let vec = VectorArray::try_from_iter(outputs.into_iter())?;
     let _guard = runtime_lock::enter();
     <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_eval(vec.as_ptr()) })
-}
-
-/// Evaluate a module's parameters.
-///
-/// This is a convenience function that flattens the parameters and evaluates them.
-pub fn eval_params(params: ModuleParamRef<'_>) -> Result<()> {
-    eval(params.flatten().values().copied())
 }
 
 /// Asynchronously evaluate an iterator of [`Array`]s.
@@ -159,13 +149,6 @@ pub fn async_eval_timed<'a>(
         safemlx_sys::mlx_async_eval_timed(event, vec.as_ptr(), stream.c_stream)
     })
     .map(TimedEvaluation::from_completion)
-}
-
-/// Asynchronously evaluate a module's parameters.
-///
-/// This is a convenience function that flattens the parameters and evaluates them.
-pub fn async_eval_params(params: ModuleParamRef<'_>) -> Result<()> {
-    async_eval(params.flatten().values().copied())
 }
 
 #[inline]

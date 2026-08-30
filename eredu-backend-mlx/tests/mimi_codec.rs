@@ -1,11 +1,9 @@
 #![cfg(feature = "codec")]
 
-use eredu_backend_mlx::{codec::mimi::load, MlxTensor};
+use eredu_backend_mlx::{codec::mimi::load, native::ExecutionContext, MlxTensor};
 use eredu_codec::AudioTokenizer;
 use eredu_nn::Tensor;
-use safemlx::{
-    ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType, ExecutionContext,
-};
+use safemlx::{ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType};
 
 #[test]
 #[ignore = "requires EREDU_MIMI_PATH with a released Mimi safetensors checkpoint and Metal"]

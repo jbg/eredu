@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 
+use super::routing::grouped_matmul;
 #[cfg(feature = "cuda")]
 use safemlx::fast::CudaKernel;
 use safemlx::fast::CustomKernelConfig;
@@ -18,7 +19,7 @@ use safemlx::fast::MetalKernel;
 use safemlx::{
     error::Exception,
     ops::{
-        concatenate_axis, grouped_matmul,
+        concatenate_axis,
         indexing::{take, TryIndexOp},
         matmul,
     },
@@ -1258,7 +1259,8 @@ mod tests {
         let decoded = decoded.evaluated().unwrap();
         assert_eq!(decoded.as_slice::<f32>(), &[1.0, 2.0, 0.5]);
     }
-    use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype, ExecutionContext};
+    use crate::backend::ExecutionContext;
+    use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype};
 
     fn assert_block_fp8_dense_and_grouped_projections(device_type: DeviceType) {
         let context = ExecutionContext::new(Device::new(device_type, 0));

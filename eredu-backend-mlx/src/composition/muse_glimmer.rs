@@ -21,9 +21,11 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint},
+    ops::{concatenate_axis, indexing::TryIndexOp},
     Stream,
 };
+
+use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 
 use crate::backend::{
     error::Error,
@@ -1108,7 +1110,7 @@ impl MuseGlimmerModel {
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if state.layout() != &self.state_layout {
@@ -1133,7 +1135,7 @@ impl MuseGlimmerModel {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
@@ -1164,7 +1166,7 @@ impl MuseGlimmerModel {
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1186,7 +1188,7 @@ impl MuseGlimmerModel {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1223,7 +1225,7 @@ impl MuseGlimmerModel {
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1315,7 +1317,7 @@ impl MuseGlimmerModel {
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if state.layout() != &self.state_layout {

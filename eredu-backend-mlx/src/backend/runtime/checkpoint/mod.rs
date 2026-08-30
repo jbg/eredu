@@ -25,6 +25,8 @@ pub mod binding;
 pub mod binding_plan;
 /// Out-of-core transformation of dense bindings into packed weight stores.
 pub mod bounded_quantization;
+/// GGUF checkpoint access and bounded MLX tensor materialization.
+pub mod gguf;
 /// Strict checkpoint loading and validation.
 pub mod load;
 /// Generic affine checkpoint quantization and conversion.

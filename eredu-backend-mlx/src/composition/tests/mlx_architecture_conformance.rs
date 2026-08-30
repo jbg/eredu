@@ -1,8 +1,9 @@
 //! MLX composition conformance for backend-neutral architecture operators.
 
+use crate::backend::ExecutionContext;
 use eredu_nn::Tensor;
 use eredu_runtime::{DeviceState, LayeredArchitecture, LayeredForwardState};
-use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
+use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType};
 use std::sync::OnceLock;
 
 use crate::backend::{

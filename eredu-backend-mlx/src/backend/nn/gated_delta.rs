@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 
 #[cfg(not(feature = "cuda"))]
-use safemlx::fast::{CustomKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
+use safemlx::fast::{CustomKernelConfig, MetalKernel};
 #[cfg(not(feature = "cuda"))]
 use safemlx::DeviceType;
 use safemlx::{
@@ -35,6 +35,64 @@ const PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
 const PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
 #[cfg(not(feature = "cuda"))]
 const PREFILL_LONG_SCAN_TOKENS: i32 = 32;
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug)]
+struct RecurrentScanKernel {
+    decode: MetalKernel,
+    prefill: MetalKernel,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl RecurrentScanKernel {
+    fn apply<I, A>(
+        kernel: &MetalKernel,
+        inputs: I,
+        config: &CustomKernelConfig,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        let mut outputs = kernel.apply_device(inputs, config, stream)?;
+        if outputs.len() != 2 {
+            return Err(Exception::custom(format!(
+                "gated-delta kernel returned {} outputs, expected 2",
+                outputs.len()
+            )));
+        }
+        let state = outputs.remove(1);
+        let sequence = outputs.remove(0);
+        Ok((sequence, state))
+    }
+
+    fn decode<I, A>(
+        &self,
+        inputs: I,
+        config: &CustomKernelConfig,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        Self::apply(&self.decode, inputs, config, stream)
+    }
+
+    fn prefill<I, A>(
+        &self,
+        inputs: I,
+        config: &CustomKernelConfig,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<Array>,
+    {
+        Self::apply(&self.prefill, inputs, config, stream)
+    }
+}
 
 #[cfg(not(feature = "cuda"))]
 fn metal_kernels(vector_decay: bool) -> Result<RecurrentScanKernel, Exception> {
@@ -110,8 +168,8 @@ fn metal_kernels(vector_decay: bool) -> Result<RecurrentScanKernel, Exception> {
         prefill_decay_index = prefill_decay_index
     );
     let suffix = if vector_decay { "vector" } else { "scalar" };
-    Ok(RecurrentScanKernel::new(
-        StatefulMetalKernel::new(
+    Ok(RecurrentScanKernel {
+        decode: MetalKernel::new(
             format!("gated_delta_decode_{suffix}"),
             ["state", "query", "key", "value", "g", "beta"],
             ["out", "state_out"],
@@ -120,7 +178,7 @@ fn metal_kernels(vector_decay: bool) -> Result<RecurrentScanKernel, Exception> {
             true,
             false,
         )?,
-        StatefulMetalKernel::new(
+        prefill: MetalKernel::new(
             format!("gated_delta_prefill_{suffix}"),
             ["state", "query", "key", "value", "g", "beta"],
             ["out", "state_out"],
@@ -129,7 +187,7 @@ fn metal_kernels(vector_decay: bool) -> Result<RecurrentScanKernel, Exception> {
             true,
             false,
         )?,
-    ))
+    })
 }
 
 fn recurrent_step(
@@ -219,7 +277,7 @@ fn metal_scan_chunk(
         let kernel = cell.borrow();
         let kernel = kernel.as_ref().expect("gated-delta kernels initialized");
         if decode {
-            kernel.decode_device(
+            kernel.decode(
                 [&state, &query, &key, &value, &log_decay, &beta],
                 &config,
                 stream,
@@ -228,7 +286,7 @@ fn metal_scan_chunk(
             let config = config
                 .with_template_arg_int("L", sequence)
                 .with_template_arg_int("H", heads);
-            kernel.prefill_device(
+            kernel.prefill(
                 [&state, &query, &key, &value, &log_decay, &beta],
                 &config,
                 stream,
@@ -240,7 +298,7 @@ fn metal_scan_chunk(
     } else {
         SCALAR_KERNELS.with(run)?
     };
-    let (output, state) = output.into_tuple();
+    let (output, state) = output;
     Ok((state, output))
 }
 
@@ -379,8 +437,10 @@ pub fn gated_delta_scan(
 mod tests {
     use safemlx::{
         ops::{concatenate_axis, indexing::TryIndexOp},
-        Array, Device, DeviceType, ExecutionContext,
+        Array, Device, DeviceType,
     };
+
+    use crate::backend::ExecutionContext;
 
     use super::gated_delta_scan;
 

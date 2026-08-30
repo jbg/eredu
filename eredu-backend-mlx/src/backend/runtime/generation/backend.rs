@@ -4,14 +4,10 @@ use std::collections::HashMap;
 
 use eredu_runtime::{PenaltyConfig, SamplingBackend, TokenDomain};
 use safemlx::{
-    argmax_axis, array,
-    error::Exception,
-    ops::indexing::TryIndexOp,
-    random::{self, RandomState},
-    Array, Dtype, Stream,
+    argmax_axis, array, error::Exception, ops::indexing::TryIndexOp, random, Array, Dtype, Stream,
 };
 
-use crate::backend::nn::tensor::validate_token_domain;
+use crate::backend::{nn::tensor::validate_token_domain, random::RandomState};
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
 
@@ -322,13 +318,9 @@ mod tests {
     use eredu_runtime::{
         GenerationSampler, MirostatV2Sampler, Sampler, SamplingBackend, TokenDomain,
     };
-    use safemlx::{
-        random::{self, RandomState},
-        transforms::async_eval_with_event,
-        Array, Device, DeviceType, ExecutionContext,
-    };
+    use safemlx::{random, transforms::async_eval_with_event, Array, Device, DeviceType};
 
-    use crate::backend::nn::tensor::TokenValidationScope;
+    use crate::backend::{nn::tensor::TokenValidationScope, random::RandomState, ExecutionContext};
 
     #[test]
     fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {

@@ -21,7 +21,9 @@ use std::{
     sync::Arc,
 };
 
-use safemlx::{module::ModuleParameters, Dtype, Stream};
+use safemlx::{Dtype, Stream};
+
+use crate::module::ModuleParameters;
 
 use crate::{
     backend::error::Error,
@@ -572,10 +574,11 @@ fn collect_quantization_recipes(
 mod packed_weight_companion_tests {
     use super::*;
     use crate::backend::nn::shared::MlxNeuralBackend;
+    use crate::backend::ExecutionContext;
     use eredu_checkpoint::store::MemoryWeightStore;
     use eredu_checkpoint::AffineQuantization;
     use eredu_nn::{LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
 
     fn parameter(name: &str) -> ParameterSpec {
         ParameterSpec::trainable(name).unwrap()

@@ -3286,7 +3286,7 @@ mod tests {
             (0..10).map(|r| r as f32 / 9.0).collect(),
         ];
 
-        let mut random_state = random::RandomState::with_seed(42).unwrap();
+        let mut random_state = random::TestKeys::with_seed(42).unwrap();
 
         for (m, n, k) in shapes {
             for s in &all_segments {
@@ -3396,7 +3396,7 @@ mod tests {
         use crate::ops::indexing::take_axis;
         use crate::random;
 
-        let mut random_state = random::RandomState::with_seed(0).unwrap();
+        let mut random_state = random::TestKeys::with_seed(0).unwrap();
 
         // Reference implementation using take
         fn gather_mm_ref(
@@ -3483,7 +3483,7 @@ mod tests {
         use crate::ops::sort;
         use crate::random;
 
-        let mut random_state = random::RandomState::with_seed(0).unwrap();
+        let mut random_state = random::TestKeys::with_seed(0).unwrap();
 
         // Reference implementation
         fn gather_mm_ref(a: &Array, b: &Array, rhs: &Array, stream: &Stream) -> Array {

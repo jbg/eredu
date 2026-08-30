@@ -1048,7 +1048,7 @@ impl Lfm2Model {
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         mut execute: F,
         stream: &Stream,
     ) -> Result<Array, Error>
@@ -1072,7 +1072,7 @@ impl Lfm2Model {
                     hidden: &crate::MlxTensor,
                     state: &mut MlxHybridState,
                     forward: &mut eredu_architectures::lfm2::ForwardContext<crate::MlxTensor>,
-                    parallel: &safemlx::distributed::Group,
+                    parallel: &crate::backend::runtime::distributed::Group,
                     context: &Stream| {
             <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
                 MlxNeuralBackend,
@@ -1135,7 +1135,7 @@ impl Lfm2Model {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let input = eredu_architectures::decoder::LayeredInput {
@@ -1163,7 +1163,7 @@ impl Lfm2Model {
         &mut self,
         tokens: &Array,
         cache: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {

@@ -1315,11 +1315,12 @@ fn quantization_error(message: impl Into<String>) -> Error {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::{backend::runtime::checkpoint::gguf::GgufCheckpoint, backend::ExecutionContext};
     use eredu_checkpoint::{
         store::{ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, WeightStoreBackend},
         AffineQuantization,
     };
-    use safemlx::{ops::GgufCheckpoint, Device, DeviceType, ExecutionContext};
+    use safemlx::{Device, DeviceType};
     use safetensors::tensor::{serialize_to_file, TensorView};
     use tempfile::TempDir;
 

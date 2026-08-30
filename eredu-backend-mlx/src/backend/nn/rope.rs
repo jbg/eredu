@@ -1,12 +1,9 @@
 //! Rotary position embedding initialization and variants.
 
+use eredu_backend_mlx_macros::ModuleParameters;
 use eredu_nn::RotaryAlgorithm;
-use safemlx::macros::ModuleParameters;
 use safemlx::{
-    builder::Builder,
     error::Exception,
-    module::Module,
-    nn,
     ops::{
         arange, concatenate_axis, cos,
         indexing::{NewAxis, TryIndexOp},
@@ -15,12 +12,15 @@ use safemlx::{
     Array, Stream,
 };
 
+use crate::{module::Module, nn};
+
 /// Piecewise wavelength-based RoPE frequency scaling.
 ///
 /// Applies piecewise frequency scaling based on wavelength cutoffs derived from
 /// `low_freq_factor`, `high_freq_factor`, `factor`, and `original_max_position_embeddings`.
 // TODO: support derive ModuleParameters for structs with non-param Array fields
 #[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct FrequencyScaledRope {
     /// Number of rotary dimensions.
     pub dimensions: i32,
@@ -165,6 +165,7 @@ where
 /// MLX reciprocates to an effectively zero inverse frequency and therefore
 /// leaves unchanged for real context lengths.
 #[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct ProportionalRope {
     /// Head dimension passed to MLX RoPE.
     pub dimensions: i32,
@@ -178,6 +179,7 @@ pub struct ProportionalRope {
 
 /// YaRN rotary embeddings with frequency interpolation and attention scaling.
 #[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct YarnRope {
     /// Number of rotary dimensions.
     pub dimensions: i32,
@@ -378,7 +380,7 @@ pub enum RopeVariant {
 }
 
 // TODO: support derive ModuleParameters for enum
-impl safemlx::module::ModuleParameters for RopeVariant {
+impl crate::module::ModuleParameters for RopeVariant {
     fn num_parameters(&self) -> usize {
         match self {
             RopeVariant::Default(rope) => rope.num_parameters(),
@@ -406,7 +408,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
         }
     }
 
-    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+    fn parameters(&self) -> crate::module::ModuleParamRef<'_> {
         match self {
             RopeVariant::Default(rope) => rope.parameters(),
             RopeVariant::FrequencyScaled(rope) => rope.parameters(),
@@ -415,7 +417,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
         }
     }
 
-    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> crate::module::ModuleParamMut<'_> {
         match self {
             RopeVariant::Default(rope) => rope.parameters_mut(),
             RopeVariant::FrequencyScaled(rope) => rope.parameters_mut(),
@@ -424,7 +426,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
         }
     }
 
-    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> crate::module::ModuleParamRef<'_> {
         match self {
             RopeVariant::Default(rope) => rope.trainable_parameters(),
             RopeVariant::FrequencyScaled(rope) => rope.trainable_parameters(),

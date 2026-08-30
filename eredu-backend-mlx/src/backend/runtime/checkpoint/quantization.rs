@@ -503,12 +503,14 @@ fn write_planned_config(output_dir: &Path, config: &Value) -> Result<(), Error> 
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use crate::backend::ExecutionContext;
     use eredu_architectures::checkpoint_conversion::{
         SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
     };
     use eredu_gguf::{Endian, GgmlType};
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use safemlx::{Device, DeviceType, Dtype, ExecutionContext};
+    use safemlx::{Device, DeviceType, Dtype};
 
     use super::*;
 

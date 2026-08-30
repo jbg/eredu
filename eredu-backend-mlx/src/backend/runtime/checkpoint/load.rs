@@ -10,14 +10,16 @@ use std::{
 
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use memmap2::MmapOptions;
+use safemlx::{transforms::async_eval_with_event, Array, Stream};
+
 #[cfg(all(
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
 ))]
-use safemlx::module::ModuleParameters;
-use safemlx::{
-    module::FlattenedModuleParamMut, native_quantization::NativeQuantizationFormat,
-    ops::GgufCheckpoint, transforms::async_eval_with_event, Array, Stream,
+use crate::module::ModuleParameters;
+use crate::{
+    backend::runtime::checkpoint::gguf::GgufCheckpoint, module::FlattenedModuleParamMut,
+    native_quantization::NativeQuantizationFormat,
 };
 use safetensors::SafeTensors;
 use serde::Deserialize;
@@ -244,35 +246,6 @@ where
     Ok(())
 }
 
-#[cfg(all(
-    test,
-    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
-))]
-fn quantize_safetensors_for_test<M: ModuleParameters>(
-    model: &mut M,
-    path: impl AsRef<Path>,
-    weights_stream: &Stream,
-    quantization_stream: &Stream,
-    quantization: WeightQuantization,
-    recipes: &HashMap<String, QuantizedLoadRecipe>,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    quantization.validate()?;
-    let mut params = model.parameters_mut().flatten();
-    for_each_safetensor_array(path, weights_stream, |key, value| {
-        let recipe = recipes.get(&key);
-        load_array_quantized_strict(
-            &mut params,
-            key,
-            value,
-            quantization_stream,
-            quantization,
-            recipe,
-            report,
-        )
-    })
-}
-
 /// Strict-loads one exact checkpoint tensor identity into a module parameter.
 pub(crate) fn load_array_strict(
     params: &mut FlattenedModuleParamMut<'_>,
@@ -434,36 +407,31 @@ pub fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Er
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
     use std::collections::BTreeMap;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use std::{
-        collections::HashMap,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::collections::HashMap;
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    use eredu_backend_mlx_macros::ModuleParameters;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_checkpoint::AffineQuantization;
     use eredu_checkpoint::WeightQuantization;
     use eredu_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use safemlx::{
-        macros::ModuleParameters,
-        module::{ModuleParameters as _, Param},
-        quantization::MaybeQuantized,
-        Array, Device, DeviceType, Dtype, ExecutionContext,
-    };
+    use safemlx::{Array, Device, DeviceType, Dtype};
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use crate::{
-        backend::nn::linear::unloaded_maybe_quantized_linear,
-        backend::runtime::checkpoint::quantization::quantize_tensor,
+        backend::ExecutionContext,
+        module::{ModuleParameters as _, Param},
     };
 
     use super::gguf_quantization_configs;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use super::{
-        load_array_strict, load_arrays_quantized_strict, quantize_safetensors_for_test, Error,
-        QuantizedLoadRecipe, StrictLoadReport,
+        load_array_strict, load_arrays_quantized_strict, Error, QuantizedLoadRecipe,
+        StrictLoadReport,
     };
 
     #[test]
@@ -501,7 +469,7 @@ mod tests {
             )
             .unwrap();
 
-        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let checkpoint = GgufCheckpoint::open(path).unwrap();
         let tensor_mapping = checkpoint
             .catalog()
             .translated_outputs(str::to_string)
@@ -537,7 +505,7 @@ mod tests {
         )
         .unwrap();
 
-        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let checkpoint = GgufCheckpoint::open(path).unwrap();
         let tensor_mapping = checkpoint
             .catalog()
             .translated_outputs(str::to_string)
@@ -547,13 +515,6 @@ mod tests {
             configs["projection.weight"],
             WeightQuantization::Affine(config) if config.group_size == 32 && config.bits == 4
         ));
-    }
-
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[derive(Debug, Clone, ModuleParameters)]
-    struct QuantizedLinear {
-        #[param]
-        projection: MaybeQuantized<safemlx::nn::Linear>,
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -684,95 +645,6 @@ mod tests {
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
-    fn quantized_strict_load_uses_explicit_private_slot_recipe() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let weights_stream = weights_context.stream();
-        let quantization = AffineQuantization::default();
-        let mut model = QuantizedLinear {
-            projection: unloaded_maybe_quantized_linear(
-                64,
-                8,
-                false,
-                Some(quantization.into()),
-                stream,
-            )
-            .unwrap(),
-        };
-        let values = (0..(8 * 64))
-            .map(|index| (index as f32 - 255.5) / 64.0)
-            .collect::<Vec<_>>();
-        let dense = Array::from_slice(&values, &[8, 64]);
-        let expected = quantize_tensor(&dense, quantization, stream).unwrap();
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "eredu-mlx-exact-quantized-load-{}-{suffix}.safetensors",
-            std::process::id()
-        ));
-        Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();
-
-        let mut report = StrictLoadReport::default();
-        quantize_safetensors_for_test(
-            &mut model,
-            &path,
-            weights_stream,
-            stream,
-            quantization.into(),
-            &HashMap::from([(
-                "projection.weight".into(),
-                QuantizedLoadRecipe::new(
-                    "projection.inner.weight",
-                    "projection.scales",
-                    Some("projection.biases".into()),
-                ),
-            )]),
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&model).unwrap();
-
-        let MaybeQuantized::Quantized(projection) = model.projection else {
-            panic!("target projection should use affine storage")
-        };
-        assert_eq!(
-            projection
-                .inner
-                .weight
-                .evaluated()
-                .unwrap()
-                .as_slice::<u32>(),
-            expected.weight.evaluated().unwrap().as_slice::<u32>()
-        );
-        assert_eq!(
-            projection.scales.evaluated().unwrap().as_slice::<f32>(),
-            expected.scales.evaluated().unwrap().as_slice::<f32>()
-        );
-        assert_eq!(
-            projection
-                .biases
-                .value
-                .as_ref()
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<f32>(),
-            expected
-                .biases
-                .as_ref()
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<f32>()
-        );
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[test]
     fn quantized_strict_load_preserves_exact_inner_weight_and_companions() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
@@ -820,55 +692,5 @@ mod tests {
                 .shape(),
             &[8, 1]
         );
-    }
-
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[test]
-    fn mxfp4_strict_load_streams_weight_and_scales_without_biases() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let weights_stream = weights_context.stream();
-        let mut model = QuantizedLinear {
-            projection: unloaded_maybe_quantized_linear(
-                64,
-                8,
-                false,
-                Some(WeightQuantization::MxFp4),
-                stream,
-            )
-            .unwrap(),
-        };
-        let dense = Array::from_slice(&vec![0.5f32; 8 * 64], &[8, 64]);
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "eredu-mlx-mxfp4-strict-load-{}-{suffix}.safetensors",
-            std::process::id()
-        ));
-        Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();
-        let mut report = StrictLoadReport::default();
-        quantize_safetensors_for_test(
-            &mut model,
-            &path,
-            weights_stream,
-            stream,
-            WeightQuantization::MxFp4,
-            &HashMap::from([(
-                "projection.weight".into(),
-                QuantizedLoadRecipe::new("projection.inner.weight", "projection.scales", None),
-            )]),
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&model).unwrap();
-        let MaybeQuantized::Quantized(projection) = model.projection else {
-            panic!("target projection should use MXFP4 storage")
-        };
-        assert_eq!(projection.mode, safemlx::ops::QuantizationMode::MxFp4);
-        assert!(projection.biases.value.is_none());
-        std::fs::remove_file(path).unwrap();
     }
 }

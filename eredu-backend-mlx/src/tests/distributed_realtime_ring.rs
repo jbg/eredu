@@ -41,7 +41,7 @@ fn balanced_widths(total: usize) -> [usize; 2] {
 fn verify_canonical_vocabulary(
     total: usize,
     rank: usize,
-    group: &crate::native::distributed::Group,
+    group: &crate::backend::runtime::distributed::Group,
     stream: &Stream,
 ) {
     let widths = balanced_widths(total);
@@ -51,7 +51,9 @@ fn verify_canonical_vocabulary(
         .map(|token| i32::try_from(token).expect("test vocabulary fits i32"))
         .collect::<Vec<_>>();
     let local = Array::from_slice(&local, &[i32::try_from(local.len()).unwrap()]);
-    let gathered = distributed::all_gather_uneven_axis(&local, 0, &widths, group, stream).unwrap();
+    let gathered =
+        crate::backend::distributed::all_gather_uneven_axis(&local, 0, &widths, group, stream)
+            .unwrap();
     let gathered = gathered.evaluated().unwrap();
     let expected = (0..total)
         .map(|token| i32::try_from(token).expect("test vocabulary fits i32"))
@@ -65,7 +67,9 @@ fn moshi_ring_collective_worker() {
         return;
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
-    let group = distributed::init(true, Backend::Ring).unwrap();
+    let group = crate::backend::runtime::distributed::Group::native(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    );
     assert_eq!(group.size(), 2);
     assert_eq!(group.rank(), expected_rank);
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
@@ -95,7 +99,8 @@ fn moshi_ring_collective_worker() {
         for _ in 0..phase_count {
             let marker = i32::try_from(observed_all_sum + 1).unwrap();
             let local = Array::from_int(marker * 10 + expected_rank as i32);
-            let reduced = distributed::all_sum(&local, &group, &stream).unwrap();
+            let reduced =
+                crate::backend::runtime::distributed::all_sum(&local, &group, &stream).unwrap();
             let reduced = reduced.evaluated().unwrap();
             assert_eq!(reduced.item::<i32>(), marker * 20 + 1);
             observed_all_sum += 1;
@@ -216,7 +221,9 @@ fn moshi_ring_model_parity_worker() {
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let fixture = std::env::var_os(MODEL_WORKER_FIXTURE).unwrap();
     let expected_profile = std::env::var(MODEL_WORKER_PROFILE).unwrap();
-    let group = Arc::new(distributed::init(true, Backend::Ring).unwrap());
+    let group = Arc::new(crate::backend::runtime::distributed::Group::native(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    ));
     assert_eq!((group.rank(), group.size()), (expected_rank, 2));
     let device = DeviceAssignment::new(DeviceType::Cpu, 0);
     let stream = Stream::new_with_device(&device.device().unwrap());
@@ -235,7 +242,7 @@ fn moshi_ring_model_parity_worker() {
     let expected = run_forced_and_greedy_sequence(&mut replicated);
     drop(replicated);
 
-    let topology = MlxParallelContext::for_group(group.as_ref(), 2, 1, 1, device).unwrap();
+    let topology = MlxParallelContext::for_group(group.native_group(), 2, 1, 1, device).unwrap();
     let backend = MlxRealtimeBackend::new(&stream, &weights_stream)
         .with_tensor_parallel_group(Arc::clone(&group));
     let mut parallel = load_realtime_model_with_options(
@@ -262,7 +269,8 @@ fn moshi_ring_model_parity_worker() {
     // Gather the committed frame transcript once more so both ranks prove
     // they observed the same canonical text/audio outputs as replication.
     let local = Array::from_slice(&actual, &[i32::try_from(actual.len()).unwrap()]);
-    let gathered = distributed::all_gather(&local, group.as_ref(), &stream).unwrap();
+    let gathered =
+        crate::backend::runtime::distributed::all_gather(&local, group.as_ref(), &stream).unwrap();
     let gathered = gathered.evaluated().unwrap();
     let gathered = gathered.as_slice::<i32>();
     assert_eq!(gathered.len(), expected.len() * 2);

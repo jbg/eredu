@@ -1,5 +1,6 @@
 use std::{path::PathBuf, time::Instant};
 
+use eredu_backend_mlx::native::ExecutionContext;
 use eredu_backend_mlx::{
     codec::mimi::load,
     native::{MlxRealtimeBackend, MlxRealtimeInput},
@@ -11,7 +12,7 @@ use eredu_core::{
     scheduler::{RequestId, SchedulerLimits},
     RealtimeModel, RealtimeSampling, RealtimeScheduler,
 };
-use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
+use safemlx::{transforms::eval, Array, Device, DeviceType, Stream};
 
 const SAMPLE_RATE: f64 = 24_000.0;
 const FRAME_RATE: f64 = 12.5;

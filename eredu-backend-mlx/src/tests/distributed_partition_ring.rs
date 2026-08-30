@@ -29,10 +29,17 @@ fn partition_ring_worker() {
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let checkpoint = std::env::var_os(CHECKPOINT_DIR).unwrap();
-    let group = distributed::init(true, Backend::Ring).unwrap();
-    let topology =
-        MlxParallelContext::for_group(&group, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap();
+    let group = crate::backend::runtime::distributed::Group::native(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    );
+    let topology = MlxParallelContext::for_group(
+        group.native_group(),
+        2,
+        1,
+        1,
+        DeviceAssignment::new(DeviceType::Cpu, 0),
+    )
+    .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
 
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
@@ -58,7 +65,8 @@ fn partition_ring_worker() {
 
     let local = partition.get("model.projection.weight").unwrap();
     assert_eq!(local.shape(), &[2, 2]);
-    let gathered = distributed::all_gather(local, &group, &stream).unwrap();
+    let gathered =
+        crate::backend::runtime::distributed::all_gather(local, &group, &stream).unwrap();
     let gathered = gathered.evaluated().unwrap();
     assert_eq!(gathered.as_array().shape(), &[4, 2]);
     assert_eq!(gathered.as_slice::<i32>(), &[0, 1, 10, 11, 2, 3, 12, 13]);

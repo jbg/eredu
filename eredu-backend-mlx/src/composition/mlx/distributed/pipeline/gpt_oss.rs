@@ -1,12 +1,13 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::backend::runtime::distributed::Group;
 use eredu_architectures::{gpt_oss as gpt_oss_arch, ModelKind};
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_nn::RoutedNeuralBackend;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
 };
-use safemlx::{distributed::Group, error::Exception, Array, Stream};
+use safemlx::{error::Exception, Array, Stream};
 
 use crate::{
     backend::{

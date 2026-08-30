@@ -9,9 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::module::ModuleParameters;
 use crate::native::{
     distributed::{self, Backend},
-    module::ModuleParameters,
     ops::{indexing::TryIndexOp, stack_axis},
     Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
 };
@@ -692,7 +692,7 @@ fn pipeline_ring_worker() {
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT_DIR).unwrap());
     let family = FixtureFamily::parse(&std::env::var(FIXTURE_FAMILY).unwrap());
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
-    let group = distributed::init(true, Backend::Ring).unwrap();
+    let native_group = distributed::init(true, Backend::Ring).unwrap();
     let cartesian_axes = std::env::var(CARTESIAN_AXES).ok();
     let (tensor_parallel_size, pipeline_parallel_size, expert_parallel_size) =
         match cartesian_axes.as_deref() {
@@ -706,7 +706,7 @@ fn pipeline_ring_worker() {
             Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
         };
     let topology = MlxParallelContext::for_group(
-        &group,
+        &native_group,
         tensor_parallel_size,
         pipeline_parallel_size,
         expert_parallel_size,
@@ -717,7 +717,7 @@ fn pipeline_ring_worker() {
     let pipeline_rank = topology.pipeline_parallel_rank;
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
-        let backend = crate::native::distributed_backend(&stream, &stream, &group);
+        let backend = crate::native::distributed_backend(&stream, &stream, &native_group);
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
             ModelLoadOptions::with_parallel(
                 topology,
@@ -1109,7 +1109,7 @@ fn pipeline_ring_worker() {
         return;
     }
     let execution = crate::native::backend(&stream, &stream)
-        .communication_for_topology(topology, &group)
+        .communication_for_topology(topology, &native_group)
         .unwrap();
     let reference = (pipeline_rank + 1 == pipeline_parallel_size
         && (family.needs_resident_reference()

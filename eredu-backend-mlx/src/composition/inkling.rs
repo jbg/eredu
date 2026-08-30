@@ -344,7 +344,7 @@ fn forward_mtp_draft_parallel_architecture(
     tokens: &crate::MlxTensor,
     depth: usize,
     state: &mut MlxHybridState,
-    group: &safemlx::distributed::Group,
+    group: &crate::backend::runtime::distributed::Group,
     stream: &Stream,
 ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
     let embeddings = architecture
@@ -385,11 +385,14 @@ pub struct InklingModel {
 /// Collective context adapter for the neutral tensor-parallel MTP target.
 pub struct InklingTensorMtpTarget<'a> {
     model: &'a mut InklingModel,
-    group: &'a safemlx::distributed::Group,
+    group: &'a crate::backend::runtime::distributed::Group,
 }
 
 impl<'a> InklingTensorMtpTarget<'a> {
-    pub const fn new(model: &'a mut InklingModel, group: &'a safemlx::distributed::Group) -> Self {
+    pub const fn new(
+        model: &'a mut InklingModel,
+        group: &'a crate::backend::runtime::distributed::Group,
+    ) -> Self {
         Self { model, group }
     }
 }
@@ -983,7 +986,7 @@ impl InklingModel {
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if state.target.layout() != self.state_layouts.target() {
@@ -1017,7 +1020,7 @@ impl InklingModel {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         if state.target.layout() != self.state_layouts.target() {
@@ -1073,7 +1076,7 @@ impl InklingModel {
         &mut self,
         tokens: &crate::MlxTensor,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1095,7 +1098,7 @@ impl InklingModel {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1139,7 +1142,7 @@ impl InklingModel {
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
@@ -1291,7 +1294,7 @@ impl InklingModel {
         &mut self,
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         if state.target.layout() != self.state_layouts.target() {
@@ -1339,7 +1342,7 @@ impl InklingModel {
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut InklingState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
@@ -1383,7 +1386,7 @@ impl InklingModel {
         tokens: &crate::MlxTensor,
         depth: usize,
         state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         match &mut self.execution {

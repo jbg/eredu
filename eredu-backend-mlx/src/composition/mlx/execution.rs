@@ -171,7 +171,7 @@ pub(super) fn decode_model_tensor_parallel(
 fn forward_model_tensor_parallel(
     executable: &mut Executable,
     input: &Array,
-    group: &safemlx::distributed::Group,
+    group: &crate::backend::runtime::distributed::Group,
     stream: &Stream,
 ) -> Result<Array, Error> {
     let tensor_input = MlxTensor::from_array(input.clone());
@@ -275,7 +275,7 @@ pub(super) fn prefill_model_tensor_parallel_with_observer(
 pub(super) fn forward_model_tensor_parallel_with_observer(
     executable: &mut Executable,
     input: &Array,
-    group: &safemlx::distributed::Group,
+    group: &crate::backend::runtime::distributed::Group,
     stream: &Stream,
     observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
 ) -> Result<Array, Error> {

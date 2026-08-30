@@ -1,134 +1,12 @@
 //! Collection of functions related to random number generation
 
+#[cfg(test)]
 use crate::ops::indexing::TryIndexOp;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
 use crate::{error::Exception, error::Result, Array, ArrayElement, Stream};
 use safemlx_internal_macros::generate_macro;
 use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Random state for reproducible random number generation.
-///
-/// This struct holds the PRNG state and can be used with compiled functions
-/// to properly track random state across JIT compilation boundaries.
-///
-/// # Compilation Support
-///
-/// `RandomState` implements `Updatable`, making it compatible with
-/// `compile_with_state`. This is the Rust equivalent of Python's
-/// `@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)`.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-/// use safemlx::random::RandomState;
-/// use safemlx::transforms::compile::compile_with_state;
-/// use safemlx::random::categorical;
-/// use safemlx::Array;
-///
-/// let mut state = RandomState::with_seed(42).unwrap();
-/// let logits = Array::zeros::<f32>(&[1, 10], &stream).unwrap();
-/// let mut compiled = compile_with_state(
-///     |state: &mut RandomState, x: &Array| {
-///         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-///         let key = state.next_key(&stream)?;
-///         categorical(x, None, None, Some(&key), &stream)
-///     },
-///     None,
-/// );
-/// let result = compiled(&mut state, &logits).unwrap();
-/// ```
-#[derive(Debug, Clone)]
-pub struct RandomState {
-    state: Array,
-}
-
-impl RandomState {
-    /// Create a new random state with a time-based seed.
-    pub fn new() -> Result<Self> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        Ok(Self { state: key(now)? })
-    }
-
-    /// Create a new random state from a specific seed.
-    ///
-    /// Use this for reproducible random number generation.
-    pub fn with_seed(seed: u64) -> Result<Self> {
-        Ok(Self { state: key(seed)? })
-    }
-
-    /// Create a random state from an existing key array.
-    ///
-    /// The key must be a valid PRNG key (typically created via `random::key()`).
-    pub fn from_key(key: Array) -> Self {
-        Self { state: key }
-    }
-
-    /// Get the next random key, advancing the state.
-    ///
-    /// This splits the current state into two keys: one becomes the new state,
-    /// and the other is returned for use in random operations.
-    pub fn next_key(&mut self, stream: &Stream) -> Result<Array> {
-        let next = split(&self.state, 2, stream)?;
-        self.state = next.0;
-        Ok(next.1)
-    }
-
-    /// Reseed the random state.
-    pub fn seed(&mut self, seed: u64) -> Result<()> {
-        self.state = key(seed)?;
-        Ok(())
-    }
-
-    /// Get a reference to the underlying state array.
-    ///
-    /// This is useful for inspection or manual state management.
-    pub fn as_array(&self) -> &Array {
-        &self.state
-    }
-
-    /// Get a mutable reference to the underlying state array.
-    ///
-    /// # Note
-    ///
-    /// Modifying the state array directly may break the PRNG invariants.
-    /// Prefer using `seed()` or `next_key()` instead.
-    pub fn as_array_mut(&mut self) -> &mut Array {
-        &mut self.state
-    }
-}
-
-impl Default for RandomState {
-    /// Creates a new `RandomState` with a time-based seed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the underlying PRNG key creation fails, which should not
-    /// occur under normal conditions.
-    fn default() -> Self {
-        Self::new().expect("Failed to create default RandomState")
-    }
-}
-
-impl crate::utils::Updatable for RandomState {
-    fn updatable_states_len(&self) -> usize {
-        1
-    }
-
-    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
-        std::iter::once(&self.state)
-    }
-
-    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
-        std::iter::once(&mut self.state)
-    }
-}
-
 /// Use the given key.
 fn resolve<'a>(key: impl Into<Option<&'a Array>>) -> Result<Cow<'a, Array>> {
     key.into()
@@ -145,42 +23,60 @@ pub fn key(seed: u64) -> Result<Array> {
     Array::try_from_op(|res| unsafe { safemlx_sys::mlx_random_key(res, seed) })
 }
 
-/// Split a PRNG key into two keys and return a tuple.
-pub fn split(
-    key: impl AsRef<Array>,
-    num: i32,
-    stream: impl AsRef<Stream>,
-) -> Result<(Array, Array)> {
-    let stream = stream.as_ref();
-    let keys = Array::try_from_op(|res| unsafe {
-        safemlx_sys::mlx_random_split_num(res, key.as_ref().as_ptr(), num, stream.as_ptr())
-    })?;
-
-    Ok((
-        keys.try_index_device(0, stream)?,
-        keys.try_index_device(1, stream)?,
-    ))
+/// Split a PRNG key into a native MLX array containing `num` keys.
+pub fn split_n(key: impl AsRef<Array>, num: i32, stream: impl AsRef<Stream>) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        safemlx_sys::mlx_random_split_num(res, key.as_ref().as_ptr(), num, stream.as_ref().as_ptr())
+    })
 }
 
-/// Returns the deterministic subkey at `index` from one PRNG-key split.
-///
-/// This is useful for counter- or position-addressed random streams: callers
-/// can derive the key for one logical position without advancing mutable
-/// state. The same root key and index always produce the same subkey.
-pub fn split_key_at(
-    key: impl AsRef<Array>,
-    index: usize,
-    stream: impl AsRef<Stream>,
-) -> Result<Array> {
-    let stream = stream.as_ref();
-    let count = index
-        .checked_add(1)
-        .and_then(|count| i32::try_from(count).ok())
-        .ok_or_else(|| Exception::custom("random subkey index exceeds i32"))?;
-    let keys = Array::try_from_op(|res| unsafe {
-        safemlx_sys::mlx_random_split_num(res, key.as_ref().as_ptr(), count, stream.as_ptr())
-    })?;
-    keys.try_index_device(index as i32, stream)
+#[cfg(test)]
+pub(crate) struct TestKeys {
+    key: Array,
+    next: usize,
+}
+
+#[cfg(test)]
+impl TestKeys {
+    pub(crate) fn new() -> Result<Self> {
+        Self::with_seed(0)
+    }
+
+    pub(crate) fn with_seed(seed: u64) -> Result<Self> {
+        Ok(Self {
+            key: key(seed)?,
+            next: 0,
+        })
+    }
+
+    pub(crate) fn from_key(key: Array) -> Self {
+        Self { key, next: 0 }
+    }
+
+    pub(crate) fn seed(&mut self, seed: u64) -> Result<()> {
+        self.key = key(seed)?;
+        self.next = 0;
+        Ok(())
+    }
+
+    pub(crate) fn next_key(&mut self, stream: impl AsRef<Stream>) -> Result<Array> {
+        let stream = stream.as_ref();
+        let keys = split_n(&self.key, 2, stream)?;
+        self.key = keys.try_index_device(0, stream)?;
+        self.next += 1;
+        keys.try_index_device(1, stream)
+    }
+
+    pub(crate) fn as_array(&self) -> &Array {
+        &self.key
+    }
+}
+
+#[cfg(test)]
+impl Default for TestKeys {
+    fn default() -> Self {
+        Self::new().expect("test PRNG key")
+    }
 }
 
 /// Generate uniformly distributed random numbers.
@@ -584,13 +480,13 @@ mod tests {
     #[test]
     fn test_explicit_random_state_is_deterministic() {
         let stream = crate::test_stream();
-        let mut state = RandomState::with_seed(3).unwrap();
+        let mut state = TestKeys::with_seed(3).unwrap();
         let a_key = state.next_key(stream).unwrap();
         let b_key = state.next_key(stream).unwrap();
         let a = uniform::<_, f32>(0, 1, None, &a_key, stream).unwrap();
         let b = uniform::<_, f32>(0, 1, None, &b_key, stream).unwrap();
 
-        let mut state = RandomState::with_seed(3).unwrap();
+        let mut state = TestKeys::with_seed(3).unwrap();
         let x_key = state.next_key(stream).unwrap();
         let y_key = state.next_key(stream).unwrap();
         let x = uniform::<_, f32>(0, 1, None, &x_key, stream).unwrap();
@@ -611,36 +507,20 @@ mod tests {
     }
 
     #[test]
-    fn test_split() {
+    fn test_split_n() {
         let stream = crate::test_stream();
         let key = key(0).unwrap();
 
-        let (k1, k2) = split(&key, 2, stream).unwrap();
+        let keys = split_n(&key, 2, stream).unwrap();
+        let k1 = keys.try_index_device(0, stream).unwrap();
+        let k2 = keys.try_index_device(1, stream).unwrap();
         assert!(!crate::array::eval_equal_values(&k1, &k2));
 
-        let (r1, r2) = split(&key, 2, stream).unwrap();
+        let repeated = split_n(&key, 2, stream).unwrap();
+        let r1 = repeated.try_index_device(0, stream).unwrap();
+        let r2 = repeated.try_index_device(1, stream).unwrap();
         assert!(crate::array::eval_equal_values(&r1, &k1));
         assert!(crate::array::eval_equal_values(&r2, &k2));
-    }
-
-    #[test]
-    fn test_split_key_at_is_position_addressed() {
-        let stream = crate::test_stream();
-        let root = key(0).unwrap();
-        let other_root = key(1).unwrap();
-        let first = split_key_at(&root, 0, stream).unwrap();
-        let second = split_key_at(&root, 1, stream).unwrap();
-        let repeated = split_key_at(&root, 7, stream).unwrap();
-
-        assert!(!crate::array::eval_equal_values(&first, &second));
-        assert!(crate::array::eval_equal_values(
-            &repeated,
-            &split_key_at(&root, 7, stream).unwrap()
-        ));
-        assert!(!crate::array::eval_equal_values(
-            &repeated,
-            &split_key_at(&other_root, 7, stream).unwrap()
-        ));
     }
 
     #[test]
@@ -845,14 +725,14 @@ mod tests {
 
     #[test]
     fn test_random_state_new() {
-        let state = RandomState::new().unwrap();
+        let state = TestKeys::new().unwrap();
         assert_eq!(state.as_array().shape(), &[2]);
     }
 
     #[test]
     fn test_random_state_with_seed_deterministic() {
-        let s1 = RandomState::with_seed(42).unwrap();
-        let s2 = RandomState::with_seed(42).unwrap();
+        let s1 = TestKeys::with_seed(42).unwrap();
+        let s2 = TestKeys::with_seed(42).unwrap();
         assert!(crate::array::eval_equal_values(
             s1.as_array(),
             s2.as_array()
@@ -862,7 +742,7 @@ mod tests {
     #[test]
     fn test_random_state_next_key_advances() {
         let stream = crate::test_stream();
-        let mut state = RandomState::with_seed(0).unwrap();
+        let mut state = TestKeys::with_seed(0).unwrap();
         let k1 = state.next_key(stream).unwrap();
         let k2 = state.next_key(stream).unwrap();
         assert!(!crate::array::eval_equal_values(&k1, &k2));
@@ -870,9 +750,9 @@ mod tests {
 
     #[test]
     fn test_random_state_from_key_roundtrip() {
-        let original = RandomState::with_seed(99).unwrap();
+        let original = TestKeys::with_seed(99).unwrap();
         let arr = original.as_array().clone();
-        let restored = RandomState::from_key(arr);
+        let restored = TestKeys::from_key(arr);
         assert!(crate::array::eval_equal_values(
             original.as_array(),
             restored.as_array()
@@ -880,16 +760,8 @@ mod tests {
     }
 
     #[test]
-    fn test_random_state_updatable() {
-        use crate::utils::Updatable;
-        let state = RandomState::with_seed(0).unwrap();
-        assert_eq!(state.updatable_states_len(), 1);
-        assert_eq!(state.updatable_states().into_iter().count(), 1);
-    }
-
-    #[test]
     fn test_random_state_default() {
-        let state = RandomState::default();
+        let state = TestKeys::default();
         assert_eq!(state.as_array().shape(), &[2]);
     }
 
@@ -900,7 +772,7 @@ mod tests {
         let seed = 23;
         let mut results = Vec::new();
         for _ in 0..10 {
-            let mut state = RandomState::new().unwrap();
+            let mut state = TestKeys::new().unwrap();
             state.seed(seed).unwrap();
             let draw_key = state.next_key(stream).unwrap();
             let result = uniform::<_, f32>(0.0, 1.0, &[10, 10], &draw_key, stream)

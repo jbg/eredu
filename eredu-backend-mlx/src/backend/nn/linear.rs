@@ -2,15 +2,15 @@
 
 use eredu_checkpoint::{BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 
+use eredu_backend_mlx_macros::ModuleParameters;
 use safemlx::{
     error::Exception,
-    macros::ModuleParameters,
-    module::Param,
-    native_quantization::NativeQuantizedTensor,
-    nn,
     ops::{matmul, quantized_matmul_with_mode, quantized_packed_dimension, QuantizationMode},
-    quantization::MaybeQuantized,
     Array, Dtype, Stream,
+};
+
+use crate::{
+    module::Param, native_quantization::NativeQuantizedTensor, nn, quantization::MaybeQuantized,
 };
 
 fn ceil_div(value: i32, divisor: i32) -> i32 {
@@ -19,6 +19,7 @@ fn ceil_div(value: i32, divisor: i32) -> i32 {
 
 /// Backend-owned linear materialization for every neutral physical format.
 #[derive(Debug, Clone, ModuleParameters)]
+#[module(root = crate)]
 pub struct PhysicalLinear {
     /// Logical input width.
     pub input_dimensions: i32,
@@ -227,85 +228,17 @@ impl PhysicalLinear {
     pub fn forward_row_parallel(
         &mut self,
         input: &Array,
-        group: &safemlx::distributed::Group,
+        group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let bias = self.bias.value.take();
         let partial = self.forward(input, stream);
         self.bias.value = bias;
-        let output = safemlx::distributed::all_sum(&partial?, group, stream)?;
+        let output = crate::backend::runtime::distributed::all_sum(&partial?, group, stream)?;
         match self.bias.as_ref() {
             Some(bias) => output.add(bias, stream),
             None => Ok(output),
         }
-    }
-}
-
-/// Creates an unloaded linear using the standard dense or affine parameter tree.
-#[cfg(all(
-    test,
-    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
-))]
-pub(crate) fn unloaded_maybe_quantized_linear(
-    input_dims: i32,
-    output_dims: i32,
-    bias: bool,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    unloaded_maybe_quantized_linear_with_dtype(
-        input_dims,
-        output_dims,
-        bias,
-        quantization,
-        Dtype::Float32,
-        stream,
-    )
-}
-
-/// Creates an unloaded linear using the requested dense dtype or a quantized parameter tree.
-#[cfg(all(
-    test,
-    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
-))]
-fn unloaded_maybe_quantized_linear_with_dtype(
-    input_dims: i32,
-    output_dims: i32,
-    bias: bool,
-    quantization: Option<WeightQuantization>,
-    dense_dtype: Dtype,
-    stream: &Stream,
-) -> Result<MaybeQuantized<nn::Linear>, Exception> {
-    match quantization {
-        Some(WeightQuantization::GgufIQuant { ggml_type, endian }) => {
-            Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded_iq(
-                input_dims,
-                output_dims,
-                ggml_type,
-                endian,
-                bias,
-                stream,
-            )?))
-        }
-        Some(config) => Ok(MaybeQuantized::Quantized(
-            nn::QuantizedLinear::unloaded_with_mode(
-                input_dims,
-                output_dims,
-                config.group_size(),
-                config.bits(),
-                crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(config)
-                    .map_err(|error| Exception::custom(error.to_string()))?,
-                bias,
-                stream,
-            )?,
-        )),
-        None => Ok(MaybeQuantized::Original(nn::Linear::unloaded(
-            input_dims,
-            output_dims,
-            bias,
-            dense_dtype,
-            stream,
-        )?)),
     }
 }
 

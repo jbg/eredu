@@ -116,50 +116,17 @@
 //! println!("{:?}", result);
 //! ```
 //!
-//! Use [`compile_with_state()`] to compile functions that have side effects and
-//! pass the state as an mutable reference.
-//!
-//! ```rust
-//! # let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-//! use safemlx::{Array, array, transforms::compile::compile_with_state};
-//! let mut state = vec![];
-//!
-//! let fun = |state: &mut Vec<Array>, (x, y): (&Array, &Array)| {
-//!     let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-//!     let z = x.add(y, &stream)?;
-//!     let result = safemlx::exp!(&z, stream=&stream);
-//!     state.push(z);
-//!     result
-//! };
-//!
-//! let x = array!(1.0);
-//! let y = array!(2.0);
-//!
-//! let mut compiled = compile_with_state(fun, None);
-//! let result = compiled(&mut state, (&x, &y)).unwrap();
-//! println!("{:?}", result);
-//! assert_eq!(state.len(), 1);
-//! ```
-//!
-//! This is particularly useful for compiling a function which includes an
-//! update to a container of arrays, as is commonly done when training the
-//! parameters of a [`crate::module::Module`].
-//!
-//! See `safemlx-tests/tests/test_compile_with_state.rs` for more examples.
-//!
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::{transform_guard, Closure, Guarded, VectorArray};
-use crate::{error::Result, Array};
+use crate::error::Result;
 
 #[allow(clippy::module_inception)]
 mod compile;
-mod compile_with_state;
 
 pub use compile::*;
-pub use compile_with_state::*;
 
 /// Globally enable the compilation of functions.
 ///
@@ -225,11 +192,4 @@ where
     let mut hasher = DefaultHasher::new();
     type_id.hash(&mut hasher);
     hasher.finish() as usize
-}
-
-fn update_by_replace_with_ref_to_new_array(src: &mut Array, new_array: &Array) {
-    debug_assert_eq!(src.shape(), new_array.shape());
-    unsafe {
-        safemlx_sys::mlx_array_set(&mut src.as_ptr() as *mut _, new_array.as_ptr());
-    }
 }

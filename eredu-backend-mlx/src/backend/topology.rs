@@ -3,7 +3,7 @@
 use std::ops::Deref;
 
 use eredu_core::{BackendError, ParallelRankTopology, ParallelTopology};
-use safemlx::{distributed, distributed::Group, Device, DeviceType, Stream};
+use safemlx::{distributed::Group, Device, DeviceType, Stream};
 
 use crate::backend::error::Error;
 
@@ -27,10 +27,9 @@ impl DeviceAssignment {
 
     /// Resolves this assignment to an MLX device.
     pub fn device(self) -> Result<Device, Error> {
-        Ok(distributed::device_for_local_rank(
-            self.device_type,
-            self.local_index,
-        )?)
+        let index = i32::try_from(self.local_index)
+            .map_err(|_| Error::Parallel("local device index does not fit in i32".into()))?;
+        Ok(Device::new(self.device_type, index))
     }
 }
 

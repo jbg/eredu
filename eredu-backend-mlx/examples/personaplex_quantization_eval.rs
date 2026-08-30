@@ -1,11 +1,12 @@
 use std::{error::Error, path::Path, path::PathBuf};
 
+use eredu_backend_mlx::native::ExecutionContext;
 use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeBackend};
 use eredu_core::load_realtime_model;
 use eredu_evaluation::{
     run_personaplex_quantization, PersonaPlexEvaluationOptions, PersonaPlexEvaluationPaths,
 };
-use safemlx::{Device, DeviceType, ExecutionContext};
+use safemlx::{Device, DeviceType};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

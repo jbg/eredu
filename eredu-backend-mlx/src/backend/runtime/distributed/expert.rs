@@ -15,15 +15,17 @@ use std::{
 
 use eredu_nn::TensorParallelExpertOutput;
 use safemlx::{
-    distributed::{self, Group},
-    ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum_by_index, zeros_dtype},
+    ops::{concatenate_axis, indexing::TryIndexOp, r#where, zeros_dtype},
     transforms::{depends, eval},
     Array, Dtype, Stream,
 };
 
 use crate::{
+    backend::compaction::{compact_indices, count_nonzero},
     backend::error::Error,
     backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
+    backend::nn::routing::segment_sum_by_index,
+    backend::runtime::distributed::{self as distributed, Group},
 };
 
 thread_local! {
@@ -470,7 +472,7 @@ pub fn compact_local_routes(
         )?,
         stream,
     )?;
-    let invalid = valid.logical_not(stream)?.count_nonzero(stream)?;
+    let invalid = count_nonzero(&valid.logical_not(stream)?, stream)?;
     // Use a safe placeholder for invalid ids so validation and the compact
     // count can share the same single host synchronization below.
     let safe_ids = r#where(
@@ -499,7 +501,7 @@ pub fn compact_local_routes(
     let mask = route_owners
         .eq(Array::from_int(assignment.rank as i32), stream)?
         .logical_and(valid, stream)?;
-    let compact = mask.compact_indices(stream)?;
+    let compact = compact_indices(&mask, stream)?;
     let started = std::time::Instant::now();
     eval([&invalid, &compact.count])?;
     let synchronization_time = started.elapsed();
