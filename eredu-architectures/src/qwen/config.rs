@@ -37,6 +37,16 @@ pub enum QwenVariant {
     Qwen3Moe,
 }
 
+impl QwenVariant {
+    /// Canonical architecture family published by the model registry.
+    pub const fn model_kind(self) -> crate::ModelKind {
+        match self {
+            Self::Qwen2 => crate::ModelKind::Qwen2,
+            Self::Qwen3 | Self::Qwen3Moe => crate::ModelKind::Qwen3,
+        }
+    }
+}
+
 /// Typed context for parsing a standalone or multimodal-embedded text config.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TextConfigContext {
@@ -200,7 +210,7 @@ impl ModelArgs {
 
 impl Config for ModelArgs {
     fn model_family(&self) -> &'static str {
-        "qwen"
+        self.variant.model_kind().canonical_name()
     }
     fn model_identity(&self) -> &str {
         &self.model_type
@@ -584,7 +594,7 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
         .unwrap_or_default();
     quantized_weight_configs.sort_unstable();
     derive_prompt_cache_architecture_fingerprint(
-        "qwen",
+        args.variant.model_kind().canonical_name(),
         [
             ("variant", format!("{:?}", args.variant)),
             ("model_type", args.model_type.clone()),
@@ -1053,6 +1063,25 @@ mod tests {
         assert!(!qwen2.attention_bias(AttentionProjection::Output));
         assert_eq!(qwen2.query_key_norm_epsilon(), None);
         assert_eq!(qwen3.query_key_norm_epsilon(), Some(0.000001));
+    }
+
+    #[test]
+    fn prompt_cache_identity_uses_the_registry_family() {
+        for (model_type, family) in [("qwen2", "qwen2"), ("qwen3", "qwen3")] {
+            let args = model_args_from_config_value(&base(model_type)).unwrap();
+            let layout = crate::qwen::state_layout(&args).unwrap();
+            let identity = crate::qwen::state_identity(
+                &args,
+                &layout,
+                0,
+                eredu_core::cache::PromptCacheTopology::default(),
+            )
+            .unwrap()
+            .prompt_cache_identity(&layout)
+            .unwrap();
+
+            assert_eq!(identity.model_family, family);
+        }
     }
 
     #[test]

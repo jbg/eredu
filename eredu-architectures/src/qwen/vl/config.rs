@@ -37,6 +37,17 @@ pub struct ModelArgs {
     pub model_type: String,
 }
 
+impl ModelArgs {
+    /// Canonical architecture family published by the model registry.
+    pub fn model_kind(&self) -> crate::ModelKind {
+        match self.model_type.as_str() {
+            "qwen3_vl" => crate::ModelKind::Qwen3Vl,
+            "qwen3_vl_moe" => crate::ModelKind::Qwen3VlMoe,
+            _ => unreachable!("normalized Qwen3-VL model type"),
+        }
+    }
+}
+
 /// Structurally admitted Qwen3-VL GGUF geometry awaiting facade-owned token IDs.
 #[derive(Debug, Clone)]
 pub struct GgufModelArgs {
@@ -274,7 +285,7 @@ pub fn model_args_from_gguf_parts(
 /// Stable text/media position identity.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
     derive_prompt_cache_architecture_fingerprint(
-        "qwen3_vl",
+        args.model_kind().canonical_name(),
         [
             (
                 "text",
@@ -355,7 +366,7 @@ pub fn state_identity(
         )));
     }
     Ok(ModelStateIdentity {
-        model_family: "qwen3_vl".into(),
+        model_family: args.model_kind().canonical_name().into(),
         effective_model_type: args.model_type.clone(),
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
         layer_count,
@@ -421,6 +432,7 @@ mod tests {
     fn parses_nested_dense_and_moe_policy_without_leaking_mrope_into_text_parser() {
         let dense = model_args_from_config_value(&config("qwen3_vl", "qwen3_vl_text")).unwrap();
         assert!(!dense.text.is_moe());
+        assert_eq!(dense.model_kind(), crate::ModelKind::Qwen3Vl);
         assert_eq!(dense.text.parameter_root, "model.language_model");
         assert_eq!(dense.mrope_section, [2, 1, 1]);
         assert_eq!(dense.vision.deepstack_layers(), [1, 3]);
@@ -432,6 +444,31 @@ mod tests {
         moe["text_config"]["num_experts_per_tok"] = Value::from(2);
         let moe = model_args_from_config_value(&moe).unwrap();
         assert!(moe.text.is_moe());
+        assert_eq!(moe.model_kind(), crate::ModelKind::Qwen3VlMoe);
+    }
+
+    #[test]
+    fn prompt_cache_identity_uses_the_registry_family() {
+        for (outer, inner, family) in [
+            ("qwen3_vl", "qwen3_vl_text", "qwen3_vl"),
+            ("qwen3_vl_moe", "qwen3_vl_moe_text", "qwen3_vl_moe"),
+        ] {
+            let mut value = config(outer, inner);
+            if outer == "qwen3_vl_moe" {
+                value["text_config"]["intermediate_size"] = Value::from(0);
+                value["text_config"]["moe_intermediate_size"] = Value::from(16);
+                value["text_config"]["num_experts"] = Value::from(4);
+                value["text_config"]["num_experts_per_tok"] = Value::from(2);
+            }
+            let args = model_args_from_config_value(&value).unwrap();
+            let layout = state_layout(&args).unwrap();
+            let identity = state_identity(&args, &layout, 0, PromptCacheTopology::default())
+                .unwrap()
+                .prompt_cache_identity(&layout)
+                .unwrap();
+
+            assert_eq!(identity.model_family, family);
+        }
     }
 
     #[test]

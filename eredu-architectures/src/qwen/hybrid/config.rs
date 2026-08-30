@@ -75,6 +75,14 @@ pub enum HybridVariant {
 }
 
 impl HybridVariant {
+    /// Canonical architecture family published by the model registry.
+    pub const fn model_kind(self) -> crate::ModelKind {
+        match self {
+            Self::Qwen35Dense | Self::Qwen35Moe => crate::ModelKind::Qwen35,
+            Self::Qwen3Next => crate::ModelKind::Qwen3Next,
+        }
+    }
+
     /// Stable effective text model type.
     pub const fn model_type(self) -> &'static str {
         match self {
@@ -1024,7 +1032,7 @@ pub fn prompt_cache_architecture_fingerprint(config: &HybridConfig) -> String {
         },
     );
     derive_prompt_cache_architecture_fingerprint(
-        "qwen_hybrid",
+        config.variant.model_kind().canonical_name(),
         [
             ("model_type", config.model_type.clone()),
             ("layers", config.num_hidden_layers.to_string()),

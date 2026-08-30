@@ -178,24 +178,7 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    let global_layer_end = global_layer_start
-        .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("Qwen owned layer range overflowed"))?;
-    let layer_count = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    if global_layer_end > layer_count {
-        return Err(Error::backend(format!(
-            "Qwen owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
-        )));
-    }
-    Ok(ModelStateIdentity {
-        model_family: "qwen".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
-        layer_count,
-        global_layer_start,
-        sink_tokens: 0,
-        topology,
-    })
+    crate::decoder::state_identity(args, layout, global_layer_start, topology)
 }
 
 #[cfg(test)]

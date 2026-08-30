@@ -174,6 +174,12 @@ geometry, and payload digests must match before arrays become live. Multimodal
 applications should include media bytes and processor settings in the
 processed-prefix fingerprint.
 
+The persisted model family is the architecture registry's canonical family
+name, identical to `model_family().canonical_name()` on the loaded model. It is
+not a backend grouping or shared-implementation label; distinct registered
+families such as `qwen2`, `qwen3`, `qwen3_next`, `qwen3_vl_moe`, and `qwen3_5`
+remain distinct cache identities.
+
 Distributed prompt caches are rank-local beneath one shared root. A cache
 cannot be reopened under a different tensor, pipeline, or expert topology.
 Realtime Moshi and PersonaPlex sessions remain outside this decoder prompt-cache

@@ -1203,7 +1203,7 @@ pub fn state_identity(
         )));
     }
     Ok(ModelStateIdentity {
-        model_family: "qwen_hybrid".into(),
+        model_family: config.variant.model_kind().canonical_name().into(),
         effective_model_type: config.model_type.clone(),
         architecture_fingerprint: prompt_cache_architecture_fingerprint(config),
         layer_count,
@@ -1217,10 +1217,9 @@ pub fn state_identity(
 mod state_identity_tests {
     use super::state_identity;
 
-    #[test]
-    fn embedded_prediction_layers_trail_the_prompt_frontier() {
-        let parsed = crate::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
-            "model_type": "qwen3_5_text",
+    fn config(model_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model_type": model_type,
             "vocab_size": 8,
             "hidden_size": 8,
             "num_hidden_layers": 2,
@@ -1233,8 +1232,13 @@ mod state_identity_tests {
             "num_experts": 0,
             "tie_word_embeddings": true,
             "layer_types": ["full_attention", "full_attention"]
-        }))
-        .unwrap();
+        })
+    }
+
+    #[test]
+    fn embedded_prediction_layers_trail_the_prompt_frontier() {
+        let parsed =
+            crate::qwen::hybrid::model_args_from_config_value(&config("qwen3_5_text")).unwrap();
         let layout = crate::qwen::hybrid::state_layout(&parsed.text).unwrap();
         let identity = state_identity(
             &parsed.text,
@@ -1246,6 +1250,7 @@ mod state_identity_tests {
         .prompt_cache_identity(&layout)
         .unwrap();
 
+        assert_eq!(identity.model_family, "qwen3_5");
         assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
 
         let prediction_layout = layout.slice(2..4).unwrap();
@@ -1259,5 +1264,23 @@ mod state_identity_tests {
         .prompt_cache_identity(&prediction_layout)
         .unwrap();
         assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);
+    }
+
+    #[test]
+    fn qwen3_next_prompt_cache_identity_uses_the_registry_family() {
+        let parsed =
+            crate::qwen::hybrid::model_args_from_config_value(&config("qwen3_next")).unwrap();
+        let layout = crate::qwen::hybrid::state_layout(&parsed.text).unwrap();
+        let identity = state_identity(
+            &parsed.text,
+            &layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap()
+        .prompt_cache_identity(&layout)
+        .unwrap();
+
+        assert_eq!(identity.model_family, "qwen3_next");
     }
 }
