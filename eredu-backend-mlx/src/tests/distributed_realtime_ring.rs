@@ -475,8 +475,8 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
 }
 
 /// Optional production-model gate. Set `EREDU_MOSHI_NATIVE_FIXTURE`
-/// to a released native Moshi model directory and run the ignored Ring
-/// aggregate; it returns before starting workers when the gate is unset.
+/// to a released native Moshi model directory and select this ignored test
+/// explicitly.
 #[test]
 #[ignore = "requires EREDU_MOSHI_NATIVE_FIXTURE and two local Ring ranks"]
 fn moshi_ring_tp2_native_model_parity() {
@@ -485,8 +485,7 @@ fn moshi_ring_tp2_native_model_parity() {
 
 /// Optional production-model gate. Set
 /// `EREDU_MOSHI_PERSONAPLEX_FIXTURE` to a released PersonaPlex model
-/// directory; the ignored aggregate returns before starting workers when the
-/// gate is unset.
+/// directory and select this ignored test explicitly.
 #[test]
 #[ignore = "requires EREDU_MOSHI_PERSONAPLEX_FIXTURE and two local Ring ranks"]
 fn moshi_ring_tp2_personaplex_model_parity() {

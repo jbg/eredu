@@ -46,18 +46,29 @@ and CUDA coverage remains in the platform workflows.
 The manually dispatched `Native release gate` workflow must pass before
 publication. Its macOS job first proves that native MLX execution is available;
 failure to initialize Metal is a test failure, never a skip. The same job runs
-every ignored distributed pipeline Ring test serially rather than sampling the
-representative cases used by pull-request CI. To run these gates locally on an
-Apple silicon host, outside a sandbox:
+every self-contained ignored distributed Ring test serially across the
+Cartesian-topology, expert-exchange, checkpoint-partition, pipeline, and
+realtime suites rather than sampling the representative cases used by
+pull-request CI. To run these gates locally on an Apple silicon host, outside a
+sandbox:
 
 ```bash
 cargo test -p eredu-backend-mlx --features metal --lib \
   composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
   --exact
 cargo test -p eredu-backend-mlx --lib \
-  tests::distributed_pipeline_ring:: -- \
-  --ignored --test-threads=1 --nocapture
+  _ring:: -- \
+  --ignored \
+  --skip moshi_ring_tp2_native_model_parity \
+  --skip moshi_ring_tp2_personaplex_model_parity \
+  --test-threads=1 --nocapture
 ```
+
+The two production-model realtime parity tests are explicit opt-in gates
+because their released model directories are not stored in the repository or
+provisioned on the GitHub-hosted runner. Run either test separately with its
+documented `EREDU_MOSHI_NATIVE_FIXTURE` or
+`EREDU_MOSHI_PERSONAPLEX_FIXTURE` directory when validating those artifacts.
 
 ## Publication order
 

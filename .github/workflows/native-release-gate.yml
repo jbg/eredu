@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   macos:
-    name: Native MLX and complete Ring conformance
+    name: Native MLX and self-contained Ring conformance
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +28,11 @@ jobs:
           cargo test -p eredu-backend-mlx --features metal --lib \
             composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
             --exact
-      - name: Test every distributed pipeline Ring case
+      - name: Test every self-contained distributed Ring case
         run: |
           cargo test -p eredu-backend-mlx --lib \
-            tests::distributed_pipeline_ring:: -- \
-            --ignored --test-threads=1 --nocapture
+            _ring:: -- \
+            --ignored \
+            --skip moshi_ring_tp2_native_model_parity \
+            --skip moshi_ring_tp2_personaplex_model_parity \
+            --test-threads=1 --nocapture
