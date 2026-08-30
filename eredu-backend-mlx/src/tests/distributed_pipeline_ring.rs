@@ -300,6 +300,42 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
 }
 
 #[test]
+fn inkling_pipeline_reports_static_embedded_mtp_ownership() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_inkling_pipeline_mtp_fixture(checkpoint.path());
+
+    for rank in 0..2 {
+        let topology =
+            MlxParallelContext::for_rank(rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        let stream = Stream::new_with_device(&topology.device.device().unwrap());
+        let model = load_prepared_pipeline_model(
+            checkpoint.path(),
+            ModelLoadOptions::with_parallel(
+                topology,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+            ),
+            &stream,
+        );
+
+        assert_eq!(
+            model.speculative_capability(),
+            SpeculativeCapability::Ready {
+                draft_source: SpeculativeDraftSource::Embedded,
+            }
+        );
+        assert_eq!(model.stage_info().global_embedded_mtp_layers, 2);
+        assert_eq!(model.stage_info().owns_embedded_mtp, rank == 1);
+        assert_eq!(
+            model.stage_info().embedded_mtp_layers,
+            if rank == 1 { 2 } else { 0 }
+        );
+    }
+}
+
+#[test]
 fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_fixture(checkpoint.path());

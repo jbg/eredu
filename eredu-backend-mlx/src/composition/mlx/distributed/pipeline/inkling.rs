@@ -999,6 +999,16 @@ pub(super) fn load_neutral_inkling_pipeline(
         .map(|index| stage.build_unit(decoder_group, index, stream))
         .collect::<Result<Vec<_>, _>>()?;
     let static_roles = parameter_description.select_static_roles(&stage.partition);
+    let embedded_mtp_layers = stage.architecture.mtp_len();
+    let owns_embedded_mtp = embedded_mtp_layers > 0
+        && static_roles.contains(&eredu_architectures::inkling::MTP_STATIC_ROLE);
+    info.owns_embedded_mtp = owns_embedded_mtp;
+    info.embedded_mtp_layers = if owns_embedded_mtp {
+        embedded_mtp_layers
+    } else {
+        0
+    };
+    info.global_embedded_mtp_layers = embedded_mtp_layers;
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
             let source_quantization = BoundPipelineBindings::new(
