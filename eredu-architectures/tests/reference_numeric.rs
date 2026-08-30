@@ -9904,6 +9904,11 @@ fn inkling_embedded_mtp_traversal_and_rollback_are_backend_neutral() {
         .unwrap()
         .expect("Inkling MTP state layout");
     let mut model = inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let ingress_layout = model.ingress_state_layout().unwrap();
+    let persistence_layout = ArchitectureParameters::state_layout(&model).unwrap();
+    assert_eq!(ingress_layout.len(), 2);
+    assert_eq!(persistence_layout.len(), 4);
+    assert_ne!(ingress_layout, persistence_layout);
     assert_eq!(model.mtp_len(), 2);
     assert_eq!(model.mtp_policy(0), Some(eredu_core::AttentionPolicy::Full));
     assert!(model.mtp_policy(1).unwrap().window().is_some());

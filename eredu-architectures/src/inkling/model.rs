@@ -619,8 +619,12 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .map_err(Error::backend)
     }
 
-    /// Returns the state layout authoritative for this realization.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
+    /// Returns the transient target state required to enter this realization.
+    ///
+    /// Ordinary realizations use the global target geometry. Parallel
+    /// realizations use the rank-local target geometry. Embedded-prediction
+    /// state is persisted separately and is never part of decoder ingress.
+    pub fn ingress_state_layout(&self) -> Result<StateLayout, Error> {
         match &self.parallel_geometry {
             Some(geometry) => Ok(geometry.state_layout().clone()),
             None => state_layout(&self.args).map_err(Error::backend),
@@ -629,7 +633,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
     /// Returns every state layout consumed by execution and persistence.
     pub fn state_layouts(&self) -> Result<InklingStateLayouts, Error> {
-        let target = self.state_layout_impl()?;
+        let target = self.ingress_state_layout()?;
         let prediction = match &self.parallel_geometry {
             Some(geometry) => geometry.prediction_state().cloned(),
             None => mtp_state_layout(&self.args)
@@ -1374,7 +1378,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if state.layout() != &state_layout(&self.args).map_err(Error::backend)? {
+        if state.layout() != &self.ingress_state_layout()? {
             return Err(Error::backend("Inkling runtime state layout mismatch"));
         }
         let parts = self.prepare_parts(input.parts, context)?;
@@ -1534,12 +1538,12 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self
-            .parallel_geometry
-            .as_ref()
-            .ok_or_else(|| Error::backend("Inkling model was not built with local geometry"))?
-            .state_layout();
-        if state.layout() != expected {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        if state.layout() != &self.ingress_state_layout()? {
             return Err(Error::backend("Inkling rank-local state layout mismatch"));
         }
         let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;

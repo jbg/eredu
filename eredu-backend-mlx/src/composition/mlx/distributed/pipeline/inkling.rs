@@ -127,13 +127,13 @@ impl InklingPipelinePartition {
             vision_patches: prepared.images.as_ref(),
             audio,
         };
-        // Media ingress executes through the complete rank-local architecture,
-        // before decoder pipeline ownership is applied. Its transient state
-        // must therefore match the architecture geometry rather than the
-        // decoder slice persisted by this stage.
-        let ingress_layout =
-            eredu_runtime::ArchitectureParameters::state_layout(&self.architecture)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        // Media ingress executes before decoder pipeline ownership is applied.
+        // The neutral architecture owns this transient geometry independently
+        // of the composite target-plus-prediction persistence layout.
+        let ingress_layout = self
+            .architecture
+            .ingress_state_layout()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut state = MlxHybridState::device(ingress_layout)?;
         let forward = match execution.and_then(ParallelExecutionContext::group) {
             Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<

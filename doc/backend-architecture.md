@@ -608,8 +608,14 @@ on the realized architecture before transferring that architecture into its
 runtime. When a family owns additional state outside the ordinary layered
 target, its architecture publishes the target, prediction placement, and
 composite persistence layout together; the backend consumes that value without
-reassembling segments or recovering offsets from layer-count fields. Pipeline
-prompt-cache identity is derived by the neutral partition operation from
+reassembling segments or recovering offsets from layer-count fields. Ingress
+state is a distinct transient contract when it does not span that
+composite persistence layout. Inkling publishes its realized target-only
+ingress layout explicitly: ordinary execution receives global target geometry,
+parallel execution receives rank-local target geometry, and neither receives
+embedded-prediction state. Both neutral forward entry and concrete pipeline
+allocation consume that same architecture-owned layout. Pipeline prompt-cache
+identity is derived by the neutral partition operation from
 `ArchitectureParameters::state_identity` and the partition's exact
 `PartitionState`; a backend lowers only its parallel topology. Target or
 embedded-prediction cache allocation uses that identity and does not recreate
