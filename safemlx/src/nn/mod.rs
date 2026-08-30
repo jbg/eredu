@@ -6,6 +6,7 @@
 //! to set optional parameters.
 
 mod activation;
+mod attention;
 mod container;
 mod convolution;
 mod convolution_transpose;
@@ -19,11 +20,11 @@ mod pooling;
 mod positional_encoding;
 mod quantized;
 mod recurrent;
-mod transformer;
 mod upsample;
 mod value_and_grad;
 
 pub use activation::*;
+pub use attention::*;
 pub use container::*;
 pub use convolution::*;
 pub use convolution_transpose::*;
@@ -35,6 +36,5 @@ pub use pooling::*;
 pub use positional_encoding::*;
 pub use quantized::*;
 pub use recurrent::*;
-pub use transformer::*;
 pub use upsample::*;
 pub use value_and_grad::*;

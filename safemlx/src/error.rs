@@ -347,39 +347,6 @@ pub enum MultiHeadAttentionBuildError {
     Exception(#[from] Exception),
 }
 
-/// Error with building a transformer
-#[derive(Debug, PartialEq, Error)]
-pub enum TransformerBuildError {
-    /// Dropout probability must be in the range [0, 1)
-    #[error("Dropout probability must be in the range [0, 1)")]
-    InvalidProbability,
-
-    /// Invalid number of heads
-    #[error("Invalid number of heads: {0}")]
-    InvalidNumHeads(i32),
-
-    /// Exceptions
-    #[error(transparent)]
-    Exception(#[from] Exception),
-}
-
-impl From<DropoutBuildError> for TransformerBuildError {
-    fn from(e: DropoutBuildError) -> Self {
-        match e {
-            DropoutBuildError::InvalidProbability => Self::InvalidProbability,
-        }
-    }
-}
-
-impl From<MultiHeadAttentionBuildError> for TransformerBuildError {
-    fn from(e: MultiHeadAttentionBuildError) -> Self {
-        match e {
-            MultiHeadAttentionBuildError::InvalidNumHeads(n) => Self::InvalidNumHeads(n),
-            MultiHeadAttentionBuildError::Exception(e) => Self::Exception(e),
-        }
-    }
-}
-
 /// The dtype is not a float-point type
 #[derive(Debug, Error)]
 #[error("[finfo] dtype {:?} is not inexact", .0)]

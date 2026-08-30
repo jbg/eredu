@@ -2,8 +2,10 @@
 
 `safemlx` is the low-level MLX implementation used by Eredu's default backend.
 It provides arrays and operations, lazy graph evaluation, transforms,
-neural-network modules, optimizers, quantization helpers, checkpoint I/O,
-streams, and distributed collectives.
+reusable MLX neural-network primitives, optimizers, quantization helpers,
+checkpoint I/O, streams, and distributed collectives. It does not own concrete
+model architectures or end-to-end encoder/decoder stacks; those belong in
+`eredu-architectures` and backend composition.
 
 Most applications should use [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Depend on this crate
 directly only when building MLX-specific operations or backend components.

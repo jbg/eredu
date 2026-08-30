@@ -1,7 +1,10 @@
 # `safemlx` implementation guides
 
-These guides document low-level MLX primitives exposed by `safemlx`. Eredu
-applications normally use the facade and do not need these APIs directly.
+These guides document low-level MLX primitives exposed by `safemlx`. The crate
+wraps reusable MLX operations and neural-network building blocks, while
+concrete model architectures and complete encoder/decoder stacks live outside
+it. Eredu applications normally use the facade and do not need these APIs
+directly.
 
 - [Completion events](completion-events.md): graph submission, host
   observation, and same-device stream dependencies.
