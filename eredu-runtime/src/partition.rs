@@ -893,6 +893,24 @@ impl PartitionState {
     pub fn global_layers(&self) -> Range<usize> {
         self.global_layers.clone()
     }
+
+    /// Derives prompt-cache identity from this canonical state partition.
+    pub fn prompt_cache_identity<B, M>(
+        &self,
+        architecture: &M,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, ArchitecturePartitionError>
+    where
+        B: eredu_nn::NeuralBackend,
+        M: crate::ArchitectureParameters<B>,
+        M::DefinitionError: std::fmt::Display,
+    {
+        architecture
+            .state_identity(self, topology)
+            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?
+            .prompt_cache_identity(self.layout())
+            .map_err(|error| ArchitecturePartitionError::PromptCacheIdentity(error.to_string()))
+    }
 }
 
 /// One validated architecture group and its group-local global unit range.
@@ -1145,11 +1163,7 @@ impl<G, A> ArchitecturePartition<G, A> {
         let state = self
             .state()
             .ok_or(ArchitecturePartitionError::MissingArchitectureState)?;
-        architecture
-            .state_identity(state, topology)
-            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?
-            .prompt_cache_identity(state.layout())
-            .map_err(|error| ArchitecturePartitionError::PromptCacheIdentity(error.to_string()))
+        state.prompt_cache_identity::<B, M>(architecture, topology)
     }
 
     /// Resolves the architecture-authored state plan for this realized partition.

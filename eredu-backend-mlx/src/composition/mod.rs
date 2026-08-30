@@ -13,6 +13,33 @@ use eredu_runtime::{
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
 
+/// Derives prompt-cache identity for a complete replicated realization through
+/// the architecture's neutral mutable-state contract.
+pub(crate) fn replicated_prompt_cache_identity<A>(
+    architecture: &A,
+    topology: eredu_core::cache::PromptCacheTopology,
+) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error>
+where
+    A: ArchitectureParameters<MlxNeuralBackend>,
+    A::DefinitionError: std::fmt::Display,
+{
+    let layout = architecture
+        .state_layout()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    eredu_runtime::PartitionState::new(layout, 0)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .prompt_cache_identity::<MlxNeuralBackend, A>(architecture, topology)
+        .map_err(|error| match error {
+            eredu_runtime::ArchitecturePartitionError::ArchitectureState(detail) => {
+                Error::ArchitectureModel(detail)
+            }
+            eredu_runtime::ArchitecturePartitionError::PromptCacheIdentity(detail) => {
+                Error::Parallel(detail)
+            }
+            error => Error::Parallel(error.to_string()),
+        })
+}
+
 /// Adapts public MLX-array observation to the neutral tensor/error contract.
 pub(crate) struct NeutralActivationObserver<'a> {
     inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,

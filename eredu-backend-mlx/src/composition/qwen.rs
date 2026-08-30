@@ -159,6 +159,17 @@ enum QwenExecution {
     TensorParallelLayerwise(Box<NeutralParallelLayerwiseRuntime>),
 }
 
+impl QwenExecution {
+    fn architecture(&self) -> &NeutralArchitecture {
+        match self {
+            Self::Resident(runtime) => runtime.architecture(),
+            Self::Layerwise(runtime) => runtime.architecture(),
+            Self::TensorParallelResident(runtime) => runtime.architecture(),
+            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
+        }
+    }
+}
+
 fn qwen_unit_recipes(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     args: &ModelArgs,
@@ -1021,18 +1032,16 @@ impl QwenModel {
     }
 
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self.state_layout.clone();
         let topology = self
             .parallel_info
             .as_ref()
             .map_or_else(PromptCacheTopology::default, |info| {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
-        let identity = eredu_architectures::qwen::state_identity(self.args(), &layout, 0, topology)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        identity
-            .prompt_cache_identity(&layout)
-            .map_err(|error| Error::Parallel(error.to_string()))
+        crate::composition::replicated_prompt_cache_identity(
+            self.execution.architecture(),
+            topology,
+        )
     }
 
     fn validate_cache(&self, cache: &MlxKeyValueState) -> Result<(), Error> {
@@ -1655,6 +1664,24 @@ mod tests {
 
     use super::*;
 
+    fn fixture_args() -> ModelArgs {
+        eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }))
+        .unwrap()
+    }
+
     fn f32_tensor(
         name: &str,
         shape: Vec<usize>,
@@ -1670,23 +1697,8 @@ mod tests {
 
     #[test]
     fn qwen_static_bindings_use_architecture_parameter_identities() {
-        let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
-            "model_type": "qwen3",
-            "hidden_size": 8,
-            "num_hidden_layers": 1,
-            "intermediate_size": 16,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 4,
-            "rms_norm_eps": 0.00001,
-            "vocab_size": 32,
-            "max_position_embeddings": 128,
-            "rope_theta": 10000.0,
-            "tie_word_embeddings": false
-        }))
-        .unwrap();
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let architecture = NeutralArchitecture::new(args, &stream).unwrap();
+        let architecture = NeutralArchitecture::new(fixture_args(), &stream).unwrap();
         let store = MemoryWeightStore::from_safetensors([
             f32_tensor("model.embed_tokens.weight", vec![32, 8]),
             f32_tensor("model.norm.weight", vec![8]),
@@ -1731,5 +1743,26 @@ mod tests {
         .unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id().as_str(), "embedding");
+    }
+
+    #[test]
+    fn replicated_identity_uses_neutral_architecture_state_contract() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let architecture = NeutralArchitecture::new(fixture_args(), &stream).unwrap();
+        let layout = architecture.state_layout().unwrap();
+
+        let identity = crate::composition::replicated_prompt_cache_identity(
+            &architecture,
+            PromptCacheTopology::default(),
+        )
+        .unwrap();
+
+        assert_eq!(identity.global_layer_start, 0);
+        assert_eq!(identity.layer_count, layout.len());
+        assert_eq!(identity.layer_layout, *layout.layers());
+        assert_eq!(
+            identity.architecture_fingerprint,
+            eredu_architectures::qwen::prompt_cache_architecture_fingerprint(architecture.args())
+        );
     }
 }

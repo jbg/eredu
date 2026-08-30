@@ -171,6 +171,17 @@ enum GptOssExecution {
     TensorParallelLayerwise(Box<ParallelLayerwiseExecution>),
 }
 
+impl GptOssExecution {
+    fn architecture(&self) -> &NeutralArchitecture {
+        match self {
+            Self::Resident(runtime) => runtime.architecture(),
+            Self::Layerwise(runtime) => runtime.architecture(),
+            Self::TensorParallelResident(runtime) => runtime.architecture(),
+            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
+        }
+    }
+}
+
 /// Parameter view used only to select ordinary dense matrices for load-time
 /// quantization. Native expert matrices retain their exact MXFP4 recipes.
 #[derive(Debug, Clone)]
@@ -1405,16 +1416,10 @@ impl GptOssModel {
     }
 
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let identity = eredu_architectures::gpt_oss::state_identity(
-            &self.args,
-            &self.state_layout,
-            0,
+        crate::composition::replicated_prompt_cache_identity(
+            self.execution.architecture(),
             self.prompt_cache_topology.clone(),
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        identity
-            .prompt_cache_identity(&self.state_layout)
-            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn validate_cache(&self, cache: &Cache) -> Result<(), Error> {

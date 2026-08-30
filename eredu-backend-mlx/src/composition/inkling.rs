@@ -285,13 +285,17 @@ enum Execution {
 }
 
 impl Execution {
-    fn output_group(&self) -> Result<usize, Error> {
-        let architecture = match self {
+    fn architecture(&self) -> &NeutralArchitecture {
+        match self {
             Self::Resident(runtime) => runtime.architecture(),
             Self::Bounded(runtime) => runtime.architecture(),
             Self::ParallelResident(runtime) => runtime.architecture(),
             Self::ParallelBounded(runtime) => runtime.architecture(),
-        };
+        }
+    }
+
+    fn output_group(&self) -> Result<usize, Error> {
+        let architecture = self.architecture();
         <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
             MlxNeuralBackend,
             MlxHybridState,
@@ -424,19 +428,6 @@ impl InklingModel {
             .transpose()
     }
 
-    fn prompt_state_identity(
-        &self,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        eredu_architectures::inkling::state_identity(
-            &self.args,
-            self.state_layouts.composite(),
-            0,
-            topology,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
         Ok(self.state_layouts.composite().layer_prefix_offsets())
     }
@@ -503,9 +494,10 @@ impl InklingModel {
             .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
-        self.prompt_state_identity(topology)?
-            .prompt_cache_identity(self.state_layouts.composite())
-            .map_err(|error| Error::Parallel(error.to_string()))
+        crate::composition::replicated_prompt_cache_identity(
+            self.execution.architecture(),
+            topology,
+        )
     }
 
     pub fn load_prompt_cache(

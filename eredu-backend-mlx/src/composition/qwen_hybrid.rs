@@ -907,15 +907,29 @@ impl QwenHybridModel {
     pub(crate) fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        hybrid::state_identity(
-            &self.parsed.text,
-            &self.state_layout,
-            0,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .prompt_cache_identity(&self.state_layout)
-        .map_err(|error| Error::Parallel(error.to_string()))
+        let topology = eredu_core::cache::PromptCacheTopology::default();
+        match &self.execution {
+            Execution::Resident(runtime) => crate::composition::replicated_prompt_cache_identity(
+                runtime.architecture(),
+                topology,
+            ),
+            Execution::Bounded(runtime) => crate::composition::replicated_prompt_cache_identity(
+                runtime.architecture(),
+                topology,
+            ),
+            Execution::ConditionalResident(runtime) => {
+                crate::composition::replicated_prompt_cache_identity(
+                    runtime.architecture(),
+                    topology,
+                )
+            }
+            Execution::ConditionalBounded(runtime) => {
+                crate::composition::replicated_prompt_cache_identity(
+                    runtime.architecture(),
+                    topology,
+                )
+            }
+        }
     }
 
     pub fn save_prompt_cache(

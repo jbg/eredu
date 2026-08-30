@@ -628,10 +628,12 @@ composite persistence layout. Inkling publishes its realized target-only
 ingress layout explicitly: ordinary execution receives global target geometry,
 parallel execution receives rank-local target geometry, and neither receives
 embedded-prediction state. Both neutral forward entry and concrete pipeline
-allocation consume that same architecture-owned layout. Pipeline prompt-cache
-identity is derived by the neutral partition operation from
-`ArchitectureParameters::state_identity` and the partition's exact
-`PartitionState`; a backend lowers only its parallel topology. Target or
+allocation consume that same architecture-owned layout. Prompt-cache identity
+for both replicated and pipeline execution is derived from
+`ArchitectureParameters::state_identity` and a canonical `PartitionState`; a
+backend lowers only its parallel topology. Pipeline execution uses its exact
+placed partition, while replicated execution attaches the architecture's
+complete realized state layout at global offset zero. Target or
 embedded-prediction cache allocation uses that identity and does not recreate
 a global layout, offsets, or family identity after placement. Composite
 model layouts, such as a target decoder plus embedded prediction state, are

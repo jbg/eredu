@@ -1155,6 +1155,29 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
 }
 
 #[test]
+fn complete_state_partition_derives_identity_through_architecture_contract() {
+    let architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let state = eredu_runtime::PartitionState::new(
+        architecture.state_layout().expect("fixture state layout"),
+        0,
+    )
+    .expect("complete replicated state partition");
+    let topology = eredu_core::cache::PromptCacheTopology::default();
+
+    let identity = state
+        .prompt_cache_identity::<FakeBackend, _>(&architecture, topology.clone())
+        .expect("architecture derives prompt-cache identity");
+
+    assert_eq!(identity.architecture_fingerprint, "fixture");
+    assert_eq!(identity.global_layer_start, 0);
+    assert_eq!(identity.layer_count, 4);
+    assert_eq!(identity.topology, topology);
+}
+
+#[test]
 fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     FORK_COUNT.set(0);
     SUBMIT_COUNT.set(0);

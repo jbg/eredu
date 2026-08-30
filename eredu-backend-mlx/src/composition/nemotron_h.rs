@@ -285,6 +285,17 @@ enum NemotronHExecution {
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 
+impl NemotronHExecution {
+    fn architecture(&self) -> &NeutralArchitecture {
+        match self {
+            Self::Resident(runtime) => runtime.architecture(),
+            Self::Layerwise(runtime) => runtime.architecture(),
+            Self::TensorParallelResident(runtime) => runtime.architecture(),
+            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
+        }
+    }
+}
+
 pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
@@ -876,19 +887,14 @@ impl NemotronHModel {
 
     /// Returns the canonical prompt-cache identity.
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        eredu_architectures::nemotron_h::state_identity(
-            &self.args,
-            &self.state_layout,
-            0,
+        crate::composition::replicated_prompt_cache_identity(
+            self.execution.architecture(),
             self.parallel_info
                 .as_ref()
                 .map_or_else(PromptCacheTopology::default, |info| {
                     crate::backend::cache::prompt_cache_topology(info.topology())
                 }),
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .prompt_cache_identity(&self.state_layout)
-        .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     /// Persists paged attention and all fixed components atomically.

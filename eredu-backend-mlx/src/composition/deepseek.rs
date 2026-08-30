@@ -2024,20 +2024,37 @@ impl DeepSeekModel {
     }
 
     pub fn prompt_cache_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self.state_layout()?;
         let topology = PromptCacheTopology::default();
-        let identity = match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => {
-                deepseek::v3::state_identity(args, &layout, 0, topology)
-            }
-            DeepSeekModelInner::V4 { args, .. } => {
-                deepseek::v4::state_identity(args, &layout, 0, topology)
-            }
-        };
-        identity
-            .map_err(neutral_error)?
-            .prompt_cache_identity(&layout)
-            .map_err(|error| unsupported(error.to_string()))
+        match &self.inner {
+            DeepSeekModelInner::V3 { execution, .. } => match execution {
+                V3Execution::Resident(runtime) => {
+                    crate::composition::replicated_prompt_cache_identity(
+                        runtime.architecture(),
+                        topology,
+                    )
+                }
+                V3Execution::Layerwise(runtime) => {
+                    crate::composition::replicated_prompt_cache_identity(
+                        runtime.architecture(),
+                        topology,
+                    )
+                }
+            },
+            DeepSeekModelInner::V4 { execution, .. } => match execution {
+                V4Execution::Resident(runtime) => {
+                    crate::composition::replicated_prompt_cache_identity(
+                        runtime.architecture(),
+                        topology,
+                    )
+                }
+                V4Execution::Layerwise(runtime) => {
+                    crate::composition::replicated_prompt_cache_identity(
+                        runtime.architecture(),
+                        topology,
+                    )
+                }
+            },
+        }
     }
 
     pub fn save_prompt_cache(

@@ -78,6 +78,17 @@ enum LlamaExecution {
     TensorParallelLayerwise(Box<NeutralParallelLayerwiseRuntime>),
 }
 
+impl LlamaExecution {
+    fn architecture(&self) -> &NeutralArchitecture {
+        match self {
+            Self::Resident(runtime) => runtime.architecture(),
+            Self::Layerwise(runtime) => runtime.architecture(),
+            Self::TensorParallelResident(runtime) => runtime.architecture(),
+            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
+        }
+    }
+}
+
 fn load_neutral_llama(
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
@@ -571,19 +582,16 @@ impl LlamaModel {
     }
 
     pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self.state_layout.clone();
         let topology = self
             .parallel_info
             .as_ref()
             .map_or_else(PromptCacheTopology::default, |info| {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
-        let identity =
-            eredu_architectures::llama::state_identity(self.args(), &layout, 0, topology)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        identity
-            .prompt_cache_identity(&layout)
-            .map_err(|error| Error::Parallel(error.to_string()))
+        crate::composition::replicated_prompt_cache_identity(
+            self.execution.architecture(),
+            topology,
+        )
     }
 
     fn validate_cache(&self, cache: &MlxKeyValueState) -> Result<(), Error> {
