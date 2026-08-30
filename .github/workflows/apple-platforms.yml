@@ -9,7 +9,6 @@ on:
       - "rust-toolchain.toml"
       - "safemlx/**"
       - "safemlx-sys/**"
-      - "safemlx-macros/**"
       - "safemlx-internal-macros/**"
       - "safemlx-tests/**"
       - "eredu/**"

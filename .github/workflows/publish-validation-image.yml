@@ -12,7 +12,6 @@ on:
       - "safemlx-sys/**"
       - "eredu/**"
       - "eredu-*/**"
-      - "safemlx-macros/**"
       - "safemlx-internal-macros/**"
       - "validation/**"
   workflow_dispatch:
