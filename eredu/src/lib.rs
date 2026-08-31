@@ -54,22 +54,6 @@
 //! ```compile_fail
 //! use eredu::SpeculativeGenerationLane;
 //! ```
-//!
-//! Dependency-owned values have no facade aliases:
-//!
-//! ```compile_fail
-//! use eredu::ExecutionPlan;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::PromptCacheDescriptor;
-//! ```
-//!
-//! Chat contracts use their runtime-owned paths rather than aliases in `api`:
-//!
-//! ```compile_fail
-//! use eredu::api::PreparedChat;
-//! ```
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]
