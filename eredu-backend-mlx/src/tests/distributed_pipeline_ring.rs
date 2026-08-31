@@ -656,13 +656,6 @@ impl FixtureFamily {
         )
     }
 
-    const fn has_streamed_media_unit(self) -> bool {
-        matches!(
-            self,
-            Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal | Self::Qwen3Vl | Self::Qwen3VlMoe
-        )
-    }
-
     const fn comparison_tolerance(self) -> f32 {
         match self {
             Self::DeepSeekGguf => 3e-3,
@@ -1192,7 +1185,7 @@ fn pipeline_ring_worker() {
     }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
-        let expected_units = expected_range.len() + usize::from(family.has_streamed_media_unit());
+        let expected_units = expected_range.len() + info.local_encoder_units;
         assert_eq!(report.planned_layer_count(), expected_units);
         assert!(report
             .residency()
@@ -1220,7 +1213,7 @@ fn pipeline_ring_worker() {
         assert!(model.dense_stream_report().unwrap().is_none());
         let report = model.parameter_residency_report().unwrap().unwrap();
         assert!(report.initialized());
-        let expected_units = expected_range.len() + usize::from(family.has_streamed_media_unit());
+        let expected_units = expected_range.len() + info.local_encoder_units;
         assert_eq!(report.units().len(), expected_units);
         assert!(report
             .units()
@@ -5569,6 +5562,14 @@ fn ring_two_process_gemma_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Gemma);
 }
 
+/// Exercises Gemma 4's canonical vision, audio, and decoder unit traversal
+/// through bounded checkpoint streaming across two pipeline stages.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_gemma4_dense_stream_pipeline() {
+    run_ring_pipeline(true, FixtureFamily::Gemma);
+}
+
 /// Verifies biased GQA, mixed full/sliding cache persistence, and two-stage
 /// execution for a Qwen2 decoder.
 #[test]
@@ -6652,6 +6653,14 @@ fn ring_two_process_muse_glimmer_image_tensor_parallel_opaque_session() {
     );
 }
 
+/// Exercises Muse-Glimmer's canonical vision and decoder unit traversal
+/// through bounded checkpoint streaming across two pipeline stages.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_muse_glimmer_dense_stream_pipeline() {
+    run_ring_pipeline(true, FixtureFamily::MuseGlimmer);
+}
+
 /// Verifies Inkling's uneven 2+1 stage placement and combined KV/convolution
 /// state against the resident text decoder.
 #[test]
@@ -7114,8 +7123,10 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
+            FixtureFamily::MuseGlimmer => {
+                write_muse_glimmer_tensor_parallel_fixture(checkpoint.path())
+            }
             FixtureFamily::DeepSeekGguf
-            | FixtureFamily::MuseGlimmer
             | FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
             | FixtureFamily::Lfm2MoeGguf

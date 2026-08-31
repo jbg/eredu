@@ -63,6 +63,17 @@ type NeutralUnit = Unit<MlxNeuralBackend>;
 type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxNeuralBackend>;
 pub type MuseGlimmerPipelineUnit = MlxModule<NeutralUnit>;
 
+fn group_kind(
+    architecture: &NeutralArchitecture,
+    group: usize,
+) -> eredu_runtime::ArchitectureGroupKind {
+    <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::group_transport(
+        architecture,
+        group,
+    )
+    .kind
+}
+
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -430,7 +441,9 @@ impl MuseGlimmerPipelineBindings {
         layout: Option<&eredu_runtime::LocalModelLayout>,
         _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = if group == 1 {
+        let expert_targets = if group_kind(architecture, group)
+            == eredu_runtime::ArchitectureGroupKind::Decoder
+        {
             eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
                 .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
@@ -475,7 +488,9 @@ impl MuseGlimmerPipelineBindings {
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
-        let expert_targets = if group == 1 {
+        let expert_targets = if group_kind(architecture, group)
+            == eredu_runtime::ArchitectureGroupKind::Decoder
+        {
             eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
                 .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()

@@ -604,11 +604,23 @@ pub(super) fn load_muse_glimmer_pipeline(
     let static_bytes = loaded.finish(&mut info)?;
     if let Some(options) = dense_stream {
         let layout = parallel_layout.clone();
-        let vision_start = stage.vision_range().start;
-        let vision_count = stage.vision_range().len();
-        let text_start = stage.range().start;
-        let unit_count = vision_count + stage.range().len();
         let architecture = &stage.architecture;
+        let streamed_units = stage
+            .partition
+            .units()
+            .filter(|address| {
+                <eredu_architectures::muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                >>::group_transport(architecture, address.group())
+                .placement
+                    == eredu_runtime::ArchitectureGroupPlacement::Pipeline
+            })
+            .collect::<Vec<_>>();
+        let execution_offset = streamed_units
+            .iter()
+            .position(|address| address.group() == decoder_group)
+            .unwrap_or(streamed_units.len());
         let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -617,58 +629,43 @@ pub(super) fn load_muse_glimmer_pipeline(
             } else {
                 &[]
             },
-            0..unit_count,
+            0..streamed_units.len(),
             options,
             static_bytes,
             info.materialization.clone(),
             stream,
             weights_stream,
             |ordinal, stream| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
+                let address = streamed_units[ordinal];
                 <eredu_architectures::muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
                     MlxNeuralBackend,
                     MlxKeyValueState,
-                >>::build_unit(architecture, group, index, stream)
+                >>::build_unit(architecture, address.group(), address.index(), stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |ordinal, layer, store| {
-                if ordinal < vision_count {
-                    binding_adapter.cartesian_layer_bindings(
-                        architecture,
-                        vision_group,
-                        vision_start + ordinal,
-                        layer,
-                        store,
-                        layout.as_ref(),
-                        None,
-                    )
-                } else {
-                    binding_adapter.cartesian_layer_bindings(
-                        architecture,
-                        decoder_group,
-                        text_start + ordinal - vision_count,
-                        layer,
-                        store,
-                        layout.as_ref(),
-                        None,
-                    )
-                }
+                let address = streamed_units[ordinal];
+                binding_adapter.cartesian_layer_bindings(
+                    architecture,
+                    address.group(),
+                    address.index(),
+                    layer,
+                    store,
+                    layout.as_ref(),
+                    None,
+                )
             },
             |ordinal| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
-                architecture_parameter_unit_owner::<_, MlxKeyValueState>(architecture, group, index)
+                let address = streamed_units[ordinal];
+                architecture_parameter_unit_owner::<_, MlxKeyValueState>(
+                    architecture,
+                    address.group(),
+                    address.index(),
+                )
             },
         )?
-        .with_execution_offset(vision_count)?;
+        .with_execution_offset(execution_offset)?;
         stage.dense_layers = Some(dense_layers);
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes =

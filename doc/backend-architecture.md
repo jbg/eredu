@@ -777,7 +777,10 @@ backend composition does not rename architecture-authored semantic kinds into
 a legacy execution-group type.
 Rank-local materialization traverses the canonical units exposed by its
 `ArchitecturePartition`, so composite vision, target, and prediction ordering
-is never restated by a backend loader. Every distributed family loader
+is never restated by a backend loader. Dense-stream storage indexes those
+addresses directly and derives its primary execution offset from the first
+architecture-declared decoder address rather than summing preceding group
+counts. Every distributed family loader
 registers tensor-parallel groups from the complete architecture parameter
 description; it does not enumerate static, media, decoder, or prediction
 parameters independently. The same description supplies the ownership used by

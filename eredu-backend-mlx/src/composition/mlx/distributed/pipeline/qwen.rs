@@ -2172,11 +2172,24 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
     if let Some(options) = dense_stream {
         let layout = parallel_layout.clone();
         let assignment = stage.expert_assignment.clone();
-        let vision_start = stage.vision_range().start;
-        let vision_count = stage.vision_range().len();
-        let text_start = stage.range().start;
         let adapter = &stage.adapter;
         let architecture = &stage.architecture;
+        let streamed_units = stage
+            .partition
+            .units()
+            .filter(|address| {
+                <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::group_transport(architecture, address.group())
+                .placement
+                    == eredu_runtime::ArchitectureGroupPlacement::Pipeline
+            })
+            .collect::<Vec<_>>();
+        let execution_offset = streamed_units
+            .iter()
+            .position(|address| address.group() == decoder_group)
+            .unwrap_or(streamed_units.len());
         let dense = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -2185,65 +2198,45 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
             } else {
                 &[]
             },
-            0..vision_count + stage.range().len(),
+            0..streamed_units.len(),
             options,
             static_bytes,
             info.materialization.clone(),
             stream,
             weights_stream,
             |ordinal, stream| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
+                let address = streamed_units[ordinal];
                 architecture
-                    .construct_unit(group, index, stream)
+                    .construct_unit(address.group(), address.index(), stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |ordinal, _layer, store| {
-                if ordinal < vision_count {
-                    let binding_layer = binding_architecture
-                        .construct_unit(vision_group, vision_start + ordinal, stream)
-                        .map(MlxModule::new)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    adapter.cartesian_layer_bindings(
-                        &binding_architecture,
-                        vision_group,
-                        vision_start + ordinal,
-                        &binding_layer,
-                        store,
-                        layout.as_ref(),
-                        None,
-                    )
-                } else {
-                    let index = text_start + ordinal - vision_count;
-                    let binding_layer = binding_architecture
-                        .construct_unit(decoder_group, index, stream)
-                        .map(MlxModule::new)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    adapter.cartesian_layer_bindings(
-                        &binding_architecture,
-                        decoder_group,
-                        index,
-                        &binding_layer,
-                        store,
-                        layout.as_ref(),
-                        assignment.as_ref(),
-                    )
-                }
+                let address = streamed_units[ordinal];
+                let binding_layer = binding_architecture
+                    .construct_unit(address.group(), address.index(), stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                adapter.cartesian_layer_bindings(
+                    &binding_architecture,
+                    address.group(),
+                    address.index(),
+                    &binding_layer,
+                    store,
+                    layout.as_ref(),
+                    assignment.as_ref(),
+                )
             },
             |ordinal| {
-                let (group, index) = if ordinal < vision_count {
-                    (vision_group, vision_start + ordinal)
-                } else {
-                    (decoder_group, text_start + ordinal - vision_count)
-                };
-                architecture_parameter_unit_owner::<_, MlxHybridState>(architecture, group, index)
+                let address = streamed_units[ordinal];
+                architecture_parameter_unit_owner::<_, MlxHybridState>(
+                    architecture,
+                    address.group(),
+                    address.index(),
+                )
             },
         )?
-        .with_execution_offset(vision_count)?;
+        .with_execution_offset(execution_offset)?;
         stage.dense_layers = Some(dense);
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?)
