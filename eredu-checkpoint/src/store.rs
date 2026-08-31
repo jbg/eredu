@@ -4,20 +4,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     ops::Range,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
 };
 
+use crate::{safetensors::SafetensorsShards, StoredDtype};
 use safetensors::{
     tensor::{Dtype, Metadata, TensorInfo},
     SafeTensors,
 };
-use serde::{de::MapAccess, Deserialize, Deserializer};
-
-use crate::StoredDtype;
 
 /// Catalog metadata for one logical checkpoint tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -708,14 +706,9 @@ pub enum StoreError {
         /// Missing checkpoint or payload path.
         path: PathBuf,
     },
-    /// A SafeTensors index could not be decoded or validated.
-    #[error("malformed safetensors index {path}: {message}", path = .path.display())]
-    MalformedIndex {
-        /// Index path.
-        path: PathBuf,
-        /// Decoder or validation detail.
-        message: String,
-    },
+    /// Canonical SafeTensors shard discovery or path admission failed.
+    #[error(transparent)]
+    SafetensorsShards(#[from] crate::safetensors::SafetensorsShardError),
     /// A SafeTensors payload header or contents are invalid.
     #[error("malformed safetensors shard {path}: {message}", path = .path.display())]
     MalformedSafetensors {
@@ -723,12 +716,6 @@ pub enum StoreError {
         path: PathBuf,
         /// Parser detail.
         message: String,
-    },
-    /// An indexed shard path is absolute or escapes the checkpoint root.
-    #[error("unsafe safetensors shard path {path}", path = .path.display())]
-    UnsafeShardPath {
-        /// Rejected path.
-        path: PathBuf,
     },
     /// An index maps a tensor to a shard that does not contain it.
     #[error("index maps tensor {key:?} to {path}, but that shard does not contain it", path = .path.display())]
@@ -838,7 +825,6 @@ struct SafetensorsReadReceipt {
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     shard: PathBuf,
-    indexed: bool,
 }
 
 /// Encoded SafeTensors selection retaining its backing shard buffer.
@@ -899,7 +885,6 @@ impl EncodedTensorLease for SafetensorsLease {
 /// Persistent neutral SafeTensors catalog with bounded shard-buffer ownership.
 #[derive(Debug)]
 pub struct SafetensorsWeightStore {
-    canonical_root: PathBuf,
     catalog: BTreeMap<String, CatalogEntry>,
     metadata: Mutex<BTreeMap<String, TensorMetadata>>,
     cache: Mutex<CacheState>,
@@ -921,92 +906,36 @@ impl SafetensorsWeightStore {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
         }
-        let path = path.as_ref();
-        if !path.exists() {
-            return Err(StoreError::MissingShard {
-                path: path.to_path_buf(),
+        let shards = SafetensorsShards::discover(path)?;
+        if let Some(locations) = shards.tensor_locations() {
+            let catalog = locations
+                .iter()
+                .map(|(key, shard)| {
+                    (
+                        key.clone(),
+                        CatalogEntry {
+                            shard: shard.clone(),
+                        },
+                    )
+                })
+                .collect();
+            return Ok(Self {
+                catalog,
+                metadata: Mutex::new(BTreeMap::new()),
+                cache: Mutex::new(CacheState::default()),
+                read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
+                max_cached_shards,
             });
         }
-        if path.is_dir() {
-            let root = path.to_path_buf();
-            let canonical_root = canonical_checkpoint_access_root(path)?;
-            let index_path = root.join("model.safetensors.index.json");
-            if index_path.exists() {
-                let raw = std::fs::read_to_string(&index_path)
-                    .map_err(|error| io_error(&index_path, error))?;
-                let index: SafetensorsIndex =
-                    serde_json::from_str(&raw).map_err(|error| StoreError::MalformedIndex {
-                        path: index_path.clone(),
-                        message: error.to_string(),
-                    })?;
-                if index.weight_map.0.is_empty() {
-                    return Err(StoreError::MalformedIndex {
-                        path: index_path,
-                        message: "weight_map must not be empty".into(),
-                    });
-                }
-                let mut catalog = BTreeMap::new();
-                for (key, relative) in index.weight_map.0 {
-                    if key.is_empty() {
-                        return Err(StoreError::MalformedIndex {
-                            path: index_path.clone(),
-                            message: "tensor names must not be empty".into(),
-                        });
-                    }
-                    let relative = validate_relative_shard_path(Path::new(&relative))?;
-                    catalog.insert(
-                        key,
-                        CatalogEntry {
-                            shard: root.join(relative),
-                            indexed: true,
-                        },
-                    );
-                }
-                return Ok(Self {
-                    canonical_root,
-                    catalog,
-                    metadata: Mutex::new(BTreeMap::new()),
-                    cache: Mutex::new(CacheState::default()),
-                    read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
-                    max_cached_shards,
-                });
-            }
-            return Self::from_single_file(
-                root.join("model.safetensors"),
-                canonical_root,
-                max_cached_shards,
-            );
-        }
-        let file = path.to_path_buf();
-        let root = file
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        Self::from_single_file(file, canonicalize(&root)?, max_cached_shards)
+        let file = shards
+            .payload_paths()
+            .first()
+            .expect("unindexed discovery returns one payload")
+            .clone();
+        Self::from_single_file(file, max_cached_shards)
     }
 
-    /// Returns the canonical payload paths admitted by this store.
-    ///
-    /// Indexed paths are parsed with duplicate-key rejection, restricted to
-    /// relative non-traversing names, and resolved beneath the checkpoint's
-    /// canonical access root before they are returned. Hugging Face snapshot
-    /// symlinks may resolve into the repository's sibling `blobs` directory,
-    /// but never outside that repository.
-    pub fn validated_payload_paths(&self) -> Result<Vec<PathBuf>, StoreError> {
-        let paths = self
-            .catalog
-            .values()
-            .map(|entry| self.validate_access_path(entry))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        Ok(paths.into_iter().collect())
-    }
-
-    fn from_single_file(
-        file: PathBuf,
-        canonical_root: PathBuf,
-        max_cached_shards: usize,
-    ) -> Result<Self, StoreError> {
+    fn from_single_file(file: PathBuf, max_cached_shards: usize) -> Result<Self, StoreError> {
         let discovered = inspect_file(&file)?;
         let catalog = discovered
             .keys()
@@ -1015,13 +944,11 @@ impl SafetensorsWeightStore {
                     key.clone(),
                     CatalogEntry {
                         shard: file.clone(),
-                        indexed: false,
                     },
                 )
             })
             .collect();
         Ok(Self {
-            canonical_root,
             catalog,
             metadata: Mutex::new(discovered),
             cache: Mutex::new(CacheState::default()),
@@ -1037,7 +964,7 @@ impl SafetensorsWeightStore {
     }
 
     fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<BufferedShard>, StoreError> {
-        let canonical_path = self.validate_access_path(entry)?;
+        let canonical_path = entry.shard.clone();
         let mut cache = self.lock_cache()?;
         cache.tick = cache.tick.saturating_add(1);
         let tick = cache.tick;
@@ -1102,16 +1029,6 @@ impl SafetensorsWeightStore {
             },
         );
         Ok(shard)
-    }
-
-    fn validate_access_path(&self, entry: &CatalogEntry) -> Result<PathBuf, StoreError> {
-        let canonical = canonicalize(&entry.shard)?;
-        if entry.indexed && !canonical.starts_with(&self.canonical_root) {
-            return Err(StoreError::UnsafeShardPath {
-                path: entry.shard.clone(),
-            });
-        }
-        Ok(canonical)
     }
 
     fn metadata_from_shard(
@@ -1590,82 +1507,6 @@ fn stored_dtype_from_safetensors(dtype: Dtype) -> StoredDtype {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SafetensorsIndex {
-    weight_map: UniqueWeightMap,
-}
-
-#[derive(Debug)]
-struct UniqueWeightMap(BTreeMap<String, String>);
-
-impl<'de> Deserialize<'de> for UniqueWeightMap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = UniqueWeightMap;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a tensor-to-shard object with unique names")
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut values = BTreeMap::new();
-                while let Some((key, shard)) = map.next_entry::<String, String>()? {
-                    if values.insert(key.clone(), shard).is_some() {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate tensor mapping for {key:?}"
-                        )));
-                    }
-                }
-                Ok(UniqueWeightMap(values))
-            }
-        }
-        deserializer.deserialize_map(Visitor)
-    }
-}
-
-fn validate_relative_shard_path(path: &Path) -> Result<PathBuf, StoreError> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(StoreError::UnsafeShardPath {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(path.to_path_buf())
-}
-
-fn canonicalize(path: &Path) -> Result<PathBuf, StoreError> {
-    std::fs::canonicalize(path).map_err(|error| fs_error(path, error))
-}
-
-fn canonical_checkpoint_access_root(path: &Path) -> Result<PathBuf, StoreError> {
-    let canonical_root = canonicalize(path)?;
-    let Some(snapshots) = canonical_root.parent() else {
-        return Ok(canonical_root);
-    };
-    if snapshots.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
-        return Ok(canonical_root);
-    }
-    let Some(repository_root) = snapshots.parent() else {
-        return Ok(canonical_root);
-    };
-    if !repository_root.join("blobs").is_dir() {
-        return Ok(canonical_root);
-    }
-    canonicalize(repository_root)
-}
-
 fn io_error(path: &Path, error: impl std::fmt::Display) -> StoreError {
     StoreError::Io {
         path: path.to_path_buf(),
@@ -1797,6 +1638,7 @@ mod tests {
 
         let store =
             SafetensorsWeightStore::open_with_max_cached_shards(directory.path(), 1).unwrap();
+        let first = first.canonicalize().unwrap();
         store.metadata("left").unwrap();
         let metadata_diagnostics = store.diagnostics().unwrap();
         assert_eq!(
@@ -1843,7 +1685,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validated_payload_paths_reject_symlinks_outside_the_checkpoint_root() {
+    fn opening_rejects_symlinks_outside_the_checkpoint_root() {
         use std::os::unix::fs::symlink;
 
         let parent = tempfile::tempdir().unwrap();
@@ -1869,10 +1711,11 @@ mod tests {
         )
         .unwrap();
 
-        let store = SafetensorsWeightStore::open(&checkpoint).unwrap();
         assert!(matches!(
-            store.validated_payload_paths(),
-            Err(StoreError::UnsafeShardPath { .. })
+            SafetensorsWeightStore::open(&checkpoint),
+            Err(StoreError::SafetensorsShards(
+                crate::safetensors::SafetensorsShardError::UnsafeShardPath { .. }
+            ))
         ));
     }
 

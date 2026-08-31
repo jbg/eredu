@@ -14,6 +14,8 @@ pub mod composite;
 pub mod expert;
 pub mod gguf_store;
 pub mod recipe;
+/// Canonical SafeTensors index parsing and shard-path admission.
+pub mod safetensors;
 pub mod schema;
 /// Backend-neutral checkpoint stores, selections, and encoded leases.
 pub mod store;

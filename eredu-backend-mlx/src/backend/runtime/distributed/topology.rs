@@ -1058,6 +1058,7 @@ mod tests {
                 ("model.remote.weight", "remote.safetensors"),
             ],
         );
+        let local_shard = dir.path().join("local.safetensors").canonicalize().unwrap();
 
         let mut reconstructed = Vec::new();
         for rank in 0..2 {
@@ -1076,10 +1077,7 @@ mod tests {
             plan.insert("model.remote.weight", TensorPlacement::Omit);
             let partition = load_safetensors_partition(dir.path(), &plan, &stream).unwrap();
             assert_eq!(partition.len(), 1);
-            assert_eq!(
-                partition.opened_shards(),
-                &[dir.path().join("local.safetensors")]
-            );
+            assert_eq!(partition.opened_shards(), &[local_shard.clone()]);
             assert!(partition.get("model.remote.weight").is_none());
             let local = partition
                 .get("model.projection.weight")

@@ -171,8 +171,11 @@ examples; they do not live under the facade.
 
 Portable crates split tensor-independent ownership by responsibility:
 
+- `eredu-checkpoint` owns canonical SafeTensors index parsing and shard-path
+  admission; inspection, neutral stores, and conversion tooling consume the
+  same discovery result and never reinterpret `weight_map`;
 - artifact identity, header inspection, the model-configuration resolver
-  contract, tensor catalogs, and preparation plans;
+  contract, tensor catalogs, and preparation plans live in `eredu-core`;
 - validated attention schedules and parallel topologies;
 - model capabilities, resource requirements, admission decisions, execution
   plans, and telemetry schemas;
@@ -363,10 +366,13 @@ execute those plans literally. They do not select tensors by suffix, rank,
 dtype, size, or substring; derive companion identities; canonicalize legacy
 names; or inject compatibility metadata into `config.json`. Conversion fails
 closed when a declared source is absent or any declared output collides with
-another checkpoint tensor. Conversion also obtains payload paths from the
-backend-neutral SafeTensors store, so duplicate index keys, absolute or
-traversing shard names, and symlinks outside the admitted checkpoint access
-root fail before a concrete backend can read or publish any tensor.
+another checkpoint tensor. Conversion obtains payload paths from the canonical
+`eredu-checkpoint` SafeTensors shard facility used by inspection and neutral
+stores. Duplicate index keys, empty mappings, absolute or traversing shard
+names, missing payloads, and symlinks outside the admitted checkpoint access
+root therefore fail consistently before a concrete backend can read or publish
+any tensor. Hugging Face snapshot symlinks remain confined to their repository,
+including its sibling `blobs` directory.
 
 Portable SafeTensors schemas use released checkpoint names directly. A private
 module spelling that inserts `inner` into an architecture name, such as

@@ -1777,11 +1777,16 @@ mod tests {
     fn indexed_catalog_is_sorted_without_mapping_payloads() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("broken.safetensors"), b"not a checkpoint").unwrap();
+        std::fs::write(
+            dir.path().join("also-broken.safetensors"),
+            b"not a checkpoint either",
+        )
+        .unwrap();
         write_index(
             dir.path(),
             &[
                 ("z.weight", "broken.safetensors"),
-                ("a.weight", "missing.safetensors"),
+                ("a.weight", "also-broken.safetensors"),
             ],
         );
 
@@ -1805,7 +1810,7 @@ mod tests {
         assert!(matches!(
             store.acquire("a.weight", TensorSelection::Full),
             Err(CheckpointMaterializationError::Store(
-                StoreError::MissingShard { .. }
+                StoreError::MalformedSafetensors { .. }
             ))
         ));
         assert!(matches!(
@@ -1868,7 +1873,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             SafetensorsWeightStore::open(malformed.path()),
-            Err(eredu_checkpoint::store::StoreError::MalformedIndex { .. })
+            Err(eredu_checkpoint::store::StoreError::SafetensorsShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::MalformedIndex { .. }
+            ))
         ));
 
         let duplicate = tempfile::tempdir().unwrap();
@@ -1879,7 +1886,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             SafetensorsWeightStore::open(duplicate.path()),
-            Err(eredu_checkpoint::store::StoreError::MalformedIndex { .. })
+            Err(eredu_checkpoint::store::StoreError::SafetensorsShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::MalformedIndex { .. }
+            ))
         ));
 
         for shard in ["../escape.safetensors", "/absolute.safetensors"] {
@@ -1887,7 +1896,9 @@ mod tests {
             write_index(dir.path(), &[("weight", shard)]);
             assert!(matches!(
                 SafetensorsWeightStore::open(dir.path()),
-                Err(eredu_checkpoint::store::StoreError::UnsafeShardPath { .. })
+                Err(eredu_checkpoint::store::StoreError::SafetensorsShards(
+                    eredu_checkpoint::safetensors::SafetensorsShardError::UnsafeShardPath { .. }
+                ))
             ));
         }
     }
@@ -2225,11 +2236,10 @@ mod tests {
         write_i32(&outside_file, "weight", &[1], vec![1]);
         std::os::unix::fs::symlink(&outside_file, dir.path().join("linked.safetensors")).unwrap();
         write_index(dir.path(), &[("weight", "linked.safetensors")]);
-        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
         assert!(matches!(
-            store.acquire("weight", TensorSelection::Full),
-            Err(CheckpointMaterializationError::Store(
-                StoreError::UnsafeShardPath { .. }
+            SafetensorsWeightStore::open(dir.path()),
+            Err(StoreError::SafetensorsShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::UnsafeShardPath { .. }
             ))
         ));
     }

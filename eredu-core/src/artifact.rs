@@ -4,6 +4,7 @@
 //! materializes tensor payloads or creates a device/runtime object.
 
 use crate::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage};
+use eredu_checkpoint::safetensors::SafetensorsShards;
 use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType, MetadataValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 /// Backend-neutral loader contract required by an inspected artifact.
@@ -713,11 +714,11 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
     let (configuration, resolved_plan) = resolver.resolve_safetensors(&json)?.into_parts();
-    let shards = safetensors_shards(path)?;
+    let shards = SafetensorsShards::discover(path)?;
     let mut descriptors = Vec::new();
     let mut names = BTreeSet::new();
-    for shard in shards {
-        for descriptor in inspect_safetensors_header(&shard)? {
+    for shard in shards.payload_paths() {
+        for descriptor in inspect_safetensors_header(shard)? {
             if !names.insert(descriptor.name.clone()) {
                 return Err(ArtifactError::DuplicateTensor(descriptor.name));
             }
@@ -746,37 +747,6 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
         validated_gguf: None,
         architecture_plan,
     })
-}
-
-#[derive(Deserialize)]
-struct SafetensorsIndex {
-    weight_map: BTreeMap<String, String>,
-}
-
-fn safetensors_shards(path: &Path) -> Result<Vec<PathBuf>, ArtifactError> {
-    let index_path = path.join("model.safetensors.index.json");
-    if index_path.exists() {
-        let index: SafetensorsIndex = serde_json::from_reader(File::open(&index_path)?)?;
-        if index.weight_map.is_empty() {
-            return Err(ArtifactError::InvalidArtifact(
-                "SafeTensors index weight_map is empty".into(),
-            ));
-        }
-        let mut shards = BTreeSet::new();
-        for relative in index.weight_map.values() {
-            let relative = Path::new(relative);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-            {
-                return Err(ArtifactError::UnsafeShardPath(relative.to_path_buf()));
-            }
-            shards.insert(path.join(relative));
-        }
-        return Ok(shards.into_iter().collect());
-    }
-    Ok(vec![path.join("model.safetensors")])
 }
 
 #[derive(Deserialize)]
@@ -942,9 +912,9 @@ pub enum ArtifactError {
     /// A tensor name occurred more than once.
     #[error("duplicate checkpoint tensor {0:?}")]
     DuplicateTensor(String),
-    /// Indexed shard path escapes the artifact root.
-    #[error("unsafe SafeTensors shard path {0}")]
-    UnsafeShardPath(PathBuf),
+    /// Canonical SafeTensors shard discovery or path admission failed.
+    #[error(transparent)]
+    SafetensorsShards(#[from] eredu_checkpoint::safetensors::SafetensorsShardError),
     /// Requested quantization transformation is unavailable for the artifact.
     #[error("unsupported model quantization policy: {0}")]
     UnsupportedQuantizationPolicy(String),
@@ -1236,6 +1206,38 @@ mod tests {
         let (artifact, architecture_plan, _, _) = plan.into_parts();
         assert!(matches!(artifact, ModelArtifact::SafeTensors { .. }));
         assert_eq!(architecture_plan.format, Some(ArtifactFormat::SafeTensors));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safetensors_inspection_rejects_indexed_symlinks_outside_the_access_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        write_safetensors_fixture(&outside, "llama");
+
+        let checkpoint = parent.path().join("checkpoint");
+        std::fs::create_dir(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        symlink(
+            outside.join("model.safetensors"),
+            checkpoint.join("model-00001.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(
+            checkpoint.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"token_embd.weight":"model-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            inspect_artifact(&checkpoint, &FixtureResolver),
+            Err(ArtifactError::SafetensorsShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::UnsafeShardPath { .. }
+            ))
+        ));
     }
 
     #[test]

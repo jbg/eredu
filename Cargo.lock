@@ -950,6 +950,7 @@ dependencies = [
 name = "eredu-core"
 version = "0.1.0"
 dependencies = [
+ "eredu-checkpoint",
  "eredu-gguf",
  "serde",
  "serde_json",

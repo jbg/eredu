@@ -225,6 +225,13 @@ fn reject_portable_safetensors(
                 InspectionReadiness::Unverified,
             )
         }
+        eredu_core::artifact::ArtifactError::SafetensorsShards(
+            eredu_checkpoint::safetensors::SafetensorsShardError::MissingShard { .. },
+        ) => (
+            InspectionIssueCode::MissingCheckpointShard,
+            InspectionReadiness::Missing,
+            InspectionReadiness::Unverified,
+        ),
         eredu_core::artifact::ArtifactError::Json(_) => (
             InspectionIssueCode::InvalidConfiguration,
             InspectionReadiness::Invalid,
@@ -236,7 +243,7 @@ fn reject_portable_safetensors(
             InspectionReadiness::Invalid,
         ),
         eredu_core::artifact::ArtifactError::DuplicateTensor(_)
-        | eredu_core::artifact::ArtifactError::UnsafeShardPath(_)
+        | eredu_core::artifact::ArtifactError::SafetensorsShards(_)
         | eredu_core::artifact::ArtifactError::Catalog(_) => (
             InspectionIssueCode::InvalidContainer,
             InspectionReadiness::Invalid,

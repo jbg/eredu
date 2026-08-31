@@ -95,6 +95,10 @@ pub enum Error {
     #[error(transparent)]
     CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
 
+    /// Backend-neutral SafeTensors shard discovery or path admission failed.
+    #[error(transparent)]
+    CheckpointShards(#[from] eredu_checkpoint::safetensors::SafetensorsShardError),
+
     /// MLX checkpoint tensor conversion or materialization failure.
     #[error(transparent)]
     CheckpointMaterialization(

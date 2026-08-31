@@ -374,8 +374,7 @@ fn load_arrays_quantized_strict<M: PhysicalParameters>(
 
 /// Returns the validated safetensors payloads referenced by a model directory.
 pub fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
-    let store = eredu_checkpoint::store::SafetensorsWeightStore::open(model_dir)?;
-    Ok(store.validated_payload_paths()?)
+    Ok(eredu_checkpoint::safetensors::SafetensorsShards::discover(model_dir)?.into_payload_paths())
 }
 
 #[cfg(test)]
@@ -418,8 +417,8 @@ mod tests {
         let traversal_error = safetensors_files(traversal.path()).unwrap_err();
         assert!(matches!(
             traversal_error,
-            crate::backend::Error::CheckpointStore(
-                eredu_checkpoint::store::StoreError::UnsafeShardPath { .. }
+            crate::backend::Error::CheckpointShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::UnsafeShardPath { .. }
             )
         ));
 
@@ -432,9 +431,32 @@ mod tests {
         let duplicate_error = safetensors_files(duplicate.path()).unwrap_err();
         assert!(matches!(
             duplicate_error,
-            crate::backend::Error::CheckpointStore(
-                eredu_checkpoint::store::StoreError::MalformedIndex { .. }
+            crate::backend::Error::CheckpointShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::MalformedIndex { .. }
             )
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safetensors_file_discovery_rejects_external_payload_symlinks() {
+        let parent = tempfile::tempdir().unwrap();
+        let checkpoint = parent.path().join("checkpoint");
+        std::fs::create_dir(&checkpoint).unwrap();
+        let outside = parent.path().join("outside.safetensors");
+        std::fs::write(&outside, []).unwrap();
+        std::os::unix::fs::symlink(&outside, checkpoint.join("linked.safetensors")).unwrap();
+        std::fs::write(
+            checkpoint.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"weight":"linked.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            safetensors_files(&checkpoint),
+            Err(crate::backend::Error::CheckpointShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::UnsafeShardPath { .. }
+            ))
         ));
     }
 
