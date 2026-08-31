@@ -795,26 +795,6 @@ impl QwenModel {
         result
     }
 
-    /// Runs the neutral decoder while delegating routed experts to a runtime
-    /// provider such as bounded expert residency or expert-parallel exchange.
-    pub fn forward_with_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut MlxKeyValueState,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut provider =
-            crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                &mut execute,
-            );
-        self.forward_with_expert_provider(inputs, mask, cache, &mut provider, stream)
-    }
-
     fn forward_with_expert_provider<P>(
         &mut self,
         inputs: &Array,
@@ -876,27 +856,6 @@ impl QwenModel {
             )),
         }?;
         Ok(output.into_array())
-    }
-
-    /// Runs tensor-parallel attention and projections while delegating routed
-    /// experts to the matching-coordinate expert-parallel provider.
-    pub fn forward_tensor_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut provider =
-            crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                &mut execute,
-            );
-        self.forward_tensor_expert_provider(inputs, mask, cache, group, &mut provider, stream)
     }
 
     fn forward_tensor_expert_provider<P>(

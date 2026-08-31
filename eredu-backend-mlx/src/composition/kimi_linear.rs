@@ -42,7 +42,7 @@ use crate::backend::{
         media::input,
         residency::expert_cache::ExpertCatalogEntry,
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
-        residency::expert_provider::{CachedGatedProductExpertProvider, ExpertExecutorProvider},
+        residency::expert_provider::CachedGatedProductExpertProvider,
     },
 };
 use eredu_core::cache::{
@@ -992,91 +992,6 @@ impl KimiLinearModel {
         eredu_runtime::observe_model_logits(observer, &output)
             .map(crate::MlxTensor::into_array)
             .map_err(Into::into)
-    }
-
-    /// Runs the neutral decoder while delegating routed experts to an
-    /// external placement policy such as expert parallelism.
-    pub fn forward_with_expert_executor<F>(
-        &mut self,
-        tokens: &Array,
-        mask: Option<&Array>,
-        cache: &mut MlxHybridState,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut provider = ExpertExecutorProvider::new(&mut execute);
-        self.forward_with_provider(tokens, mask, cache, &mut provider, stream)
-    }
-
-    /// Runs TP-sharded neutral blocks and dense operators while delegating
-    /// routed experts to the matching expert-parallel subgroup.
-    pub fn forward_tensor_expert_parallel<F>(
-        &mut self,
-        tokens: &Array,
-        mask: Option<&Array>,
-        cache: &mut MlxHybridState,
-        group: &crate::backend::runtime::distributed::Group,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let pass = if tokens.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
-        let input = eredu_architectures::decoder::LayeredInput {
-            tokens: crate::composition::tensor_ref(tokens),
-            mask: crate::composition::tensor_opt(mask),
-        };
-        let mut provider = ExpertExecutorProvider::new(&mut execute);
-        let hook =
-            |architecture: &mut NeutralArchitecture,
-             group_index: usize,
-             index: usize,
-             block: &mut NeutralBlock,
-             hidden: &crate::MlxTensor,
-             state: &mut MlxHybridState,
-             forward: &mut eredu_architectures::kimi_linear::ForwardContext<crate::MlxTensor>,
-             parallel: &crate::backend::runtime::distributed::Group,
-             context: &Stream| {
-                <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::forward_unit_parallel_with_provider(
-                    architecture,
-                    group_index,
-                    index,
-                    block,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut provider,
-                    parallel,
-                    context,
-                )
-            };
-        let output = match &mut self.execution {
-            KimiLinearExecution::TensorParallelResident(runtime) => {
-                runtime.forward_parallel_with_unit_executor(input, cache, group, stream, hook)
-            }
-            KimiLinearExecution::TensorParallelLayerwise(runtime) => {
-                runtime.forward_parallel_with_unit_executor(input, cache, group, stream, hook)
-            }
-            _ => {
-                return Err(Error::Parallel(
-                    "Kimi Linear was not loaded for tensor plus expert parallelism".into(),
-                ))
-            }
-        }
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(output.into_array())
     }
 
     /// Executes a rank-local tensor-parallel forward pass.
