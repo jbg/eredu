@@ -43,6 +43,12 @@ normal package verification still compiles each crate's default packaged
 targets. Packaging does not need an Apple or NVIDIA runner: target-native Metal
 and CUDA coverage remains in the platform workflows.
 
+The Linux build workflow separately denies all workspace Clippy warnings and
+checks each weakly forwarded facade feature (`metal`, `cuda`, `nccl`, `image`,
+and `audio`) without `mlx` at the minimum supported Rust version. These checks
+keep optional facade features from accidentally activating the native backend
+or depending on its availability.
+
 The manually dispatched `Native release gate` workflow must pass before
 publication. Its macOS job first proves that native MLX execution is available;
 failure to initialize Metal is a test failure, never a skip. The same job runs

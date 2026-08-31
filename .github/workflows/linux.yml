@@ -31,6 +31,13 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check the portable workspace with the locked MSRV
         run: cargo check --locked --workspace --all-targets --no-default-features
+      - name: Check standalone weak facade features with the locked MSRV
+        run: |
+          cargo check --locked -p eredu --no-default-features --features metal
+          cargo check --locked -p eredu --no-default-features --features cuda
+          cargo check --locked -p eredu --no-default-features --features nccl
+          cargo check --locked -p eredu --no-default-features --features image
+          cargo check --locked -p eredu --no-default-features --features audio
       - name: Check every CPU-compatible optional surface with the locked MSRV
         run: |
           cargo check --locked -p safemlx-sys --no-default-features --features "accelerate,metal,generate-bindings"
@@ -58,6 +65,8 @@ jobs:
         run: cargo test -p safemlx --test events --no-default-features
       - name: Check the Linux workspace
         run: cargo check --workspace
+      - name: Lint the workspace with warnings denied
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Check isolated audio and codec features
         run: |
           cargo check -p eredu-backend-mlx --no-default-features --features audio

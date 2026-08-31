@@ -1303,7 +1303,8 @@ Dependency direction and semantic ownership are review rules recorded in
   model-family configuration, checkpoint naming policy, state geometry, or
   layer equations;
 - native dependencies remain behind facade features, preserving the
-  `default-features = false` build; and
+  `default-features = false` build; Linux CI also checks every weakly forwarded
+  native and media feature without enabling `mlx`; and
 - model families and their neutral execution remain available without enabling
   a concrete backend feature; feature gates belong on backend adapters, not on
   entire families; and

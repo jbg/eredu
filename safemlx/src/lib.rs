@@ -57,7 +57,7 @@ pub(crate) fn test_stream() -> &'static Stream {
 pub(crate) fn test_key(seed: u64, stream: &Stream) -> Array {
     use crate::ops::indexing::TryIndexOp;
 
-    random::split_n(&random::key(seed).unwrap(), 2, stream)
+    random::split_n(random::key(seed).unwrap(), 2, stream)
         .unwrap()
         .try_index_device(1, stream)
         .unwrap()
