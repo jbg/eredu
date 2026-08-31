@@ -3784,13 +3784,25 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
-    let ids = architecture.prediction_execution_groups();
-    let id = ids.get(depth).ok_or_else(|| {
-        Error::Parallel(format!(
-            "architecture has no prediction execution group at depth {depth}"
-        ))
-    })?;
-    architecture_group_by_id::<A, S>(architecture, id)
+    let id = architecture_prediction_group_id::<A, S>(architecture, depth)?;
+    architecture_group_by_id::<A, S>(architecture, &id)
+}
+
+fn architecture_prediction_group_id<A, S>(architecture: &A, depth: usize) -> Result<String, Error>
+where
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Error: std::fmt::Display,
+{
+    architecture
+        .prediction_execution_groups()
+        .into_iter()
+        .nth(depth)
+        .ok_or_else(|| {
+            Error::Parallel(format!(
+                "architecture has no prediction execution group at depth {depth}"
+            ))
+        })
 }
 
 fn architecture_prediction_groups<A, S>(architecture: &A) -> Result<Vec<usize>, Error>

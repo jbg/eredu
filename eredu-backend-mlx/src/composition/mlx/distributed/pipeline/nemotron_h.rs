@@ -37,12 +37,13 @@ use crate::{
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_parallel_layout,
         architecture_parameter_unit_owner, architecture_prediction_group,
-        architecture_prediction_unit_ranges, base_info, build_pipeline_expert_cache,
-        build_pipeline_layer_storage, execute_neutral_routed_output_group,
-        execute_resident_distributed_experts, execute_routed_layered_partition_observed,
-        load_architecture_static_parameters, local_architecture_parameter_bindings,
-        materialize_pipeline_cache_layers, partition_owns_architecture_units,
-        pipeline_binding_units, prediction_architecture_transport, preflight_pipeline_realization,
+        architecture_prediction_group_id, architecture_prediction_unit_ranges, base_info,
+        build_pipeline_expert_cache, build_pipeline_layer_storage,
+        execute_neutral_routed_output_group, execute_resident_distributed_experts,
+        execute_routed_layered_partition_observed, load_architecture_static_parameters,
+        local_architecture_parameter_bindings, materialize_pipeline_cache_layers,
+        partition_owns_architecture_units, pipeline_binding_units,
+        prediction_architecture_transport, preflight_pipeline_realization,
         quantize_pipeline_stage_store, validate_admitted_pipeline_kind,
         validate_pipeline_expert_dispatch, BoundPipelineBindings, NemotronHPipelinePartition,
         PipelineEmbeddedMtp, PipelineExpertStorage, PipelineForward, PipelineLayerCache,
@@ -53,12 +54,11 @@ use crate::{
     composition::{mlx::speculative::embedded::EmbeddedMtpOutput, nemotron_h::NemotronHBindings},
 };
 
-fn realization_has_mtp_depth<S>(
+fn realization_has_prediction_group<S>(
     plan: Option<&eredu_architectures::ExpertRealizationPlan<S>>,
-    depth: usize,
+    group: &str,
 ) -> bool {
-    let group = format!("mtp.{depth}");
-    plan.is_some_and(|plan| plan.has_routed_units_in_group(&group))
+    plan.is_some_and(|plan| plan.has_routed_units_in_group(group))
 }
 
 impl PipelinePartitionMetadata for NemotronHPipelinePartition {
@@ -753,9 +753,11 @@ impl NemotronHPipelinePartition {
         self.prediction_layers.get(depth).ok_or_else(|| {
             Error::Parallel(format!("Nemotron-H has no MTP prediction depth {depth}"))
         })?;
-        Ok(realization_has_mtp_depth(
+        let group =
+            architecture_prediction_group_id::<_, MlxHybridState>(&self.architecture, depth)?;
+        Ok(realization_has_prediction_group(
             self.architecture.expert_realization_plan(),
-            depth,
+            &group,
         ))
     }
 
@@ -1005,25 +1007,34 @@ impl NemotronHPipelinePartition {
 
 #[cfg(test)]
 mod tests {
-    use super::realization_has_mtp_depth;
+    use super::realization_has_prediction_group;
     use eredu_architectures::ExpertRealizationPlan;
     use eredu_core::{ParallelRankTopology, ParallelTopology};
     use eredu_runtime::ExecutionGroupId;
     use std::collections::BTreeMap;
 
     #[test]
-    fn nemotron_h_mtp_routing_follows_the_expert_realization_groups() {
+    fn nemotron_h_mtp_routing_uses_the_architecture_prediction_group_id() {
         let topology = ParallelTopology::new(1, 1, 1, 1).unwrap();
         let rank = ParallelRankTopology::new(topology, 0).unwrap();
         let plan = ExpertRealizationPlan::balanced(
             2,
             rank,
-            BTreeMap::from([((ExecutionGroupId::new("mtp.1").unwrap(), 0), ())]),
+            BTreeMap::from([(
+                (ExecutionGroupId::new("prediction-renamed").unwrap(), 0),
+                (),
+            )]),
         )
         .unwrap();
 
-        assert!(!realization_has_mtp_depth(Some(&plan), 0));
-        assert!(realization_has_mtp_depth(Some(&plan), 1));
-        assert!(!realization_has_mtp_depth::<()>(None, 1));
+        assert!(realization_has_prediction_group(
+            Some(&plan),
+            "prediction-renamed"
+        ));
+        assert!(!realization_has_prediction_group(Some(&plan), "mtp.1"));
+        assert!(!realization_has_prediction_group::<()>(
+            None,
+            "prediction-renamed"
+        ));
     }
 }

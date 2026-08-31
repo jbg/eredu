@@ -1243,7 +1243,8 @@ The primary decoder and embedded-prediction groups have explicit stable
 identities, so multimodal ingress ends at the declared primary boundary and
 prediction runs only in the architecture-declared identity order. Their
 semantic kinds remain useful for lifecycle classification but do not select
-either group.
+either group. Backend expert-routing guards consume those declared identities;
+they do not reconstruct family prediction-group names from depth indices.
 
 Pipeline ingress uses the same canonical execution graph through
 `LayeredPipelineSchedule`. The neutral runtime consumes both architecture-authored
