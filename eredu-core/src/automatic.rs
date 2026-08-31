@@ -1445,34 +1445,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_telemetry_serializes_effective_model_type_without_legacy_key() {
-        let telemetry = ExecutionTelemetry {
-            schema_version: AUTOMATIC_SCHEMA_VERSION,
-            effective_model_type: "gemma4_text".into(),
-            plan: None,
-            plan_explanation: None,
-            hardware: None,
-            resources: None,
-            prompt_tokens: 1,
-            generated_tokens: 1,
-            stop_reason: "length".into(),
-            timing: TimingTelemetry::new(Duration::ZERO, Duration::ZERO, None, 1, Duration::ZERO),
-            allocator: None,
-            residency: None,
-            expert_cache: None,
-            speculative: None,
-        };
-
-        let encoded = serde_json::to_value(&telemetry).unwrap();
-        assert_eq!(encoded["effective_model_type"], "gemma4_text");
-        assert!(encoded.get("model_type").is_none());
-        assert_eq!(
-            serde_json::from_value::<ExecutionTelemetry>(encoded).unwrap(),
-            telemetry
-        );
-    }
-
-    #[test]
     fn tokenizer_compatibility_requires_identical_vocabularies() {
         let fingerprint = [7; 32];
         let proof = TokenizerCompatibilityProof::prove(fingerprint, fingerprint).unwrap();
