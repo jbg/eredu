@@ -122,6 +122,5 @@ pub fn local_geometry(
     crate::decoder::local_geometry(args, layout, local_block_args)
 }
 
-/// Declares embedding, final normalization, and output-head placement groups.
 /// Shared dense-decoder lifecycle specialized to Llama configuration policy.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs>;
