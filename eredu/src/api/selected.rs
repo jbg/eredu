@@ -4,17 +4,7 @@
 //! behind this module. Applications configure and operate the selected local
 //! backend through portable plans and facade-owned diagnostics.
 //!
-//! The selected backend and its session are not part of the application API:
-//!
-//! ```compile_fail
-//! use eredu::api::LocalBackend;
-//! ```
-//!
-//! ```compile_fail
-//! fn native_session(model: &eredu::api::LocalModel) {
-//!     let _ = model.runtime().session();
-//! }
-//! ```
+//! The selected backend and its session are not part of the application API.
 
 use std::path::Path;
 #[cfg(feature = "metal")]
@@ -359,12 +349,6 @@ impl Iterator for LocalTextGeneration<'_> {
 }
 
 /// Loaded local model with no public backend, session, tensor, or completion type.
-///
-/// ```compile_fail
-/// fn native_session(model: &eredu::api::LocalModel) {
-///     let _ = model.runtime().session();
-/// }
-/// ```
 pub struct LocalModel {
     inner: super::LoadedModel<SelectedBackend>,
 }

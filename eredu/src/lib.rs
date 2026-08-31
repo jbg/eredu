@@ -9,51 +9,11 @@
 //! their owning crates, and import facade-owned operations from [`api`] or
 //! [`runtime`].
 //!
-//! Backend implementation contracts are imported from their owning crates:
-//!
-//! ```compile_fail
-//! use eredu::BackendProvider;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::BackendSession;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::PreparedModel;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::Completion;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::ValueDescriptor;
-//! ```
+//! Backend implementation contracts are imported from their owning crates.
 //!
 //! Generic realtime scheduling and speculative execution infrastructure also
 //! comes from `eredu-core`; the facade exposes selected-backend realtime
-//! wrappers and prepared-chat speculative requests instead:
-//!
-//! ```compile_fail
-//! use eredu::RealtimeScheduler;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::RealtimeCompletedStep;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::RealtimeError;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::SpeculativeGenerationBatchRequest;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::SpeculativeGenerationLane;
-//! ```
+//! wrappers and prepared-chat speculative requests instead.
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]

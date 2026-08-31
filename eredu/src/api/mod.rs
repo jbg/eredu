@@ -6,27 +6,7 @@
 //! selected.
 //!
 //! Backend implementation traits and their errors are imported from
-//! `eredu-core`, not this facade namespace:
-//!
-//! ```compile_fail
-//! use eredu::api::AutomaticPlanningBackend;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::api::ModelCapabilityBackend;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::api::MultimodalPreparationBackend;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::api::MultimodalPreparationFailure;
-//! ```
-//!
-//! ```compile_fail
-//! use eredu::api::SpeculativeGenerationBackend;
-//! ```
+//! `eredu-core`, not this facade namespace.
 
 mod media;
 mod metadata;

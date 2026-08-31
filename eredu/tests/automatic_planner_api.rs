@@ -2,7 +2,7 @@ use eredu::api::{LocalBackendFactory, LocalInspectionOptions};
 use eredu_core::{AutomaticPlanRequest, DevicePlan, ExecutionPlan};
 
 #[test]
-fn portable_planner_inputs_do_not_expose_the_local_backend() {
+fn portable_planner_inputs_round_trip_and_build_inspection_options() {
     let device = DevicePlan::new("mlx", "cpu:0").unwrap();
     let request = AutomaticPlanRequest::new("model", device.clone());
     let encoded = serde_json::to_vec(&request).unwrap();
