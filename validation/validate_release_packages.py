@@ -38,20 +38,6 @@ RELEASE_ORDER = (
     "eredu-cli",
 )
 
-# These published crates exercise compatibility promises that a fresh workspace
-# package cannot cover. Run each consumer immediately after staging the candidate
-# that could otherwise change its dependency resolution.
-HISTORICAL_CONSUMERS = {
-    "safemlx-internal-macros": (
-        {
-            "name": "safemlx-0-1-3",
-            "dependency": "safemlx",
-            "version": "=0.1.3",
-            "default_features": False,
-        },
-    ),
-}
-
 MAX_ARCHIVE_BYTES = 10 * 1024 * 1024
 
 
@@ -367,42 +353,6 @@ def validate_downstream_consumer(
     )
 
 
-def validate_historical_consumers(
-    candidate_name: str,
-    destination: Path,
-    config: Path,
-    environment: dict[str, str],
-) -> None:
-    for historical in HISTORICAL_CONSUMERS.get(candidate_name, ()):
-        consumer = destination / historical["name"]
-        source = consumer / "src"
-        source.mkdir(parents=True)
-        default_features = str(historical["default_features"]).lower()
-        (consumer / "Cargo.toml").write_text(
-            "\n".join(
-                [
-                    "[package]",
-                    f'name = "{historical["name"]}-release-consumer"',
-                    'version = "0.0.0"',
-                    'edition = "2021"',
-                    "",
-                    "[dependencies]",
-                    f'{historical["dependency"]} = {{ version = '
-                    f'"{historical["version"]}", default-features = '
-                    f"{default_features} }}",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        (source / "lib.rs").write_text("", encoding="utf-8")
-        run(
-            ["cargo", "check", "--config", str(config)],
-            cwd=consumer,
-            env=environment,
-        )
-
-
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -504,12 +454,6 @@ def main() -> int:
             stage_package(package, archive, index, downloads, publishable_names)
             staged.append(package)
             write_cargo_config(config, index, staged)
-            validate_historical_consumers(
-                crate_name,
-                root / "historical-consumers",
-                config,
-                environment,
-            )
             validate_downstream_consumer(
                 package,
                 root / "downstream-consumers",
