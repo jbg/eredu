@@ -18,8 +18,8 @@ use eredu_core::InputModality;
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters,
-    CacheResidencyPolicy, CausalModel, ExecutionResidency, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
+    CacheResidencyPolicy, CausalModel, LayerWeightResidency, LayeredArchitecture,
+    LayerwiseRuntime,
     PagedCacheOptions, ParameterRole, ResidencyReport, WeightBinding,
 };
 use safemlx::{
@@ -702,27 +702,26 @@ pub(crate) fn load_gguf(
         })
         .transpose()?
         .flatten();
-    let (store, materialization) = if let Some(quantization) = quantize_on_load {
+    let store = if let Some(quantization) = quantize_on_load {
         if parsed.vision.is_some() {
-            let (store, target, report) =
+            let (store, target, _) =
                 quantize_conditional_store(store, &parsed, quantization, stream)?;
             parsed = target;
-            (store, Some(report))
+            store
         } else {
-            let (store, target, report) =
+            let (store, target, _) =
                 quantize_store(store, &parsed.text, quantization, stream)?;
             parsed.text = target;
-            (store, Some(report))
+            store
         }
     } else {
-        (store, None)
+        store
     };
     let mut model = if parsed.vision.is_some() {
         load_conditional_store(
             store,
             parsed,
             options,
-            materialization,
             expert_options.is_some(),
             stream,
             weights_stream,
@@ -732,7 +731,6 @@ pub(crate) fn load_gguf(
             store,
             parsed,
             options,
-            materialization,
             expert_options.is_some(),
             stream,
             weights_stream,
@@ -796,7 +794,6 @@ struct PreparedConditionalOutput {
 pub struct QwenHybridModel {
     parsed: ParsedHybridConfig,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
 }
@@ -817,16 +814,6 @@ impl QwenHybridModel {
         self.parsed.vision.as_ref()
     }
 
-    pub fn vision_spatial_merge_size(&self) -> Option<i32> {
-        self.parsed
-            .vision
-            .as_ref()
-            .map(|vision| vision.spatial_merge_size)
-    }
-    /// Effective model type selected by strict neutral configuration parsing.
-    pub fn model_type(&self) -> &str {
-        &self.parsed.text.model_type
-    }
     /// Embedded prediction depth declared by the constructed architecture graph.
     pub fn mtp_len(&self) -> usize {
         match &self.execution {
@@ -841,17 +828,6 @@ impl QwenHybridModel {
         &self,
     ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
         None
-    }
-    /// Canonical residency metadata.
-    pub fn metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-    pub fn residency_metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-    /// Whether all execution units are pinned on device.
-    pub fn is_fully_resident(&self) -> bool {
-        self.metadata.residency() == ExecutionResidency::FullyResident
     }
     /// Allocates the declared recurrent, convolution, KV, and MTP state.
     pub fn new_cache(&self) -> MlxHybridState {
@@ -1944,19 +1920,18 @@ pub fn load_safetensors_with_residency(
     let options = residency.layers();
     let store = artifact.store();
     if parsed.vision.is_some() {
-        let (store, materialization) = if let Some(quantization) = quantize_on_load {
-            let (store, target, report) =
+        let store = if let Some(quantization) = quantize_on_load {
+            let (store, target, _) =
                 quantize_conditional_store(store, &parsed, quantization, stream)?;
             parsed = target;
-            (store, Some(report))
+            store
         } else {
-            (store, None)
+            store
         };
         let mut model = load_conditional_store(
             store,
             parsed,
             options,
-            materialization,
             expert_options.is_some(),
             stream,
             weights_stream,
@@ -1966,18 +1941,17 @@ pub fn load_safetensors_with_residency(
         }
         return Ok(model);
     }
-    let (store, materialization) = if let Some(quantization) = quantize_on_load {
-        let (store, target, report) = quantize_store(store, &parsed.text, quantization, stream)?;
+    let store = if let Some(quantization) = quantize_on_load {
+        let (store, target, _) = quantize_store(store, &parsed.text, quantization, stream)?;
         parsed.text = target;
-        (store, Some(report))
+        store
     } else {
-        (store, None)
+        store
     };
     let mut model = load_store(
         store,
         parsed,
         options,
-        materialization,
         expert_options.is_some(),
         stream,
         weights_stream,
@@ -1992,7 +1966,6 @@ fn load_conditional_store(
     store: Arc<dyn CheckpointSource>,
     parsed: ParsedHybridConfig,
     options: LayerWeightResidency,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2012,7 +1985,7 @@ fn load_conditional_store(
     let binding = parsed.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         factory,
@@ -2045,9 +2018,6 @@ fn load_conditional_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(parsed.text.model_type.clone());
-    metadata.set_quantization(parsed.text.quantization);
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -2066,7 +2036,6 @@ fn load_conditional_store(
     Ok(QwenHybridModel {
         parsed,
         state_layout,
-        metadata,
         execution,
         expert_cache: None,
     })
@@ -2076,7 +2045,6 @@ fn load_store(
     store: Arc<dyn CheckpointSource>,
     parsed: ParsedHybridConfig,
     options: LayerWeightResidency,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2096,7 +2064,7 @@ fn load_store(
     let binding_config = parsed.text.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         factory,
@@ -2126,9 +2094,6 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(parsed.text.model_type.clone());
-    metadata.set_quantization(parsed.text.quantization);
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -2147,7 +2112,6 @@ fn load_store(
     Ok(QwenHybridModel {
         parsed,
         state_layout,
-        metadata,
         execution,
         expert_cache: None,
     })

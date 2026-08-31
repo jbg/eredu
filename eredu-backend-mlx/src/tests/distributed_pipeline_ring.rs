@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::ExecutionContext;
+use crate::native::{ExecutionContext, MlxModelSession};
 use crate::MlxTensor;
 use crate::{
     backend::runtime::{
@@ -1726,32 +1726,56 @@ fn complete_family_adapters_return_final_output_interventions() {
             fn intervene(
                 &mut self,
                 path: &str,
-                _value: &MlxTensor,
+                value: &MlxTensor,
             ) -> Result<Option<MlxTensor>, safemlx::error::Exception> {
-                Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
-                    .then(|| MlxTensor::from_array(Array::from_slice(&[41.0f32], &[1]))))
+                Ok(
+                    (path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH).then(|| {
+                        let value = value.as_array();
+                        MlxTensor::from_array(Array::from_iter(
+                            std::iter::repeat_n(41.0f32, value.size()),
+                            value.shape(),
+                        ))
+                    }),
+                )
             }
         }
 
         let checkpoint = tempfile::tempdir().unwrap();
         write_fixture(checkpoint.path());
         let backend = crate::native::backend(&stream, &stream);
-        let mut model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default())
+        let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default())
             .unwrap()
-            .into_inner()
-            .into_complete()
-            .unwrap();
+            .into_inner();
+        let mut session = MlxModelSession::from_model(
+            model,
+            None,
+            eredu_core::SessionCapabilities {
+                persistent_cache: true,
+                output_observation: true,
+                activation_inspection: true,
+            },
+        )
+        .unwrap();
         let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [text_input_part(&tokens)];
         let mut observer = ReplacingLogits { observed: false };
-        let output = model
-            .forward_with_observer(&tokens, None, &stream, &mut observer)
+        let output = session
+            .submit_prefill_with_observer(
+                &backend,
+                crate::backend::runtime::media::input::ModelInput::new(&parts).into(),
+                &mut observer,
+            )
             .unwrap_or_else(|error| panic!("{family} observed forward failed: {error}"));
+        let output = output.wait().unwrap();
         assert!(observer.observed, "{family} did not report final logits");
-        assert_eq!(output.shape(), &[1], "{family} ignored the intervention");
-        assert_eq!(
-            output.evaluated().unwrap().as_slice::<f32>(),
-            &[41.0],
-            "{family} returned its original logits"
+        assert!(
+            output
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .iter()
+                .all(|value| *value == 41.0),
+            "{family} ignored the intervention"
         );
     }
 }
@@ -1782,31 +1806,45 @@ fn resident_reference_quantized(
         })
         .unwrap_or_default();
     let backend = crate::native::backend(stream, stream);
-    let mut model = eredu_core::load_model(&backend, checkpoint, options)
+    let model = eredu_core::load_model(&backend, checkpoint, options)
         .unwrap()
-        .into_inner()
-        .into_complete()
-        .unwrap();
+        .into_inner();
+    let mut session = MlxModelSession::from_model(
+        model,
+        None,
+        eredu_core::SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        },
+    )
+    .unwrap();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [text_input_part(&prompt)];
-    let prefill = model
-        .submit_prefill(
-            crate::backend::runtime::media::input::ModelInput::new(&parts),
-            stream,
+    let prefill = session
+        .prefill(
+            &backend,
+            crate::backend::runtime::media::input::ModelInput::new(&parts).into(),
         )
         .unwrap()
         .wait()
         .unwrap()
+        .into_logits()
+        .unwrap()
+        .into_array()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
-    let decode = model
-        .submit_decode(token, stream)
+    let decode = session
+        .decode(&backend, token)
         .unwrap()
         .wait()
         .unwrap()
+        .into_logits()
+        .unwrap()
+        .into_array()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
@@ -1820,30 +1858,44 @@ fn resident_reference_for_prepared(
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
     let backend = crate::native::backend(stream, stream);
-    let mut model = eredu_core::load_model(&backend, checkpoint, ModelLoadOptions::default())
+    let model = eredu_core::load_model(&backend, checkpoint, ModelLoadOptions::default())
         .unwrap()
-        .into_inner()
-        .into_complete()
-        .unwrap();
+        .into_inner();
+    let mut session = MlxModelSession::from_model(
+        model,
+        None,
+        eredu_core::SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        },
+    )
+    .unwrap();
     let parts = prepared.input_parts();
-    let prefill = model
-        .submit_prefill(
-            crate::backend::runtime::media::input::ModelInput::new(parts),
-            stream,
+    let prefill = session
+        .prefill(
+            &backend,
+            crate::backend::runtime::media::input::ModelInput::new(parts).into(),
         )
         .unwrap()
         .wait()
         .unwrap()
+        .into_logits()
+        .unwrap()
+        .into_array()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
-    let decode = model
-        .submit_decode(token, stream)
+    let decode = session
+        .decode(&backend, token)
         .unwrap()
         .wait()
         .unwrap()
+        .into_logits()
+        .unwrap()
+        .into_array()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
@@ -1929,31 +1981,45 @@ fn multimodal_resident_reference(
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
     let backend = crate::native::backend(stream, stream);
-    let mut model = eredu_core::load_model(&backend, checkpoint, ModelLoadOptions::default())
+    let model = eredu_core::load_model(&backend, checkpoint, ModelLoadOptions::default())
         .unwrap()
-        .into_inner()
-        .into_complete()
-        .unwrap();
+        .into_inner();
+    let mut session = MlxModelSession::from_model(
+        model,
+        None,
+        eredu_core::SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        },
+    )
+    .unwrap();
     let prepared = multimodal_prepared_input(family);
     let parts = prepared.input_parts();
-    let prefill = model
-        .submit_prefill(
-            crate::backend::runtime::media::input::ModelInput::new(parts),
-            stream,
+    let prefill = session
+        .prefill(
+            &backend,
+            crate::backend::runtime::media::input::ModelInput::new(parts).into(),
         )
         .unwrap()
         .wait()
         .unwrap()
+        .into_logits()
+        .unwrap()
+        .into_array()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
-    let decode = model
-        .submit_decode(token, stream)
+    let decode = session
+        .decode(&backend, token)
         .unwrap()
         .wait()
         .unwrap()
+        .into_logits()
+        .unwrap()
+        .into_array()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()

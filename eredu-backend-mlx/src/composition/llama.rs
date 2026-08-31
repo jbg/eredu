@@ -5,8 +5,8 @@ pub mod checkpoint;
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    ArchitectureParameters, CausalModel, ExecutionResidency, LayerWeightResidency,
-    LayerwiseRuntime, RuntimeState, WeightResidency,
+    ArchitectureParameters, CausalModel, LayerWeightResidency, LayerwiseRuntime, RuntimeState,
+    WeightResidency,
 };
 
 use std::{path::Path, sync::Arc};
@@ -36,8 +36,8 @@ use crate::{
     backend::runtime::media::input,
 };
 use eredu_runtime::{
-    CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
-    ParallelModelInfo, StaticUnitBindings,
+    CacheResidencyPolicy, DenseDiskStreamReport, PagedCacheOptions, ParallelModelInfo,
+    StaticUnitBindings,
 };
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
@@ -82,11 +82,10 @@ fn load_neutral_llama(
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
 ) -> Result<LlamaModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let (policy, mut metadata) = prepare_layerwise_policy(
+    let (policy, _) = prepare_layerwise_policy(
         store,
         &mut architecture,
         (),
@@ -96,9 +95,6 @@ fn load_neutral_llama(
         weights_stream,
         |_| false,
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.weight_quantization());
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -117,7 +113,6 @@ fn load_neutral_llama(
     Ok(LlamaModel {
         state_layout,
         args,
-        metadata,
         parallel_info: None,
         parallel_rank: None,
         execution,
@@ -186,7 +181,6 @@ pub fn quantize_neutral_llama_store(
 pub struct LlamaModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: LlamaExecution,
@@ -196,16 +190,6 @@ impl LlamaModel {
     /// Returns normalized model arguments regardless of execution engine.
     pub fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    /// Returns whether all parameters use the eager execution-device engine.
-    pub fn is_fully_resident(&self) -> bool {
-        self.metadata.residency() == ExecutionResidency::FullyResident
-    }
-
-    /// Returns canonical parameter and residency metadata.
-    pub fn metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -237,34 +221,6 @@ impl LlamaModel {
             LlamaExecution::TensorParallelResident(_) => Ok(None),
             LlamaExecution::Layerwise(execution) => execution.policy().dense_stream_report(),
             LlamaExecution::Resident(_) => Ok(None),
-        }
-    }
-
-    /// Returns the persistent checkpoint store used by a layerwise model.
-    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
-        match &self.execution {
-            LlamaExecution::Resident(execution) => execution.policy().checkpoint_store(),
-            LlamaExecution::Layerwise(execution) => execution.policy().checkpoint_store(),
-            LlamaExecution::TensorParallelResident(execution) => {
-                execution.policy().checkpoint_store()
-            }
-            LlamaExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().checkpoint_store()
-            }
-        }
-    }
-
-    /// Returns the number of pinned static leases used by the layerwise engine.
-    pub fn static_lease_count(&self) -> usize {
-        match &self.execution {
-            LlamaExecution::Resident(execution) => execution.policy().static_lease_count(),
-            LlamaExecution::Layerwise(execution) => execution.policy().static_lease_count(),
-            LlamaExecution::TensorParallelResident(execution) => {
-                execution.policy().static_lease_count()
-            }
-            LlamaExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().static_lease_count()
-            }
         }
     }
 
@@ -620,18 +576,10 @@ pub fn load_safetensors(
         .flatten();
     let store = artifact.store();
     if let Some(quantization) = quantize_on_load {
-        let (store, args, report) =
-            quantize_neutral_llama_store(store, &args, quantization, stream)?;
-        return load_neutral_llama(
-            store,
-            args,
-            execution_options,
-            stream,
-            weights_stream,
-            Some(report),
-        );
+        let (store, args, _) = quantize_neutral_llama_store(store, &args, quantization, stream)?;
+        return load_neutral_llama(store, args, execution_options, stream, weights_stream);
     }
-    load_neutral_llama(store, args, execution_options, stream, weights_stream, None)
+    load_neutral_llama(store, args, execution_options, stream, weights_stream)
 }
 
 fn load_neutral_llama_parallel(
@@ -762,7 +710,6 @@ fn load_neutral_llama_parallel(
     Ok(LlamaModel {
         args,
         state_layout,
-        metadata,
         parallel_info: Some(parallel_info),
         parallel_rank,
         execution,
@@ -835,18 +782,10 @@ pub(crate) fn load_llama_gguf_model(
     }
     let execution_options = residency.layers();
     let model = if let Some(quantization) = quantization {
-        let (store, args, report) =
-            quantize_neutral_llama_store(store, &args, quantization, stream)?;
-        load_neutral_llama(
-            store,
-            args,
-            execution_options,
-            stream,
-            weights_stream,
-            Some(report),
-        )?
+        let (store, args, _) = quantize_neutral_llama_store(store, &args, quantization, stream)?;
+        load_neutral_llama(store, args, execution_options, stream, weights_stream)?
     } else {
-        load_neutral_llama(store, args, execution_options, stream, weights_stream, None)?
+        load_neutral_llama(store, args, execution_options, stream, weights_stream)?
     };
     Ok(model)
 }

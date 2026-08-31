@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    ArchitectureParameters, CausalModel, ExecutionResidency, LayerWeightResidency,
-    LayerwiseRuntime, RuntimeState, WeightResidency,
+    ArchitectureParameters, CausalModel, LayerWeightResidency, LayerwiseRuntime, RuntimeState,
+    WeightResidency,
 };
 
 use std::{
@@ -83,8 +83,8 @@ pub mod vl {
     include!("qwen_vl.rs");
 }
 use eredu_runtime::{
-    CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole,
+    CacheResidencyPolicy, DenseDiskStreamReport, PagedCacheOptions, ParallelModelInfo,
+    ParameterRole,
 };
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
@@ -179,7 +179,6 @@ fn load_neutral_qwen(
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<QwenModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
@@ -197,7 +196,7 @@ fn load_neutral_qwen(
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
     };
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         factory,
@@ -226,9 +225,6 @@ fn load_neutral_qwen(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.weight_quantization());
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -247,7 +243,6 @@ fn load_neutral_qwen(
     Ok(QwenModel {
         state_layout,
         args,
-        metadata,
         parallel_info: None,
         parallel_rank: None,
         execution,
@@ -317,7 +312,6 @@ pub fn quantize_neutral_qwen_store(
 pub struct QwenModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: QwenExecution,
@@ -328,16 +322,6 @@ impl QwenModel {
     /// Returns normalized model arguments regardless of execution engine.
     pub fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    /// Returns whether all parameters use the eager execution-device engine.
-    pub fn is_fully_resident(&self) -> bool {
-        self.metadata.residency() == ExecutionResidency::FullyResident
-    }
-
-    /// Returns canonical parameter and residency metadata.
-    pub fn metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -381,20 +365,6 @@ impl QwenModel {
             .map_err(Error::from)
     }
 
-    /// Returns the persistent checkpoint store used by a layerwise model.
-    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
-        match &self.execution {
-            QwenExecution::Resident(execution) => execution.policy().checkpoint_store(),
-            QwenExecution::Layerwise(execution) => execution.policy().checkpoint_store(),
-            QwenExecution::TensorParallelResident(execution) => {
-                execution.policy().checkpoint_store()
-            }
-            QwenExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().checkpoint_store()
-            }
-        }
-    }
-
     pub fn checkpoint_store_arc(&self) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         match &self.execution {
             QwenExecution::Resident(execution) => execution.policy().checkpoint_store_arc(),
@@ -404,20 +374,6 @@ impl QwenModel {
             }
             QwenExecution::TensorParallelLayerwise(execution) => {
                 execution.policy().checkpoint_store_arc()
-            }
-        }
-    }
-
-    /// Returns the number of pinned static leases used by the layerwise engine.
-    pub fn static_lease_count(&self) -> usize {
-        match &self.execution {
-            QwenExecution::Resident(execution) => execution.policy().static_lease_count(),
-            QwenExecution::Layerwise(execution) => execution.policy().static_lease_count(),
-            QwenExecution::TensorParallelResident(execution) => {
-                execution.policy().static_lease_count()
-            }
-            QwenExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().static_lease_count()
             }
         }
     }
@@ -1025,15 +981,13 @@ pub fn load_safetensors(
         .flatten();
     let store = artifact.store();
     if let Some(quantization) = quantize_on_load {
-        let (store, args, report) =
-            quantize_neutral_qwen_store(store, &args, quantization, stream)?;
+        let (store, args, _) = quantize_neutral_qwen_store(store, &args, quantization, stream)?;
         let mut model = load_neutral_qwen(
             store,
             args,
             execution_options,
             stream,
             weights_stream,
-            Some(report),
             expert_options.is_some(),
         )?;
         if let Some(options) = expert_options {
@@ -1047,7 +1001,6 @@ pub fn load_safetensors(
         execution_options,
         stream,
         weights_stream,
-        None,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
@@ -1247,7 +1200,6 @@ fn load_neutral_qwen_parallel(
     Ok(QwenModel {
         args,
         state_layout,
-        metadata,
         parallel_info: Some(parallel_info),
         parallel_rank,
         execution,
@@ -1354,15 +1306,13 @@ pub(crate) fn load_qwen_gguf_model(
     let expert_options = residency.expert_cache();
     let execution_options = residency.layers();
     let model = if let Some(quantization) = quantization {
-        let (store, args, report) =
-            quantize_neutral_qwen_store(store, &args, quantization, stream)?;
+        let (store, args, _) = quantize_neutral_qwen_store(store, &args, quantization, stream)?;
         load_neutral_qwen(
             store,
             args,
             execution_options,
             stream,
             weights_stream,
-            Some(report),
             expert_options.is_some(),
         )?
     } else {
@@ -1372,7 +1322,6 @@ pub(crate) fn load_qwen_gguf_model(
             execution_options,
             stream,
             weights_stream,
-            None,
             expert_options.is_some(),
         )?
     };

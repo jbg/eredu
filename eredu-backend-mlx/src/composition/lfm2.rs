@@ -10,8 +10,8 @@ use eredu_architectures::lfm2::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
-    LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, ResidencyReport, WeightBinding, WeightResidency,
+    LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    ResidencyReport, WeightBinding, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -312,7 +312,6 @@ fn load_neutral(
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<Lfm2Model, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
@@ -326,7 +325,7 @@ fn load_neutral(
     let binding_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         Lfm2UnitPopulator {
@@ -358,9 +357,6 @@ fn load_neutral(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.weight_quantization);
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -379,7 +375,6 @@ fn load_neutral(
     Ok(Lfm2Model {
         args,
         state_layout,
-        metadata,
         execution,
         expert_cache: None,
         parallel_info: None,
@@ -545,7 +540,6 @@ fn load_neutral_parallel(
     Ok(Lfm2Model {
         args,
         state_layout,
-        metadata,
         execution,
         expert_cache: None,
         parallel_info: Some(info),
@@ -615,7 +609,6 @@ fn quantize_store(
 pub struct Lfm2Model {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     execution: Lfm2Execution,
     expert_cache: Option<ExpertCache>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
@@ -626,11 +619,6 @@ impl Lfm2Model {
     /// Returns validated family policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    /// Returns canonical residency metadata.
-    pub const fn residency_metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
     }
 
     /// Returns parallel metadata when a distributed binder supplied it.
@@ -658,14 +646,6 @@ impl Lfm2Model {
                     .map_err(Into::into)
             }
         }
-    }
-
-    /// Returns cache residency telemetry.
-    pub fn cache_residency_report(
-        &self,
-        cache: &MlxHybridState,
-    ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Error> {
-        cache.residency_report().map_err(Into::into)
     }
 
     /// Returns weight residency telemetry.
@@ -697,16 +677,6 @@ impl Lfm2Model {
             .map(ExpertCache::report)
             .transpose()
             .map_err(Into::into)
-    }
-
-    /// Returns the persistent checkpoint source.
-    pub fn checkpoint_store(&self) -> &dyn CheckpointSource {
-        match &self.execution {
-            Lfm2Execution::Resident(runtime) => runtime.policy().checkpoint_store(),
-            Lfm2Execution::Layerwise(runtime) => runtime.policy().checkpoint_store(),
-            Lfm2Execution::TensorParallelResident(runtime) => runtime.policy().checkpoint_store(),
-            Lfm2Execution::TensorParallelLayerwise(runtime) => runtime.policy().checkpoint_store(),
-        }
     }
 
     pub fn checkpoint_store_arc(&self) -> Arc<dyn CheckpointSource> {
@@ -1130,14 +1100,13 @@ pub fn load_lfm2_model(
         .flatten();
     let store = artifact.store();
     if let Some(quantization) = quantize {
-        let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
+        let (store, target, _) = quantize_store(store, &args, quantization, stream)?;
         let mut model = load_neutral(
             store,
             target,
             options,
             stream,
             weights_stream,
-            Some(report),
             expert_options.is_some(),
         )?;
         if let Some(expert_options) = expert_options {
@@ -1151,7 +1120,6 @@ pub fn load_lfm2_model(
         options,
         stream,
         weights_stream,
-        None,
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {
@@ -1244,13 +1212,12 @@ pub(crate) fn load_lfm2_gguf_model(
         source.plan().tensor_mapping(),
         residency.max_mapped_shards(),
     )?);
-    let (store, args, materialization) = match quantization {
+    let (store, args) = match quantization {
         Some(quantization) => {
-            let (store, args, report) =
-                quantize_store(store, &prepared.args, quantization, stream)?;
-            (store, args, Some(report))
+            let (store, args, _) = quantize_store(store, &prepared.args, quantization, stream)?;
+            (store, args)
         }
-        None => (store, prepared.args, None),
+        None => (store, prepared.args),
     };
     let mut model = load_neutral(
         store,
@@ -1258,7 +1225,6 @@ pub(crate) fn load_lfm2_gguf_model(
         residency.layers(),
         stream,
         weights_stream,
-        materialization,
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {

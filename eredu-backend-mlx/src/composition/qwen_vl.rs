@@ -14,8 +14,8 @@ use eredu_checkpoint::{
 use eredu_core::InputModality;
 use eredu_runtime::{
     ArchitectureParameters,
-    CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
-    LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
+    CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
+    LayeredArchitecture, LayerwiseRuntime,
     PagedCacheOptions, ParameterRole, ResidencyReport, WeightBinding,
     WeightResidency,
 };
@@ -449,7 +449,6 @@ impl Execution {
 pub struct QwenVlModel {
     args: vl::ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
 }
@@ -467,17 +466,6 @@ impl QwenVlModel {
         &self,
     ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
         None
-    }
-
-    pub fn metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-    pub fn residency_metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-
-    pub fn is_fully_resident(&self) -> bool {
-        self.metadata.residency() == ExecutionResidency::FullyResident
     }
 
     pub fn new_cache(&self) -> MlxHybridState {
@@ -817,18 +805,6 @@ impl QwenVlModel {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    /// Runs a complete multimodal prefill and returns logits for every input
-    /// position. Generation-facing callers normally use `CausalModel`, which
-    /// selects only the final position.
-    pub fn prefill(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut MlxHybridState,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.prepared_forward(input, cache, stream, None)
-    }
-
     pub fn prefill_with_observer(
         &mut self,
         input: input::ModelInput<'_>,
@@ -1057,18 +1033,17 @@ pub fn load_gguf(
         })
         .transpose()?
         .flatten();
-    let (store, materialization) = if let Some(quantization) = quantize_on_load {
-        let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
+    let store = if let Some(quantization) = quantize_on_load {
+        let (store, target, _) = quantize_store(store, &args, quantization, stream)?;
         args = target;
-        (store, Some(report))
+        store
     } else {
-        (store, None)
+        store
     };
     let mut model = load_store(
         store,
         args,
         options,
-        materialization,
         expert_options.is_some(),
         stream,
         weights_stream,
@@ -1120,18 +1095,17 @@ pub fn load_safetensors_with_residency(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let store = artifact.store();
-    let (store, materialization) = if let Some(quantization) = quantize_on_load {
-        let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
+    let store = if let Some(quantization) = quantize_on_load {
+        let (store, target, _) = quantize_store(store, &args, quantization, stream)?;
         args = target;
-        (store, Some(report))
+        store
     } else {
-        (store, None)
+        store
     };
     let mut model = load_store(
         store,
         args,
         options,
-        materialization,
         expert_options.is_some(),
         stream,
         weights_stream,
@@ -1170,7 +1144,6 @@ fn load_store(
     store: Arc<dyn CheckpointSource>,
     args: vl::ModelArgs,
     options: LayerWeightResidency,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1190,7 +1163,7 @@ fn load_store(
     let binding_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         factory,
@@ -1222,9 +1195,6 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.effective_model_type());
-    metadata.set_quantization(args.text.weight_quantization());
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -1243,7 +1213,6 @@ fn load_store(
     Ok(QwenVlModel {
         args,
         state_layout,
-        metadata,
         execution,
         expert_cache: None,
     })

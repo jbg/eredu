@@ -5,7 +5,7 @@ use ref_cast::RefCast;
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use super::session::ArrayObserverAdapter;
-use super::{Executable, MlxCompletion, MlxDistributedSession, MlxModelInput};
+use super::{Executable, MlxDistributedSession};
 use crate::backend::error::Error;
 use crate::backend::runtime::media::input;
 use crate::MlxTensor;
@@ -91,23 +91,6 @@ pub(super) fn decode_model(
             decode_pair(model, cache, input, stream)
         }
     }
-}
-
-pub fn submit_prefill(
-    executable: &mut Executable,
-    input: MlxModelInput,
-    stream: &Stream,
-) -> Result<eredu_core::Submission<Array, MlxCompletion>, Error> {
-    let output = input.with_borrowed(|input| prefill_model(executable, input, stream))?;
-    MlxCompletion::submission(output)
-}
-
-pub fn submit_decode(
-    executable: &mut Executable,
-    input: Array,
-    stream: &Stream,
-) -> Result<eredu_core::Submission<Array, MlxCompletion>, Error> {
-    MlxCompletion::submission(decode_model(executable, &input, stream)?)
 }
 
 fn last_token_logits(logits: Array, stream: &Stream) -> Result<Array, Error> {

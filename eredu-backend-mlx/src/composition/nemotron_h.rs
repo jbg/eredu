@@ -6,9 +6,9 @@ use eredu_architectures::nemotron_h::{LayeredModel, ModelArgs, Unit, PREDICTION_
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ActivationObserver, ArchitectureParameters, CacheResidencyPolicy, CausalModel,
-    DenseDiskStreamReport, LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata,
-    LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport,
-    WeightBinding, WeightResidency,
+    DenseDiskStreamReport, LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime,
+    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, WeightBinding,
+    WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -43,7 +43,7 @@ use crate::backend::{
         media::input,
         residency::expert_cache::ExpertCatalogEntry,
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
-        residency::expert_provider::{CachedRelu2ExpertProvider, ExpertExecutorProvider},
+        residency::expert_provider::CachedRelu2ExpertProvider,
     },
 };
 use eredu_core::cache::{
@@ -334,7 +334,6 @@ fn load_neutral(
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<NemotronHModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
@@ -360,7 +359,7 @@ fn load_neutral(
     let binding_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         NemotronHUnitPopulator {
@@ -400,9 +399,6 @@ fn load_neutral(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.weight_quantization);
-    metadata.set_materialization(materialization);
     let state_layout = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
@@ -420,7 +416,6 @@ fn load_neutral(
     Ok(NemotronHModel {
         args,
         state_layout,
-        metadata,
         execution,
         expert_realization,
         expert_cache: None,
@@ -616,7 +611,6 @@ fn load_neutral_parallel(
     Ok(NemotronHModel {
         args,
         state_layout,
-        metadata,
         execution,
         expert_realization,
         expert_cache: None,
@@ -723,7 +717,6 @@ fn quantize_store(
 pub struct NemotronHModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     execution: NemotronHExecution,
     expert_realization:
         Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>>,
@@ -765,11 +758,6 @@ impl NemotronHModel {
         }
     }
 
-    /// Returns canonical residency metadata.
-    pub const fn residency_metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-
     /// Returns parallel metadata when a distributed binder supplied it.
     pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
@@ -795,14 +783,6 @@ impl NemotronHModel {
                     .map_err(Into::into)
             }
         }
-    }
-
-    /// Returns cache residency telemetry.
-    pub fn cache_residency_report(
-        &self,
-        cache: &MlxHybridState,
-    ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Error> {
-        cache.residency_report().map_err(Into::into)
     }
 
     /// Returns weight residency telemetry.
@@ -838,20 +818,6 @@ impl NemotronHModel {
             .map(ExpertCache::report)
             .transpose()
             .map_err(Into::into)
-    }
-
-    /// Returns the persistent checkpoint source.
-    pub fn checkpoint_store(&self) -> &dyn CheckpointSource {
-        match &self.execution {
-            NemotronHExecution::Resident(runtime) => runtime.policy().checkpoint_store(),
-            NemotronHExecution::Layerwise(runtime) => runtime.policy().checkpoint_store(),
-            NemotronHExecution::TensorParallelResident(runtime) => {
-                runtime.policy().checkpoint_store()
-            }
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().checkpoint_store()
-            }
-        }
     }
 
     pub fn checkpoint_store_arc(&self) -> Arc<dyn CheckpointSource> {
@@ -1368,132 +1334,6 @@ impl NemotronHModel {
             .map_err(Into::into)
     }
 
-    pub fn forward_mtp_target_with_expert_executor<F>(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        tensor_group: Option<&crate::backend::runtime::distributed::Group>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.forward_mtp_input_with_expert_executor(
-            eredu_architectures::nemotron_h::EmbeddedInput::target(tokens, None),
-            cache,
-            tensor_group,
-            &mut execute,
-            stream,
-        )
-    }
-
-    pub fn forward_mtp_draft_with_expert_executor<F>(
-        &mut self,
-        hidden: &Array,
-        tokens: &Array,
-        depth: usize,
-        cache: &mut MlxHybridState,
-        tensor_group: Option<&crate::backend::runtime::distributed::Group>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.forward_mtp_input_with_expert_executor(
-            eredu_architectures::nemotron_h::EmbeddedInput::draft(tokens, hidden, depth),
-            cache,
-            tensor_group,
-            &mut execute,
-            stream,
-        )
-    }
-
-    fn forward_mtp_input_with_expert_executor<'a, F>(
-        &mut self,
-        input: eredu_architectures::nemotron_h::EmbeddedInput<'a, Array>,
-        cache: &mut MlxHybridState,
-        tensor_group: Option<&crate::backend::runtime::distributed::Group>,
-        execute: &mut F,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let tokens = match &input {
-            eredu_architectures::nemotron_h::EmbeddedInput::Target { tokens, .. }
-            | eredu_architectures::nemotron_h::EmbeddedInput::Draft { tokens, .. } => {
-                (*tokens).clone()
-            }
-        };
-        let input = neutral_embedded_input(input);
-        let mut provider = ExpertExecutorProvider::new(execute);
-        let (logits, context) = match tensor_group {
-            Some(group) => {
-                let hook = |architecture: &mut NeutralArchitecture,
-                            group_index: usize,
-                            index: usize,
-                            unit: &mut NeutralBlock,
-                            hidden: &crate::MlxTensor,
-                            state: &mut MlxHybridState,
-                            forward: &mut eredu_architectures::nemotron_h::ForwardContext<
-                    crate::MlxTensor,
-                >,
-                            parallel: &crate::backend::runtime::distributed::Group,
-                            context: &Stream| {
-                    architecture.forward_unit_parallel_with_provider(
-                        group_index,
-                        index,
-                        unit,
-                        hidden,
-                        state,
-                        forward,
-                        parallel,
-                        &mut provider,
-                        context,
-                    )
-                };
-                match &mut self.execution {
-                    NemotronHExecution::TensorParallelResident(runtime) => runtime
-                        .forward_parallel_with_unit_executor_and_context_hook(
-                            input,
-                            cache,
-                            group,
-                            stream,
-                            hook,
-                            |_, _, _| Ok(()),
-                        ),
-                    NemotronHExecution::TensorParallelLayerwise(runtime) => runtime
-                        .forward_parallel_with_unit_executor_and_context_hook(
-                            input,
-                            cache,
-                            group,
-                            stream,
-                            hook,
-                            |_, _, _| Ok(()),
-                        ),
-                    _ => return Err(Exception::custom("Nemotron-H was not loaded for TP+EP MTP")),
-                }
-                .map_err(|error| Exception::custom(error.to_string()))?
-            }
-            None => self
-                .forward_input_with_provider_context(input, cache, &mut provider, stream)
-                .map_err(|error| Exception::custom(error.to_string()))?,
-        };
-        let hidden = context
-            .target_capture()
-            .cloned()
-            .ok_or_else(|| Exception::custom("Nemotron-H MTP pass retained no hidden state"))?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden,
-                tokens: crate::MlxTensor::from_array(tokens),
-            },
-        )
-    }
-
     /// Executes a rank-local tensor-parallel forward pass.
     pub fn forward_tensor_parallel(
         &mut self,
@@ -1844,14 +1684,13 @@ pub fn load_nemotron_h_model(
         .flatten();
     let store = artifact.store();
     if let Some(quantization) = quantize {
-        let (store, target, report) = quantize_store(store, &args, quantization, stream)?;
+        let (store, target, _) = quantize_store(store, &args, quantization, stream)?;
         let mut model = load_neutral(
             store,
             target,
             options,
             stream,
             weights_stream,
-            Some(report),
             expert_options.is_some(),
         )?;
         if let Some(expert_options) = expert_options {
@@ -1865,7 +1704,6 @@ pub fn load_nemotron_h_model(
         options,
         stream,
         weights_stream,
-        None,
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {
@@ -1960,13 +1798,12 @@ pub(crate) fn load_nemotron_h_gguf_model(
         source.plan().tensor_mapping(),
         residency.max_mapped_shards(),
     )?);
-    let (store, args, materialization) = match quantization {
+    let (store, args) = match quantization {
         Some(quantization) => {
-            let (store, args, report) =
-                quantize_store(store, &prepared.args, quantization, stream)?;
-            (store, args, Some(report))
+            let (store, args, _) = quantize_store(store, &prepared.args, quantization, stream)?;
+            (store, args)
         }
-        None => (store, prepared.args, None),
+        None => (store, prepared.args),
     };
     let mut model = load_neutral(
         store,
@@ -1974,7 +1811,6 @@ pub(crate) fn load_nemotron_h_gguf_model(
         residency.layers(),
         stream,
         weights_stream,
-        materialization,
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {

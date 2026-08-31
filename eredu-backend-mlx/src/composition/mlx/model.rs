@@ -4,13 +4,11 @@ use std::path::Path;
 
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use eredu_core::SpeculativeCapability;
-use safemlx::{error::Exception, Array, Stream};
+use safemlx::{error::Exception, Stream};
 
 use crate::backend::error::Error;
-use crate::backend::runtime::media::input;
 use crate::composition::gpt_oss;
 use eredu_architectures::ModelKind;
-use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
@@ -423,39 +421,6 @@ impl Executable {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    /// Runs an instrumented pass through the canonical generalized executor.
-    pub fn forward_with_observer(
-        &mut self,
-        input_tokens: &Array,
-        mask: Option<&Array>,
-        stream: &Stream,
-        observer: &mut impl RuntimeActivationObserver<crate::MlxTensor, Exception>,
-    ) -> Result<Array, Exception> {
-        crate::composition::mlx::MlxModelSession::forward_with_observer(
-            self,
-            input_tokens,
-            mask,
-            stream,
-            observer,
-        )
-        .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    /// Submits prompt prefill while reporting detailed activations.
-    pub fn submit_prefill_with_observer(
-        &mut self,
-        input: input::ModelInput<'_>,
-        stream: &Stream,
-        observer: &mut impl RuntimeActivationObserver<crate::MlxTensor, Exception>,
-    ) -> Result<eredu_core::Submission<Array, crate::backend::MlxCompletion>, Error> {
-        crate::composition::mlx::MlxModelSession::submit_complete_prefill_with_observer(
-            self,
-            input.into(),
-            stream,
-            observer,
-        )
-    }
-
     /// Replaces the executable's state with an empty cache using `policy`.
     pub fn reset_cache_with_options(
         &mut self,
@@ -601,24 +566,6 @@ impl Executable {
             }
             Self::Qwen35(_, model, cache) => save_from!(model, cache),
         }
-    }
-
-    /// Submits prompt prefill through the selected MLX model session.
-    pub fn submit_prefill(
-        &mut self,
-        input: input::ModelInput<'_>,
-        stream: &Stream,
-    ) -> Result<eredu_core::Submission<Array, crate::backend::MlxCompletion>, Error> {
-        crate::composition::mlx::submit_prefill(self, input.into(), stream)
-    }
-
-    /// Submits cached decode through the selected MLX model session.
-    pub fn submit_decode(
-        &mut self,
-        input: Array,
-        stream: &Stream,
-    ) -> Result<eredu_core::Submission<Array, crate::backend::MlxCompletion>, Error> {
-        crate::composition::mlx::submit_decode(self, input, stream)
     }
 
     /// Returns aggregate cache-residency telemetry when paging is active.

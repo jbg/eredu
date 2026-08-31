@@ -13,9 +13,8 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
-    ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime,
-    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, RuntimeState,
-    WeightBinding, WeightResidency,
+    LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    ResidencyReport, RuntimeState, WeightBinding, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -253,7 +252,6 @@ pub fn load_neutral_with_store(
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<GptOssModel, Error> {
     let mut architecture =
@@ -267,7 +265,7 @@ pub fn load_neutral_with_store(
     let binding_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         factory,
@@ -296,9 +294,6 @@ pub fn load_neutral_with_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.quantization);
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -317,7 +312,6 @@ pub fn load_neutral_with_store(
     Ok(GptOssModel {
         args,
         state_layout,
-        metadata,
         parallel_info: None,
         parallel_rank: None,
         planned_external_experts: None,
@@ -488,7 +482,6 @@ fn load_neutral_parallel_with_store(
     Ok(GptOssModel {
         args,
         state_layout,
-        metadata,
         parallel_info: Some(parallel_info),
         parallel_rank,
         planned_external_experts,
@@ -757,7 +750,6 @@ impl GptOssPipelineBindings {
 pub struct GptOssModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    metadata: LayerwiseModelMetadata,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     planned_external_experts: Option<Vec<ExpertCatalogEntry>>,
@@ -772,11 +764,6 @@ impl GptOssModel {
         &self.args
     }
 
-    /// Returns canonical parameter and residency metadata.
-    pub fn metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-
     pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
@@ -787,18 +774,6 @@ impl GptOssModel {
             || expert::expert_catalog(&self.args, self.checkpoint_store(), None),
             Ok,
         )
-    }
-
-    /// Records the complete distributed coordinates used by EP/TP+EP wrappers.
-    pub fn bind_parallel_topology(&mut self, topology: crate::backend::MlxParallelContext) {
-        self.parallel_rank =
-            crate::backend::cache::prompt_cache_topology(topology).cache_rank_identity();
-        self.prompt_cache_topology = crate::backend::cache::prompt_cache_topology(topology);
-    }
-
-    /// Returns whether all decoder blocks remain resident on the execution device.
-    pub fn is_fully_resident(&self) -> bool {
-        self.metadata.residency() == ExecutionResidency::FullyResident
     }
 
     /// Returns logical layer-residency telemetry.
@@ -859,20 +834,6 @@ impl GptOssModel {
             }
             GptOssExecution::TensorParallelLayerwise(execution) => {
                 execution.policy().checkpoint_store_arc()
-            }
-        }
-    }
-
-    /// Returns the number of static checkpoint leases.
-    pub fn static_lease_count(&self) -> usize {
-        match &self.execution {
-            GptOssExecution::Resident(execution) => execution.policy().static_lease_count(),
-            GptOssExecution::Layerwise(execution) => execution.policy().static_lease_count(),
-            GptOssExecution::TensorParallelResident(execution) => {
-                execution.policy().static_lease_count()
-            }
-            GptOssExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().static_lease_count()
             }
         }
     }
@@ -1473,12 +1434,12 @@ pub fn load_safetensors(
         .transpose()?
         .flatten();
     let store = artifact.store();
-    let (store, args, materialization) = match quantize_on_load {
+    let (store, args) = match quantize_on_load {
         Some(quantization) => {
-            let (store, args, report) = quantize_neutral_store(store, &args, quantization, stream)?;
-            (store, args, Some(report))
+            let (store, args, _) = quantize_neutral_store(store, &args, quantization, stream)?;
+            (store, args)
         }
-        None => (store, args, None),
+        None => (store, args),
     };
     let mut model = load_neutral_with_store(
         store,
@@ -1486,7 +1447,6 @@ pub fn load_safetensors(
         execution_options,
         stream,
         weights_stream,
-        materialization,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
@@ -1560,13 +1520,13 @@ pub(crate) fn load_gpt_oss_gguf_model(
     )?);
     let expert_options = residency.expert_cache();
     let execution_options = residency.layers();
-    let (store, args, materialization) = match quantization {
+    let (store, args) = match quantization {
         Some(quantization) => {
-            let (store, args, report) =
+            let (store, args, _) =
                 quantize_neutral_store(store, &prepared.args, quantization, stream)?;
-            (store, args, Some(report))
+            (store, args)
         }
-        None => (store, prepared.args, None),
+        None => (store, prepared.args),
     };
     let mut model = load_neutral_with_store(
         store,
@@ -1574,7 +1534,6 @@ pub(crate) fn load_gpt_oss_gguf_model(
         execution_options,
         stream,
         weights_stream,
-        materialization,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {

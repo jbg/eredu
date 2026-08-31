@@ -374,7 +374,6 @@ fn forward_mtp_draft_parallel_architecture(
 pub struct InklingModel {
     args: ModelArgs,
     state_layouts: eredu_architectures::inkling::InklingStateLayouts,
-    metadata: eredu_runtime::LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
@@ -398,10 +397,6 @@ impl<'a> InklingTensorMtpTarget<'a> {
 impl InklingModel {
     pub fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    pub fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
-        &self.metadata
     }
 
     pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
@@ -1969,7 +1964,6 @@ fn load_store(
     layer_policy: eredu_runtime::LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<InklingModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
@@ -1984,7 +1978,7 @@ fn load_store(
     let unit_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         UnitPopulator {
@@ -2019,9 +2013,6 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.text_config.weight_quantization);
-    metadata.set_materialization(materialization);
     let state_layouts = architecture
         .state_layouts()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -2040,7 +2031,6 @@ fn load_store(
     Ok(InklingModel {
         state_layouts,
         args,
-        metadata,
         execution,
         expert_cache: None,
         parallel_info: None,
@@ -2214,7 +2204,6 @@ fn load_parallel_store(
     Ok(InklingModel {
         args,
         state_layouts,
-        metadata,
         execution,
         expert_cache: None,
         parallel_info: Some(parallel_info),
@@ -2297,12 +2286,12 @@ pub fn load_safetensors(
         })
         .transpose()?
         .flatten();
-    let (store, args, materialization) = match requested {
+    let (store, args) = match requested {
         Some(quantization) => {
-            let (store, args, report) = quantize_store(store, &args, quantization, stream)?;
-            (store, args, Some(report))
+            let (store, args, _) = quantize_store(store, &args, quantization, stream)?;
+            (store, args)
         }
-        None => (store, args, None),
+        None => (store, args),
     };
     let mut model = load_store(
         store,
@@ -2310,7 +2299,6 @@ pub fn load_safetensors(
         residency.layers(),
         stream,
         weights_stream,
-        materialization,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
@@ -2336,7 +2324,6 @@ pub fn load_gguf(
         layer_policy,
         stream,
         weights_stream,
-        None,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {

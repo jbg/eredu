@@ -17,7 +17,6 @@ mod session;
 pub mod speculative;
 pub mod structural;
 
-pub(crate) use execution::{submit_decode, submit_prefill};
 pub use inspection::{inspect_model, MlxInspectionOptions};
 pub(crate) use loading::validate_gguf_quantization_source;
 pub(crate) use model::Executable;

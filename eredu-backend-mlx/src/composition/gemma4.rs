@@ -278,7 +278,6 @@ where
 pub struct Gemma4Model {
     args: FamilyConfig,
     state_layout: eredu_runtime::StateLayout,
-    metadata: eredu_runtime::LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
@@ -449,10 +448,6 @@ pub struct Gemma4SpeculativeOutput {
 impl Gemma4Model {
     pub fn args(&self) -> &FamilyConfig {
         &self.args
-    }
-
-    pub fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
-        &self.metadata
     }
 
     pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
@@ -1757,7 +1752,6 @@ fn load_store(
     residency: eredu_runtime::LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<Gemma4Model, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
@@ -1775,7 +1769,7 @@ fn load_store(
     };
     let binding_args = args.clone();
     let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         UnitPopulator {
@@ -1807,9 +1801,6 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.effective_model_type());
-    metadata.set_quantization(args.text.weight_quantization);
-    metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -1828,7 +1819,6 @@ fn load_store(
     Ok(Gemma4Model {
         state_layout,
         args,
-        metadata,
         execution,
         expert_cache: None,
         parallel_info: None,
@@ -1990,7 +1980,6 @@ fn load_parallel_store(
     Ok(Gemma4Model {
         args,
         state_layout,
-        metadata,
         execution,
         expert_cache: None,
         parallel_info: Some(parallel_info),
@@ -2070,12 +2059,12 @@ pub fn load_safetensors(
         })
         .transpose()?
         .flatten();
-    let (store, args, materialization) = match requested {
+    let (store, args) = match requested {
         Some(quantization) => {
-            let (store, args, report) = quantize_store(store, &args, quantization, stream)?;
-            (store, args, Some(report))
+            let (store, args, _) = quantize_store(store, &args, quantization, stream)?;
+            (store, args)
         }
-        None => (store, args, None),
+        None => (store, args),
     };
     let mut model = load_store(
         store,
@@ -2083,7 +2072,6 @@ pub fn load_safetensors(
         residency.layers(),
         stream,
         weights_stream,
-        materialization,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
@@ -2109,7 +2097,6 @@ pub fn load_gguf(
         residency.layers(),
         stream,
         weights_stream,
-        None,
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
