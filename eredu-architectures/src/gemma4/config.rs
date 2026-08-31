@@ -558,7 +558,10 @@ fn default_true() -> bool {
 }
 
 fn normalize(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
-    if !matches!(source.model_type.as_str(), "gemma4" | "gemma4_unified") {
+    if !matches!(
+        source.model_type.as_str(),
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
+    ) {
         return Err(invalid(format!(
             "unsupported Gemma 4 model_type {:?}",
             source.model_type

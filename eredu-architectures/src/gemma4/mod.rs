@@ -132,7 +132,7 @@ pub fn state_identity(
     }
     Ok(eredu_runtime::ModelStateIdentity {
         model_family: "gemma4".into(),
-        effective_model_type: args.model_type.clone(),
+        effective_model_type: args.effective_model_type().into(),
         architecture_fingerprint: args.architecture_fingerprint(),
         layer_count,
         global_layer_start,

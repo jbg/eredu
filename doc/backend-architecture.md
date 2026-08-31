@@ -317,7 +317,10 @@ unrelated ownership domains.
 Loaded facade models, backend models, and sessions preserve these as two distinct identities:
 `model_family()` returns the canonical architecture-owned `ModelKind`, while
 `effective_model_type()` returns the parsed implementation or nested text-model
-type. The portable `LoadedTextModelConfig` requires both identities, and the
+type. Architecture-owned typed family configurations retain that nested value
+after geometry parsing; cache identity, backend metadata, and complete or
+partitioned model reporting derive it from the same retained field. The
+portable `LoadedTextModelConfig` requires both identities, and the
 facade carries the resolved family through artifact loading rather than exposing
 the effective type under the ambiguous legacy `model_type` name. Portable
 capability records, execution telemetry, rank-local parallel summaries, and

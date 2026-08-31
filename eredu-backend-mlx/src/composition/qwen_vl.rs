@@ -180,7 +180,7 @@ impl QwenVlPipelineBindings {
     }
 
     pub fn model_type<'a>(&self, architecture: &'a Architecture) -> &'a str {
-        &architecture.args().model_type
+        architecture.args().effective_model_type()
     }
 
     pub fn begin_pipeline_ingress(
@@ -455,8 +455,8 @@ pub struct QwenVlModel {
 }
 
 impl QwenVlModel {
-    pub fn model_type(&self) -> &str {
-        &self.args.model_type
+    pub fn effective_model_type(&self) -> &str {
+        self.args.effective_model_type()
     }
 
     pub fn args(&self) -> &vl::ModelArgs {
@@ -1222,7 +1222,7 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.effective_model_type());
     metadata.set_quantization(args.text.weight_quantization());
     metadata.set_materialization(materialization);
     let state_layout = architecture

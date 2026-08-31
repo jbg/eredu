@@ -832,7 +832,7 @@ pub fn qwen_vl(args: &crate::qwen::vl::ModelArgs) -> Result<CapabilityEstimate, 
         1,
         EstimationCompleteness::Complete,
     )?;
-    Ok(finish(args.model_type.clone(), spec))
+    Ok(finish(args.effective_model_type().into(), spec))
 }
 
 /// Derives Muse-Glimmer capabilities from normalized architecture policy.
@@ -877,7 +877,7 @@ pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, C
 pub fn gemma4(args: &crate::gemma4::FamilyConfig) -> Result<CapabilityEstimate, CapabilityError> {
     Ok(with_speculative_draft_source(
         finish(
-            args.model_type.clone(),
+            args.effective_model_type().into(),
             gemma4_spec(&args.text, args.input_modalities())?,
         ),
         Some(SpeculativeDraftSource::Separate),

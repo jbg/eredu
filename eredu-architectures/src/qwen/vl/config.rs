@@ -33,8 +33,10 @@ pub struct ModelArgs {
     pub video_token_id: i32,
     /// Temporal/height/width interleaving sections.
     pub mrope_section: [i32; 3],
-    /// Effective top-level model type.
+    /// Declared outer family-wrapper model type.
     pub model_type: String,
+    /// Nested text implementation identity preserved at admission.
+    pub effective_model_type: String,
 }
 
 impl ModelArgs {
@@ -45,6 +47,11 @@ impl ModelArgs {
             "qwen3_vl_moe" => crate::ModelKind::Qwen3VlMoe,
             _ => unreachable!("normalized Qwen3-VL model type"),
         }
+    }
+
+    /// Returns the nested text implementation identity preserved at admission.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
     }
 }
 
@@ -87,6 +94,7 @@ impl GgufModelArgs {
             image_token_id,
             video_token_id,
             mrope_section: self.mrope_section,
+            effective_model_type: self.model_type.clone(),
             model_type: self.model_type,
         })
     }
@@ -146,6 +154,23 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, VlConfig
     let text_object = text_value
         .as_object_mut()
         .ok_or_else(|| invalid("text_config must be an object"))?;
+    let effective_model_type = text_object
+        .get("model_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("text_config is missing string model_type"))?;
+    let effective_kind = crate::ModelKind::resolve_model_type(effective_model_type)
+        .map_err(|error| invalid(error.to_string()))?;
+    let declared_kind = match context {
+        TextConfigContext::Qwen3Vl => crate::ModelKind::Qwen3Vl,
+        TextConfigContext::Qwen3VlMoe => crate::ModelKind::Qwen3VlMoe,
+        TextConfigContext::Standalone => unreachable!("Qwen3-VL parser selected standalone text"),
+    };
+    if effective_kind != declared_kind {
+        return Err(invalid(format!(
+            "Qwen3-VL outer model type {model_type:?} and nested text model type {effective_model_type:?} resolve to different families"
+        )));
+    }
+    let effective_model_type = effective_model_type.to_owned();
     for field in ["tie_word_embeddings", "quantization", "quantization_config"] {
         if !text_object.contains_key(field) {
             if let Some(value) = object.get(field) {
@@ -204,6 +229,7 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, VlConfig
         video_token_id,
         mrope_section,
         model_type: model_type.into(),
+        effective_model_type,
     })
 }
 
@@ -367,7 +393,7 @@ pub fn state_identity(
     }
     Ok(ModelStateIdentity {
         model_family: args.model_kind().canonical_name().into(),
-        effective_model_type: args.model_type.clone(),
+        effective_model_type: args.effective_model_type.clone(),
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
@@ -468,6 +494,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(identity.model_family, family);
+            assert_eq!(identity.effective_model_type, inner);
         }
     }
 

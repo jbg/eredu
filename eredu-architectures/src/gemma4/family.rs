@@ -62,7 +62,7 @@ const fn default_true() -> bool {
 /// One normalized Gemma text/vision/audio family configuration.
 #[derive(Debug, Clone)]
 pub struct FamilyConfig {
-    /// Stable architecture identity (`gemma4` or `gemma4_unified`).
+    /// Declared outer family-wrapper identity (`gemma4` or `gemma4_unified`).
     pub model_type: String,
     /// Normalized text decoder.
     pub text: ModelArgs,
@@ -79,6 +79,11 @@ pub struct FamilyConfig {
 }
 
 impl FamilyConfig {
+    /// Returns the nested text implementation identity preserved at admission.
+    pub fn effective_model_type(&self) -> &str {
+        &self.text.model_type
+    }
+
     /// Whether this configuration uses the unified multimodal family identity.
     pub fn is_unified(&self) -> bool {
         self.model_type == "gemma4_unified"
@@ -107,10 +112,6 @@ impl FamilyConfig {
         let text_object = text_value.as_object_mut().ok_or_else(|| {
             FamilyConfigError::Invalid("Gemma 4 text_config must be an object".into())
         })?;
-        text_object.insert(
-            "model_type".into(),
-            serde_json::Value::String(source.model_type.clone()),
-        );
         text_object.insert(
             "tie_word_embeddings".into(),
             serde_json::Value::Bool(source.tie_word_embeddings),
@@ -311,12 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_nested_family_and_freezes_all_component_identity() {
+    fn preserves_nested_family_and_freezes_all_component_identity() {
         let mut value = config();
         value["video_token_id"] = 62.into();
         let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(parsed.model_type, "gemma4_unified");
-        assert_eq!(parsed.text.model_type, "gemma4_unified");
+        assert_eq!(parsed.effective_model_type(), "gemma4_text");
         assert!(!parsed.text.tie_word_embeddings);
         assert!(parsed.vision.is_some());
         assert!(parsed.audio.is_some());
@@ -380,6 +381,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(identity.model_family, "gemma4");
+        assert_eq!(identity.effective_model_type, "gemma4_text");
         assert_eq!(
             identity.architecture_fingerprint,
             parsed.architecture_fingerprint()

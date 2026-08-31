@@ -90,7 +90,7 @@ impl Gemma4Bindings {
     }
 
     pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
-        &architecture.args().model_type
+        architecture.args().effective_model_type()
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
@@ -1807,7 +1807,7 @@ fn load_store(
             .map_err(Into::into)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.effective_model_type());
     metadata.set_quantization(args.text.weight_quantization);
     metadata.set_materialization(materialization);
     let state_layout = architecture
@@ -1949,7 +1949,7 @@ fn load_parallel_store(
             shard_layer_bindings(bindings, store, &unit_sharding)
         },
     )?;
-    metadata.set_effective_model_type(args.model_type.clone());
+    metadata.set_effective_model_type(args.effective_model_type());
     metadata.set_quantization(args.text.weight_quantization);
     let local_parameter_bytes = metadata
         .static_device_bytes()
@@ -1961,7 +1961,7 @@ fn load_parallel_store(
         .ok_or_else(|| Error::Parallel("Gemma 4 device parameter bytes overflowed".into()))?;
     let parallel_info = ParallelModelInfo::new(
         build.topology(),
-        args.model_type.clone(),
+        args.effective_model_type(),
         report_layout
             .tensors()
             .map(|(target, _)| target.to_owned())

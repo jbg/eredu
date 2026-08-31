@@ -547,7 +547,7 @@ impl FixtureFamily {
             Self::Mistral => "mistral",
             Self::DeepSeek | Self::DeepSeekGguf => "deepseek_v3",
             Self::DeepSeekV4 => "deepseek_v4",
-            Self::Gemma => "gemma4",
+            Self::Gemma => "gemma4_text",
             Self::MuseGlimmer => "muse_glimmer_text",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
@@ -560,8 +560,8 @@ impl FixtureFamily {
             Self::Qwen3Next | Self::Qwen3NextMoe => "qwen3_next",
             Self::Qwen35 | Self::Qwen35Multimodal => "qwen3_5_text",
             Self::Qwen35Moe | Self::Qwen35MoeMultimodal => "qwen3_5_moe_text",
-            Self::Qwen3Vl => "qwen3_vl",
-            Self::Qwen3VlMoe => "qwen3_vl_moe",
+            Self::Qwen3Vl => "qwen3_vl_text",
+            Self::Qwen3VlMoe => "qwen3_vl_moe_text",
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "inkling_mm_model",
         }
     }
@@ -735,17 +735,7 @@ fn pipeline_ring_worker() {
             )
         };
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
-        let expected_effective_model_type = if family == FixtureFamily::Gemma {
-            let config: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
-                    .unwrap();
-            match config["model_type"].as_str().unwrap() {
-                "gemma4_unified" => "gemma4_unified",
-                _ => family.effective_model_type(),
-            }
-        } else {
-            family.effective_model_type()
-        };
+        let expected_effective_model_type = family.effective_model_type();
         let expected_model_family =
             ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
         assert_eq!(model.model_family(), expected_model_family);
@@ -1645,13 +1635,27 @@ fn pipeline_ring_worker() {
 #[test]
 fn complete_qwen3_vl_variants_accept_paged_cache() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    for (expected_family, moe) in [(ModelKind::Qwen3Vl, false), (ModelKind::Qwen3VlMoe, true)] {
+    for (expected_family, expected_effective_model_type, moe) in [
+        (ModelKind::Qwen3Vl, "qwen3_vl_text", false),
+        (ModelKind::Qwen3VlMoe, "qwen3_vl_moe_text", true),
+    ] {
         let checkpoint = tempfile::tempdir().unwrap();
         write_qwen3_vl_fixture(checkpoint.path(), moe);
         let backend = crate::native::backend(&stream, &stream);
         let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
+        assert_eq!(model.effective_model_type(), expected_effective_model_type);
         let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
         assert_eq!(runtime.session().model_family(), expected_family);
+        assert_eq!(
+            runtime.session().effective_model_type(),
+            expected_effective_model_type
+        );
+        assert_eq!(
+            <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::model_capabilities(&runtime)
+                .unwrap()
+                .effective_model_type,
+            expected_effective_model_type
+        );
 
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
@@ -1666,6 +1670,25 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
             .unwrap()
             .is_some());
     }
+}
+
+#[test]
+fn complete_gemma4_preserves_nested_effective_model_type() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma_fixture(checkpoint.path());
+    let backend = crate::native::backend(&stream, &stream);
+    let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
+    assert_eq!(model.model_family(), ModelKind::Gemma4);
+    assert_eq!(model.effective_model_type(), "gemma4_text");
+    let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+    assert_eq!(runtime.session().effective_model_type(), "gemma4_text");
+    assert_eq!(
+        <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::model_capabilities(&runtime)
+            .unwrap()
+            .effective_model_type,
+        "gemma4_text"
+    );
 }
 
 #[test]
@@ -2407,7 +2430,7 @@ fn gemma_config() -> serde_json::Value {
         "model_type": "gemma4",
         "tie_word_embeddings": true,
         "text_config": {
-            "model_type": "gemma4",
+            "model_type": "gemma4_text",
             "hidden_size": 8,
             "num_hidden_layers": 4,
             "intermediate_size": 16,

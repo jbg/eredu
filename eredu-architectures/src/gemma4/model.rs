@@ -1757,7 +1757,7 @@ where
     }
 
     fn model_identity(&self) -> &str {
-        &self.args.model_type
+        self.args.effective_model_type()
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {

@@ -382,7 +382,7 @@ impl Executable {
     pub fn effective_model_type(&self) -> &str {
         match self {
             Self::DeepSeek(_, model, _) => model.model_type(),
-            Self::Gemma4(_, model, _) => &model.args().model_type,
+            Self::Gemma4(_, model, _) => model.args().effective_model_type(),
             Self::GptOss(_, model, _) => &model.args().model_type,
             Self::Inkling(_, model, _) => &model.args().model_type,
             Self::KimiLinear(_, model, _) => &model.args().model_type,
@@ -392,8 +392,8 @@ impl Executable {
             Self::Qwen(_, model, _) => &model.args().model_type,
             Self::MuseGlimmer(_, model, _) => &model.args().model_type,
             Self::Qwen3Next(_, model, _) => &model.args().model_type,
-            Self::Qwen3Vl(_, model, _) => model.model_type(),
-            Self::Qwen3VlMoe(_, model, _) => model.model_type(),
+            Self::Qwen3Vl(_, model, _) => model.effective_model_type(),
+            Self::Qwen3VlMoe(_, model, _) => model.effective_model_type(),
             Self::Qwen35(_, model, _) => &model.args().model_type,
         }
     }
