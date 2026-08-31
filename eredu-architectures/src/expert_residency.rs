@@ -96,6 +96,13 @@ impl<S> ExpertRealizationPlan<S> {
             .map(|(_, spec)| spec)
     }
 
+    /// Returns whether the plan declares any routed unit in an execution group.
+    pub fn has_routed_units_in_group(&self, owner_group: &str) -> bool {
+        self.unit_specs
+            .keys()
+            .any(|(group, _)| group.as_str() == owner_group)
+    }
+
     /// Returns every routed execution unit and its rank-local bank specification.
     pub fn unit_specs(&self) -> &BTreeMap<(ExecutionGroupId, usize), S> {
         &self.unit_specs
@@ -562,6 +569,8 @@ mod tests {
             plans[2].unit_spec("text_decoder", 4).map(String::as_str),
             Some("rank-2-bank")
         );
+        assert!(plans[2].has_routed_units_in_group("text_decoder"));
+        assert!(!plans[2].has_routed_units_in_group("mtp.0"));
     }
 
     #[test]

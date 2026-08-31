@@ -505,6 +505,13 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         self.expert_realization = Some(realization);
     }
 
+    /// Borrows the architecture-derived expert realization used by unit factories.
+    pub fn expert_realization_plan(
+        &self,
+    ) -> Option<&crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>> {
+        self.expert_realization.as_ref()
+    }
+
     /// Constructs one canonical target or MTP unit from model-owned geometry.
     pub fn construct_unit(
         &self,

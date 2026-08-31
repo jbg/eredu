@@ -53,6 +53,14 @@ use crate::{
     composition::{mlx::speculative::embedded::EmbeddedMtpOutput, nemotron_h::NemotronHBindings},
 };
 
+fn realization_has_mtp_depth<S>(
+    plan: Option<&eredu_architectures::ExpertRealizationPlan<S>>,
+    depth: usize,
+) -> bool {
+    let group = format!("mtp.{depth}");
+    plan.is_some_and(|plan| plan.has_routed_units_in_group(&group))
+}
+
 impl PipelinePartitionMetadata for NemotronHPipelinePartition {
     fn capability_estimate(
         &self,
@@ -181,7 +189,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
             self.expert_storage = PipelineExpertStorage::External(expert_cache);
             return result;
         }
-        if expert_group.is_some() && self.mtp_depth_has_sparse(depth)? {
+        if expert_group.is_some() && self.mtp_depth_has_routed_experts(depth)? {
             return Err(Error::Parallel(
                 "Nemotron-H pipeline MTP with EP requires rank-owned expert residency".into(),
             ));
@@ -741,20 +749,14 @@ impl NemotronHPipelinePartition {
         self.architecture.args()
     }
 
-    fn mtp_depth_has_sparse(&self, depth: usize) -> Result<bool, Error> {
-        let layers = self.prediction_layers.get(depth).ok_or_else(|| {
+    fn mtp_depth_has_routed_experts(&self, depth: usize) -> Result<bool, Error> {
+        self.prediction_layers.get(depth).ok_or_else(|| {
             Error::Parallel(format!("Nemotron-H has no MTP prediction depth {depth}"))
         })?;
-        Ok(layers.iter().any(|layer| {
-            matches!(
-                &**layer,
-                eredu_architectures::nemotron_h::Unit::Prediction(unit)
-                    if matches!(
-                        &unit.block.operator,
-                        eredu_architectures::nemotron_h::Operator::Sparse(_)
-                    )
-            )
-        }))
+        Ok(realization_has_mtp_depth(
+            self.architecture.expert_realization_plan(),
+            depth,
+        ))
     }
 
     fn new(
@@ -998,5 +1000,30 @@ impl NemotronHPipelinePartition {
             hidden,
             tokens: crate::MlxTensor::from_array(tokens.clone()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::realization_has_mtp_depth;
+    use eredu_architectures::ExpertRealizationPlan;
+    use eredu_core::{ParallelRankTopology, ParallelTopology};
+    use eredu_runtime::ExecutionGroupId;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn nemotron_h_mtp_routing_follows_the_expert_realization_groups() {
+        let topology = ParallelTopology::new(1, 1, 1, 1).unwrap();
+        let rank = ParallelRankTopology::new(topology, 0).unwrap();
+        let plan = ExpertRealizationPlan::balanced(
+            2,
+            rank,
+            BTreeMap::from([((ExecutionGroupId::new("mtp.1").unwrap(), 0), ())]),
+        )
+        .unwrap();
+
+        assert!(!realization_has_mtp_depth(Some(&plan), 0));
+        assert!(realization_has_mtp_depth(Some(&plan), 1));
+        assert!(!realization_has_mtp_depth::<()>(None, 1));
     }
 }
