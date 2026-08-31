@@ -617,9 +617,12 @@ Runtime state follows the same contract at materialization time. Architecture
 `StateLayout` values are authoritative for per-layer attention windows,
 append-only pooling streams, and named segment boundaries and lifetimes.
 Concrete backends derive native cache objects directly from those policies;
-cache advancement and advertised embedded-draft limits likewise come from the
-constructed architecture graph and its state layout. Parsed model-family
-arguments are not a second source of execution or state geometry. Backend
+cache advancement likewise comes from the constructed architecture graph and
+its state layout. Advertised draft proposal capacity is a distinct
+architecture-owned graph property: sequential MTP derives it from prediction
+depth, while fused DSpark derives it from the validated block width rather than
+the number of DSpark layers. Parsed model-family arguments are not a second
+source of execution or state geometry. Backend
 composition obtains the layout through `ArchitectureParameters::state_layout`
 on the realized architecture before transferring that architecture into its
 runtime. When a family owns additional state outside the ordinary layered

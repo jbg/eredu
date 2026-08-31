@@ -2413,6 +2413,10 @@ trait PipelinePlacedIngress {
 trait PipelineEmbeddedMtp {
     fn embedded_mtp_len(&self) -> usize;
 
+    fn draft_proposal_capacity(&self, global_prediction_layers: usize) -> usize {
+        global_prediction_layers
+    }
+
     fn embedded_mtp_state_segment(&self) -> Option<&'static str>;
 
     fn prefill_token_identity(
@@ -6791,7 +6795,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
             .try_index_device((.., ..sequence - 1, ..), stream)?;
         let next = tokens.as_array().try_index_device((.., 1..), stream)?;
         let mut draft = self.draft_cache(cache);
-        for depth in 0..self.max_draft_tokens() {
+        for depth in 0..self.model.info.global_embedded_mtp_layers {
             let output = self.forward_draft(&hidden, &next, depth, &mut draft, stream)?;
             synchronize_outputs([output.logits.as_array(), output.hidden.as_array()])?;
         }
@@ -6873,7 +6877,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
         if handled {
             return Ok(());
         }
-        for depth in 0..self.max_draft_tokens() {
+        for depth in 0..self.model.info.global_embedded_mtp_layers {
             let _ =
                 self.forward_draft(hidden.as_array(), tokens.as_array(), depth, cache, stream)?;
         }
@@ -6917,7 +6921,11 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_, '_> {
     }
 
     fn max_draft_tokens(&self) -> usize {
-        self.model.info.global_embedded_mtp_layers
+        self.model
+            .stage
+            .embedded_mtp()
+            .map(|mtp| mtp.draft_proposal_capacity(self.model.info.global_embedded_mtp_layers))
+            .unwrap_or(0)
     }
 }
 

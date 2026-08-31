@@ -638,6 +638,10 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         self.mtp_layers.len()
     }
 
+    fn draft_proposal_capacity(&self, _global_prediction_layers: usize) -> usize {
+        self.architecture.draft_proposal_capacity()
+    }
+
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,

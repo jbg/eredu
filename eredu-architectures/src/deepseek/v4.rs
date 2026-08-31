@@ -191,6 +191,26 @@ pub struct ForwardContext<T> {
     captures: Vec<Option<T>>,
 }
 
+fn validate_dspark_proposal<T: Tensor>(
+    config: &DsparkConfig,
+    anchor: &T,
+    capacity: usize,
+) -> Result<(), Error> {
+    let maximum = usize::try_from(config.block_size)
+        .map_err(|_| Error::backend("validated DSpark block size is not positive"))?;
+    if capacity == 0 || capacity > maximum {
+        return Err(Error::backend(format!(
+            "DSpark proposal capacity must be between 1 and {maximum}, got {capacity}"
+        )));
+    }
+    if anchor.shape().len() != 2 || anchor.dim(1) != 1 {
+        return Err(Error::backend(
+            "DSpark proposal anchor must have shape [batch, 1]",
+        ));
+    }
+    Ok(())
+}
+
 /// Family-owned schema for immutable V4 target context crossing pipeline ranks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TargetBoundarySchema {
@@ -662,6 +682,20 @@ where
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
         self.groups.prediction_count()
+    }
+
+    /// Returns the maximum number of draft tokens emitted by one proposal.
+    ///
+    /// Sequential MTP emits one token per prediction layer. A fused DSpark
+    /// block instead emits the checkpoint-declared block width, independently
+    /// of the number of blocks used to compute it.
+    pub fn draft_proposal_capacity(&self) -> usize {
+        self.args.dspark.as_ref().map_or_else(
+            || self.groups.prediction_count(),
+            |config| {
+                usize::try_from(config.block_size).expect("validated DSpark block size is positive")
+            },
+        )
     }
 
     /// Borrows pinned modules for checkpoint binding.
@@ -1247,11 +1281,7 @@ where
             .dspark
             .as_ref()
             .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
-        if capacity == 0 || anchor.shape().len() != 2 || anchor.dim(1) != 1 {
-            return Err(Error::backend(
-                "DSpark proposal requires a positive capacity and [batch, 1] anchor",
-            ));
-        }
+        validate_dspark_proposal(config, anchor, capacity)?;
         if units.len() != caches.len() {
             return Err(Error::backend("DSpark unit/cache count mismatch"));
         }
@@ -1338,11 +1368,7 @@ where
             .dspark
             .as_ref()
             .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
-        if capacity == 0 || anchor.shape().len() != 2 || anchor.dim(1) != 1 {
-            return Err(Error::backend(
-                "DSpark proposal requires a positive capacity and [batch, 1] anchor",
-            ));
-        }
+        validate_dspark_proposal(config, anchor, capacity)?;
         if units.len() != caches.len() {
             return Err(Error::backend("DSpark unit/cache count mismatch"));
         }
@@ -2039,11 +2065,7 @@ where
                     .dspark
                     .as_ref()
                     .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
-                if capacity == 0 || anchor.shape().len() != 2 || anchor.dim(1) != 1 {
-                    return Err(Error::backend(
-                        "DSpark proposal requires a positive capacity and [batch, 1] anchor",
-                    ));
-                }
+                validate_dspark_proposal(config, anchor, capacity)?;
                 let input_ids = if capacity == 1 {
                     anchor.clone()
                 } else {
@@ -2401,11 +2423,7 @@ where
                     .dspark
                     .as_ref()
                     .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
-                if capacity == 0 || anchor.shape().len() != 2 || anchor.dim(1) != 1 {
-                    return Err(Error::backend(
-                        "DSpark proposal requires a positive capacity and [batch, 1] anchor",
-                    ));
-                }
+                validate_dspark_proposal(config, anchor, capacity)?;
                 let input_ids = if capacity == 1 {
                     anchor.clone()
                 } else {

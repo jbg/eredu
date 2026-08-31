@@ -1876,6 +1876,20 @@ impl DeepSeekModel {
         }
     }
 
+    /// Returns the architecture-declared token capacity of one draft proposal.
+    pub fn draft_proposal_capacity(&self) -> usize {
+        match &self.inner {
+            DeepSeekModelInner::V3 { execution, .. } => match execution {
+                V3Execution::Resident(runtime) => runtime.architecture().mtp_len(),
+                V3Execution::Layerwise(runtime) => runtime.architecture().mtp_len(),
+            },
+            DeepSeekModelInner::V4 { execution, .. } => match execution {
+                V4Execution::Resident(runtime) => runtime.architecture().draft_proposal_capacity(),
+                V4Execution::Layerwise(runtime) => runtime.architecture().draft_proposal_capacity(),
+            },
+        }
+    }
+
     pub fn v3_args(&self) -> Option<&V3Args> {
         match &self.inner {
             DeepSeekModelInner::V3 { args, .. } => Some(args),
@@ -2327,7 +2341,7 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for DeepS
     }
 
     fn max_draft_tokens(&self) -> usize {
-        self.mtp_len()
+        self.draft_proposal_capacity()
     }
 }
 

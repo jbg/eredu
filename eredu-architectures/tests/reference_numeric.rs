@@ -12894,7 +12894,7 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
         "vocab_size": 16,
         "max_position_embeddings": 128,
         "sliding_window": 8,
-        "compress_ratios": [0, 0, 0, 0],
+        "compress_ratios": [0, 0, 0],
         "index_n_heads": 2,
         "index_head_dim": 4,
         "index_topk": 1,
@@ -12909,7 +12909,7 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
         "norm_topk_prob": true,
         "routed_scaling_factor": 1.0,
         "swiglu_limit": 4.0,
-        "num_nextn_predict_layers": 2,
+        "num_nextn_predict_layers": 1,
         "dspark_block_size": 2,
         "dspark_noise_token_id": 0,
         "dspark_target_layer_ids": [0, 1],
@@ -12926,6 +12926,8 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
         &context,
     )
     .unwrap();
+    assert_eq!(v4_runtime.architecture().mtp_len(), 1);
+    assert_eq!(v4_runtime.architecture().draft_proposal_capacity(), 2);
     let (target_logits, target_context) = v4_runtime
         .forward_with_context(
             deepseek::mtp::EmbeddedInput::target(&target_tokens, None),
@@ -12944,10 +12946,19 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
         )
         .unwrap();
     assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
-    assert_eq!(v4_state.layer(3).unwrap().offset(), 2);
 
     let mut transaction = eredu_runtime::DraftStateTransaction::fork(&v4_state);
     let anchor = NumericTensor::token_ids(&[3]);
+    let oversized = v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 3),
+            transaction.draft_mut(),
+            &context,
+        )
+        .expect_err("proposal capacity exceeds the DSpark block width");
+    assert!(oversized
+        .to_string()
+        .contains("DSpark proposal capacity must be between 1 and 2, got 3"));
     let proposal = v4_runtime
         .forward(
             deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 2),

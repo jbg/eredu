@@ -28,7 +28,10 @@ embedded MTP heads and fused DSpark draft blocks, including persisted
 draft-cache continuation. A base `deepseek4` GGUF contains target weights only;
 its metadata may describe omitted companion prediction weights but does not
 advertise an embedded-draft capability. The usable proposal depth is capped by
-the checkpoint's validated capability.
+the checkpoint's validated capability. For sequential MTP that capacity is the
+number of prediction layers. For a fused DSpark head it is
+`dspark_block_size`, which is independent of the number of DSpark layers used
+to compute the block.
 
 Applications should query `speculative_capability` or run model inspection
 instead of assuming support from a family name.
