@@ -205,8 +205,8 @@ where
         .len(),
     )
     .map_err(Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in 0..usize::try_from(args.num_hidden_layers).map_err(Error::backend)? {
         if args.layer_policy(layer).map(|policy| policy.feed_forward)

@@ -184,8 +184,8 @@ pub fn expert_realization_plan<B: RoutedNeuralBackend>(
         .len(),
     )
     .map_err(Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
         if policy.feed_forward != FeedForwardPolicy::SparseMoe {

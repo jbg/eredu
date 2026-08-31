@@ -550,6 +550,9 @@ Ownership and localized construction are published together as an
 `ExpertRealizationPlan`. The plan contains the checkpoint-global expert count,
 the complete global-expert-to-owner map, the current rank's global expert IDs,
 and the exact rank-local bank specification for every routed execution unit.
+Each plan entry uses the same canonical execution-group and group-local unit
+address as the architecture execution layout and expert-residency catalog;
+group aliases are not interchangeable ownership addresses.
 Distributed preflight consumes the plan's global count, and a concrete backend
 lowers the declared owner map into its native dispatch representation without
 running another assignment policy. The plan's presence or absence is also the

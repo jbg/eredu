@@ -6700,6 +6700,48 @@ fn qwen_expert_realization_owns_assignment_and_tp_local_bank_geometry() {
 }
 
 #[test]
+fn kimi_linear_and_lfm2_expert_realization_use_the_target_execution_group() {
+    let context = NumericContext::default();
+    let rank = ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap();
+
+    let kimi_args = kimi_linear::model_args_from_config_value(&serde_json::json!({
+        "model_type":"kimi_linear", "vocab_size":7, "hidden_size":8,
+        "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":2,
+        "intermediate_size":10, "head_dim":4, "model_max_length":64,
+        "linear_attn_config":{
+            "kda_layers":[1], "full_attn_layers":[2], "num_heads":2,
+            "head_dim":4, "short_conv_kernel_size":3
+        },
+        "num_experts":2, "moe_intermediate_size":6, "kv_lora_rank":4,
+        "qk_nope_head_dim":4, "qk_rope_head_dim":2, "v_head_dim":4,
+        "mla_use_nope":true, "num_experts_per_token":1, "num_shared_experts":1,
+        "routed_scaling_factor":1.0, "first_k_dense_replace":1,
+        "num_expert_group":1, "topk_group":1, "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let kimi = kimi_linear::LayeredModel::<NumericBackend>::new(kimi_args, &context).unwrap();
+    let kimi_plan = kimi_linear::expert_realization_plan(&kimi, rank)
+        .unwrap()
+        .unwrap();
+    assert!(kimi_plan.unit_spec("target", 1).is_some());
+
+    let lfm_args = lfm2::model_args_from_config_value(&serde_json::json!({
+        "model_type":"lfm2_moe", "vocab_size":7, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":2,
+        "num_attention_heads":4, "num_key_value_heads":2,
+        "max_position_embeddings":32, "layer_types":["conv","full_attention"],
+        "conv_L_cache":3, "block_multiple_of":2,
+        "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
+        "tie_word_embeddings":false, "num_dense_layers":1,
+        "moe_intermediate_size":6, "num_experts":2, "num_experts_per_tok":1
+    }))
+    .unwrap();
+    let lfm = lfm2::LayeredModel::<NumericBackend>::new(lfm_args, &context).unwrap();
+    let lfm_plan = lfm2::expert_realization_plan(&lfm, rank).unwrap().unwrap();
+    assert!(lfm_plan.unit_spec("target", 1).is_some());
+}
+
+#[test]
 fn qwen_prompt_snapshot_reopens_with_global_identity_and_continues_exactly() {
     let mut value = config("qwen3", false);
     value["num_hidden_layers"] = 2.into();
