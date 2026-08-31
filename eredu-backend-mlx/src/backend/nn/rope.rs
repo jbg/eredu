@@ -360,7 +360,8 @@ where
 
 /// Enum wrapping different RoPE variants so that `initialize_rope` can return
 /// either a standard RoPE or a piecewise frequency-scaled RoPE.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PhysicalParameters)]
+#[module(root = crate)]
 pub enum RopeVariant {
     /// Standard MLX RoPE.
     Default(nn::RotaryPositionalEncoding),
@@ -370,54 +371,6 @@ pub enum RopeVariant {
     Proportional(ProportionalRope),
     /// YaRN scaled RoPE.
     Yarn(YarnRope),
-}
-
-// TODO: support derive PhysicalParameters for enum
-impl crate::module::PhysicalParameters for RopeVariant {
-    fn freeze_parameters(&mut self, _recursive: bool) {
-        match self {
-            RopeVariant::Default(rope) => rope.freeze_parameters(_recursive),
-            RopeVariant::FrequencyScaled(rope) => rope.freeze_parameters(_recursive),
-            RopeVariant::Proportional(rope) => rope.freeze_parameters(_recursive),
-            RopeVariant::Yarn(rope) => rope.freeze_parameters(_recursive),
-        }
-    }
-
-    fn unfreeze_parameters(&mut self, _recursive: bool) {
-        match self {
-            RopeVariant::Default(rope) => rope.unfreeze_parameters(_recursive),
-            RopeVariant::FrequencyScaled(rope) => rope.unfreeze_parameters(_recursive),
-            RopeVariant::Proportional(rope) => rope.unfreeze_parameters(_recursive),
-            RopeVariant::Yarn(rope) => rope.unfreeze_parameters(_recursive),
-        }
-    }
-
-    fn parameters(&self) -> crate::module::ModuleParamRef<'_> {
-        match self {
-            RopeVariant::Default(rope) => rope.parameters(),
-            RopeVariant::FrequencyScaled(rope) => rope.parameters(),
-            RopeVariant::Proportional(rope) => rope.parameters(),
-            RopeVariant::Yarn(rope) => rope.parameters(),
-        }
-    }
-
-    fn parameters_mut(&mut self) -> crate::module::ModuleParamMut<'_> {
-        match self {
-            RopeVariant::Default(rope) => rope.parameters_mut(),
-            RopeVariant::FrequencyScaled(rope) => rope.parameters_mut(),
-            RopeVariant::Proportional(rope) => rope.parameters_mut(),
-            RopeVariant::Yarn(rope) => rope.parameters_mut(),
-        }
-    }
-
-    fn trainable_parameters(&self) -> crate::module::ModuleParamRef<'_> {
-        match self {
-            RopeVariant::Default(rope) => rope.trainable_parameters(),
-            RopeVariant::FrequencyScaled(rope) => rope.trainable_parameters(),
-            RopeVariant::Proportional(rope) => rope.trainable_parameters(),
-            RopeVariant::Yarn(rope) => rope.trainable_parameters(),
-        }
-    }
 }
 
 impl<'a, Input> Module<Input> for RopeVariant

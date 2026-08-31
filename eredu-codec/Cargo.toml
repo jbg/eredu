@@ -9,6 +9,7 @@ categories.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Backend-neutral neural audio codec architectures for Eredu"
+readme = "README.md"
 
 [dependencies]
 eredu-checkpoint.workspace = true
