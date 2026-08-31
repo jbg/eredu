@@ -64,12 +64,6 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, KimiLinearUnitPopulator>,
 >;
-type ParallelResidentRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxResidentPolicy<NeutralBlock>,
->;
 type ParallelBoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -256,7 +250,7 @@ impl MlxUnitPopulator<NeutralBlock> for KimiLinearParallelUnitPopulator {
 enum KimiLinearExecution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<BoundedRuntime>),
-    TensorParallelResident(Box<ParallelResidentRuntime>),
+    TensorParallelResident(Box<ResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 

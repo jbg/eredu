@@ -8,12 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::{
-    distributed::{self, Backend},
-    ops::concatenate_axis,
-    transforms::{async_eval_with_event, eval},
-    Array, Device, DeviceType, Stream,
-};
 use crate::{
     backend::error::Error,
     backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
@@ -31,6 +25,12 @@ use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
 use eredu_core::{residency::OffloadConfig, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,
+};
+use safemlx::{
+    distributed::{self, Backend},
+    ops::concatenate_axis,
+    transforms::{async_eval_with_event, eval},
+    Array, Device, DeviceType, Stream,
 };
 use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 
@@ -190,7 +190,7 @@ fn execute_cached_qwen_routes(
             cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
             let compact_routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
             let unit_weights =
-                crate::native::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+                safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
             Ok(bank.forward(hidden, &compact_routes, &unit_weights, stream)?)
         },
     )?)

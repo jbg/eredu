@@ -893,7 +893,6 @@ dependencies = [
  "ref-cast",
  "rustfft",
  "safemlx",
- "safemlx-internal-macros",
  "safetensors",
  "serde",
  "serde_json",

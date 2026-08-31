@@ -1202,11 +1202,11 @@ pub fn configure_local_runtime(
 ) -> Result<(), LocalBackendError> {
     #[cfg(feature = "metal")]
     if let Some(path) = &configuration.accelerator_library_path {
-        eredu_backend_mlx::native::metal::set_metallib_path(path)
+        eredu_backend_mlx::set_accelerator_library_path(path)
             .map_err(|error| LocalBackendError::new("runtime configuration", error))?;
     }
     if let Some(bytes) = configuration.allocator_cache_limit {
-        eredu_backend_mlx::native::memory::set_cache_limit(bytes)
+        eredu_backend_mlx::set_allocator_cache_limit(bytes)
             .map_err(|error| LocalBackendError::new("allocator configuration", error))?;
     }
     Ok(())
@@ -1238,7 +1238,7 @@ const fn compiled_accelerator_family() -> Option<&'static str> {
 
 /// Resets the selected runtime's allocator high-water mark.
 pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
-    eredu_backend_mlx::native::memory::reset_peak_memory()
+    eredu_backend_mlx::reset_allocator_peak()
         .map_err(|error| LocalBackendError::new("allocator peak reset", error))?;
     Ok(())
 }
@@ -1251,16 +1251,12 @@ pub fn local_speculative_decoding_telemetry(
 }
 
 fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, LocalBackendError> {
+    let memory = eredu_backend_mlx::allocator_memory()
+        .map_err(|error| LocalBackendError::new("allocator telemetry", error))?;
     Ok(crate::AllocatorTelemetry {
-        peak_bytes: eredu_backend_mlx::native::memory::peak_memory()
-            .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
-            as u64,
-        active_bytes: eredu_backend_mlx::native::memory::active_memory()
-            .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
-            as u64,
-        cache_bytes: eredu_backend_mlx::native::memory::cache_memory()
-            .map_err(|error| LocalBackendError::new("allocator telemetry", error))?
-            as u64,
+        peak_bytes: memory.peak_bytes(),
+        active_bytes: memory.active_bytes(),
+        cache_bytes: memory.cached_bytes(),
     })
 }
 

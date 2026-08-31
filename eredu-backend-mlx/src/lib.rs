@@ -54,12 +54,14 @@ pub(crate) mod array {
     }
 }
 
-/// Native MLX handles and composition-owned integrations for backend tooling.
+/// Composition-owned MLX integrations for backend tooling.
 ///
-/// This namespace supports explicit device, stream, memory, tensor, model
-/// session, inspection, drafting, and realtime integration work. Reusable MLX
+/// Native arrays, devices, streams, operations, and collectives retain their
+/// canonical [`safemlx`] paths and are not re-exported here. Reusable MLX
 /// backend facilities are organized under [`backend`].
 pub mod native {
+    use safemlx::Stream;
+
     pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
@@ -72,8 +74,6 @@ pub mod native {
         inspect_model, MlxInspectionOptions, MlxModelInput, MlxModelOutput, MlxModelSession,
         MlxSessionCompletion,
     };
-    pub use safemlx::*;
-
     /// Converts a checkpoint with an explicitly selected native execution stream.
     pub fn quantize_checkpoint(
         source_dir: impl AsRef<std::path::Path>,
@@ -101,7 +101,7 @@ pub mod native {
     pub fn distributed_backend<'a>(
         stream: &Stream,
         weights_stream: &Stream,
-        world: &'a distributed::Group,
+        world: &'a safemlx::distributed::Group,
     ) -> crate::backend::MlxBackend<'a> {
         crate::backend::MlxBackend::with_distributed_world(stream, weights_stream, world)
     }

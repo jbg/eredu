@@ -113,12 +113,6 @@ type LayerwiseExecution = LayerwiseRuntime<
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock, GptOssUnitPopulator>,
 >;
-type ParallelResidentRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxResidentPolicy<NeutralBlock>,
->;
 type ParallelLayerwiseExecution = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -167,7 +161,7 @@ impl MlxUnitPopulator<NeutralBlock> for GptOssParallelUnitPopulator {
 enum GptOssExecution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<LayerwiseExecution>),
-    TensorParallelResident(Box<ParallelResidentRuntime>),
+    TensorParallelResident(Box<ResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelLayerwiseExecution>),
 }
 

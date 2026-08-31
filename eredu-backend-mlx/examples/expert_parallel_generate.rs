@@ -1,19 +1,17 @@
 //! Minimal MLX sparse-cache Ring expert-parallel generation probe.
 
-use eredu_backend_mlx::{
-    backend::{
-        config::ModelLoadOptions,
-        runtime::media::input::{token_ids_part, ModelInput},
-        topology::{DeviceAssignment, MlxParallelContext},
-    },
-    native::{
-        distributed::{self, Backend},
-        DeviceType, Stream,
-    },
+use eredu_backend_mlx::backend::{
+    config::ModelLoadOptions,
+    runtime::media::input::{token_ids_part, ModelInput},
+    topology::{DeviceAssignment, MlxParallelContext},
 };
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 use eredu_runtime::{ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency};
+use safemlx::{
+    distributed::{self, Backend},
+    Array, DeviceType, Stream,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = std::env::args()
@@ -53,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut session = backend.create_session(model)?;
-    let prompt = eredu_backend_mlx::native::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+    let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [token_ids_part(&prompt)?];
     let mut logits = session
         .prefill(&backend, ModelInput::new(&parts).into())?

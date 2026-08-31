@@ -18,13 +18,14 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext, Stream};
-use eredu_backend_mlx::{native::MlxRealtimeBackend, MlxTensor};
+use eredu_backend_mlx::native::{ExecutionContext, MlxRealtimeBackend};
+use eredu_backend_mlx::MlxTensor;
 use eredu_core::{load_realtime_model, ObservationSet, ObservationValue, RealtimeSampling};
 use eredu_evaluation::{
     compare_observations, encoded_audio_frames, observe_i32_tensor, run_realtime_trace,
     ParityPolicy,
 };
+use safemlx::{Array, Device, DeviceType, Stream};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

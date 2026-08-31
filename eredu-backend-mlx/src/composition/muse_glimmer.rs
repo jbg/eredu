@@ -75,19 +75,6 @@ type Bounded = LayerwiseRuntime<
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
-type ParallelResident = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxResidentPolicy<NeutralUnit>,
->;
-type ParallelBounded = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
->;
-
 #[derive(Clone)]
 struct UnitPopulator {
     external_experts: bool,
@@ -110,8 +97,8 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
 enum Execution {
     Resident(Resident),
     Bounded(Bounded),
-    ParallelResident(Box<ParallelResident>),
-    ParallelBounded(Box<ParallelBounded>),
+    ParallelResident(Box<Resident>),
+    ParallelBounded(Box<Bounded>),
 }
 
 impl Execution {

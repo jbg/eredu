@@ -65,12 +65,6 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, NemotronHUnitPopulator>,
 >;
-type ParallelResidentRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxResidentPolicy<NeutralBlock>,
->;
 type ParallelBoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -281,7 +275,7 @@ impl MlxUnitPopulator<NeutralBlock> for NemotronHParallelUnitPopulator {
 enum NemotronHExecution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<BoundedRuntime>),
-    TensorParallelResident(Box<ParallelResidentRuntime>),
+    TensorParallelResident(Box<ResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 

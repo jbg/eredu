@@ -11,12 +11,12 @@ use crate::backend::{
     runtime::distributed::expert::{AllToAllVPlan, RoutedTransport},
     DeviceAssignment, MlxParallelContext,
 };
-use crate::native::{
+use crate::MlxTensor;
+use eredu_core::{CollectiveScope, DistributedSession};
+use safemlx::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
-use crate::MlxTensor;
-use eredu_core::{CollectiveScope, DistributedSession};
 
 const WORKER_ENV: &str = "EREDU_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "EREDU_CARTESIAN_TRIPLE_RING_WORKER";
@@ -101,8 +101,7 @@ fn cartesian_ring_worker() {
             exchange.statistics.payload_allocation_upper_bound_bytes
         );
     }
-    let empty =
-        crate::native::ops::zeros_dtype(&[0, 3], crate::native::Dtype::Float32, &stream).unwrap();
+    let empty = safemlx::ops::zeros_dtype(&[0, 3], safemlx::Dtype::Float32, &stream).unwrap();
     let empty_counts = [0usize; 4];
     let empty = crate::backend::runtime::distributed::all_to_all_v(
         &empty,

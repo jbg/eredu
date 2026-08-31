@@ -8,10 +8,7 @@ use eredu_backend_mlx::backend::{
     runtime::media::input::{token_ids_part, ModelInput},
     MlxBackend,
 };
-use eredu_backend_mlx::native::{
-    transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext, MlxModelInput,
-    MlxModelSession,
-};
+use eredu_backend_mlx::native::{ExecutionContext, MlxModelInput, MlxModelSession};
 use eredu_backend_mlx::MlxTensor;
 use eredu_core::{
     cache::{PromptCacheDescriptor, PromptCacheOptions},
@@ -19,6 +16,7 @@ use eredu_core::{
 };
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_text::tokenizer::Tokenizer;
+use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType};
 
 #[derive(Debug, Parser)]
 #[command(about = "Verify reusable paged prompt-cache parity")]

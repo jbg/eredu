@@ -22,9 +22,10 @@ for implementation architecture, native platform setup, and low-level
 ```rust,no_run
 use eredu_backend_mlx::{
     backend::config::ModelLoadOptions,
-    native::{backend, Device, DeviceType, ExecutionContext},
+    native::{backend, ExecutionContext},
 };
 use eredu_core::load_model;
+use safemlx::{Device, DeviceType};
 
 let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
 let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -44,13 +45,14 @@ sampling primitives those policies require. Runtime `Sampler` and
 `SpeculativeSampler` implementations bind to it through `MlxTensor`; the MLX
 backend does not define parallel policy traits.
 
-The `native` module is a deliberate escape hatch for devices, device-bound
-streams, allocator state, random state, low-level arrays, and platform setup
-needed by concrete MLX tooling. It supplies the native types required by raw
-operations alongside composition-owned model sessions, inputs, outputs,
-inspection policy, and realtime types. Backend configuration, errors, topology,
-prepared models, and reusable runtime facilities are organized under `backend`.
-Backend-generic sampling APIs exchange `MlxTensor` values.
+The `native` module exposes composition-owned model sessions, inputs, outputs,
+inspection policy, realtime types, execution contexts, and random state for
+concrete MLX tooling. Raw arrays, devices, streams, operations, allocator
+state, platform setup, and collective groups are imported directly from their
+canonical `safemlx` paths; this crate does not create a second public path for
+the binding crate. Backend configuration, errors, topology, prepared models,
+and reusable runtime facilities are organized under `backend`. Backend-generic
+sampling APIs exchange `MlxTensor` values.
 MLX physical parameter slots and their traversal are private implementation
 details. Public operators expose the architecture-owned `eredu_nn::Parameterized`
 topology; loading and residency use those stable identities exclusively.

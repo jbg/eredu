@@ -16,15 +16,16 @@ use clap::{Parser, ValueEnum};
 use eredu_backend_mlx::backend::{
     config::ModelLoadOptions, runtime::media::input::ModelInput, MlxBackend,
 };
-use eredu_backend_mlx::native::{
-    memory,
-    ops::indexing::{NewAxis, TryIndexOp},
-    Array, Device, DeviceType, ExecutionContext, MlxModelInput, MlxModelSession, Stream,
-};
+use eredu_backend_mlx::native::{ExecutionContext, MlxModelInput, MlxModelSession};
 use eredu_core::{
     load_model, BackendProvider as _, BackendSession as _, ObservationValue, TensorObservationData,
 };
 use eredu_text::tokenizer::Tokenizer;
+use safemlx::{
+    memory,
+    ops::indexing::{NewAxis, TryIndexOp},
+    Array, Device, DeviceType, Stream,
+};
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use serde::Serialize;
 

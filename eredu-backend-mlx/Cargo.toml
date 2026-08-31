@@ -64,7 +64,6 @@ eredu-architectures.workspace = true
 eredu-gguf.workspace = true
 eredu-codec = { workspace = true, optional = true }
 safemlx = { workspace = true, default-features = false, features = ["safetensors"] }
-safemlx-internal-macros.workspace = true
 eredu-backend-mlx-macros.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

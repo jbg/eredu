@@ -9,10 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::{
-    distributed::{self, Backend},
-    Array, Device, DeviceType, Stream,
-};
 use crate::{
     backend::{
         config::ModelLoadOptions,
@@ -25,6 +21,10 @@ use eredu_core::scheduler::{RequestId, SchedulerLimits};
 use eredu_core::{
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler,
+};
+use safemlx::{
+    distributed::{self, Backend},
+    Array, Device, DeviceType, Stream,
 };
 
 const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";

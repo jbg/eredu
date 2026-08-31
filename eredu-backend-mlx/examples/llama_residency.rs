@@ -7,7 +7,7 @@ use eredu_backend_mlx::backend::{
     config::ModelLoadOptions,
     runtime::{generation::MlxSamplingBackend, media::input::ModelInput},
 };
-use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::ExecutionContext;
 use eredu_core::{
     load_model,
     residency::{MemoryTier, OffloadConfig, TransferDirection},
@@ -16,6 +16,7 @@ use eredu_core::{
 use eredu_runtime::{
     DefaultSampler, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, Sampler, WeightResidency,
 };
+use safemlx::{Array, Device, DeviceType};
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure synchronous Llama decoder-layer host transfers")]

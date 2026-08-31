@@ -8,9 +8,10 @@ use eredu_architectures::checkpoint_conversion::{
 };
 use eredu_backend_mlx::{
     backend::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
-    native::{quantize_checkpoint, Device, DeviceType, ExecutionContext},
+    native::{quantize_checkpoint, ExecutionContext},
 };
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use safemlx::{Device, DeviceType};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {

@@ -120,19 +120,6 @@ type NeutralLayerwiseRuntime = LayerwiseRuntime<
     MlxLayerwisePolicy<NeutralBlock, QwenUnitPopulator>,
 >;
 
-type NeutralParallelResidentRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxResidentPolicy<NeutralBlock>,
->;
-type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock, QwenUnitPopulator>,
->;
-
 #[derive(Clone)]
 struct QwenUnitPopulator {
     external_experts: bool,
@@ -155,8 +142,8 @@ impl MlxUnitPopulator<NeutralBlock> for QwenUnitPopulator {
 enum QwenExecution {
     Resident(Box<NeutralResidentRuntime>),
     Layerwise(Box<NeutralLayerwiseRuntime>),
-    TensorParallelResident(Box<NeutralParallelResidentRuntime>),
-    TensorParallelLayerwise(Box<NeutralParallelLayerwiseRuntime>),
+    TensorParallelResident(Box<NeutralResidentRuntime>),
+    TensorParallelLayerwise(Box<NeutralLayerwiseRuntime>),
 }
 
 impl QwenExecution {

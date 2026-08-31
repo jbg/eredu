@@ -2,12 +2,10 @@
 
 //! Inspect MLX Cartesian rank topology construction.
 
-use eredu_backend_mlx::{
-    backend::topology::{DeviceAssignment, MlxParallelContext},
-    native::{
-        distributed::{self, Backend},
-        DeviceType,
-    },
+use eredu_backend_mlx::backend::topology::{DeviceAssignment, MlxParallelContext};
+use safemlx::{
+    distributed::{self, Backend},
+    DeviceType,
 };
 
 fn parse(index: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {

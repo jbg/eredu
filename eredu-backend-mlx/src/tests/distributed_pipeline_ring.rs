@@ -9,11 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::{
-    distributed::{self, Backend},
-    ops::{indexing::TryIndexOp, stack_axis},
-    Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
-};
+use crate::native::ExecutionContext;
 use crate::MlxTensor;
 use crate::{
     backend::runtime::{
@@ -53,6 +49,11 @@ use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Paramet
 use eredu_runtime::{
     CacheResidencyPolicy, DefaultSampler, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions,
     LayerwiseLoadOptions, NonExpertWeightResidency, PagedCacheOptions, WeightResidency,
+};
+use safemlx::{
+    distributed::{self, Backend},
+    ops::{indexing::TryIndexOp, stack_axis},
+    Array, Device, DeviceType, Dtype as MlxDtype, Stream,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -1409,7 +1410,7 @@ fn pipeline_ring_worker() {
             .into_logits()
             .unwrap()
     } else {
-        let prompt = crate::native::Array::from_slice(&prefix_ids, &[1, prompt_length]);
+        let prompt = Array::from_slice(&prefix_ids, &[1, prompt_length]);
         if family.is_qwen_hybrid() {
             let parts = [text_input_part(&prompt)];
             model
@@ -1473,7 +1474,7 @@ fn pipeline_ring_worker() {
             &stream,
         )
         .unwrap();
-    let token = crate::native::Array::from_slice(&[0u32], &[1, 1]);
+    let token = Array::from_slice(&[0u32], &[1, 1]);
     let uninterrupted = forward_pipeline_model(
         &mut model,
         (pipeline_rank == 0).then_some(&token),
@@ -4082,7 +4083,7 @@ fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                crate::native::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
                     .unwrap(),
             ));
         }
@@ -4223,7 +4224,7 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                crate::native::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
                     .unwrap(),
             ));
         }
@@ -4352,7 +4353,7 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                crate::native::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
                     .unwrap(),
             ));
         }

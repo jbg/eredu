@@ -8,15 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::{
-    distributed::{self, Backend},
-    DeviceType, Stream,
-};
 use crate::{
     backend::runtime::distributed::topology::{load_safetensors_partition, PlacementPlan},
     backend::{DeviceAssignment, MlxParallelContext},
 };
 use eredu_runtime::TensorPlacement;
+use safemlx::{
+    distributed::{self, Backend},
+    DeviceType, Stream,
+};
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "EREDU_PARTITION_RING_WORKER";

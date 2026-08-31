@@ -65,7 +65,9 @@ does not name or alias the concrete backend, session, prompt, drafter, token,
 completion, or error types in its public selected API. The implementation crate
 exports composition-owned adapter factories at its flat root and deliberately
 makes its reusable `backend` module tree public for backend authors. Family
-composition and architecture-erased dispatch remain crate-private. Native
+composition and architecture-erased dispatch remain crate-private. Raw native
+binding APIs retain their canonical `safemlx` paths rather than being
+re-exported by the implementation crate. Native
 facade integration tests realize execution plans through facade-owned methods;
 tests that require backend facilities live in `eredu-backend-mlx`, while facade
 sampling-policy tests use neutral sampling traits and mock backends. Direct
@@ -85,8 +87,8 @@ planning, drafting, scheduler, completed-step, and error wrappers. The realtime
 factory loads an architecture-owned preparation directly into the facade model.
 The facade materializes portable inputs and observes portable outputs while
 concrete associated types and handle-oriented constructors remain private.
-Explicit native sessions, streams, token handles, and distributed
-collective groups remain backend-author concerns.
+Explicit native sessions and token handles remain backend-author concerns;
+streams and distributed collective groups come directly from `safemlx`.
 
 Application targets depend on `eredu` for facade operations and directly on
 the neutral crates whose public values they construct. Infrastructure-aware
@@ -96,8 +98,9 @@ selected-local-backend API owns device-plan creation, process runtime
 configuration, allocator telemetry, and diagnostic benchmarks, while
 `LocalModel::synchronize` is the sole application-facing synchronization entry
 point. These APIs do not expose native tensors, streams, devices, or random
-state. Direct native access remains an explicit backend-author escape hatch in
-the implementation crate; it is not an application dependency.
+state. Direct native binding access remains an explicit backend-author concern
+through `safemlx`; composition-owned native sessions remain in the
+implementation crate. Neither is an application dependency.
 `LocalLoadOptions` and `LocalInspectionOptions` contain only neutral
 quantization, residency, and session-capability policy, while native
 device-bound contexts are selected only by backend tooling. `LocalBackendError`

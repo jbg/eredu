@@ -82,12 +82,6 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, Lfm2UnitPopulator>,
 >;
-type ParallelResidentRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxResidentPolicy<NeutralBlock>,
->;
 type ParallelBoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -281,7 +275,7 @@ impl MlxUnitPopulator<NeutralBlock> for Lfm2ParallelUnitPopulator {
 enum Lfm2Execution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<BoundedRuntime>),
-    TensorParallelResident(Box<ParallelResidentRuntime>),
+    TensorParallelResident(Box<ResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 

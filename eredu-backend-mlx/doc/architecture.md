@@ -10,9 +10,10 @@ declarations to MLX storage and execution.
 
 Reusable mechanics are rooted at `eredu_backend_mlx::backend::{nn, runtime,
 ...}`. The `native` module is an explicit escape hatch for backend tooling that
-needs MLX arrays, streams, devices, random state, distributed groups, or
-composition-owned sessions. The flat crate root exposes the narrow adapters
-used by the `eredu` facade.
+needs composition-owned sessions, execution contexts, or random state. Raw MLX
+arrays, streams, devices, operations, and distributed groups retain their
+canonical `safemlx` paths instead of being re-exported by the backend. The flat
+crate root exposes the narrow adapters used by the `eredu` facade.
 
 - `backend::MlxBackend` implements complete model/session contracts and owns
   its execution and weight-materialization streams.

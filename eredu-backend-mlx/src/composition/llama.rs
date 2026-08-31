@@ -58,24 +58,11 @@ type NeutralLayerwiseRuntime = LayerwiseRuntime<
     MlxLayerwisePolicy<NeutralBlock>,
 >;
 
-type NeutralParallelResidentRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxResidentPolicy<NeutralBlock>,
->;
-type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock>,
->;
-
 enum LlamaExecution {
     Resident(NeutralResidentRuntime),
     Layerwise(NeutralLayerwiseRuntime),
-    TensorParallelResident(Box<NeutralParallelResidentRuntime>),
-    TensorParallelLayerwise(Box<NeutralParallelLayerwiseRuntime>),
+    TensorParallelResident(Box<NeutralResidentRuntime>),
+    TensorParallelLayerwise(Box<NeutralLayerwiseRuntime>),
 }
 
 impl LlamaExecution {

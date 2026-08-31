@@ -101,12 +101,6 @@ type Bounded = LayerwiseRuntime<
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
 
-type ParallelResident = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxResidentPolicy<NeutralUnit>,
->;
 type ParallelBounded = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -280,7 +274,7 @@ impl MlxUnitPopulator<NeutralUnit> for ParallelUnitPopulator {
 enum Execution {
     Resident(Resident),
     Bounded(Bounded),
-    ParallelResident(Box<ParallelResident>),
+    ParallelResident(Box<Resident>),
     ParallelBounded(Box<ParallelBounded>),
 }
 

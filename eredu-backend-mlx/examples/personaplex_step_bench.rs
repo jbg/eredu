@@ -4,8 +4,7 @@ use std::{path::PathBuf, time::Instant};
 
 use eredu_backend_mlx::backend::config::ModelLoadOptions;
 use eredu_backend_mlx::native::{
-    personaplex_sine_frame, transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext,
-    MlxRealtimeBackend, MlxRealtimeInput, Stream,
+    personaplex_sine_frame, ExecutionContext, MlxRealtimeBackend, MlxRealtimeInput,
 };
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
 use eredu_core::QuantizationRequest;
@@ -13,6 +12,7 @@ use eredu_core::{
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler,
 };
+use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, Stream};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights_stream = weights_ctx.stream();
 
     if quantize_on_load {
-        eredu_backend_mlx::native::memory::reset_peak_memory()?;
+        safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
         let mut model = load_realtime_model_with_options(
             MlxRealtimeBackend::new(stream, weights_stream),
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report_memory()?;
         benchmark_model(&mut model, frames, stream)?;
     } else {
-        eredu_backend_mlx::native::memory::reset_peak_memory()?;
+        safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
         let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
         let mut model =
@@ -72,15 +72,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn report_memory() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "mlx_active_memory_bytes={}",
-        eredu_backend_mlx::native::memory::active_memory()?
+        safemlx::memory::active_memory()?
     );
-    println!(
-        "mlx_peak_memory_bytes={}",
-        eredu_backend_mlx::native::memory::peak_memory()?
-    );
+    println!("mlx_peak_memory_bytes={}", safemlx::memory::peak_memory()?);
     println!(
         "mlx_cache_memory_bytes={}",
-        eredu_backend_mlx::native::memory::cache_memory()?
+        safemlx::memory::cache_memory()?
     );
     Ok(())
 }
@@ -110,7 +107,7 @@ struct StepBenchResult {
 
 fn run_steps(
     model: &mut RealtimeModel<MlxRealtimeBackend>,
-    input: &eredu_backend_mlx::native::Array,
+    input: &Array,
     frames: i32,
     stream: &Stream,
 ) -> Result<StepBenchResult, Box<dyn std::error::Error>> {

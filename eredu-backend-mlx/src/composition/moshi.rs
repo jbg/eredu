@@ -54,24 +54,11 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxKeyValueState,
     MlxLayerwisePolicy<MoshiUnit>,
 >;
-type ParallelResidentRuntime = LayerwiseRuntime<
-    Architecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxResidentPolicy<MoshiUnit>,
->;
-type ParallelBoundedRuntime = LayerwiseRuntime<
-    Architecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<MoshiUnit>,
->;
-
 enum Execution {
     Resident(ResidentRuntime),
     Bounded(BoundedRuntime),
-    ParallelResident(Box<ParallelResidentRuntime>),
-    ParallelBounded(Box<ParallelBoundedRuntime>),
+    ParallelResident(Box<ResidentRuntime>),
+    ParallelBounded(Box<BoundedRuntime>),
 }
 
 #[derive(Clone)]
