@@ -26,6 +26,7 @@ pub use config::{
 pub use graph::{component_graph, state_layout};
 pub use model::{
     DecoderInputPart, ForwardContext, LayeredModel, ModelInput, TextPartitionInput, Unit,
+    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     layer_parameter_groups, local_decoder_config, local_geometry, static_parameter_groups,
@@ -62,8 +63,8 @@ pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
     )
     .map_err(eredu_nn::Error::backend)?;
     let layers = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(eredu_nn::Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in 0..layers {
         let local = architecture

@@ -607,6 +607,10 @@ where
         crate::transport::decoder()
     }
 
+    fn primary_execution_group(&self) -> &str {
+        crate::decoder::TARGET_EXECUTION_GROUP
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,

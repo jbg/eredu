@@ -496,6 +496,8 @@ fn build_pipeline_expert_cache(
 pub struct PipelineStageInfo {
     /// Authoritative global placement of decoder and multimodal execution groups.
     pub placement: Arc<PlacedExecutionDag>,
+    /// Stable architecture-owned identity of the primary pipeline group.
+    pub primary_execution_group: String,
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
     pub topology: MlxParallelContext,
     /// Zero-based pipeline coordinate.
@@ -2017,13 +2019,13 @@ struct MediaPipelineRealization<A, G, B, C, U, I> {
 }
 
 impl<A, G, B, C, U, I> MediaPipelineRealization<A, G, B, C, U, I> {
-    fn media_range<S>(&self, kind: eredu_runtime::ArchitectureGroupKind) -> Range<usize>
+    fn media_range<S>(&self, group: &str) -> Range<usize>
     where
         S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
         A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
         A::Error: std::fmt::Display,
     {
-        architecture_partition_range::<A, S, _>(&self.architecture, &self.partition, kind)
+        architecture_partition_range::<A, S, _>(&self.architecture, &self.partition, group)
     }
 }
 
@@ -3698,22 +3700,10 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    (0..graph.groups().len())
-        .find(|&group| {
-            let transport = architecture.group_transport(group);
-            transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder
-                && transport.placement == eredu_runtime::ArchitectureGroupPlacement::Pipeline
-        })
-        .ok_or_else(|| Error::Parallel("architecture has no pipeline decoder group".into()))
+    architecture_group_by_id::<A, S>(architecture, architecture.primary_execution_group())
 }
 
-fn architecture_group_by_kind<A, S>(
-    architecture: &A,
-    kind: eredu_runtime::ArchitectureGroupKind,
-) -> Result<usize, Error>
+fn architecture_group_by_id<A, S>(architecture: &A, id: &str) -> Result<usize, Error>
 where
     S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
@@ -3722,17 +3712,9 @@ where
     let graph = architecture
         .execution_graph()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut matches =
-        (0..graph.groups().len()).filter(|&group| architecture.group_transport(group).kind == kind);
-    let group = matches
-        .next()
-        .ok_or_else(|| Error::Parallel(format!("architecture has no {kind:?} group")))?;
-    if matches.next().is_some() {
-        return Err(Error::Parallel(format!(
-            "architecture has multiple {kind:?} groups"
-        )));
-    }
-    Ok(group)
+    graph
+        .group_index(id)
+        .ok_or_else(|| Error::Parallel(format!("architecture has no execution group {id:?}")))
 }
 
 fn architecture_parameter_unit_owner<A, S>(
@@ -3760,34 +3742,27 @@ where
     ))
 }
 
-fn architecture_group_id_by_kind<A, S>(
-    architecture: &A,
-    kind: eredu_runtime::ArchitectureGroupKind,
-) -> Result<String, Error>
+fn architecture_group_id<A, S>(architecture: &A, id: &str) -> Result<String, Error>
 where
     S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
-    let group = architecture_group_by_kind::<A, S>(architecture, kind)?;
+    let group = architecture_group_by_id::<A, S>(architecture, id)?;
     let graph = architecture
         .execution_graph()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(graph.groups()[group].id().to_owned())
 }
 
-fn architecture_partition_range<A, S, P>(
-    architecture: &A,
-    partition: &P,
-    kind: eredu_runtime::ArchitectureGroupKind,
-) -> Range<usize>
+fn architecture_partition_range<A, S, P>(architecture: &A, partition: &P, id: &str) -> Range<usize>
 where
     S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
     P: GroupedPartition,
 {
-    let group = architecture_group_by_kind::<A, S>(architecture, kind)
+    let group = architecture_group_by_id::<A, S>(architecture, id)
         .expect("validated architecture transport group");
     architecture_partition_group_range(partition, group)
 }
@@ -3810,21 +3785,13 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    (0..graph.groups().len())
-        .filter(|&group| {
-            let transport = architecture.group_transport(group);
-            transport.kind == eredu_runtime::ArchitectureGroupKind::Prediction
-                && transport.placement == eredu_runtime::ArchitectureGroupPlacement::OutputOwner
-        })
-        .nth(depth)
-        .ok_or_else(|| {
-            Error::Parallel(format!(
-                "architecture has no output-owner prediction group at depth {depth}"
-            ))
-        })
+    let ids = architecture.prediction_execution_groups();
+    let id = ids.get(depth).ok_or_else(|| {
+        Error::Parallel(format!(
+            "architecture has no prediction execution group at depth {depth}"
+        ))
+    })?;
+    architecture_group_by_id::<A, S>(architecture, id)
 }
 
 fn architecture_prediction_groups<A, S>(architecture: &A) -> Result<Vec<usize>, Error>
@@ -3833,16 +3800,11 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    Ok((0..graph.groups().len())
-        .filter(|&group| {
-            let transport = architecture.group_transport(group);
-            transport.kind == eredu_runtime::ArchitectureGroupKind::Prediction
-                && transport.placement == eredu_runtime::ArchitectureGroupPlacement::OutputOwner
-        })
-        .collect())
+    architecture
+        .prediction_execution_groups()
+        .iter()
+        .map(|id| architecture_group_by_id::<A, S>(architecture, id))
+        .collect()
 }
 
 fn architecture_prediction_unit_ranges<A, S>(
@@ -4990,6 +4952,17 @@ impl PipelineModel {
         mut info: PipelineStageInfo,
         stage: impl PipelineArchitecture + 'static,
     ) -> Result<Self, Error> {
+        if !info
+            .placement
+            .groups()
+            .iter()
+            .any(|group| group.id == info.primary_execution_group)
+        {
+            return Err(Error::Parallel(format!(
+                "pipeline placement has no primary execution group {:?}",
+                info.primary_execution_group
+            )));
+        }
         let ownership = stage.partition_ownership();
         info.owns_input = ownership.owns_input();
         info.owns_output = ownership.owns_output();
@@ -5041,7 +5014,7 @@ impl PipelineModel {
             .iter()
             .enumerate()
             .filter(|(_, group)| {
-                group.dependencies.is_empty() && group.kind != ExecutionGroupKind::Decoder
+                group.dependencies.is_empty() && group.id != info.primary_execution_group
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
@@ -5596,10 +5569,7 @@ impl PipelineModel {
     }
 
     pub(crate) fn requires_embedded_mtp_prefill(&self) -> bool {
-        matches!(
-            self.info.model_kind,
-            ModelKind::Qwen3Next | ModelKind::Qwen35
-        ) && self.info.global_embedded_mtp_layers > 0
+        self.info.global_embedded_mtp_layers > 0
     }
 
     /// Runs a microbatch through the selected distributed backend session.
@@ -6024,7 +5994,7 @@ impl PipelineModel {
                 .iter()
                 .map(|index| {
                     let group = &placement.groups()[*index];
-                    if group.kind == ExecutionGroupKind::Decoder {
+                    if group.id == self.info.primary_execution_group {
                         1
                     } else {
                         group.owners.len().max(1)
@@ -6036,7 +6006,7 @@ impl PipelineModel {
                 let mut submissions = BTreeMap::new();
                 for &index in &batch {
                     let placed = &placement.groups()[index];
-                    let owner = if placed.kind == ExecutionGroupKind::Decoder {
+                    let owner = if placed.id == self.info.primary_execution_group {
                         (wave == 0)
                             .then(|| placed.first_owner().unwrap_or(placed.merge_destination))
                     } else {
@@ -6075,7 +6045,9 @@ impl PipelineModel {
                                 .finish_placed_ingress(tensor, execution_stream)?
                                 .into_arrays()
                         }
-                        ExecutionGroupKind::Decoder => {
+                        ExecutionGroupKind::Decoder
+                            if placed.id == self.info.primary_execution_group =>
+                        {
                             let arrays = working.remove(&index).unwrap_or_default();
                             if arrays.is_empty() && !placed.dependencies.is_empty() {
                                 return Err(Error::Parallel(format!(
@@ -6100,6 +6072,17 @@ impl PipelineModel {
                             decoder_payload = Some(payload);
                             arrays
                         }
+                        ExecutionGroupKind::Decoder => {
+                            let arrays = working.remove(&index).unwrap_or_default();
+                            self.stage.merge_placed_ingress_arrays(arrays)?;
+                            self.stage.execute_placed_ingress(
+                                &placed.id,
+                                step,
+                                tensor,
+                                execution_stream,
+                            )?;
+                            self.stage.placed_ingress_arrays(&placed.id)?
+                        }
                         ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => {
                             working.remove(&index).unwrap_or_default()
                         }
@@ -6112,7 +6095,7 @@ impl PipelineModel {
 
                 for &index in &batch {
                     let placed = &placement.groups()[index];
-                    if !active[index] || placed.kind == ExecutionGroupKind::Decoder {
+                    if !active[index] || placed.id == self.info.primary_execution_group {
                         continue;
                     }
                     let Some(owners) = placed.owners.get(wave..wave.saturating_add(2)) else {
@@ -7169,11 +7152,13 @@ fn base_info(
     wire_contract: eredu_runtime::PipelineWireContract,
     range: Range<usize>,
     placement: Arc<PlacedExecutionDag>,
+    primary_execution_group: impl Into<String>,
     model_kind: ModelKind,
 ) -> PipelineStageInfo {
     let stage = topology.pipeline_parallel_rank;
     PipelineStageInfo {
         placement,
+        primary_execution_group: primary_execution_group.into(),
         topology,
         pipeline_stage: stage,
         pipeline_stages: topology.pipeline_parallel_size,

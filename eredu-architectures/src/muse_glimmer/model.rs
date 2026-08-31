@@ -19,6 +19,11 @@ use super::{
     VisionStatic,
 };
 
+/// Stable execution-group identity for Muse-Glimmer vision ingress.
+pub const VISION_EXECUTION_GROUP: &str = "vision_encoder";
+/// Stable execution-group identity for Muse-Glimmer text decoding.
+pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
+
 /// One ordered decoder-ingress segment.
 pub enum DecoderInputPart<'a, T> {
     /// Ordinary text token IDs.
@@ -315,8 +320,8 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Describes pinned multimodal modules and each vision/text graph unit with
     /// explicit neutral ownership.
     fn parameter_description_impl(&self) -> Result<ArchitectureParameterDescription, Error> {
-        let graph =
-            ExecutionGraph::chain(["vision_encoder", "text_decoder"]).map_err(Error::backend)?;
+        let graph = ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
+            .map_err(Error::backend)?;
         let counts = [
             self.args
                 .vision_config
@@ -916,6 +921,10 @@ where
         }
     }
 
+    fn primary_execution_group(&self) -> &str {
+        TEXT_EXECUTION_GROUP
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,
@@ -928,7 +937,8 @@ where
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::chain(["vision_encoder", "text_decoder"]).map_err(Error::backend)
+        ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
+            .map_err(Error::backend)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {

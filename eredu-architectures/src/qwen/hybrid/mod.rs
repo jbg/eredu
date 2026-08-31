@@ -21,7 +21,7 @@ pub use conditional::{
     ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,
     ConditionalPartitionInput, ConditionalPipelineBoundary, ConditionalPipelineBoundarySchema,
     ConditionalPipelinePrepared, ConditionalPipelineVisionState, ConditionalStaticModules,
-    ConditionalUnit,
+    ConditionalUnit, VISION_EXECUTION_GROUP,
 };
 pub use config::{
     fp8_block_row_widths, fused_projection_widths, model_args_from_config_value,

@@ -305,6 +305,7 @@ pub(super) fn load_gpt_oss_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TEXT_DECODER_EXECUTION_GROUP,
         model_kind,
     );
     stage.expert_realization = eredu_architectures::gpt_oss::expert_realization_plan(

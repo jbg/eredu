@@ -386,6 +386,7 @@ pub(super) fn load_kimi_linear_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TARGET_EXECUTION_GROUP,
         model_kind,
     );
     let parameter_description = architecture

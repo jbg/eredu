@@ -417,6 +417,7 @@ pub(super) fn load_nemotron_h_pipeline(
         wire_contract,
         range.clone(),
         Arc::clone(&neutral_placement),
+        eredu_architectures::decoder::TARGET_EXECUTION_GROUP,
         model_kind,
     );
     let parameter_description = architecture

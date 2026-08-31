@@ -23,8 +23,10 @@ use eredu_runtime::{
     StateLayout, TensorPlacement,
 };
 
-/// Canonical execution-group identity for ordinary decoder layers.
-pub(crate) const TARGET_EXECUTION_GROUP: &str = "target";
+/// Stable identity of the shared decoder target execution group.
+pub const TARGET_EXECUTION_GROUP: &str = "target";
+/// Stable identity of an ordinary one-group text decoder.
+pub const TEXT_DECODER_EXECUTION_GROUP: &str = "text_decoder";
 
 /// Canonical field segments used by one shared decoder block.
 ///
@@ -2257,10 +2259,17 @@ impl SequentialPredictionGroups {
     /// Builds one dependency chain from target through every prediction depth.
     pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         eredu_runtime::ExecutionGraph::chain(
-            std::iter::once("target".to_owned())
-                .chain((0..self.prediction_paths.len()).map(|depth| format!("mtp.{depth}"))),
+            std::iter::once(TARGET_EXECUTION_GROUP.to_owned())
+                .chain(self.prediction_execution_groups()),
         )
         .map_err(Error::backend)
+    }
+
+    /// Returns stable prediction-group identities in prediction-depth order.
+    pub fn prediction_execution_groups(&self) -> Vec<String> {
+        (0..self.prediction_paths.len())
+            .map(|depth| format!("mtp.{depth}"))
+            .collect()
     }
 
     /// Returns the number of units in one group.
@@ -2961,7 +2970,8 @@ where
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::chain(["text_decoder"]).map_err(Error::backend)?;
+        let graph =
+            ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)?;
         let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
         let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
         let static_groups = static_parallel_parameter_groups::<B>(
@@ -3082,6 +3092,10 @@ where
         crate::transport::decoder()
     }
 
+    fn primary_execution_group(&self) -> &str {
+        TEXT_DECODER_EXECUTION_GROUP
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,
@@ -3094,7 +3108,7 @@ where
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Error::backend)
+        eredu_runtime::ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {

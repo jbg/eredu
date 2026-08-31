@@ -547,6 +547,22 @@ where
     /// Declares transport and physical placement semantics for one canonical group slot.
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport;
 
+    /// Returns the stable identifier of the primary pipeline execution group.
+    ///
+    /// Pipeline composition resolves this identifier against [`Self::execution_graph`]
+    /// instead of guessing the primary group from its semantic kind. Architectures may
+    /// therefore declare multiple decoder-shaped groups without making composition
+    /// dependent on declaration order.
+    fn primary_execution_group(&self) -> &str;
+
+    /// Returns stable identifiers for ordered embedded-prediction groups.
+    ///
+    /// The order is the architecture's prediction-depth order. Semantic group kinds
+    /// remain lifecycle metadata and are not used as group addresses.
+    fn prediction_execution_groups(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Declares how the complete mutable-state layout is divided among realized partitions.
     fn state_partition_plan(&self, layout: &StateLayout) -> crate::ArchitectureStatePartitionPlan;
 

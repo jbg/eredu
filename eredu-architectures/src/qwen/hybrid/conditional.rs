@@ -26,6 +26,9 @@ use super::{
     ParsedHybridConfig, PredictionUnit, Unit,
 };
 
+/// Stable execution-group identity for conditional Qwen vision ingress.
+pub const VISION_EXECUTION_GROUP: &str = "vision";
+
 enum PreparedPart<T> {
     Text { tokens: T, embeddings: T },
     Media { tokens: T },
@@ -529,8 +532,11 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
 
     fn canonical_execution_graph(&self) -> Result<ExecutionGraph, Error> {
         let mut groups = vec![
-            ExecutionGroupSpec::root("vision"),
-            ExecutionGroupSpec::with_dependencies("target", ["vision"]),
+            ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+            ExecutionGroupSpec::with_dependencies(
+                crate::decoder::TARGET_EXECUTION_GROUP,
+                [VISION_EXECUTION_GROUP],
+            ),
         ];
         let mut output = "target".to_owned();
         for depth in 0..self.prediction_steps {
@@ -1459,6 +1465,16 @@ where
             1 => crate::transport::decoder(),
             _ => conditional_prediction_group_transport(group),
         }
+    }
+
+    fn primary_execution_group(&self) -> &str {
+        crate::decoder::TARGET_EXECUTION_GROUP
+    }
+
+    fn prediction_execution_groups(&self) -> Vec<String> {
+        (0..self.prediction_steps)
+            .map(|depth| format!("mtp.{depth}"))
+            .collect()
     }
 
     fn state_partition_plan(

@@ -1005,6 +1005,10 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         }
     }
 
+    fn primary_execution_group(&self) -> &str {
+        "text"
+    }
+
     fn state_partition_plan(
         &self,
         layout: &StateLayout,

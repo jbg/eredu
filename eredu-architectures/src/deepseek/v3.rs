@@ -1091,6 +1091,14 @@ where
         }
     }
 
+    fn primary_execution_group(&self) -> &str {
+        crate::decoder::TARGET_EXECUTION_GROUP
+    }
+
+    fn prediction_execution_groups(&self) -> Vec<String> {
+        self.groups.prediction_execution_groups()
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,

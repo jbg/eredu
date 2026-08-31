@@ -35,7 +35,7 @@ pub use ingress::{
 pub use media::ModalityProjector;
 pub use model::{
     DecoderInputPart, ForwardContext, LayeredModel, ModelInput, StaticModules, TextBoundary,
-    TextBoundarySchema, Unit,
+    TextBoundarySchema, Unit, AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
@@ -89,8 +89,8 @@ pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
         .len(),
     )
     .map_err(eredu_nn::Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(eredu_nn::Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in sparse_layers {
         let local = architecture

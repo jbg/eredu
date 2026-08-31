@@ -1122,8 +1122,8 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
 ) -> Result<crate::ExpertResidencyCatalog, String> {
     let layers = nonnegative_count(args.text_config.num_hidden_layers, "layer count")?;
     let recipes = safetensors_recipes(args, catalog)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
+        .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
     for layer in 0..layers {
         if args

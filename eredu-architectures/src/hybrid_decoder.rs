@@ -98,6 +98,16 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         }
     }
 
+    /// Returns stable prediction-group identities in prediction-depth order.
+    pub fn prediction_execution_groups(&self) -> Vec<String> {
+        match &self.groups {
+            HybridExecutionGroups::Target(_) => Vec::new(),
+            HybridExecutionGroups::TargetAndPrediction(groups) => {
+                groups.prediction_execution_groups()
+            }
+        }
+    }
+
     /// Returns the number of units in the target group.
     pub fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
         match &self.groups {

@@ -27,6 +27,10 @@ use super::{
 /// Canonical static-role identity for the embedded prediction modules and
 /// their persistent state owner.
 pub const MTP_STATIC_ROLE: &str = "mtp";
+/// Stable execution-group identity for Inkling vision ingress.
+pub const VISION_EXECUTION_GROUP: &str = "vision";
+/// Stable execution-group identity for Inkling text decoding.
+pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
 
 /// Pinned text, audio, and image modules.
 #[derive(Debug, Clone, Parameterized)]
@@ -542,7 +546,8 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::chain(["vision", "text_decoder"]).map_err(Error::backend)?;
+        let graph = ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
+            .map_err(Error::backend)?;
         let counts = [
             self.args
                 .vision_config
@@ -1257,6 +1262,10 @@ where
         }
     }
 
+    fn primary_execution_group(&self) -> &str {
+        TEXT_EXECUTION_GROUP
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,
@@ -1275,7 +1284,8 @@ where
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::chain(["vision", "text_decoder"]).map_err(Error::backend)
+        ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
+            .map_err(Error::backend)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {

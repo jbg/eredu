@@ -178,6 +178,7 @@ pub(super) fn load_llama_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TEXT_DECODER_EXECUTION_GROUP,
         model_kind,
     );
     let geometry = architecture.shared_parallel_geometry();

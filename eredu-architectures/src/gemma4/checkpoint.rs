@@ -1216,8 +1216,8 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     .ok()
     .filter(|count| *count > 0)
     .ok_or_else(|| "Gemma 4 expert count must be positive".to_string())?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
+        .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
     for layer in 0..args.num_hidden_layers() {
         if args

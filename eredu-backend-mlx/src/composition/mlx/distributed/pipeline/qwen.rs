@@ -40,7 +40,7 @@ use crate::{
         MlxParallelContext,
     },
     composition::mlx::distributed::pipeline::{
-        architecture_decoder_group, architecture_group_by_kind, architecture_group_id_by_kind,
+        architecture_decoder_group, architecture_group_by_id, architecture_group_id,
         architecture_group_unit_count, architecture_parallel_layout,
         architecture_parameter_unit_owner, architecture_partition_group_range,
         architecture_prediction_group, architecture_single_prediction_units, base_info,
@@ -317,11 +317,11 @@ impl QwenVlPipelinePartition {
     }
 
     fn range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::Decoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::qwen::vl::TEXT_EXECUTION_GROUP)
     }
 
     fn vision_range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::VisionEncoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::qwen::vl::VISION_EXECUTION_GROUP)
     }
 
     fn boundary_schema(
@@ -402,9 +402,9 @@ impl QwenVlPipelinePartition {
                     Some(controller.group_guard(&storage.residency, "pipeline_stage"))
                 }
             };
-            let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+            let vision_group = architecture_group_by_id::<_, MlxHybridState>(
                 &self.architecture,
-                eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                eredu_architectures::qwen::vl::VISION_EXECUTION_GROUP,
             )?;
             let mut window = storage.transfer_window(0..self.vision_range().len(), true)?;
             for (ordinal, index) in self.vision_range().clone().enumerate() {
@@ -672,9 +672,9 @@ impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
     }
 
     fn merge_placed_ingress_arrays(&mut self, arrays: Vec<Array>) -> Result<(), Error> {
-        let group = architecture_group_id_by_kind::<_, MlxHybridState>(
+        let group = architecture_group_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::qwen::vl::VISION_EXECUTION_GROUP,
         )?;
         self.replace_placed_ingress_arrays(&group, arrays)
     }
@@ -686,9 +686,9 @@ impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let vision_group = architecture_group_id_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::qwen::vl::VISION_EXECUTION_GROUP,
         )?;
         if group != vision_group {
             return Ok(());
@@ -838,7 +838,9 @@ impl QwenConditionalPipelinePartition {
     }
 
     fn vision_range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::VisionEncoder)
+        self.media_range::<MlxHybridState>(
+            eredu_architectures::qwen::hybrid::VISION_EXECUTION_GROUP,
+        )
     }
 
     fn boundary_schema(
@@ -922,9 +924,9 @@ impl QwenConditionalPipelinePartition {
                     Some(controller.group_guard(&storage.residency, "pipeline_stage"))
                 }
             };
-            let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+            let vision_group = architecture_group_by_id::<_, MlxHybridState>(
                 &self.architecture,
-                eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                eredu_architectures::qwen::hybrid::VISION_EXECUTION_GROUP,
             )?;
             let mut window = storage.transfer_window(0..self.vision_range().len(), true)?;
             for (ordinal, index) in self.vision_range().clone().enumerate() {
@@ -1273,9 +1275,9 @@ impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
     }
 
     fn merge_placed_ingress_arrays(&mut self, arrays: Vec<Array>) -> Result<(), Error> {
-        let group = architecture_group_id_by_kind::<_, MlxHybridState>(
+        let group = architecture_group_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::qwen::hybrid::VISION_EXECUTION_GROUP,
         )?;
         self.replace_placed_ingress_arrays(&group, arrays)
     }
@@ -1287,9 +1289,9 @@ impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let vision_group = architecture_group_id_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::qwen::hybrid::VISION_EXECUTION_GROUP,
         )?;
         if group != vision_group {
             return Ok(());
@@ -1629,6 +1631,7 @@ pub(super) fn load_qwen_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TEXT_DECODER_EXECUTION_GROUP,
         model_kind,
     );
     let expert_assignment =
@@ -1939,9 +1942,9 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
     let binding_parameter_description = binding_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+    let vision_group = architecture_group_by_id::<_, MlxHybridState>(
         &binding_architecture,
-        eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        eredu_architectures::qwen::vl::VISION_EXECUTION_GROUP,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
     let target_units = architecture_group_unit_count(
@@ -1984,6 +1987,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::qwen::vl::TEXT_EXECUTION_GROUP,
         model_kind,
     );
     let expert_realization = eredu_architectures::qwen::vl::expert_realization_plan(
@@ -3042,6 +3046,7 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TARGET_EXECUTION_GROUP,
         model_kind,
     );
     let expert_realization = eredu_architectures::qwen::hybrid::expert_realization_plan(
@@ -3441,9 +3446,9 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
     let binding_parameter_description = binding_architecture
         .parameter_description(stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+    let vision_group = architecture_group_by_id::<_, MlxHybridState>(
         &binding_architecture,
-        eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        eredu_architectures::qwen::hybrid::VISION_EXECUTION_GROUP,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
     let target_units = binding_parameter_description
@@ -3488,6 +3493,7 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TARGET_EXECUTION_GROUP,
         model_kind,
     );
     let expert_realization =

@@ -23,6 +23,13 @@ use super::{
     SharedAttentionStates, VisionInput, VisionLayer, VisionState, VisionStatic,
 };
 
+/// Stable execution-group identity for Gemma 4 vision ingress.
+pub const VISION_EXECUTION_GROUP: &str = "vision";
+/// Stable execution-group identity for Gemma 4 audio ingress.
+pub const AUDIO_EXECUTION_GROUP: &str = "audio";
+/// Stable execution-group identity for Gemma 4 text decoding.
+pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
+
 fn text_static_parameter_ownership(
     args: &super::ModelArgs,
 ) -> Result<Vec<OwnedParameterGroupSpec>, ParallelPlanError> {
@@ -802,11 +809,14 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     ) -> Result<ArchitectureParameterDescription, Error> {
         let graph = ExecutionGraph::new(
             vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::with_dependencies("text_decoder", ["vision", "audio"]),
+                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+                ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
+                ExecutionGroupSpec::with_dependencies(
+                    TEXT_EXECUTION_GROUP,
+                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
+                ),
             ],
-            "text_decoder",
+            TEXT_EXECUTION_GROUP,
         )
         .map_err(Error::backend)?;
         let counts = [
@@ -1735,6 +1745,10 @@ where
         }
     }
 
+    fn primary_execution_group(&self) -> &str {
+        TEXT_EXECUTION_GROUP
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,
@@ -1749,11 +1763,14 @@ where
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::new(
             vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::with_dependencies("text_decoder", ["vision", "audio"]),
+                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+                ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
+                ExecutionGroupSpec::with_dependencies(
+                    TEXT_EXECUTION_GROUP,
+                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
+                ),
             ],
-            "text_decoder",
+            TEXT_EXECUTION_GROUP,
         )
         .map_err(Error::backend)
     }

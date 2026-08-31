@@ -327,6 +327,11 @@ impl ExecutionGraph {
         &self.groups
     }
 
+    /// Resolves a stable execution-group identity to its architecture slot.
+    pub fn group_index(&self, id: &str) -> Option<usize> {
+        self.groups.iter().position(|group| group.id() == id)
+    }
+
     /// Returns stable topological execution slots.
     pub fn execution_order(&self) -> &[usize] {
         &self.execution_order
@@ -712,6 +717,9 @@ mod tests {
         .unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [2, 3]).unwrap();
 
+        assert_eq!(graph.group_index("vision"), Some(0));
+        assert_eq!(graph.group_index("text"), Some(1));
+        assert_eq!(graph.group_index("missing"), None);
         assert_eq!(layout.len(), 5);
         assert_eq!(layout.group_count(), 2);
         assert_eq!(layout.group_id(0).unwrap().as_str(), "vision");

@@ -20,6 +20,7 @@ pub use config::{
 pub use model::{
     ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
     PipelinePartitionInput, PipelinePrepared, PipelineVisionState, StaticModules, Unit,
+    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{local_geometry, LocalGeometry};
 pub use positions::{
@@ -51,8 +52,8 @@ pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
         .len(),
     )
     .map_err(eredu_nn::Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(eredu_nn::Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
     let geometry = architecture.shared_parallel_geometry();
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in

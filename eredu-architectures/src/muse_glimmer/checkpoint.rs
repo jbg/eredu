@@ -1125,8 +1125,8 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     let capacity = layers
         .checked_mul(experts)
         .ok_or_else(|| "Muse-Glimmer expert residency catalog size overflows".to_string())?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
+        .map_err(|error| error.to_string())?;
     let mut units = Vec::with_capacity(capacity);
     for layer in 0..layers {
         let unit_path = format!("model.layers.{layer}");

@@ -29,6 +29,7 @@ pub use graph::{
 pub use model::{
     state_identity, DecoderInputPart, ForwardContext, InklingStateLayouts, LayeredModel,
     ModelInput, PartitionMtpOutput, StaticModules, TextPartitionInput, Unit, MTP_STATIC_ROLE,
+    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use mtp::{MtpDepth, MtpModel, MtpOutput};
 pub use parallel::{
@@ -77,8 +78,8 @@ pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
         .len(),
     )
     .map_err(eredu_nn::Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(eredu_nn::Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
     for (layer, policy) in args.text_config.layer_schedule.iter().enumerate() {
         if policy.feed_forward != FeedForwardPolicy::SparseMoe {

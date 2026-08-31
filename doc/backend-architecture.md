@@ -216,7 +216,12 @@ unchanged.
 Execution-group transport is also architecture policy. The runtime defines the
 neutral placement, semantic-kind, merge-destination, parallel-subgroup, and
 request-optionality data types, but every `LayeredArchitecture` must declare the
-transport for each of its groups. Request optionality applies only to root media
+transport for each of its groups. It also declares the stable primary-group
+identity and the stable identities of ordered prediction groups. Composition
+resolves those IDs against the canonical graph; semantic kinds classify
+lifecycle behavior and are never group addresses. Multiple groups may therefore
+share a decoder, encoder, projector, or prediction kind without making selection
+depend on declaration order. Request optionality applies only to root media
 encoders; the neutral pipeline lifecycle rejects it on structural, decoder, or
 prediction groups. Shared decoder defaults live in `eredu-architectures`; the
 runtime does not assign decoder roles or placement to an unspecified group.
@@ -610,6 +615,9 @@ to its implementation; it does not maintain a family-name MTP table. Pipeline
 sessions therefore report architecture-declared separate draft weights as
 unsupported while external drafting remains unavailable for pipeline
 execution; only an absent architecture declaration reports unavailable.
+Pipeline prefill likewise enters embedded-prediction cache preparation whenever
+the realized architecture declares prediction layers; the backend does not gate
+that path on a family enum.
 
 For SafeTensors and GGUF materialization, architecture preparation also
 identifies the checkpoint parameter that establishes the generic floating-state
@@ -1199,9 +1207,11 @@ through the partition's `ArchitectureBoundary`; backend composition does not
 reconstruct a family's begin/finish lifecycle. Families do not expose alternate
 public execution seams that accept caller-supplied embedding, reduction, or
 projection operations, or piecemeal setters for partition forward state.
-Primary decoder and embedded
-prediction groups have distinct semantic kinds, so multimodal ingress ends at
-the decoder boundary and prediction runs only in its explicit phase.
+The primary decoder and embedded-prediction groups have explicit stable
+identities, so multimodal ingress ends at the declared primary boundary and
+prediction runs only in the architecture-declared identity order. Their
+semantic kinds remain useful for lifecycle classification but do not select
+either group.
 
 Pipeline ingress uses the same canonical execution graph through
 `LayeredPipelineSchedule`. The neutral runtime consumes both architecture-authored
@@ -1211,6 +1221,9 @@ compatible ready batches, and owns group completion transitions. Concrete
 backends retain that resolved optionality with physical placement and realize
 streams, residency, payload transport, and collectives; they do not infer
 optionality from backend-local kinds or maintain a second graph lifecycle.
+Backend adapters address media storage and the primary boundary by the graph's
+stable architecture-owned IDs, including when several groups have the same
+semantic kind.
 
 The partition also carries an architecture-owned boundary schema. That schema
 declares the primary evolving activation and every auxiliary tensor, including

@@ -38,7 +38,7 @@ use crate::{
         MlxParallelContext,
     },
     composition::mlx::distributed::pipeline::{
-        architecture_decoder_group, architecture_group_by_kind, architecture_group_id_by_kind,
+        architecture_decoder_group, architecture_group_by_id, architecture_group_id,
         architecture_group_unit_count, architecture_parallel_layout,
         architecture_parameter_unit_owner, base_info, build_pipeline_expert_cache,
         build_pipeline_layer_storage, checkpoint_backing_shards,
@@ -64,11 +64,11 @@ impl InklingPipelinePartition {
     }
 
     fn range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::Decoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::inkling::TEXT_EXECUTION_GROUP)
     }
 
     fn vision_range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::VisionEncoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::inkling::VISION_EXECUTION_GROUP)
     }
 
     fn build_unit(
@@ -151,9 +151,9 @@ impl InklingPipelinePartition {
     }
 
     fn ingress_active(&self, state: &InklingIngressState) -> bool {
-        let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
         )
         .expect("validated Inkling vision group");
         <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
@@ -185,9 +185,9 @@ impl InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
         )?;
         state.forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
             Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
@@ -229,9 +229,9 @@ impl InklingPipelinePartition {
         stream: &Stream,
     ) -> Result<Array, Error> {
         if self.ingress_active(&state) {
-            let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+            let vision_group = architecture_group_by_id::<_, MlxHybridState>(
                 &self.architecture,
-                eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                eredu_architectures::inkling::VISION_EXECUTION_GROUP,
             )?;
             state.forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
                 Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
@@ -385,9 +385,9 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
     }
 
     fn merge_placed_ingress_arrays(&mut self, arrays: Vec<Array>) -> Result<(), Error> {
-        let group = architecture_group_id_by_kind::<_, MlxHybridState>(
+        let group = architecture_group_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
         )?;
         self.replace_placed_ingress_arrays(&group, arrays)
     }
@@ -399,9 +399,9 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let vision_group = architecture_group_id_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_id::<_, MlxHybridState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
         )?;
         if group != vision_group {
             return Ok(());
@@ -660,9 +660,9 @@ impl InklingPipelinePartition {
         }
         if let Some(storage) = self.dense_layers.take() {
             let result = (|| {
-                let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+                let vision_group = architecture_group_by_id::<_, MlxHybridState>(
                     &self.architecture,
-                    eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                    eredu_architectures::inkling::VISION_EXECUTION_GROUP,
                 )?;
                 let mut window = storage.transfer_window(0..self.vision_range().len(), true)?;
                 for (ordinal, index) in self.vision_range().clone().enumerate() {
@@ -960,6 +960,7 @@ pub(super) fn load_neutral_inkling_pipeline(
         wire_contract,
         range.clone(),
         Arc::clone(&neutral_placement),
+        eredu_architectures::inkling::TEXT_EXECUTION_GROUP,
         model_kind,
     );
     let parameter_description = architecture
@@ -986,9 +987,9 @@ pub(super) fn load_neutral_inkling_pipeline(
         stage.expert_storage = PipelineExpertStorage::ExternalEmpty;
     }
     let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
-    let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+    let vision_group = architecture_group_by_id::<_, MlxHybridState>(
         &stage.architecture,
-        eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        eredu_architectures::inkling::VISION_EXECUTION_GROUP,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
     stage.vision_layers = stage
@@ -1129,9 +1130,9 @@ pub(super) fn load_neutral_inkling_pipeline(
         let vision_count = stage.vision_range().len();
         let text_start = stage.range().start;
         let unit_count = vision_count + stage.range().len();
-        let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
             architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
         )?;
         let decoder_group = architecture_decoder_group::<_, MlxHybridState>(architecture)?;
         let storage = build_pipeline_layer_storage(

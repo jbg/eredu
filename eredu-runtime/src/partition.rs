@@ -1536,6 +1536,41 @@ where
     let graph = architecture
         .execution_graph()
         .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+    let primary = architecture.primary_execution_group();
+    let primary_index = graph.group_index(primary).ok_or_else(|| {
+        ArchitecturePartitionError::ArchitectureTopology(format!(
+            "primary execution group {primary:?} is not present in the canonical graph"
+        ))
+    })?;
+    let primary_transport = architecture.group_transport(primary_index);
+    if primary_transport.kind != crate::ArchitectureGroupKind::Decoder
+        || primary_transport.placement != crate::ArchitectureGroupPlacement::Pipeline
+    {
+        return Err(ArchitecturePartitionError::ArchitectureTopology(format!(
+            "primary execution group {primary:?} must be a pipeline decoder"
+        )));
+    }
+    let mut declared_groups = BTreeSet::from([primary.to_owned()]);
+    for prediction in architecture.prediction_execution_groups() {
+        let prediction_index = graph.group_index(&prediction).ok_or_else(|| {
+            ArchitecturePartitionError::ArchitectureTopology(format!(
+                "prediction execution group {prediction:?} is not present in the canonical graph"
+            ))
+        })?;
+        let prediction_transport = architecture.group_transport(prediction_index);
+        if prediction_transport.kind != crate::ArchitectureGroupKind::Prediction
+            || prediction_transport.placement != crate::ArchitectureGroupPlacement::OutputOwner
+        {
+            return Err(ArchitecturePartitionError::ArchitectureTopology(format!(
+                "prediction execution group {prediction:?} must be an output-owner prediction"
+            )));
+        }
+        if !declared_groups.insert(prediction.clone()) {
+            return Err(ArchitecturePartitionError::ArchitectureTopology(format!(
+                "execution group {prediction:?} is declared as a primary or prediction group more than once"
+            )));
+        }
+    }
     let mut counts = Vec::with_capacity(graph.groups().len());
     let mut paths = BTreeSet::new();
     for group in 0..graph.groups().len() {

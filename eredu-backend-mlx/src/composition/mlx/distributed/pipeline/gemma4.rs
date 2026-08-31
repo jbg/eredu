@@ -8,6 +8,12 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
+#[derive(Clone, Copy)]
+enum Gemma4MediaGroup {
+    Vision,
+    Audio,
+}
+
 use crate::{
     backend::{
         error::Error,
@@ -39,7 +45,7 @@ use crate::{
         Gemma4Bindings, Gemma4PipelineUnit, PreparedParts as Gemma4PreparedParts,
     },
     composition::mlx::distributed::pipeline::{
-        architecture_decoder_group, architecture_group_by_kind, architecture_group_id_by_kind,
+        architecture_decoder_group, architecture_group_by_id, architecture_group_id,
         architecture_group_unit_count, architecture_parallel_layout,
         architecture_parameter_unit_owner, base_info, build_pipeline_expert_cache,
         build_pipeline_layer_storage, execute_routed_layered_partition_observed,
@@ -60,15 +66,15 @@ impl Gemma4PipelinePartition {
     }
 
     fn range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::Decoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::gemma4::TEXT_EXECUTION_GROUP)
     }
 
     fn vision_range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::VisionEncoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::gemma4::VISION_EXECUTION_GROUP)
     }
 
     fn audio_range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::AudioEncoder)
+        self.media_range::<MlxHybridState>(eredu_architectures::gemma4::AUDIO_EXECUTION_GROUP)
     }
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
@@ -104,14 +110,14 @@ impl Gemma4PipelinePartition {
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
-    fn ingress_kind(&self, id: &str) -> Result<eredu_runtime::ArchitectureGroupKind, Error> {
-        let graph = self.canonical_graph()?;
-        let group = graph
-            .groups()
-            .iter()
-            .position(|group| group.id() == id)
-            .ok_or_else(|| Error::Parallel(format!("Gemma 4 has no placed group {id:?}")))?;
-        Ok(self.group_kind(group))
+    fn media_group(id: &str) -> Result<Gemma4MediaGroup, Error> {
+        match id {
+            eredu_architectures::gemma4::VISION_EXECUTION_GROUP => Ok(Gemma4MediaGroup::Vision),
+            eredu_architectures::gemma4::AUDIO_EXECUTION_GROUP => Ok(Gemma4MediaGroup::Audio),
+            _ => Err(Error::Parallel(format!(
+                "Gemma 4 has no placed media group {id:?}"
+            ))),
+        }
     }
 
     fn canonical_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
@@ -122,35 +128,17 @@ impl Gemma4PipelinePartition {
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
-    fn group_kind(&self, group: usize) -> eredu_runtime::ArchitectureGroupKind {
-        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::group_transport(&self.architecture, group)
-        .kind
-    }
-
     fn ingress_active(&self, group: &str, state: &Gemma4IngressState) -> Result<bool, Error> {
-        match self.ingress_kind(group)? {
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
-                Ok(state.vision_hidden.is_some())
-            }
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => Ok(state.audio_hidden.is_some()),
-            _ => Err(Error::Parallel(format!(
-                "Gemma 4 has no placed media group {group:?}"
-            ))),
+        match Self::media_group(group)? {
+            Gemma4MediaGroup::Vision => Ok(state.vision_hidden.is_some()),
+            Gemma4MediaGroup::Audio => Ok(state.audio_hidden.is_some()),
         }
     }
 
     fn ingress_arrays(&self, group: &str, state: &Gemma4IngressState) -> Result<Vec<Array>, Error> {
-        let hidden = match self.ingress_kind(group)? {
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => state.vision_hidden.as_ref(),
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => state.audio_hidden.as_ref(),
-            _ => {
-                return Err(Error::Parallel(format!(
-                    "Gemma 4 has no placed media group {group:?}"
-                )))
-            }
+        let hidden = match Self::media_group(group)? {
+            Gemma4MediaGroup::Vision => state.vision_hidden.as_ref(),
+            Gemma4MediaGroup::Audio => state.audio_hidden.as_ref(),
         };
         Ok(hidden
             .map(|hidden| hidden.as_array().clone())
@@ -164,14 +152,9 @@ impl Gemma4PipelinePartition {
         state: &mut Gemma4IngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        let slot = match self.ingress_kind(group)? {
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => &mut state.vision_hidden,
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => &mut state.audio_hidden,
-            _ => {
-                return Err(Error::Parallel(format!(
-                    "Gemma 4 has no placed media group {group:?}"
-                )))
-            }
+        let slot = match Self::media_group(group)? {
+            Gemma4MediaGroup::Vision => &mut state.vision_hidden,
+            Gemma4MediaGroup::Audio => &mut state.audio_hidden,
         };
         match (slot.is_some(), arrays.as_slice()) {
             (true, [hidden]) => {
@@ -243,17 +226,14 @@ impl Gemma4PipelinePartition {
             >>::begin_forward(&mut self.architecture, input, &mut state, stream),
         }
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let graph = self.canonical_graph()?;
-        let media_group = |kind| {
-            graph
-                .groups()
-                .iter()
-                .enumerate()
-                .find_map(|(index, _)| (self.group_kind(index) == kind).then_some(index))
-                .ok_or_else(|| Error::Parallel(format!("Gemma 4 graph has no {kind:?} group")))
-        };
-        let vision_group = media_group(eredu_runtime::ArchitectureGroupKind::VisionEncoder)?;
-        let audio_group = media_group(eredu_runtime::ArchitectureGroupKind::AudioEncoder)?;
+        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
+            &self.architecture,
+            eredu_architectures::gemma4::VISION_EXECUTION_GROUP,
+        )?;
+        let audio_group = architecture_group_by_id::<_, MlxHybridState>(
+            &self.architecture,
+            eredu_architectures::gemma4::AUDIO_EXECUTION_GROUP,
+        )?;
         let mut begin_group = |group_index| {
             if !<eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
                 MlxNeuralBackend,
@@ -346,11 +326,11 @@ impl Gemma4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let kind = self.group_kind(group);
-        let hidden = match kind {
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => state.vision_hidden.as_ref(),
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => state.audio_hidden.as_ref(),
-            _ => None,
+        let group_id = self.canonical_graph()?.groups()[group].id().to_owned();
+        let media = Self::media_group(&group_id)?;
+        let hidden = match media {
+            Gemma4MediaGroup::Vision => state.vision_hidden.as_ref(),
+            Gemma4MediaGroup::Audio => state.audio_hidden.as_ref(),
         }
         .ok_or_else(|| Error::Parallel("Gemma 4 media group has no activation".into()))?
         .clone();
@@ -396,12 +376,9 @@ impl Gemma4PipelinePartition {
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         };
-        match kind {
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
-                state.vision_hidden = Some(output)
-            }
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => state.audio_hidden = Some(output),
-            _ => unreachable!(),
+        match media {
+            Gemma4MediaGroup::Vision => state.vision_hidden = Some(output),
+            Gemma4MediaGroup::Audio => state.audio_hidden = Some(output),
         }
         Ok(())
     }
@@ -589,22 +566,11 @@ impl MlxPlacedGroupExecutor for Gemma4PipelinePartition {
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, execution, stream)?;
-        let graph = self.canonical_graph()?;
-        let media = graph
-            .groups()
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                matches!(
-                    self.group_kind(*index),
-                    eredu_runtime::ArchitectureGroupKind::VisionEncoder
-                        | eredu_runtime::ArchitectureGroupKind::AudioEncoder
-                )
-            })
-            .map(|(_, group)| group.id().to_owned())
-            .collect::<Vec<_>>();
-        for group in media {
-            self.execute_placed_media(&group, &mut state, execution, stream)?;
+        for group in [
+            eredu_architectures::gemma4::VISION_EXECUTION_GROUP,
+            eredu_architectures::gemma4::AUDIO_EXECUTION_GROUP,
+        ] {
+            self.execute_placed_media(group, &mut state, execution, stream)?;
         }
         let payload = self.finish_ingress(state, execution, stream)?;
         self.forward_decoder(
@@ -694,11 +660,13 @@ impl Gemma4PipelinePartition {
             .iter()
             .position(|candidate| candidate.id() == group)
             .ok_or_else(|| Error::Parallel(format!("Gemma 4 has no placed group {group:?}")))?;
-        let kind = self.group_kind(group_index);
-        let range = match kind {
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => self.vision_range().clone(),
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => self.audio_range().clone(),
-            _ => return Ok(()),
+        let media = match Self::media_group(group) {
+            Ok(media) => media,
+            Err(_) => return Ok(()),
+        };
+        let range = match media {
+            Gemma4MediaGroup::Vision => self.vision_range().clone(),
+            Gemma4MediaGroup::Audio => self.audio_range().clone(),
         };
         let ordinal_start = self
             .partition
@@ -755,24 +723,16 @@ impl Gemma4PipelinePartition {
             self.dense_layers = Some(storage);
             result?;
         } else {
-            let mut resident = match kind {
-                eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
-                    std::mem::take(&mut self.vision_layers)
-                }
-                eredu_runtime::ArchitectureGroupKind::AudioEncoder => {
-                    std::mem::take(&mut self.audio_layers)
-                }
-                _ => unreachable!(),
+            let mut resident = match media {
+                Gemma4MediaGroup::Vision => std::mem::take(&mut self.vision_layers),
+                Gemma4MediaGroup::Audio => std::mem::take(&mut self.audio_layers),
             };
             let result = range.zip(&mut resident).try_for_each(|(index, layer)| {
                 self.forward_media_unit(group_index, index, layer, state, execution, stream)
             });
-            match kind {
-                eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
-                    self.vision_layers = resident
-                }
-                eredu_runtime::ArchitectureGroupKind::AudioEncoder => self.audio_layers = resident,
-                _ => unreachable!(),
+            match media {
+                Gemma4MediaGroup::Vision => self.vision_layers = resident,
+                Gemma4MediaGroup::Audio => self.audio_layers = resident,
             }
             result?;
         }
@@ -997,9 +957,9 @@ pub(super) fn load_neutral_gemma4_pipeline(
         .get(topology.pipeline_parallel_rank)
         .cloned()
         .ok_or_else(|| Error::Parallel("Gemma 4 pipeline rank has no layer range".into()))?;
-    let decoder_group_id = architecture_group_id_by_kind::<_, MlxHybridState>(
+    let decoder_group_id = architecture_group_id::<_, MlxHybridState>(
         &architecture,
-        eredu_runtime::ArchitectureGroupKind::Decoder,
+        eredu_architectures::gemma4::TEXT_EXECUTION_GROUP,
     )?;
     let neutral_placement = Arc::new(
         media_architecture_transport::<_, MlxHybridState>(
@@ -1013,6 +973,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
         wire_contract,
         range.clone(),
         Arc::clone(&neutral_placement),
+        eredu_architectures::gemma4::TEXT_EXECUTION_GROUP,
         model_kind,
     );
     let parameter_description = architecture
@@ -1046,13 +1007,13 @@ pub(super) fn load_neutral_gemma4_pipeline(
         stage.expert_storage = PipelineExpertStorage::ExternalEmpty;
     }
     let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
-    let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+    let vision_group = architecture_group_by_id::<_, MlxHybridState>(
         &stage.architecture,
-        eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        eredu_architectures::gemma4::VISION_EXECUTION_GROUP,
     )?;
-    let audio_group = architecture_group_by_kind::<_, MlxHybridState>(
+    let audio_group = architecture_group_by_id::<_, MlxHybridState>(
         &stage.architecture,
-        eredu_runtime::ArchitectureGroupKind::AudioEncoder,
+        eredu_architectures::gemma4::AUDIO_EXECUTION_GROUP,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
     stage.vision_layers = stage
@@ -1217,13 +1178,13 @@ pub(super) fn load_neutral_gemma4_pipeline(
         let text_start = stage.range().start;
         let media_count = vision_count + audio_count;
         let unit_count = media_count + stage.range().len();
-        let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
+        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
             architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::gemma4::VISION_EXECUTION_GROUP,
         )?;
-        let audio_group = architecture_group_by_kind::<_, MlxHybridState>(
+        let audio_group = architecture_group_by_id::<_, MlxHybridState>(
             architecture,
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder,
+            eredu_architectures::gemma4::AUDIO_EXECUTION_GROUP,
         )?;
         let decoder_group = architecture_decoder_group::<_, MlxHybridState>(architecture)?;
         let storage = build_pipeline_layer_storage(

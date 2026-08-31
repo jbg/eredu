@@ -37,7 +37,7 @@ use crate::{
         MlxParallelContext,
     },
     composition::mlx::distributed::pipeline::{
-        architecture_decoder_group, architecture_group_by_kind, architecture_group_unit_count,
+        architecture_decoder_group, architecture_group_by_id, architecture_group_unit_count,
         architecture_parallel_layout, architecture_parameter_unit_owner,
         architecture_partition_range, base_info, build_pipeline_expert_cache,
         build_pipeline_layer_storage, checkpoint_backing_shards,
@@ -116,9 +116,9 @@ impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
         let state = self.ingress_state.as_ref().ok_or_else(|| {
             Error::Parallel("Muse-Glimmer placed ingress state is unavailable".into())
         })?;
-        let vision_group = architecture_group_by_kind::<_, MlxKeyValueState>(
+        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
         )?;
         Ok(
             <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
@@ -192,9 +192,9 @@ impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
         let mut state = self.ingress_state.take().ok_or_else(|| {
             Error::Parallel("Muse-Glimmer placed ingress state is unavailable".into())
         })?;
-        let vision_group = architecture_group_by_kind::<_, MlxKeyValueState>(
+        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
         )?;
         if <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
             MlxNeuralBackend,
@@ -235,9 +235,9 @@ impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
     ) -> Result<PipelineStageOutput, Error> {
         let mut ingress = self.begin_placed_input(input, execution, stream)?;
         self.execute_placed_vision(&mut ingress, execution, stream)?;
-        let vision_group = architecture_group_by_kind::<_, MlxKeyValueState>(
+        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
         )?;
         if <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
             MlxNeuralBackend,
@@ -401,6 +401,7 @@ pub(super) fn load_muse_glimmer_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::muse_glimmer::TEXT_EXECUTION_GROUP,
         model_kind,
     );
     let geometry = architecture.shared_parallel_geometry();
@@ -415,20 +416,20 @@ pub(super) fn load_muse_glimmer_pipeline(
             geometry,
             &parameter_description,
         )?;
-    let vision_group = architecture_group_by_kind::<_, MlxKeyValueState>(
+    let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
         &architecture,
-        eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
     )?;
     let decoder_group = architecture_decoder_group::<_, MlxKeyValueState>(&architecture)?;
     let vision_range = architecture_partition_range::<_, MlxKeyValueState, _>(
         &architecture,
         &partition,
-        eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
     );
     let decoder_range = architecture_partition_range::<_, MlxKeyValueState, _>(
         &architecture,
         &partition,
-        eredu_runtime::ArchitectureGroupKind::Decoder,
+        eredu_architectures::muse_glimmer::TEXT_EXECUTION_GROUP,
     );
     let vision_layers = vision_range
         .clone()
@@ -733,11 +734,15 @@ pub(super) fn load_muse_glimmer_pipeline(
 
 impl MuseGlimmerPipelinePartition {
     fn range(&self) -> Range<usize> {
-        self.media_range::<MlxKeyValueState>(eredu_runtime::ArchitectureGroupKind::Decoder)
+        self.media_range::<MlxKeyValueState>(
+            eredu_architectures::muse_glimmer::TEXT_EXECUTION_GROUP,
+        )
     }
 
     fn vision_range(&self) -> Range<usize> {
-        self.media_range::<MlxKeyValueState>(eredu_runtime::ArchitectureGroupKind::VisionEncoder)
+        self.media_range::<MlxKeyValueState>(
+            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
+        )
     }
 
     fn begin_placed_input(
@@ -805,9 +810,9 @@ impl MuseGlimmerPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let vision_group = architecture_group_by_kind::<_, MlxKeyValueState>(
+        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
             &self.architecture,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
         )?;
         if let Some(storage) = self.dense_layers.as_ref() {
             let forward_guard = match &storage.controller {

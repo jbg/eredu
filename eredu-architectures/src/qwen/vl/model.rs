@@ -26,6 +26,11 @@ use super::{
     PositionPart,
 };
 
+/// Stable execution-group identity for Qwen3-VL vision ingress.
+pub const VISION_EXECUTION_GROUP: &str = "vision";
+/// Stable execution-group identity for Qwen3-VL text decoding.
+pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
+
 /// One semantic segment in decoder order.
 pub enum InputPart<'a, T> {
     /// Ordinary text token IDs.
@@ -682,10 +687,13 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     ) -> Result<ArchitectureParameterDescription, Error> {
         let graph = ExecutionGraph::new(
             vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::with_dependencies("text_decoder", ["vision"]),
+                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+                ExecutionGroupSpec::with_dependencies(
+                    TEXT_EXECUTION_GROUP,
+                    [VISION_EXECUTION_GROUP],
+                ),
             ],
-            "text_decoder",
+            TEXT_EXECUTION_GROUP,
         )
         .map_err(Error::backend)?;
         let counts = [
@@ -1534,6 +1542,10 @@ where
         }
     }
 
+    fn primary_execution_group(&self) -> &str {
+        TEXT_EXECUTION_GROUP
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,
@@ -1548,10 +1560,13 @@ where
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::new(
             vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::with_dependencies("text_decoder", ["vision"]),
+                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+                ExecutionGroupSpec::with_dependencies(
+                    TEXT_EXECUTION_GROUP,
+                    [VISION_EXECUTION_GROUP],
+                ),
             ],
-            "text_decoder",
+            TEXT_EXECUTION_GROUP,
         )
         .map_err(Error::backend)
     }

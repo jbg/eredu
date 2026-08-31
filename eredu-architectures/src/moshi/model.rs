@@ -612,6 +612,14 @@ where
         group_transport(group)
     }
 
+    fn primary_execution_group(&self) -> &str {
+        "temporal_transformer"
+    }
+
+    fn prediction_execution_groups(&self) -> Vec<String> {
+        vec!["depth_codebook_slices".to_owned()]
+    }
+
     fn state_partition_plan(
         &self,
         layout: &eredu_runtime::StateLayout,

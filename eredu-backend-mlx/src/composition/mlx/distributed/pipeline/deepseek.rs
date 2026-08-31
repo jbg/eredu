@@ -1246,6 +1246,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TARGET_EXECUTION_GROUP,
         model_kind,
     );
     info.global_embedded_mtp_layers = prediction_units.len();
@@ -1666,6 +1667,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
         wire_contract,
         range.clone(),
         placement,
+        eredu_architectures::decoder::TARGET_EXECUTION_GROUP,
         model_kind,
     );
     info.global_embedded_mtp_layers = prediction_units.len();

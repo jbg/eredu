@@ -797,6 +797,10 @@ mod tests {
             }
         }
 
+        fn primary_execution_group(&self) -> &str {
+            self.graph.groups()[self.graph.output()].id()
+        }
+
         fn state_partition_plan(
             &self,
             layout: &eredu_runtime::StateLayout,
@@ -984,6 +988,39 @@ mod tests {
             "text",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn stable_group_identity_disambiguates_repeated_semantic_kinds() {
+        let placed = PlacedExecutionDag::plan(
+            2,
+            vec![
+                request("context_decoder", &[], ExecutionGroupKind::Decoder, 1, &[0]),
+                request(
+                    "text_decoder",
+                    &["context_decoder"],
+                    ExecutionGroupKind::Decoder,
+                    2,
+                    &[1],
+                ),
+            ],
+            "text_decoder",
+        )
+        .unwrap();
+        let architecture = FixtureArchitecture::new(&placed);
+
+        assert_eq!(
+            super::super::architecture_group_by_id::<_, MlxHybridState>(
+                &architecture,
+                "context_decoder",
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            super::super::architecture_decoder_group::<_, MlxHybridState>(&architecture).unwrap(),
+            1
+        );
     }
 
     #[test]
