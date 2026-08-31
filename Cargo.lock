@@ -944,6 +944,7 @@ dependencies = [
 name = "eredu-codec"
 version = "0.1.0"
 dependencies = [
+ "eredu-checkpoint",
  "eredu-nn",
  "thiserror",
 ]

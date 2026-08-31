@@ -946,11 +946,11 @@ mod tests {
     use crate::backend::ExecutionContext;
     use eredu_checkpoint::store::MemoryWeightStore;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use eredu_checkpoint::AffineQuantization;
+    use eredu_checkpoint::{AffineQuantization, LinearFormat};
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_nn::{
-        LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterMetadata,
-        ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+        LinearFormatSpec, LinearSpec, NeuralBackend, ParameterMetadata, ParameterSpec,
+        ParameterVisitor, ParameterVisitorMut,
     };
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use safemlx::{Device, DeviceType};

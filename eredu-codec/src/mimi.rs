@@ -47,7 +47,8 @@ fn unloaded_linear<T: Tensor>(
             output,
             weight: parameter_spec("weight"),
             bias: bias.then(|| parameter_spec("bias")),
-            format: eredu_nn::LinearFormatSpec::unscaled(eredu_nn::LinearFormat::Dense).unwrap(),
+            format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
+                .unwrap(),
         },
         context,
     )

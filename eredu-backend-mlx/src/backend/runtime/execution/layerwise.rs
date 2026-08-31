@@ -575,7 +575,8 @@ mod packed_weight_companion_tests {
     use crate::backend::ExecutionContext;
     use eredu_checkpoint::store::MemoryWeightStore;
     use eredu_checkpoint::AffineQuantization;
-    use eredu_nn::{LinearFormat, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
+    use eredu_checkpoint::LinearFormat;
+    use eredu_nn::{LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
     use safemlx::{Device, DeviceType};
 
     fn parameter(name: &str) -> ParameterSpec {

@@ -10,7 +10,7 @@ extern crate self as eredu_nn;
 
 use std::fmt::Debug;
 
-pub use eredu_checkpoint::LinearFormat;
+use eredu_checkpoint::LinearFormat;
 
 pub use eredu_nn_macros::Parameterized;
 

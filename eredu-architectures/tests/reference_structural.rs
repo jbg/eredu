@@ -1613,7 +1613,8 @@ fn tied_vocabulary_parallel_projection_preserves_embedding_storage_and_global_lo
         vocabulary: 7,
         dimensions: 4,
         weight: eredu_nn::ParameterSpec::trainable("model.embed_tokens.weight").unwrap(),
-        format: eredu_nn::LinearFormatSpec::unscaled(eredu_nn::LinearFormat::Dense).unwrap(),
+        format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
+            .unwrap(),
     };
     let mut embedding = ReferenceBackend::vocabulary_parallel_embedding(
         spec,

@@ -526,8 +526,10 @@ Architecture implementations also provide any released-checkpoint rewrite
 recipes for their static modules, so alias and fused-layout handling does not
 reintroduce checkpoint roots into a backend.
 
-`eredu-nn::LinearFormatSpec` is the single neutral declaration of a matrix's
-physical encoding and exact scale and affine-bias companion parameters.
+`eredu-checkpoint::LinearFormat` is the single public description of a matrix's
+physical checkpoint encoding; `eredu-nn` does not re-export that checkpoint-owned
+type. `eredu-nn::LinearFormatSpec` combines the encoding with the exact scale and
+affine-bias companion parameters required by neural construction.
 Ordinary linear, embedding, router, and expert construction specifications use
 it directly, and architecture parallel plans return the same declaration for
 encoded parameters. Neutral runtime code derives packed shapes and remaps

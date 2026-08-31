@@ -11,5 +11,6 @@ rust-version.workspace = true
 description = "Backend-neutral neural audio codec architectures for Eredu"
 
 [dependencies]
+eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
 thiserror.workspace = true

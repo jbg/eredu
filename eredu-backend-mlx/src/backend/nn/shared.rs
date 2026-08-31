@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use eredu_checkpoint::LinearFormat;
 use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
@@ -15,15 +16,14 @@ use eredu_nn::{
     GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
     GatedProductPolicy, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
-    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearFormatSpec,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
-    RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
-    RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult,
-    RoutingScoring, SegmentedAttentionInput, SelectiveStateSpaceScanInput,
-    SelectiveStateSpaceScanOutput, Tensor, TensorParallelExpertOutput, TopKRouterSpec,
-    VocabularyParallelRange,
+    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormatSpec, LinearOperator,
+    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
+    NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SegmentedAttentionInput,
+    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    TensorParallelExpertOutput, TopKRouterSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use ref_cast::RefCast;
