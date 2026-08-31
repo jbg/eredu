@@ -20,9 +20,12 @@ adding that archive to an ephemeral local registry. After staging a library, it
 also checks a new lock-free downstream crate that depends on the staged package
 with default features disabled. This lets consumers and the next workspace crate
 resolve the exact unpublished version while retaining Cargo's normal package
-verification. Package builds use a temporary target directory that is removed
-after validation. Nothing contacts a registry publishing API and no credentials
-are required.
+verification. When `safemlx-internal-macros` is staged, the validator also
+compiles the published `safemlx` 0.1.3 release from a lock-free consumer. That
+guards its `safemlx-internal-macros = "0.1.1"` requirement against resolving to
+an incompatible patch candidate. Package builds use a temporary target directory
+that is removed after validation. Nothing contacts a registry publishing API and
+no credentials are required.
 
 This catches:
 
@@ -32,6 +35,8 @@ This catches:
   test compilation, or packaged doctests to fail;
 - dependency requirements that fail when a downstream consumer resolves the
   published crate without inheriting the workspace lockfile;
+- semver-incompatible macro candidates that break the published `safemlx` 0.1.3
+  dependency graph;
 - archives above crates.io's 10 MiB compressed-size limit; and
 - new publishable crates or dependency changes that are missing from the
   declared order.

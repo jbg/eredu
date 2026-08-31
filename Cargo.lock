@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "safemlx-internal-macros"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "itertools 0.15.0",
  "proc-macro2",

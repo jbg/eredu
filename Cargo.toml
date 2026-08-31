@@ -36,7 +36,7 @@ safemlx = { version = "0.2.0", path = "safemlx", default-features = false }
 eredu-gguf = { version = "0.1.0", path = "eredu-gguf" }
 safemlx-sys = { version = "0.2.0", path = "safemlx-sys", default-features = false }
 eredu-backend-mlx-macros = { version = "0.1.0", path = "eredu-backend-mlx-macros" }
-safemlx-internal-macros = { version = "0.1.2", path = "safemlx-internal-macros" }
+safemlx-internal-macros = { version = "0.2.0", path = "safemlx-internal-macros" }
 eredu = { version = "0.1.0", path = "eredu", default-features = false }
 eredu-core = { version = "0.1.0", path = "eredu-core" }
 eredu-text = { version = "0.1.0", path = "eredu-text", default-features = false }
