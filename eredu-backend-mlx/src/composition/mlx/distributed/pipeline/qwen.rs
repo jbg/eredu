@@ -1536,11 +1536,6 @@ pub(super) fn load_qwen_pipeline(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Qwen2, ModelKind::Qwen3], "Qwen")?;
-    if expert_cache_options.is_some() && !source_args.is_moe() {
-        return Err(Error::Parallel(
-            "pipeline independent expert caching requires a Qwen3-MoE checkpoint".into(),
-        ));
-    }
     let binding_adapter = if expert_cache_options.is_some() {
         crate::composition::qwen::QwenPipelineBindings::new_external_experts()
     } else {

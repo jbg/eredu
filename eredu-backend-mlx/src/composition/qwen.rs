@@ -1148,9 +1148,17 @@ fn attach_qwen_expert_cache(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
-    if !model.args.is_moe() {
+    let topology = eredu_core::ParallelTopology::new(1, 1, 1, 1)
+        .and_then(|topology| eredu_core::ParallelRankTopology::new(topology, 0))
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let expert_realization = eredu_architectures::qwen::expert_realization_plan(
+        model.execution.architecture(),
+        topology,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if expert_realization.is_none() {
         return Err(Error::ArchitectureModel(
-            "independent expert caching requires Qwen3-MoE arguments".into(),
+            "independent expert caching requires an architecture expert realization".into(),
         ));
     }
     let store = model.checkpoint_store_arc();

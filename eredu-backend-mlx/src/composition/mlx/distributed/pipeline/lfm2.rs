@@ -445,10 +445,11 @@ pub(super) fn load_lfm2_pipeline(
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
-        if stage.range().any(|layer| {
-            source_args.layer_schedule.get(layer).is_some_and(|policy| {
-                policy.feed_forward == eredu_architectures::lfm2::FeedForwardPolicy::SparseMoe
-            })
+        if expert_realization.as_ref().is_some_and(|realization| {
+            realization
+                .unit_specs()
+                .keys()
+                .any(|(group, unit)| stage.partition.owns_unit(group.as_str(), *unit))
         }) {
             info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         }

@@ -555,7 +555,10 @@ lowers the declared owner map into its native dispatch representation without
 running another assignment policy. The plan's presence or absence is also the
 only authority for whether the realized architecture has routed execution
 units; composition must not inspect a family schedule or configuration count
-to decide expert availability. Backend composition must not pass family fields
+to decide expert availability. Pipeline stage telemetry exposes local expert
+identities only when the plan enumerates a routed unit owned by that stage, and
+expert-cache admission likewise follows plan presence rather than a family
+variant predicate. Backend composition must not pass family fields
 or a separately derived tensor-parallel width into expert-bank construction;
 the bank specification retained by this same plan is the only construction
 input.
