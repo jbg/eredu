@@ -539,34 +539,35 @@ impl FixtureFamily {
         }
     }
 
-    fn descriptor_names(self) -> (&'static str, &'static str) {
+    fn effective_model_type(self) -> &'static str {
         match self {
-            Self::Llama => ("llama", "llama"),
-            Self::Mistral => ("llama", "mistral"),
-            Self::DeepSeek | Self::DeepSeekGguf => ("deepseek_v3", "deepseek_v3"),
-            Self::DeepSeekV4 => ("deepseek_v4", "deepseek_v4"),
-            Self::Gemma => ("gemma4", "gemma4"),
-            Self::MuseGlimmer => ("muse_glimmer", "muse_glimmer_text"),
-            Self::Qwen2 => ("qwen", "qwen2"),
-            Self::Qwen3 => ("qwen", "qwen3"),
-            Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("qwen", "qwen3_moe"),
-            Self::GptOss | Self::GptOssGguf => ("gpt_oss", "gpt_oss"),
-            Self::Lfm2 => ("lfm2", "lfm2"),
-            Self::Lfm2Moe | Self::Lfm2MoeGguf => ("lfm2", "lfm2_moe"),
-            Self::KimiLinear | Self::KimiLinearGguf => ("kimi_linear", "kimi_linear"),
-            Self::NemotronH | Self::NemotronHGguf => ("nemotron_h", "nemotron_h"),
-            Self::Qwen3Next => ("qwen_hybrid", "qwen3_next"),
-            Self::Qwen3NextMoe => ("qwen_hybrid", "qwen3_next"),
-            Self::Qwen35 => ("qwen_hybrid", "qwen3_5_text"),
-            Self::Qwen35Moe => ("qwen_hybrid", "qwen3_5_moe_text"),
-            Self::Qwen35Multimodal => ("qwen_hybrid", "qwen3_5_text"),
-            Self::Qwen35MoeMultimodal => ("qwen_hybrid", "qwen3_5_moe_text"),
-            Self::Qwen3Vl => ("qwen3_vl", "qwen3_vl"),
-            Self::Qwen3VlMoe => ("qwen3_vl", "qwen3_vl_moe"),
-            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => {
-                ("inkling", "inkling_mm_model")
-            }
+            Self::Llama => "llama",
+            Self::Mistral => "mistral",
+            Self::DeepSeek | Self::DeepSeekGguf => "deepseek_v3",
+            Self::DeepSeekV4 => "deepseek_v4",
+            Self::Gemma => "gemma4",
+            Self::MuseGlimmer => "muse_glimmer_text",
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => "qwen3_moe",
+            Self::GptOss | Self::GptOssGguf => "gpt_oss",
+            Self::Lfm2 => "lfm2",
+            Self::Lfm2Moe | Self::Lfm2MoeGguf => "lfm2_moe",
+            Self::KimiLinear | Self::KimiLinearGguf => "kimi_linear",
+            Self::NemotronH | Self::NemotronHGguf => "nemotron_h",
+            Self::Qwen3Next | Self::Qwen3NextMoe => "qwen3_next",
+            Self::Qwen35 | Self::Qwen35Multimodal => "qwen3_5_text",
+            Self::Qwen35Moe | Self::Qwen35MoeMultimodal => "qwen3_5_moe_text",
+            Self::Qwen3Vl => "qwen3_vl",
+            Self::Qwen3VlMoe => "qwen3_vl_moe",
+            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "inkling_mm_model",
         }
+    }
+
+    fn model_family(self) -> &'static str {
+        ModelKind::resolve_model_type(self.effective_model_type())
+            .expect("fixture effective model type must be registered")
+            .canonical_name()
     }
 
     const fn layer_prefix(self) -> &'static str {
@@ -744,10 +745,10 @@ fn pipeline_ring_worker() {
                     .unwrap();
             match config["model_type"].as_str().unwrap() {
                 "gemma4_unified" => "gemma4_unified",
-                _ => family.descriptor_names().1,
+                _ => family.effective_model_type(),
             }
         } else {
-            family.descriptor_names().1
+            family.effective_model_type()
         };
         let expected_model_family =
             ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
@@ -1002,7 +1003,7 @@ fn pipeline_ring_worker() {
             } else {
                 outer_model_type
             };
-        let model_family = family.descriptor_names().0;
+        let model_family = family.model_family();
         let layer_layout = session.prompt_cache_layer_layout().unwrap();
         let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
         let state_segments = session.prompt_cache_state_segments().unwrap();
@@ -1197,7 +1198,7 @@ fn pipeline_ring_worker() {
     } else {
         load_prepared_pipeline_model(&checkpoint, base_options(), &stream)
     };
-    let expected_effective_model_type = family.descriptor_names().1;
+    let expected_effective_model_type = family.effective_model_type();
     assert_eq!(
         model.model_family(),
         ModelKind::resolve_model_type(expected_effective_model_type).unwrap()
@@ -1478,7 +1479,8 @@ fn pipeline_ring_worker() {
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
-    let (model_family, effective_model_type) = family.descriptor_names();
+    let model_family = family.model_family();
+    let effective_model_type = family.effective_model_type();
     let identity = model.prompt_cache_model_identity().unwrap();
     assert_eq!(
         identity.topology,
