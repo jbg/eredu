@@ -9,8 +9,9 @@ use eredu_nn::{NeuralBackend, Parameterized};
 
 use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
-    ExecutionUnitLayout, ExpertPass, NoAuxiliaryBoundary, ObservedExpertProvider,
-    RoutedExpertProvider, RoutedObservationPoint, RuntimeState, StateLayout, SubmissionBackend,
+    ExecutionScheduleError, ExecutionUnitLayout, ExpertPass, NoAuxiliaryBoundary,
+    ObservedExpertProvider, RoutedExpertProvider, RoutedObservationPoint, RuntimeState,
+    StateLayout, SubmissionBackend,
 };
 
 /// Statically dispatched visitor over one immutable pinned parameter module.
@@ -107,6 +108,142 @@ pub enum ArchitectureGroupKind {
     Merger,
     /// Final multimodal assembly.
     ModalityFinalization,
+}
+
+/// Backend-neutral lifecycle for the pipeline ingress phase of a layered graph.
+///
+/// Architectures declare semantic group kinds and concrete backends report only
+/// whether request-optional encoder roots have work. The runtime derives all
+/// downstream activity, admits dependency-ready compatible batches, and owns
+/// completion transitions. Pipeline backends therefore share the same graph
+/// lifecycle instead of reconstructing it around native streams and routes.
+#[derive(Debug)]
+pub struct LayeredPipelineSchedule<'a> {
+    graph: &'a ExecutionGraph,
+    schedule: ExecutionGroupSchedule<'a>,
+    active: Vec<bool>,
+    completed: usize,
+}
+
+impl<'a> LayeredPipelineSchedule<'a> {
+    /// Creates the pipeline ingress lifecycle from canonical architecture kinds.
+    ///
+    /// `request_group_active` is called only for request-optional encoder roots.
+    /// Structural merge activity is derived from dependency activity, decoder
+    /// ingress and finalization always run, and prediction is a later phase.
+    pub fn try_new<E>(
+        graph: &'a ExecutionGraph,
+        group_kinds: impl IntoIterator<Item = ArchitectureGroupKind>,
+        mut request_group_active: impl FnMut(usize) -> Result<bool, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<LayeredPipelineScheduleError>,
+    {
+        let group_kinds = group_kinds.into_iter().collect::<Vec<_>>();
+        if group_kinds.len() != graph.groups().len() {
+            return Err(LayeredPipelineScheduleError::GroupKindCount {
+                graph: graph.groups().len(),
+                declared: group_kinds.len(),
+            }
+            .into());
+        }
+        let mut active = vec![false; group_kinds.len()];
+        for &group in graph.execution_order() {
+            active[group] = match group_kinds[group] {
+                ArchitectureGroupKind::VisionEncoder | ArchitectureGroupKind::AudioEncoder => {
+                    request_group_active(group)?
+                }
+                ArchitectureGroupKind::Projector | ArchitectureGroupKind::Merger => graph
+                    .dependencies(group)
+                    .expect("validated execution order contains a known group")
+                    .iter()
+                    .any(|&dependency| active[dependency]),
+                ArchitectureGroupKind::ModalityFinalization | ArchitectureGroupKind::Decoder => {
+                    true
+                }
+                ArchitectureGroupKind::Prediction => false,
+            };
+        }
+        Ok(Self {
+            graph,
+            schedule: ExecutionGroupSchedule::new(graph),
+            active,
+            completed: 0,
+        })
+    }
+
+    /// Returns whether a group participates in this pipeline ingress pass.
+    pub fn is_active(&self, group: usize) -> Option<bool> {
+        self.active.get(group).copied()
+    }
+
+    /// Returns all group activity in canonical architecture order.
+    pub fn activity(&self) -> &[bool] {
+        &self.active
+    }
+
+    /// Returns dependency-ready groups in stable architecture order.
+    pub fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
+        self.schedule.startable_groups()
+    }
+
+    /// Selects a deterministic maximal compatible subset of ready groups.
+    pub fn compatible_batch(&self, mut compatible: impl FnMut(usize, usize) -> bool) -> Vec<usize> {
+        let mut selected = Vec::new();
+        for candidate in self.ready_groups() {
+            if selected
+                .iter()
+                .copied()
+                .all(|group| compatible(group, candidate))
+            {
+                selected.push(candidate);
+            }
+        }
+        selected
+    }
+
+    /// Returns dependency slots in architecture declaration order.
+    pub fn dependencies(&self, group: usize) -> Option<&[usize]> {
+        self.graph.dependencies(group)
+    }
+
+    /// Commits architecture setup for a dependency-ready group.
+    ///
+    /// The returned producer slots no longer need to retain their outputs for
+    /// another consumer after this group has captured its dependencies.
+    pub fn started(&mut self, group: usize) -> Result<Vec<usize>, LayeredPipelineScheduleError> {
+        self.schedule.started(group).map_err(Into::into)
+    }
+
+    /// Commits one successfully submitted group and unlocks its dependents.
+    pub fn ordered(&mut self, group: usize) -> Result<(), LayeredPipelineScheduleError> {
+        self.schedule.ordered(group)?;
+        self.completed += 1;
+        Ok(())
+    }
+
+    /// Returns whether every architecture group has completed this phase.
+    pub fn is_complete(&self) -> bool {
+        self.completed == self.active.len()
+    }
+}
+
+/// Invalid backend-neutral pipeline lifecycle declaration or transition.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum LayeredPipelineScheduleError {
+    /// The physical realization did not preserve one kind per canonical group.
+    #[error(
+        "execution graph contains {graph} groups but the pipeline declared {declared} group kinds"
+    )]
+    GroupKindCount {
+        /// Number of canonical graph groups.
+        graph: usize,
+        /// Number of supplied semantic kinds.
+        declared: usize,
+    },
+    /// An ordinary execution-group lifecycle invariant failed.
+    #[error(transparent)]
+    Transition(#[from] ExecutionScheduleError),
 }
 
 /// Pipeline ownership policy for one architecture execution group.
@@ -2408,4 +2545,94 @@ pub enum ResidentUnitWindowError {
         /// Conflicting index.
         index: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArchitectureGroupKind, LayeredPipelineSchedule, LayeredPipelineScheduleError};
+    use crate::{ExecutionGraph, ExecutionGroupSpec, ExecutionScheduleError};
+
+    fn pipeline_graph() -> ExecutionGraph {
+        ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::root("audio"),
+                ExecutionGroupSpec::with_dependencies("projector", ["vision"]),
+                ExecutionGroupSpec::with_dependencies("merge", ["projector", "audio"]),
+                ExecutionGroupSpec::with_dependencies("decoder", ["merge"]),
+                ExecutionGroupSpec::with_dependencies("prediction", ["decoder"]),
+            ],
+            "prediction",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pipeline_schedule_owns_activity_propagation_and_ready_batches() {
+        let graph = pipeline_graph();
+        let kinds = [
+            ArchitectureGroupKind::VisionEncoder,
+            ArchitectureGroupKind::AudioEncoder,
+            ArchitectureGroupKind::Projector,
+            ArchitectureGroupKind::Merger,
+            ArchitectureGroupKind::Decoder,
+            ArchitectureGroupKind::Prediction,
+        ];
+        let mut queried = Vec::new();
+        let mut schedule = LayeredPipelineSchedule::try_new(&graph, kinds, |group| {
+            queried.push(group);
+            Ok::<_, LayeredPipelineScheduleError>(group == 0)
+        })
+        .unwrap();
+
+        assert_eq!(queried, [0, 1]);
+        assert_eq!(schedule.activity(), [true, false, true, true, true, false]);
+        assert_eq!(schedule.compatible_batch(|_, _| true), [0, 1]);
+        schedule.started(0).unwrap();
+        schedule.started(1).unwrap();
+        schedule.ordered(0).unwrap();
+        schedule.ordered(1).unwrap();
+        assert_eq!(schedule.ready_groups().collect::<Vec<_>>(), [2]);
+        for group in [2, 3, 4, 5] {
+            schedule.started(group).unwrap();
+            schedule.ordered(group).unwrap();
+        }
+        assert!(schedule.is_complete());
+    }
+
+    #[test]
+    fn pipeline_schedule_rejects_kind_and_transition_drift() {
+        let graph = pipeline_graph();
+        let error =
+            LayeredPipelineSchedule::try_new(&graph, [ArchitectureGroupKind::Decoder], |_| {
+                Ok::<_, LayeredPipelineScheduleError>(true)
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            LayeredPipelineScheduleError::GroupKindCount {
+                graph: 6,
+                declared: 1,
+            }
+        );
+
+        let kinds = [
+            ArchitectureGroupKind::VisionEncoder,
+            ArchitectureGroupKind::AudioEncoder,
+            ArchitectureGroupKind::Projector,
+            ArchitectureGroupKind::Merger,
+            ArchitectureGroupKind::Decoder,
+            ArchitectureGroupKind::Prediction,
+        ];
+        let mut schedule = LayeredPipelineSchedule::try_new(&graph, kinds, |_| {
+            Ok::<_, LayeredPipelineScheduleError>(true)
+        })
+        .unwrap();
+        assert_eq!(
+            schedule.started(2),
+            Err(LayeredPipelineScheduleError::Transition(
+                ExecutionScheduleError::DependenciesPending { group: 2 }
+            ))
+        );
+    }
 }

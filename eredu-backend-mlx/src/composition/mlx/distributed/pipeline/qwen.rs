@@ -53,12 +53,13 @@ use crate::{
         media_architecture_transport, partition_owns_architecture_units, pipeline_binding_units,
         prediction_architecture_transport, quantize_pipeline_stage_store,
         validate_admitted_pipeline_kind, validate_pipeline_expert_dispatch, BoundPipelineBindings,
-        DecoderPipelineBuilder, PipelineAuxiliaryState, PipelineEmbeddedMtp, PipelineExpertStorage,
-        PipelineForward, PipelineLayerCache, PipelineLayerController, PipelineLayerLoadOptions,
-        PipelineLayerStorage, PipelineLoadAccumulator, PipelineModel, PipelineMtpCache,
-        PipelinePartitionMetadata, PipelinePayload, PipelinePlacedIngress, PipelineRangeState,
-        PipelineStageInput, PipelineStageOutput, PipelineStep, QwenConditionalPipelinePartition,
-        QwenHybridPipelinePartition, QwenPipelinePartition, QwenVlPipelinePartition,
+        DecoderPipelineBuilder, MlxPlacedGroupExecutor, PipelineAuxiliaryState,
+        PipelineEmbeddedMtp, PipelineExpertStorage, PipelineForward, PipelineLayerCache,
+        PipelineLayerController, PipelineLayerLoadOptions, PipelineLayerStorage,
+        PipelineLoadAccumulator, PipelineModel, PipelineMtpCache, PipelinePartitionMetadata,
+        PipelinePayload, PipelineRangeState, PipelineStageInput, PipelineStageOutput, PipelineStep,
+        QwenConditionalPipelinePartition, QwenHybridPipelinePartition, QwenPipelinePartition,
+        QwenVlPipelinePartition,
     },
     composition::{
         mlx::speculative::embedded::EmbeddedMtpOutput,
@@ -606,7 +607,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
     }
 }
 
-impl PipelinePlacedIngress for QwenVlPipelinePartition {
+impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -1215,7 +1216,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
     }
 }
 
-impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
+impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,

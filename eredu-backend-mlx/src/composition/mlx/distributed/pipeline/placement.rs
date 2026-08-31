@@ -12,28 +12,9 @@ use std::{
 
 use crate::backend::error::Error;
 use eredu_runtime::{
-    ArchitecturePartition, ArchitecturePartitionError, ExecutionGraph, ExecutionGroupSpec,
-    ExecutionUnitLayout, PartitionOwnership,
+    ArchitectureGroupKind as ExecutionGroupKind, ArchitecturePartition, ArchitecturePartitionError,
+    ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, PartitionOwnership,
 };
-
-/// Semantic role of one placed execution group.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ExecutionGroupKind {
-    /// Ordered text decoder blocks.
-    Decoder,
-    /// Output-owner embedded prediction blocks.
-    Prediction,
-    /// Ordered visual encoder blocks.
-    VisionEncoder,
-    /// Ordered audio encoder blocks.
-    AudioEncoder,
-    /// Learned modality projection.
-    Projector,
-    /// Learned or structural modality merge.
-    Merger,
-    /// Assembly of modality and text payloads.
-    ModalityFinalization,
-}
 
 /// Active Cartesian subgroups for a placed group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -374,10 +355,6 @@ impl PlacedExecutionDag {
     /// Returns topology-planned routes.
     pub fn routes(&self) -> &[PlacementRoute] {
         &self.routes
-    }
-    /// Returns stable topological group order.
-    pub fn execution_order(&self) -> &[usize] {
-        self.semantic.execution_order()
     }
     /// Returns the shared semantic DAG used by the ready-set scheduler.
     pub const fn semantic(&self) -> &ExecutionGraph {

@@ -46,10 +46,11 @@ use crate::{
         load_architecture_static_parameters, media_architecture_transport, pipeline_binding_units,
         preflight_pipeline_realization, quantize_pipeline_stage_store,
         validate_admitted_pipeline_kind, validate_pipeline_expert_dispatch, BoundPipelineBindings,
-        Gemma4IngressState, Gemma4PipelinePartition, PipelineAuxiliaryState, PipelineExpertStorage,
-        PipelineForward, PipelineLayerCache, PipelineLayerLoadOptions, PipelineLayerStorage,
-        PipelineLoadAccumulator, PipelineModel, PipelinePartitionMetadata, PipelinePayload,
-        PipelinePlacedIngress, PipelineStageInput, PipelineStageOutput, PipelineStep,
+        Gemma4IngressState, Gemma4PipelinePartition, MlxPlacedGroupExecutor,
+        PipelineAuxiliaryState, PipelineExpertStorage, PipelineForward, PipelineLayerCache,
+        PipelineLayerLoadOptions, PipelineLayerStorage, PipelineLoadAccumulator, PipelineModel,
+        PipelinePartitionMetadata, PipelinePayload, PipelineStageInput, PipelineStageOutput,
+        PipelineStep,
     },
 };
 
@@ -487,7 +488,7 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
     }
 }
 
-impl PipelinePlacedIngress for Gemma4PipelinePartition {
+impl MlxPlacedGroupExecutor for Gemma4PipelinePartition {
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,

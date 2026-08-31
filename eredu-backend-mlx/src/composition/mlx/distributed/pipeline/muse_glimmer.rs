@@ -45,11 +45,11 @@ use crate::{
         media_architecture_transport, pipeline_binding_units, preflight_pipeline_realization,
         quantize_pipeline_stage_store, validate_admitted_pipeline_kind,
         validate_pipeline_expert_dispatch, validate_pipeline_key_value_cache_layout,
-        BoundPipelineBindings, MuseGlimmerPipelinePartition, PipelineAuxiliaryState,
-        PipelineExpertStorage, PipelineForward, PipelineLayerCache, PipelineLayerController,
-        PipelineLayerLoadOptions, PipelineLayerStorage, PipelineLoadAccumulator, PipelineModel,
-        PipelinePartitionMetadata, PipelinePayload, PipelinePlacedIngress, PipelineStageInput,
-        PipelineStageOutput, PipelineStep,
+        BoundPipelineBindings, MlxPlacedGroupExecutor, MuseGlimmerPipelinePartition,
+        PipelineAuxiliaryState, PipelineExpertStorage, PipelineForward, PipelineLayerCache,
+        PipelineLayerController, PipelineLayerLoadOptions, PipelineLayerStorage,
+        PipelineLoadAccumulator, PipelineModel, PipelinePartitionMetadata, PipelinePayload,
+        PipelineStageInput, PipelineStageOutput, PipelineStep,
     },
     composition::muse_glimmer::{MuseGlimmerPipelineBindings, MuseGlimmerPlacedState},
 };
@@ -91,7 +91,7 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
     }
 }
 
-impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
+impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,

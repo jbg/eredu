@@ -26,8 +26,9 @@ use ref_cast::RefCast;
 
 mod placement;
 
+pub use eredu_runtime::ArchitectureGroupKind as ExecutionGroupKind;
 pub use placement::{
-    ActiveParallelSubgroup, ExecutionGroupKind, ExecutionGroupPlacementRequest, PlacedExecutionDag,
+    ActiveParallelSubgroup, ExecutionGroupPlacementRequest, PlacedExecutionDag,
     PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacementRoute, ResidencyBinding,
 };
 
@@ -115,7 +116,6 @@ use eredu_core::{
     SpeculativeCapability, SpeculativeDraftSource,
 };
 use eredu_runtime::DenseDiskStreamReport;
-use eredu_runtime::ExecutionGroupReadySet;
 use eredu_runtime::ResidentLayerGroup;
 use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
@@ -2356,7 +2356,13 @@ trait PipelinePartitionMetadata {
     }
 }
 
-trait PipelinePlacedIngress {
+/// MLX realization of local operations selected by the neutral pipeline lifecycle.
+///
+/// Implementations adapt architecture-owned forward state to native arrays and
+/// execute only the local units selected by [`eredu_runtime::LayeredPipelineSchedule`].
+/// Activity propagation, dependency readiness, and completion ordering do not
+/// belong to this adapter.
+trait MlxPlacedGroupExecutor {
     fn begin_placed_ingress(
         &mut self,
         _input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -2568,8 +2574,8 @@ use qwen::{
 trait PipelineArchitecture:
     PipelinePartitionMetadata + PipelineForward + RealizedPipelinePartition
 {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress>;
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress>;
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor>;
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor>;
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp>;
     fn embedded_mtp_mut(&mut self) -> Option<&mut dyn PipelineEmbeddedMtp>;
 }
@@ -2760,10 +2766,10 @@ impl dyn PipelineArchitecture {
 }
 
 impl PipelineArchitecture for LlamaPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2775,10 +2781,10 @@ impl PipelineArchitecture for LlamaPipelinePartition {
 }
 
 impl PipelineArchitecture for DeepSeekV3PipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2790,10 +2796,10 @@ impl PipelineArchitecture for DeepSeekV3PipelinePartition {
 }
 
 impl PipelineArchitecture for DeepSeekV4PipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2805,10 +2811,10 @@ impl PipelineArchitecture for DeepSeekV4PipelinePartition {
 }
 
 impl PipelineArchitecture for Gemma4PipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2820,10 +2826,10 @@ impl PipelineArchitecture for Gemma4PipelinePartition {
 }
 
 impl PipelineArchitecture for QwenPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2835,10 +2841,10 @@ impl PipelineArchitecture for QwenPipelinePartition {
 }
 
 impl PipelineArchitecture for MuseGlimmerPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2850,10 +2856,10 @@ impl PipelineArchitecture for MuseGlimmerPipelinePartition {
 }
 
 impl PipelineArchitecture for InklingPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2865,10 +2871,10 @@ impl PipelineArchitecture for InklingPipelinePartition {
 }
 
 impl PipelineArchitecture for QwenVlPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2880,10 +2886,10 @@ impl PipelineArchitecture for QwenVlPipelinePartition {
 }
 
 impl PipelineArchitecture for QwenConditionalPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         Some(self)
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2895,10 +2901,10 @@ impl PipelineArchitecture for QwenConditionalPipelinePartition {
 }
 
 impl PipelineArchitecture for GptOssPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2910,10 +2916,10 @@ impl PipelineArchitecture for GptOssPipelinePartition {
 }
 
 impl PipelineArchitecture for Lfm2PipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2925,10 +2931,10 @@ impl PipelineArchitecture for Lfm2PipelinePartition {
 }
 
 impl PipelineArchitecture for NemotronHPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2940,10 +2946,10 @@ impl PipelineArchitecture for NemotronHPipelinePartition {
 }
 
 impl PipelineArchitecture for KimiLinearPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -2955,10 +2961,10 @@ impl PipelineArchitecture for KimiLinearPipelinePartition {
 }
 
 impl PipelineArchitecture for QwenHybridPipelinePartition {
-    fn placed_ingress(&self) -> Option<&dyn PipelinePlacedIngress> {
+    fn placed_ingress(&self) -> Option<&dyn MlxPlacedGroupExecutor> {
         None
     }
-    fn placed_ingress_mut(&mut self) -> Option<&mut dyn PipelinePlacedIngress> {
+    fn placed_ingress_mut(&mut self) -> Option<&mut dyn MlxPlacedGroupExecutor> {
         None
     }
     fn embedded_mtp(&self) -> Option<&dyn PipelineEmbeddedMtp> {
@@ -5938,22 +5944,15 @@ impl PipelineModel {
             self.stage
                 .begin_placed_ingress_continuation(input, tensor, stream)?;
         }
-        let mut active = vec![false; placement.groups().len()];
-        for &index in placement.execution_order() {
-            let placed = &placement.groups()[index];
-            active[index] = match placed.kind {
-                ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder => {
-                    self.stage.placed_ingress_active(&placed.id)?
-                }
-                ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => placement
-                    .dependency_indices(index)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|dependency| active[*dependency]),
-                ExecutionGroupKind::ModalityFinalization | ExecutionGroupKind::Decoder => true,
-                ExecutionGroupKind::Prediction => false,
-            };
-        }
+        let mut lifecycle = eredu_runtime::LayeredPipelineSchedule::try_new(
+            placement.semantic(),
+            placement.groups().iter().map(|placed| placed.kind),
+            |index| {
+                let placed = &placement.groups()[index];
+                self.stage.placed_ingress_active(&placed.id)
+            },
+        )?;
+        let active = lifecycle.activity().to_vec();
 
         let policy = PlacedGroupConcurrencyPolicy {
             rank_local_streams: true,
@@ -5967,15 +5966,13 @@ impl PipelineModel {
             .iter()
             .map(|_| Stream::new_with_device(&device))
             .collect::<Vec<_>>();
-        let mut ready = ExecutionGroupReadySet::new(placement.semantic());
         let mut payloads = PlacedPayloadStore::default();
         let mut working = BTreeMap::<usize, Vec<Array>>::new();
         let mut decoder_payload = None;
-        let mut completed = 0usize;
         let mut schedule = PlacedIngressScheduleReport::default();
 
-        while completed < placement.groups().len() {
-            let ready_slots = ready.ready_groups().collect::<Vec<_>>();
+        while !lifecycle.is_complete() {
+            let ready_slots = lifecycle.ready_groups().collect::<Vec<_>>();
             for (position, &left) in ready_slots.iter().enumerate() {
                 for &right in &ready_slots[position + 1..] {
                     if let Err(reason) = placement.concurrency_compatibility(left, right, policy) {
@@ -5990,7 +5987,7 @@ impl PipelineModel {
                     }
                 }
             }
-            let batch = ready.compatible_batch(|left, right| {
+            let batch = lifecycle.compatible_batch(|left, right| {
                 placement
                     .concurrency_compatibility(left, right, policy)
                     .is_ok()
@@ -6011,10 +6008,9 @@ impl PipelineModel {
 
             for &index in &batch {
                 let placed = &placement.groups()[index];
-                if placed.dependencies.is_empty() {
-                    continue;
-                }
-                if placed.first_owner() == Some(self.info.pipeline_stage) {
+                if !placed.dependencies.is_empty()
+                    && placed.first_owner() == Some(self.info.pipeline_stage)
+                {
                     let dependencies = payloads.ordered_dependencies(&placement, index, &active)?;
                     let arrays = dependencies
                         .into_iter()
@@ -6022,6 +6018,7 @@ impl PipelineModel {
                         .collect::<Vec<_>>();
                     working.insert(index, arrays);
                 }
+                lifecycle.started(index)?;
             }
 
             let waves = batch
@@ -6280,8 +6277,7 @@ impl PipelineModel {
                     }
                 }
                 working.remove(&index);
-                ready.ordered(index);
-                completed += 1;
+                lifecycle.ordered(index)?;
             }
         }
         payloads.ensure_empty()?;
@@ -7237,19 +7233,7 @@ where
             eredu_runtime::ArchitectureGroupPlacement::Pipeline => (0..pipeline_stages).collect(),
             eredu_runtime::ArchitectureGroupPlacement::OutputOwner => vec![pipeline_stages - 1],
         };
-        let kind = match transport.kind {
-            eredu_runtime::ArchitectureGroupKind::Decoder => ExecutionGroupKind::Decoder,
-            eredu_runtime::ArchitectureGroupKind::Prediction => ExecutionGroupKind::Prediction,
-            eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
-                ExecutionGroupKind::VisionEncoder
-            }
-            eredu_runtime::ArchitectureGroupKind::AudioEncoder => ExecutionGroupKind::AudioEncoder,
-            eredu_runtime::ArchitectureGroupKind::Projector => ExecutionGroupKind::Projector,
-            eredu_runtime::ArchitectureGroupKind::Merger => ExecutionGroupKind::Merger,
-            eredu_runtime::ArchitectureGroupKind::ModalityFinalization => {
-                ExecutionGroupKind::ModalityFinalization
-            }
-        };
+        let kind = transport.kind;
         let active_subgroup = match transport.parallel_subgroup {
             Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded) => {
                 ActiveParallelSubgroup::tensor_sharded()

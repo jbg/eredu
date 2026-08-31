@@ -104,11 +104,12 @@ pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParallelSubgroup, ArchitectureParameters,
     CompositeLayeredTraversalHook, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
-    LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture,
-    ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture,
-    StaticParameterVisitor, StaticParameterVisitorMut,
+    LayeredPartitionOutput, LayeredPipelineSchedule, LayeredPipelineScheduleError,
+    LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction, LayerwiseAcquireError,
+    LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, ResidentRuntime,
+    ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture, StaticParameterVisitor,
+    StaticParameterVisitorMut,
 };
 pub use parallel::{
     aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,

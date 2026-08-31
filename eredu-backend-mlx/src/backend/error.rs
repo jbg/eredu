@@ -67,6 +67,10 @@ pub enum Error {
     #[error(transparent)]
     ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
 
+    /// Invalid backend-neutral pipeline execution-group lifecycle.
+    #[error(transparent)]
+    LayeredPipelineSchedule(#[from] eredu_runtime::LayeredPipelineScheduleError),
+
     /// Backend-neutral neural operator or parameter-topology failure.
     #[error(transparent)]
     Neural(#[from] eredu_nn::Error),

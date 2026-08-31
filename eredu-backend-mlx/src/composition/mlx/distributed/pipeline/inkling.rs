@@ -46,11 +46,11 @@ use crate::{
         materialize_pipeline_cache_layers, media_architecture_transport, pipeline_binding_units,
         preflight_pipeline_realization, quantize_pipeline_stage_store,
         validate_admitted_pipeline_kind, validate_pipeline_expert_dispatch, BoundPipelineBindings,
-        InklingIngressState, InklingPipelinePartition, PipelineAuxiliaryState, PipelineEmbeddedMtp,
-        PipelineExpertStorage, PipelineForward, PipelineLayerCache, PipelineLayerLoadOptions,
-        PipelineLayerStorage, PipelineLoadAccumulator, PipelineModel, PipelineMtpCache,
-        PipelinePartitionMetadata, PipelinePayload, PipelinePlacedIngress, PipelineStageInput,
-        PipelineStageOutput, PipelineStep,
+        InklingIngressState, InklingPipelinePartition, MlxPlacedGroupExecutor,
+        PipelineAuxiliaryState, PipelineEmbeddedMtp, PipelineExpertStorage, PipelineForward,
+        PipelineLayerCache, PipelineLayerLoadOptions, PipelineLayerStorage,
+        PipelineLoadAccumulator, PipelineModel, PipelineMtpCache, PipelinePartitionMetadata,
+        PipelinePayload, PipelineStageInput, PipelineStageOutput, PipelineStep,
     },
     composition::{
         inkling::{InklingBindings, InklingPipelineUnit, PreparedInklingInput},
@@ -341,7 +341,7 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
     }
 }
 
-impl PipelinePlacedIngress for InklingPipelinePartition {
+impl MlxPlacedGroupExecutor for InklingPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,

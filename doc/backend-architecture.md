@@ -1201,6 +1201,14 @@ Primary decoder and embedded
 prediction groups have distinct semantic kinds, so multimodal ingress ends at
 the decoder boundary and prediction runs only in its explicit phase.
 
+Pipeline ingress uses the same canonical execution graph through
+`LayeredPipelineSchedule`. The neutral runtime derives request activity from
+architecture-authored group kinds, propagates it through merge dependencies,
+admits compatible ready batches, and owns group completion transitions.
+Concrete backends report only whether optional encoder roots have request work
+and realize streams, residency, payload transport, and collectives; they do not
+maintain a second group-kind model or reinterpret the graph lifecycle.
+
 The partition also carries an architecture-owned boundary schema. That schema
 declares the primary evolving activation and every auxiliary tensor, including
 their stable roles, canonical order, symbolic shapes, logical dtypes, and
