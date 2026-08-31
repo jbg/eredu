@@ -3,7 +3,6 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    ops::{Deref, DerefMut},
     rc::Rc,
     sync::Arc,
 };
@@ -52,7 +51,7 @@ use crate::backend::{
 };
 use crate::MlxTensor;
 use crate::{
-    module::{Module, ModuleParam, ModuleParamMut, ModuleParamRef, ModuleParameters},
+    module::{Module, ModuleParamMut, ModuleParamRef, PhysicalParameters},
     nested::NestedValue,
     nn,
     quantization::MaybeQuantized,
@@ -118,7 +117,7 @@ impl BlockwiseAttentionBackend for MlxNeuralBackend {
 }
 
 fn parameter_topology(
-    module: &impl ModuleParameters,
+    module: &impl PhysicalParameters,
     weight: ParameterSpec,
     bias: Option<ParameterSpec>,
     format: &LinearFormatSpec,
@@ -169,7 +168,7 @@ fn parameter_topology(
 }
 
 fn exact_parameter_topology(
-    module: &impl ModuleParameters,
+    module: &impl PhysicalParameters,
     specs: impl IntoIterator<Item = (&'static str, ParameterSpec)>,
 ) -> Result<BTreeMap<String, ParameterSpec>, ComputeError> {
     let expected = specs
@@ -196,7 +195,7 @@ fn visit_module_parameters<'a, M, V>(
     topology: &BTreeMap<String, ParameterSpec>,
     visitor: &mut V,
 ) where
-    M: ModuleParameters,
+    M: PhysicalParameters,
     V: ParameterVisitor<'a, MlxTensor>,
 {
     let trainable = module
@@ -221,7 +220,7 @@ fn visit_module_parameters_mut<'a, M, V>(
     topology: &BTreeMap<String, ParameterSpec>,
     visitor: &mut V,
 ) where
-    M: ModuleParameters,
+    M: PhysicalParameters,
     V: ParameterVisitorMut<'a, MlxTensor>,
 {
     let trainable = module
@@ -241,7 +240,7 @@ fn visit_module_parameters_mut<'a, M, V>(
     }
 }
 
-fn set_module_trainable(module: &mut impl ModuleParameters, trainable: bool) {
+fn set_module_trainable(module: &mut impl PhysicalParameters, trainable: bool) {
     if trainable {
         module.unfreeze_parameters(true);
     } else {
@@ -278,18 +277,8 @@ impl<'a> ParameterVisitorMut<'a, MlxTensor> for ParameterMutCollector<'a> {
     }
 }
 
-struct ParameterStateCollector {
-    states: Vec<bool>,
-}
-
-impl<'a> ParameterVisitor<'a, MlxTensor> for ParameterStateCollector {
-    fn visit(&mut self, metadata: ParameterMetadata, _value: &'a MlxTensor) {
-        self.states.push(metadata.trainable);
-    }
-}
-
 /// Collects immutable MLX parameter references from a neutral module.
-pub fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
+pub(crate) fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
     module: &M,
     trainable_only: bool,
 ) -> ModuleParamRef<'_> {
@@ -303,7 +292,7 @@ pub fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
 }
 
 /// Collects mutable MLX parameter references from a neutral module.
-pub fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
+pub(crate) fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
     module: &mut M,
 ) -> ModuleParamMut<'_> {
     validate_parameter_topology(&*module).expect("backend-neutral parameter topology is valid");
@@ -312,14 +301,6 @@ pub fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
     };
     module.visit_parameters_mut(&mut collector);
     collector.parameters
-}
-
-/// Returns the trainable state of each parameter in neutral traversal order.
-pub fn neutral_parameter_states<M: Parameterized<MlxTensor>>(module: &M) -> Vec<bool> {
-    validate_parameter_topology(module).expect("backend-neutral parameter topology is valid");
-    let mut collector = ParameterStateCollector { states: Vec::new() };
-    module.visit_parameters(&mut collector);
-    collector.states
 }
 
 /// MLX module view over any backend-neutral parameterized value.
@@ -360,42 +341,6 @@ impl<M> AsMut<M> for MlxModule<M> {
     }
 }
 
-impl<M: Parameterized<MlxTensor>> ModuleParameters for MlxModule<M> {
-    fn num_parameters(&self) -> usize {
-        neutral_parameter_refs(&self.inner, false).entries.len()
-    }
-
-    fn parameters(&self) -> ModuleParamRef<'_> {
-        neutral_parameter_refs(&self.inner, false)
-    }
-
-    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        neutral_parameter_refs_mut(&mut self.inner)
-    }
-
-    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        neutral_parameter_refs(&self.inner, true)
-    }
-
-    fn freeze_parameters(&mut self, _recursive: bool) {
-        self.inner.set_trainable(false);
-    }
-
-    fn unfreeze_parameters(&mut self, _recursive: bool) {
-        self.inner.set_trainable(true);
-    }
-
-    fn all_frozen(&self) -> Option<bool> {
-        let states = neutral_parameter_states(&self.inner);
-        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
-    }
-
-    fn any_frozen(&self) -> Option<bool> {
-        let states = neutral_parameter_states(&self.inner);
-        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
-    }
-}
-
 impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxModule<M> {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
@@ -416,86 +361,14 @@ impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxModule<M> {
     }
 }
 
-/// Borrowed MLX parameter view over a backend-neutral module.
-///
-/// This lets residency/loading policy populate one architecture-owned static
-/// component without cloning it or giving the architecture a backend-native
-/// trait.
-pub struct MlxModuleRef<'a, M> {
-    inner: &'a mut M,
-}
-
-impl<'a, M> MlxModuleRef<'a, M> {
-    /// Borrows a neutral module as an MLX module-parameter view.
-    pub const fn new(inner: &'a mut M) -> Self {
-        Self { inner }
-    }
-}
-
-impl<M: Parameterized<MlxTensor>> ModuleParameters for MlxModuleRef<'_, M> {
-    fn num_parameters(&self) -> usize {
-        neutral_parameter_refs(&*self.inner, false).entries.len()
-    }
-
-    fn parameters(&self) -> ModuleParamRef<'_> {
-        neutral_parameter_refs(&*self.inner, false)
-    }
-
-    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        neutral_parameter_refs_mut(&mut *self.inner)
-    }
-
-    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        neutral_parameter_refs(&*self.inner, true)
-    }
-
-    fn freeze_parameters(&mut self, _recursive: bool) {
-        self.inner.set_trainable(false);
-    }
-
-    fn unfreeze_parameters(&mut self, _recursive: bool) {
-        self.inner.set_trainable(true);
-    }
-
-    fn all_frozen(&self) -> Option<bool> {
-        let states = neutral_parameter_states(&*self.inner);
-        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
-    }
-
-    fn any_frozen(&self) -> Option<bool> {
-        let states = neutral_parameter_states(&*self.inner);
-        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
-    }
-}
-
-impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxModuleRef<'_, M> {
-    fn visit_parameters<'b, V>(&'b self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'b, MlxTensor>,
-    {
-        self.inner.visit_parameters(visitor);
-    }
-
-    fn visit_parameters_mut<'b, V>(&'b mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'b, MlxTensor>,
-    {
-        self.inner.visit_parameters_mut(visitor);
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        self.inner.set_trainable(trainable);
-    }
-}
-
 /// Native MLX module exposed through stable neutral parameter identities.
 #[derive(Debug, Clone)]
-pub struct MlxNamedModule<M> {
+struct MlxNamedModule<M> {
     inner: M,
     topology: BTreeMap<String, ParameterSpec>,
 }
 
-impl<M: ModuleParameters> MlxNamedModule<M> {
+impl<M: PhysicalParameters> MlxNamedModule<M> {
     fn with_exact_topology(
         inner: M,
         specs: impl IntoIterator<Item = (&'static str, ParameterSpec)>,
@@ -519,7 +392,7 @@ impl<M> std::ops::DerefMut for MlxNamedModule<M> {
     }
 }
 
-impl<M: ModuleParameters> Parameterized<MlxTensor> for MlxNamedModule<M> {
+impl<M: PhysicalParameters> Parameterized<MlxTensor> for MlxNamedModule<M> {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -539,40 +412,6 @@ impl<M: ModuleParameters> Parameterized<MlxTensor> for MlxNamedModule<M> {
     }
 }
 
-macro_rules! delegate_parameters {
-    ($type:ty, $field:tt) => {
-        impl ModuleParameters for $type {
-            fn num_parameters(&self) -> usize {
-                self.$field.num_parameters()
-            }
-            fn parameters(&self) -> ModuleParamRef<'_> {
-                self.$field.parameters()
-            }
-            fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-                self.$field.parameters_mut()
-            }
-            fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-                self.$field.trainable_parameters()
-            }
-            fn update(&mut self, parameters: ModuleParam) {
-                self.$field.update(parameters);
-            }
-            fn freeze_parameters(&mut self, recursive: bool) {
-                self.$field.freeze_parameters(recursive);
-            }
-            fn unfreeze_parameters(&mut self, recursive: bool) {
-                self.$field.unfreeze_parameters(recursive);
-            }
-            fn all_frozen(&self) -> Option<bool> {
-                self.$field.all_frozen()
-            }
-            fn any_frozen(&self) -> Option<bool> {
-                self.$field.any_frozen()
-            }
-        }
-    };
-}
-
 /// MLX dense-or-quantized affine projection.
 #[derive(Debug, Clone)]
 pub struct MlxLinear {
@@ -580,8 +419,6 @@ pub struct MlxLinear {
     topology: BTreeMap<String, ParameterSpec>,
     vocabulary_range: Option<VocabularyParallelRange>,
 }
-
-delegate_parameters!(MlxLinear, module);
 
 impl LinearOperator<MlxTensor> for MlxLinear {
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
@@ -615,19 +452,6 @@ pub struct MlxEmbedding {
     vocabulary: i32,
     vocabulary_range: Option<VocabularyParallelRange>,
 }
-
-impl Deref for MlxEmbedding {
-    type Target = MaybeQuantized<nn::Embedding>;
-    fn deref(&self) -> &Self::Target {
-        &self.module
-    }
-}
-impl DerefMut for MlxEmbedding {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.module
-    }
-}
-delegate_parameters!(MlxEmbedding, module);
 
 impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
@@ -788,42 +612,6 @@ impl Parameterized<MlxTensor> for MlxRmsNorm {
     }
 }
 
-impl ModuleParameters for MlxRmsNorm {
-    fn num_parameters(&self) -> usize {
-        neutral_parameter_refs(self, false).entries.len()
-    }
-
-    fn parameters(&self) -> ModuleParamRef<'_> {
-        neutral_parameter_refs(self, false)
-    }
-
-    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        neutral_parameter_refs_mut(self)
-    }
-
-    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        neutral_parameter_refs(self, true)
-    }
-
-    fn freeze_parameters(&mut self, _recursive: bool) {
-        self.set_trainable(false);
-    }
-
-    fn unfreeze_parameters(&mut self, _recursive: bool) {
-        self.set_trainable(true);
-    }
-
-    fn all_frozen(&self) -> Option<bool> {
-        let states = neutral_parameter_states(self);
-        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
-    }
-
-    fn any_frozen(&self) -> Option<bool> {
-        let states = neutral_parameter_states(self);
-        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
-    }
-}
-
 fn mlx_weightless_rms_norm(
     input: &Array,
     epsilon: f32,
@@ -841,20 +629,7 @@ fn mlx_weightless_rms_norm(
 
 /// MLX RoPE variant selected from model metadata.
 #[derive(Debug, Clone)]
-pub struct MlxRotary(pub RopeVariant);
-
-impl Deref for MlxRotary {
-    type Target = RopeVariant;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl DerefMut for MlxRotary {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-delegate_parameters!(MlxRotary, 0);
+pub struct MlxRotary(RopeVariant);
 
 impl RotaryOperator<MlxTensor> for MlxRotary {
     fn forward(
@@ -903,8 +678,6 @@ pub struct MlxHyperConnection {
     module: common::hyper_connections::HyperConnection,
     topology: BTreeMap<String, ParameterSpec>,
 }
-
-delegate_parameters!(MlxHyperConnection, module);
 
 impl HyperConnectionOperator<MlxTensor> for MlxHyperConnection {
     fn collapse(
@@ -969,8 +742,6 @@ pub struct MlxHyperHead {
     module: common::hyper_connections::HyperHead,
     topology: BTreeMap<String, ParameterSpec>,
 }
-
-delegate_parameters!(MlxHyperHead, module);
 
 impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
     fn forward(

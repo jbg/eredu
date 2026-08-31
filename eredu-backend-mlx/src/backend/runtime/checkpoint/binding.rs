@@ -943,7 +943,7 @@ pub enum ModuleBindingError {
 mod tests {
     use super::*;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use crate::{backend::ExecutionContext, module::ModuleParameters};
+    use crate::backend::ExecutionContext;
     use eredu_checkpoint::store::MemoryWeightStore;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_checkpoint::AffineQuantization;
@@ -1062,7 +1062,7 @@ mod tests {
         )
         .unwrap();
 
-        let parameters = module.parameters().flatten();
+        let parameters = neutral_parameter_refs(&module, false).flatten();
         assert_eq!(parameters["unconventional.matrix"].shape(), &[8, 8]);
         assert_eq!(parameters["separate.scale.factor"].shape(), &[8, 1]);
         assert_eq!(parameters["another.affine.offset"].shape(), &[8, 1]);

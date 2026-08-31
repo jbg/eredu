@@ -2,7 +2,7 @@
 
 use safemlx::Stream;
 
-use super::module::{Module, ModuleParameters};
+use super::module::{Module, PhysicalParameters};
 
 /// Trait for quantization of modules.
 pub trait Quantizable {
@@ -155,18 +155,11 @@ where
     }
 }
 
-impl<M> ModuleParameters for MaybeQuantized<M>
+impl<M> PhysicalParameters for MaybeQuantized<M>
 where
-    M: Quantizable + ModuleParameters,
-    M::Quantized: ModuleParameters,
+    M: Quantizable + PhysicalParameters,
+    M::Quantized: PhysicalParameters,
 {
-    fn num_parameters(&self) -> usize {
-        match self {
-            MaybeQuantized::Original(m) => m.num_parameters(),
-            MaybeQuantized::Quantized(q) => q.num_parameters(),
-        }
-    }
-
     fn parameters(&self) -> crate::module::ModuleParamRef<'_> {
         match self {
             MaybeQuantized::Original(m) => m.parameters(),
@@ -201,20 +194,6 @@ where
             MaybeQuantized::Quantized(q) => q.unfreeze_parameters(recursive),
         }
     }
-
-    fn all_frozen(&self) -> Option<bool> {
-        match self {
-            MaybeQuantized::Original(m) => m.all_frozen(),
-            MaybeQuantized::Quantized(q) => q.all_frozen(),
-        }
-    }
-
-    fn any_frozen(&self) -> Option<bool> {
-        match self {
-            MaybeQuantized::Original(m) => m.any_frozen(),
-            MaybeQuantized::Quantized(q) => q.any_frozen(),
-        }
-    }
 }
 
 impl<M, Input> Module<Input> for MaybeQuantized<M>
@@ -231,13 +210,6 @@ where
         match self {
             MaybeQuantized::Original(m) => m.forward(x, stream),
             MaybeQuantized::Quantized(q) => q.forward(x, stream),
-        }
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        match self {
-            MaybeQuantized::Original(m) => m.training_mode(mode),
-            MaybeQuantized::Quantized(q) => q.training_mode(mode),
         }
     }
 }

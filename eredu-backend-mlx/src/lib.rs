@@ -23,15 +23,10 @@ mod composition;
 pub use adapter::*;
 
 pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn, quantization};
-pub(crate) use safemlx::{ops, transforms, Array, Dtype, Stream};
+pub(crate) use safemlx::{ops, Array, Dtype, Stream};
 
 #[cfg(test)]
-pub(crate) mod macros {
-    pub(crate) use eredu_backend_mlx_macros::*;
-}
-
-#[cfg(test)]
-pub(crate) use safemlx::{array, Device, DeviceType};
+pub(crate) use safemlx::{array, Device};
 
 #[cfg(test)]
 pub(crate) fn test_stream() -> &'static Stream {

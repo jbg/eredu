@@ -1,17 +1,17 @@
 //! Backend-owned RMS normalization.
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::{error::Exception, Array, Dtype, Stream};
 
-use crate::module::{Module, Param};
+use crate::module::{Module, PhysicalParam};
 
 /// MLX RMS normalization with a checkpoint-bound scale parameter.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct RmsNorm {
     /// Learned scale.
     #[param]
-    pub weight: Param<Array>,
+    pub weight: PhysicalParam<Array>,
     /// Numerical stability epsilon.
     pub eps: f32,
 }
@@ -25,7 +25,7 @@ impl RmsNorm {
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::<Array>::unloaded(&[dimensions], dtype, stream)?,
+            weight: PhysicalParam::<Array>::unloaded(&[dimensions], dtype, stream)?,
             eps,
         })
     }
@@ -38,6 +38,4 @@ impl Module<&Array> for RmsNorm {
     fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
         safemlx::fast::rms_norm(input, self.weight.as_ref(), self.eps, stream)
     }
-
-    fn training_mode(&mut self, _mode: bool) {}
 }

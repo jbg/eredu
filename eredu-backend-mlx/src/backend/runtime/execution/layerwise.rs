@@ -23,8 +23,6 @@ use std::{
 
 use safemlx::{Dtype, Stream};
 
-use crate::module::ModuleParameters;
-
 use crate::{
     backend::error::Error,
     backend::runtime::checkpoint::binding::{build_module_bindings, ModuleBindingError},
@@ -785,8 +783,8 @@ pub fn quantize_module_store_with_bindings<SM, U, SF, TF, SB, UB>(
     mut unit_bindings: UB,
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
-    SM: ModuleParameters + Parameterized<crate::MlxTensor>,
-    U: ModuleParameters + Parameterized<crate::MlxTensor>,
+    SM: Parameterized<crate::MlxTensor>,
+    U: Parameterized<crate::MlxTensor>,
     SF: FnMut(usize, &Stream) -> Result<U, Error>,
     TF: FnMut(usize, &Stream) -> Result<U, Error>,
     SB: FnOnce(
@@ -905,7 +903,7 @@ pub(crate) fn quantize_pipeline_stage_store_with<L, SU, Q, SL, TL, LB>(
     mut layer_bindings: LB,
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
-    L: ModuleParameters + Parameterized<crate::MlxTensor>,
+    L: Parameterized<crate::MlxTensor>,
     SU: FnOnce(
         &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error>,

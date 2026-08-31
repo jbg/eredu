@@ -355,6 +355,11 @@ neutral `Parameterized` topology, including when native storage uses private
 module slots. Generic binding, residency, and distributed-planning utilities
 accept that topology rather than a backend module's raw physical parameter
 tree, consume its exact identities, and never normalize path segments. A
+concrete backend must not expose its physical-slot traversal, parameter
+wrappers, training/freezing state, or nested parameter maps as a second public
+parameter framework. Composition-facing backend types implement only the
+neutral topology, and checkpoint loading, mutation, and byte accounting all
+traverse that topology with exact missing/unexpected-name validation. A
 backend-only physical slot is excluded explicitly by the operator's topology
 mapping; its name, shape, neighboring slots, or storage dtype never determine
 whether it is checkpoint-backed. Private native topology must not widen or

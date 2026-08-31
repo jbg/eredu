@@ -1,12 +1,12 @@
 //! Backend-owned rotary-position module state.
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::{error::Exception, Array, Stream};
 
 use crate::module::Module;
 
 /// Rotary positional encoding configured for a backend operator.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct RotaryPositionalEncoding {
     /// Number of feature dimensions to rotate.
@@ -148,6 +148,4 @@ where
             stream,
         )
     }
-
-    fn training_mode(&mut self, _mode: bool) {}
 }

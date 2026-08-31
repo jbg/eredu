@@ -1,6 +1,6 @@
 use std::iter::once;
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use eredu_gguf::{Endian as GgufEndian, GgmlType};
 use safemlx::{
     error::Exception,
@@ -13,13 +13,13 @@ use safemlx::{
 };
 
 use crate::{
-    module::{Module, ModuleParameters, Param},
+    module::{Module, PhysicalParam, PhysicalParameters},
     native_quantization::{NativeQuantizationFormat, NativeQuantizedTensor},
     nn::Embedding,
 };
 
 /// The same as ``Embedding`` but with a quantized weight matrix.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct QuantizedEmbedding {
     /// Quantization group size. Default to [`QuantizedEmbedding::DEFAULT_GROUP_SIZE`]
@@ -45,11 +45,11 @@ pub struct QuantizedEmbedding {
 
     /// Scales
     #[param]
-    pub scales: Param<Array>,
+    pub scales: PhysicalParam<Array>,
 
     /// Biases
     #[param]
-    pub biases: Param<Option<Array>>,
+    pub biases: PhysicalParam<Option<Array>>,
 
     /// Inner embedding
     #[param]
@@ -66,7 +66,7 @@ fn build_quantized_embedding_inner(
     let arrays = ops::quantize_with_mode(&weight, group_size, bits, mode, stream)?;
 
     let inner = Embedding {
-        weight: Param::new(arrays.weight),
+        weight: PhysicalParam::new(arrays.weight),
     };
 
     let mut qe = QuantizedEmbedding {
@@ -77,8 +77,8 @@ fn build_quantized_embedding_inner(
         native_format: None,
         native_endian: GgufEndian::Little,
         native_columns: 0,
-        scales: Param::new(arrays.scales),
-        biases: Param::new(arrays.biases),
+        scales: PhysicalParam::new(arrays.scales),
+        biases: PhysicalParam::new(arrays.biases),
         inner,
     };
 
@@ -112,7 +112,7 @@ impl QuantizedEmbedding {
             Dtype::Float32
         };
         let inner = Embedding {
-            weight: Param::<Array>::unloaded(
+            weight: PhysicalParam::<Array>::unloaded(
                 &[
                     embedding_count,
                     quantized_packed_dimension(dimensions, bits),
@@ -129,19 +129,19 @@ impl QuantizedEmbedding {
             native_format: None,
             native_endian: GgufEndian::Little,
             native_columns: 0,
-            scales: Param::<Array>::unloaded(
+            scales: PhysicalParam::<Array>::unloaded(
                 &[embedding_count, dimensions / group_size],
                 scale_dtype,
                 stream,
             )?,
             biases: if mode.has_biases() {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[embedding_count, dimensions / group_size],
                     Dtype::Float32,
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             inner,
         };
@@ -174,10 +174,10 @@ impl QuantizedEmbedding {
             native_format: Some(format),
             native_endian: endian,
             native_columns: dimensions,
-            scales: Param::<Array>::unloaded(&[1], Dtype::Float32, stream)?,
-            biases: Param::new(None),
+            scales: PhysicalParam::<Array>::unloaded(&[1], Dtype::Float32, stream)?,
+            biases: PhysicalParam::new(None),
             inner: Embedding {
-                weight: Param::<Array>::unloaded(
+                weight: PhysicalParam::<Array>::unloaded(
                     &[embedding_count, dimensions / block_values * block_bytes],
                     Dtype::Uint8,
                     stream,
@@ -287,9 +287,5 @@ impl Module<&Array> for QuantizedEmbedding {
 
         let ret_shape = s.iter().copied().chain(once(-1)).collect::<Vec<_>>();
         out.reshape(&ret_shape, stream)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.inner.training_mode(mode);
     }
 }

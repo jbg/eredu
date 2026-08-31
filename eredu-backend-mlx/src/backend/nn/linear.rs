@@ -2,7 +2,7 @@
 
 use eredu_checkpoint::{BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::{
     error::Exception,
     ops::{matmul, quantized_matmul_with_mode, quantized_packed_dimension, QuantizationMode},
@@ -10,7 +10,8 @@ use safemlx::{
 };
 
 use crate::{
-    module::Param, native_quantization::NativeQuantizedTensor, nn, quantization::MaybeQuantized,
+    module::PhysicalParam, native_quantization::NativeQuantizedTensor, nn,
+    quantization::MaybeQuantized,
 };
 
 fn ceil_div(value: i32, divisor: i32) -> i32 {
@@ -18,7 +19,7 @@ fn ceil_div(value: i32, divisor: i32) -> i32 {
 }
 
 /// Backend-owned linear materialization for every neutral physical format.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct PhysicalLinear {
     /// Logical input width.
@@ -27,19 +28,19 @@ pub struct PhysicalLinear {
     pub output_dimensions: i32,
     #[param]
     /// Dense or packed weight array.
-    pub weight: Param<Array>,
+    pub weight: PhysicalParam<Array>,
     #[param]
     /// Inverse scale for native block-float formats.
-    pub weight_scale_inv: Param<Option<Array>>,
+    pub weight_scale_inv: PhysicalParam<Option<Array>>,
     #[param]
     /// Per-group affine scales, when applicable.
-    pub scales: Param<Option<Array>>,
+    pub scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Per-group affine biases, when applicable.
-    pub biases: Param<Option<Array>>,
+    pub biases: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional additive output bias.
-    pub bias: Param<Option<Array>>,
+    pub bias: PhysicalParam<Option<Array>>,
     /// Number of logical values in each quantization group.
     pub group_size: i32,
     /// Number of bits in each affine-quantized value.
@@ -132,9 +133,9 @@ impl PhysicalLinear {
         Ok(Self {
             input_dimensions,
             output_dimensions,
-            weight: Param::<Array>::unloaded(&weight_shape, weight_dtype, stream)?,
+            weight: PhysicalParam::<Array>::unloaded(&weight_shape, weight_dtype, stream)?,
             weight_scale_inv: if let Some(fp8) = fp8 {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
                         ceil_div(output_dimensions, fp8.block_rows),
                         ceil_div(input_dimensions, fp8.block_columns),
@@ -146,10 +147,10 @@ impl PhysicalLinear {
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             scales: if let Some(quantization) = affine {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
                         output_dimensions,
                         input_dimensions / quantization.group_size(),
@@ -162,10 +163,10 @@ impl PhysicalLinear {
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             biases: if let Some(quantization) = affine.filter(|value| value.has_biases()) {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
                         output_dimensions,
                         input_dimensions / quantization.group_size(),
@@ -174,12 +175,16 @@ impl PhysicalLinear {
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             bias: if bias {
-                Param::<Option<Array>>::unloaded_some(&[output_dimensions], Dtype::Float32, stream)?
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[output_dimensions],
+                    Dtype::Float32,
+                    stream,
+                )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             group_size: affine.map_or(0, WeightQuantization::group_size),
             bits: affine.map_or(0, WeightQuantization::bits),

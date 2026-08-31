@@ -1,6 +1,6 @@
 //! Rotary position embedding initialization and variants.
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use eredu_nn::RotaryAlgorithm;
 use safemlx::{
     error::Exception,
@@ -18,7 +18,7 @@ use crate::{module::Module, nn};
 ///
 /// Applies piecewise frequency scaling based on wavelength cutoffs derived from
 /// `low_freq_factor`, `high_freq_factor`, `factor`, and `original_max_position_embeddings`.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct FrequencyScaledRope {
     /// Number of rotary dimensions.
@@ -152,8 +152,6 @@ where
         )?;
         x.reshape(shape, stream)
     }
-
-    fn training_mode(&mut self, _mode: bool) {}
 }
 
 /// Proportional RoPE over a configurable prefix of each attention head.
@@ -163,7 +161,7 @@ where
 /// configured rotary proportion use the largest finite `f32` denominator, which
 /// MLX reciprocates to an effectively zero inverse frequency and therefore
 /// leaves unchanged for real context lengths.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct ProportionalRope {
     /// Head dimension passed to MLX RoPE.
@@ -177,7 +175,7 @@ pub struct ProportionalRope {
 }
 
 /// YaRN rotary embeddings with frequency interpolation and attention scaling.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct YarnRope {
     /// Number of rotary dimensions.
@@ -291,8 +289,6 @@ where
         )?;
         x.reshape(shape, stream)
     }
-
-    fn training_mode(&mut self, _mode: bool) {}
 }
 
 fn proportional_rotary_dims(dims: i32, proportion: f32) -> (i32, i32) {
@@ -360,8 +356,6 @@ where
         )?;
         x.reshape(shape, stream)
     }
-
-    fn training_mode(&mut self, _mode: bool) {}
 }
 
 /// Enum wrapping different RoPE variants so that `initialize_rope` can return
@@ -378,17 +372,8 @@ pub enum RopeVariant {
     Yarn(YarnRope),
 }
 
-// TODO: support derive ModuleParameters for enum
-impl crate::module::ModuleParameters for RopeVariant {
-    fn num_parameters(&self) -> usize {
-        match self {
-            RopeVariant::Default(rope) => rope.num_parameters(),
-            RopeVariant::FrequencyScaled(rope) => rope.num_parameters(),
-            RopeVariant::Proportional(rope) => rope.num_parameters(),
-            RopeVariant::Yarn(rope) => rope.num_parameters(),
-        }
-    }
-
+// TODO: support derive PhysicalParameters for enum
+impl crate::module::PhysicalParameters for RopeVariant {
     fn freeze_parameters(&mut self, _recursive: bool) {
         match self {
             RopeVariant::Default(rope) => rope.freeze_parameters(_recursive),
@@ -433,24 +418,6 @@ impl crate::module::ModuleParameters for RopeVariant {
             RopeVariant::Yarn(rope) => rope.trainable_parameters(),
         }
     }
-
-    fn all_frozen(&self) -> Option<bool> {
-        match self {
-            RopeVariant::Default(rope) => rope.all_frozen(),
-            RopeVariant::FrequencyScaled(rope) => rope.all_frozen(),
-            RopeVariant::Proportional(rope) => rope.all_frozen(),
-            RopeVariant::Yarn(rope) => rope.all_frozen(),
-        }
-    }
-
-    fn any_frozen(&self) -> Option<bool> {
-        match self {
-            RopeVariant::Default(rope) => rope.any_frozen(),
-            RopeVariant::FrequencyScaled(rope) => rope.any_frozen(),
-            RopeVariant::Proportional(rope) => rope.any_frozen(),
-            RopeVariant::Yarn(rope) => rope.any_frozen(),
-        }
-    }
 }
 
 impl<'a, Input> Module<Input> for RopeVariant
@@ -466,23 +433,6 @@ where
             RopeVariant::FrequencyScaled(rope) => rope.forward(input, stream),
             RopeVariant::Proportional(rope) => rope.forward(input, stream),
             RopeVariant::Yarn(rope) => rope.forward(input, stream),
-        }
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        match self {
-            RopeVariant::Default(rope) => {
-                <nn::RotaryPositionalEncoding as Module<nn::RopeInput>>::training_mode(rope, mode)
-            }
-            RopeVariant::FrequencyScaled(rope) => {
-                <FrequencyScaledRope as Module<nn::RopeInput>>::training_mode(rope, mode)
-            }
-            RopeVariant::Proportional(rope) => {
-                <ProportionalRope as Module<nn::RopeInput>>::training_mode(rope, mode)
-            }
-            RopeVariant::Yarn(rope) => {
-                <YarnRope as Module<nn::RopeInput>>::training_mode(rope, mode)
-            }
         }
     }
 }

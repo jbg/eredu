@@ -25,7 +25,7 @@ use crate::{
         },
         residency::expert_cache::{ExpertCache, ExpertCatalogEntry, ExpertRouteBatch},
     },
-    module::Param,
+    module::PhysicalParam,
 };
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
 use eredu_core::{residency::OffloadConfig, ParallelRankTopology, ParallelTopology};
@@ -110,8 +110,8 @@ fn full_dispatch_blocks(rank: usize, stream: &Stream) -> ShardedRouteBlocks {
 
 fn relu2_bank(stream: &Stream) -> PackedRelu2Experts {
     let mut bank = PackedRelu2Experts::new(2, 1, 1, [None, None], stream).unwrap();
-    bank.up_proj = Param::new(f32_array(&[1.0, 2.0], &[2, 1, 1], stream));
-    bank.down_proj = Param::new(f32_array(&[1.0, 10.0], &[2, 1, 1], stream));
+    bank.up_proj = PhysicalParam::new(f32_array(&[1.0, 2.0], &[2, 1, 1], stream));
+    bank.down_proj = PhysicalParam::new(f32_array(&[1.0, 10.0], &[2, 1, 1], stream));
     bank
 }
 
@@ -178,14 +178,14 @@ fn execute_cached_qwen_routes(
                 gate_up_iquant: None,
                 down_iquant: None,
                 native_fp8_e8m0: false,
-                gate_up_proj: Param::new(acquired.compact_binding("gate_up_proj", stream)?),
-                gate_up_proj_bias: Param::new(None),
-                gate_up_proj_scales: Param::new(None),
-                gate_up_proj_biases: Param::new(None),
-                down_proj: Param::new(acquired.compact_binding("down_proj", stream)?),
-                down_proj_bias: Param::new(None),
-                down_proj_scales: Param::new(None),
-                down_proj_biases: Param::new(None),
+                gate_up_proj: PhysicalParam::new(acquired.compact_binding("gate_up_proj", stream)?),
+                gate_up_proj_bias: PhysicalParam::new(None),
+                gate_up_proj_scales: PhysicalParam::new(None),
+                gate_up_proj_biases: PhysicalParam::new(None),
+                down_proj: PhysicalParam::new(acquired.compact_binding("down_proj", stream)?),
+                down_proj_bias: PhysicalParam::new(None),
+                down_proj_scales: PhysicalParam::new(None),
+                down_proj_biases: PhysicalParam::new(None),
             };
             cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
             let compact_routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
@@ -350,14 +350,14 @@ fn expert_exchange_ring_worker() {
         gate_up_iquant: None,
         down_iquant: None,
         native_fp8_e8m0: false,
-        gate_up_proj: Param::new(f32_array(&qwen_gate_up, &[4, 2, 1], &stream)),
-        gate_up_proj_bias: Param::new(None),
-        gate_up_proj_scales: Param::new(None),
-        gate_up_proj_biases: Param::new(None),
-        down_proj: Param::new(f32_array(&qwen_down, &[4, 1, 1], &stream)),
-        down_proj_bias: Param::new(None),
-        down_proj_scales: Param::new(None),
-        down_proj_biases: Param::new(None),
+        gate_up_proj: PhysicalParam::new(f32_array(&qwen_gate_up, &[4, 2, 1], &stream)),
+        gate_up_proj_bias: PhysicalParam::new(None),
+        gate_up_proj_scales: PhysicalParam::new(None),
+        gate_up_proj_biases: PhysicalParam::new(None),
+        down_proj: PhysicalParam::new(f32_array(&qwen_down, &[4, 1, 1], &stream)),
+        down_proj_bias: PhysicalParam::new(None),
+        down_proj_scales: PhysicalParam::new(None),
+        down_proj_biases: PhysicalParam::new(None),
     };
     let expected_qwen = full_qwen
         .forward(&qwen_hidden, &qwen_ids, &qwen_weights, &stream)

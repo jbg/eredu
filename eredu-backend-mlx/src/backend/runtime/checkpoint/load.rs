@@ -16,7 +16,7 @@ use safemlx::{transforms::async_eval_with_event, Array, Stream};
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
 ))]
-use crate::module::ModuleParameters;
+use crate::module::PhysicalParameters;
 use crate::{
     backend::runtime::checkpoint::gguf::GgufCheckpoint, module::FlattenedModuleParamMut,
     native_quantization::NativeQuantizationFormat,
@@ -168,7 +168,7 @@ impl StrictLoadReport {
         test,
         any(feature = "cuda", all(feature = "metal", target_os = "macos"))
     ))]
-    pub(crate) fn finish<M: ModuleParameters + ?Sized>(self, model: &M) -> Result<(), Error> {
+    pub(crate) fn finish<M: PhysicalParameters + ?Sized>(self, model: &M) -> Result<(), Error> {
         self.finish_excluding(model, |_| false)
     }
 
@@ -180,7 +180,7 @@ impl StrictLoadReport {
     ))]
     pub(crate) fn finish_excluding<M, F>(self, model: &M, excluded: F) -> Result<(), Error>
     where
-        M: ModuleParameters + ?Sized,
+        M: PhysicalParameters + ?Sized,
         F: Fn(&str) -> bool,
     {
         self.finish_parameter_names(
@@ -354,7 +354,7 @@ pub(in crate::backend::runtime::checkpoint) fn load_array_quantized_strict(
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
 ))]
-fn load_arrays_quantized_strict<M: ModuleParameters>(
+fn load_arrays_quantized_strict<M: PhysicalParameters>(
     model: &mut M,
     loaded: HashMap<String, Array>,
     quantization_stream: &Stream,
@@ -413,7 +413,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    use eredu_backend_mlx_macros::ModuleParameters;
+    use eredu_backend_mlx_macros::PhysicalParameters;
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_checkpoint::AffineQuantization;
     use eredu_checkpoint::WeightQuantization;
@@ -424,7 +424,7 @@ mod tests {
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use crate::{
         backend::ExecutionContext,
-        module::{ModuleParameters as _, Param},
+        module::{PhysicalParam, PhysicalParameters as _},
     };
 
     use super::gguf_quantization_configs;
@@ -518,39 +518,39 @@ mod tests {
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[derive(Debug, Clone, ModuleParameters)]
+    #[derive(Debug, Clone, PhysicalParameters)]
     struct PackedExperts {
         #[param]
-        experts: Param<Array>,
+        experts: PhysicalParam<Array>,
         #[param]
-        experts_scales: Param<Option<Array>>,
+        experts_scales: PhysicalParam<Option<Array>>,
         #[param]
-        experts_biases: Param<Option<Array>>,
+        experts_biases: PhysicalParam<Option<Array>>,
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[derive(Debug, Clone, ModuleParameters)]
+    #[derive(Debug, Clone, PhysicalParameters)]
     struct ExactInnerWeight {
         #[param]
         projection: ExactInnerProjection,
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[derive(Debug, Clone, ModuleParameters)]
+    #[derive(Debug, Clone, PhysicalParameters)]
     struct ExactInnerProjection {
         #[param]
         inner: ExactPackedLinear,
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-    #[derive(Debug, Clone, ModuleParameters)]
+    #[derive(Debug, Clone, PhysicalParameters)]
     struct ExactPackedLinear {
         #[param]
-        weight: Param<Array>,
+        weight: PhysicalParam<Array>,
         #[param]
-        scales: Param<Array>,
+        scales: PhysicalParam<Array>,
         #[param]
-        biases: Param<Option<Array>>,
+        biases: PhysicalParam<Option<Array>>,
     }
 
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -561,9 +561,11 @@ mod tests {
         let mut model = ExactInnerWeight {
             projection: ExactInnerProjection {
                 inner: ExactPackedLinear {
-                    weight: Param::<Array>::unloaded(&[8, 64], Dtype::Float32, stream).unwrap(),
-                    scales: Param::<Array>::unloaded(&[8, 2], Dtype::Float32, stream).unwrap(),
-                    biases: Param::new(None),
+                    weight: PhysicalParam::<Array>::unloaded(&[8, 64], Dtype::Float32, stream)
+                        .unwrap(),
+                    scales: PhysicalParam::<Array>::unloaded(&[8, 2], Dtype::Float32, stream)
+                        .unwrap(),
+                    biases: PhysicalParam::new(None),
                 },
             },
         };
@@ -588,9 +590,11 @@ mod tests {
         let mut model = ExactInnerWeight {
             projection: ExactInnerProjection {
                 inner: ExactPackedLinear {
-                    weight: Param::<Array>::unloaded(&[8, 64], Dtype::Float32, stream).unwrap(),
-                    scales: Param::<Array>::unloaded(&[8, 2], Dtype::Float32, stream).unwrap(),
-                    biases: Param::new(None),
+                    weight: PhysicalParam::<Array>::unloaded(&[8, 64], Dtype::Float32, stream)
+                        .unwrap(),
+                    scales: PhysicalParam::<Array>::unloaded(&[8, 2], Dtype::Float32, stream)
+                        .unwrap(),
+                    biases: PhysicalParam::new(None),
                 },
             },
         };
@@ -615,10 +619,14 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let mut model = PackedExperts {
-            experts: Param::<Array>::unloaded(&[3, 8, 8], Dtype::Uint32, stream).unwrap(),
-            experts_scales: Param::<Option<Array>>::unloaded_some(&[3, 8, 2], Dtype::Uint8, stream)
-                .unwrap(),
-            experts_biases: Param::new(None),
+            experts: PhysicalParam::<Array>::unloaded(&[3, 8, 8], Dtype::Uint32, stream).unwrap(),
+            experts_scales: PhysicalParam::<Option<Array>>::unloaded_some(
+                &[3, 8, 2],
+                Dtype::Uint8,
+                stream,
+            )
+            .unwrap(),
+            experts_biases: PhysicalParam::new(None),
         };
         let dense = Array::from_slice(&vec![0.25f32; 3 * 8 * 64], &[3, 8, 64]);
         let mut report = StrictLoadReport::default();
@@ -652,10 +660,16 @@ mod tests {
         let mut model = ExactInnerWeight {
             projection: ExactInnerProjection {
                 inner: ExactPackedLinear {
-                    weight: Param::<Array>::unloaded(&[8, 8], Dtype::Uint32, stream).unwrap(),
-                    scales: Param::<Array>::unloaded(&[8, 1], Dtype::Uint8, stream).unwrap(),
-                    biases: Param::<Option<Array>>::unloaded_some(&[8, 1], Dtype::Float32, stream)
+                    weight: PhysicalParam::<Array>::unloaded(&[8, 8], Dtype::Uint32, stream)
                         .unwrap(),
+                    scales: PhysicalParam::<Array>::unloaded(&[8, 1], Dtype::Uint8, stream)
+                        .unwrap(),
+                    biases: PhysicalParam::<Option<Array>>::unloaded_some(
+                        &[8, 1],
+                        Dtype::Float32,
+                        stream,
+                    )
+                    .unwrap(),
                 },
             },
         };

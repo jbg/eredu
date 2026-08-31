@@ -9,7 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::module::ModuleParameters;
 use crate::native::{
     distributed::{self, Backend},
     ops::{indexing::TryIndexOp, stack_axis},
@@ -23,7 +22,9 @@ use crate::{
     },
     backend::{
         error::Error as MlxError,
-        nn::shared::{MlxModule, MlxNeuralBackend},
+        nn::shared::{
+            neutral_parameter_refs, neutral_parameter_refs_mut, MlxModule, MlxNeuralBackend,
+        },
         DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
     },
     composition::mlx::distributed::pipeline::{
@@ -3078,7 +3079,7 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap());
-    for (name, parameter) in model.parameters_mut().flatten() {
+    for (name, parameter) in neutral_parameter_refs_mut(&mut model).flatten() {
         let shape = parameter.shape().to_vec();
         *parameter = if name.ends_with("norm.weight") {
             Array::ones::<f32>(&shape, stream).unwrap()
@@ -3092,8 +3093,7 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
             .unwrap()
         };
     }
-    let arrays = model
-        .parameters()
+    let arrays = neutral_parameter_refs(&model, false)
         .flatten()
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.clone()))
@@ -3142,7 +3142,7 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
         MlxModule::new(lfm2::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap());
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
-    for (runtime_name, value) in model.parameters().flatten() {
+    for (runtime_name, value) in neutral_parameter_refs(&model, false).flatten() {
         let runtime_name = runtime_name.to_string();
         let layer_name = |name: &str| {
             name.replace("model.layers.", "blk.")
@@ -3244,8 +3244,8 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
         .unwrap();
 }
 
-fn initialize_fixture(model: &mut impl ModuleParameters, stream: &Stream) {
-    for (name, parameter) in model.parameters_mut().flatten() {
+fn initialize_fixture(model: &mut impl Parameterized<MlxTensor>, stream: &Stream) {
+    for (name, parameter) in neutral_parameter_refs_mut(model).flatten() {
         let shape = parameter.shape().to_vec();
         let value = if name.ends_with("norm.weight")
             || name.ends_with("layernorm.weight")
@@ -3272,10 +3272,9 @@ fn initialize_fixture(model: &mut impl ModuleParameters, stream: &Stream) {
 fn save_parameter_fixture(
     directory: &Path,
     config: &serde_json::Value,
-    model: &impl ModuleParameters,
+    model: &impl Parameterized<MlxTensor>,
 ) {
-    let arrays = model
-        .parameters()
+    let arrays = neutral_parameter_refs(model, false)
         .flatten()
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.clone()))
@@ -3407,7 +3406,7 @@ fn write_kimi_linear_fixture(directory: &Path) {
     );
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
-    for (name, value) in model.parameters().flatten() {
+    for (name, value) in neutral_parameter_refs(&model, false).flatten() {
         if name.as_ref() == "model.layers.1.mlp.experts.gate_up_proj" {
             for expert in 0..args.num_experts {
                 arrays.push((
@@ -3559,7 +3558,7 @@ fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Valu
     );
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
-    for (name, value) in model.parameters().flatten() {
+    for (name, value) in neutral_parameter_refs(&model, false).flatten() {
         let runtime = name.to_string();
         if runtime.ends_with("moe.experts.up_proj") {
             let prefix = nemotron_public_name(runtime.trim_end_matches(".up_proj"), &args);
@@ -3600,7 +3599,7 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     );
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
-    for (runtime_name, value) in model.parameters().flatten() {
+    for (runtime_name, value) in neutral_parameter_refs(&model, false).flatten() {
         let runtime_name = runtime_name.to_string();
         let gguf_name = if runtime_name == "model.embeddings.weight" {
             "token_embd.weight".to_string()
@@ -3871,8 +3870,7 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
         crate::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
-    let arrays = model
-        .parameters()
+    let arrays = neutral_parameter_refs(&model, false)
         .flatten()
         .into_iter()
         .map(|(name, value)| {

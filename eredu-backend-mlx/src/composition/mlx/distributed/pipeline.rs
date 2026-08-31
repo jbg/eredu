@@ -49,7 +49,7 @@ use crate::composition::mlx::realization::{FamilyBinding, FamilyRealization};
 use crate::{
     backend::error::Error,
     backend::nn::{
-        shared::{MlxModule, MlxModuleRef, MlxNeuralBackend},
+        shared::{neutral_parameter_refs, MlxModule, MlxNeuralBackend},
         tensor::{TokenValidationBatch, TokenValidationScope},
     },
     backend::runtime::cache::residency::{
@@ -103,7 +103,6 @@ use crate::{
             vl::QwenVlPipelineBindings,
         },
     },
-    module::ModuleParameters,
 };
 
 use eredu_architectures::ModelKind;
@@ -132,7 +131,7 @@ type LlamaBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxNeur
 /// This deliberately excludes forward execution, cache semantics, and residency
 /// policy: those remain architecture-owned or backend-neutral runtime concerns.
 trait PipelineQuantizationAdapter {
-    type Layer: ModuleParameters + Parameterized<crate::MlxTensor>;
+    type Layer: Parameterized<crate::MlxTensor>;
 
     fn model_type(&self) -> &str;
     fn static_units(
@@ -157,7 +156,7 @@ trait PipelineQuantizationAdapter {
 
 trait PipelineArchitectureBindings {
     type Architecture;
-    type Layer: ModuleParameters + Parameterized<crate::MlxTensor>;
+    type Layer: Parameterized<crate::MlxTensor>;
 
     fn model_type<'a>(&self, architecture: &'a Self::Architecture) -> &'a str;
     fn static_units(
@@ -7463,7 +7462,7 @@ fn load_bound_module<M>(
     stream: &Stream,
 ) -> Result<(u64, Vec<String>), Error>
 where
-    M: ModuleParameters + Parameterized<crate::MlxTensor>,
+    M: Parameterized<crate::MlxTensor>,
 {
     load_bound_module_excluding(
         module,
@@ -7487,7 +7486,7 @@ fn load_bound_module_excluding<M>(
     excluded: &dyn Fn(&str) -> bool,
 ) -> Result<(u64, Vec<String>), Error>
 where
-    M: ModuleParameters + Parameterized<crate::MlxTensor>,
+    M: Parameterized<crate::MlxTensor>,
 {
     let arrays = materialize_module_bindings(store, bindings, weights_stream, stream)?;
     if let Some(quantization) = quantize_on_load {
@@ -7501,8 +7500,7 @@ where
     } else {
         populate_module_from_arrays_excluding(module, &arrays, excluded)?;
     }
-    let bytes = module
-        .parameters()
+    let bytes = neutral_parameter_refs(module, false)
         .flatten()
         .into_iter()
         .filter(|(name, _)| !excluded(name))
@@ -7556,7 +7554,7 @@ impl PipelineLoadAccumulator {
         stream: &Stream,
     ) -> Result<(), Error>
     where
-        M: ModuleParameters + Parameterized<crate::MlxTensor>,
+        M: Parameterized<crate::MlxTensor>,
     {
         validate_partition_owner_bindings(&self.binding_authority, &owner, bindings)?;
         let (bytes, names) = load_bound_module(
@@ -7587,7 +7585,7 @@ impl PipelineLoadAccumulator {
         excluded_roles: &[eredu_runtime::ParameterRole],
     ) -> Result<(), Error>
     where
-        M: ModuleParameters + Parameterized<crate::MlxTensor>,
+        M: Parameterized<crate::MlxTensor>,
     {
         let (_, excluded_targets) =
             owner_parameter_targets(&self.binding_authority, &owner, excluded_roles)?;
@@ -7691,7 +7689,7 @@ impl StaticParameterVisitorMut<MlxNeuralBackend> for ArchitectureStaticLoader<'_
         }
         self.loaded.load(
             owner,
-            &mut MlxModuleRef::new(module),
+            module,
             self.store,
             &bindings,
             self.quantize_on_load,
@@ -8613,7 +8611,7 @@ fn build_pipeline_layer_storage<L, F, B, O>(
     mut owner_for_ordinal: O,
 ) -> Result<PipelineLayerStorage, Error>
 where
-    L: ModuleParameters,
+    L: Parameterized<crate::MlxTensor>,
     F: FnMut(usize, &Stream) -> Result<L, Error>,
     B: FnMut(
         usize,

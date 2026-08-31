@@ -34,7 +34,7 @@ let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?
 ```
 
 Reusable low-level mechanics are rooted directly under
-`eredu_backend_mlx::backend`, including neural modules, quantization,
+`eredu_backend_mlx::backend`, including neutral neural operators, quantization,
 checkpoint materialization, mutable execution state, logical distributed
 subgroups, axis-aware collectives, and runtime facilities.
 `safemlx` beneath this boundary contains only safe wrappers over native MLX.
@@ -51,6 +51,9 @@ operations alongside composition-owned model sessions, inputs, outputs,
 inspection policy, and realtime types. Backend configuration, errors, topology,
 prepared models, and reusable runtime facilities are organized under `backend`.
 Backend-generic sampling APIs exchange `MlxTensor` values.
+MLX physical parameter slots and their traversal are private implementation
+details. Public operators expose the architecture-owned `eredu_nn::Parameterized`
+topology; loading and residency use those stable identities exclusively.
 
 ## Features
 

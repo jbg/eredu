@@ -8,22 +8,15 @@ use safemlx::{error::Exception, ops::zeros_dtype, Array, Dtype, Stream};
 
 use crate::backend::nn::nested::NestedValue;
 
-use super::ModuleParameters;
+use super::PhysicalParameters;
 
 /// Trait for a module parameter.
-pub trait Parameter {
-    /// Total number of parameters in this module/parameter.
-    fn count(&self) -> usize;
-
+pub trait PhysicalParameter {
     /// Freeze the parameter.
     fn freeze(&mut self, recursive: bool);
 
     /// Unfreeze the parameter.
     fn unfreeze(&mut self, recursive: bool);
-
-    /// Check if the parameter is frozen. Returns `None` if the parameter is a module that has no
-    /// parameters.
-    fn is_frozen(&self) -> Option<bool>;
 
     /// Get the parameter as a nested value.
     fn as_nested_value(&self) -> NestedValue<Rc<str>, &Array>;
@@ -37,18 +30,18 @@ pub trait Parameter {
 
 /// A simple wrapper for a module parameter.
 #[derive(Debug, Clone)]
-pub struct Param<T> {
+pub struct PhysicalParam<T> {
     /// The value of the parameter.
     pub value: T,
 
     /// Whether the parameter is frozen.
     ///
-    /// Access this state through the [`Parameter`] trait.
+    /// Access this state through the [`PhysicalParameter`] trait.
     is_frozen: bool,
 }
 
-impl<T> Param<T> {
-    /// Create a new `Param`
+impl<T> PhysicalParam<T> {
+    /// Create a new `PhysicalParam`
     pub fn new(value: T) -> Self {
         Self {
             value,
@@ -57,13 +50,13 @@ impl<T> Param<T> {
     }
 }
 
-impl<T> From<T> for Param<T> {
+impl<T> From<T> for PhysicalParam<T> {
     fn from(inner: T) -> Self {
         Self::new(inner)
     }
 }
 
-impl Param<Array> {
+impl PhysicalParam<Array> {
     /// Create a placeholder parameter with the expected shape but no
     /// materialized tensor contents.
     ///
@@ -78,7 +71,7 @@ impl Param<Array> {
     }
 }
 
-impl Param<Option<Array>> {
+impl PhysicalParam<Option<Array>> {
     /// Create a present optional placeholder parameter with the expected shape
     /// but no materialized tensor contents.
     pub fn unloaded_some(
@@ -87,12 +80,12 @@ impl Param<Option<Array>> {
         stream: impl AsRef<Stream>,
     ) -> Result<Self, Exception> {
         Ok(Self::new(Some(
-            Param::<Array>::unloaded(shape, dtype, stream)?.value,
+            PhysicalParam::<Array>::unloaded(shape, dtype, stream)?.value,
         )))
     }
 }
 
-impl<T> Deref for Param<T> {
+impl<T> Deref for PhysicalParam<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -100,39 +93,31 @@ impl<T> Deref for Param<T> {
     }
 }
 
-impl<T> DerefMut for Param<T> {
+impl<T> DerefMut for PhysicalParam<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
 }
 
-impl<T> AsRef<T> for Param<T> {
+impl<T> AsRef<T> for PhysicalParam<T> {
     fn as_ref(&self) -> &T {
         &self.value
     }
 }
 
-impl<T> AsMut<T> for Param<T> {
+impl<T> AsMut<T> for PhysicalParam<T> {
     fn as_mut(&mut self) -> &mut T {
         &mut self.value
     }
 }
 
-impl Parameter for Param<Array> {
-    fn count(&self) -> usize {
-        1
-    }
-
+impl PhysicalParameter for PhysicalParam<Array> {
     fn freeze(&mut self, _recursive: bool) {
         self.is_frozen = true;
     }
 
     fn unfreeze(&mut self, _recursive: bool) {
         self.is_frozen = false;
-    }
-
-    fn is_frozen(&self) -> Option<bool> {
-        Some(self.is_frozen)
     }
 
     fn as_nested_value<'a>(&self) -> NestedValue<Rc<str>, &Array> {
@@ -151,21 +136,13 @@ impl Parameter for Param<Array> {
     }
 }
 
-impl Parameter for Param<Option<Array>> {
-    fn count(&self) -> usize {
-        self.value.as_ref().map_or(0, |_| 1)
-    }
-
+impl PhysicalParameter for PhysicalParam<Option<Array>> {
     fn freeze(&mut self, _recursive: bool) {
         self.is_frozen = true;
     }
 
     fn unfreeze(&mut self, _recursive: bool) {
         self.is_frozen = false;
-    }
-
-    fn is_frozen(&self) -> Option<bool> {
-        Some(self.is_frozen)
     }
 
     fn as_nested_value(&self) -> NestedValue<Rc<str>, &Array> {
@@ -192,14 +169,10 @@ impl Parameter for Param<Option<Array>> {
     }
 }
 
-impl<M> Parameter for Option<M>
+impl<M> PhysicalParameter for Option<M>
 where
-    M: ModuleParameters,
+    M: PhysicalParameters,
 {
-    fn count(&self) -> usize {
-        self.as_ref().map_or(0, |m| m.count())
-    }
-
     fn freeze(&mut self, recursive: bool) {
         if let Some(m) = self.as_mut() {
             m.freeze(recursive);
@@ -210,10 +183,6 @@ where
         if let Some(m) = self.as_mut() {
             m.unfreeze(recursive);
         }
-    }
-
-    fn is_frozen(&self) -> Option<bool> {
-        self.as_ref().and_then(|m| m.is_frozen())
     }
 
     fn as_nested_value(&self) -> NestedValue<Rc<str>, &Array> {
@@ -238,24 +207,16 @@ where
     }
 }
 
-impl<T> Parameter for T
+impl<T> PhysicalParameter for T
 where
-    T: ModuleParameters,
+    T: PhysicalParameters,
 {
-    fn count(&self) -> usize {
-        self.num_parameters()
-    }
-
     fn freeze(&mut self, recursive: bool) {
         self.freeze_parameters(recursive);
     }
 
     fn unfreeze(&mut self, recursive: bool) {
         self.unfreeze_parameters(recursive);
-    }
-
-    fn is_frozen(&self) -> Option<bool> {
-        self.all_frozen()
     }
 
     fn as_nested_value(&self) -> NestedValue<Rc<str>, &Array> {

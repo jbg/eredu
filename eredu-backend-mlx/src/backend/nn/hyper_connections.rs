@@ -4,14 +4,14 @@
 //! streams.  Keeping the numerical definition here avoids embedding a second
 //! implementation in target and speculative-decoder code.
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::{
     error::Exception,
     ops::{einsum, indexing::TryIndexOp, matmul, mean_axis, rsqrt, sigmoid, softmax_axis},
     Array, Dtype, Stream,
 };
 
-use crate::module::Param;
+use crate::module::PhysicalParam;
 
 /// The three tensors produced by one hyper-connection split.
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ pub struct HyperConnectionSplit {
 }
 
 /// Trainable multi-stream hyper-connection.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct HyperConnection {
     /// Number of residual streams.
@@ -38,13 +38,13 @@ pub struct HyperConnection {
     pub epsilon: f32,
     #[param]
     /// Projection producing pre/post/combination logits.
-    pub function: Param<Array>,
+    pub function: PhysicalParam<Array>,
     #[param]
     /// Additive mixing base, kept in FP32.
-    pub base: Param<Array>,
+    pub base: PhysicalParam<Array>,
     #[param]
     /// Three learned mixing scales, kept in FP32.
-    pub scale: Param<Array>,
+    pub scale: PhysicalParam<Array>,
 }
 
 impl HyperConnection {
@@ -67,21 +67,14 @@ impl HyperConnection {
             hidden_size,
             iterations,
             epsilon,
-            function: Param::unloaded(&[width, streams * hidden_size], Dtype::Float32, stream)?,
-            base: Param::unloaded(&[width], Dtype::Float32, stream)?,
-            scale: Param::unloaded(&[3], Dtype::Float32, stream)?,
+            function: PhysicalParam::unloaded(
+                &[width, streams * hidden_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            base: PhysicalParam::unloaded(&[width], Dtype::Float32, stream)?,
+            scale: PhysicalParam::unloaded(&[3], Dtype::Float32, stream)?,
         })
-    }
-
-    /// Collapses residual streams and returns the coefficients needed to expand them.
-    pub fn collapse(
-        &mut self,
-        residual: &Array,
-        norm_epsilon: f32,
-        stream: &Stream,
-    ) -> Result<(Array, Array, Array), Exception> {
-        let (collapsed, split) = self.collapse_split(residual, norm_epsilon, stream)?;
-        Ok((collapsed, split.post, split.combination))
     }
 
     /// Collapses residual streams while retaining all typed mixing coefficients.
@@ -158,7 +151,7 @@ pub fn expand(
 }
 
 /// Final learned collapse from multiple residual streams to one hidden state.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct HyperHead {
     /// Number of residual streams.
@@ -171,13 +164,13 @@ pub struct HyperHead {
     pub epsilon: f32,
     #[param]
     /// Projection producing per-stream collapse logits.
-    pub function: Param<Array>,
+    pub function: PhysicalParam<Array>,
     #[param]
     /// Per-stream additive base.
-    pub base: Param<Array>,
+    pub base: PhysicalParam<Array>,
     #[param]
     /// Learned collapse scale.
-    pub scale: Param<Array>,
+    pub scale: PhysicalParam<Array>,
 }
 
 impl HyperHead {
@@ -194,9 +187,13 @@ impl HyperHead {
             hidden_size,
             norm_epsilon,
             epsilon,
-            function: Param::unloaded(&[streams, streams * hidden_size], Dtype::Float32, stream)?,
-            base: Param::unloaded(&[streams], Dtype::Float32, stream)?,
-            scale: Param::unloaded(&[1], Dtype::Float32, stream)?,
+            function: PhysicalParam::unloaded(
+                &[streams, streams * hidden_size],
+                Dtype::Float32,
+                stream,
+            )?,
+            base: PhysicalParam::unloaded(&[streams], Dtype::Float32, stream)?,
+            scale: PhysicalParam::unloaded(&[1], Dtype::Float32, stream)?,
         })
     }
 

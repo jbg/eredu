@@ -1,7 +1,7 @@
-//! Traits for backend neural-network modules and parameters.
+//! Private physical-slot traversal for native MLX kernels.
 //!
-//! Keeping these traits separate from the neural-network modules also allows downstream crates to
-//! use the `eredu_backend_mlx_macros::ModuleParameters` derive macro for their own module implementations.
+//! Architecture and composition code use `eredu_nn::Parameterized`; this
+//! module must not be exported as a second parameter API.
 
 #[allow(clippy::module_inception)]
 mod module;

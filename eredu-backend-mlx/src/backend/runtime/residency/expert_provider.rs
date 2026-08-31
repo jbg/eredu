@@ -11,7 +11,7 @@ use eredu_runtime::{
 };
 use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
 
-use crate::module::Param;
+use crate::module::PhysicalParam;
 
 use crate::backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts};
 use crate::backend::nn::shared::MlxNeuralBackend;
@@ -844,20 +844,23 @@ fn execute_cached_gated_product_inner(
                 stream,
             )?
             .with_policy(spec.policy)?;
-            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+            bank.gate_up_proj =
+                PhysicalParam::new(acquired.compact_binding("gate_up_proj", stream)?);
             bank.gate_up_proj_bias =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_bias", stream)?);
-            bank.gate_up_proj_scales =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-            bank.gate_up_proj_biases =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("gate_up_proj_bias", stream)?);
+            bank.gate_up_proj_scales = PhysicalParam::new(
+                acquired.optional_compact_binding("gate_up_proj_scales", stream)?,
+            );
+            bank.gate_up_proj_biases = PhysicalParam::new(
+                acquired.optional_compact_binding("gate_up_proj_biases", stream)?,
+            );
+            bank.down_proj = PhysicalParam::new(acquired.compact_binding("down_proj", stream)?);
             bank.down_proj_bias =
-                Param::new(acquired.optional_compact_binding("down_proj_bias", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("down_proj_bias", stream)?);
             bank.down_proj_scales =
-                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
             bank.down_proj_biases =
-                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
             cache.record_compact_bank(
                 acquired.pass(),
                 acquired.scratch_bytes(),
@@ -937,16 +940,16 @@ pub fn execute_cached_relu2(
                 ],
                 stream,
             )?;
-            bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);
+            bank.up_proj = PhysicalParam::new(acquired.compact_binding("up_proj", stream)?);
             bank.up_proj_scales =
-                Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
             bank.up_proj_biases =
-                Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
-            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
+            bank.down_proj = PhysicalParam::new(acquired.compact_binding("down_proj", stream)?);
             bank.down_proj_scales =
-                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
             bank.down_proj_biases =
-                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+                PhysicalParam::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
             cache.record_compact_bank(
                 acquired.pass(),
                 acquired.scratch_bytes(),

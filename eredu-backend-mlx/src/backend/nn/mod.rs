@@ -6,22 +6,17 @@ pub mod attention;
 pub mod fp8;
 /// Gated-delta recurrent scans shared by linear-attention architectures.
 pub mod gated_delta;
-/// Multi-stream residual mixing shared by hyper-connection architectures.
-pub mod hyper_connections;
+pub(crate) mod hyper_connections;
 /// Activation functions.
 pub mod layers;
-/// Linear layers, embeddings, and language-model heads.
-pub mod linear;
-/// Backend-owned module parameter traversal.
-pub mod module;
-/// Mixture-of-experts routing and packed expert implementations.
-pub mod moe;
+pub(crate) mod linear;
+pub(crate) mod module;
+pub(crate) mod moe;
 pub(crate) mod native_quantization;
 pub(crate) mod nested;
 pub(crate) mod primitives;
 pub(crate) mod quantization;
-/// Rotary position-embedding variants and initialization.
-pub mod rope;
+pub(crate) mod rope;
 pub(crate) mod routing;
 /// Backend-neutral architecture operators specialized to MLX.
 pub mod shared;

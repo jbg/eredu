@@ -3,7 +3,7 @@
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::{GatedProductActivation, GatedProductPolicy, TensorParallelExpertOutput};
 
-use eredu_backend_mlx_macros::ModuleParameters;
+use eredu_backend_mlx_macros::PhysicalParameters;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use ref_cast::RefCast;
 use safemlx::{
@@ -18,7 +18,7 @@ use safemlx::{
 };
 
 use crate::{
-    module::Param,
+    module::PhysicalParam,
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     MlxTensor,
 };
@@ -206,7 +206,7 @@ pub struct TopKRouterConfig {
 }
 
 /// Reusable top-k router for sparse MoE layers.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct TopKRouter {
     /// Number of selected experts per token.
@@ -229,25 +229,25 @@ pub struct TopKRouter {
     pub topk_group: i32,
     #[param]
     /// Router projection weight.
-    pub weight: Param<Array>,
+    pub weight: PhysicalParam<Array>,
     #[param]
     /// Optional ordinary projection output bias applied to router logits.
-    pub bias: Param<Option<Array>>,
+    pub bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional affine scales for a packed router projection.
-    pub scales: Param<Option<Array>>,
+    pub scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional affine biases for a packed router projection.
-    pub biases: Param<Option<Array>>,
+    pub biases: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional score correction bias used only when choosing experts.
-    pub e_score_correction_bias: Param<Option<Array>>,
+    pub e_score_correction_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional learned feature scale applied to RMS-normalized inputs.
-    pub input_scale: Param<Option<Array>>,
+    pub input_scale: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional learned multiplier gathered for each selected expert.
-    pub route_scale: Param<Option<Array>>,
+    pub route_scale: PhysicalParam<Option<Array>>,
     /// Optional router-input RMS epsilon.
     pub input_rms_epsilon: Option<f32>,
     /// Whether normalized router inputs are divided by the square root of width.
@@ -327,7 +327,7 @@ impl TopKRouter {
                                 "{ggml_type:?} has no native router block geometry"
                             ))
                         })?;
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[
                             config.num_experts,
                             config.hidden_size / block_values as i32 * block_bytes as i32,
@@ -336,7 +336,7 @@ impl TopKRouter {
                         stream,
                     )?
                 }
-                Some(quantization) => Param::<Array>::unloaded(
+                Some(quantization) => PhysicalParam::<Array>::unloaded(
                     &[
                         config.num_experts,
                         quantized_packed_dimension(config.hidden_size, quantization.bits()),
@@ -344,19 +344,23 @@ impl TopKRouter {
                     Dtype::Uint32,
                     stream,
                 )?,
-                None => Param::<Array>::unloaded(
+                None => PhysicalParam::<Array>::unloaded(
                     &[config.num_experts, config.hidden_size],
                     dense_dtype,
                     stream,
                 )?,
             },
             bias: if config.projection_bias {
-                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[config.num_experts],
+                    dense_dtype,
+                    stream,
+                )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             scales: if let Some(quantization) = affine {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
                         config.num_experts,
                         config.hidden_size / quantization.group_size(),
@@ -369,10 +373,10 @@ impl TopKRouter {
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             biases: if let Some(quantization) = affine.filter(|q| q.has_biases()) {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
                         config.num_experts,
                         config.hidden_size / quantization.group_size(),
@@ -381,22 +385,34 @@ impl TopKRouter {
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             e_score_correction_bias: if config.score_correction_bias {
-                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[config.num_experts],
+                    dense_dtype,
+                    stream,
+                )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             input_scale: if config.input_rms_epsilon.is_some() {
-                Param::<Option<Array>>::unloaded_some(&[config.hidden_size], dense_dtype, stream)?
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[config.hidden_size],
+                    dense_dtype,
+                    stream,
+                )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             route_scale: if config.route_scale {
-                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[config.num_experts],
+                    dense_dtype,
+                    stream,
+                )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             input_rms_epsilon: config.input_rms_epsilon,
             input_inverse_sqrt_dimensions: config.input_inverse_sqrt_dimensions,
@@ -770,9 +786,6 @@ impl TopKRouter {
         argpartition_axis(masked_scores, -self.top_k, -1, stream)?
             .try_index_device((.., -self.top_k..), stream)
     }
-
-    /// Sets training mode.
-    pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 /// Applies route weights and reduces expert-major route outputs back to source tokens.
@@ -807,7 +820,7 @@ pub fn weighted_route_sum(
 }
 
 /// Packed routed ReLU2 expert bank with dense, affine, MXFP4, or GGUF-native IQ storage.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct PackedRelu2Experts {
     /// Number of routed experts.
@@ -826,22 +839,22 @@ pub struct PackedRelu2Experts {
     pub down_iquant: Option<WeightQuantization>,
     #[param]
     /// Expert up-projection weights.
-    pub up_proj: Param<Array>,
+    pub up_proj: PhysicalParam<Array>,
     #[param]
     /// Expert up-projection packed scales.
-    pub up_proj_scales: Param<Option<Array>>,
+    pub up_proj_scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Expert up-projection affine biases, absent for MXFP4.
-    pub up_proj_biases: Param<Option<Array>>,
+    pub up_proj_biases: PhysicalParam<Option<Array>>,
     #[param]
     /// Expert down-projection weights.
-    pub down_proj: Param<Array>,
+    pub down_proj: PhysicalParam<Array>,
     #[param]
     /// Expert down-projection packed scales.
-    pub down_proj_scales: Param<Option<Array>>,
+    pub down_proj_scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Expert down-projection affine biases, absent for MXFP4.
-    pub down_proj_biases: Param<Option<Array>>,
+    pub down_proj_biases: PhysicalParam<Option<Array>>,
 }
 
 impl PackedRelu2Experts {
@@ -891,7 +904,7 @@ impl PackedRelu2Experts {
                     .block_and_bytes()
                     .expect("canonical IQ block geometry");
                 return Ok((
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[
                             num_experts,
                             out_features,
@@ -900,13 +913,13 @@ impl PackedRelu2Experts {
                         Dtype::Uint8,
                         stream,
                     )?,
-                    Param::new(None),
-                    Param::new(None),
+                    PhysicalParam::new(None),
+                    PhysicalParam::new(None),
                 ));
             }
             match quantization {
                 Some(quantization) => Ok((
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[
                             num_experts,
                             out_features,
@@ -915,7 +928,7 @@ impl PackedRelu2Experts {
                         Dtype::Uint32,
                         stream,
                     )?,
-                    Param::<Option<Array>>::unloaded_some(
+                    PhysicalParam::<Option<Array>>::unloaded_some(
                         &[
                             num_experts,
                             out_features,
@@ -929,7 +942,7 @@ impl PackedRelu2Experts {
                         stream,
                     )?,
                     if quantization.has_biases() {
-                        Param::<Option<Array>>::unloaded_some(
+                        PhysicalParam::<Option<Array>>::unloaded_some(
                             &[
                                 num_experts,
                                 out_features,
@@ -939,17 +952,17 @@ impl PackedRelu2Experts {
                             stream,
                         )?
                     } else {
-                        Param::new(None)
+                        PhysicalParam::new(None)
                     },
                 )),
                 None => Ok((
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[num_experts, out_features, in_features],
                         dense_dtype,
                         stream,
                     )?,
-                    Param::new(None),
-                    Param::new(None),
+                    PhysicalParam::new(None),
+                    PhysicalParam::new(None),
                 )),
             }
         };
@@ -1077,16 +1090,13 @@ impl PackedRelu2Experts {
                 post_reduce: None,
             })
     }
-
-    /// Sets training mode.
-    pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
 
 /// Packed gated-product expert bank with optional MLX affine or MXFP4 projections.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct PackedGatedProductExperts {
     /// Number of experts.
@@ -1109,31 +1119,35 @@ pub struct PackedGatedProductExperts {
     pub native_fp8_e8m0: bool,
     #[param]
     /// Concatenated gate/up weights shaped `[experts, 2 * intermediate, hidden]`.
-    pub gate_up_proj: Param<Array>,
+    pub gate_up_proj: PhysicalParam<Array>,
     #[param]
     /// Optional ordinary gate/up output bias shaped `[experts, 2 * intermediate]`.
-    pub gate_up_proj_bias: Param<Option<Array>>,
+    pub gate_up_proj_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Gate/up quantization scales.
-    pub gate_up_proj_scales: Param<Option<Array>>,
+    pub gate_up_proj_scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Gate/up quantization biases.
-    pub gate_up_proj_biases: Param<Option<Array>>,
+    pub gate_up_proj_biases: PhysicalParam<Option<Array>>,
     #[param]
     /// Down weights shaped `[experts, hidden, intermediate]`.
-    pub down_proj: Param<Array>,
+    pub down_proj: PhysicalParam<Array>,
     #[param]
     /// Optional ordinary down output bias shaped `[experts, hidden]`.
-    pub down_proj_bias: Param<Option<Array>>,
+    pub down_proj_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Down quantization scales.
-    pub down_proj_scales: Param<Option<Array>>,
+    pub down_proj_scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Down quantization biases.
-    pub down_proj_biases: Param<Option<Array>>,
+    pub down_proj_biases: PhysicalParam<Option<Array>>,
 }
 
-type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
+type ExpertProjectionParams = (
+    PhysicalParam<Array>,
+    PhysicalParam<Option<Array>>,
+    PhysicalParam<Option<Array>>,
+);
 
 impl PackedGatedProductExperts {
     /// Creates an unloaded packed expert bank.
@@ -1188,7 +1202,7 @@ impl PackedGatedProductExperts {
                     .block_and_bytes()
                     .expect("canonical IQ block geometry");
                 Ok((
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[
                             num_experts,
                             out_features,
@@ -1197,8 +1211,8 @@ impl PackedGatedProductExperts {
                         Dtype::Uint8,
                         stream,
                     )?,
-                    Param::new(None),
-                    Param::new(None),
+                    PhysicalParam::new(None),
+                    PhysicalParam::new(None),
                 ))
             } else if let Some(quantization) = quantization {
                 if in_features % quantization.group_size() != 0 {
@@ -1208,7 +1222,7 @@ impl PackedGatedProductExperts {
                     )));
                 }
                 Ok((
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[
                             num_experts,
                             out_features,
@@ -1217,7 +1231,7 @@ impl PackedGatedProductExperts {
                         Dtype::Uint32,
                         stream,
                     )?,
-                    Param::<Option<Array>>::unloaded_some(
+                    PhysicalParam::<Option<Array>>::unloaded_some(
                         &[
                             num_experts,
                             out_features,
@@ -1231,7 +1245,7 @@ impl PackedGatedProductExperts {
                         stream,
                     )?,
                     if quantization.has_biases() {
-                        Param::<Option<Array>>::unloaded_some(
+                        PhysicalParam::<Option<Array>>::unloaded_some(
                             &[
                                 num_experts,
                                 out_features,
@@ -1241,18 +1255,18 @@ impl PackedGatedProductExperts {
                             stream,
                         )?
                     } else {
-                        Param::new(None)
+                        PhysicalParam::new(None)
                     },
                 ))
             } else {
                 Ok((
-                    Param::<Array>::unloaded(
+                    PhysicalParam::<Array>::unloaded(
                         &[num_experts, out_features, in_features],
                         dense_dtype,
                         stream,
                     )?,
-                    Param::new(None),
-                    Param::new(None),
+                    PhysicalParam::new(None),
+                    PhysicalParam::new(None),
                 ))
             }
         };
@@ -1276,25 +1290,25 @@ impl PackedGatedProductExperts {
             native_fp8_e8m0: false,
             gate_up_proj,
             gate_up_proj_bias: if projection_biases[0] {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[num_experts, 2 * intermediate_dim],
                     dense_dtype,
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             gate_up_proj_scales,
             gate_up_proj_biases,
             down_proj,
             down_proj_bias: if projection_biases[1] {
-                Param::<Option<Array>>::unloaded_some(
+                PhysicalParam::<Option<Array>>::unloaded_some(
                     &[num_experts, hidden_dim],
                     dense_dtype,
                     stream,
                 )?
             } else {
-                Param::new(None)
+                PhysicalParam::new(None)
             },
             down_proj_scales,
             down_proj_biases,
@@ -1313,12 +1327,12 @@ impl PackedGatedProductExperts {
     /// Rebuilds projection storage for native block-FP8 expert tensors.
     pub fn with_native_fp8_e8m0(mut self, stream: &Stream) -> Result<Self, Exception> {
         let ceil128 = |value: i32| (value + 127) / 128;
-        self.gate_up_proj = Param::<Array>::unloaded(
+        self.gate_up_proj = PhysicalParam::<Array>::unloaded(
             &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
             Dtype::Uint8,
             stream,
         )?;
-        self.gate_up_proj_scales = Param::<Option<Array>>::unloaded_some(
+        self.gate_up_proj_scales = PhysicalParam::<Option<Array>>::unloaded_some(
             &[
                 self.num_experts,
                 ceil128(2 * self.intermediate_dim),
@@ -1327,12 +1341,12 @@ impl PackedGatedProductExperts {
             Dtype::Uint8,
             stream,
         )?;
-        self.down_proj = Param::<Array>::unloaded(
+        self.down_proj = PhysicalParam::<Array>::unloaded(
             &[self.num_experts, self.hidden_dim, self.intermediate_dim],
             Dtype::Uint8,
             stream,
         )?;
-        self.down_proj_scales = Param::<Option<Array>>::unloaded_some(
+        self.down_proj_scales = PhysicalParam::<Option<Array>>::unloaded_some(
             &[
                 self.num_experts,
                 ceil128(self.hidden_dim),
@@ -1542,15 +1556,12 @@ impl PackedGatedProductExperts {
             post_reduce: Some(bias),
         })
     }
-
-    /// Sets training mode.
-    pub fn training_mode(&mut self, _mode: bool) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{backend::ExecutionContext, module::Param};
+    use crate::{backend::ExecutionContext, module::PhysicalParam};
     use safemlx::{transforms::eval, Device, DeviceType};
 
     #[test]
@@ -1578,12 +1589,13 @@ mod tests {
             stream,
         )
         .unwrap();
-        router.weight = Param::new(Array::from_slice(
+        router.weight = PhysicalParam::new(Array::from_slice(
             &[1.0_f32, 0.0, 0.0, 1.0, -1.0, 0.0],
             &[3, 2],
         ));
-        router.input_scale = Param::new(Some(Array::from_slice(&[2.0_f32, 1.0], &[2])));
-        router.route_scale = Param::new(Some(Array::from_slice(&[2.0_f32, 3.0, 5.0], &[3])));
+        router.input_scale = PhysicalParam::new(Some(Array::from_slice(&[2.0_f32, 1.0], &[2])));
+        router.route_scale =
+            PhysicalParam::new(Some(Array::from_slice(&[2.0_f32, 3.0, 5.0], &[3])));
         let output = router
             .forward_routes_with_selection_bias(
                 &Array::from_slice(&[3.0_f32, 4.0], &[1, 2]),
@@ -1647,13 +1659,13 @@ mod tests {
             stream,
         )
         .unwrap();
-        router.weight = Param::new(Array::from_slice(&[0.0_f32; 3], &[3, 1]));
-        router.bias = Param::new(Some(Array::from_slice(
+        router.weight = PhysicalParam::new(Array::from_slice(&[0.0_f32; 3], &[3, 1]));
+        router.bias = PhysicalParam::new(Some(Array::from_slice(
             &[0.0_f32, 2.0_f32.ln(), 4.0_f32.ln()],
             &[3],
         )));
         router.e_score_correction_bias =
-            Param::new(Some(Array::from_slice(&[10.0_f32, 0.0, 0.0], &[3])));
+            PhysicalParam::new(Some(Array::from_slice(&[10.0_f32, 0.0, 0.0], &[3])));
 
         let output = router
             .forward_routes_with_selection_bias(
@@ -1705,10 +1717,11 @@ mod tests {
             .unwrap()
             .with_policy(policy)
             .unwrap();
-        bank.gate_up_proj = Param::new(Array::from_slice(&[0.0_f32, 0.0], &[1, 2, 1]));
-        bank.gate_up_proj_bias = Param::new(Some(Array::from_slice(&[2.5_f32, -3.0], &[1, 2])));
-        bank.down_proj = Param::new(Array::from_slice(&[2.0_f32], &[1, 1, 1]));
-        bank.down_proj_bias = Param::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
+        bank.gate_up_proj = PhysicalParam::new(Array::from_slice(&[0.0_f32, 0.0], &[1, 2, 1]));
+        bank.gate_up_proj_bias =
+            PhysicalParam::new(Some(Array::from_slice(&[2.5_f32, -3.0], &[1, 2])));
+        bank.down_proj = PhysicalParam::new(Array::from_slice(&[2.0_f32], &[1, 1, 1]));
+        bank.down_proj_bias = PhysicalParam::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
 
         let output = bank
             .forward(
@@ -1750,9 +1763,9 @@ mod tests {
         let rank = |down_weight: f32| {
             let mut bank =
                 PackedGatedProductExperts::new(1, 1, 1, None, None, [false, true], stream).unwrap();
-            bank.gate_up_proj = Param::new(Array::from_slice(&[1.0_f32, 1.0], &[1, 2, 1]));
-            bank.down_proj = Param::new(Array::from_slice(&[down_weight], &[1, 1, 1]));
-            bank.down_proj_bias = Param::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
+            bank.gate_up_proj = PhysicalParam::new(Array::from_slice(&[1.0_f32, 1.0], &[1, 2, 1]));
+            bank.down_proj = PhysicalParam::new(Array::from_slice(&[down_weight], &[1, 1, 1]));
+            bank.down_proj_bias = PhysicalParam::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
             bank
         };
         let input = Array::from_slice(&[1.0_f32], &[1, 1]);
