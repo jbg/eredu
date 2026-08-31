@@ -15,8 +15,9 @@ Applications that use only loading, chat, and generation should normally use
 the `eredu` facade. The implementation crate is a direct dependency only for
 backend development and backend-specific low-level tooling.
 
-See the [MLX backend documentation](doc/README.md) for implementation
-architecture, native platform setup, and low-level `safemlx` guides.
+See the [MLX backend documentation](https://github.com/jbg/eredu/blob/main/eredu-backend-mlx/doc/README.md)
+for implementation architecture, native platform setup, and low-level
+`safemlx` guides.
 
 ```rust,no_run
 use eredu_backend_mlx::{
@@ -78,5 +79,5 @@ backend-neutral driver in `eredu-evaluation`.
 
 Backend-specific reference-fixture generators used by the Moshi and
 PersonaPlex parity examples live in `validation/` and are packaged with this
-crate. See the general [evaluation architecture](../doc/evaluation.md) for the
-portable observation, evidence, comparison, and reporting contracts.
+crate. See the general [evaluation architecture](https://github.com/jbg/eredu/blob/main/doc/evaluation.md)
+for the portable observation, evidence, comparison, and reporting contracts.
