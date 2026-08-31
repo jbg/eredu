@@ -1258,14 +1258,23 @@ A new backend should:
 3. implement concrete runtime-state/cache storage when cached or paged
    execution is desired;
 4. implement collective operations when distributed execution is desired;
-5. compose those capabilities with existing neutral architectures and runtime
-   policies in the facade;
-6. populate portable capability, resource, admission, and telemetry reports;
-7. add optional multimodal, speculative, realtime, transfer, or distributed
+5. bind those capabilities to neutral architecture and runtime contracts inside
+   the concrete backend adapter;
+6. expose a narrow adapter for selection by the facade, where
+   backend-independent application orchestration remains;
+7. populate portable capability, resource, admission, and telemetry reports;
+8. add optional multimodal, speculative, realtime, transfer, or distributed
    capabilities only when supported;
-8. realize portable execution plans through an
+9. realize portable execution plans through an
    `ExecutionPlanBackendFactory`; and
-9. run the reusable backend and architecture conformance suites.
+10. run the reusable backend and architecture conformance suites.
+
+Facade selection is an upward dependency on the backend's adapter, not
+ownership of concrete composition: the facade may select and opaquely wrap the
+adapter, while the backend must not depend on facade APIs or orchestration.
+Concrete binding consumes architecture-owned declarations and does not take
+ownership of model-family configuration, checkpoint naming, execution
+equations, or state geometry.
 
 Adding a backend never requires implementing Llama, mapping Llama checkpoint
 names, or constructing a Llama-specific cache. Backend-specific compiler
