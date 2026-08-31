@@ -854,9 +854,6 @@ impl Default for LocalRealtimeBackendFactory {
     }
 }
 
-/// Realtime coordination failure from the selected local backend.
-pub type LocalRealtimeError = eredu_core::RealtimeError<LocalBackendError>;
-
 /// A selected local realtime backend and its loaded model.
 ///
 /// Native models, tensors, streams, and backend traits remain private. Use a
@@ -931,7 +928,7 @@ impl LocalRealtimeScheduler {
     pub fn new(
         model: &LocalRealtimeModel,
         limits: crate::SchedulerLimits,
-    ) -> Result<Self, LocalRealtimeError> {
+    ) -> Result<Self, eredu_core::RealtimeError<LocalBackendError>> {
         Ok(Self {
             inner: eredu_core::RealtimeScheduler::new(&model.inner, limits)
                 .map_err(map_local_realtime_error)?,
@@ -944,7 +941,7 @@ impl LocalRealtimeScheduler {
         model: &LocalRealtimeModel,
         request: crate::RequestId,
         sampling: crate::RealtimeSampling,
-    ) -> Result<(), LocalRealtimeError> {
+    ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
         self.inner
             .register_request(&model.inner, request, sampling)
             .map_err(map_local_realtime_error)
@@ -956,7 +953,7 @@ impl LocalRealtimeScheduler {
         model: &LocalRealtimeModel,
         request: crate::RequestId,
         session: LocalRealtimeSession,
-    ) -> Result<(), LocalRealtimeError> {
+    ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
         self.inner
             .register_request_with_session(&model.inner, request, session.inner)
             .map_err(map_local_realtime_error)
@@ -968,7 +965,7 @@ impl LocalRealtimeScheduler {
         model: &LocalRealtimeModel,
         request: crate::RequestId,
         frame: crate::RealtimeInputFrame,
-    ) -> Result<crate::WorkId, LocalRealtimeError> {
+    ) -> Result<crate::WorkId, eredu_core::RealtimeError<LocalBackendError>> {
         self.enqueue_with_deadline(model, request, frame, None)
     }
 
@@ -979,7 +976,7 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
         frame: crate::RealtimeInputFrame,
         deadline: Option<Instant>,
-    ) -> Result<crate::WorkId, LocalRealtimeError> {
+    ) -> Result<crate::WorkId, eredu_core::RealtimeError<LocalBackendError>> {
         let input = model
             .inner
             .backend()
@@ -1001,7 +998,7 @@ impl LocalRealtimeScheduler {
         model: &LocalRealtimeModel,
         request: crate::RequestId,
         frames: Vec<crate::RealtimeInputFrame>,
-    ) -> Result<Vec<crate::WorkId>, LocalRealtimeError> {
+    ) -> Result<Vec<crate::WorkId>, eredu_core::RealtimeError<LocalBackendError>> {
         let inputs = frames
             .iter()
             .map(|frame| {
@@ -1026,7 +1023,7 @@ impl LocalRealtimeScheduler {
     pub fn run_queued(
         &mut self,
         model: &mut LocalRealtimeModel,
-    ) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
+    ) -> Result<Vec<LocalRealtimeCompletedStep>, eredu_core::RealtimeError<LocalBackendError>> {
         let completed = self
             .inner
             .run_queued(&mut model.inner)
@@ -1039,7 +1036,7 @@ impl LocalRealtimeScheduler {
         &mut self,
         model: &mut LocalRealtimeModel,
         max_frames: usize,
-    ) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
+    ) -> Result<Vec<LocalRealtimeCompletedStep>, eredu_core::RealtimeError<LocalBackendError>> {
         let completed = self
             .inner
             .run_bounded(&mut model.inner, max_frames)
@@ -1048,14 +1045,20 @@ impl LocalRealtimeScheduler {
     }
 
     /// Completes one request and drops its backend session.
-    pub fn finish_request(&mut self, request: crate::RequestId) -> Result<(), LocalRealtimeError> {
+    pub fn finish_request(
+        &mut self,
+        request: crate::RequestId,
+    ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
         self.inner
             .finish_request(request)
             .map_err(map_local_realtime_error)
     }
 
     /// Cancels one request and discards queued frames.
-    pub fn cancel_request(&mut self, request: crate::RequestId) -> Result<(), LocalRealtimeError> {
+    pub fn cancel_request(
+        &mut self,
+        request: crate::RequestId,
+    ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
         self.inner
             .cancel_request(request)
             .map_err(map_local_realtime_error)
@@ -1065,7 +1068,7 @@ impl LocalRealtimeScheduler {
     pub fn release_request(
         &mut self,
         request: crate::RequestId,
-    ) -> Result<LocalRealtimeSession, LocalRealtimeError> {
+    ) -> Result<LocalRealtimeSession, eredu_core::RealtimeError<LocalBackendError>> {
         Ok(LocalRealtimeSession {
             inner: self
                 .inner
@@ -1078,7 +1081,7 @@ impl LocalRealtimeScheduler {
     pub fn forget_terminal_request(
         &mut self,
         request: crate::RequestId,
-    ) -> Result<crate::RequestStatus, LocalRealtimeError> {
+    ) -> Result<crate::RequestStatus, eredu_core::RealtimeError<LocalBackendError>> {
         self.inner
             .forget_terminal_request(request)
             .map_err(map_local_realtime_error)
@@ -1100,7 +1103,7 @@ impl LocalRealtimeScheduler {
         model: &LocalRealtimeModel,
         request: crate::RequestId,
         sampling: crate::RealtimeSampling,
-    ) -> Result<(), LocalRealtimeError> {
+    ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
         self.inner
             .set_request_sampling(&model.inner, request, sampling)
             .map_err(map_local_realtime_error)
@@ -1120,7 +1123,7 @@ impl LocalRealtimeScheduler {
 fn observe_realtime_steps(
     model: &LocalRealtimeModel,
     completed: Vec<eredu_core::RealtimeCompletedStep<eredu_backend_mlx::native::MlxRealtimeOutput>>,
-) -> Result<Vec<LocalRealtimeCompletedStep>, LocalRealtimeError> {
+) -> Result<Vec<LocalRealtimeCompletedStep>, eredu_core::RealtimeError<LocalBackendError>> {
     completed
         .into_iter()
         .map(|step| {
@@ -1142,7 +1145,7 @@ fn observe_realtime_steps(
 
 fn map_local_realtime_error(
     error: eredu_core::RealtimeError<eredu_backend_mlx::backend::error::Error>,
-) -> LocalRealtimeError {
+) -> eredu_core::RealtimeError<LocalBackendError> {
     match error {
         eredu_core::RealtimeError::Backend(error) => {
             eredu_core::RealtimeError::Backend(LocalBackendError::new("realtime execution", error))
