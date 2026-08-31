@@ -8,6 +8,8 @@
 //! execution support remain in their checkpoint block representation through
 //! conversion so runtimes can execute them without affine expansion.
 
+#![forbid(unsafe_code)]
+
 mod catalog;
 mod codebook;
 mod convert;

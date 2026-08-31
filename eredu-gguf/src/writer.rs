@@ -213,6 +213,16 @@ impl<W: Write> Encoder<'_, W> {
             .write_all(v)
             .map_err(|source| Error::Io { offset: 0, source })
     }
+    fn i8s(&mut self, values: &[i8]) -> Result<()> {
+        let mut bytes = [0; 8 * 1024];
+        for chunk in values.chunks(bytes.len()) {
+            for (byte, value) in bytes.iter_mut().zip(chunk) {
+                *byte = *value as u8;
+            }
+            self.bytes(&bytes[..chunk.len()])?;
+        }
+        Ok(())
+    }
     fn count(&mut self, v: u64) -> Result<()> {
         if self.version == 1 {
             self.u32(v.try_into().map_err(|_| Error::Overflow("v1 count"))?)
@@ -249,9 +259,7 @@ impl<W: Write> Encoder<'_, W> {
         self.count(a.len() as u64)?;
         match a {
             MetadataArray::Uint8(v) => self.bytes(v),
-            MetadataArray::Int8(v) => {
-                self.bytes(unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len()) })
-            }
+            MetadataArray::Int8(v) => self.i8s(v),
             MetadataArray::Uint16(v) => {
                 for x in v {
                     self.u16(*x)?;

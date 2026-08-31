@@ -121,6 +121,22 @@ fn metadata_only_file_does_not_require_tensor_section_padding() {
 }
 
 #[test]
+fn signed_byte_metadata_crosses_writer_buffer_boundaries() {
+    let values = (0..9_000)
+        .map(|value| value as u8 as i8)
+        .collect::<Vec<_>>();
+    let metadata = BTreeMap::from([("signed.bytes".into(), V::Array(A::Int8(values)))]);
+    let mut output = Cursor::new(Vec::new());
+
+    Writer::default()
+        .write(&mut output, &metadata, &[])
+        .unwrap();
+
+    let reader = Reader::new(Cursor::new(output.into_inner())).unwrap();
+    assert_eq!(reader.metadata(), &metadata);
+}
+
+#[test]
 fn deterministic_and_raw_quantized_roundtrip() {
     let a = file(3, Endian::Little, 32);
     let b = file(3, Endian::Little, 32);
