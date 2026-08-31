@@ -1764,7 +1764,7 @@ mod tests {
                 backend_active_allocation_bytes: unavailable(),
                 backend_allocator_cache_bytes: unavailable(),
                 physical_semantics: crate::PhysicalMemorySemantics::Unknown,
-                currently_mapped_shards: unavailable(),
+                currently_cached_shards: unavailable(),
             })
         }
     }

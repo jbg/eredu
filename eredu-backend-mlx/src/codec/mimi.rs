@@ -1,12 +1,11 @@
 //! MLX checkpoint adapter for the backend-neutral Mimi architecture.
 
-use std::{fs::File, path::Path};
+use std::{fs, path::Path};
 
 use eredu_codec::{
     mimi::{checkpoint_tensor_plan, CheckpointTensorLayout, Config, Mimi},
     Error,
 };
-use memmap2::MmapOptions;
 use safemlx::{Array, Stream};
 use safetensors::SafeTensors;
 
@@ -15,7 +14,7 @@ use crate::MlxTensor;
 /// Loads a released Mimi SafeTensors checkpoint into the MLX backend.
 ///
 /// Checkpoint naming and layout decisions come from `eredu-codec`; this
-/// adapter owns file mapping, MLX array construction, device-side layout
+/// adapter owns file buffering, MLX array construction, device-side layout
 /// conversion, and stream-local copies.
 pub fn load(
     path: impl AsRef<Path>,
@@ -31,12 +30,8 @@ fn load_checkpoint_parameters(
     path: impl AsRef<Path>,
     stream: &Stream,
 ) -> Result<Vec<(String, MlxTensor)>, Error> {
-    let file = File::open(path)?;
-    // SAFETY: `mmap` is kept alive while every SafeTensors view is converted
-    // into an owned, stream-local MLX array below. No mapped view escapes this
-    // function.
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap).map_err(boxed)?;
+    let bytes = fs::read(path)?;
+    let tensors = SafeTensors::deserialize(&bytes).map_err(boxed)?;
     let mut loaded = Vec::new();
     for (checkpoint_name, view) in tensors.iter() {
         let Some(plan) = checkpoint_tensor_plan(checkpoint_name) else {

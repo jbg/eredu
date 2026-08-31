@@ -4,12 +4,10 @@ use eredu_checkpoint::WeightQuantization;
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
     path::{Path, PathBuf},
 };
 
 use eredu_gguf::MetadataValue as GgufMetadataValue;
-use memmap2::MmapOptions;
 use safemlx::{transforms::async_eval_with_event, Array, Stream};
 
 #[cfg(all(
@@ -232,10 +230,8 @@ pub fn for_each_safetensor_array<F>(
 where
     F: FnMut(String, Array) -> Result<(), Error>,
 {
-    let file = File::open(path)?;
-    // The mmap only has to live until each TensorView is copied into an MLX-owned Array.
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap).map_err(|err| Error::Other(Box::new(err)))?;
+    let bytes = std::fs::read(path)?;
+    let tensors = SafeTensors::deserialize(&bytes).map_err(|err| Error::Other(Box::new(err)))?;
 
     for (key, view) in tensors.iter() {
         let value = Array::try_from(view).map_err(|err| Error::Other(Box::new(err)))?;

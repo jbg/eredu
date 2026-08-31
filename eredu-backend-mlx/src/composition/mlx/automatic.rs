@@ -325,7 +325,7 @@ fn mlx_load_options(
                 *host_budget_bytes,
                 *device_layer_window,
             )?,
-            max_mapped_shards: plan.max_mapped_shards,
+            max_cached_shards: plan.max_cached_shards,
             sample_backend_memory: factory.sample_mlx_memory,
             sample_process_memory: factory.sample_process_memory,
         }),
@@ -341,7 +341,7 @@ fn mlx_load_options(
                 *host_lookahead,
                 *background_queue,
             )?;
-            options.max_mapped_shards = plan.max_mapped_shards;
+            options.max_cached_shards = plan.max_cached_shards;
             options.sample_backend_memory = factory.sample_mlx_memory;
             options.sample_process_memory = factory.sample_process_memory;
             NonExpertWeightResidency::DenseDiskStream(options)

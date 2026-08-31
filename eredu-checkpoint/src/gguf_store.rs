@@ -20,7 +20,7 @@ use crate::{
         validate_selection, BoundedReadProof, CheckpointLease, CheckpointSource,
         EncodedTensorLease, ReadPolicy, StoreError, TensorMetadata, TensorReadRequest,
         TensorSelection, WeightStore, WeightStoreBackend, WeightStoreDiagnostics,
-        DEFAULT_MAX_MAPPED_SHARDS,
+        DEFAULT_MAX_CACHED_SHARDS,
     },
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
     StoredDtype,
@@ -100,7 +100,7 @@ impl GgufWeightStoreBuilder {
     /// Sets the nonzero maximum number of open GGUF shard readers.
     pub fn max_cached_readers(mut self, maximum: usize) -> Result<Self, StoreError> {
         if maximum == 0 {
-            return Err(StoreError::InvalidMappedShardLimit);
+            return Err(StoreError::InvalidShardCacheLimit);
         }
         self.max_cached_readers = maximum;
         Ok(self)
@@ -245,7 +245,7 @@ impl GgufWeightStoreBuilder {
                     evictions: 0,
                 }),
                 max_cached_readers: if self.max_cached_readers == 0 {
-                    DEFAULT_MAX_MAPPED_SHARDS
+                    DEFAULT_MAX_CACHED_SHARDS
                 } else {
                     self.max_cached_readers
                 },
@@ -433,10 +433,10 @@ impl WeightStore for GgufWeightStore {
             .map_err(|_| StoreError::Internal("GGUF reader cache is poisoned".into()))?;
         Ok(WeightStoreDiagnostics {
             backend: WeightStoreBackend::Gguf,
-            mapping_hits: readers.hits,
-            mapping_misses: readers.misses,
+            cache_hits: readers.hits,
+            cache_misses: readers.misses,
             evictions: readers.evictions,
-            currently_mapped_shards: readers
+            currently_cached_shards: readers
                 .materializers
                 .iter()
                 .filter(|materializer| materializer.open_shard_path().is_some())

@@ -36,9 +36,9 @@ impl PreparedSafetensorsArtifact {
         configuration: ModelConfiguration,
         architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
         catalog: TensorCatalog,
-        max_mapped_shards: usize,
+        max_cached_shards: usize,
     ) -> Result<Self, Error> {
-        let store = open_catalog_bound_store(&path, catalog, max_mapped_shards)?;
+        let store = open_catalog_bound_store(&path, catalog, max_cached_shards)?;
         let resolution = architecture
             .checkpoint_resolution()
             .ok_or_else(|| {
@@ -82,9 +82,9 @@ pub(crate) fn open_prepared_safetensors_checkpoint(
     catalog: TensorCatalog,
     plan: &SafetensorsCheckpointPlan,
     admitted_resolution: &eredu_checkpoint::validation::ResolvedCheckpointPlan,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 ) -> Result<SharedCheckpointSource, Error> {
-    let store = open_catalog_bound_store(path, catalog, max_mapped_shards)?;
+    let store = open_catalog_bound_store(path, catalog, max_cached_shards)?;
     let resolution = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
         .map_err(|failure| {
         Error::ArchitectureModel(format!(
@@ -104,9 +104,9 @@ pub(crate) fn open_prepared_safetensors_checkpoint(
 fn open_catalog_bound_store(
     path: &Path,
     catalog: TensorCatalog,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 ) -> Result<SharedCheckpointSource, Error> {
-    let store = SafetensorsWeightStore::open_with_max_mapped_shards(path, max_mapped_shards)?;
+    let store = SafetensorsWeightStore::open_with_max_cached_shards(path, max_cached_shards)?;
     validate_prepared_catalog(&catalog, &store)?;
     Ok(Arc::new(PreparedCatalogSource {
         catalog,
@@ -338,7 +338,7 @@ mod tests {
         )
         .unwrap();
 
-        let source = eredu_checkpoint::store::SafetensorsWeightStore::open_with_max_mapped_shards(
+        let source = eredu_checkpoint::store::SafetensorsWeightStore::open_with_max_cached_shards(
             directory.path(),
             1,
         )

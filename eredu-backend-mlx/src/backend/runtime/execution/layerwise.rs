@@ -50,13 +50,13 @@ fn is_temporary_residency_contention(error: &Error) -> bool {
     )
 }
 
-/// Opens a shared safetensors source with a bounded mapped-shard cache.
+/// Opens a shared SafeTensors source with a bounded shard-buffer cache.
 pub fn open_safetensors_weight_store(
     model_dir: &Path,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 ) -> Result<SharedCheckpointSource, Error> {
     Ok(Arc::new(
-        SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
+        SafetensorsWeightStore::open_with_max_cached_shards(model_dir, max_cached_shards)?,
     ))
 }
 

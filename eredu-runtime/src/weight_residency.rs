@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use eredu_core::{
     residency::{CacheEvictionPolicy, OffloadConfig, OffloadError, OffloadUnitId},
-    DEFAULT_MAX_MAPPED_SHARDS,
+    DEFAULT_MAX_CACHED_SHARDS,
 };
 
 use crate::WeightBinding;
@@ -176,8 +176,8 @@ pub enum DenseTransferScheduleError {
 pub struct LayerwiseLoadOptions {
     /// Residency budgets and maximum device-unit window.
     pub offload: OffloadConfig,
-    /// Maximum number of checkpoint payload shards retained as mappings.
-    pub max_mapped_shards: usize,
+    /// Maximum number of checkpoint payload shards or readers retained in cache.
+    pub max_cached_shards: usize,
     /// Sample backend allocator memory when a forward pass completes.
     pub sample_backend_memory: bool,
     /// Sample process memory metrics when a forward pass completes.
@@ -185,7 +185,7 @@ pub struct LayerwiseLoadOptions {
 }
 
 impl LayerwiseLoadOptions {
-    /// Creates layerwise options with the default mapped-shard bound.
+    /// Creates layerwise options with the default shard-cache bound.
     pub fn new(offload: OffloadConfig) -> Self {
         Self {
             offload,
@@ -198,7 +198,7 @@ impl Default for LayerwiseLoadOptions {
     fn default() -> Self {
         Self {
             offload: OffloadConfig::default(),
-            max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
+            max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             sample_backend_memory: false,
             sample_process_memory: false,
         }
@@ -218,8 +218,8 @@ pub struct DenseDiskStreamLoadOptions {
     pub background_queue_capacity: usize,
     /// Deterministic ordering used when unprotected cached copies must be evicted.
     pub eviction_policy: CacheEvictionPolicy,
-    /// Maximum number of checkpoint payload shards retained as mappings.
-    pub max_mapped_shards: usize,
+    /// Maximum number of checkpoint payload shards or readers retained in cache.
+    pub max_cached_shards: usize,
     /// Sample backend allocator memory after a forward pass.
     pub sample_backend_memory: bool,
     /// Sample process memory and page-fault counters after a forward pass.
@@ -240,7 +240,7 @@ impl DenseDiskStreamLoadOptions {
             host_lookahead,
             background_queue_capacity,
             eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
-            max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
+            max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             sample_backend_memory: false,
             sample_process_memory: false,
         };
@@ -517,8 +517,8 @@ impl WeightResidency {
     }
 
     /// Returns the common checkpoint shard/reader cache bound.
-    pub const fn max_mapped_shards(self) -> usize {
-        self.layers().max_mapped_shards()
+    pub const fn max_cached_shards(self) -> usize {
+        self.layers().max_cached_shards()
     }
 }
 
@@ -530,11 +530,11 @@ impl Default for WeightResidency {
 
 impl LayerWeightResidency {
     /// Returns the checkpoint shard/reader cache bound carried by this policy.
-    pub const fn max_mapped_shards(self) -> usize {
+    pub const fn max_cached_shards(self) -> usize {
         match self {
-            Self::FullyResident => DEFAULT_MAX_MAPPED_SHARDS,
-            Self::LayerwiseHost(options) => options.max_mapped_shards,
-            Self::DenseDiskStream(options) => options.max_mapped_shards,
+            Self::FullyResident => DEFAULT_MAX_CACHED_SHARDS,
+            Self::LayerwiseHost(options) => options.max_cached_shards,
+            Self::DenseDiskStream(options) => options.max_cached_shards,
         }
     }
 

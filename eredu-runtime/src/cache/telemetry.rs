@@ -229,7 +229,7 @@ pub struct CacheResidencyReport {
     /// Logical bytes written or cataloged for prompt caches.
     pub prompt_cache_bytes: u64,
     /// Imported persistent shard count.
-    pub imported_mapped_shards: u64,
+    pub imported_buffered_shards: u64,
     /// Optional peak process resident-set size.
     pub process_rss_bytes: Option<u64>,
     /// Optional cumulative minor page faults.

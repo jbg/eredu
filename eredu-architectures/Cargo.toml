@@ -9,6 +9,9 @@ rust-version.workspace = true
 description = "Backend-neutral text, multimodal, and realtime model architectures for Eredu"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true

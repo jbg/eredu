@@ -147,9 +147,9 @@ pub trait MlxWeightRecipeExt {
 impl MlxWeightRecipeExt for DerivedWeightRecipe {
     ///
     /// Source leases remain live until their dependent output has been
-    /// evaluated. If a multi-input join reaches the mapping bound, completed
+    /// evaluated. If a multi-input join reaches the shard-cache bound, completed
     /// children are detached before retrying so cross-shard recipes can honor
-    /// a one-mapping limit without serializing the normal batched path.
+    /// a one-shard cache limit without serializing the normal batched path.
     #[cfg(test)]
     fn materialize(
         &self,
@@ -421,7 +421,7 @@ fn materialize_inputs(
                         ) =>
                 {
                     // The current child could not acquire another shard while
-                    // earlier children pinned the mapping cache. Their arrays
+                    // earlier children pinned the shard cache. Their arrays
                     // are sufficient evaluation roots, so detach them and retry.
                     drop(input_sources);
                     for (array, child_sources) in &mut pending {
@@ -734,7 +734,7 @@ mod tests {
         )
         .unwrap();
         let store =
-            Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap());
+            Arc::new(SafetensorsWeightStore::open_with_max_cached_shards(dir.path(), 1).unwrap());
         (dir, store)
     }
 
@@ -836,7 +836,7 @@ mod tests {
             &[1, 2, 3, 4, 5, 6, 7, 8]
         );
         let diagnostics = store.source_diagnostics().unwrap();
-        assert_eq!(diagnostics.currently_mapped_shards, 1);
+        assert_eq!(diagnostics.currently_cached_shards, 1);
         assert_eq!(diagnostics.touched_shard_paths.len(), 2);
         assert!(diagnostics.evictions >= 1);
     }

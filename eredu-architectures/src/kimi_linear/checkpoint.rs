@@ -1241,10 +1241,10 @@ mod tests {
         fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
             Ok(WeightStoreDiagnostics {
                 backend: self.backend,
-                mapping_hits: 0,
-                mapping_misses: 0,
+                cache_hits: 0,
+                cache_misses: 0,
                 evictions: 0,
-                currently_mapped_shards: 0,
+                currently_cached_shards: 0,
                 touched_shard_paths: Vec::new(),
                 payload_shard_paths: Vec::new(),
                 physical_reads: 0,

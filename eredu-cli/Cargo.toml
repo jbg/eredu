@@ -23,6 +23,9 @@ name = "eredu"
 path = "src/main.rs"
 required-features = ["mlx"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

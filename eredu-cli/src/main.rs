@@ -416,9 +416,9 @@ struct Cli {
     #[arg(long)]
     expert_cache_benchmark: bool,
 
-    /// Maximum simultaneously mapped safetensors shards or cached GGUF readers.
+    /// Maximum simultaneously cached SafeTensors shards or GGUF readers.
     #[arg(long, default_value_t = 4, value_name = "SHARDS")]
-    mapped_shards: usize,
+    cached_shards: usize,
 
     /// Pass the prompt directly instead of applying the model's chat template.
     #[arg(long)]
@@ -496,7 +496,7 @@ const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
     "expert_cache_prefill_bank_bytes",
     "expert_cache_eviction",
     "expert_cache_benchmark",
-    "mapped_shards",
+    "cached_shards",
 ];
 
 #[derive(Debug, Default)]
@@ -576,8 +576,8 @@ impl AutomaticCliOverrides {
         if self.contains("expert_cache_benchmark") {
             args.expert_cache_benchmark = original.expert_cache_benchmark;
         }
-        if self.contains("mapped_shards") {
-            args.mapped_shards = original.mapped_shards;
+        if self.contains("cached_shards") {
+            args.cached_shards = original.cached_shards;
         }
         if self.contains("draft_model") {
             args.speculative_draft_tokens = original.speculative_draft_tokens;
@@ -1800,7 +1800,7 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             args.quantization_mode = LoadQuantizationMode::Mxfp4;
         }
     }
-    args.mapped_shards = plan.max_mapped_shards;
+    args.cached_shards = plan.max_cached_shards;
     args.layerwise_host = false;
     args.dense_disk_stream = false;
     match &plan.residency {
@@ -2682,7 +2682,7 @@ fn cli_execution_plan(
             (Some(4), LoadQuantizationMode::Mxfp4) => WeightTransformationPlan::MxFp4,
             _ => WeightTransformationPlan::PreserveCheckpoint,
         },
-        max_mapped_shards: args.mapped_shards,
+        max_cached_shards: args.cached_shards,
         expert_cache: args.expert_cache.then_some(ExpertCachePlan {
             device_budget_bytes: args.expert_cache_device_budget_bytes,
             host_budget_bytes: args.expert_cache_host_budget_bytes,
@@ -2829,8 +2829,8 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.device_layer_window == 0 {
         bail!("--device-layer-window must be greater than zero");
     }
-    if args.mapped_shards == 0 {
-        bail!("--mapped-shards must be greater than zero");
+    if args.cached_shards == 0 {
+        bail!("--cached-shards must be greater than zero");
     }
     if args.revision.is_some() && Path::new(&args.model).exists() {
         bail!("--revision can only be used with a Hugging Face model identifier");
@@ -3538,7 +3538,7 @@ mod tests {
                 "--dense-disk-stream",
                 "--device-budget-bytes",
                 "1234",
-                "--mapped-shards",
+                "--cached-shards",
                 "7",
                 "prompt",
             ])
@@ -3553,7 +3553,7 @@ mod tests {
         assert!(!applied.layerwise_host);
         assert!(applied.dense_disk_stream);
         assert_eq!(applied.device_budget_bytes, Some(1234));
-        assert_eq!(applied.mapped_shards, 7);
+        assert_eq!(applied.cached_shards, 7);
     }
 
     #[test]

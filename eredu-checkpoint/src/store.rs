@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs,
     ops::Range,
     path::{Component, Path, PathBuf},
     sync::{
@@ -11,7 +11,6 @@ use std::{
     },
 };
 
-use memmap2::{Mmap, MmapOptions};
 use safetensors::{
     tensor::{Dtype, Metadata, TensorInfo},
     SafeTensors,
@@ -94,7 +93,7 @@ pub struct BoundedReadProof {
     pub physically_bounded: bool,
     /// Physical payload byte offset relative to the tensor payload.
     pub offset_bytes: u64,
-    /// Physical payload bytes read or mapped for this lease.
+    /// Physical payload bytes read for this lease.
     pub length_bytes: u64,
 }
 
@@ -117,7 +116,7 @@ pub trait EncodedTensorLease: Send + Sync + 'static {
 /// Type-erased neutral lease covering the checkpoint formats supported by Eredu.
 #[derive(Debug, Clone)]
 pub enum CheckpointLease {
-    /// Memory-mapped SafeTensors bytes.
+    /// Buffered SafeTensors bytes.
     Safetensors(SafetensorsLease),
     /// Lazily read portable GGUF payload.
     Gguf(crate::gguf_store::GgufLease),
@@ -315,10 +314,10 @@ impl WeightStore for MemoryWeightStore {
     fn diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
         Ok(WeightStoreDiagnostics {
             backend: WeightStoreBackend::Memory,
-            mapping_hits: 0,
-            mapping_misses: 0,
+            cache_hits: 0,
+            cache_misses: 0,
             evictions: 0,
-            currently_mapped_shards: 0,
+            currently_cached_shards: 0,
             touched_shard_paths: Vec::new(),
             payload_shard_paths: Vec::new(),
             physical_reads: 0,
@@ -474,12 +473,12 @@ impl CheckpointSource for CompositeCheckpointSource {
         payloads.sort();
         Ok(WeightStoreDiagnostics {
             backend,
-            mapping_hits: diagnostics.iter().map(|value| value.mapping_hits).sum(),
-            mapping_misses: diagnostics.iter().map(|value| value.mapping_misses).sum(),
+            cache_hits: diagnostics.iter().map(|value| value.cache_hits).sum(),
+            cache_misses: diagnostics.iter().map(|value| value.cache_misses).sum(),
             evictions: diagnostics.iter().map(|value| value.evictions).sum(),
-            currently_mapped_shards: diagnostics
+            currently_cached_shards: diagnostics
                 .iter()
-                .map(|value| value.currently_mapped_shards)
+                .map(|value| value.currently_cached_shards)
                 .sum(),
             touched_shard_paths: touched,
             payload_shard_paths: payloads,
@@ -647,7 +646,7 @@ pub trait WeightStore {
 /// Storage format represented by a diagnostics snapshot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WeightStoreBackend {
-    /// Memory-mapped SafeTensors payload shards.
+    /// Buffered SafeTensors payload shards.
     Safetensors,
     /// Seekable GGUF payload shards.
     Gguf,
@@ -660,14 +659,14 @@ pub enum WeightStoreBackend {
 pub struct WeightStoreDiagnostics {
     /// Storage format.
     pub backend: WeightStoreBackend,
-    /// Successful acquisitions reusing an existing mapping or reader.
-    pub mapping_hits: u64,
-    /// Acquisitions opening a new mapping or reader.
-    pub mapping_misses: u64,
-    /// Unleased mappings or readers removed to honor a bound.
+    /// Successful acquisitions reusing an existing shard buffer or reader.
+    pub cache_hits: u64,
+    /// Acquisitions loading a new shard buffer or opening a reader.
+    pub cache_misses: u64,
+    /// Unleased shard buffers or readers removed to honor a bound.
     pub evictions: u64,
-    /// Mappings or readers currently retained by the store.
-    pub currently_mapped_shards: usize,
+    /// Shard buffers or readers currently retained by the store.
+    pub currently_cached_shards: usize,
     /// Shard paths touched so far in stable order.
     pub touched_shard_paths: Vec<PathBuf>,
     /// Shard paths selected for tensor payload access in stable order.
@@ -686,9 +685,9 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// The configured mapped-shard or reader limit was zero.
-    #[error("maximum mapped-shard count must be nonzero")]
-    InvalidMappedShardLimit,
+    /// The configured cached-shard or reader limit was zero.
+    #[error("maximum cached-shard count must be nonzero")]
+    InvalidShardCacheLimit,
     /// A requested tensor is absent.
     #[error("unknown checkpoint tensor {key:?}")]
     UnknownTensor {
@@ -762,9 +761,9 @@ pub enum StoreError {
         context: String,
     },
     /// Every cache entry is pinned by a live lease.
-    #[error("checkpoint mapping capacity {maximum} is exhausted; leased shards: {leased:?}")]
+    #[error("checkpoint shard-cache capacity {maximum} is exhausted; leased shards: {leased:?}")]
     CapacityExhausted {
-        /// Configured mapping bound.
+        /// Configured shard-cache bound.
         maximum: usize,
         /// Deterministically ordered pinned paths.
         leased: Vec<PathBuf>,
@@ -783,7 +782,7 @@ pub enum StoreError {
         /// Stable failure detail.
         message: String,
     },
-    /// The catalog or mapping cache is internally unavailable.
+    /// The catalog or shard cache is internally unavailable.
     #[error("checkpoint store state is unavailable: {0}")]
     Internal(String),
     /// A GGUF catalog, selection, or payload-read operation failed.
@@ -796,20 +795,20 @@ pub enum StoreError {
     },
 }
 
-/// Default maximum number of simultaneously retained mapped shards.
-pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
+/// Default maximum number of simultaneously retained shard buffers.
+pub const DEFAULT_MAX_CACHED_SHARDS: usize = 4;
 
 #[derive(Debug)]
-struct MappedShard {
+struct BufferedShard {
     path: PathBuf,
-    mmap: Mmap,
+    bytes: Vec<u8>,
     metadata: Metadata,
     payload_offset: usize,
 }
 
 #[derive(Debug)]
 struct CacheEntry {
-    shard: Arc<MappedShard>,
+    shard: Arc<BufferedShard>,
     last_used: u64,
 }
 
@@ -842,15 +841,15 @@ struct CatalogEntry {
     indexed: bool,
 }
 
-/// Encoded SafeTensors selection retaining its backing mmap.
+/// Encoded SafeTensors selection retaining its backing shard buffer.
 #[derive(Debug, Clone)]
 pub struct SafetensorsLease {
     metadata: TensorMetadata,
     selection: TensorSelection,
     output_shape: Vec<usize>,
     proof: BoundedReadProof,
-    shard: Arc<MappedShard>,
-    mapped_span: Range<usize>,
+    shard: Arc<BufferedShard>,
+    buffered_span: Range<usize>,
     selected_bytes: Option<Arc<[u8]>>,
     read_receipt: Arc<SafetensorsReadReceipt>,
 }
@@ -879,7 +878,7 @@ impl EncodedTensorLease for SafetensorsLease {
     fn encoded_bytes(&self) -> Option<&[u8]> {
         let bytes = match &self.selected_bytes {
             Some(bytes) => Some(bytes.as_ref()),
-            None => self.shard.mmap.get(self.mapped_span.clone()),
+            None => self.shard.bytes.get(self.buffered_span.clone()),
         };
         if let Some(bytes) = bytes {
             if !self.read_receipt.counted.swap(true, Ordering::AcqRel) {
@@ -897,7 +896,7 @@ impl EncodedTensorLease for SafetensorsLease {
     }
 }
 
-/// Persistent neutral SafeTensors catalog with bounded mmap ownership.
+/// Persistent neutral SafeTensors catalog with bounded shard-buffer ownership.
 #[derive(Debug)]
 pub struct SafetensorsWeightStore {
     canonical_root: PathBuf,
@@ -905,22 +904,22 @@ pub struct SafetensorsWeightStore {
     metadata: Mutex<BTreeMap<String, TensorMetadata>>,
     cache: Mutex<CacheState>,
     read_telemetry: Arc<SafetensorsReadTelemetry>,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 }
 
 impl SafetensorsWeightStore {
     /// Opens a file, indexed directory, or directory containing `model.safetensors`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_with_max_mapped_shards(path, DEFAULT_MAX_MAPPED_SHARDS)
+        Self::open_with_max_cached_shards(path, DEFAULT_MAX_CACHED_SHARDS)
     }
 
-    /// Opens a checkpoint with an explicit nonzero mapping bound.
-    pub fn open_with_max_mapped_shards(
+    /// Opens a checkpoint with an explicit nonzero shard-cache bound.
+    pub fn open_with_max_cached_shards(
         path: impl AsRef<Path>,
-        max_mapped_shards: usize,
+        max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
-        if max_mapped_shards == 0 {
-            return Err(StoreError::InvalidMappedShardLimit);
+        if max_cached_shards == 0 {
+            return Err(StoreError::InvalidShardCacheLimit);
         }
         let path = path.as_ref();
         if !path.exists() {
@@ -969,13 +968,13 @@ impl SafetensorsWeightStore {
                     metadata: Mutex::new(BTreeMap::new()),
                     cache: Mutex::new(CacheState::default()),
                     read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
-                    max_mapped_shards,
+                    max_cached_shards,
                 });
             }
             return Self::from_single_file(
                 root.join("model.safetensors"),
                 canonical_root,
-                max_mapped_shards,
+                max_cached_shards,
             );
         }
         let file = path.to_path_buf();
@@ -984,13 +983,13 @@ impl SafetensorsWeightStore {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        Self::from_single_file(file, canonicalize(&root)?, max_mapped_shards)
+        Self::from_single_file(file, canonicalize(&root)?, max_cached_shards)
     }
 
     fn from_single_file(
         file: PathBuf,
         canonical_root: PathBuf,
-        max_mapped_shards: usize,
+        max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
         let discovered = inspect_file(&file)?;
         let catalog = discovered
@@ -1011,17 +1010,17 @@ impl SafetensorsWeightStore {
             metadata: Mutex::new(discovered),
             cache: Mutex::new(CacheState::default()),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
-            max_mapped_shards,
+            max_cached_shards,
         })
     }
 
     fn lock_cache(&self) -> Result<MutexGuard<'_, CacheState>, StoreError> {
         self.cache
             .lock()
-            .map_err(|_| StoreError::Internal("mapped-shard cache is poisoned".into()))
+            .map_err(|_| StoreError::Internal("checkpoint shard cache is poisoned".into()))
     }
 
-    fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<MappedShard>, StoreError> {
+    fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<BufferedShard>, StoreError> {
         let canonical_path = self.validate_access_path(entry)?;
         let mut cache = self.lock_cache()?;
         cache.tick = cache.tick.saturating_add(1);
@@ -1036,7 +1035,7 @@ impl SafetensorsWeightStore {
             return Ok(shard);
         }
         cache.misses = cache.misses.saturating_add(1);
-        if cache.entries.len() >= self.max_mapped_shards {
+        if cache.entries.len() >= self.max_cached_shards {
             let victim = cache
                 .entries
                 .iter()
@@ -1050,7 +1049,7 @@ impl SafetensorsWeightStore {
                 cache.evictions = cache.evictions.saturating_add(1);
             } else {
                 return Err(StoreError::CapacityExhausted {
-                    maximum: self.max_mapped_shards,
+                    maximum: self.max_cached_shards,
                     leased: cache
                         .entries
                         .values()
@@ -1059,11 +1058,8 @@ impl SafetensorsWeightStore {
                 });
             }
         }
-        let file = File::open(&canonical_path).map_err(|error| fs_error(&entry.shard, error))?;
-        // SAFETY: leases retain the owning `MappedShard` for every exposed span.
-        let mmap = unsafe { MmapOptions::new().map(&file) }
-            .map_err(|error| io_error(&entry.shard, error))?;
-        let (header_len, metadata) = SafeTensors::read_metadata(&mmap).map_err(|error| {
+        let bytes = fs::read(&canonical_path).map_err(|error| fs_error(&entry.shard, error))?;
+        let (header_len, metadata) = SafeTensors::read_metadata(&bytes).map_err(|error| {
             StoreError::MalformedSafetensors {
                 path: entry.shard.clone(),
                 message: error.to_string(),
@@ -1075,9 +1071,9 @@ impl SafetensorsWeightStore {
                 .ok_or_else(|| StoreError::Overflow {
                     context: format!("payload offset for {}", entry.shard.display()),
                 })?;
-        let shard = Arc::new(MappedShard {
+        let shard = Arc::new(BufferedShard {
             path: entry.shard.clone(),
-            mmap,
+            bytes,
             metadata,
             payload_offset,
         });
@@ -1106,7 +1102,7 @@ impl SafetensorsWeightStore {
         &self,
         key: &str,
         entry: &CatalogEntry,
-        shard: &MappedShard,
+        shard: &BufferedShard,
     ) -> Result<TensorMetadata, StoreError> {
         if let Some(metadata) = self
             .metadata
@@ -1202,9 +1198,9 @@ impl WeightStore for SafetensorsWeightStore {
                 context: format!("payload end for {:?}", request.key),
             })?;
         let payload = shard
-            .mmap
+            .bytes
             .get(payload_start..payload_end)
-            .ok_or_else(|| io_error(&shard.path, "tensor payload is outside mapped shard"))?;
+            .ok_or_else(|| io_error(&shard.path, "tensor payload is outside buffered shard"))?;
         let (relative_span, selected_bytes) = select_safetensors_bytes(
             &request.key,
             info.dtype,
@@ -1217,7 +1213,7 @@ impl WeightStore for SafetensorsWeightStore {
         let length = selected_bytes
             .as_ref()
             .map_or(relative_span.len(), |bytes| bytes.len());
-        let mapped_span = payload_start + relative_span.start..payload_start + relative_span.end;
+        let buffered_span = payload_start + relative_span.start..payload_start + relative_span.end;
         let full_selection = matches!(request.selection, TensorSelection::Full);
         self.lock_cache()?.payloads.insert(shard.path.clone());
         Ok(SafetensorsLease {
@@ -1237,7 +1233,7 @@ impl WeightStore for SafetensorsWeightStore {
                 })?,
             },
             shard,
-            mapped_span,
+            buffered_span,
             selected_bytes: selected_bytes.map(Arc::from),
             read_receipt: Arc::new(SafetensorsReadReceipt {
                 telemetry: Arc::clone(&self.read_telemetry),
@@ -1250,10 +1246,10 @@ impl WeightStore for SafetensorsWeightStore {
         let cache = self.lock_cache()?;
         Ok(WeightStoreDiagnostics {
             backend: WeightStoreBackend::Safetensors,
-            mapping_hits: cache.hits,
-            mapping_misses: cache.misses,
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
             evictions: cache.evictions,
-            currently_mapped_shards: cache.entries.len(),
+            currently_cached_shards: cache.entries.len(),
             touched_shard_paths: cache.touched.iter().cloned().collect(),
             payload_shard_paths: cache.payloads.iter().cloned().collect(),
             physical_reads: self.read_telemetry.physical_reads.load(Ordering::Relaxed),
@@ -1300,11 +1296,9 @@ impl crate::validation::SafetensorsCatalog for SafetensorsWeightStore {
 }
 
 fn inspect_file(path: &Path) -> Result<BTreeMap<String, TensorMetadata>, StoreError> {
-    let file = File::open(path).map_err(|error| fs_error(path, error))?;
-    // SAFETY: all returned metadata is owned before this mapping is dropped.
-    let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|error| io_error(path, error))?;
+    let bytes = fs::read(path).map_err(|error| fs_error(path, error))?;
     let checkpoint =
-        SafeTensors::deserialize(&mmap).map_err(|error| StoreError::MalformedSafetensors {
+        SafeTensors::deserialize(&bytes).map_err(|error| StoreError::MalformedSafetensors {
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
@@ -1786,7 +1780,7 @@ mod tests {
         .unwrap();
 
         let store =
-            SafetensorsWeightStore::open_with_max_mapped_shards(directory.path(), 1).unwrap();
+            SafetensorsWeightStore::open_with_max_cached_shards(directory.path(), 1).unwrap();
         store.metadata("left").unwrap();
         let metadata_diagnostics = store.diagnostics().unwrap();
         assert_eq!(

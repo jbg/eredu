@@ -13,6 +13,10 @@ pub struct Stream {
     pub(crate) c_stream: safemlx_sys::mlx_stream,
 }
 
+// SAFETY: the owned MLX stream handle may move between threads. Every safemlx
+// operation that touches MLX runtime-global state enters the runtime guard.
+unsafe impl Send for Stream {}
+
 impl AsRef<Stream> for Stream {
     fn as_ref(&self) -> &Stream {
         self
@@ -149,5 +153,11 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn streams_can_move_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Stream>();
     }
 }

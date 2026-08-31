@@ -323,7 +323,7 @@ struct GgufLeaseSource {
     >,
 }
 
-/// A validated selection that pins its mapped payload shard.
+/// A validated selection that pins its buffered payload shard.
 ///
 /// The lease deliberately has no method returning a borrowed or mmap-derived
 /// MLX array. [`Self::materialize`] is the only array-producing operation.
@@ -523,15 +523,11 @@ impl WeightLease {
                 message: error.to_string(),
             }
         })?;
-        let aligned = (data.as_ptr() as usize).is_multiple_of(safetensors_dtype_alignment(dtype));
-        let source_value = if aligned {
-            unsafe { Array::try_from_borrowed_safetensors(view) }
-        } else {
-            Array::try_from(view)
-        }
-        .map_err(|conversion| CheckpointMaterializationError::MlxConversion {
-            key: self.key.clone(),
-            source: conversion,
+        let source_value = Array::try_from(view).map_err(|conversion| {
+            CheckpointMaterializationError::MlxConversion {
+                key: self.key.clone(),
+                source: conversion,
+            }
         })?;
         Ok(PendingWeightMaterialization {
             output: source_value.clone(),
@@ -540,7 +536,7 @@ impl WeightLease {
             lease: Some(self),
             source_stream: source_stream.clone(),
             execution_stream: source_stream.clone(),
-            borrowed_source: aligned,
+            borrowed_source: false,
             completed: false,
         })
     }
@@ -780,13 +776,13 @@ impl PendingWeightMaterialization {
 
 /// Owning completion for one checkpoint tensor materialization.
 ///
-/// This single-shot guard retains checkpoint mappings and source arrays until
+/// This single-shot guard retains checkpoint leases and source arrays until
 /// its exact MLX completion finishes. It may order multiple compatible
 /// consumers. Dropping an unfinished guard blocks only for this event, never
 /// for an entire stream. Asynchronous backend errors are returned by query or
 /// synchronization. The type is intentionally neither `Send` nor `Sync`
 /// because it owns `safemlx`'s thread-affine [`Event`].
-#[must_use = "checkpoint mappings remain retained until this completion is consumed or dropped"]
+#[must_use = "checkpoint leases remain retained until this completion is consumed or dropped"]
 pub struct WeightMaterialization {
     output: Array,
     sources: Vec<PendingWeightMaterialization>,
@@ -907,7 +903,7 @@ impl Drop for PendingWeightMaterialization {
             return;
         }
         // Submission creates the exact completion event and moves this value's
-        // mapping lease into `WeightMaterialization`. If submission itself is
+        // checkpoint lease into `WeightMaterialization`. If submission itself is
         // abandoned or fails before that event exists, draining both candidate
         // streams is the only conservative way to prove that no lazy copy still
         // references the mmap. This error-cleanup path is intentionally the sole
@@ -1070,15 +1066,6 @@ fn mlx_error(
         key: key.to_string(),
         operation,
         source,
-    }
-}
-
-fn safetensors_dtype_alignment(dtype: Dtype) -> usize {
-    match dtype {
-        Dtype::I64 | Dtype::U64 | Dtype::F64 => 8,
-        Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
-        Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
-        _ => 1,
     }
 }
 
@@ -1394,7 +1381,7 @@ mod tests {
             [1]
         );
         let diagnostics = store.source_diagnostics().unwrap();
-        assert_eq!(diagnostics.currently_mapped_shards, 0);
+        assert_eq!(diagnostics.currently_cached_shards, 0);
         assert!(diagnostics.touched_shard_paths.is_empty());
         assert_eq!(diagnostics.physical_reads, 0);
     }
@@ -1804,10 +1791,10 @@ mod tests {
             store.source_diagnostics().unwrap(),
             WeightStoreDiagnostics {
                 backend: WeightStoreBackend::Safetensors,
-                mapping_hits: 0,
-                mapping_misses: 0,
+                cache_hits: 0,
+                cache_misses: 0,
                 evictions: 0,
-                currently_mapped_shards: 0,
+                currently_cached_shards: 0,
                 touched_shard_paths: vec![],
                 payload_shard_paths: vec![],
                 physical_reads: 0,
@@ -1847,7 +1834,7 @@ mod tests {
             ))
         ));
         assert_eq!(
-            store.source_diagnostics().unwrap().currently_mapped_shards,
+            store.source_diagnostics().unwrap().currently_cached_shards,
             1
         );
     }
@@ -1866,7 +1853,7 @@ mod tests {
             directory
                 .source_diagnostics()
                 .unwrap()
-                .currently_mapped_shards,
+                .currently_cached_shards,
             0
         );
     }
@@ -1928,9 +1915,9 @@ mod tests {
         let second = store.acquire("z_tensor", TensorSelection::Full).unwrap();
         assert_eq!(first.backing_shard(), second.backing_shard());
         let diagnostics = store.source_diagnostics().unwrap();
-        assert_eq!(diagnostics.currently_mapped_shards, 1);
-        assert_eq!(diagnostics.mapping_misses, 1);
-        assert_eq!(diagnostics.mapping_hits, 1);
+        assert_eq!(diagnostics.currently_cached_shards, 1);
+        assert_eq!(diagnostics.cache_misses, 1);
+        assert_eq!(diagnostics.cache_hits, 1);
         assert_eq!(diagnostics.touched_shard_paths.len(), 1);
     }
 
@@ -1943,7 +1930,7 @@ mod tests {
             dir.path(),
             &[("one", "one.safetensors"), ("two", "two.safetensors")],
         );
-        let store = SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap();
+        let store = SafetensorsWeightStore::open_with_max_cached_shards(dir.path(), 1).unwrap();
         let one = store.acquire("one", TensorSelection::Full).unwrap();
         let error = store.acquire("two", TensorSelection::Full).unwrap_err();
         assert!(matches!(
@@ -1963,7 +1950,7 @@ mod tests {
         let two = store.acquire("two", TensorSelection::Full).unwrap();
         assert_eq!(two.metadata().logical_shape, [1]);
         let diagnostics = store.source_diagnostics().unwrap();
-        assert_eq!(diagnostics.currently_mapped_shards, 1);
+        assert_eq!(diagnostics.currently_cached_shards, 1);
         assert_eq!(diagnostics.evictions, 1);
         assert_eq!(diagnostics.touched_shard_paths.len(), 2);
     }

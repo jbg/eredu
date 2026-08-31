@@ -17,6 +17,9 @@ include = [
     "LICENSE-APACHE",
 ]
 
+[lints]
+workspace = true
+
 [dependencies]
 eredu-architectures.workspace = true
 eredu-codec.workspace = true

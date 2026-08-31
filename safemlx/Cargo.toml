@@ -37,6 +37,12 @@ parking_lot = "0.12"
 safetensors = { version = "0.8", optional = true }
 bytemuck = { version = "1", optional = true, features = ["extern_crate_std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 pretty_assertions = "1"
 float_eq = "1"

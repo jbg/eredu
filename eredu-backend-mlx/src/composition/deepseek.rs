@@ -1861,7 +1861,7 @@ pub fn load_gguf(
                 checkpoint.clone(),
                 source.plan().checkpoint(),
                 source.plan().tensor_mapping(),
-                residency.max_mapped_shards(),
+                residency.max_cached_shards(),
             )?);
             DeepSeekModel::load_v4(
                 store,
@@ -1884,7 +1884,7 @@ pub fn load_gguf(
                 checkpoint.clone(),
                 source.plan().checkpoint(),
                 source.plan().tensor_mapping(),
-                residency.max_mapped_shards(),
+                residency.max_cached_shards(),
             )?);
             DeepSeekModel::load_v3(
                 store,

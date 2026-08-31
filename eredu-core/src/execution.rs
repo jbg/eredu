@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 4;
 
 /// Default bound for simultaneously open checkpoint payload sources.
-pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
+pub const DEFAULT_MAX_CACHED_SHARDS: usize = 4;
 
 /// Stable, extensible identity of an execution backend.
 ///
@@ -215,7 +215,7 @@ pub struct ExecutionPlan {
     /// Optional transformation applied while checkpoint weights are loaded.
     pub weight_transformation: WeightTransformationPlan,
     /// Maximum number of checkpoint shards or readers retained simultaneously.
-    pub max_mapped_shards: usize,
+    pub max_cached_shards: usize,
     /// Independent routed-expert cache, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expert_cache: Option<ExpertCachePlan>,
@@ -236,7 +236,7 @@ impl ExecutionPlan {
             topology: ParallelTopology::new(1, 1, 1, 1).expect("the singleton topology is valid"),
             residency: ResidencyPlan::FullyResident,
             weight_transformation: WeightTransformationPlan::PreserveCheckpoint,
-            max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
+            max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             expert_cache: None,
             drafting: DraftingPlan::Disabled,
             required_device_capabilities: DeviceCapabilities {
@@ -293,7 +293,7 @@ impl ExecutionPlan {
         if self.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
             return Err(ExecutionPlanError::Schema(self.schema_version));
         }
-        if self.max_mapped_shards == 0 {
+        if self.max_cached_shards == 0 {
             return Err(ExecutionPlanError::ZeroMappedShards);
         }
         match &self.drafting {
@@ -348,7 +348,7 @@ pub enum ExecutionPlanError {
     #[error("execution-plan topology is invalid: {0}")]
     Topology(String),
     /// The checkpoint source bound is zero.
-    #[error("execution-plan max_mapped_shards must be greater than zero")]
+    #[error("execution-plan max_cached_shards must be greater than zero")]
     ZeroMappedShards,
     /// An external assistant artifact path or identifier is empty.
     #[error("execution-plan external draft model must not be empty")]

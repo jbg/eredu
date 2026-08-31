@@ -750,7 +750,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
             checkpoint.clone(),
             source.plan().checkpoint(),
             source.plan().tensor_mapping(),
-            options.max_mapped_shards(),
+            options.max_cached_shards(),
         )?);
     let model =
         load_neutral_llama_parallel(store, prepared.args, options, build, stream, weights_stream)?;
@@ -772,7 +772,7 @@ pub(crate) fn load_llama_gguf_model(
             checkpoint.clone(),
             source.plan().checkpoint(),
             source.plan().tensor_mapping(),
-            residency.max_mapped_shards(),
+            residency.max_cached_shards(),
         )?);
     let args = prepared.args;
     if residency.expert_cache().is_some() {

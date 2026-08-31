@@ -14,6 +14,9 @@ cuda = ["safemlx/cuda"]
 metal = ["safemlx/accelerate", "safemlx/metal"]
 nccl = ["cuda", "safemlx/nccl"]
 
+[lints]
+workspace = true
+
 [dependencies]
 
 [dev-dependencies]

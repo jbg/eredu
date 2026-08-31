@@ -1271,7 +1271,7 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
             checkpoint.clone(),
             source.plan().checkpoint(),
             source.plan().tensor_mapping(),
-            options.max_mapped_shards(),
+            options.max_cached_shards(),
         )?);
     let model = load_neutral_qwen_parallel(
         store,
@@ -1300,7 +1300,7 @@ pub(crate) fn load_qwen_gguf_model(
             checkpoint.clone(),
             source.plan().checkpoint(),
             source.plan().tensor_mapping(),
-            residency.max_mapped_shards(),
+            residency.max_cached_shards(),
         )?);
     let args = prepared.args;
     let expert_options = residency.expert_cache();

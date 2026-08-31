@@ -1516,7 +1516,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
         checkpoint.clone(),
         source.plan().checkpoint(),
         source.plan().tensor_mapping(),
-        residency.max_mapped_shards(),
+        residency.max_cached_shards(),
     )?);
     let expert_options = residency.expert_cache();
     let execution_options = residency.layers();
@@ -1556,7 +1556,7 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
         checkpoint.clone(),
         source.plan().checkpoint(),
         source.plan().tensor_mapping(),
-        options.max_mapped_shards(),
+        options.max_cached_shards(),
     )?);
     let model = load_neutral_parallel_with_store(
         store,

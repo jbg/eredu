@@ -17,7 +17,6 @@ use std::{
     time::Instant,
 };
 
-use memmap2::{Mmap, MmapOptions};
 use safemlx::{
     host_transfer_capacity_upper_bound,
     transforms::{async_eval_with_event, eval},
@@ -539,7 +538,7 @@ struct DiskLocation {
     first_name: String,
     second_name: String,
     persistent: bool,
-    mapped: Option<Arc<Mmap>>,
+    buffered: Option<Arc<[u8]>>,
     payload_sha256: Option<String>,
     payload_verification: Arc<OnceLock<Result<(), String>>>,
 }
@@ -2852,7 +2851,7 @@ pub fn open_prompt_cache(
                 rank: block.rank,
             };
             let shard = safe_prompt_cache_shard_path(&cache_root, &block.shard)?;
-            let mapped = map_prompt_cache_shard(&shard)?;
+            let buffered = buffer_prompt_cache_shard(&shard)?;
             let record = CacheBlockRecord {
                 physical: MlxCacheBlockStorage::disk(
                     id.clone(),
@@ -2861,7 +2860,7 @@ pub fn open_prompt_cache(
                         first_name: block.first_array.clone(),
                         second_name: block.second_array.clone(),
                         persistent: true,
-                        mapped: Some(mapped),
+                        buffered: Some(buffered),
                         payload_sha256: Some(block.payload_sha256.clone()),
                         payload_verification: Arc::new(OnceLock::new()),
                     },
@@ -2884,7 +2883,7 @@ pub fn open_prompt_cache(
             .iter()
             .map(|block| block.logical_bytes)
             .sum::<u64>();
-        state.telemetry.report.imported_mapped_shards += manifest.blocks.len() as u64;
+        state.telemetry.report.imported_buffered_shards += manifest.blocks.len() as u64;
         update_report_totals(&mut state);
     }
     Ok((manager, manifest))
@@ -3348,7 +3347,7 @@ fn write_live_block(
         first_name: names.0.into(),
         second_name: names.1.into(),
         persistent: false,
-        mapped: None,
+        buffered: None,
         payload_sha256: None,
         payload_verification: Arc::new(OnceLock::new()),
     })
@@ -3455,19 +3454,21 @@ fn verify_disk_payload(location: &DiskLocation) -> Result<(), CacheResidencyErro
         return Ok(());
     };
     let verification = location.payload_verification.get_or_init(|| {
-        let actual = if let Some(mapped) = &location.mapped {
-            if mapped.len() < 8 {
+        let actual = if let Some(buffered) = &location.buffered {
+            if buffered.len() < 8 {
                 return Err("file is too short for a safetensors header".into());
             }
             let mut length_bytes = [0u8; 8];
-            length_bytes.copy_from_slice(&mapped[..8]);
+            length_bytes.copy_from_slice(&buffered[..8]);
             let header_len = usize::try_from(u64::from_le_bytes(length_bytes))
                 .map_err(|_| "safetensors header length exceeds addressable memory".to_string())?;
             let data_start = 8usize
                 .checked_add(header_len)
-                .filter(|start| *start <= mapped.len())
-                .ok_or_else(|| "safetensors header extends beyond the mapped shard".to_string())?;
-            sha256_hex(Sha256::digest(&mapped[data_start..]))
+                .filter(|start| *start <= buffered.len())
+                .ok_or_else(|| {
+                    "safetensors header extends beyond the buffered shard".to_string()
+                })?;
+            sha256_hex(Sha256::digest(&buffered[data_start..]))
         } else {
             hash_prompt_cache_shard_payload(&location.path).map_err(|error| error.to_string())?
         };
@@ -3494,8 +3495,8 @@ fn load_host_cache_block_direct(
 ) -> Result<HostCacheBlock, CacheResidencyError> {
     verify_disk_payload(location)?;
     let owned;
-    let bytes = if let Some(mapped) = &location.mapped {
-        mapped.as_ref()
+    let bytes = if let Some(buffered) = &location.buffered {
+        buffered.as_ref()
     } else {
         owned = fs::read(&location.path).map_err(|source| CacheResidencyError::Io {
             action: "read cache block shard",
@@ -3595,27 +3596,19 @@ fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
     encoded
 }
 
-fn map_prompt_cache_shard(path: &Path) -> Result<Arc<Mmap>, CacheResidencyError> {
-    let file = File::open(path).map_err(|source| CacheResidencyError::Io {
-        action: "open prompt cache shard for mapping",
+fn buffer_prompt_cache_shard(path: &Path) -> Result<Arc<[u8]>, CacheResidencyError> {
+    let buffered = fs::read(path).map_err(|source| CacheResidencyError::Io {
+        action: "read prompt cache shard",
         path: path.to_path_buf(),
         source,
     })?;
-    // SAFETY: prompt-cache shards are immutable after publication and the Mmap
-    // is retained by every DiskLocation that can create an MLX view from it.
-    let mapped =
-        unsafe { MmapOptions::new().map(&file) }.map_err(|source| CacheResidencyError::Io {
-            action: "map prompt cache shard",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    safetensors::SafeTensors::deserialize(&mapped).map_err(|error| {
+    safetensors::SafeTensors::deserialize(&buffered).map_err(|error| {
         CacheResidencyError::MalformedShard {
             path: path.to_path_buf(),
             reason: error.to_string(),
         }
     })?;
-    Ok(Arc::new(mapped))
+    Ok(Arc::from(buffered))
 }
 
 #[cfg(test)]
@@ -3633,28 +3626,13 @@ fn sync_file(path: &Path) -> Result<(), CacheResidencyError> {
         })
 }
 
-#[cfg(unix)]
 fn sample_process(report: &mut CacheResidencyReport) {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: `usage` points to writable storage of the exact type required by
-    // `getrusage`; the value is read only after a successful return.
-    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-    if status != 0 {
-        return;
+    if let Some(usage) = safemlx::system::process_usage() {
+        report.process_rss_bytes = Some(usage.peak_rss);
+        report.process_minor_page_faults = Some(usage.minor_page_faults);
+        report.process_major_page_faults = Some(usage.major_page_faults);
     }
-    // SAFETY: a successful `getrusage` call initialized the structure.
-    let usage = unsafe { usage.assume_init() };
-    #[cfg(target_os = "macos")]
-    let rss_bytes = usage.ru_maxrss.max(0) as u64;
-    #[cfg(not(target_os = "macos"))]
-    let rss_bytes = (usage.ru_maxrss.max(0) as u64).saturating_mul(1024);
-    report.process_rss_bytes = Some(rss_bytes);
-    report.process_minor_page_faults = Some(usage.ru_minflt.max(0) as u64);
-    report.process_major_page_faults = Some(usage.ru_majflt.max(0) as u64);
 }
-
-#[cfg(not(unix))]
-fn sample_process(_report: &mut CacheResidencyReport) {}
 
 /// Structured cache residency and persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -3762,9 +3740,9 @@ pub enum CacheResidencyError {
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_stream, hash_prompt_cache_shard_payload, host_cache_capacity_upper_bound,
-        inspect_prompt_cache, map_prompt_cache_shard, open_prompt_cache, verify_disk_payload,
-        CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey,
+        buffer_prompt_cache_shard, cpu_stream, hash_prompt_cache_shard_payload,
+        host_cache_capacity_upper_bound, inspect_prompt_cache, open_prompt_cache,
+        verify_disk_payload, CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey,
         CacheIoOperationKind, CacheLayerResidencyStats, CacheManagerState, CachePoolError,
         CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
         CacheResidencyManager, CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation,
@@ -3877,7 +3855,7 @@ mod tests {
             first_name: "keys".into(),
             second_name: "values".into(),
             persistent: false,
-            mapped: None,
+            buffered: None,
             payload_sha256: None,
             payload_verification: Arc::new(OnceLock::new()),
         }
@@ -4645,14 +4623,14 @@ mod tests {
         fs::write(&shard, &bytes).unwrap();
 
         // Header-only inspection remains valid because metadata and length did
-        // not change. The mapped payload gate must still reject the shard.
+        // not change. The buffered payload gate must still reject the shard.
         inspect_prompt_cache(directory.path()).unwrap();
         let location = DiskLocation {
             path: shard.clone(),
             first_name: "keys".into(),
             second_name: "values".into(),
             persistent: true,
-            mapped: Some(map_prompt_cache_shard(&shard).unwrap()),
+            buffered: Some(buffer_prompt_cache_shard(&shard).unwrap()),
             payload_sha256: Some(manifest.blocks[0].payload_sha256.clone()),
             payload_verification: Arc::new(OnceLock::new()),
         };
@@ -4661,9 +4639,9 @@ mod tests {
     }
 
     #[test]
-    fn imported_prompt_shards_are_actually_mapped_and_retained() {
+    fn imported_prompt_shards_are_buffered_and_retained() {
         let directory = tempfile::tempdir().unwrap();
-        write_prompt_fixture(directory.path(), "mapped");
+        write_prompt_fixture(directory.path(), "buffered");
         let options = PagedCacheOptions::new(1, 64, 64, 1).unwrap();
         let (manager, _) = open_prompt_cache(
             directory.path(),
@@ -4674,10 +4652,10 @@ mod tests {
         )
         .unwrap();
         let state = manager.lock().unwrap();
-        assert_eq!(state.telemetry.report.imported_mapped_shards, 1);
+        assert_eq!(state.telemetry.report.imported_buffered_shards, 1);
         assert!(state.blocks.values().all(|record| record
             .disk()
-            .and_then(|location| location.mapped.as_ref())
+            .and_then(|location| location.buffered.as_ref())
             .is_some()));
         for record in state.blocks.values() {
             verify_disk_payload(record.disk().unwrap()).unwrap();

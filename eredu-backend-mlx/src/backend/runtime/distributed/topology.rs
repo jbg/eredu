@@ -764,7 +764,7 @@ pub fn load_safetensors_partition_on_streams(
 /// explicit source and execution streams.
 ///
 /// Placement is resolved from catalog metadata before a lease materializes an
-/// array. Remote-only indexed shards are therefore never acquired or mapped.
+/// array. Remote-only indexed shards are therefore never acquired or buffered.
 pub fn load_partition_from_store_on_streams(
     store: &(impl CheckpointSource + ?Sized),
     plan: &PlacementPlan,

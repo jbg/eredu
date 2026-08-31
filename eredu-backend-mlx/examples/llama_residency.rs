@@ -41,9 +41,9 @@ struct Args {
     /// Optional host parameter budget in bytes.
     #[arg(long)]
     host_budget_bytes: Option<u64>,
-    /// Maximum simultaneously mapped checkpoint shards.
+    /// Maximum simultaneously cached checkpoint shards or readers.
     #[arg(long, default_value_t = 4)]
-    mapped_shards: usize,
+    cached_shards: usize,
     /// Enable experimental dense disk streaming instead of eager host layers.
     #[arg(long)]
     dense_disk_stream: bool,
@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
             args.stream_host_lookahead,
             args.stream_queue_capacity,
         )?;
-        dense.max_mapped_shards = args.mapped_shards;
+        dense.max_cached_shards = args.cached_shards;
         dense.sample_backend_memory = true;
         dense.sample_process_memory = true;
         WeightResidency::dense_disk_stream(dense)
@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<()> {
         )?;
         let layerwise = LayerwiseLoadOptions {
             offload: config,
-            max_mapped_shards: args.mapped_shards,
+            max_cached_shards: args.cached_shards,
             sample_backend_memory: true,
             sample_process_memory: true,
         };

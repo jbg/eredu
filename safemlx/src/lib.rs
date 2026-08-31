@@ -35,6 +35,7 @@ pub mod metal;
 pub mod ops;
 pub mod random;
 mod stream;
+pub mod system;
 pub mod transforms;
 pub mod utils;
 

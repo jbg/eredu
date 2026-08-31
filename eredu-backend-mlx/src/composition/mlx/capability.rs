@@ -295,7 +295,7 @@ pub fn static_model_memory(
     let residency = session
         .residency_report()
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let (logical, host, device, disk, mappings) = if let Some(report) = residency {
+    let (logical, host, device, disk, cached_shards) = if let Some(report) = residency {
         let planned = report.offload().planned_bytes();
         let resident = report.offload().resident_bytes();
         let logical = checked_add(
@@ -329,9 +329,9 @@ pub fn static_model_memory(
                 source: "bounded-residency plan".into(),
             },
             Observed::Available {
-                value: report.weight_store().currently_mapped_shards as u64,
+                value: report.weight_store().currently_cached_shards as u64,
                 kind: ObservationKind::Observational,
-                source: "checkpoint-store mapping cache".into(),
+                source: "checkpoint shard cache".into(),
             },
         )
     } else {
@@ -350,7 +350,7 @@ pub fn static_model_memory(
                 reason: "disk residency unavailable".into(),
             },
             Observed::Unavailable {
-                reason: "mapping information unavailable".into(),
+                reason: "checkpoint shard-cache information unavailable".into(),
             },
         )
     };
@@ -372,7 +372,7 @@ pub fn static_model_memory(
         } else {
             PhysicalMemorySemantics::Unknown
         },
-        currently_mapped_shards: mappings,
+        currently_cached_shards: cached_shards,
     })
 }
 
@@ -412,183 +412,42 @@ impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_memory() -> Result<AvailableMemory, CapabilityError> {
-    unsafe extern "C" {
-        fn os_proc_available_memory() -> usize;
-    }
-
-    let name = c"hw.memsize";
-    let mut total = 0u64;
-    let mut size = std::mem::size_of::<u64>();
-    let status = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            (&mut total as *mut u64).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    let physical_memory_bytes = if status == 0 && size == std::mem::size_of::<u64>() {
-        Observed::Available {
-            value: total,
-            kind: ObservationKind::Exact,
-            source: "macOS sysctl hw.memsize".into(),
-        }
-    } else {
-        Observed::Unavailable {
-            reason: std::io::Error::last_os_error().to_string(),
-        }
-    };
-    let available = unsafe { os_proc_available_memory() };
-    let available_memory_bytes = match u64::try_from(available) {
-        Ok(value) if value > 0 => Observed::Available {
-            value,
-            kind: ObservationKind::Estimated,
-            source: "macOS os_proc_available_memory".into(),
-        },
-        _ => Observed::Unavailable {
-            reason: "os_proc_available_memory returned no usable value".into(),
-        },
-    };
-    Ok(AvailableMemory {
-        physical_memory_bytes,
-        available_memory_bytes,
-        physical_semantics: if cfg!(target_arch = "aarch64") {
-            PhysicalMemorySemantics::Unified
-        } else {
-            PhysicalMemorySemantics::Unknown
-        },
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn linux_memory() -> Result<AvailableMemory, CapabilityError> {
-    let contents = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let value = |name: &str| -> Option<u64> {
-        contents.lines().find_map(|line| {
-            let (key, rest) = line.split_once(':')?;
-            if key != name {
-                return None;
-            }
-            let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            kib.checked_mul(1024)
-        })
-    };
-    Ok(AvailableMemory {
-        physical_memory_bytes: value("MemTotal").map_or_else(
-            || Observed::Unavailable {
-                reason: "/proc/meminfo has no MemTotal".into(),
-            },
-            |value| Observed::Available {
-                value,
-                kind: ObservationKind::Exact,
-                source: "Linux /proc/meminfo MemTotal".into(),
-            },
-        ),
-        available_memory_bytes: value("MemAvailable").map_or_else(
-            || Observed::Unavailable {
-                reason: "/proc/meminfo has no MemAvailable".into(),
-            },
-            |value| Observed::Available {
-                value,
-                kind: ObservationKind::Estimated,
-                source: "Linux /proc/meminfo MemAvailable".into(),
-            },
-        ),
-        physical_semantics: PhysicalMemorySemantics::Unknown,
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn windows_memory() -> Result<AvailableMemory, CapabilityError> {
-    #[repr(C)]
-    struct MemoryStatusEx {
-        length: u32,
-        memory_load: u32,
-        total_physical: u64,
-        available_physical: u64,
-        total_page_file: u64,
-        available_page_file: u64,
-        total_virtual: u64,
-        available_virtual: u64,
-        available_extended_virtual: u64,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
-    }
-
-    let mut status = MemoryStatusEx {
-        length: std::mem::size_of::<MemoryStatusEx>() as u32,
-        memory_load: 0,
-        total_physical: 0,
-        available_physical: 0,
-        total_page_file: 0,
-        available_page_file: 0,
-        total_virtual: 0,
-        available_virtual: 0,
-        available_extended_virtual: 0,
-    };
-    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
-        return Ok(AvailableMemory {
-            physical_memory_bytes: Observed::Unavailable {
-                reason: "GlobalMemoryStatusEx failed".into(),
-            },
-            available_memory_bytes: Observed::Unavailable {
-                reason: "GlobalMemoryStatusEx failed".into(),
-            },
-            physical_semantics: PhysicalMemorySemantics::Unknown,
-        });
-    }
-    Ok(AvailableMemory {
-        physical_memory_bytes: Observed::Available {
-            value: status.total_physical,
-            kind: ObservationKind::Exact,
-            source: "Windows GlobalMemoryStatusEx ullTotalPhys".into(),
-        },
-        available_memory_bytes: Observed::Available {
-            value: status.available_physical,
-            kind: ObservationKind::Estimated,
-            source: "Windows GlobalMemoryStatusEx ullAvailPhys".into(),
-        },
-        physical_semantics: PhysicalMemorySemantics::Unknown,
-    })
-}
-
 /// Queries system memory that can be used as an admission signal.
 ///
 /// Apple Silicon reports one unified physical capacity; logical host/device
 /// residency tiers must not be added as independent physical capacities.
 pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
-    #[cfg(target_os = "macos")]
-    {
-        macos_memory()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux_memory()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        windows_memory()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        Ok(AvailableMemory {
-            physical_memory_bytes: Observed::Unavailable {
-                reason: "portable physical-memory query is not implemented on this platform".into(),
-            },
-            available_memory_bytes: Observed::Unavailable {
-                reason: "portable available-memory query is not implemented on this platform"
-                    .into(),
-            },
-            physical_semantics: PhysicalMemorySemantics::Unknown,
-        })
-    }
+    let memory = safemlx::system::system_memory()
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let physical_memory_bytes = memory.total.map_or_else(
+        || Observed::Unavailable {
+            reason: "physical-memory capacity is unavailable on this platform".into(),
+        },
+        |value| Observed::Available {
+            value,
+            kind: ObservationKind::Exact,
+            source: "host physical-memory observation".into(),
+        },
+    );
+    let available_memory_bytes = memory.available.map_or_else(
+        || Observed::Unavailable {
+            reason: "available physical memory is unavailable on this platform".into(),
+        },
+        |value| Observed::Available {
+            value,
+            kind: ObservationKind::Estimated,
+            source: "host available-memory observation".into(),
+        },
+    );
+    Ok(AvailableMemory {
+        physical_memory_bytes,
+        available_memory_bytes,
+        physical_semantics: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            PhysicalMemorySemantics::Unified
+        } else {
+            PhysicalMemorySemantics::Unknown
+        },
+    })
 }
 
 #[cfg(test)]

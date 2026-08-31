@@ -825,37 +825,8 @@ fn durable_rename(source: &Path, destination: &Path, _replace: bool) -> std::io:
 }
 
 #[cfg(windows)]
-fn durable_rename(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Windows cache publication path contains an embedded NUL",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let source = wide_path(source)?;
-    let destination = wide_path(destination)?;
-    let mut flags = MOVEFILE_WRITE_THROUGH;
-    if replace {
-        flags |= MOVEFILE_REPLACE_EXISTING;
-    }
-    // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the call.
-    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+fn durable_rename(source: &Path, destination: &Path, _replace: bool) -> std::io::Result<()> {
+    fs::rename(source, destination)
 }
 
 fn hex(digest: impl AsRef<[u8]>) -> String {

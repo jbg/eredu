@@ -213,13 +213,34 @@ impl Array {
         Array { c_array }
     }
 
-    /// Transfers an owned host allocation into an MLX array without copying it.
-    ///
-    /// # Safety
-    ///
-    /// The byte representation of `values` must match `dtype`. The checked byte
-    /// count and alignment must match the supplied shape.
-    pub unsafe fn try_from_owned_host_data<T: 'static>(
+    /// Transfers an owned, typed host allocation into an MLX array without copying it.
+    pub fn try_from_owned_data<T: ArrayElement + 'static>(
+        values: Vec<T>,
+        shape: &[i32],
+    ) -> crate::error::Result<Self> {
+        if T::DTYPE == Dtype::Bool {
+            return Err(crate::error::Exception::custom(
+                "owned boolean buffers are unsupported",
+            ));
+        }
+        unsafe { Self::try_from_owned_host_data(values, shape, T::DTYPE) }
+    }
+
+    /// Copies a checked typed slice into a new MLX array.
+    pub fn try_from_data<T: ArrayElement>(
+        values: &[T],
+        shape: &[i32],
+    ) -> crate::error::Result<Self> {
+        let elements = checked_elements(shape)?;
+        if values.len() != elements {
+            return Err(crate::error::Exception::custom(
+                "array element count does not match shape",
+            ));
+        }
+        Ok(unsafe { Self::from_raw_data(values.as_ptr().cast(), shape, T::DTYPE) })
+    }
+
+    unsafe fn try_from_owned_host_data<T: 'static>(
         mut values: Vec<T>,
         shape: &[i32],
         dtype: Dtype,
@@ -467,6 +488,15 @@ impl Array {
     }
 }
 
+fn checked_elements(shape: &[i32]) -> crate::error::Result<usize> {
+    shape.iter().try_fold(1usize, |count, dimension| {
+        usize::try_from(*dimension)
+            .ok()
+            .and_then(|dimension| count.checked_mul(dimension))
+            .ok_or_else(|| crate::error::Exception::custom("invalid or overflowing shape"))
+    })
+}
+
 impl<'a> EvaluatedArray<'a> {
     /// Return the evaluated array to the lazy array type if this value owns it.
     pub fn into_array(self) -> Option<Array> {
@@ -655,6 +685,63 @@ impl Clone for Array {
 }
 
 impl EvaluatedArray<'_> {
+    /// Copies the evaluated storage into its native-endian byte representation.
+    pub fn to_native_bytes(&self) -> Vec<u8> {
+        macro_rules! extend_bytes {
+            ($values:expr) => {{
+                let values = $values;
+                let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+                for value in values {
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                bytes
+            }};
+        }
+
+        match self.as_array().dtype() {
+            Dtype::Bool => self
+                .as_slice::<bool>()
+                .iter()
+                .map(|value| u8::from(*value))
+                .collect(),
+            Dtype::Uint8 => self.as_slice::<u8>().to_vec(),
+            Dtype::Uint16 => extend_bytes!(self.as_slice::<u16>()),
+            Dtype::Uint32 => extend_bytes!(self.as_slice::<u32>()),
+            Dtype::Uint64 => extend_bytes!(self.as_slice::<u64>()),
+            Dtype::Int8 => self
+                .as_slice::<i8>()
+                .iter()
+                .map(|value| *value as u8)
+                .collect(),
+            Dtype::Int16 => extend_bytes!(self.as_slice::<i16>()),
+            Dtype::Int32 => extend_bytes!(self.as_slice::<i32>()),
+            Dtype::Int64 => extend_bytes!(self.as_slice::<i64>()),
+            Dtype::Float16 => self
+                .as_slice::<half::f16>()
+                .iter()
+                .flat_map(|value| value.to_bits().to_ne_bytes())
+                .collect(),
+            Dtype::Float32 => extend_bytes!(self.as_slice::<f32>()),
+            Dtype::Float64 => extend_bytes!(self.as_slice::<f64>()),
+            Dtype::Bfloat16 => self
+                .as_slice::<half::bf16>()
+                .iter()
+                .flat_map(|value| value.to_bits().to_ne_bytes())
+                .collect(),
+            Dtype::Complex64 => self
+                .as_slice::<complex64>()
+                .iter()
+                .flat_map(|value| {
+                    value
+                        .re
+                        .to_ne_bytes()
+                        .into_iter()
+                        .chain(value.im.to_ne_bytes())
+                })
+                .collect(),
+        }
+    }
+
     /// Compare two evaluated arrays for equal dtype, shape, and values.
     pub fn equal_values(&self, other: &Self) -> bool {
         if self.as_array().dtype() != other.as_array().dtype()
@@ -1266,6 +1353,21 @@ mod tests {
         assert_eq!(array.shape(), &[5]);
         assert_eq!(array.dtype(), Dtype::Int32);
         assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
+    }
+
+    #[test]
+    fn owned_typed_data_and_native_bytes_round_trip() {
+        let values = vec![0x0102_0304u32, u32::MAX];
+        let array = Array::try_from_owned_data(values.clone(), &[2]).unwrap();
+        let evaluated = array.evaluated().unwrap();
+        assert_eq!(evaluated.as_slice::<u32>(), values);
+        assert_eq!(
+            evaluated.to_native_bytes(),
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

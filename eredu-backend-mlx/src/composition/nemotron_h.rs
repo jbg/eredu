@@ -1796,7 +1796,7 @@ pub(crate) fn load_nemotron_h_gguf_model(
         checkpoint.clone(),
         source.plan().checkpoint(),
         source.plan().tensor_mapping(),
-        residency.max_mapped_shards(),
+        residency.max_cached_shards(),
     )?);
     let (store, args) = match quantization {
         Some(quantization) => {
@@ -1833,7 +1833,7 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
         checkpoint.clone(),
         source.plan().checkpoint(),
         source.plan().tensor_mapping(),
-        options.max_mapped_shards(),
+        options.max_cached_shards(),
     )?);
     let model = load_neutral_parallel(
         store,

@@ -412,14 +412,12 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
         payloads.dedup();
         Ok(WeightStoreDiagnostics {
             backend: source.backend,
-            mapping_hits: source.mapping_hits.saturating_add(transformed.mapping_hits),
-            mapping_misses: source
-                .mapping_misses
-                .saturating_add(transformed.mapping_misses),
+            cache_hits: source.cache_hits.saturating_add(transformed.cache_hits),
+            cache_misses: source.cache_misses.saturating_add(transformed.cache_misses),
             evictions: source.evictions.saturating_add(transformed.evictions),
-            currently_mapped_shards: source
-                .currently_mapped_shards
-                .saturating_add(transformed.currently_mapped_shards),
+            currently_cached_shards: source
+                .currently_cached_shards
+                .saturating_add(transformed.currently_cached_shards),
             touched_shard_paths: touched,
             payload_shard_paths: payloads,
             physical_reads: source
@@ -933,14 +931,14 @@ fn submit_quantization_tile(
     let tile_context = &tile_contexts[report.source_tiles % tile_buffers];
     let tile_stream = tile_context.source_stream();
     let pending = recipe.prepare_borrowed_materialization(source, tile_context)?;
-    let (dense, source_mappings) = pending.into_parts();
+    let (dense, source_leases) = pending.into_parts();
     let outputs = quantize_tile_outputs(&dense, quantization, target, tile_stream)?;
     let completion = async_eval_with_event(outputs.iter())?;
     output_shards[output_shard].tile_submitted();
     pending_tiles.push_back(SubmittedQuantizationTile {
         outputs,
         _dense: dense,
-        source_mappings,
+        source_leases,
         completion: Some(completion),
         output_start,
         rows,
@@ -1096,7 +1094,7 @@ fn allocate_output_buffer(name: &str, byte_len: u64) -> Result<Vec<u8>, Error> {
 struct SubmittedQuantizationTile {
     outputs: Vec<Array>,
     _dense: Array,
-    source_mappings: Vec<PendingWeightMaterialization>,
+    source_leases: Vec<PendingWeightMaterialization>,
     completion: Option<Event>,
     output_start: usize,
     rows: usize,
@@ -1124,7 +1122,7 @@ impl SubmittedQuantizationTile {
             .take()
             .expect("submitted tile retains its completion")
             .synchronize();
-        for mapping in self.source_mappings.drain(..) {
+        for mapping in self.source_leases.drain(..) {
             mapping.complete();
         }
         result.map_err(Error::from)
@@ -1207,30 +1205,17 @@ fn write_tile(
             ))
         })?;
     let evaluated = output.evaluated()?;
-    let source = match output.dtype() {
-        Dtype::Uint32 => native_slice_bytes(evaluated.as_slice::<u32>()),
-        Dtype::Float16 => native_slice_bytes(evaluated.as_slice::<half::f16>()),
-        Dtype::Bfloat16 => native_slice_bytes(evaluated.as_slice::<half::bf16>()),
-        Dtype::Float32 => native_slice_bytes(evaluated.as_slice::<f32>()),
-        Dtype::Uint8 => evaluated.as_slice::<u8>(),
+    match output.dtype() {
+        Dtype::Uint32 | Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Uint8 => {}
         dtype => {
             return Err(quantization_error(format!(
                 "quantized output {:?} has unsupported dtype {dtype:?}",
                 layout.name
             )))
         }
-    };
-    destination.copy_from_slice(source);
-    Ok(())
-}
-
-fn native_slice_bytes<T>(values: &[T]) -> &[u8] {
-    unsafe {
-        // SAFETY: `values` is a valid initialized slice, and its byte view has
-        // the identical lifetime. The public constructor rejects big-endian
-        // hosts because SafeTensors payloads are little-endian.
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
+    destination.copy_from_slice(&evaluated.to_native_bytes());
+    Ok(())
 }
 
 fn preflight_source_collisions(

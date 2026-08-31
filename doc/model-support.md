@@ -154,7 +154,7 @@ rules.
 ## Important boundaries
 
 - Weight budgets exclude activations, request caches, kernels, allocator
-  caches, memory mappings, and some temporary workspaces.
+  caches, buffered checkpoint shards, and some temporary workspaces.
 - On Apple silicon, logical host and device tiers share physical unified memory.
 - Full-attention paging reduces logical device residency but still reads all
   retained history and can be I/O intensive.

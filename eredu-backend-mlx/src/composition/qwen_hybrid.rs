@@ -595,7 +595,7 @@ const fn cached_provider<'a>(
 fn prepare_hybrid_gguf_store(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
     let checkpoint = source.checkpoint();
     let eredu_architectures::configuration::GgufModelConfig::QwenHybrid(primary) = source.model()
@@ -622,7 +622,7 @@ fn prepare_hybrid_gguf_store(
         checkpoint.clone(),
         source.plan().checkpoint(),
         source.plan().tensor_mapping(),
-        max_mapped_shards,
+        max_cached_shards,
     )?);
     if parsed.text.variant == hybrid::HybridVariant::Qwen3Next {
         let parsed = hybrid::conditional_with_checkpoint_formats(&parsed, text_formats, None)
@@ -645,7 +645,7 @@ fn prepare_hybrid_gguf_store(
         projector.checkpoint().clone(),
         projector.plan().checkpoint(),
         projector.plan().tensor_mapping(),
-        max_mapped_shards,
+        max_cached_shards,
     )?);
     let parsed = hybrid::conditional_with_checkpoint_formats(
         &parsed,
@@ -662,9 +662,9 @@ fn prepare_hybrid_gguf_store(
 pub fn prepare_gguf_pipeline(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
-    prepare_hybrid_gguf_store(source, projector, max_mapped_shards)
+    prepare_hybrid_gguf_store(source, projector, max_cached_shards)
 }
 
 /// Loads a llama.cpp Qwen3-Next/Qwen3.5 text artifact through the same
@@ -693,7 +693,7 @@ pub(crate) fn load_gguf(
     let (mut parsed, store) = prepare_hybrid_gguf_store(
         source,
         projector,
-        options.max_mapped_shards(),
+        options.max_cached_shards(),
     )?;
     let quantize_on_load = quantization
         .map(|requested| {

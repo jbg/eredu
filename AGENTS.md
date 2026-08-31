@@ -69,6 +69,9 @@ Prefer semantic enforcement that survives refactors:
 
 - Cargo manifests and feature-gated builds for crate and optional-dependency
   boundaries;
+- the workspace `unsafe_code = "forbid"` lint, inherited by every package except
+  the `safemlx` native wrapper, the raw `safemlx-sys` bindings, and the
+  `eredu-ios` C-ABI example;
 - compiler type checking and visibility for ownership boundaries;
 - backend-neutral conformance tests for public behavior; and
 - focused tests for architecture/runtime contracts.

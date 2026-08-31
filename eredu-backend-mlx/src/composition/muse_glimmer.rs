@@ -329,7 +329,7 @@ pub fn load_dflash_gguf(
     )?;
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-            .max_cached_readers(options.weight_residency.max_mapped_shards())?
+            .max_cached_readers(options.weight_residency.max_cached_shards())?
             .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
             .build()?,
     );
@@ -1878,7 +1878,7 @@ pub fn load_gguf_tensor_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let (store, args) = open_gguf_store(source, projector, residency.max_mapped_shards())?;
+    let (store, args) = open_gguf_store(source, projector, residency.max_cached_shards())?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
@@ -1957,7 +1957,7 @@ pub fn load_gguf(
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
     let expert_options = residency.expert_cache();
-    let (store, args) = open_gguf_store(source, projector, residency.max_mapped_shards())?;
+    let (store, args) = open_gguf_store(source, projector, residency.max_cached_shards())?;
     let mut model = load_store(
         store,
         args,

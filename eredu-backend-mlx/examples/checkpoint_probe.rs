@@ -617,27 +617,8 @@ fn create_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn process_peak_rss_bytes() -> Option<u64> {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: getrusage initializes the supplied rusage on success.
-    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-    if status != 0 {
-        return None;
-    }
-    // SAFETY: the successful call above initialized usage.
-    let rss = unsafe { usage.assume_init() }.ru_maxrss;
-    let rss = u64::try_from(rss).ok()?;
-    if cfg!(target_os = "macos") {
-        Some(rss)
-    } else {
-        rss.checked_mul(1024)
-    }
-}
-
-#[cfg(not(unix))]
-fn process_peak_rss_bytes() -> Option<u64> {
-    None
+    safemlx::system::process_usage().map(|usage| usage.peak_rss)
 }
 
 #[cfg(test)]

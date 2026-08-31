@@ -80,7 +80,7 @@ impl MlxDrafter {
                             catalog,
                             &plan,
                             &resolution,
-                            options.weight_residency.max_mapped_shards(),
+                            options.weight_residency.max_cached_shards(),
                         )?;
                         load_assistant_safetensors(store, config, options, stream, weights_stream)?
                     }
@@ -114,7 +114,7 @@ impl MlxDrafter {
                             catalog,
                             &plan,
                             &resolution,
-                            options.weight_residency.max_mapped_shards(),
+                            options.weight_residency.max_cached_shards(),
                         )?;
                         load_dflash_safetensors(store, config, options, stream, weights_stream)?
                     }

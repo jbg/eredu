@@ -21,7 +21,8 @@ eredu-core        eredu-checkpoint        eredu-nn
 The neutral crates contain no native accelerator dependency under any feature.
 `safemlx` is the native-binding dependency of `eredu-backend-mlx`. It owns safe
 wrappers for MLX arrays, operations, devices, streams, collectives, graph
-transforms, serialization, and accelerator/runtime handles. It owns no
+transforms, serialization, host-resource observations, and accelerator/runtime
+handles. It owns no
 framework abstractions: neural-network modules, quantization policy, mutable
 execution state, GGUF materialization, and composed backend operations belong
 to `eredu-backend-mlx`. This includes logical distributed subgroups and
@@ -34,6 +35,11 @@ Model-family construction and equations remain in
 on the neutral tensor contracts in `eredu-nn`. A concrete backend may depend on
 `eredu-codec` for an optional codec binding; the codec crate does not acquire a
 backend feature or dependency in the other direction.
+The workspace forbids unsafe Rust in every package except the native `safemlx`
+wrapper, its raw `safemlx-sys` bindings, and the `eredu-ios` C-ABI example.
+Unsafe MLX and operating-system calls remain encapsulated by safe `safemlx`
+APIs; the iOS exception is limited to its foreign entry points, callbacks, and
+pointer ownership boundary.
 `eredu-gguf` is likewise a backend-neutral storage dependency. Backends that
 execute nonlinear GGUF IQ blocks consume their canonical values through the
 typed `IQuantCodebook` API; generated table modules remain private and cannot
@@ -934,7 +940,7 @@ A backend owns runtime-specific resources and computation:
 
 - tensors, neural operators, queues or streams, random state, and sampling math;
 - model and request cache storage;
-- checkpoint payload mapping and tensor materialization;
+- checkpoint payload buffering and tensor materialization;
 - native device discovery, allocation measurements, transfers, and kernels;
 - communicators and collective tensor operations; and
 - exact native completion objects and runtime-specific errors.
@@ -1213,7 +1219,7 @@ Core separates logical policy from physical storage:
   Unit construction, cache policy, and forward execution reuse those retained
   arguments rather than accepting an independent configuration.
 
-A backend supplies concrete tensors, host buffers, mapped payloads, files,
+A backend supplies concrete tensors, host buffers, buffered payloads, files,
 workers, native transfer objects, and allocation observations. It applies core
 transition results and releases the physical resources selected by those
 results.

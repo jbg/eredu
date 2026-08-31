@@ -9,9 +9,11 @@ rust-version.workspace = true
 description = "Backend-neutral checkpoint contracts and storage encodings for Eredu"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 eredu-gguf.workspace = true
-memmap2 = "0.9"
 serde.workspace = true
 serde_json.workspace = true
 safetensors = "0.8"

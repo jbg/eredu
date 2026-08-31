@@ -9,6 +9,9 @@ rust-version.workspace = true
 description = "Backend-neutral contracts and orchestration for eredu"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

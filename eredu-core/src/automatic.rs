@@ -9,7 +9,7 @@ use crate::{
     backend::{BackendProvider, ModelLoadingBackend, ModelRuntime},
     execution::{
         DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, ResidencyPlan,
-        DEFAULT_MAX_MAPPED_SHARDS,
+        DEFAULT_MAX_CACHED_SHARDS,
     },
     speculative::SpeculativeDraft,
 };
@@ -289,8 +289,8 @@ pub struct AutomaticPlannerPolicy {
     pub expert_cache_share_percent: u8,
     /// Repeated execution groups retained in the layerwise device window.
     pub device_layer_window: usize,
-    /// Maximum simultaneously mapped checkpoint shards or readers.
-    pub max_mapped_shards: usize,
+    /// Maximum simultaneously cached checkpoint shards or readers.
+    pub max_cached_shards: usize,
     /// Maximum proposals used when embedded MTP is available.
     pub embedded_mtp_draft_tokens: usize,
     /// Minimum generated-token count for one prior run to influence planning.
@@ -305,7 +305,7 @@ impl Default for AutomaticPlannerPolicy {
             memory_headroom_percent: 30,
             expert_cache_share_percent: 40,
             device_layer_window: 1,
-            max_mapped_shards: DEFAULT_MAX_MAPPED_SHARDS,
+            max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             embedded_mtp_draft_tokens: 3,
             minimum_feedback_tokens: 1,
         }
@@ -1072,7 +1072,7 @@ fn validate_request(
         || policy.expert_cache_share_percent == 0
         || policy.expert_cache_share_percent >= 100
         || policy.device_layer_window == 0
-        || policy.max_mapped_shards == 0
+        || policy.max_cached_shards == 0
         || policy.embedded_mtp_draft_tokens == 0
         || policy.minimum_feedback_tokens == 0
     {
@@ -1134,7 +1134,7 @@ fn base_candidates(
     policy: &AutomaticPlannerPolicy,
 ) -> [ExecutionPlan; 3] {
     let mut resident = ExecutionPlan::fully_resident(device);
-    resident.max_mapped_shards = policy.max_mapped_shards;
+    resident.max_cached_shards = policy.max_cached_shards;
     let mut layerwise = resident.clone();
     layerwise.residency = ResidencyPlan::LayerwiseHost {
         device_layer_window: policy.device_layer_window,

@@ -8942,7 +8942,7 @@ pub fn load_pipeline_model_with_options(
             (Some(experts), layer_residency())
         }
     };
-    let max_mapped_shards = options.weight_residency.max_mapped_shards();
+    let max_cached_shards = options.weight_residency.max_cached_shards();
 
     let artifact = match artifact {
         ModelArtifact::Gguf {
@@ -9000,7 +9000,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_neutral_deepseek_v4_pipeline(
                         args.clone(),
@@ -9021,7 +9021,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_llama_pipeline(
                         prepared.args,
@@ -9040,7 +9040,7 @@ pub fn load_pipeline_model_with_options(
                         crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
                             &admitted,
                             projector.as_ref(),
-                            max_mapped_shards,
+                            max_cached_shards,
                         )?;
                     load_muse_glimmer_pipeline(
                         args,
@@ -9067,7 +9067,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_neutral_deepseek_v3_pipeline(
                         args.clone(),
@@ -9086,7 +9086,7 @@ pub fn load_pipeline_model_with_options(
                     let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
                         &admitted,
                         projector.as_ref(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?;
                     load_neutral_gemma4_pipeline(
                         args,
@@ -9109,7 +9109,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_qwen_pipeline(
                         args,
@@ -9130,7 +9130,7 @@ pub fn load_pipeline_model_with_options(
                         projector
                             .as_ref()
                             .expect("required GGUF projector was validated above"),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?;
                     load_neutral_qwen_vl_pipeline(
                         args,
@@ -9151,7 +9151,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_gpt_oss_pipeline(
                         prepared.args,
@@ -9172,7 +9172,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_lfm2_pipeline(
                         prepared.args,
@@ -9193,7 +9193,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_nemotron_h_pipeline(
                         prepared.args,
@@ -9212,7 +9212,7 @@ pub fn load_pipeline_model_with_options(
                     let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
                         &admitted,
                         projector.as_ref(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?;
                     if parsed.vision.is_some() {
                         load_neutral_qwen_conditional_pipeline(
@@ -9248,7 +9248,7 @@ pub fn load_pipeline_model_with_options(
                         checkpoint,
                         admitted.plan().checkpoint(),
                         admitted.plan().tensor_mapping(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?);
                     load_kimi_linear_pipeline(
                         prepared.args,
@@ -9267,7 +9267,7 @@ pub fn load_pipeline_model_with_options(
                     let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
                         &admitted,
                         projector.as_ref(),
-                        max_mapped_shards,
+                        max_cached_shards,
                     )?;
                     load_neutral_inkling_pipeline(
                         args,
@@ -9296,7 +9296,7 @@ pub fn load_pipeline_model_with_options(
             )?
             .clone(),
             tensors,
-            max_mapped_shards,
+            max_cached_shards,
         )?,
     };
 

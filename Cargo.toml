@@ -22,6 +22,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.package]
 edition = "2021"
 authors = ["Jasper Hugo <jasper@jasperhugo.com>"]

@@ -2239,7 +2239,7 @@ pub fn load_gguf_tensor_parallel(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let (store, args) = open_gguf_store(source, projector, layer_policy.max_mapped_shards())?;
+    let (store, args) = open_gguf_store(source, projector, layer_policy.max_cached_shards())?;
     load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
 }
 
@@ -2316,7 +2316,7 @@ pub fn load_gguf(
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
     let expert_options = residency.expert_cache();
-    let (store, args) = open_gguf_store(source, projector, residency.max_mapped_shards())?;
+    let (store, args) = open_gguf_store(source, projector, residency.max_cached_shards())?;
     let layer_policy = residency.layers();
     let mut model = load_store(
         store,

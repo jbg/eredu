@@ -7,7 +7,7 @@
 //! unified-memory systems.
 //! Missing units can be reserved and submitted as one batch. Caller-owned
 //! [`crate::backend::runtime::residency::manager::ResidentTransfer`] values retain
-//! source mappings until MLX reports exact completion of the submitted
+//! source leases until MLX reports exact completion of the submitted
 //! transfer.
 
 use std::{
@@ -820,7 +820,7 @@ impl ResidencyTransferOwner<Event, ResidentTransferResources> for ManagerInner {
         } else {
             // Preserve PendingWeightMaterialization's conservative failure
             // cleanup: it synchronizes the involved streams and retains a
-            // mapping permanently if backend state is unknowable.
+            // source lease permanently if backend state is unknowable.
             drop(resources);
         }
     }
@@ -853,11 +853,6 @@ struct ManagerState {
     source_stream: Stream,
     device_stream: Stream,
 }
-
-// SAFETY: every access to the MLX stream handles and resident arrays in this
-// state is serialized by `ManagerInner::state`. No stream reference escapes
-// the lock, and MLX operations use safemlx's runtime guard internally.
-unsafe impl Send for ManagerState {}
 
 #[derive(Default)]
 struct UnitStorage {
@@ -1122,21 +1117,21 @@ fn ensure_many_resident(
                 match item {
                     Ok(item) => break item,
                     Err(error)
-                        if is_mapping_capacity_error(&error)
+                        if is_shard_cache_capacity_error(&error)
                             && prepared.iter().any(
                                 |(_, item): &(OffloadUnitId, PreparedResidentArrays)| {
                                     !item.pending_sources.is_empty()
                                 },
                             ) =>
                     {
-                        // Earlier units in this batch can pin the only mapped
+                        // Earlier units in this batch can pin the only cached
                         // shard while a later cross-shard expert is prepared.
                         // Their output arrays are complete evaluation roots, so
-                        // detach those mappings and retry the current unit.
+                        // detach those leases and retry the current unit.
                         eval(prepared.iter().flat_map(|(_, item)| item.arrays.values())).map_err(
                             |source| ResidencyError::Mlx {
                                 id: internal_id(),
-                                operation: "mapping-capacity batch evaluation",
+                                operation: "shard-cache-capacity batch evaluation",
                                 source,
                             },
                         )?;
@@ -1477,11 +1472,11 @@ fn prepare_from_disk(
                 Err(error)
                     if !retried_after_capacity
                         && !pending_sources.is_empty()
-                        && is_mapping_capacity_error(&error) =>
+                        && is_shard_cache_capacity_error(&error) =>
                 {
                     eval(arrays.values()).map_err(|source| ResidencyError::Mlx {
                         id: internal_id(),
-                        operation: "mapping-capacity residency evaluation",
+                        operation: "shard-cache-capacity residency evaluation",
                         source,
                     })?;
                     for source in pending_sources.drain(..) {
@@ -1504,7 +1499,7 @@ fn prepare_from_disk(
     })
 }
 
-fn is_mapping_capacity_error(error: &ResidencyError) -> bool {
+fn is_shard_cache_capacity_error(error: &ResidencyError) -> bool {
     matches!(
         error,
         ResidencyError::CheckpointStore(
@@ -1764,7 +1759,7 @@ mod tests {
         )
         .unwrap();
         let store =
-            Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap());
+            Arc::new(SafetensorsWeightStore::open_with_max_cached_shards(dir.path(), 1).unwrap());
         (dir, store)
     }
 
@@ -1958,7 +1953,7 @@ mod tests {
         assert_eq!(host_i32(&leases[0], "weight"), [1, 2]);
         assert_eq!(host_i32(&leases[1], "weight"), [3, 4]);
         let diagnostics = store.source_diagnostics().unwrap();
-        assert_eq!(diagnostics.currently_mapped_shards, 1);
+        assert_eq!(diagnostics.currently_cached_shards, 1);
         assert!(diagnostics.evictions >= 1);
     }
 
@@ -2825,7 +2820,7 @@ mod tests {
             report.offload().peak_resident_bytes().get(MemoryTier::Host),
             fixture_host_capacity(2)
         );
-        assert!(report.weight_store().mapping_hits > 0);
+        assert!(report.weight_store().cache_hits > 0);
     }
 
     #[test]

@@ -20,6 +20,9 @@ default = ["onig", "esaxx_fast"]
 esaxx_fast = ["tokenizers/esaxx_fast"]
 onig = ["tokenizers/onig"]
 
+[lints]
+workspace = true
+
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

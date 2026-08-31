@@ -93,6 +93,9 @@ nccl = ["cuda", "eredu-backend-mlx?/nccl"]
 image = ["eredu-backend-mlx?/image"]
 audio = ["eredu-backend-mlx?/audio"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }

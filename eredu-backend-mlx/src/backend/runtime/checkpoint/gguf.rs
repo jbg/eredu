@@ -1,5 +1,5 @@
 use eredu_gguf::{DenseTensorSpan, Endian, GgmlType, MetadataValue, TensorSelection};
-use safemlx::{error::IoError, Array, Dtype};
+use safemlx::{error::IoError, Array};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -453,17 +453,52 @@ fn convert_tensor(
         eredu_gguf::ConvertedTensor::Dense(dense) => {
             let [name] = converted_output_names(&descriptor.name, output_names)?;
             let shape = mlx_shape_i32(&descriptor.name, &dense.shape)?;
-            let dtype = match dense.dtype {
-                eredu_gguf::DenseDtype::F32 => Dtype::Float32,
-                eredu_gguf::DenseDtype::F16 => Dtype::Float16,
-                eredu_gguf::DenseDtype::Bf16 => Dtype::Bfloat16,
-                eredu_gguf::DenseDtype::I8 => Dtype::Int8,
-                eredu_gguf::DenseDtype::I16 => Dtype::Int16,
-                eredu_gguf::DenseDtype::I32 => Dtype::Int32,
-                eredu_gguf::DenseDtype::I64 => Dtype::Int64,
-                eredu_gguf::DenseDtype::F64 => Dtype::Float64,
+            let array = match dense.dtype {
+                eredu_gguf::DenseDtype::F32 => array_from_owned_data(
+                    decode_native(dense.data, f32::from_ne_bytes)?,
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::F16 => array_from_owned_data(
+                    decode_native(dense.data, |bytes| {
+                        half::f16::from_bits(u16::from_ne_bytes(bytes))
+                    })?,
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::Bf16 => array_from_owned_data(
+                    decode_native(dense.data, |bytes| {
+                        half::bf16::from_bits(u16::from_ne_bytes(bytes))
+                    })?,
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::I8 => array_from_owned_data(
+                    dense.data.into_iter().map(|value| value as i8).collect(),
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::I16 => array_from_owned_data(
+                    decode_native(dense.data, i16::from_ne_bytes)?,
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::I32 => array_from_owned_data(
+                    decode_native(dense.data, i32::from_ne_bytes)?,
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::I64 => array_from_owned_data(
+                    decode_native(dense.data, i64::from_ne_bytes)?,
+                    &shape,
+                    host_owned,
+                )?,
+                eredu_gguf::DenseDtype::F64 => array_from_owned_data(
+                    decode_native(dense.data, f64::from_ne_bytes)?,
+                    &shape,
+                    host_owned,
+                )?,
             };
-            let array = array_from_owned_data(dense.data, &shape, dtype, host_owned)?;
             Ok(GgufTensor::Dense(GgufArray { name, array }))
         }
         eredu_gguf::ConvertedTensor::IQuant(iquant) => {
@@ -473,8 +508,7 @@ fn convert_tensor(
                 &iquant.packed_shape().map_err(gguf_error)?,
             )?;
             let logical_shape = mlx_shape_i32(&descriptor.name, &iquant.shape)?;
-            let array =
-                array_from_owned_data(iquant.data, &packed_shape, Dtype::Uint8, host_owned)?;
+            let array = array_from_owned_data(iquant.data, &packed_shape, host_owned)?;
             Ok(GgufTensor::IQuant(GgufIQuantTensor {
                 physical_name: descriptor.name.clone(),
                 ggml_type: iquant.ggml_type,
@@ -488,12 +522,9 @@ fn convert_tensor(
                 converted_output_names(&descriptor.name, output_names)?;
             let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
-            let weight =
-                array_from_owned_data(affine.weights, &weight_shape, Dtype::Uint32, host_owned)?;
-            let scales =
-                array_from_owned_data(affine.scales, &scale_shape, Dtype::Float16, host_owned)?;
-            let biases =
-                array_from_owned_data(affine.biases, &scale_shape, Dtype::Float16, host_owned)?;
+            let weight = array_from_owned_data(affine.weights, &weight_shape, host_owned)?;
+            let scales = array_from_owned_data(affine.scales, &scale_shape, host_owned)?;
+            let biases = array_from_owned_data(affine.biases, &scale_shape, host_owned)?;
             Ok(GgufTensor::Affine(GgufAffineTensor {
                 physical_name: descriptor.name,
                 bits: affine.bits,
@@ -517,10 +548,8 @@ fn convert_tensor(
                 converted_output_names(&descriptor.name, output_names)?;
             let weight_shape = mlx_shape_i32(&descriptor.name, &mxfp4.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &mxfp4.scale_shape)?;
-            let weight =
-                array_from_owned_data(mxfp4.weights, &weight_shape, Dtype::Uint32, host_owned)?;
-            let scales =
-                array_from_owned_data(mxfp4.scales, &scale_shape, Dtype::Uint8, host_owned)?;
+            let weight = array_from_owned_data(mxfp4.weights, &weight_shape, host_owned)?;
+            let scales = array_from_owned_data(mxfp4.scales, &scale_shape, host_owned)?;
             Ok(GgufTensor::MxFp4(GgufMxFp4Tensor {
                 physical_name: descriptor.name,
                 weight: GgufArray {
@@ -548,19 +577,32 @@ fn converted_output_names<const N: usize>(
     })
 }
 
-fn array_from_owned_data<T: 'static>(
+fn array_from_owned_data<T: safemlx::ArrayElement + 'static>(
     values: Vec<T>,
     shape: &[i32],
-    dtype: Dtype,
     host_owned: bool,
 ) -> Result<Array, IoError> {
-    Ok(unsafe {
-        if host_owned {
-            Array::try_from_owned_host_data(values, shape, dtype)?
-        } else {
-            Array::from_raw_data(values.as_ptr().cast(), shape, dtype)
-        }
+    Ok(if host_owned {
+        Array::try_from_owned_data(values, shape)?
+    } else {
+        Array::try_from_data(&values, shape)?
     })
+}
+
+fn decode_native<T, const N: usize>(
+    bytes: Vec<u8>,
+    decode: impl Fn([u8; N]) -> T,
+) -> Result<Vec<T>, IoError> {
+    if !bytes.len().is_multiple_of(N) {
+        return Err(IoError::InvalidFormat(format!(
+            "dense payload length {} is not divisible by element width {N}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(N)
+        .map(|chunk| decode(chunk.try_into().expect("chunk length is exact")))
+        .collect())
 }
 
 fn mlx_shape_i32(name: &str, shape: &[u64]) -> Result<Vec<i32>, IoError> {

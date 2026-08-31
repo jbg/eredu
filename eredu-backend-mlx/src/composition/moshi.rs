@@ -283,7 +283,7 @@ pub fn load(
     let artifact_identity = artifact_identity(&model_dir, &source_path, &source_config)?;
     let source_store = open_safetensors_weight_store(
         &source_path,
-        options.weight_residency.layers().max_mapped_shards(),
+        options.weight_residency.layers().max_cached_shards(),
     )?;
     let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
         source_store.as_ref(),

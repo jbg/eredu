@@ -237,8 +237,8 @@ where
 /// This is useful for loaders that keep one parameter class resident while a
 /// separate cache owns another class from the same type-erased checkpoint
 /// store. Direct and recipe outputs share a fixed two-completion window;
-/// source mappings remain retained through their exact event, and outputs are
-/// copied to the execution stream when the streams differ. Mapping-capacity
+/// source leases remain retained through their exact event, and outputs are
+/// copied to the execution stream when the streams differ. Shard-cache-capacity
 /// pressure drains the oldest completion before retrying.
 pub fn materialize_module_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -269,7 +269,7 @@ pub fn materialize_module_bindings(
         let materialization = loop {
             match submit_module_binding(store, binding, source_stream, execution_stream, &context) {
                 Ok(materialization) => break materialization,
-                Err(error) if !pending.is_empty() && is_mapping_capacity_error(&error) => {
+                Err(error) if !pending.is_empty() && is_shard_cache_capacity_error(&error) => {
                     finish_module_binding(&mut pending, &mut arrays)?;
                 }
                 Err(error) => return Err(error),
@@ -347,7 +347,7 @@ fn finish_module_binding(
     Ok(())
 }
 
-fn is_mapping_capacity_error(error: &ModuleBindingError) -> bool {
+fn is_shard_cache_capacity_error(error: &ModuleBindingError) -> bool {
     matches!(
         error,
         ModuleBindingError::CheckpointStore(

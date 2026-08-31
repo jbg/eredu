@@ -8,6 +8,9 @@ repository.workspace = true
 license.workspace = true
 description = "Bounded framework-independent GGUF reader, writer, and tensor converter"
 
+[lints]
+workspace = true
+
 [dependencies]
 half.workspace = true
 thiserror.workspace = true

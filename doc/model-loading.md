@@ -70,9 +70,9 @@ control how much future materialization may be in flight. This policy reduces
 resident parameter bytes at the cost of checkpoint reads and conversion during
 execution.
 
-SafeTensors mappings and GGUF readers are bounded separately. Operating-system
-page caching can make repeated reads faster, so logical read counters should
-not be interpreted as physical storage traffic.
+SafeTensors shard buffers and GGUF readers are bounded separately. Logical read
+counters describe Eredu's checkpoint access rather than physical storage
+traffic.
 
 ### Independent expert cache
 
@@ -205,6 +205,6 @@ in-flight ownership. Expert, dense-stream, and request-cache reports are
 separate because they have different budgets and lifetimes.
 
 Static parameter estimates do not include activations, KV or recurrent state,
-kernel memory, allocator caches, checkpoint mappings, all temporary workspaces,
+kernel memory, allocator caches, buffered checkpoint shards, all temporary workspaces,
 or opaque backend-driver allocations. Use backend allocator statistics and
 process memory observation alongside Eredu reports when sizing an application.

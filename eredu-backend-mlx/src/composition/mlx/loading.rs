@@ -259,7 +259,7 @@ pub fn materialize_model_plan(
                     configuration,
                     prepared_safetensors_architecture(&architecture_plan)?.clone(),
                     tensors,
-                    options.weight_residency.max_mapped_shards(),
+                    options.weight_residency.max_cached_shards(),
                 )?;
                 let model = materialize_tensor_parallel(&prepared, options, stream, weights_stream)
                     .map(|model| MlxModel::complete(model, floating_state_dtype_bytes))?;
@@ -283,7 +283,7 @@ pub fn materialize_model_plan(
                 configuration,
                 prepared_safetensors_architecture(&architecture_plan)?.clone(),
                 tensors,
-                options.weight_residency.max_mapped_shards(),
+                options.weight_residency.max_cached_shards(),
             )?;
             let model = materialize_safetensors(&prepared, options, stream, weights_stream)
                 .map(|model| MlxModel::complete(model, floating_state_dtype_bytes))?;

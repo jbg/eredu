@@ -258,8 +258,8 @@ pub struct StaticMemoryReport {
     pub backend_allocator_cache_bytes: Observed<u64>,
     /// Whether logical host/device tiers share physical capacity.
     pub physical_semantics: PhysicalMemorySemantics,
-    /// Currently retained memory mappings.
-    pub currently_mapped_shards: Observed<u64>,
+    /// Currently retained checkpoint shard buffers or readers.
+    pub currently_cached_shards: Observed<u64>,
 }
 
 /// System memory usable as an admission signal.
@@ -1018,7 +1018,7 @@ mod tests {
             backend_active_allocation_bytes: Observed::unavailable("no allocator probe"),
             backend_allocator_cache_bytes: Observed::unsupported("no allocator cache"),
             physical_semantics: PhysicalMemorySemantics::SeparateTiers,
-            currently_mapped_shards: Observed::exact(1, "mock store"),
+            currently_cached_shards: Observed::exact(1, "mock store"),
         };
         let encoded = serde_json::to_string(&report).unwrap();
         let decoded: StaticMemoryReport = serde_json::from_str(&encoded).unwrap();

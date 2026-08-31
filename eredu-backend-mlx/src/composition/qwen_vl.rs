@@ -968,7 +968,7 @@ fn quantize_store(
 pub fn prepare_gguf_pipeline(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: &crate::composition::mlx::structural::AdmittedGgufProjector,
-    max_mapped_shards: usize,
+    max_cached_shards: usize,
 ) -> Result<(vl::ModelArgs, Arc<dyn CheckpointSource>), Error> {
     let checkpoint = source.checkpoint();
     let eredu_architectures::configuration::GgufModelConfig::Qwen(_) = source.model() else {
@@ -995,13 +995,13 @@ pub fn prepare_gguf_pipeline(
         checkpoint.clone(),
         source.plan().checkpoint(),
         source.plan().tensor_mapping(),
-        max_mapped_shards,
+        max_cached_shards,
     )?);
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         projector.checkpoint().clone(),
         projector.plan().checkpoint(),
         projector.plan().tensor_mapping(),
-        max_mapped_shards,
+        max_cached_shards,
     )?);
     Ok((
         args,
@@ -1025,7 +1025,7 @@ pub fn load_gguf(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let (mut args, store) =
-        prepare_gguf_pipeline(source, projector, options.max_mapped_shards())?;
+        prepare_gguf_pipeline(source, projector, options.max_cached_shards())?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen3-VL GGUF", None, requested)
