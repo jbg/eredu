@@ -16,6 +16,7 @@ use eredu_backend_mlx::native::{
     MlxRealtimeModel, MlxSessionCompletion,
 };
 use eredu_backend_mlx::MlxTensor;
+use eredu_core::InspectableBackendSession;
 
 fn assert_public_type<T: ?Sized>() {}
 
@@ -53,6 +54,13 @@ fn composition_owned_native_types_have_one_public_native_path() {
     assert_public_type::<MlxModelOutput>();
     assert_public_type::<MlxModelSession<'static>>();
     assert_public_type::<MlxSessionCompletion>();
+}
+
+#[test]
+fn model_session_exposes_the_neutral_inspection_contract() {
+    fn assert_inspectable<T: InspectableBackendSession<MlxBackend<'static>>>() {}
+
+    assert_inspectable::<MlxModelSession<'static>>();
 }
 
 #[test]

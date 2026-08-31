@@ -832,7 +832,7 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Runs one MLX instrumented pass through the architecture-erased adapter.
-    pub fn forward_with_observer(
+    pub(crate) fn forward_with_observer(
         model: &mut Executable,
         input_tokens: &Array,
         mask: Option<&Array>,
@@ -983,7 +983,7 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Submits an instrumented prefill for a non-pipeline executable.
-    pub fn submit_complete_prefill_with_observer(
+    pub(crate) fn submit_complete_prefill_with_observer(
         model: &mut Executable,
         input: MlxModelInput,
         stream: &Stream,
