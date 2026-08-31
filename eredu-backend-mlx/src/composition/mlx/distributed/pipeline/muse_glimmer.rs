@@ -44,7 +44,7 @@ use crate::{
         execute_routed_layered_partition_observed, load_architecture_static_parameters,
         media_architecture_transport, pipeline_binding_units, preflight_pipeline_realization,
         quantize_pipeline_stage_store, validate_admitted_pipeline_kind,
-        validate_pipeline_expert_dispatch, validate_scheduled_pipeline_kv_cache,
+        validate_pipeline_expert_dispatch, validate_pipeline_key_value_cache_layout,
         BoundPipelineBindings, MuseGlimmerPipelinePartition, PipelineAuxiliaryState,
         PipelineExpertStorage, PipelineForward, PipelineLayerCache, PipelineLayerController,
         PipelineLayerLoadOptions, PipelineLayerStorage, PipelineLoadAccumulator, PipelineModel,
@@ -955,10 +955,11 @@ impl MuseGlimmerPipelinePartition {
         stream: &Stream,
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
-        validate_scheduled_pipeline_kv_cache(
+        validate_pipeline_key_value_cache_layout(
             "Muse-Glimmer",
-            self.range().clone(),
-            &self.architecture.args().attention_schedule,
+            self.partition.state().ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer stage has no architecture state layout".into())
+            })?,
             caches,
         )?;
         let assignment = self.expert_assignment.clone();

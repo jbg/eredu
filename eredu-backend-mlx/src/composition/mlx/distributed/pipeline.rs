@@ -4589,27 +4589,33 @@ fn materialize_pipeline_cache_layers(
         .collect()
 }
 
-fn validate_scheduled_pipeline_kv_cache(
+fn validate_pipeline_key_value_cache_layout(
     family: &str,
-    range: Range<usize>,
-    schedule: &eredu_core::LayerSchedule<eredu_core::AttentionPolicy>,
+    state: &eredu_runtime::PartitionState,
     caches: &[PipelineLayerCache],
 ) -> Result<(), Error> {
-    if caches.len() != range.len() {
+    let layout = state.layout();
+    if caches.len() != layout.len() {
         return Err(Error::Parallel(format!(
             "{family} stage cache has {} entries, expected {}",
             caches.len(),
-            range.len()
+            layout.len()
         )));
     }
-    for (global_layer, cache) in range.zip(caches) {
-        let expected = schedule
-            .get(global_layer)
-            .ok_or_else(|| Error::Parallel(format!("{family} has no layer {global_layer}")))?
-            .window()
-            .map(|window| {
-                i32::try_from(window.get()).expect("validated attention window fits i32")
-            });
+    for ((global_layer, policy), cache) in state
+        .global_layers()
+        .zip(layout.layers().iter())
+        .zip(caches)
+    {
+        let attention = match policy {
+            eredu_core::cache::LayerCachePolicy::KeyValue { attention, .. } => *attention,
+            _ => {
+                return Err(Error::Parallel(format!(
+                    "{family} state layout is not key/value state at global layer {global_layer}"
+                )))
+            }
+        };
+        let expected = attention_window_i32(attention, global_layer)?;
         let (cached_layer, actual) = match cache {
             PipelineLayerCache::KeyValue {
                 global_layer,
@@ -4634,6 +4640,55 @@ fn validate_scheduled_pipeline_kv_cache(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn pipeline_key_value_validation_consumes_partition_state_layout() {
+    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
+
+    let layout = eredu_runtime::StateLayout::new(
+        LayerSchedule::new(
+            2,
+            vec![
+                LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap(),
+                LayerCachePolicy::key_value(AttentionPolicy::sliding(8).unwrap(), 1, 8).unwrap(),
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let state = eredu_runtime::PartitionState::new(layout, 4).unwrap();
+    let caches = vec![
+        PipelineLayerCache::KeyValue {
+            global_layer: 4,
+            cache: PipelineKeyValueCache::Standard(ConcatKeyValueCache::new()),
+            slots: Vec::new(),
+        },
+        PipelineLayerCache::KeyValue {
+            global_layer: 5,
+            cache: PipelineKeyValueCache::Standard(ConcatKeyValueCache::new_for_sliding_attention(
+                8,
+            )),
+            slots: Vec::new(),
+        },
+    ];
+    validate_pipeline_key_value_cache_layout("test", &state, &caches).unwrap();
+
+    let drifted = [
+        caches[0].clone(),
+        PipelineLayerCache::KeyValue {
+            global_layer: 5,
+            cache: PipelineKeyValueCache::Standard(ConcatKeyValueCache::new()),
+            slots: Vec::new(),
+        },
+    ];
+    let error = validate_pipeline_key_value_cache_layout("test", &state, &drifted).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Parallel(message)
+            if message.contains("global layer 5") && message.contains("expected window Some(8)")
+    ));
 }
 
 pub struct PipelineModel {

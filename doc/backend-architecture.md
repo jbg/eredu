@@ -644,8 +644,12 @@ backend lowers only its parallel topology. Pipeline execution uses its exact
 placed partition, while replicated execution attaches the architecture's
 complete realized state layout at global offset zero. Target or
 embedded-prediction cache allocation uses that identity and does not recreate
-a global layout, offsets, or family identity after placement. Composite
-model layouts, such as a target decoder plus embedded prediction state, are
+a global layout, offsets, or family identity after placement. Pipeline cache
+validation likewise consumes the placed partition's localized `StateLayout`,
+including its architecture-global offset; it does not reread a family
+attention schedule or interpret configuration fields as a second cache policy.
+Composite model layouts, such as a target decoder plus embedded prediction
+state, are
 assembled by the architecture before a backend consumes them. Architecture
 capability construction consumes that same composite layout for admission
 accounting, so prediction segments cannot be admitted with target-only byte
