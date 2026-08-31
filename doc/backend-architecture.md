@@ -650,6 +650,11 @@ metadata. When separately materialized prediction state follows target state,
 the architecture's rank-local geometry publishes its `PartitionState`, including
 the architecture-global offset; a backend does not recover that offset from a
 family layer-count field.
+The public session returns this identity as one value. Descriptor construction
+copies all model-owned fields from that value atomically and accepts only the
+checkpoint fingerprint, processed-prefix fingerprint, and batch size from the
+caller; backend adapters do not expose a parallel set of field-level identity
+getters for callers to reassemble.
 Each pipeline descriptor covers exactly the state executed and owned by that
 stage. Required fixed components are persisted only on their architecture-owned
 global layer, even when their current value also travels in an auxiliary

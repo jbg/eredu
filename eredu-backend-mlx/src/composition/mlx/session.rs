@@ -577,85 +577,15 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    /// Returns the canonical cache-relevant architecture identity.
-    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model
-                .prompt_cache_architecture_fingerprint()
-                .map_err(Into::into),
-            MlxSessionKind::Pipeline(model, _) => Ok(model
-                .prompt_cache_model_identity()?
-                .architecture_fingerprint),
-        }
-    }
-
-    /// Returns the exact ordered rank-local prompt-cache layout.
-    pub fn prompt_cache_layer_layout(
+    /// Returns the complete model-derived identity for a reusable prompt cache.
+    pub fn prompt_cache_model_identity(
         &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
         match &self.inner {
             MlxSessionKind::Complete(model) => {
-                model.prompt_cache_layer_layout().map_err(Into::into)
+                model.prompt_cache_model_identity().map_err(Into::into)
             }
-            MlxSessionKind::Pipeline(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.layer_layout)
-            }
-        }
-    }
-
-    /// Returns the global decoder-layer count used by prompt-cache identity.
-    pub fn prompt_cache_layer_count(&self) -> Result<usize, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model
-                .prompt_cache_layer_layout()
-                .map(|layout| layout.len())
-                .map_err(Into::into),
-            MlxSessionKind::Pipeline(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.layer_count)
-            }
-        }
-    }
-
-    /// Returns the rank-local global decoder-layer range used by prompt-cache identity.
-    pub fn prompt_cache_global_layer_range(&self) -> Result<std::ops::Range<usize>, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => {
-                let count = model
-                    .prompt_cache_layer_layout()
-                    .map(|layout| layout.len())
-                    .map_err(Error::from)?;
-                Ok(0..count)
-            }
-            MlxSessionKind::Pipeline(model, _) => {
-                let identity = model.prompt_cache_model_identity()?;
-                Ok(identity.global_layer_start..identity.global_layer_end)
-            }
-        }
-    }
-
-    /// Returns each owned layer's processed-token delta from the persisted prefix.
-    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model
-                .prompt_cache_layer_prefix_offsets()
-                .map_err(Into::into),
-            MlxSessionKind::Pipeline(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.layer_prefix_offsets)
-            }
-        }
-    }
-
-    /// Returns the architecture-declared named rank-local state ranges.
-    pub fn prompt_cache_state_segments(
-        &self,
-    ) -> Result<Vec<eredu_core::cache::PromptCacheStateSegment>, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => {
-                model.prompt_cache_state_segments().map_err(Into::into)
-            }
-            MlxSessionKind::Pipeline(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.state_segments)
-            }
+            MlxSessionKind::Pipeline(model, _) => model.prompt_cache_model_identity(),
         }
     }
 

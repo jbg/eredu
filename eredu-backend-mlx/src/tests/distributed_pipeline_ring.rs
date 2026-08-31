@@ -35,7 +35,7 @@ use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
+use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions};
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, FinishReason,
     GenerationCancellationToken, InputExtent, InputMetadataKey, InputModality, ModelRuntime,
@@ -564,12 +564,6 @@ impl FixtureFamily {
         }
     }
 
-    fn model_family(self) -> &'static str {
-        ModelKind::resolve_model_type(self.effective_model_type())
-            .expect("fixture effective model type must be registered")
-            .canonical_name()
-    }
-
     const fn layer_prefix(self) -> &'static str {
         match self {
             Self::Gemma | Self::MuseGlimmer | Self::Qwen3Vl | Self::Qwen3VlMoe => {
@@ -927,13 +921,13 @@ fn pipeline_ring_worker() {
             family.comparison_tolerance()
         };
         if std::env::var_os(OPAQUE_INSPECTION).is_some() {
-            let local_layers = runtime.session().prompt_cache_global_layer_range().unwrap();
+            let identity = runtime.session().prompt_cache_model_identity().unwrap();
             let layer_root = if family == FixtureFamily::Gemma {
                 "model.language_model.layers"
             } else {
                 "model.layers"
             };
-            let expected = format!("{layer_root}.{}.output", local_layers.start);
+            let expected = format!("{layer_root}.{}.output", identity.global_layer_start);
             let inspected = runtime
                 .inspect_prefill(ModelInput::new(&parts).into(), &ObservationRequest::all())
                 .unwrap();
@@ -960,12 +954,9 @@ fn pipeline_ring_worker() {
             return;
         }
         if inkling_mtp_mode {
-            let layer_prefix_offsets = runtime
-                .session()
-                .prompt_cache_layer_prefix_offsets()
-                .unwrap();
+            let identity = runtime.session().prompt_cache_model_identity().unwrap();
             assert_eq!(
-                layer_prefix_offsets.contains(&-1),
+                identity.layer_prefix_offsets.contains(&-1),
                 pipeline_rank + 1 == pipeline_parallel_size
             );
             let max_tokens = 3;
@@ -993,46 +984,13 @@ fn pipeline_ring_worker() {
         if let (Some(actual), Some((expected, _))) = (output.logits(), &reference) {
             assert_final_logits_close(actual.as_array(), expected, reference_tolerance);
         }
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
-                .unwrap();
-        let outer_model_type = config["model_type"].as_str().unwrap();
-        let effective_model_type =
-            if matches!(outer_model_type, "muse_glimmer" | "qwen3_5" | "qwen3_5_moe") {
-                config["text_config"]["model_type"].as_str().unwrap()
-            } else {
-                outer_model_type
-            };
-        let model_family = family.model_family();
-        let layer_layout = session.prompt_cache_layer_layout().unwrap();
-        let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
-        let state_segments = session.prompt_cache_state_segments().unwrap();
-        let layer_count = session.prompt_cache_layer_count().unwrap();
-        let global_layer_range = session.prompt_cache_global_layer_range().unwrap();
-        let descriptor = PromptCacheDescriptor {
-            model_family: model_family.into(),
-            effective_model_type: effective_model_type.into(),
-            checkpoint_fingerprint: "opaque-ring-fixture".into(),
-            prefix_content_fingerprint: format!("tokens:{prefix_tokens:?}"),
-            architecture_fingerprint: session.prompt_cache_architecture_fingerprint().unwrap(),
-            layer_count,
-            global_layer_start: global_layer_range.start,
-            global_layer_end: global_layer_range.end,
-            batch_size: 1,
-            layer_prefix_offsets,
-            state_segments,
-            layer_layout,
-            sink_tokens: 0,
-            topology: PromptCacheTopology {
-                pipeline: (pipeline_parallel_size > 1)
-                    .then_some((pipeline_parallel_size, pipeline_rank)),
-                tensor_parallel: (tensor_parallel_size > 1)
-                    .then_some((tensor_parallel_size, topology.tensor_parallel_rank)),
-                expert_parallel: (expert_parallel_size > 1)
-                    .then_some((expert_parallel_size, topology.expert_parallel_rank)),
-                expert_parallel_cache_replicated: true,
-            },
-        };
+        let descriptor = PromptCacheDescriptor::from_model_identity(
+            session.prompt_cache_model_identity().unwrap(),
+            "opaque-ring-fixture",
+            format!("tokens:{prefix_tokens:?}"),
+            1,
+        )
+        .unwrap();
         let rank_prompt_cache = prompt_cache_root.join(format!("rank-{expected_rank}"));
         session
             .save_prompt_cache(
@@ -1479,8 +1437,6 @@ fn pipeline_ring_worker() {
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
-    let model_family = family.model_family();
-    let effective_model_type = family.effective_model_type();
     let identity = model.prompt_cache_model_identity().unwrap();
     assert_eq!(
         identity.topology,
@@ -1499,22 +1455,13 @@ fn pipeline_ring_worker() {
             assert_eq!(identity.state_segments[1].layers(), 1..2);
         }
     }
-    let descriptor = PromptCacheDescriptor {
-        model_family: model_family.into(),
-        effective_model_type: effective_model_type.into(),
-        checkpoint_fingerprint: "pipeline-ring-fixture".into(),
-        prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
-        architecture_fingerprint: identity.architecture_fingerprint,
-        layer_count: identity.layer_count,
-        global_layer_start: identity.global_layer_start,
-        global_layer_end: identity.global_layer_end,
-        batch_size: 1,
-        layer_prefix_offsets: identity.layer_prefix_offsets,
-        state_segments: identity.state_segments,
-        layer_layout: identity.layer_layout,
-        sink_tokens: 0,
-        topology: identity.topology,
-    };
+    let descriptor = PromptCacheDescriptor::from_model_identity(
+        identity,
+        "pipeline-ring-fixture",
+        format!("tokens:{prefix_ids:?}"),
+        1,
+    )
+    .unwrap();
     model
         .save_prompt_cache(
             &mut cache,

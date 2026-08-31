@@ -14,7 +14,7 @@ use eredu_backend_mlx::native::{
 };
 use eredu_backend_mlx::MlxTensor;
 use eredu_core::{
-    cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+    cache::{PromptCacheDescriptor, PromptCacheOptions},
     load_model, AttentionPolicy, BackendProvider as _, BackendSession as _,
 };
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
@@ -97,8 +97,6 @@ fn main() -> anyhow::Result<()> {
     let stream = execution.stream();
     let backend = eredu_backend_mlx::native::backend(stream, weights.stream());
     let model = load_model(&backend, &args.model_dir, ModelLoadOptions::default())?;
-    let model_type = model.effective_model_type().to_owned();
-    let model_family = model.model_family().canonical_name().to_owned();
     let mut session = backend.create_session(model)?;
     let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -125,8 +123,9 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let layer_layout = session.prompt_cache_layer_layout()?;
-    let has_full_attention = layer_layout
+    let prompt_cache_identity = session.prompt_cache_model_identity()?;
+    let has_full_attention = prompt_cache_identity
+        .layer_layout
         .iter()
         .any(|policy| matches!(policy.attention(), Some(AttentionPolicy::Full)));
     let mut paged = PagedCacheOptions::new(
@@ -153,23 +152,12 @@ fn main() -> anyhow::Result<()> {
 
     session.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
     let _ = prefill_tokens(&prefix, &backend, &mut session)?;
-    let layer_count = layer_layout.len();
-    let descriptor = PromptCacheDescriptor {
-        model_family,
-        effective_model_type: model_type,
-        checkpoint_fingerprint: args.checkpoint_fingerprint,
-        prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
-        architecture_fingerprint: session.prompt_cache_architecture_fingerprint()?,
-        layer_count,
-        global_layer_start: 0,
-        global_layer_end: layer_count,
-        batch_size: 1,
-        layer_prefix_offsets: session.prompt_cache_layer_prefix_offsets()?,
-        state_segments: session.prompt_cache_state_segments()?,
-        layer_layout,
-        sink_tokens: 0,
-        topology: PromptCacheTopology::default(),
-    };
+    let descriptor = PromptCacheDescriptor::from_model_identity(
+        prompt_cache_identity,
+        args.checkpoint_fingerprint,
+        format!("tokens:{prefix_ids:?}"),
+        1,
+    )?;
     let manifest = session.save_prompt_cache(
         &backend,
         &args.cache_dir,

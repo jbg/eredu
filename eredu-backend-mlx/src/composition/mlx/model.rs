@@ -9,9 +9,7 @@ use safemlx::{error::Exception, Array, Stream};
 use crate::backend::error::Error;
 use crate::backend::runtime::media::input;
 use crate::composition::gpt_oss;
-use eredu_architectures::{kimi_linear, ModelKind};
-use eredu_core::cache::LayerCachePolicy;
-use eredu_core::LayerSchedule;
+use eredu_architectures::ModelKind;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
@@ -400,45 +398,6 @@ impl Executable {
         }
     }
 
-    /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
-    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
-        match self {
-            Self::DeepSeek(_, model, _) => model
-                .prompt_cache_identity()
-                .map(|identity| identity.architecture_fingerprint)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Gemma4(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.architecture_fingerprint)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Llama(_, model, _) => {
-                Ok(eredu_architectures::llama::prompt_cache_architecture_fingerprint(model.args()))
-            }
-            Self::GptOss(_, model, _) => Ok(model.prompt_cache_architecture_fingerprint()),
-            Self::Inkling(_, model, _) => Ok(model.args().architecture_fingerprint()),
-            Self::KimiLinear(_, model, _) => Ok(
-                kimi_linear::prompt_cache_architecture_fingerprint(model.args()),
-            ),
-            Self::Lfm2(_, model, _) => model
-                .prompt_cache_architecture_fingerprint()
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen(_, model, _) => Ok(model.prompt_cache_architecture_fingerprint()),
-            Self::MuseGlimmer(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.architecture_fingerprint)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::NemotronH(_, model, _) => model
-                .prompt_cache_architecture_fingerprint()
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
-                Ok(model.prompt_cache_architecture_fingerprint())
-            }
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
-                Ok(model.prompt_cache_architecture_fingerprint())
-            }
-        }
-    }
-
     /// Returns the complete architecture-derived prompt-cache model identity.
     pub fn prompt_cache_model_identity(
         &self,
@@ -462,80 +421,6 @@ impl Executable {
             }
         }
         .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    /// Returns the exact ordered prompt-cache state and attention layout.
-    pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
-        match self {
-            Self::DeepSeek(_, model, _) => model
-                .prompt_cache_identity()
-                .map(|identity| identity.layer_layout),
-            Self::Llama(_, model, _) => model.prompt_cache_layer_layout(),
-            Self::GptOss(_, model, _) => model.prompt_cache_layer_layout(),
-            Self::Qwen(_, model, _) => model.prompt_cache_layer_layout(),
-            Self::MuseGlimmer(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_layout),
-            Self::KimiLinear(_, model, _) => model.prompt_cache_layer_layout(),
-            Self::Lfm2(_, model, _) => model.prompt_cache_layer_layout(),
-            Self::NemotronH(_, model, _) => model.prompt_cache_layer_layout(),
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
-                model.prompt_cache_layer_layout()
-            }
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
-                model.prompt_cache_layer_layout()
-            }
-            Self::Gemma4(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_layout),
-            Self::Inkling(_, model, _) => model.prompt_cache_layer_layout(),
-        }
-        .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    /// Returns each owned layer's processed-token delta relative to the
-    /// persisted prefix. Ordinary decoder layers use zero; speculative layers
-    /// may trail the target frontier.
-    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Exception> {
-        match self {
-            Self::DeepSeek(_, model, _) => model
-                .prompt_cache_identity()
-                .map(|identity| identity.layer_prefix_offsets)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Gemma4(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_prefix_offsets)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::MuseGlimmer(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_prefix_offsets)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Inkling(_, model, _) => model
-                .prompt_cache_layer_prefix_offsets()
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::NemotronH(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_prefix_offsets)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_prefix_offsets)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::GptOss(_, _, _)
-            | Self::KimiLinear(_, _, _)
-            | Self::Lfm2(_, _, _)
-            | Self::Llama(_, _, _)
-            | Self::Qwen(_, _, _)
-            | Self::Qwen3Vl(_, _, _)
-            | Self::Qwen3VlMoe(_, _, _) => Ok(vec![0; self.prompt_cache_layer_layout()?.len()]),
-        }
-    }
-
-    /// Returns the architecture-declared named prompt-cache state ranges.
-    pub fn prompt_cache_state_segments(
-        &self,
-    ) -> Result<Vec<eredu_core::cache::PromptCacheStateSegment>, Exception> {
-        Ok(self.prompt_cache_model_identity()?.state_segments)
     }
 
     /// Runs an instrumented pass through the canonical generalized executor.
@@ -764,7 +649,7 @@ mod tests {
         residency::CacheResidencyManager,
         state::{MlxHybridState, MlxKeyValueState},
     };
-    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy};
+    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
     use eredu_runtime::StateLayout;
 
     fn paged_state_layout() -> StateLayout {

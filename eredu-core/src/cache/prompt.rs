@@ -87,6 +87,37 @@ pub struct PromptCacheDescriptor {
 }
 
 impl PromptCacheDescriptor {
+    /// Derives every model-owned field from a prepared model identity.
+    ///
+    /// The checkpoint and prefix-content fingerprints remain caller-owned
+    /// because they identify the concrete weights and processed input rather
+    /// than model structure.
+    pub fn from_model_identity(
+        model: PromptCacheModelIdentity,
+        checkpoint_fingerprint: impl Into<String>,
+        prefix_content_fingerprint: impl Into<String>,
+        batch_size: usize,
+    ) -> Result<Self, PromptCacheError> {
+        let descriptor = Self {
+            model_family: model.model_family,
+            effective_model_type: model.effective_model_type,
+            checkpoint_fingerprint: checkpoint_fingerprint.into(),
+            prefix_content_fingerprint: prefix_content_fingerprint.into(),
+            architecture_fingerprint: model.architecture_fingerprint,
+            layer_count: model.layer_count,
+            global_layer_start: model.global_layer_start,
+            global_layer_end: model.global_layer_end,
+            batch_size,
+            layer_layout: model.layer_layout,
+            layer_prefix_offsets: model.layer_prefix_offsets,
+            state_segments: model.state_segments,
+            sink_tokens: model.sink_tokens,
+            topology: model.topology,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
     /// Validates the complete portable identity and cache geometry.
     pub fn validate(&self) -> Result<(), PromptCacheError> {
         IdentityLayout {
@@ -1032,6 +1063,44 @@ mod tests {
         let restored: PromptCacheManifest = serde_json::from_str(&json).unwrap();
         restored.validate().unwrap();
         assert_eq!(restored, manifest);
+    }
+
+    #[test]
+    fn descriptor_derives_every_model_owned_field_from_identity() {
+        let manifest = manifest();
+        let identity = PromptCacheModelIdentity {
+            model_family: manifest.model_family.clone(),
+            effective_model_type: manifest.effective_model_type.clone(),
+            architecture_fingerprint: manifest.architecture_fingerprint.clone(),
+            layer_count: manifest.layer_count,
+            global_layer_start: manifest.global_layer_start,
+            global_layer_end: manifest.global_layer_end,
+            sink_tokens: manifest.sink_tokens,
+            topology: manifest.topology.clone(),
+            layer_layout: manifest.layer_layout.clone(),
+            layer_prefix_offsets: manifest.layer_prefix_offsets.clone(),
+            state_segments: manifest.state_segments.clone(),
+        };
+
+        let descriptor = PromptCacheDescriptor::from_model_identity(
+            identity.clone(),
+            "caller-checkpoint",
+            "caller-prefix-content",
+            3,
+        )
+        .unwrap();
+
+        validate_prompt_cache_model_identity(&descriptor, &identity).unwrap();
+        assert_eq!(descriptor.checkpoint_fingerprint, "caller-checkpoint");
+        assert_eq!(
+            descriptor.prefix_content_fingerprint,
+            "caller-prefix-content"
+        );
+        assert_eq!(descriptor.batch_size, 3);
+        assert!(
+            PromptCacheDescriptor::from_model_identity(identity, "checkpoint", "prefix", 0)
+                .is_err()
+        );
     }
 
     #[test]

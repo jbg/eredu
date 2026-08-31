@@ -152,6 +152,13 @@ publishes a manifest plus bounded SafeTensors shards atomically. Loading first
 validates the entire manifest and owned layer layout, then attaches compatible
 shards as read-only disk blocks and promotes them only on demand.
 
+Callers obtain one complete `PromptCacheModelIdentity` from the prepared
+session and pass it to `PromptCacheDescriptor::from_model_identity`. Only the
+checkpoint fingerprint, processed-prefix fingerprint, and batch size are
+caller-supplied; family, effective type, architecture identity, state geometry,
+frontier offsets, sink policy, and distributed topology are copied together
+from the prepared model.
+
 For Qwen3-Next and Qwen3.5-family checkpoints with embedded prediction layers,
 ordinary prefill also advances prediction state to its architecture-declared
 prefix-relative frontier. Callers do not need to enter speculative generation
