@@ -4,6 +4,11 @@
 //! `mlx` feature selects the optional MLX backend adapter. Platform and
 //! capability features configure that backend without selecting it.
 //!
+//! The facade does not re-export contracts from its dependency crates. Import
+//! architecture, artifact, planning, generation, and scheduling contracts from
+//! their owning crates, and import facade-owned operations from [`api`] or
+//! [`runtime`].
+//!
 //! Backend implementation contracts are imported from their owning crates:
 //!
 //! ```compile_fail
@@ -49,6 +54,22 @@
 //! ```compile_fail
 //! use eredu::SpeculativeGenerationLane;
 //! ```
+//!
+//! Dependency-owned values have no facade aliases:
+//!
+//! ```compile_fail
+//! use eredu::ExecutionPlan;
+//! ```
+//!
+//! ```compile_fail
+//! use eredu::PromptCacheDescriptor;
+//! ```
+//!
+//! Chat contracts use their runtime-owned paths rather than aliases in `api`:
+//!
+//! ```compile_fail
+//! use eredu::api::PreparedChat;
+//! ```
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]
@@ -73,60 +94,21 @@ compile_error!(
 pub mod api;
 /// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;
-pub use api::{inspect_text_model, PlannedModelLoadError, TextInspectionOptions};
-pub use eredu_architectures::configuration::inspect_artifact;
-pub use eredu_architectures::moshi::{
-    prepare_realtime_model, RealtimePreparationError, RealtimePreparationPlan,
+
+// Internal bindings keep implementation paths concise without adding public
+// aliases for contracts owned by dependency crates.
+#[cfg(feature = "mlx")]
+use eredu_architectures::moshi::RealtimePreparationPlan;
+#[cfg(test)]
+use eredu_architectures::{GgufArchitecture, ModelKind};
+#[cfg(feature = "mlx")]
+use eredu_core::scheduler::{
+    RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits, SchedulerReport, WorkId,
 };
-pub use eredu_architectures::{
-    prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
-};
-pub use eredu_architectures::{GgufArchitecture, ModelKind};
-pub use eredu_core::artifact::{
-    plan_model_preparation, ArtifactFormat, ArtifactInspection, LoadingProtocol,
-    MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,
-    PreparationPolicy, QuantizationRequest, ResidencyRequest,
-};
-pub use eredu_core::cache::{
-    CachePolicyError, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
-    PromptCacheOptions, PromptCacheStateSegment, PROMPT_CACHE_SCHEMA_VERSION,
-};
-pub use eredu_core::generation::{
-    CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,
-    GenerationConfigOverrides, ResolvedGenerationConfig, SemanticEvent, SpeculativeConfig,
-    SpeculativeRequestId, SpeculativeRequestPhase, SpeculativeSchedulerOptions,
-};
-pub use eredu_core::scheduler::{
-    RequestId, RequestStatus, SchedulerCapabilities, SchedulerError, SchedulerLimits,
-    SchedulerReport, WorkId,
-};
-pub use eredu_core::{
-    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
-    ArtifactModality, ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, AutomaticPlanningError, AvailableMemory, BackendDescriptor, BackendId,
-    CacheStateStrategy, CapabilityError, DeviceCapabilities, DeviceDescriptor, DevicePlan,
-    DistributedCapabilities, DraftPlacementPlan, DraftingPlan, DurationSeconds,
-    EstimationCompleteness, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, InspectedOutput,
-    InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionRequirement,
-    InspectionSeverity, Media, MediaBinding, MediaRequestError, ModelCapabilities,
-    ModelInspectionReport, ModelResourceProfile, MultimodalRequest, MultimodalSegment,
-    ObservationError, ObservationKind, ObservationRequest, ObservationSelector, ObservationSet,
-    ObservationValue, Observed, ParallelAxis, ParallelTopology, PhysicalMemorySemantics,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, RealtimeConfigError,
-    RealtimeDecisionDiagnostics, RealtimeFrameConvention, RealtimeFrameForcing,
-    RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition, RealtimeInputFrame,
-    RealtimeOutputFrame, RealtimeSampling, RealtimeScheduleError, RealtimeSlotCoordinate,
-    RealtimeSlotOccupancy, RealtimeSpeechConfig, RealtimeTargetDecision, RealtimeTargetSource,
-    RealtimeTemporalSource, ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate,
-    SessionCapabilities, SlidingWindowLayerCount, SpeculativeCapability,
-    SpeculativeDecodingTelemetry, SpeculativeDraft, SpeculativeDraftSource,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, StateMemoryAssumptions,
-    StateMemoryLayout, StaticMemoryReport, TensorObservation, TensorObservationData,
-    TextGenerationConfig, TextSamplingStrategy, TimingTelemetry, TokenFilter, TokenFilterError,
-    TokenOutput, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
-    TokenizerCompatibilityError, TokenizerCompatibilityProof, TransferTelemetry, Video,
-    VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
-    EXECUTION_PLAN_SCHEMA_VERSION, MODEL_LOGITS_OBSERVATION_PATH,
+#[cfg(feature = "mlx")]
+use eredu_core::{
+    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningError, DevicePlan,
+    ExecutionPlan, ExecutionPlanReport, ExpertCacheTelemetry, ModelInspectionReport,
+    QuantizationRequest, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
+    RealtimeSpeechConfig, ResidencyTelemetry, SessionCapabilities, SpeculativeDecodingTelemetry,
 };

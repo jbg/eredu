@@ -1,16 +1,15 @@
 use eredu::api::{
-    inspect_text_model, load_tokenizer, AutomaticPlanRequest, ChatTokenizer, DevicePlan,
-    LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
+    inspect_text_model, load_tokenizer, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
 };
-use eredu::{
-    ArtifactFormat, BackendDescriptor, DeviceCapabilities, DeviceDescriptor,
-    GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport, ModelKind,
-    ObservationSet, ObservationValue, TextGenerationConfig, TokenFilter, TokenOutput,
-};
+use eredu_architectures::ModelKind;
 use eredu_core::{
-    BackendProvider, BackendSession, Completion, ModelRuntime, PreparedModel, Submission,
-    TextGenerationBackend,
+    ArtifactFormat, AutomaticPlanRequest, BackendDescriptor, BackendProvider, BackendSession,
+    Completion, DeviceCapabilities, DeviceDescriptor, DevicePlan, GenerationConfigOverrides,
+    InspectionReadiness, ModelInspectionReport, ModelRuntime, ObservationSet, ObservationValue,
+    PreparedModel, SessionCapabilities, Submission, TextGenerationBackend, TextGenerationConfig,
+    TokenFilter, TokenOutput,
 };
+use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
 struct MockBackend;
@@ -66,10 +65,7 @@ impl BackendProvider for MockBackend {
         &self,
         _: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        Ok(PreparedModel::new(
-            (),
-            eredu::SessionCapabilities::default(),
-        ))
+        Ok(PreparedModel::new((), SessionCapabilities::default()))
     }
 
     fn create_session(&self, _: PreparedModel<Self::Model>) -> Result<Self::Session, Self::Error> {
@@ -83,8 +79,8 @@ impl BackendSession<MockBackend> for MockSession {
     type Output = u32;
     type Completion = Complete;
 
-    fn capabilities(&self) -> eredu::SessionCapabilities {
-        eredu::SessionCapabilities::default()
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities::default()
     }
 
     fn prefill(

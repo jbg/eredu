@@ -12,18 +12,19 @@ use eredu_gguf::MetadataValue as GgufMetadataValue;
 use eredu_text::{
     gguf::GgufTokenizer,
     tokenizer::{
-        chat_template_kwargs as inspect_chat_template_kwargs, ModelChatTemplate,
-        Tokenizer as ChatTokenizer,
+        chat_template_kwargs as inspect_chat_template_kwargs, ChatTemplateIdentity,
+        ModelChatTemplate, Tokenizer as ChatTokenizer,
     },
 };
 
 use super::{
-    LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChat, PreparedChatError,
+    LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChatError,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
     PreparedChatInput, PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
     PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest, TextDecoderError,
     TextMetadataError, TextModelError,
 };
+use crate::runtime::chat::PreparedChat;
 use crate::{
     api::{
         metadata::{
@@ -40,7 +41,7 @@ use crate::{
         },
     },
     runtime::{
-        chat::{constraints::ConstraintCompiler, ChatTemplateIdentity, ChatTemplateRequest},
+        chat::{constraints::ConstraintCompiler, ChatTemplateRequest},
         generation::streaming::{
             drive_committed_generation_cancellable, CommittedGenerationError,
             CommittedTokenPipeline, CommittedTokenPipelineError, RawTokenDecoder,
@@ -87,10 +88,7 @@ where
 }
 
 fn map_controlled_generation_error<E>(
-    error: eredu_core::ControlledTextGenerationError<
-        E,
-        crate::runtime::chat::constraints::ConstraintError,
-    >,
+    error: eredu_core::ControlledTextGenerationError<E, crate::api::ConstraintError>,
 ) -> PreparedChatError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -107,10 +105,7 @@ where
 
 fn map_committed_generation_error<E>(
     error: CommittedGenerationError<
-        eredu_core::ControlledTextGenerationError<
-            E,
-            crate::runtime::chat::constraints::ConstraintError,
-        >,
+        eredu_core::ControlledTextGenerationError<E, crate::api::ConstraintError>,
         TextDecoderError,
     >,
 ) -> PreparedChatError<E>

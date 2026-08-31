@@ -55,8 +55,9 @@ only through concrete image or audio capabilities. Backend feature diagnostics
 name the active public spelling; published Cargo features are selectable API,
 not a privacy mechanism.
 
-The facade root and `api` namespace expose portable application concepts plus
-the opaque selected-backend adapter. `LocalBackendFactory`, `LocalModel`,
+The facade root exposes only the `api` and `runtime` namespaces. The `api`
+namespace exposes facade-owned operations and the opaque selected-backend
+adapter. `LocalBackendFactory`, `LocalModel`,
 `LocalPlannedModel`, `LocalDrafting`, `LocalPrompt`, and local generation
 iterators are facade-owned wrappers with private backend state. The selected
 factory does not implement the public neutral factory traits, and the facade
@@ -70,30 +71,27 @@ tests that require backend facilities live in `eredu-backend-mlx`, while facade
 sampling-policy tests use neutral sampling traits and mock backends. Direct
 backend consumers import neutral contracts from their owning crates.
 
-The facade may re-export deliberately application-facing portable value types
-from neutral crates so applications can use its high-level APIs without
-reconstructing their dependency graph. That convenience does not extend to
-generic infrastructure. Cache workers, checkpoint storage bindings, residency
-and prefetch engines, generic schedulers and completions, speculative execution
-request and lane contracts, parameter plans, and other infrastructure are
-imported from their owning crates. Backend providers, sessions, prepared
-models, runtime handles, completion and submission primitives, distributed
-execution contracts—including received-value shape and dtype descriptors—and
-`eredu-runtime` infrastructure likewise come directly from their owning crates
-rather than facade compatibility re-exports.
+The facade does not re-export dependency-owned types. Architecture identities
+and preparation plans come from `eredu-architectures`; artifact, execution,
+generation, media, realtime, scheduler, and prompt-cache contracts come from
+`eredu-core`; tokenizer contracts come from `eredu-text`; and runtime
+infrastructure comes from `eredu-runtime`. This gives every public type one
+canonical import path and prevents a facade release from committing to aliases
+for operations it does not own. In particular, the facade exposes no
+prompt-cache types because it exposes no prompt-cache operation.
 
 The selected adapter exposes only facade-owned causal and realtime model,
 planning, drafting, scheduler, completed-step, and error wrappers. The realtime
 factory loads an architecture-owned preparation directly into the facade model.
 The facade materializes portable inputs and observes portable outputs while
-concrete associated types and handle-oriented constructors remain private. An
-application therefore loads and operates local models with only an `eredu`
-dependency. Explicit native sessions, streams, token handles, and distributed
+concrete associated types and handle-oriented constructors remain private.
+Explicit native sessions, streams, token handles, and distributed
 collective groups remain backend-author concerns.
 
-Application-only targets and platform examples can depend solely on the
-`eredu` facade. Infrastructure-aware clients such as the CLI also depend on
-the neutral owning crates for the low-level policies they configure. The
+Application targets depend on `eredu` for facade operations and directly on
+the neutral crates whose public values they construct. Infrastructure-aware
+clients such as the CLI likewise import low-level policies from their owning
+crates. The
 selected-local-backend API owns device-plan creation, process runtime
 configuration, allocator telemetry, and diagnostic benchmarks, while
 `LocalModel::synchronize` is the sole application-facing synchronization entry

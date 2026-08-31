@@ -22,12 +22,10 @@ families, checkpoint formats, modalities, and execution capabilities.
 - Portable inspection, automatic execution planning, admission, and telemetry
   schemas.
 
-The portable build includes artifact inspection, tokenizer and chat metadata,
-generation orchestration, media request descriptions, execution planning, and
-application-facing backend metadata. The facade re-exports selected portable
-value types used by those APIs, but generic schedulers, backend traits, and
-speculative execution transport contracts are imported from their owning
-crates.
+The portable build includes tokenizer and chat metadata plus facade-owned
+generation orchestration. Portable architecture, artifact, planning,
+generation, media, and scheduling contracts are imported from their owning
+crates; the facade does not duplicate those types at its root or under `api`.
 
 ## Loading a model
 
@@ -36,10 +34,8 @@ generation-default, and chat-template metadata. Its backend, session, prompts,
 token handles, drafting resources, and native errors remain private:
 
 ```rust,ignore
-use eredu::{
-    api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel},
-    ExecutionPlan,
-};
+use eredu::api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel};
+use eredu_core::ExecutionPlan;
 
 let device = local_device_plan(default_local_device())?;
 let plan = ExecutionPlan::fully_resident(device);
@@ -66,10 +62,10 @@ drafter described by the plan. Backend implementers can use the separate
 generic `LoadedModel<B>` API with a backend imported from its owning crate.
 
 Realtime speech models use the selected facade's concrete application API.
-`prepare_realtime_model` inspects the artifact, `LocalRealtimeBackendFactory`
-loads it, and `LocalRealtimeScheduler` accepts and returns portable host token
-frames. These operations require only the `eredu` crate; native backend traits,
-streams, tensors, sessions, and completions stay behind the facade. The
+`eredu_architectures::moshi::prepare_realtime_model` inspects the artifact,
+`LocalRealtimeBackendFactory` loads it, and `LocalRealtimeScheduler` accepts
+and returns `eredu_core` host token frames. Native backend traits, streams,
+tensors, sessions, and completions stay behind the facade. The
 realtime factory's default uses `default_local_device`, matching ordinary local
 model loading; construct it with an explicit `LocalDevice` to override that
 choice.

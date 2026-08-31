@@ -1,12 +1,10 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{
-        default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
-        LocalModel,
-    },
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
+    api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel},
+    runtime::chat::ChatTemplateRequest,
 };
+use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 fn generate(
     model: &mut LocalModel,

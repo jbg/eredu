@@ -1,7 +1,5 @@
-use eredu::{
-    api::{LocalBackendFactory, LocalInspectionOptions},
-    AutomaticPlanRequest, DevicePlan, ExecutionPlan,
-};
+use eredu::api::{LocalBackendFactory, LocalInspectionOptions};
+use eredu_core::{AutomaticPlanRequest, DevicePlan, ExecutionPlan};
 
 #[test]
 fn portable_planner_inputs_do_not_expose_the_local_backend() {

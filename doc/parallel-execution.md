@@ -5,8 +5,8 @@ expert parallelism (EP) through one Cartesian topology. Each process has exact
 coordinates and subgroup membership for the axes that apply to its model.
 
 All supported families use the ordinary architecture-erased loader.
-Application clients submit a canonical `eredu::ParallelTopology` through an
-`ExecutionPlan` and let the `eredu` facade realize it. Backend-specific tooling
+Application clients submit a canonical `eredu_core::ParallelTopology` through
+an `eredu_core::ExecutionPlan` and let the `eredu` facade realize it. Backend-specific tooling
 binds the resulting process rank to its process-local device and passes that
 context to the backend loader.
 Unsupported combinations fail preflight before checkpoint payloads are

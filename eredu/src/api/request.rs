@@ -9,18 +9,15 @@ use eredu_core::{
     SpeculativeDraft, SpeculativeOutputError, SpeculativeSchedulerOptions,
     SpeculativeSemanticState, TokenFilter, TokenFilterController,
 };
-use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
+use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer as ChatTokenizer};
 
-use super::{TextDecoderError, TextModelError};
+use super::{ConstraintError, TextDecoderError, TextModelError};
 use crate::api::TextDecoder;
-use crate::runtime::chat::constraints::{
-    ConstraintCompiler, ConstraintController, ConstraintError,
-};
+use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintController};
 use crate::runtime::chat::SemanticRuntimePlan;
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
-    ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport,
-    ToolChoice,
+    ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport, ToolChoice,
 };
 use crate::runtime::generation::streaming::{
     CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,

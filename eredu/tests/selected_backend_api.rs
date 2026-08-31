@@ -1,11 +1,13 @@
-use eredu::{
-    api::{
-        inspect_local_model, LocalBackendError, LocalBackendFactory, LocalDevice,
-        LocalInspectionOptions, LocalLoadOptions, LocalRealtimeBackendFactory, LocalRealtimeModel,
-        LocalRealtimeScheduler,
-    },
-    DevicePlan, ExecutionPlan, QuantizationRequest, RealtimeInputFrame, RealtimePreparationPlan,
-    RealtimeSampling, RequestId, SchedulerLimits, SessionCapabilities,
+use eredu::api::{
+    inspect_local_model, LocalBackendError, LocalBackendFactory, LocalDevice,
+    LocalInspectionOptions, LocalLoadOptions, LocalRealtimeBackendFactory, LocalRealtimeModel,
+    LocalRealtimeScheduler,
+};
+use eredu_architectures::moshi::RealtimePreparationPlan;
+use eredu_core::scheduler::{RequestId, SchedulerLimits};
+use eredu_core::{
+    DevicePlan, ExecutionPlan, QuantizationRequest, RealtimeInputFrame, RealtimeSampling,
+    SessionCapabilities,
 };
 
 fn operate_selected_realtime_backend(
@@ -62,7 +64,7 @@ fn selected_load_policy_is_facade_owned_and_portable() {
 
 #[test]
 fn selected_inspection_wraps_backend_errors() {
-    let result: Result<eredu::ModelInspectionReport, LocalBackendError> = inspect_local_model(
+    let result: Result<eredu_core::ModelInspectionReport, LocalBackendError> = inspect_local_model(
         "/path/that/does/not/exist/eredu-selected-backend-api",
         LocalInspectionOptions::default(),
     );

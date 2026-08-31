@@ -992,6 +992,7 @@ name = "eredu-ios"
 version = "0.1.0"
 dependencies = [
  "eredu",
+ "eredu-core",
  "serde_json",
 ]
 

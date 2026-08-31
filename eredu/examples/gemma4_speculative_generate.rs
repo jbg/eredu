@@ -6,10 +6,13 @@ use std::{
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
-        LocalModel, LocalPreparedChatInput, LocalPreparedChatSpeculativeGenerationRequest,
-        PreparedChat, PreparedChatGenerationSettings, PreparedChatSpeculativeGenerationOptions,
+        default_local_device, local_device_plan, LocalBackendFactory, LocalModel,
+        LocalPreparedChatInput, LocalPreparedChatSpeculativeGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatSpeculativeGenerationOptions,
     },
+    runtime::chat::{ChatTemplateRequest, PreparedChat},
+};
+use eredu_core::{
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
     GenerationConfigOverrides, TextGenerationConfig,
 };

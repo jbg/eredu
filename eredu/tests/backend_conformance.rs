@@ -16,26 +16,14 @@ use std::{
 
 use eredu::{
     api::{
-        ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, Media,
-        ModelChatTemplate, MultimodalRequest, MultimodalSegment, PreparedChat, PreparedChatError,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
-        PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeGenerationRequest, RgbImage,
+        LoadedModel, LoadedTextModelConfig, PreparedChatError, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatSpeculativeBatchLane,
+        PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeError,
+        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeGenerationRequest,
     },
-    AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlanningError, BackendDescriptor, BackendId, CacheStateStrategy, CapabilityError,
-    DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedCapabilities, DraftPlacementPlan,
-    DraftingPlan, EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    InputModalities, InputTokenCount, ModelCapabilities, ModelKind, ModelResourceProfile,
-    ObservationSet, ObservationValue, Observed, ParallelAxis, ParallelTopology,
-    PhysicalMemorySemantics, RealtimeFrameConvention, RealtimeSampling, RealtimeSpeechConfig,
-    ResidencyPlan, RuntimeStateEstimate, SemanticEvent, SessionCapabilities, SpeculativeCapability,
-    SpeculativeDraft, SpeculativeDraftSource, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationOutput, StaticMemoryReport, TextGenerationConfig, TokenFilter,
-    TokenOutput, AUTOMATIC_SCHEMA_VERSION,
+    runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
+use eredu_architectures::ModelKind;
 use eredu_core::{
     checkpoint::TensorDtype,
     load_realtime_model_with_options,
@@ -44,19 +32,32 @@ use eredu_core::{
         ResidencyPolicy,
     },
     scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
-    AutomaticPlanningBackend, BackendProvider, BackendSession, BoundedResidencyRequirement,
-    CandidateAdmission, CollectiveScope, Completion, DistributedBackend, DistributedSession,
-    DistributedSessionDescriptor, ExecutionPlanBackendFactory, ExecutionPlanTarget,
-    ExternalDraftArtifact, ModelCapabilityBackend, ModelLoadingBackend, ModelRuntime,
-    MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
-    PreparedSpeculativeLane, ProposalDecision, RealizedDrafting, RealtimeBackend,
-    RealtimeModelLoadingBackend, RealtimeScheduler, SamplingPlacement,
-    SpeculativeCallbackPublisher, SpeculativeCommit, SpeculativeExecutor,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationVisitor,
+    AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendDescriptor, BackendId,
+    BackendProvider, BackendSession, BoundedResidencyRequirement, CacheStateStrategy,
+    CandidateAdmission, CapabilityError, CollectiveScope, Completion, DeviceCapabilities,
+    DeviceDescriptor, DevicePlan, DistributedBackend, DistributedCapabilities, DistributedSession,
+    DistributedSessionDescriptor, DraftPlacementPlan, DraftingPlan, EstimationCompleteness,
+    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget,
+    ExternalDraftArtifact, FinishReason, GenerationConfigOverrides, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
+    InputTokenCount, Media, ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend,
+    ModelResourceProfile, ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure,
+    MultimodalRequest, MultimodalSegment, ObservationSet, ObservationValue, Observed, ParallelAxis,
+    ParallelTopology, PhysicalMemorySemantics, PreparedModel, PreparedSpeculativeLane,
+    ProposalDecision, RealizedDrafting, RealtimeBackend, RealtimeFrameConvention,
+    RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
+    RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RgbImage, RuntimeStateEstimate,
+    SamplingPlacement, SemanticEvent, SessionCapabilities, SpeculativeCallbackPublisher,
+    SpeculativeCapability, SpeculativeCommit, SpeculativeDraft, SpeculativeDraftSource,
+    SpeculativeExecutor, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
     SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
-    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout, Submission,
-    TextGenerationBackend, ValueDescriptor,
+    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout,
+    StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter,
+    TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
+use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 use tokenizers::{
     decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
     pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
@@ -407,7 +408,7 @@ impl TextGenerationBackend for MockBackend {
 impl MultimodalPreparationBackend for MockBackend {
     fn prepare_multimodal_input<E>(
         _: &ModelRuntime<Self>,
-        request: &eredu::TokenizedMultimodalRequest,
+        request: &eredu_core::TokenizedMultimodalRequest,
         encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
     where
@@ -416,10 +417,10 @@ impl MultimodalPreparationBackend for MockBackend {
         let mut prompt = Vec::new();
         for segment in request.segments() {
             match segment {
-                eredu::TokenizedMultimodalSegment::TokenIds(ids) => {
+                eredu_core::TokenizedMultimodalSegment::TokenIds(ids) => {
                     prompt.extend_from_slice(ids);
                 }
-                eredu::TokenizedMultimodalSegment::Media(_) => prompt.push(2_001),
+                eredu_core::TokenizedMultimodalSegment::Media(_) => prompt.push(2_001),
             }
         }
         prompt.extend(encode_backend_text("hello").map_err(MultimodalPreparationFailure::Text)?);
@@ -1285,7 +1286,7 @@ fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
     backend: &B,
     model_path: &Path,
     device: &str,
-) -> eredu::ExecutionPlanReport {
+) -> ExecutionPlanReport {
     let request = AutomaticPlanRequest::new(
         model_path,
         DevicePlan::new(backend.backend_id().as_str(), device).unwrap(),
@@ -1302,7 +1303,7 @@ fn planned_loading_client_code<F>(
     device: &str,
 ) -> (
     eredu::api::PlannedModel<F::Backend, F::Drafter>,
-    eredu::ExecutionPlanReport,
+    ExecutionPlanReport,
 )
 where
     F: ExecutionPlanBackendFactory<
@@ -1792,7 +1793,7 @@ impl RealtimeBackend for MockRealtimeBackend {
     fn materialize_input(
         &self,
         _: &Self::Model,
-        frame: &eredu::RealtimeInputFrame,
+        frame: &RealtimeInputFrame,
     ) -> Result<Self::Input, Self::Error> {
         Ok(MockFrame(
             frame
@@ -1803,11 +1804,8 @@ impl RealtimeBackend for MockRealtimeBackend {
         ))
     }
 
-    fn observe_output(
-        &self,
-        output: &Self::Output,
-    ) -> Result<eredu::RealtimeOutputFrame, Self::Error> {
-        Ok(eredu::RealtimeOutputFrame::new(
+    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error> {
+        Ok(RealtimeOutputFrame::new(
             1,
             vec![*output as i32],
             Vec::new(),

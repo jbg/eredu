@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    api::ConstraintError,
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
     runtime::chat::{
         GenerationConstraint, GenerationRuntimePlan, GenerationRuntimePlanParts,
@@ -26,21 +27,6 @@ use crate::{
 };
 
 const MAX_SCHEMA_DEPTH: usize = 64;
-
-/// Portable failure reported by prepared-chat constraint state.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{message}")]
-pub struct ConstraintError {
-    message: String,
-}
-
-impl ConstraintError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
 
 /// Canonical backend-independent grammar and activation state.
 pub(crate) struct ConstraintController {

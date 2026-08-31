@@ -15,8 +15,8 @@ use eredu::{
         LocalRuntimeConfiguration,
     },
     runtime::chat::ChatTemplateRequest,
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
 };
+use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
 pub type TextCallback = unsafe extern "C" fn(*const u8, usize, *mut c_void);

@@ -18,8 +18,8 @@ use eredu::{
         inspect_local_model, inspect_text_model, LocalInspectionOptions,
         TextInspectionOptions,
     },
-    InspectionSeverity,
 };
+use eredu_core::InspectionSeverity;
 
 let structural = inspect_local_model("/path/to/model", LocalInspectionOptions::default())?;
 let report = inspect_text_model(structural, TextInspectionOptions::default());

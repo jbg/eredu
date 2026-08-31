@@ -152,6 +152,11 @@ publishes a manifest plus bounded SafeTensors shards atomically. Loading first
 validates the entire manifest and owned layer layout, then attaches compatible
 shards as read-only disk blocks and promotes them only on demand.
 
+Prompt-cache persistence is a backend/tooling facility, not an `eredu` facade
+operation. Its portable identity and manifest types use their canonical
+`eredu_core::cache` paths; MLX persistence operations are owned by
+`eredu-backend-mlx`.
+
 Callers obtain one complete `PromptCacheModelIdentity` from the prepared
 session and pass it to `PromptCacheDescriptor::from_model_identity`. Only the
 checkpoint fingerprint, processed-prefix fingerprint, and batch size are

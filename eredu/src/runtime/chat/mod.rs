@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
+use eredu_text::tokenizer::{ChatTemplateIdentity, Tokenizer as ChatTokenizer};
 use serde_json::{Map, Value};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -37,8 +37,6 @@ use crate::{
     runtime::chat::constraints::ConstraintBlueprint,
     runtime::chat::dialect::{DialectParameters, FormatDialect, GenerationPromptBehavior},
 };
-
-pub use eredu_text::tokenizer::ChatTemplateIdentity;
 
 /// Controls whether the model may emit a native tool call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

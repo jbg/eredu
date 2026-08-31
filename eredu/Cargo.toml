@@ -51,10 +51,6 @@ name = "backend_conformance"
 path = "tests/backend_conformance.rs"
 
 [[test]]
-name = "core_types"
-path = "tests/core_types.rs"
-
-[[test]]
 name = "portable_facade"
 path = "tests/portable_facade.rs"
 

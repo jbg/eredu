@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _, TokenOutput as _};
 
 /// Discovers hardware available to the selected local backend.
-pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
+pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
+    eredu_backend_mlx::discover_hardware()
+}
 
 type SelectedBackend = eredu_backend_mlx::backend::MlxBackend<'static>;
 type SelectedDrafter = eredu_backend_mlx::native::MlxDrafter;
@@ -491,7 +493,7 @@ impl LocalModel {
     pub fn selected_chat_template_identity(
         &self,
         tools: Option<&[serde_json::Value]>,
-    ) -> Result<Option<crate::runtime::chat::ChatTemplateIdentity>, super::TextModelError> {
+    ) -> Result<Option<eredu_text::tokenizer::ChatTemplateIdentity>, super::TextModelError> {
         self.inner.selected_chat_template_identity(tools)
     }
 

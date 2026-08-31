@@ -2,8 +2,9 @@
 
 use serde_json::json;
 
+use crate::api::ConstraintError;
 use crate::runtime::chat::constraints::{
-    advance_trigger_prefix, completes_trigger, ConstraintController, ConstraintError,
+    advance_trigger_prefix, completes_trigger, ConstraintController,
 };
 use crate::{
     runtime::chat::constraints::ConstraintCompiler,

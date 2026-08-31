@@ -5,7 +5,8 @@ use eredu_core::{
     MultimodalRequest,
 };
 
-use super::{LoadedModel, PreparedChat, TextModelError};
+use super::{LoadedModel, TextModelError};
+use crate::runtime::chat::PreparedChat;
 
 /// Failure while preparing portable media for a selected backend session.
 #[derive(Debug, thiserror::Error)]

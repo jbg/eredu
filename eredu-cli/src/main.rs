@@ -20,19 +20,22 @@ use eredu::{
         LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
         LocalPreparedChatSpeculativeGenerationRequest, LocalRuntimeConfiguration,
         LocalSpeculativeComponentTimingGuard, PreparedChatGenerationSettings,
-        PreparedChatSpeculativeGenerationOptions, ResidencyPlan, TextDecoder, TextModelError,
+        PreparedChatSpeculativeGenerationOptions, TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan, DraftingPlan,
+};
+use eredu_core::{
+    residency::CacheEvictionPolicy, speculative::SpeculativeStats, AutomaticPlanRequest,
+    AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan, DraftingPlan,
     ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry,
-    PlanExplanationLevel, QuantizationRequest, SemanticEvent, SpeculativeSchedulerOptions,
-    TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, ResidencyPlan, SemanticEvent,
+    SessionCapabilities, SpeculativeSchedulerOptions, TextGenerationConfig, TimingTelemetry,
+    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
-use eredu_core::{residency::CacheEvictionPolicy, speculative::SpeculativeStats};
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use serde::{Deserialize, Serialize};
@@ -1043,7 +1046,7 @@ fn automatic_cache_key(
         })
         .and_then(|device| observed_u64(&device.total_memory_bytes));
     Ok(AutoPlanCacheKey {
-        planner_schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+        planner_schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
         model_path: fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf()),
         model_architecture: report.resources.architecture.clone(),
         stored_tensor_bytes: observed_u64(&report.resources.stored_tensor_bytes),
@@ -1368,7 +1371,7 @@ fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<Execut
     validate_automatic_device(&hardware, &selected_device)?;
     let resources = inspect_local_model(model_path, LocalInspectionOptions::default())?.resources;
     Ok(ExecutionPlanReport {
-        schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+        schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
         hardware,
         resources,
         plan: ExecutionPlan::fully_resident(selected_device),
@@ -1759,7 +1762,7 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
         let detail = inspection
             .issues
             .iter()
-            .find(|issue| issue.severity == eredu::InspectionSeverity::Error)
+            .find(|issue| issue.severity == InspectionSeverity::Error)
             .map(|issue| issue.detail.as_str())
             .unwrap_or("exact automatic plan was not admitted by checkpoint inspection");
         bail!("cannot execute exact automatic plan: {detail}");
@@ -2582,7 +2585,7 @@ fn main() -> Result<()> {
         let residency = model.residency_telemetry()?;
         let expert_cache = model.expert_cache_telemetry()?;
         let telemetry = ExecutionTelemetry {
-            schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+            schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             effective_model_type: model.effective_model_type().into(),
             plan: Some(plan),
             plan_explanation: Some(plan_explanation),
@@ -2666,7 +2669,7 @@ fn cli_execution_plan(
         DraftingPlan::Disabled
     };
     Ok(ExecutionPlan {
-        schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+        schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
         device: device_plan(args.device)?,
         topology: eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
             .expect("the singleton topology is valid"),
@@ -2688,11 +2691,11 @@ fn cli_execution_plan(
             eviction_policy: args.expert_cache_eviction.into(),
         }),
         drafting,
-        required_device_capabilities: eredu::DeviceCapabilities {
+        required_device_capabilities: DeviceCapabilities {
             exact_completion: true,
-            ..eredu::DeviceCapabilities::default()
+            ..DeviceCapabilities::default()
         },
-        required_session_capabilities: eredu::SessionCapabilities::default(),
+        required_session_capabilities: SessionCapabilities::default(),
     })
 }
 
@@ -3379,10 +3382,11 @@ mod tests {
         should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
         validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
         write_timing_report, AutoMode, AutoPlanCacheKey, AutomaticCliOverrides, CachedGgufRole,
-        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, NativeToolSupport,
-        QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel,
-        SemanticEvent, SemanticSupport, SpeculativeDraftDevice, SpeculativeSchedulerOptions,
-        StopReason, WeightTransformationPlan,
+        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
+        ModelResourceProfile, NativeToolSupport, Observed, PlanExplanation, QuantizationRequest,
+        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
+        SemanticSupport, SpeculativeDraftDevice, SpeculativeSchedulerOptions, StopReason,
+        WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -3469,35 +3473,35 @@ mod tests {
         std::fs::write(&model_path, b"fixture").unwrap();
         let device = device_plan(CliDevice::Cpu).unwrap();
         let hardware = discover_local_hardware();
-        let resources = eredu::ModelResourceProfile {
-            schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+        let resources = ModelResourceProfile {
+            schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             path: model_path.clone(),
-            artifact_format: eredu::ArtifactFormat::Gguf,
+            artifact_format: eredu_core::ArtifactFormat::Gguf,
             model_family: None,
             architecture: Some("fixture".into()),
             tensor_count: Some(1),
             checkpoint_shards: Some(1),
-            embedded_draft_layers: eredu::Observed::unsupported("fixture"),
-            stored_tensor_bytes: eredu::Observed::exact(7, "fixture"),
-            largest_stored_tensor_bytes: eredu::Observed::exact(7, "fixture"),
-            materialized_parameter_bytes: eredu::Observed::unavailable("fixture"),
-            pinned_parameter_bytes: eredu::Observed::unavailable("fixture"),
-            largest_execution_group_bytes: eredu::Observed::unavailable("fixture"),
-            largest_adjacent_execution_groups_bytes: eredu::Observed::unavailable("fixture"),
-            expert_parameter_bytes: eredu::Observed::unavailable("fixture"),
+            embedded_draft_layers: Observed::unsupported("fixture"),
+            stored_tensor_bytes: Observed::exact(7, "fixture"),
+            largest_stored_tensor_bytes: Observed::exact(7, "fixture"),
+            materialized_parameter_bytes: Observed::unavailable("fixture"),
+            pinned_parameter_bytes: Observed::unavailable("fixture"),
+            largest_execution_group_bytes: Observed::unavailable("fixture"),
+            largest_adjacent_execution_groups_bytes: Observed::unavailable("fixture"),
+            expert_parameter_bytes: Observed::unavailable("fixture"),
         };
-        let report = eredu::ExecutionPlanReport {
-            schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+        let report = ExecutionPlanReport {
+            schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             hardware,
             resources,
-            plan: eredu::ExecutionPlan::fully_resident(device.clone()),
-            explanation: eredu::PlanExplanation {
+            plan: ExecutionPlan::fully_resident(device.clone()),
+            explanation: PlanExplanation {
                 summary: "fixture".into(),
                 entries: Vec::new(),
             },
         };
         let key = AutoPlanCacheKey {
-            planner_schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
+            planner_schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             model_path,
             model_architecture: Some("fixture".into()),
             stored_tensor_bytes: Some(7),
@@ -3619,7 +3623,7 @@ mod tests {
         let mut args =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
-        let mut plan = eredu::ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap());
+        let mut plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap());
         plan.weight_transformation = WeightTransformationPlan::Affine {
             bits: 4,
             group_size: 128,
@@ -3704,12 +3708,12 @@ mod tests {
         assert_eq!(plan.device.device, "cpu:0");
         assert!(matches!(
             plan.residency,
-            eredu::ResidencyPlan::LayerwiseHost {
+            ResidencyPlan::LayerwiseHost {
                 device_layer_window: 2,
                 ..
             }
         ));
-        assert_eq!(plan.drafting, eredu::DraftingPlan::Disabled);
+        assert_eq!(plan.drafting, DraftingPlan::Disabled);
     }
 
     #[test]

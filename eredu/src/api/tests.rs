@@ -3467,7 +3467,7 @@ fn checkpoint_generation_config_resolves_declared_values_and_request_overrides()
 
 #[test]
 fn checkpoint_generation_config_honors_do_sample_false() {
-    let checkpoint = crate::CheckpointGenerationConfig {
+    let checkpoint = eredu_core::CheckpointGenerationConfig {
         do_sample: Some(false),
         temperature: Some(0.8),
         top_k: Some(20),

@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{
-        default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
-        LocalModel, ModelKind,
-    },
-    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig,
+    api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel},
+    runtime::chat::ChatTemplateRequest,
 };
+use eredu_architectures::ModelKind;
+use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

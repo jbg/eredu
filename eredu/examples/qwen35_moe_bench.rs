@@ -1,10 +1,10 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu::{
-    api::{
-        default_local_device, local_device_plan, reset_local_allocator_peak, LocalBackendFactory,
-        LocalModel,
-    },
+use eredu::api::{
+    default_local_device, local_device_plan, reset_local_allocator_peak, LocalBackendFactory,
+    LocalModel,
+};
+use eredu_core::{
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, WeightTransformationPlan,
 };
 

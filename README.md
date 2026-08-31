@@ -7,8 +7,8 @@ Hugging Face-style SafeTensors repositories and GGUF checkpoints, prepares
 tokenizers and chat templates, and provides one API for text, multimodal, and
 realtime speech models.
 
-The `eredu` crate is the public entry point. Its default backend is built on
-[MLX](https://github.com/ml-explore/mlx), with Metal support on Apple silicon
+The `eredu` crate provides the application-facing operations. Its default
+backend is built on [MLX](https://github.com/ml-explore/mlx), with Metal support on Apple silicon
 and CPU or CUDA support on x86-64 Linux and Windows. The runtime contracts,
 artifact inspection, planning, scheduling, and generation orchestration remain
 backend-neutral and can be built without MLX.
@@ -55,8 +55,9 @@ planning, quantization, residency, speculative generation, and tool calling.
 
 ## Workspace crates
 
-Most applications should depend only on `eredu`. The other crates expose
-portable components or implementation layers for specialized use.
+Applications combine facade-owned operations from `eredu` with portable values
+from their owning crates, usually `eredu-core` and `eredu-architectures`.
+Implementation crates remain specialized dependencies.
 
 | Crate | Role |
 | --- | --- |

@@ -9,8 +9,8 @@ use eredu::{
         LocalPreparedChatGenerationRequest, LocalPreparedChatInput, PreparedChatGenerationSettings,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
-    ExecutionPlan, FinishReason, ResidencyPlan, SemanticEvent,
 };
+use eredu_core::{ExecutionPlan, FinishReason, ResidencyPlan, SemanticEvent};
 use serde_json::json;
 
 fn profile_requires_structural_tool_tokens(identity: &str) -> bool {
@@ -92,7 +92,7 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
         .generate_prepared_chat(LocalPreparedChatGenerationRequest {
             input: LocalPreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
-                overrides: eredu::GenerationConfigOverrides {
+                overrides: eredu_core::GenerationConfigOverrides {
                     temperature: Some(0.0),
                     max_new_tokens: Some(256),
                     ..Default::default()
@@ -100,7 +100,7 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
                 seed: 0,
             },
             caller_stop_sequences: &[],
-            cancellation: eredu::GenerationCancellationToken::new(),
+            cancellation: eredu_core::GenerationCancellationToken::new(),
             on_event: |event| events.push(event),
         })
         .unwrap_or_else(|error| {

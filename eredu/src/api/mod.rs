@@ -35,13 +35,15 @@ mod request;
 mod tokenizer;
 
 #[cfg(feature = "mlx")]
+use crate::runtime::chat::PreparedChat;
+#[cfg(feature = "mlx")]
+use eredu_architectures::ModelKind;
+#[cfg(feature = "mlx")]
+use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
+
+#[cfg(feature = "mlx")]
 mod selected;
 
-pub use crate::runtime::chat::constraints::ConstraintError;
-pub use crate::runtime::chat::{
-    CapabilitySupport, ChatCapabilities, ChatTemplateIdentity, ChatTemplateRequest,
-    NativeToolSupport, ParallelToolCallPolicy, PreparedChat, SemanticSupport, ToolChoice,
-};
 pub use request::{
     PreparedChatError, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
     PreparedChatGenerationSettings, PreparedChatInput, PreparedChatSpeculativeBatchLane,
@@ -60,29 +62,24 @@ pub use inspection::{inspect_text_model, TextInspectionOptions};
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 
-pub use eredu_architectures::ModelKind;
-pub use eredu_core::{
-    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
-    ArtifactModality, ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, AutomaticPlanningError, AvailableMemory, BackendId, CacheStateStrategy,
-    CapabilityError, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
-    EstimationCompleteness, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity, Media,
-    MediaBinding, MediaRequestError, ModelCapabilities, ModelInspectionReport,
-    ModelResourceProfile, MultimodalRequest, MultimodalSegment, ObservationKind, Observed,
-    PhysicalMemorySemantics, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-    ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount,
-    SpeculativeDecodingTelemetry, SpeculativeDraft, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationOutput, StateMemoryAssumptions, StaticMemoryReport, TimingTelemetry,
-    TokenizedMultimodalRequest, TokenizedMultimodalSegment, TransferTelemetry, Video,
-    VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
-};
-pub use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 pub use portable::{
     LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder, TextDecoderError, TextModelError,
 };
+
+/// Portable failure reported by prepared-chat constraint state.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ConstraintError {
+    message: String,
+}
+
+impl ConstraintError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

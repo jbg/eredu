@@ -7,12 +7,16 @@ use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, ChatTemplateRequest, LocalBackendFactory,
-        LocalDevice, LocalModel, LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
-        LocalPreparedChatSpeculativeGenerationRequest, NativeToolSupport, ParallelToolCallPolicy,
-        PreparedChatGenerationSettings, PreparedChatSpeculativeGenerationOptions, ToolChoice,
+        default_local_device, local_device_plan, LocalBackendFactory, LocalDevice, LocalModel,
+        LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
+        LocalPreparedChatSpeculativeGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatSpeculativeGenerationOptions,
     },
-    DraftPlacementPlan, DraftingPlan, ExecutionPlan, SemanticEvent, SpeculativeSchedulerOptions,
+    runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
+};
+use eredu_core::{
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
+    GenerationConfigOverrides, SemanticEvent, SpeculativeSchedulerOptions,
 };
 use serde_json::json;
 
@@ -75,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let settings = PreparedChatGenerationSettings {
-        overrides: eredu::GenerationConfigOverrides {
+        overrides: GenerationConfigOverrides {
             max_new_tokens: Some(256),
             ..Default::default()
         },
@@ -103,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scheduler,
                 },
                 caller_stop_sequences: &[],
-                cancellation: eredu::GenerationCancellationToken::new(),
+                cancellation: GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason
@@ -113,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input: LocalPreparedChatInput::rendered_prompt(&prepared),
                 settings,
                 caller_stop_sequences: &[],
-                cancellation: eredu::GenerationCancellationToken::new(),
+                cancellation: GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason
