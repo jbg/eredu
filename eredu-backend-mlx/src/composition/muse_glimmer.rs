@@ -63,15 +63,28 @@ type NeutralUnit = Unit<MlxNeuralBackend>;
 type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxNeuralBackend>;
 pub type MuseGlimmerPipelineUnit = MlxModule<NeutralUnit>;
 
-fn group_kind(
-    architecture: &NeutralArchitecture,
-    group: usize,
-) -> eredu_runtime::ArchitectureGroupKind {
-    <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::group_transport(
-        architecture,
-        group,
-    )
-    .kind
+fn primary_execution_group(architecture: &NeutralArchitecture) -> Result<usize, Error> {
+    let graph = <NeutralArchitecture as LayeredArchitecture<
+        MlxNeuralBackend,
+        MlxKeyValueState,
+    >>::execution_graph(architecture)
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let primary = <NeutralArchitecture as LayeredArchitecture<
+        MlxNeuralBackend,
+        MlxKeyValueState,
+    >>::primary_execution_group(architecture);
+    resolve_primary_execution_group(&graph, primary)
+}
+
+fn resolve_primary_execution_group(
+    graph: &eredu_runtime::ExecutionGraph,
+    primary: &str,
+) -> Result<usize, Error> {
+    graph.group_index(primary).ok_or_else(|| {
+        Error::ArchitectureModel(format!(
+            "architecture has no primary execution group {primary:?}"
+        ))
+    })
 }
 
 type Resident = LayerwiseRuntime<
@@ -441,9 +454,7 @@ impl MuseGlimmerPipelineBindings {
         layout: Option<&eredu_runtime::LocalModelLayout>,
         _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = if group_kind(architecture, group)
-            == eredu_runtime::ArchitectureGroupKind::Decoder
-        {
+        let expert_targets = if group == primary_execution_group(architecture)? {
             eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
                 .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
@@ -488,9 +499,7 @@ impl MuseGlimmerPipelineBindings {
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
-        let expert_targets = if group_kind(architecture, group)
-            == eredu_runtime::ArchitectureGroupKind::Decoder
-        {
+        let expert_targets = if group == primary_execution_group(architecture)? {
             eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
                 .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
@@ -2016,4 +2025,41 @@ pub fn prepare_gguf_pipeline_source(
 ) -> Result<(DecoderConfig, SharedCheckpointSource), Error> {
     let (store, args) = open_gguf_store(source, projector, max_cached_readers)?;
     Ok((args, store))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_primary_execution_group;
+    use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
+
+    #[test]
+    fn primary_execution_group_is_resolved_by_stable_identity() {
+        let primary_last = ExecutionGraph::chain(["vision", "text"]).unwrap();
+        assert_eq!(
+            resolve_primary_execution_group(&primary_last, "text").unwrap(),
+            1
+        );
+
+        let primary_first = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("text"),
+                ExecutionGroupSpec::with_dependencies("vision", ["text"]),
+            ],
+            "vision",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_primary_execution_group(&primary_first, "text").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_primary_execution_group_is_rejected() {
+        let graph = ExecutionGraph::chain(["vision", "text"]).unwrap();
+        let error = resolve_primary_execution_group(&graph, "missing").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("architecture has no primary execution group \"missing\""));
+    }
 }
