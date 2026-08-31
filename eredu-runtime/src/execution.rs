@@ -373,15 +373,12 @@ pub enum ReadyGroupState {
     Ordered,
     /// Submission failed.
     Failed,
-    /// Work was cancelled before ordering.
-    Cancelled,
-    /// An upstream failure or cancellation made this group unreachable.
+    /// An upstream failure made this group unreachable.
     Blocked,
 }
 
-/// Deterministic dependency bookkeeping for a concrete backend executor.
 #[derive(Debug)]
-pub struct ExecutionGroupReadySet<'a> {
+struct ExecutionGroupReadySet<'a> {
     graph: &'a ExecutionGraph,
     remaining_dependencies: Vec<usize>,
     states: Vec<ReadyGroupState>,
@@ -522,8 +519,7 @@ pub enum ExecutionScheduleError {
 }
 
 impl<'a> ExecutionGroupReadySet<'a> {
-    /// Creates a ready set with all root groups ready.
-    pub fn new(graph: &'a ExecutionGraph) -> Self {
+    fn new(graph: &'a ExecutionGraph) -> Self {
         let remaining_dependencies = graph.dependencies.iter().map(Vec::len).collect::<Vec<_>>();
         let ready = remaining_dependencies
             .iter()
@@ -538,28 +534,11 @@ impl<'a> ExecutionGroupReadySet<'a> {
         }
     }
 
-    /// Returns groups which can be ordered now.
-    pub fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
+    fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
         self.ready.iter().copied()
     }
 
-    /// Selects a deterministic maximal compatible subset of ready groups.
-    pub fn compatible_batch(&self, mut compatible: impl FnMut(usize, usize) -> bool) -> Vec<usize> {
-        let mut selected = Vec::new();
-        for candidate in self.ready_groups() {
-            if selected
-                .iter()
-                .copied()
-                .all(|group| compatible(group, candidate))
-            {
-                selected.push(candidate);
-            }
-        }
-        selected
-    }
-
-    /// Records successful ordering and unlocks newly-ready dependents.
-    pub fn ordered(&mut self, group: usize) {
+    fn ordered(&mut self, group: usize) {
         debug_assert_eq!(self.states[group], ReadyGroupState::Pending);
         self.ready.remove(&group);
         self.states[group] = ReadyGroupState::Ordered;
@@ -574,14 +553,8 @@ impl<'a> ExecutionGroupReadySet<'a> {
         }
     }
 
-    /// Marks a failed group and closes its dependent subgraph.
-    pub fn fail(&mut self, group: usize) {
+    fn fail(&mut self, group: usize) {
         self.close_subgraph(group, ReadyGroupState::Failed);
-    }
-
-    /// Marks a cancelled group and closes its dependent subgraph.
-    pub fn cancel(&mut self, group: usize) {
-        self.close_subgraph(group, ReadyGroupState::Cancelled);
     }
 
     fn close_subgraph(&mut self, group: usize, state: ReadyGroupState) {
@@ -601,8 +574,7 @@ impl<'a> ExecutionGroupReadySet<'a> {
         }
     }
 
-    /// Returns one group's scheduler state.
-    pub fn state(&self, group: usize) -> Option<ReadyGroupState> {
+    fn state(&self, group: usize) -> Option<ReadyGroupState> {
         self.states.get(group).copied()
     }
 }

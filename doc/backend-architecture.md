@@ -1257,6 +1257,8 @@ compatible ready batches, and owns group completion transitions. Concrete
 backends retain that resolved optionality with physical placement and realize
 streams, residency, payload transport, and collectives; they do not infer
 optionality from backend-local kinds or maintain a second graph lifecycle.
+Compatible-batch selection is exposed only through this layered lifecycle;
+the underlying ready-set bookkeeping remains an internal implementation detail.
 Backend adapters address media storage and the primary boundary by the graph's
 stable architecture-owned IDs, including when several groups have the same
 semantic kind.
