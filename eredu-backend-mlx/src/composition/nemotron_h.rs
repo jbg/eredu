@@ -1581,28 +1581,6 @@ impl NemotronHModel {
         )
     }
 
-    /// Clears transient decoder weights for bounded execution.
-    pub fn clear_device_layer_window(&self) -> Result<(), Error> {
-        match &self.execution {
-            NemotronHExecution::Resident(_) => Ok(()),
-            NemotronHExecution::Layerwise(runtime) => {
-                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
-                    runtime.architecture(),
-                    eredu_runtime::ArchitectureGroupKind::Decoder,
-                )?;
-                runtime.policy().clear_device_group(&group)
-            }
-            NemotronHExecution::TensorParallelResident(_) => Ok(()),
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
-                    runtime.architecture(),
-                    eredu_runtime::ArchitectureGroupKind::Decoder,
-                )?;
-                runtime.policy().clear_device_group(&group)
-            }
-        }
-    }
-
     /// Executes a rank-local tensor-parallel forward pass.
     pub fn forward_tensor_parallel(
         &mut self,

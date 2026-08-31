@@ -998,26 +998,6 @@ impl QwenModel {
         self.prefill(input_tokens, cache, stream)
     }
 
-    /// Clears temporary execution-device decoder copies when layerwise residency is active.
-    ///
-    /// Returns `true` when a layerwise window was cleared and `false` for the
-    /// fully resident engine.
-    pub fn clear_device_layer_window(&self) -> Result<bool, Error> {
-        if self.is_fully_resident() {
-            return Ok(false);
-        }
-        match &self.execution {
-            QwenExecution::Layerwise(_) => {}
-            QwenExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().clear_device_window()?
-            }
-            QwenExecution::Resident(_) | QwenExecution::TensorParallelResident(_) => {
-                return Ok(false)
-            }
-        }
-        Ok(true)
-    }
-
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let topology = self
             .parallel_info

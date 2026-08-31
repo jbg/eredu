@@ -1091,28 +1091,6 @@ impl KimiLinearModel {
         Ok(output.into_array())
     }
 
-    /// Clears transient decoder weights for bounded execution.
-    pub fn clear_device_layer_window(&self) -> Result<(), Error> {
-        match &self.execution {
-            KimiLinearExecution::Resident(_) => Ok(()),
-            KimiLinearExecution::Layerwise(runtime) => {
-                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
-                    runtime.architecture(),
-                    eredu_runtime::ArchitectureGroupKind::Decoder,
-                )?;
-                runtime.policy().clear_device_group(&group)
-            }
-            KimiLinearExecution::TensorParallelResident(_) => Ok(()),
-            KimiLinearExecution::TensorParallelLayerwise(runtime) => {
-                let group = crate::composition::architecture_group_name::<_, MlxHybridState>(
-                    runtime.architecture(),
-                    eredu_runtime::ArchitectureGroupKind::Decoder,
-                )?;
-                runtime.policy().clear_device_group(&group)
-            }
-        }
-    }
-
     /// Executes a rank-local tensor-parallel forward pass.
     pub fn forward_tensor_parallel(
         &mut self,

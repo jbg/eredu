@@ -1393,22 +1393,6 @@ impl GptOssModel {
         self.prefill(input_tokens, cache, stream)
     }
 
-    /// Clears temporary device block windows for nonresident execution.
-    pub fn clear_device_layer_window(&self) -> Result<bool, Error> {
-        match &self.execution {
-            GptOssExecution::Resident(_) => Ok(false),
-            GptOssExecution::Layerwise(execution) => {
-                execution.policy().clear_device_window()?;
-                Ok(true)
-            }
-            GptOssExecution::TensorParallelResident(_) => Ok(false),
-            GptOssExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().clear_device_window()?;
-                Ok(true)
-            }
-        }
-    }
-
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),

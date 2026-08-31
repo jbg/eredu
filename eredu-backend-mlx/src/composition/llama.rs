@@ -548,26 +548,6 @@ impl LlamaModel {
         self.prefill(input_tokens, cache, stream)
     }
 
-    /// Clears temporary execution-device decoder copies when layerwise residency is active.
-    ///
-    /// Returns `true` when a layerwise window was cleared and `false` for the
-    /// fully resident engine.
-    pub fn clear_device_layer_window(&self) -> Result<bool, Error> {
-        if self.is_fully_resident() {
-            return Ok(false);
-        }
-        match &self.execution {
-            LlamaExecution::Layerwise(_) => {}
-            LlamaExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().clear_device_window()?
-            }
-            LlamaExecution::Resident(_) | LlamaExecution::TensorParallelResident(_) => {
-                return Ok(false)
-            }
-        }
-        Ok(true)
-    }
-
     pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let topology = self
             .parallel_info

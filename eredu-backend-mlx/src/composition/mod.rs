@@ -6,10 +6,7 @@ use safemlx::Array;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_nn::Parameterized;
-use eredu_runtime::{
-    ArchitectureGroupKind, ArchitectureParameters, LayeredArchitecture, RuntimeState,
-    StaticParameterVisitor, StaticUnitBindings,
-};
+use eredu_runtime::{ArchitectureParameters, StaticParameterVisitor, StaticUnitBindings};
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
 
@@ -193,41 +190,6 @@ pub(crate) fn parallel_layout_from_description(
         planner.register(group.group().clone())?;
     }
     planner.finish().map(|(_, layout)| layout)
-}
-
-/// Resolves the stable name of the sole execution group with a semantic role.
-pub(crate) fn architecture_group_name<A, S>(
-    architecture: &A,
-    kind: ArchitectureGroupKind,
-) -> Result<String, Error>
-where
-    A: LayeredArchitecture<MlxNeuralBackend, S>,
-    S: RuntimeState<MlxNeuralBackend>,
-    A::Error: std::fmt::Display,
-{
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    unique_group_name(&graph, kind, |group| {
-        architecture.group_transport(group).kind
-    })
-}
-
-fn unique_group_name(
-    graph: &eredu_runtime::ExecutionGraph,
-    kind: ArchitectureGroupKind,
-    mut group_kind: impl FnMut(usize) -> ArchitectureGroupKind,
-) -> Result<String, Error> {
-    let mut groups = (0..graph.groups().len()).filter(|&group| group_kind(group) == kind);
-    let group = groups.next().ok_or_else(|| {
-        Error::ArchitectureModel(format!("architecture declares no {kind:?} execution group"))
-    })?;
-    if groups.next().is_some() {
-        return Err(Error::ArchitectureModel(format!(
-            "architecture declares multiple {kind:?} execution groups"
-        )));
-    }
-    Ok(graph.groups()[group].id().to_owned())
 }
 
 /// Lowers already-selected neutral expert units into native cache entries.
@@ -416,33 +378,5 @@ mod expert_selection_tests {
             selected,
             vec![ExpertIdentity::new(7, 1), ExpertIdentity::new(9, 2)]
         );
-    }
-}
-
-#[cfg(test)]
-mod architecture_group_tests {
-    use eredu_runtime::{ArchitectureGroupKind, ExecutionGraph, ExecutionGroupSpec};
-
-    #[test]
-    fn semantic_group_lookup_preserves_architecture_declared_name() {
-        let graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("decoder-renamed"),
-                ExecutionGroupSpec::with_dependencies("prediction", ["decoder-renamed"]),
-            ],
-            "prediction",
-        )
-        .unwrap();
-
-        let name = super::unique_group_name(&graph, ArchitectureGroupKind::Decoder, |group| {
-            if group == 0 {
-                ArchitectureGroupKind::Decoder
-            } else {
-                ArchitectureGroupKind::Prediction
-            }
-        })
-        .unwrap();
-
-        assert_eq!(name, "decoder-renamed");
     }
 }

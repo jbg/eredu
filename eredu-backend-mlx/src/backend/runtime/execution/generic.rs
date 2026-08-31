@@ -305,35 +305,6 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             .collect()
     }
 
-    /// Evicts temporary device weights belonging to one execution group.
-    pub fn clear_device_group(&self, id: &str) -> Result<(), Error> {
-        let group = (0..self.layout.group_count())
-            .find(|&group| {
-                self.layout
-                    .group_id(group)
-                    .is_some_and(|group_id| group_id.as_str() == id)
-            })
-            .ok_or_else(|| Error::Parallel(format!("unknown execution group {id}")))?;
-        if let Some(dense) = &self.dense {
-            dense.controller.clear_group(&self.residency, id)?;
-        }
-        self.execution_group(group)?.clear(&self.residency)?;
-        Ok(())
-    }
-
-    /// Evicts every temporary execution-device unit after exact completion.
-    pub fn clear_device_window(&self) -> Result<(), Error> {
-        for group in 0..self.layout.group_count() {
-            let id = self
-                .layout
-                .group_id(group)
-                .expect("validated layout names every execution group")
-                .as_str();
-            self.clear_device_group(id)?;
-        }
-        Ok(())
-    }
-
     /// Populates every unit once and converts the bounded loader into a
     /// permanently resident policy without changing the architecture loop.
     pub fn into_resident<A, S>(
