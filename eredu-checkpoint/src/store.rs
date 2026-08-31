@@ -986,6 +986,22 @@ impl SafetensorsWeightStore {
         Self::from_single_file(file, canonicalize(&root)?, max_cached_shards)
     }
 
+    /// Returns the canonical payload paths admitted by this store.
+    ///
+    /// Indexed paths are parsed with duplicate-key rejection, restricted to
+    /// relative non-traversing names, and resolved beneath the checkpoint's
+    /// canonical access root before they are returned. Hugging Face snapshot
+    /// symlinks may resolve into the repository's sibling `blobs` directory,
+    /// but never outside that repository.
+    pub fn validated_payload_paths(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let paths = self
+            .catalog
+            .values()
+            .map(|entry| self.validate_access_path(entry))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(paths.into_iter().collect())
+    }
+
     fn from_single_file(
         file: PathBuf,
         canonical_root: PathBuf,
@@ -1823,6 +1839,41 @@ mod tests {
                 policy: ReadPolicy::RequireBounded,
             })
             .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_payload_paths_reject_symlinks_outside_the_checkpoint_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let checkpoint = parent.path().join("checkpoint");
+        std::fs::create_dir(&checkpoint).unwrap();
+        let outside = parent.path().join("outside.safetensors");
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![1], &f32_bytes(&[1.0])).unwrap(),
+            )],
+            None,
+            &outside,
+        )
+        .unwrap();
+        symlink(&outside, checkpoint.join("model-00001.safetensors")).unwrap();
+        std::fs::write(
+            checkpoint.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {"weight": "model-00001.safetensors"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = SafetensorsWeightStore::open(&checkpoint).unwrap();
+        assert!(matches!(
+            store.validated_payload_paths(),
+            Err(StoreError::UnsafeShardPath { .. })
+        ));
     }
 
     #[test]

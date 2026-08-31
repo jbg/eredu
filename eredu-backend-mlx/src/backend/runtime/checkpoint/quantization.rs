@@ -480,9 +480,12 @@ fn copy_checkpoint_assets(
         }
         let file_name = entry.file_name();
         let file_name_lossy = file_name.to_string_lossy();
+        let is_weight_file = path
+            .canonicalize()
+            .is_ok_and(|canonical| weight_files.contains(&canonical));
         if file_name_lossy == "config.json"
             || file_name_lossy == "model.safetensors.index.json"
-            || weight_files.iter().any(|weight_file| weight_file == &path)
+            || is_weight_file
         {
             continue;
         }

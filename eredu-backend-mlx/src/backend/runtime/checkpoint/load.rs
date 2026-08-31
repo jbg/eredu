@@ -10,6 +10,8 @@ use std::{
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::{transforms::async_eval_with_event, Array, Stream};
 
+use crate::backend::error::Error;
+use crate::backend::runtime::checkpoint::quantization::quantize_tensor;
 #[cfg(all(
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
@@ -20,10 +22,6 @@ use crate::{
     native_quantization::NativeQuantizationFormat,
 };
 use safetensors::SafeTensors;
-use serde::Deserialize;
-
-use crate::backend::error::Error;
-use crate::backend::runtime::checkpoint::quantization::quantize_tensor;
 
 /// Copies decoded GGUF metadata into a name-addressable map.
 pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
@@ -374,31 +372,10 @@ fn load_arrays_quantized_strict<M: PhysicalParameters>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
-/// Hugging Face safetensors index file.
-pub struct WeightMap {
-    /// Mapping from tensor name to shard file name.
-    pub weight_map: HashMap<String, String>,
-}
-
-/// Returns the safetensors files referenced by a Hugging Face model directory.
+/// Returns the validated safetensors payloads referenced by a model directory.
 pub fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
-    let model_dir = model_dir.as_ref();
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    if weights_index.exists() {
-        let json = std::fs::read_to_string(weights_index)?;
-        let weight_map: WeightMap = serde_json::from_str(&json)?;
-        let mut files = weight_map
-            .weight_map
-            .values()
-            .map(|file| model_dir.join(file))
-            .collect::<Vec<_>>();
-        files.sort();
-        files.dedup();
-        return Ok(files);
-    }
-
-    Ok(vec![model_dir.join("model.safetensors")])
+    let store = eredu_checkpoint::store::SafetensorsWeightStore::open(model_dir)?;
+    Ok(store.validated_payload_paths()?)
 }
 
 #[cfg(test)]
@@ -423,12 +400,43 @@ mod tests {
         module::{PhysicalParam, PhysicalParameters as _},
     };
 
-    use super::gguf_quantization_configs;
+    use super::{gguf_quantization_configs, safetensors_files};
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use super::{
         load_array_strict, load_arrays_quantized_strict, Error, QuantizedLoadRecipe,
         StrictLoadReport,
     };
+
+    #[test]
+    fn safetensors_file_discovery_rejects_untrusted_index_paths_and_duplicates() {
+        let traversal = tempfile::tempdir().unwrap();
+        std::fs::write(
+            traversal.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"weight":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        let traversal_error = safetensors_files(traversal.path()).unwrap_err();
+        assert!(matches!(
+            traversal_error,
+            crate::backend::Error::CheckpointStore(
+                eredu_checkpoint::store::StoreError::UnsafeShardPath { .. }
+            )
+        ));
+
+        let duplicate = tempfile::tempdir().unwrap();
+        std::fs::write(
+            duplicate.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"weight":"one.safetensors","weight":"two.safetensors"}}"#,
+        )
+        .unwrap();
+        let duplicate_error = safetensors_files(duplicate.path()).unwrap_err();
+        assert!(matches!(
+            duplicate_error,
+            crate::backend::Error::CheckpointStore(
+                eredu_checkpoint::store::StoreError::MalformedIndex { .. }
+            )
+        ));
+    }
 
     #[test]
     fn gguf_runtime_configs_preserve_every_native_affine_format() {

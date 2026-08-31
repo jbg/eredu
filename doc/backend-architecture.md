@@ -363,7 +363,10 @@ execute those plans literally. They do not select tensors by suffix, rank,
 dtype, size, or substring; derive companion identities; canonicalize legacy
 names; or inject compatibility metadata into `config.json`. Conversion fails
 closed when a declared source is absent or any declared output collides with
-another checkpoint tensor.
+another checkpoint tensor. Conversion also obtains payload paths from the
+backend-neutral SafeTensors store, so duplicate index keys, absolute or
+traversing shard names, and symlinks outside the admitted checkpoint access
+root fail before a concrete backend can read or publish any tensor.
 
 Portable SafeTensors schemas use released checkpoint names directly. A private
 module spelling that inserts `inner` into an architecture name, such as
