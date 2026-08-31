@@ -1902,7 +1902,7 @@ struct MuseVisualSource {
     image_std: [f32; 3],
     #[serde(default = "default_muse_patch")]
     patch_size: usize,
-    #[serde(default = "default_muse_temporal", alias = "temporal_patch_size")]
+    #[serde(default = "default_muse_temporal")]
     temporal_patch_size: usize,
     #[serde(default = "default_muse_merge")]
     merge_size: usize,

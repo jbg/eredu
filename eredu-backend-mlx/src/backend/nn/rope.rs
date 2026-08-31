@@ -18,7 +18,6 @@ use crate::{module::Module, nn};
 ///
 /// Applies piecewise frequency scaling based on wavelength cutoffs derived from
 /// `low_freq_factor`, `high_freq_factor`, `factor`, and `original_max_position_embeddings`.
-// TODO: support derive ModuleParameters for structs with non-param Array fields
 #[derive(Debug, Clone, ModuleParameters)]
 #[module(root = crate)]
 pub struct FrequencyScaledRope {
