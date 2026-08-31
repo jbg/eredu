@@ -434,6 +434,10 @@ ordinary routed execution path. Generic backend transforms preserve every
 leading bank dimension while sharding only the architecture-declared projection
 axis, and their returned partial or reduced output follows the same neutral
 tensor-parallel contract as a directly resident bank.
+Distributed cached dispatch is expressed once per expert-bank operator shape,
+such as gated-product or ReLU², rather than through family-named forwarding
+wrappers. Family composition supplies the architecture-declared bank spec and
+cache-unit identity to that operator-shaped backend path.
 Hybrid target/MTP families additionally declare the execution group, physical
 MTP unit, checkpoint root, and cache identity of every sparse unit in this
 catalog; backend adapters filter catalog units against the realized partition
@@ -760,6 +764,9 @@ target and prediction placement; it does not rebuild target/MTP counts from
 family configuration fields. Pipeline topology preflight and stage-range
 selection likewise use the decoder group count from that description, before
 constructing any rank-local units.
+Placement retains the neutral `ArchitectureGroupKind` vocabulary directly;
+backend composition does not rename architecture-authored semantic kinds into
+a legacy execution-group type.
 Rank-local materialization traverses the canonical units exposed by its
 `ArchitecturePartition`, so composite vision, target, and prediction ordering
 is never restated by a backend loader. Every distributed family loader

@@ -852,7 +852,7 @@ fn execute_pipeline_cached_neutral_gemma4(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::composition::mlx::distributed::expert::execute_cached_neutral_gemma4(
+        crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
             global_layer,
             routes,

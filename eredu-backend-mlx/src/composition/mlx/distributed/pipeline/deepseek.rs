@@ -1078,13 +1078,12 @@ fn execute_pipeline_cached_neutral_deepseek(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-            cache,
+        crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
             global_layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
+            routes,
             pass,
+            cache,
             stream,
         )
     };

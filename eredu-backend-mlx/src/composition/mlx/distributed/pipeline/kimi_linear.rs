@@ -268,7 +268,7 @@ fn execute_pipeline_cached_kimi_linear(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::composition::mlx::distributed::expert::execute_cached_kimi_linear(
+        crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
             global_layer,
             routes,

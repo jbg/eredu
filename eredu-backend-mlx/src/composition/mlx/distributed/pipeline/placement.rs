@@ -12,8 +12,8 @@ use std::{
 
 use crate::backend::error::Error;
 use eredu_runtime::{
-    ArchitectureGroupKind as ExecutionGroupKind, ArchitecturePartition, ArchitecturePartitionError,
-    ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, PartitionOwnership,
+    ArchitectureGroupKind, ArchitecturePartition, ArchitecturePartitionError, ExecutionGraph,
+    ExecutionGroupSpec, ExecutionUnitLayout, PartitionOwnership,
 };
 
 /// Active Cartesian subgroups for a placed group.
@@ -67,7 +67,7 @@ pub struct ExecutionGroupPlacement {
     /// Stable group identity.
     pub id: String,
     /// Semantic role.
-    pub kind: ExecutionGroupKind,
+    pub kind: ArchitectureGroupKind,
     /// Dependencies in declaration order.
     pub dependencies: Vec<String>,
     /// Complete group-global geometry.
@@ -105,7 +105,7 @@ pub struct ExecutionGroupPlacementRequest {
     /// Stable identity and semantic dependencies.
     pub spec: ExecutionGroupSpec,
     /// Semantic role.
-    pub kind: ExecutionGroupKind,
+    pub kind: ArchitectureGroupKind,
     /// Number of ordered units.
     pub unit_count: usize,
     /// Ordered allowed PP coordinates.
@@ -940,7 +940,7 @@ mod tests {
     fn request(
         id: &str,
         dependencies: &[&str],
-        kind: ExecutionGroupKind,
+        kind: ArchitectureGroupKind,
         units: usize,
         ranks: &[usize],
     ) -> ExecutionGroupPlacementRequest {
@@ -953,7 +953,7 @@ mod tests {
             kind,
             unit_count: units,
             rank_path: ranks.to_vec(),
-            active_subgroup: if kind == ExecutionGroupKind::Decoder {
+            active_subgroup: if kind == ArchitectureGroupKind::Decoder {
                 ActiveParallelSubgroup::decoder()
             } else {
                 ActiveParallelSubgroup::tensor_sharded()
@@ -961,7 +961,7 @@ mod tests {
             first_owner_static_roles: vec![format!("{id}.input")],
             last_owner_static_roles: vec![format!("{id}.output")],
             merge_destination: None,
-            request_optional: kind != ExecutionGroupKind::Decoder,
+            request_optional: kind != ArchitectureGroupKind::Decoder,
         }
     }
 
@@ -982,8 +982,14 @@ mod tests {
         PlacedExecutionDag::plan(
             2,
             vec![
-                request("vision", &[], ExecutionGroupKind::VisionEncoder, 4, &[0, 1]),
-                request("text", &["vision"], ExecutionGroupKind::Decoder, 2, &[1]),
+                request(
+                    "vision",
+                    &[],
+                    ArchitectureGroupKind::VisionEncoder,
+                    4,
+                    &[0, 1],
+                ),
+                request("text", &["vision"], ArchitectureGroupKind::Decoder, 2, &[1]),
             ],
             "text",
         )
@@ -995,11 +1001,17 @@ mod tests {
         let placed = PlacedExecutionDag::plan(
             2,
             vec![
-                request("context_decoder", &[], ExecutionGroupKind::Decoder, 1, &[0]),
+                request(
+                    "context_decoder",
+                    &[],
+                    ArchitectureGroupKind::Decoder,
+                    1,
+                    &[0],
+                ),
                 request(
                     "text_decoder",
                     &["context_decoder"],
-                    ExecutionGroupKind::Decoder,
+                    ArchitectureGroupKind::Decoder,
                     2,
                     &[1],
                 ),
@@ -1099,11 +1111,17 @@ mod tests {
 
     #[test]
     fn output_owned_prediction_selects_untied_shared_embedding_through_mtp_role() {
-        let mut target = request("target", &[], ExecutionGroupKind::Decoder, 4, &[0, 1]);
+        let mut target = request("target", &[], ArchitectureGroupKind::Decoder, 4, &[0, 1]);
         target.first_owner_static_roles = vec!["embedding".into()];
         target.last_owner_static_roles = vec!["norm".into(), "output".into()];
 
-        let mut prediction = request("mtp_0", &["target"], ExecutionGroupKind::Decoder, 1, &[1]);
+        let mut prediction = request(
+            "mtp_0",
+            &["target"],
+            ArchitectureGroupKind::Decoder,
+            1,
+            &[1],
+        );
         prediction.first_owner_static_roles = vec!["mtp".into()];
         prediction.last_owner_static_roles.clear();
 
@@ -1128,10 +1146,16 @@ mod tests {
             std::slice::from_ref(&embedding)
         );
 
-        let mut target = request("target", &[], ExecutionGroupKind::Decoder, 4, &[0, 1]);
+        let mut target = request("target", &[], ArchitectureGroupKind::Decoder, 4, &[0, 1]);
         target.first_owner_static_roles = vec!["embedding".into()];
         target.last_owner_static_roles = vec!["norm".into(), "output".into()];
-        let mut prediction = request("mtp_0", &["target"], ExecutionGroupKind::Decoder, 1, &[1]);
+        let mut prediction = request(
+            "mtp_0",
+            &["target"],
+            ArchitectureGroupKind::Decoder,
+            1,
+            &[1],
+        );
         prediction.first_owner_static_roles.clear();
         prediction.last_owner_static_roles.clear();
         let missing_role = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
@@ -1181,21 +1205,21 @@ mod tests {
                 request(
                     "vision",
                     &[],
-                    ExecutionGroupKind::VisionEncoder,
+                    ArchitectureGroupKind::VisionEncoder,
                     7,
                     &[0, 1, 2],
                 ),
                 request(
                     "projector",
                     &["vision"],
-                    ExecutionGroupKind::Projector,
+                    ArchitectureGroupKind::Projector,
                     1,
                     &[3],
                 ),
                 request(
                     "text",
                     &["projector"],
-                    ExecutionGroupKind::Decoder,
+                    ArchitectureGroupKind::Decoder,
                     8,
                     &[1, 2, 3],
                 ),
@@ -1235,7 +1259,7 @@ mod tests {
             vec![request(
                 "text",
                 &[],
-                ExecutionGroupKind::Decoder,
+                ArchitectureGroupKind::Decoder,
                 4,
                 &[0, 1],
             )],
@@ -1269,7 +1293,7 @@ mod tests {
 
     #[test]
     fn routes_terminal_group_output_to_its_merge_owner() {
-        let mut text = request("text", &[], ExecutionGroupKind::Decoder, 2, &[1]);
+        let mut text = request("text", &[], ArchitectureGroupKind::Decoder, 2, &[1]);
         text.merge_destination = Some(0);
         text.first_owner_static_roles = vec!["embedding".into()];
         text.last_owner_static_roles = vec!["embedding".into(), "output".into()];
@@ -1316,7 +1340,7 @@ mod tests {
             vec![request(
                 "vision",
                 &[],
-                ExecutionGroupKind::VisionEncoder,
+                ArchitectureGroupKind::VisionEncoder,
                 1,
                 &[0, 1, 2, 3],
             )],
@@ -1330,7 +1354,7 @@ mod tests {
             vec![request(
                 "vision",
                 &[],
-                ExecutionGroupKind::VisionEncoder,
+                ArchitectureGroupKind::VisionEncoder,
                 2,
                 &[0, 2],
             )],
@@ -1343,12 +1367,24 @@ mod tests {
     #[test]
     fn differently_ordered_encoder_paths_do_not_form_a_synthetic_rank_cycle() {
         let conflicting = vec![
-            request("vision", &[], ExecutionGroupKind::VisionEncoder, 2, &[0, 1]),
-            request("audio", &[], ExecutionGroupKind::AudioEncoder, 2, &[1, 0]),
+            request(
+                "vision",
+                &[],
+                ArchitectureGroupKind::VisionEncoder,
+                2,
+                &[0, 1],
+            ),
+            request(
+                "audio",
+                &[],
+                ArchitectureGroupKind::AudioEncoder,
+                2,
+                &[1, 0],
+            ),
             request(
                 "merge",
                 &["vision", "audio"],
-                ExecutionGroupKind::Merger,
+                ArchitectureGroupKind::Merger,
                 1,
                 &[0],
             ),
@@ -1363,12 +1399,24 @@ mod tests {
         let graph = PlacedExecutionDag::plan(
             2,
             vec![
-                request("vision", &[], ExecutionGroupKind::VisionEncoder, 2, &[0, 1]),
-                request("audio", &[], ExecutionGroupKind::AudioEncoder, 2, &[0, 1]),
+                request(
+                    "vision",
+                    &[],
+                    ArchitectureGroupKind::VisionEncoder,
+                    2,
+                    &[0, 1],
+                ),
+                request(
+                    "audio",
+                    &[],
+                    ArchitectureGroupKind::AudioEncoder,
+                    2,
+                    &[0, 1],
+                ),
                 request(
                     "merge",
                     &["vision", "audio"],
-                    ExecutionGroupKind::Merger,
+                    ArchitectureGroupKind::Merger,
                     1,
                     &[0],
                 ),
@@ -1410,16 +1458,16 @@ mod tests {
     #[test]
     fn rejects_cycle_disconnect_and_ambiguous_owner() {
         let cycle = vec![
-            request("a", &["b"], ExecutionGroupKind::VisionEncoder, 1, &[0]),
-            request("b", &["a"], ExecutionGroupKind::Decoder, 1, &[1]),
+            request("a", &["b"], ArchitectureGroupKind::VisionEncoder, 1, &[0]),
+            request("b", &["a"], ArchitectureGroupKind::Decoder, 1, &[1]),
         ];
         assert!(PlacedExecutionDag::plan(2, cycle, "b").is_err());
         let disconnected = vec![
-            request("unused", &[], ExecutionGroupKind::AudioEncoder, 1, &[0]),
-            request("text", &[], ExecutionGroupKind::Decoder, 1, &[1]),
+            request("unused", &[], ArchitectureGroupKind::AudioEncoder, 1, &[0]),
+            request("text", &[], ArchitectureGroupKind::Decoder, 1, &[1]),
         ];
         assert!(PlacedExecutionDag::plan(2, disconnected, "text").is_err());
-        let ambiguous = request("text", &[], ExecutionGroupKind::Decoder, 2, &[0, 0]);
+        let ambiguous = request("text", &[], ArchitectureGroupKind::Decoder, 2, &[0, 0]);
         assert!(PlacedExecutionDag::plan(2, vec![ambiguous], "text").is_err());
     }
 }

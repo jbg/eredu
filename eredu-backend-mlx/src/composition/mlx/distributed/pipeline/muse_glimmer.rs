@@ -1064,7 +1064,7 @@ fn execute_pipeline_cached_muse_glimmer(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::composition::mlx::distributed::expert::execute_cached_muse_glimmer(
+        crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
             global_layer,
             routes,

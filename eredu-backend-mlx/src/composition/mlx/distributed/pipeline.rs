@@ -17,16 +17,15 @@ use eredu_core::{
 };
 use eredu_nn::{Parameterized, RoutedNeuralBackend, TensorParallelExpertOutput};
 use eredu_runtime::{
-    ArchitectureParameters, DenseDiskStreamLoadOptions, LayerWeightResidency, LayeredArchitecture,
-    LayerwiseLoadOptions, OffloadUnit, ResidencyReport, ShardingPolicy, StaticParameterVisitor,
-    StaticParameterVisitorMut, StaticUnitBindings, WeightBinding, WeightMaterializationReport,
-    DENSE_TRANSFER_WINDOW,
+    ArchitectureGroupKind, ArchitectureParameters, DenseDiskStreamLoadOptions,
+    LayerWeightResidency, LayeredArchitecture, LayerwiseLoadOptions, OffloadUnit, ResidencyReport,
+    ShardingPolicy, StaticParameterVisitor, StaticParameterVisitorMut, StaticUnitBindings,
+    WeightBinding, WeightMaterializationReport, DENSE_TRANSFER_WINDOW,
 };
 use ref_cast::RefCast;
 
 mod placement;
 
-pub use eredu_runtime::ArchitectureGroupKind as ExecutionGroupKind;
 pub use placement::{
     ActiveParallelSubgroup, ExecutionGroupPlacementRequest, PlacedExecutionDag,
     PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacementRoute,
@@ -4867,11 +4866,11 @@ fn pipeline_encoder_unit_counts(
     let is_encoder_unit = |kind| {
         matches!(
             kind,
-            ExecutionGroupKind::VisionEncoder
-                | ExecutionGroupKind::AudioEncoder
-                | ExecutionGroupKind::Projector
-                | ExecutionGroupKind::Merger
-                | ExecutionGroupKind::ModalityFinalization
+            ArchitectureGroupKind::VisionEncoder
+                | ArchitectureGroupKind::AudioEncoder
+                | ArchitectureGroupKind::Projector
+                | ArchitectureGroupKind::Merger
+                | ArchitectureGroupKind::ModalityFinalization
         )
     };
     let global = placement
@@ -4893,7 +4892,7 @@ fn pipeline_encoder_unit_counts(
 fn pipeline_encoder_telemetry_excludes_prediction_units() {
     let request = |id: &str,
                    dependencies: &[&str],
-                   kind: ExecutionGroupKind,
+                   kind: ArchitectureGroupKind,
                    unit_count: usize,
                    rank_path: &[usize]| {
         ExecutionGroupPlacementRequest {
@@ -4909,7 +4908,7 @@ fn pipeline_encoder_telemetry_excludes_prediction_units() {
             unit_count,
             rank_path: rank_path.to_vec(),
             active_subgroup: match kind {
-                ExecutionGroupKind::Decoder | ExecutionGroupKind::Prediction => {
+                ArchitectureGroupKind::Decoder | ArchitectureGroupKind::Prediction => {
                     ActiveParallelSubgroup::decoder()
                 }
                 _ => ActiveParallelSubgroup::tensor_sharded(),
@@ -4923,18 +4922,24 @@ fn pipeline_encoder_telemetry_excludes_prediction_units() {
     let placement = PlacedExecutionDag::plan(
         2,
         vec![
-            request("vision", &[], ExecutionGroupKind::VisionEncoder, 4, &[0, 1]),
+            request(
+                "vision",
+                &[],
+                ArchitectureGroupKind::VisionEncoder,
+                4,
+                &[0, 1],
+            ),
             request(
                 "decoder",
                 &["vision"],
-                ExecutionGroupKind::Decoder,
+                ArchitectureGroupKind::Decoder,
                 6,
                 &[0, 1],
             ),
             request(
                 "mtp.0",
                 &["decoder"],
-                ExecutionGroupKind::Prediction,
+                ArchitectureGroupKind::Prediction,
                 1,
                 &[1],
             ),
@@ -6025,7 +6030,8 @@ impl PipelineModel {
                         stream
                     };
                     let arrays = match placed.kind {
-                        ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder => {
+                        ArchitectureGroupKind::VisionEncoder
+                        | ArchitectureGroupKind::AudioEncoder => {
                             if active[index] {
                                 self.stage.execute_placed_ingress(
                                     &placed.id,
@@ -6038,14 +6044,14 @@ impl PipelineModel {
                                 Vec::new()
                             }
                         }
-                        ExecutionGroupKind::ModalityFinalization => {
+                        ArchitectureGroupKind::ModalityFinalization => {
                             let arrays = working.remove(&index).unwrap_or_default();
                             self.stage.merge_placed_ingress_arrays(arrays)?;
                             self.stage
                                 .finish_placed_ingress(tensor, execution_stream)?
                                 .into_arrays()
                         }
-                        ExecutionGroupKind::Decoder
+                        ArchitectureGroupKind::Decoder
                             if placed.id == self.info.primary_execution_group =>
                         {
                             let arrays = working.remove(&index).unwrap_or_default();
@@ -6072,7 +6078,7 @@ impl PipelineModel {
                             decoder_payload = Some(payload);
                             arrays
                         }
-                        ExecutionGroupKind::Decoder => {
+                        ArchitectureGroupKind::Decoder => {
                             let arrays = working.remove(&index).unwrap_or_default();
                             self.stage.merge_placed_ingress_arrays(arrays)?;
                             self.stage.execute_placed_ingress(
@@ -6083,10 +6089,10 @@ impl PipelineModel {
                             )?;
                             self.stage.placed_ingress_arrays(&placed.id)?
                         }
-                        ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => {
+                        ArchitectureGroupKind::Projector | ArchitectureGroupKind::Merger => {
                             working.remove(&index).unwrap_or_default()
                         }
-                        ExecutionGroupKind::Prediction => Vec::new(),
+                        ArchitectureGroupKind::Prediction => Vec::new(),
                     };
                     let completion = DistributedCompletion::submit((), arrays.iter())?;
                     submissions.insert(index, (arrays.clone(), completion));

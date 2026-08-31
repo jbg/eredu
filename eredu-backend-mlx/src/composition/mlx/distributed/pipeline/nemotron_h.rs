@@ -288,7 +288,7 @@ fn execute_pipeline_cached_nemotron_h(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::composition::mlx::distributed::expert::execute_cached_nemotron_h(
+        crate::composition::mlx::distributed::expert::execute_cached_relu2(
             spec,
             global_layer,
             routes,
