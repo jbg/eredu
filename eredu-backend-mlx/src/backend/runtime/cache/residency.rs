@@ -2528,10 +2528,20 @@ impl CacheResidencyManager {
         let result = (|| {
             let records = {
                 let state = self.lock()?;
-                if let Some(id) = state.lifecycle.first_leased() {
-                    return Err(CacheLifecycleError::BlockLeased(id.clone()).into());
+                let owned_layers = descriptor.global_layer_start..descriptor.global_layer_end;
+                let mut records = Vec::new();
+                for record in state
+                    .blocks
+                    .values()
+                    .filter(|record| owned_layers.contains(&record.physical.id().global_layer))
+                {
+                    let id = record.physical.id();
+                    if state.lifecycle.is_leased(id)? {
+                        return Err(CacheLifecycleError::BlockLeased(id.clone()).into());
+                    }
+                    records.push(record.clone());
                 }
-                state.blocks.values().cloned().collect::<Vec<_>>()
+                records
             };
             let mut manifest_blocks = Vec::with_capacity(records.len());
             let mut manifest_state = Vec::with_capacity(state_arrays.len());
@@ -4048,6 +4058,73 @@ mod tests {
             topology: descriptor.topology,
             layer_layout: descriptor.layer_layout,
         }
+    }
+
+    #[test]
+    fn prompt_cache_save_selects_only_descriptor_owned_layers() {
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(1, 64, 64, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap();
+        let block_id = |global_layer| CacheBlockId {
+            session_id: manager.session_id,
+            global_layer,
+            representation: CacheRepresentation::KeyValue,
+            start: 0,
+            end: 1,
+            rank: None,
+        };
+        let prompt_host_block = || {
+            let arrays = CacheBlockArrays::KeyValue {
+                keys: Array::from_slice(&[0.0f32], &[1, 1, 1, 1]),
+                values: Array::from_slice(&[0.0f32], &[1, 1, 1, 1]),
+            };
+            HostCacheBlock::from_device_arrays(&arrays, &cpu_stream()).unwrap()
+        };
+        {
+            let mut state = manager.lock().unwrap();
+            for (global_layer, leases) in [(0, 0), (2, 1)] {
+                let id = block_id(global_layer);
+                insert_test_record(
+                    &mut state,
+                    CacheBlockRecord {
+                        physical: MlxCacheBlockStorage::host(id, prompt_host_block(), None),
+                        bytes: 8,
+                        shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
+                        dtypes: ["Float32".into(), "Float32".into()],
+                        imported: false,
+                    },
+                    false,
+                    leases,
+                );
+            }
+        }
+        let descriptor = PromptCacheDescriptor {
+            layer_count: 3,
+            ..prompt_descriptor()
+        };
+        let destination = tempfile::tempdir().unwrap();
+
+        let manifest = manager
+            .save_prompt_cache(
+                destination.path().join("target-only"),
+                descriptor,
+                &[7],
+                &[],
+                &PromptCacheOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            manifest
+                .blocks
+                .iter()
+                .map(|block| block.global_layer)
+                .collect::<Vec<_>>(),
+            [0]
+        );
     }
 
     const TEST_PROMPT_CACHE_GENERATION: &str = "generation-test";

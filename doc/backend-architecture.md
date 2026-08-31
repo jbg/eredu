@@ -689,7 +689,10 @@ stage. Required fixed components are persisted only on their architecture-owned
 global layer, even when their current value also travels in an auxiliary
 boundary for downstream execution. Prediction segments appear only on the
 partition that owns them; topology coordinates and family-wide layer counts do
-not synthesize additional cache coverage.
+not synthesize additional cache coverage. When target and prediction caches
+share a backend residency manager, prompt-cache persistence selects blocks by
+the descriptor's owned global-layer range; blocks for another segment remain
+live in the manager but do not enter that descriptor's manifest.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
