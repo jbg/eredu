@@ -853,16 +853,6 @@ impl QwenHybridModel {
     pub fn is_fully_resident(&self) -> bool {
         self.metadata.residency() == ExecutionResidency::FullyResident
     }
-    /// Rank-local cache policy.
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.state_layout.layers().clone())
-    }
-    /// Stable architecture fingerprint.
-    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
-        hybrid::prompt_cache_architecture_fingerprint(&self.parsed.text)
-    }
     /// Allocates the declared recurrent, convolution, KV, and MTP state.
     pub fn new_cache(&self) -> MlxHybridState {
         MlxHybridState::device(self.state_layout.clone()).expect("validated Qwen hybrid state")

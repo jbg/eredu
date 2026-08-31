@@ -480,16 +480,6 @@ impl QwenVlModel {
         self.metadata.residency() == ExecutionResidency::FullyResident
     }
 
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.state_layout.layers().clone())
-    }
-
-    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
-        vl::prompt_cache_architecture_fingerprint(&self.args)
-    }
-
     pub fn new_cache(&self) -> MlxHybridState {
         MlxHybridState::device(self.state_layout.clone()).expect("validated Qwen3-VL state layout")
     }

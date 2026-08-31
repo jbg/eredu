@@ -330,18 +330,6 @@ impl QwenModel {
         &self.args
     }
 
-    /// Returns the canonical cache-relevant architecture identity.
-    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
-        eredu_architectures::qwen::prompt_cache_architecture_fingerprint(self.args())
-    }
-
-    /// Returns this rank's exact prompt-cache state layout.
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.prompt_cache_model_identity()?.layer_layout)
-    }
-
     /// Returns whether all parameters use the eager execution-device engine.
     pub fn is_fully_resident(&self) -> bool {
         self.metadata.residency() == ExecutionResidency::FullyResident

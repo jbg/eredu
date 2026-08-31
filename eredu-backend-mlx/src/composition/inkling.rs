@@ -473,12 +473,6 @@ impl InklingModel {
         }
     }
 
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.state_layouts.composite().layers().clone())
-    }
-
     pub(crate) fn prompt_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
