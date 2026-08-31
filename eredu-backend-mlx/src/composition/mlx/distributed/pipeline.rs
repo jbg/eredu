@@ -29,7 +29,7 @@ mod placement;
 pub use eredu_runtime::ArchitectureGroupKind as ExecutionGroupKind;
 pub use placement::{
     ActiveParallelSubgroup, ExecutionGroupPlacementRequest, PlacedExecutionDag,
-    PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacementRoute, ResidencyBinding,
+    PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacementRoute,
 };
 
 use std::{
@@ -4955,11 +4955,7 @@ fn pipeline_encoder_telemetry_excludes_prediction_units() {
             first_owner_static_roles: Vec::new(),
             last_owner_static_roles: Vec::new(),
             merge_destination: None,
-            residency: ResidencyBinding {
-                unit_prefix: id.into(),
-                request_optional: false,
-            },
-            checkpoint_group: id.into(),
+            request_optional: false,
         }
     };
     let placement = PlacedExecutionDag::plan(
@@ -5946,7 +5942,10 @@ impl PipelineModel {
         }
         let mut lifecycle = eredu_runtime::LayeredPipelineSchedule::try_new(
             placement.semantic(),
-            placement.groups().iter().map(|placed| placed.kind),
+            placement
+                .groups()
+                .iter()
+                .map(|placed| (placed.kind, placed.request_optional)),
             |index| {
                 let placed = &placement.groups()[index];
                 self.stage.placed_ingress_active(&placed.id)
@@ -7260,11 +7259,7 @@ where
             first_owner_static_roles: transport.first_owner_static_roles,
             last_owner_static_roles: transport.last_owner_static_roles,
             merge_destination,
-            residency: ResidencyBinding {
-                unit_prefix: spec.id().into(),
-                request_optional: transport.request_optional,
-            },
-            checkpoint_group: spec.id().into(),
+            request_optional: transport.request_optional,
         });
     }
     let output = graph.groups()[graph.output()].id().to_owned();

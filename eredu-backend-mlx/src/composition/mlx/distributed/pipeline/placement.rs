@@ -1,9 +1,9 @@
 //! Architecture-neutral placement of pipeline execution-group DAGs.
 //!
 //! Semantic dependencies, physical PP ownership, Cartesian subgroup activity,
-//! payload contracts, static tensors, and checkpoint/residency bindings are
-//! validated before a weight store is opened. Routes are derived from group
-//! ownership and never from numeric pipeline adjacency.
+//! payload contracts, static tensors, and request activity are validated before
+//! a weight store is opened. Routes are derived from group ownership and never
+//! from numeric pipeline adjacency.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -61,15 +61,6 @@ pub struct StaticTensorOwnership {
     pub pp_rank: usize,
 }
 
-/// Residency identity attached to a placed group.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResidencyBinding {
-    /// Prefix used for offload units and telemetry.
-    pub unit_prefix: String,
-    /// Whether absent request media skips lease acquisition.
-    pub request_optional: bool,
-}
-
 /// Complete physical placement of one semantic execution group.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionGroupPlacement {
@@ -89,8 +80,8 @@ pub struct ExecutionGroupPlacement {
     pub static_tensors: Vec<StaticTensorOwnership>,
     /// PP coordinate responsible for the consumer merge.
     pub merge_destination: usize,
-    /// Residency binding.
-    pub residency: ResidencyBinding,
+    /// Whether request media may omit this root encoder group entirely.
+    pub request_optional: bool,
 }
 
 impl ExecutionGroupPlacement {
@@ -127,10 +118,8 @@ pub struct ExecutionGroupPlacementRequest {
     pub last_owner_static_roles: Vec<String>,
     /// Explicit merge coordinate; defaults to the terminal owner.
     pub merge_destination: Option<usize>,
-    /// Residency binding.
-    pub residency: ResidencyBinding,
-    /// Checkpoint binding group.
-    pub checkpoint_group: String,
+    /// Whether request media may omit this root encoder group entirely.
+    pub request_optional: bool,
 }
 
 /// Explicit topology-planned transfer between group owners.
@@ -246,7 +235,7 @@ impl PlacedExecutionDag {
                 active_subgroup: request.active_subgroup,
                 static_tensors,
                 merge_destination,
-                residency: request.residency,
+                request_optional: request.request_optional,
             });
         }
         let by_id = groups
@@ -968,11 +957,7 @@ mod tests {
             first_owner_static_roles: vec![format!("{id}.input")],
             last_owner_static_roles: vec![format!("{id}.output")],
             merge_destination: None,
-            residency: ResidencyBinding {
-                unit_prefix: id.into(),
-                request_optional: kind != ExecutionGroupKind::Decoder,
-            },
-            checkpoint_group: id.into(),
+            request_optional: kind != ExecutionGroupKind::Decoder,
         }
     }
 
@@ -1002,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn realizes_neutral_partition_without_absorbing_transport_or_residency() {
+    fn realizes_neutral_partition_without_absorbing_transport_policy() {
         #[derive(Debug, Clone, Eq, PartialEq)]
         struct Geometry(&'static str);
 
@@ -1068,10 +1053,7 @@ mod tests {
         assert_eq!(ingress.ownership().static_roles(), ["vision.input"]);
 
         assert_eq!(placed.unit_layout().group_range(0), Some(0..4));
-        assert_eq!(
-            placed.group("vision").unwrap().residency.unit_prefix,
-            "vision"
-        );
+        assert!(placed.group("vision").unwrap().request_optional);
         assert!(placed
             .routes()
             .iter()

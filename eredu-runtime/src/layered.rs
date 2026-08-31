@@ -112,11 +112,12 @@ pub enum ArchitectureGroupKind {
 
 /// Backend-neutral lifecycle for the pipeline ingress phase of a layered graph.
 ///
-/// Architectures declare semantic group kinds and concrete backends report only
-/// whether request-optional encoder roots have work. The runtime derives all
-/// downstream activity, admits dependency-ready compatible batches, and owns
-/// completion transitions. Pipeline backends therefore share the same graph
-/// lifecycle instead of reconstructing it around native streams and routes.
+/// Architectures declare semantic group kinds and request optionality while
+/// concrete backends report only whether optional encoder roots have work. The
+/// runtime derives all downstream activity, admits dependency-ready compatible
+/// batches, and owns completion transitions. Pipeline backends therefore share
+/// the same graph lifecycle instead of reconstructing it around native streams
+/// and routes.
 #[derive(Debug)]
 pub struct LayeredPipelineSchedule<'a> {
     graph: &'a ExecutionGraph,
@@ -126,32 +127,47 @@ pub struct LayeredPipelineSchedule<'a> {
 }
 
 impl<'a> LayeredPipelineSchedule<'a> {
-    /// Creates the pipeline ingress lifecycle from canonical architecture kinds.
+    /// Creates the pipeline ingress lifecycle from canonical architecture contracts.
     ///
-    /// `request_group_active` is called only for request-optional encoder roots.
-    /// Structural merge activity is derived from dependency activity, decoder
-    /// ingress and finalization always run, and prediction is a later phase.
+    /// Each contract pairs a group's semantic kind with its declared request
+    /// optionality. `request_group_active` is called only for optional encoder
+    /// roots. Mandatory encoders, decoder ingress, and finalization always run;
+    /// structural merge activity is derived from dependency activity; and
+    /// prediction is a later phase.
     pub fn try_new<E>(
         graph: &'a ExecutionGraph,
-        group_kinds: impl IntoIterator<Item = ArchitectureGroupKind>,
+        group_contracts: impl IntoIterator<Item = (ArchitectureGroupKind, bool)>,
         mut request_group_active: impl FnMut(usize) -> Result<bool, E>,
     ) -> Result<Self, E>
     where
         E: From<LayeredPipelineScheduleError>,
     {
-        let group_kinds = group_kinds.into_iter().collect::<Vec<_>>();
-        if group_kinds.len() != graph.groups().len() {
-            return Err(LayeredPipelineScheduleError::GroupKindCount {
+        let group_contracts = group_contracts.into_iter().collect::<Vec<_>>();
+        if group_contracts.len() != graph.groups().len() {
+            return Err(LayeredPipelineScheduleError::GroupContractCount {
                 graph: graph.groups().len(),
-                declared: group_kinds.len(),
+                declared: group_contracts.len(),
             }
             .into());
         }
-        let mut active = vec![false; group_kinds.len()];
+        let mut active = vec![false; group_contracts.len()];
         for &group in graph.execution_order() {
-            active[group] = match group_kinds[group] {
+            let (kind, request_optional) = group_contracts[group];
+            if request_optional
+                && (!matches!(
+                    kind,
+                    ArchitectureGroupKind::VisionEncoder | ArchitectureGroupKind::AudioEncoder
+                ) || !graph.groups()[group].dependencies().is_empty())
+            {
+                return Err(LayeredPipelineScheduleError::InvalidRequestOptionalGroup {
+                    group,
+                    kind,
+                }
+                .into());
+            }
+            active[group] = match kind {
                 ArchitectureGroupKind::VisionEncoder | ArchitectureGroupKind::AudioEncoder => {
-                    request_group_active(group)?
+                    !request_optional || request_group_active(group)?
                 }
                 ArchitectureGroupKind::Projector | ArchitectureGroupKind::Merger => graph
                     .dependencies(group)
@@ -231,15 +247,23 @@ impl<'a> LayeredPipelineSchedule<'a> {
 /// Invalid backend-neutral pipeline lifecycle declaration or transition.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum LayeredPipelineScheduleError {
-    /// The physical realization did not preserve one kind per canonical group.
+    /// The physical realization did not preserve one contract per canonical group.
     #[error(
-        "execution graph contains {graph} groups but the pipeline declared {declared} group kinds"
+        "execution graph contains {graph} groups but the pipeline declared {declared} group contracts"
     )]
-    GroupKindCount {
+    GroupContractCount {
         /// Number of canonical graph groups.
         graph: usize,
-        /// Number of supplied semantic kinds.
+        /// Number of supplied lifecycle contracts.
         declared: usize,
+    },
+    /// Request optionality was attached to a group which cannot consume request media directly.
+    #[error("execution group {group} of kind {kind:?} cannot be request-optional")]
+    InvalidRequestOptionalGroup {
+        /// Canonical architecture group slot.
+        group: usize,
+        /// Declared semantic group kind.
+        kind: ArchitectureGroupKind,
     },
     /// An ordinary execution-group lifecycle invariant failed.
     #[error(transparent)]
@@ -290,7 +314,7 @@ pub struct ArchitectureGroupTransport {
     pub merge_destination: ArchitectureMergeDestination,
     /// Optional active Cartesian subgroup contract.
     pub parallel_subgroup: Option<ArchitectureParallelSubgroup>,
-    /// Whether request data may omit the group entirely.
+    /// Whether request media may omit this root encoder group entirely.
     pub request_optional: bool,
 }
 
@@ -2570,16 +2594,16 @@ mod tests {
     #[test]
     fn pipeline_schedule_owns_activity_propagation_and_ready_batches() {
         let graph = pipeline_graph();
-        let kinds = [
-            ArchitectureGroupKind::VisionEncoder,
-            ArchitectureGroupKind::AudioEncoder,
-            ArchitectureGroupKind::Projector,
-            ArchitectureGroupKind::Merger,
-            ArchitectureGroupKind::Decoder,
-            ArchitectureGroupKind::Prediction,
+        let contracts = [
+            (ArchitectureGroupKind::VisionEncoder, true),
+            (ArchitectureGroupKind::AudioEncoder, true),
+            (ArchitectureGroupKind::Projector, false),
+            (ArchitectureGroupKind::Merger, false),
+            (ArchitectureGroupKind::Decoder, false),
+            (ArchitectureGroupKind::Prediction, false),
         ];
         let mut queried = Vec::new();
-        let mut schedule = LayeredPipelineSchedule::try_new(&graph, kinds, |group| {
+        let mut schedule = LayeredPipelineSchedule::try_new(&graph, contracts, |group| {
             queried.push(group);
             Ok::<_, LayeredPipelineScheduleError>(group == 0)
         })
@@ -2603,28 +2627,29 @@ mod tests {
     #[test]
     fn pipeline_schedule_rejects_kind_and_transition_drift() {
         let graph = pipeline_graph();
-        let error =
-            LayeredPipelineSchedule::try_new(&graph, [ArchitectureGroupKind::Decoder], |_| {
-                Ok::<_, LayeredPipelineScheduleError>(true)
-            })
-            .unwrap_err();
+        let error = LayeredPipelineSchedule::try_new(
+            &graph,
+            [(ArchitectureGroupKind::Decoder, false)],
+            |_| Ok::<_, LayeredPipelineScheduleError>(true),
+        )
+        .unwrap_err();
         assert_eq!(
             error,
-            LayeredPipelineScheduleError::GroupKindCount {
+            LayeredPipelineScheduleError::GroupContractCount {
                 graph: 6,
                 declared: 1,
             }
         );
 
-        let kinds = [
-            ArchitectureGroupKind::VisionEncoder,
-            ArchitectureGroupKind::AudioEncoder,
-            ArchitectureGroupKind::Projector,
-            ArchitectureGroupKind::Merger,
-            ArchitectureGroupKind::Decoder,
-            ArchitectureGroupKind::Prediction,
+        let contracts = [
+            (ArchitectureGroupKind::VisionEncoder, true),
+            (ArchitectureGroupKind::AudioEncoder, true),
+            (ArchitectureGroupKind::Projector, false),
+            (ArchitectureGroupKind::Merger, false),
+            (ArchitectureGroupKind::Decoder, false),
+            (ArchitectureGroupKind::Prediction, false),
         ];
-        let mut schedule = LayeredPipelineSchedule::try_new(&graph, kinds, |_| {
+        let mut schedule = LayeredPipelineSchedule::try_new(&graph, contracts, |_| {
             Ok::<_, LayeredPipelineScheduleError>(true)
         })
         .unwrap();
@@ -2633,6 +2658,52 @@ mod tests {
             Err(LayeredPipelineScheduleError::Transition(
                 ExecutionScheduleError::DependenciesPending { group: 2 }
             ))
+        );
+    }
+
+    #[test]
+    fn pipeline_schedule_consumes_declared_request_optionality() {
+        let graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("mandatory_vision"),
+                ExecutionGroupSpec::root("optional_audio"),
+                ExecutionGroupSpec::with_dependencies(
+                    "decoder",
+                    ["mandatory_vision", "optional_audio"],
+                ),
+            ],
+            "decoder",
+        )
+        .unwrap();
+        let contracts = [
+            (ArchitectureGroupKind::VisionEncoder, false),
+            (ArchitectureGroupKind::AudioEncoder, true),
+            (ArchitectureGroupKind::Decoder, false),
+        ];
+        let mut queried = Vec::new();
+        let schedule = LayeredPipelineSchedule::try_new(&graph, contracts, |group| {
+            queried.push(group);
+            Ok::<_, LayeredPipelineScheduleError>(false)
+        })
+        .unwrap();
+
+        assert_eq!(queried, [1]);
+        assert_eq!(schedule.activity(), [true, false, true]);
+
+        let invalid = [
+            (ArchitectureGroupKind::VisionEncoder, false),
+            (ArchitectureGroupKind::AudioEncoder, false),
+            (ArchitectureGroupKind::Decoder, true),
+        ];
+        assert_eq!(
+            LayeredPipelineSchedule::try_new(&graph, invalid, |_| {
+                Ok::<_, LayeredPipelineScheduleError>(true)
+            })
+            .unwrap_err(),
+            LayeredPipelineScheduleError::InvalidRequestOptionalGroup {
+                group: 2,
+                kind: ArchitectureGroupKind::Decoder,
+            }
         );
     }
 }

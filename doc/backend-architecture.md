@@ -214,14 +214,16 @@ generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
 Execution-group transport is also architecture policy. The runtime defines the
-neutral placement, semantic-kind, merge-destination, and parallel-subgroup data
-types, but every `LayeredArchitecture` must declare the transport for each of
-its groups. Shared decoder defaults live in `eredu-architectures`; the runtime
-does not assign decoder roles or placement to an unspecified group. Composite
-families may declare different policies per group. In particular, Moshi places
-its temporal decoder across the pipeline with the pinned embedding and output
-modules, while its ordered depth predictions run on the output owner and own no
-pinned static roles.
+neutral placement, semantic-kind, merge-destination, parallel-subgroup, and
+request-optionality data types, but every `LayeredArchitecture` must declare the
+transport for each of its groups. Request optionality applies only to root media
+encoders; the neutral pipeline lifecycle rejects it on structural, decoder, or
+prediction groups. Shared decoder defaults live in `eredu-architectures`; the
+runtime does not assign decoder roles or placement to an unspecified group.
+Composite families may declare different policies per group. In particular,
+Moshi places its temporal decoder across the pipeline with the pinned embedding
+and output modules, while its ordered depth predictions run on the output owner
+and own no pinned static roles.
 
 Mutable-state partitioning is a separate architecture declaration over the
 complete `StateLayout`. Every layered architecture publishes an
@@ -1202,12 +1204,13 @@ prediction groups have distinct semantic kinds, so multimodal ingress ends at
 the decoder boundary and prediction runs only in its explicit phase.
 
 Pipeline ingress uses the same canonical execution graph through
-`LayeredPipelineSchedule`. The neutral runtime derives request activity from
-architecture-authored group kinds, propagates it through merge dependencies,
-admits compatible ready batches, and owns group completion transitions.
-Concrete backends report only whether optional encoder roots have request work
-and realize streams, residency, payload transport, and collectives; they do not
-maintain a second group-kind model or reinterpret the graph lifecycle.
+`LayeredPipelineSchedule`. The neutral runtime consumes both architecture-authored
+group kinds and request optionality, queries request work only for declared
+optional encoder roots, propagates activity through merge dependencies, admits
+compatible ready batches, and owns group completion transitions. Concrete
+backends retain that resolved optionality with physical placement and realize
+streams, residency, payload transport, and collectives; they do not infer
+optionality from backend-local kinds or maintain a second graph lifecycle.
 
 The partition also carries an architecture-owned boundary schema. That schema
 declares the primary evolving activation and every auxiliary tensor, including
