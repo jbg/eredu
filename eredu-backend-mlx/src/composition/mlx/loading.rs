@@ -18,8 +18,8 @@ use crate::{
 };
 
 use super::realization::{
-    CompleteTensorParallelBinding as TensorParallelBinding, ExpertCacheBinding, FamilyBinding,
-    FamilyRealization, ParallelRealization,
+    requires_distributed_stage, CompleteTensorParallelBinding as TensorParallelBinding,
+    ExpertCacheBinding, FamilyBinding, FixedGgufBinding, GgufBinding, QuantizedGgufBinding,
 };
 
 /// MLX arrays, modules, and media preprocessing from one GGUF artifact.
@@ -55,17 +55,16 @@ fn materialize_gguf_model(
 ) -> Result<Executable, Error> {
     let kind = source.architecture().model_kind();
     let quantization = options.weight_quantization()?;
-    let realization = FamilyRealization::for_kind(kind);
-    if !realization.supports_gguf() {
-        return Err(Error::ArchitectureModel(format!(
+    let binding = GgufBinding::for_kind(kind).ok_or_else(|| {
+        Error::ArchitectureModel(format!(
             "MLX has no GGUF realization for {}",
             kind.canonical_name()
-        )));
-    }
+        ))
+    })?;
     validate_gguf_projector_requirement(source.architecture(), projector.is_some())?;
     structural::validate_complete_gguf_quantization(kind, quantization.is_some())?;
-    let model = match realization.binding() {
-        FamilyBinding::KimiLinear => {
+    let model = match binding {
+        GgufBinding::Quantized(QuantizedGgufBinding::KimiLinear) => {
             let loaded = crate::composition::kimi_linear::load_kimi_linear_gguf_model(
                 source,
                 options.weight_residency,
@@ -75,7 +74,7 @@ fn materialize_gguf_model(
             )?;
             Executable::kimi_linear(kind, loaded)?
         }
-        FamilyBinding::DeepSeekV3 => {
+        GgufBinding::Fixed(FixedGgufBinding::DeepSeekV3) => {
             let loaded = crate::composition::deepseek::load_gguf(
                 source,
                 options.weight_residency,
@@ -84,7 +83,7 @@ fn materialize_gguf_model(
             )?;
             Executable::deepseek(kind, Box::new(loaded))?
         }
-        FamilyBinding::DeepSeekV4 => {
+        GgufBinding::Fixed(FixedGgufBinding::DeepSeekV4) => {
             let loaded = crate::composition::deepseek::load_gguf(
                 source,
                 options.weight_residency,
@@ -93,7 +92,7 @@ fn materialize_gguf_model(
             )?;
             Executable::deepseek(kind, Box::new(loaded))?
         }
-        FamilyBinding::GptOss => {
+        GgufBinding::Quantized(QuantizedGgufBinding::GptOss) => {
             let loaded = crate::composition::gpt_oss::load_gpt_oss_gguf_model(
                 source,
                 options.weight_residency,
@@ -103,7 +102,7 @@ fn materialize_gguf_model(
             )?;
             Executable::gpt_oss(kind, loaded)?
         }
-        FamilyBinding::Inkling => {
+        GgufBinding::Fixed(FixedGgufBinding::Inkling) => {
             let loaded = crate::composition::inkling::load_gguf(
                 source,
                 projector,
@@ -113,7 +112,7 @@ fn materialize_gguf_model(
             )?;
             Executable::inkling(kind, loaded)?
         }
-        FamilyBinding::Gemma4 => {
+        GgufBinding::Fixed(FixedGgufBinding::Gemma4) => {
             let loaded = crate::composition::gemma4::load_gguf(
                 source,
                 projector,
@@ -123,7 +122,7 @@ fn materialize_gguf_model(
             )?;
             Executable::gemma4(kind, loaded)?
         }
-        FamilyBinding::Llama => {
+        GgufBinding::Quantized(QuantizedGgufBinding::Llama) => {
             let loaded = crate::composition::llama::load_llama_gguf_model(
                 source,
                 options.weight_residency,
@@ -133,7 +132,7 @@ fn materialize_gguf_model(
             )?;
             Executable::llama(kind, loaded)?
         }
-        FamilyBinding::MuseGlimmer => {
+        GgufBinding::Fixed(FixedGgufBinding::MuseGlimmer) => {
             let loaded = crate::composition::muse_glimmer::load_gguf(
                 source,
                 projector,
@@ -143,7 +142,7 @@ fn materialize_gguf_model(
             )?;
             Executable::muse_glimmer(kind, loaded)?
         }
-        FamilyBinding::Lfm2 => {
+        GgufBinding::Quantized(QuantizedGgufBinding::Lfm2) => {
             let loaded = crate::composition::lfm2::load_lfm2_gguf_model(
                 source,
                 options.weight_residency,
@@ -153,7 +152,7 @@ fn materialize_gguf_model(
             )?;
             Executable::lfm2(kind, loaded)?
         }
-        FamilyBinding::NemotronH => {
+        GgufBinding::Quantized(QuantizedGgufBinding::NemotronH) => {
             let loaded = crate::composition::nemotron_h::load_nemotron_h_gguf_model(
                 source,
                 options.weight_residency,
@@ -163,7 +162,7 @@ fn materialize_gguf_model(
             )?;
             Executable::nemotron_h(kind, loaded)?
         }
-        FamilyBinding::Qwen => {
+        GgufBinding::Quantized(QuantizedGgufBinding::Qwen) => {
             let loaded = crate::composition::qwen::load_qwen_gguf_model(
                 source,
                 options.weight_residency,
@@ -173,7 +172,9 @@ fn materialize_gguf_model(
             )?;
             Executable::qwen(kind, loaded)?
         }
-        binding @ (FamilyBinding::Qwen3Vl | FamilyBinding::Qwen3VlMoe) => {
+        GgufBinding::Quantized(
+            binding @ (QuantizedGgufBinding::Qwen3Vl | QuantizedGgufBinding::Qwen3VlMoe),
+        ) => {
             let projector = projector.expect("required GGUF projector was validated above");
             let loaded = crate::composition::qwen::vl::load_gguf(
                 source,
@@ -184,12 +185,14 @@ fn materialize_gguf_model(
                 weights_stream,
             )?;
             match binding {
-                FamilyBinding::Qwen3Vl => Executable::qwen3_vl(kind, loaded)?,
-                FamilyBinding::Qwen3VlMoe => Executable::qwen3_vl_moe(kind, loaded)?,
+                QuantizedGgufBinding::Qwen3Vl => Executable::qwen3_vl(kind, loaded)?,
+                QuantizedGgufBinding::Qwen3VlMoe => Executable::qwen3_vl_moe(kind, loaded)?,
                 _ => unreachable!(),
             }
         }
-        binding @ (FamilyBinding::Qwen35 | FamilyBinding::Qwen3Next) => {
+        GgufBinding::Quantized(
+            binding @ (QuantizedGgufBinding::Qwen35 | QuantizedGgufBinding::Qwen3Next),
+        ) => {
             let loaded = crate::composition::qwen::hybrid::load_gguf(
                 source,
                 projector,
@@ -199,15 +202,10 @@ fn materialize_gguf_model(
                 weights_stream,
             )?;
             match binding {
-                FamilyBinding::Qwen35 => Executable::qwen35(kind, loaded)?,
-                FamilyBinding::Qwen3Next => Executable::qwen3_next(kind, loaded)?,
+                QuantizedGgufBinding::Qwen35 => Executable::qwen35(kind, loaded)?,
+                QuantizedGgufBinding::Qwen3Next => Executable::qwen3_next(kind, loaded)?,
                 _ => unreachable!(),
             }
-        }
-        FamilyBinding::MoshiRealtime => {
-            return Err(Error::ArchitectureModel(
-                "Moshi-family models have no GGUF realization".into(),
-            ));
         }
     };
     Ok(model)
@@ -226,7 +224,7 @@ pub fn materialize_model_plan(
         .filter(|topology| !topology.is_replicated())
     {
         let kind = prepared_model_kind(plan.inspection().architecture_plan());
-        if FamilyRealization::for_kind(kind).requires_distributed_stage(topology.topology()) {
+        if requires_distributed_stage(kind, topology.topology()) {
             #[cfg(any(feature = "image", feature = "audio"))]
             let processor = ModelProcessor::from_plan(plan.inspection().architecture_plan());
             let model =
@@ -350,7 +348,7 @@ mod floating_state_dtype_tests {
         reject_complete_tensor_parallel_quantization,
     };
     use crate::backend::{DeviceAssignment, MlxParallelContext};
-    use crate::composition::mlx::realization::FamilyRealization;
+    use crate::composition::mlx::realization::requires_distributed_stage;
     use eredu_architectures::ModelKind;
     use eredu_checkpoint::WeightQuantization;
     use eredu_core::checkpoint::TensorDtype;
@@ -409,9 +407,7 @@ mod floating_state_dtype_tests {
             MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         for kind in [ModelKind::DeepSeekV3, ModelKind::DeepSeekV4] {
-            assert!(
-                FamilyRealization::for_kind(kind).requires_distributed_stage(topology.topology())
-            );
+            assert!(requires_distributed_stage(kind, topology.topology()));
         }
     }
 
@@ -441,12 +437,12 @@ mod floating_state_dtype_tests {
             ModelKind::Qwen3Vl,
             ModelKind::Qwen3VlMoe,
         ] {
-            assert!(
-                FamilyRealization::for_kind(kind).requires_distributed_stage(topology.topology())
-            );
+            assert!(requires_distributed_stage(kind, topology.topology()));
         }
-        assert!(!FamilyRealization::for_kind(ModelKind::Qwen3)
-            .requires_distributed_stage(topology.topology()));
+        assert!(!requires_distributed_stage(
+            ModelKind::Qwen3,
+            topology.topology()
+        ));
     }
 
     #[test]
@@ -454,8 +450,10 @@ mod floating_state_dtype_tests {
         let topology =
             MlxParallelContext::for_rank(0, 1, 1, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
-        assert!(FamilyRealization::for_kind(ModelKind::Llama)
-            .requires_distributed_stage(topology.topology()));
+        assert!(requires_distributed_stage(
+            ModelKind::Llama,
+            topology.topology()
+        ));
     }
 
     #[cfg(feature = "image")]
@@ -628,21 +626,19 @@ fn materialize_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = artifact.architecture().model_kind();
-    let binding = match FamilyRealization::for_kind(kind).tensor_parallel() {
-        ParallelRealization::Complete(binding) => binding,
-        ParallelRealization::DistributedStage => {
-            return Err(Error::ArchitectureModel(format!(
+    let binding = TensorParallelBinding::for_kind(kind).ok_or_else(|| {
+        if FamilyBinding::for_kind(kind).is_some() {
+            Error::ArchitectureModel(format!(
                 "distributed-stage-only {} reached complete tensor-parallel materialization",
                 kind.canonical_name()
-            )));
-        }
-        ParallelRealization::Unavailable => {
-            return Err(Error::ArchitectureModel(format!(
+            ))
+        } else {
+            Error::ArchitectureModel(format!(
                 "MLX has no tensor-parallel model realization for {}",
                 kind.canonical_name()
-            )));
+            ))
         }
-    };
+    })?;
     let topology = options.parallel_topology().ok_or_else(|| {
         Error::Parallel("tensor-parallel materialization requires a topology".into())
     })?;
@@ -847,21 +843,19 @@ fn materialize_gguf_tensor_parallel(
 ) -> Result<Executable, Error> {
     let architecture = source.architecture();
     let kind = architecture.model_kind();
-    let binding = match FamilyRealization::for_kind(kind).tensor_parallel() {
-        ParallelRealization::Complete(binding) => binding,
-        ParallelRealization::DistributedStage => {
-            return Err(Error::ArchitectureModel(format!(
+    let binding = TensorParallelBinding::for_kind(kind).ok_or_else(|| {
+        if FamilyBinding::for_kind(kind).is_some() {
+            Error::ArchitectureModel(format!(
                 "distributed-stage-only {} reached complete GGUF tensor-parallel materialization",
                 architecture.metadata_name()
-            )));
-        }
-        ParallelRealization::Unavailable => {
-            return Err(Error::ArchitectureModel(format!(
+            ))
+        } else {
+            Error::ArchitectureModel(format!(
                 "MLX has no tensor-parallel GGUF realization for {}",
                 architecture.metadata_name()
-            )));
+            ))
         }
-    };
+    })?;
     let topology = options.parallel_topology().ok_or_else(|| {
         Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
     })?;
@@ -1038,8 +1032,7 @@ pub(super) fn materialize_safetensors(
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),
     ) {
-        let binding = FamilyRealization::for_kind(kind)
-            .expert_cache()
+        let binding = ExpertCacheBinding::for_kind(kind)
             .ok_or_else(|| Error::ArchitectureModel(format!(
                 "independent expert caching is unavailable for the normalized {} architecture on MLX",
                 kind.canonical_name()
@@ -1171,7 +1164,13 @@ pub(super) fn materialize_safetensors(
     if let Some(quantization) = quantization {
         quantization.validate()?;
     }
-    match FamilyRealization::for_kind(kind).binding() {
+    let binding = FamilyBinding::for_kind(kind).ok_or_else(|| {
+        Error::ArchitectureModel(format!(
+            "{} bounded layer residency is selected through another loading protocol",
+            kind.canonical_name()
+        ))
+    })?;
+    match binding {
         FamilyBinding::DeepSeekV3 | FamilyBinding::DeepSeekV4 => Ok(Executable::deepseek(
             kind,
             Box::new(crate::composition::deepseek::load_safetensors(
@@ -1312,8 +1311,5 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::MoshiRealtime => Err(Error::ArchitectureModel(
-            "Moshi-family bounded layer residency is selected through the realtime loader".into(),
-        )),
     }
 }

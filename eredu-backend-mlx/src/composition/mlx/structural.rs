@@ -9,7 +9,9 @@ use serde_json::Value;
 
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
-use super::realization::FamilyRealization;
+use super::realization::{
+    requires_distributed_stage, ExpertCacheBinding, FamilyBinding, GgufBinding,
+};
 #[cfg(test)]
 use super::ModelLoadOptions;
 use crate::backend::error::Error;
@@ -115,7 +117,7 @@ pub(crate) fn validate_complete_gguf_quantization(
     kind: ModelKind,
     requested: bool,
 ) -> Result<(), Error> {
-    if !requested || FamilyRealization::for_kind(kind).supports_complete_gguf_quantization() {
+    if !requested || GgufBinding::for_kind(kind).is_some_and(GgufBinding::accepts_quantization) {
         return Ok(());
     }
     Err(Error::Artifact(
@@ -136,7 +138,7 @@ fn validate_quantization_capability(
         return Ok(());
     }
     if let Some(topology) = policy.topology.filter(|topology| !topology.is_replicated()) {
-        if FamilyRealization::for_kind(kind).requires_distributed_stage(topology) {
+        if requires_distributed_stage(kind, topology) {
             return Ok(());
         }
         return Err(Error::Artifact(
@@ -149,7 +151,7 @@ fn validate_quantization_capability(
     if format == eredu_core::ArtifactFormat::Gguf {
         return validate_complete_gguf_quantization(kind, true);
     }
-    let supported = FamilyRealization::for_kind(kind).supports_safetensors_quantization()
+    let supported = FamilyBinding::for_kind(kind).is_some()
         && (policy.residency == eredu_core::ResidencyRequest::FullyResident
             || capabilities.nonresident_safetensors_quantization());
     if supported {
@@ -169,7 +171,7 @@ fn validate_expert_cache_capability(
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
     if capabilities.independently_addressable_experts()
-        && FamilyRealization::for_kind(kind).supports_expert_cache()
+        && ExpertCacheBinding::for_kind(kind).is_some()
     {
         return Ok(());
     }

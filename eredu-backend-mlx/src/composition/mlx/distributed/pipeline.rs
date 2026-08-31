@@ -46,7 +46,7 @@ use eredu_core::cache::{
 };
 use safemlx::{error::Exception, Array, Dtype, Stream};
 
-use crate::composition::mlx::realization::{FamilyBinding, FamilyRealization};
+use crate::composition::mlx::realization::FamilyBinding;
 use crate::{
     backend::error::Error,
     backend::nn::{
@@ -8963,7 +8963,12 @@ pub fn load_pipeline_model_with_options(
                 "GGUF",
                 architecture.metadata_name(),
             )?;
-            let binding = FamilyRealization::for_kind(architecture.model_kind()).binding();
+            let binding = FamilyBinding::for_kind(architecture.model_kind()).ok_or_else(|| {
+                Error::ArchitectureModel(format!(
+                    "MLX has no GGUF decoder-pipeline realization for {}",
+                    architecture.model_kind().canonical_name()
+                ))
+            })?;
             return match binding {
                 FamilyBinding::DeepSeekV4 => {
                     let eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) =
@@ -9259,9 +9264,6 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                FamilyBinding::MoshiRealtime => Err(Error::ArchitectureModel(
-                    "Moshi-family models have no GGUF decoder-pipeline realization".into(),
-                )),
             };
         }
         ModelArtifact::SafeTensors {

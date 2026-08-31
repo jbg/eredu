@@ -946,6 +946,15 @@ Artifact loading has four stages:
 4. The selected backend materializes the plan into its executable model and
    creates a stateful session.
 
+Concrete backend preflight must derive family support from the typed bindings
+consumed by its materializers, not from a parallel boolean capability table.
+For MLX, ordinary family, GGUF, complete tensor-parallel, and expert-cache
+bindings are the dispatch authority. Complete-model GGUF load-time
+quantization is encoded in the GGUF route itself, so preflight and that loader
+cannot disagree about whether a quantization policy is accepted. Families
+handled by a distinct protocol, such as realtime Moshi, have no ordinary
+decoder binding.
+
 For GGUF artifacts, `ArtifactInspection::validated_gguf` is the authoritative
 handoff from stage 1. Core validates format-generic tensor-count, required
 metadata, and embedding floors using the submitted metadata prefix. The
