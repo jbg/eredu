@@ -24,7 +24,7 @@ use eredu_gguf::Checkpoint;
 
 let checkpoint = Checkpoint::open("model-00001-of-00004.gguf")?;
 checkpoint.for_each_converted_tensor(|tensor| {
-    println!("{}", tensor.descriptor().name);
+    println!("{} -> {:?}", tensor.descriptor().name, tensor.output_names());
     Ok(())
 })?;
 # Ok::<(), eredu_gguf::Error>(())
@@ -42,6 +42,9 @@ nonlinear codebooks cannot be represented as affine weights, scales, and
 biases. Backends that execute those packed blocks directly obtain the canonical
 typed values through `IQuantCodebook`; the generated table modules are private
 implementation details. MXFP4-MoE type 39 is likewise represented explicitly.
+Materialized tensor groups carry the logical output names established by the
+validated catalog, so consumers do not reconstruct affine or MXFP4 companion
+names from the physical tensor name.
 
 Names such as `UD-Q2_K_XL` describe file-level mixed-precision recipes, not new
 tensor encodings. A recipe is compatible when every tensor in the file uses a

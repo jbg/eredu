@@ -137,6 +137,7 @@ pub struct ConvertedCheckpointTensor {
     shard_index: usize,
     tensor_index: usize,
     descriptor: TensorDescriptor,
+    output_names: Vec<String>,
     converted: ConvertedTensor,
 }
 
@@ -202,6 +203,11 @@ impl ConvertedCheckpointTensor {
         &self.descriptor
     }
 
+    /// Catalog-owned logical names in the same order as the converted outputs.
+    pub fn output_names(&self) -> &[String] {
+        &self.output_names
+    }
+
     /// Converted dense tensor or atomic affine tensor group.
     pub fn converted(&self) -> &ConvertedTensor {
         &self.converted
@@ -210,6 +216,12 @@ impl ConvertedCheckpointTensor {
     /// Consume the item and return its converted tensor group.
     pub fn into_converted(self) -> ConvertedTensor {
         self.converted
+    }
+
+    /// Consume the item into its physical descriptor, logical output names,
+    /// and converted tensor group.
+    pub fn into_parts(self) -> (TensorDescriptor, Vec<String>, ConvertedTensor) {
+        (self.descriptor, self.output_names, self.converted)
     }
 }
 
@@ -575,9 +587,18 @@ impl TensorMaterializer {
         ))
     }
 
+    fn catalog_output_names(&self, location: TensorLocation) -> Vec<String> {
+        self.checkpoint.shards[location.shard_index].tensors[location.tensor_index]
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect()
+    }
+
     /// Materialize one physical tensor by its GGUF name.
     pub fn converted_tensor(&mut self, name: &str) -> Result<ConvertedCheckpointTensor> {
         let (location, descriptor, _) = self.location_and_reader(name)?;
+        let output_names = self.catalog_output_names(location);
         let converted = self
             .reader
             .as_mut()
@@ -592,6 +613,7 @@ impl TensorMaterializer {
             shard_index: location.shard_index,
             tensor_index: location.tensor_index,
             descriptor,
+            output_names,
             converted,
         })
     }
@@ -603,6 +625,7 @@ impl TensorMaterializer {
         selection: &TensorSelection,
     ) -> Result<ConvertedCheckpointTensor> {
         let (location, mut descriptor, _) = self.location_and_reader(name)?;
+        let output_names = self.catalog_output_names(location);
         let plan = TensorSelectionPlan::new(&descriptor, selection.clone())?;
         let converted = self
             .reader
@@ -619,6 +642,7 @@ impl TensorMaterializer {
             shard_index: location.shard_index,
             tensor_index: location.tensor_index,
             descriptor,
+            output_names,
             converted,
         })
     }
@@ -630,6 +654,7 @@ impl TensorMaterializer {
         selection: &DenseTensorSpan,
     ) -> Result<ConvertedCheckpointTensor> {
         let (location, descriptor, _) = self.location_and_reader(name)?;
+        let output_names = self.catalog_output_names(location);
         let plan = DenseTensorSpanPlan::new(&descriptor, selection.clone())?;
         let converted = self
             .reader
@@ -645,6 +670,7 @@ impl TensorMaterializer {
             shard_index: location.shard_index,
             tensor_index: location.tensor_index,
             descriptor: plan.selected_descriptor().clone(),
+            output_names,
             converted,
         })
     }
@@ -703,7 +729,13 @@ impl Iterator for ConvertedTensorIter<'_> {
             }
 
             let tensor_index = self.tensor_index;
-            let descriptor = shard.tensors[tensor_index].descriptor.clone();
+            let catalog_tensor = &shard.tensors[tensor_index];
+            let descriptor = catalog_tensor.descriptor.clone();
+            let output_names = catalog_tensor
+                .outputs
+                .iter()
+                .map(|output| output.name.clone())
+                .collect();
             self.tensor_index += 1;
             let converted = self
                 .reader
@@ -718,6 +750,7 @@ impl Iterator for ConvertedTensorIter<'_> {
                 shard_index: self.shard_index,
                 tensor_index,
                 descriptor,
+                output_names,
                 converted,
             }));
         }

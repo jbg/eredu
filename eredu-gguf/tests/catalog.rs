@@ -191,6 +191,11 @@ fn selects_affine_outer_rows_equal_to_slicing_the_converted_group() {
             },
         )
         .unwrap();
+    assert_eq!(
+        full.output_names(),
+        ["experts.weight", "experts.scales", "experts.biases"]
+    );
+    assert_eq!(selected.output_names(), full.output_names());
     let ConvertedTensor::Affine(full) = full.converted() else {
         panic!("expected affine tensor");
     };
@@ -818,12 +823,17 @@ fn streams_one_physical_tensor_group_at_a_time_across_shards() {
     assert_eq!(packed.shard_index(), 0);
     assert_eq!(packed.tensor_index(), 0);
     assert_eq!(packed.descriptor().name, "packed.weight");
+    assert_eq!(
+        packed.output_names(),
+        ["packed.weight", "packed.scales", "packed.biases"]
+    );
     assert!(matches!(packed.converted(), ConvertedTensor::Affine(_)));
 
     let dense = tensors.next().unwrap().unwrap();
     assert_eq!(dense.shard_index(), 1);
     assert_eq!(dense.tensor_index(), 0);
     assert_eq!(dense.descriptor().name, "dense.weight");
+    assert_eq!(dense.output_names(), ["dense.weight"]);
     assert!(matches!(dense.converted(), ConvertedTensor::Dense(_)));
     assert!(tensors.next().is_none());
 }
@@ -903,6 +913,7 @@ fn indexed_materializer_reuses_the_open_shard_reader() {
     let tensor = materializer.converted_tensor("second.weight").unwrap();
     assert_eq!(tensor.tensor_index(), 1);
     assert_eq!(tensor.descriptor().name, "second.weight");
+    assert_eq!(tensor.output_names(), ["second.weight"]);
     let ConvertedTensor::Dense(dense) = tensor.converted() else {
         panic!("expected a dense tensor");
     };

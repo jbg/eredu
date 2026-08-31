@@ -813,7 +813,10 @@ family geometry and the checkpoint schema, while GGUF plans retain the exact
 checkpoint schema. GGUF plans also retain the complete canonical mapping from
 each physical tensor output to its logical parameter name. Translation and
 collision detection therefore happen once during architecture admission; they
-are not family-dispatched again during backend materialization. Core keeps the
+are not family-dispatched again during backend materialization. Portable GGUF
+materialized groups likewise carry the logical output identities from their
+validated container catalog; concrete backends consume those names and do not
+reconstruct quantization companion suffixes from physical names. Core keeps the
 corresponding `ValidatedGguf` proof intact inside `ModelArtifact` until the
 selected backend consumes it; materializers do
 not downgrade that proof to an unvalidated checkpoint handle and rerun the

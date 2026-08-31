@@ -448,9 +448,10 @@ fn convert_tensor(
     tensor: eredu_gguf::ConvertedCheckpointTensor,
     host_owned: bool,
 ) -> Result<GgufTensor, IoError> {
-    let descriptor = tensor.descriptor().clone();
-    match tensor.into_converted() {
+    let (descriptor, output_names, converted) = tensor.into_parts();
+    match converted {
         eredu_gguf::ConvertedTensor::Dense(dense) => {
+            let [name] = converted_output_names(&descriptor.name, output_names)?;
             let shape = mlx_shape_i32(&descriptor.name, &dense.shape)?;
             let dtype = match dense.dtype {
                 eredu_gguf::DenseDtype::F32 => Dtype::Float32,
@@ -463,12 +464,10 @@ fn convert_tensor(
                 eredu_gguf::DenseDtype::F64 => Dtype::Float64,
             };
             let array = array_from_owned_data(dense.data, &shape, dtype, host_owned)?;
-            Ok(GgufTensor::Dense(GgufArray {
-                name: descriptor.name,
-                array,
-            }))
+            Ok(GgufTensor::Dense(GgufArray { name, array }))
         }
         eredu_gguf::ConvertedTensor::IQuant(iquant) => {
+            let [name] = converted_output_names(&descriptor.name, output_names)?;
             let packed_shape = mlx_shape_i32(
                 &descriptor.name,
                 &iquant.packed_shape().map_err(gguf_error)?,
@@ -481,13 +480,12 @@ fn convert_tensor(
                 ggml_type: iquant.ggml_type,
                 endian: iquant.endian,
                 logical_shape,
-                packed: GgufArray {
-                    name: descriptor.name,
-                    array,
-                },
+                packed: GgufArray { name, array },
             }))
         }
         eredu_gguf::ConvertedTensor::Affine(affine) => {
+            let [weight_name, scales_name, biases_name] =
+                converted_output_names(&descriptor.name, output_names)?;
             let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
             let weight =
@@ -496,64 +494,58 @@ fn convert_tensor(
                 array_from_owned_data(affine.scales, &scale_shape, Dtype::Float16, host_owned)?;
             let biases =
                 array_from_owned_data(affine.biases, &scale_shape, Dtype::Float16, host_owned)?;
-            let prefix = descriptor
-                .name
-                .strip_suffix(".weight")
-                .ok_or_else(|| {
-                    IoError::InvalidFormat(format!(
-                        "quantized tensor {:?} must end in .weight",
-                        descriptor.name
-                    ))
-                })?
-                .to_owned();
             Ok(GgufTensor::Affine(GgufAffineTensor {
-                physical_name: descriptor.name.clone(),
+                physical_name: descriptor.name,
                 bits: affine.bits,
                 group_size: affine.group_size,
                 weight: GgufArray {
-                    name: descriptor.name,
+                    name: weight_name,
                     array: weight,
                 },
                 scales: GgufArray {
-                    name: format!("{prefix}.scales"),
+                    name: scales_name,
                     array: scales,
                 },
                 biases: GgufArray {
-                    name: format!("{prefix}.biases"),
+                    name: biases_name,
                     array: biases,
                 },
             }))
         }
         eredu_gguf::ConvertedTensor::MxFp4(mxfp4) => {
+            let [weight_name, scales_name] =
+                converted_output_names(&descriptor.name, output_names)?;
             let weight_shape = mlx_shape_i32(&descriptor.name, &mxfp4.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &mxfp4.scale_shape)?;
             let weight =
                 array_from_owned_data(mxfp4.weights, &weight_shape, Dtype::Uint32, host_owned)?;
             let scales =
                 array_from_owned_data(mxfp4.scales, &scale_shape, Dtype::Uint8, host_owned)?;
-            let prefix = descriptor
-                .name
-                .strip_suffix(".weight")
-                .ok_or_else(|| {
-                    IoError::InvalidFormat(format!(
-                        "MXFP4 tensor {:?} must end in .weight",
-                        descriptor.name
-                    ))
-                })?
-                .to_owned();
             Ok(GgufTensor::MxFp4(GgufMxFp4Tensor {
-                physical_name: descriptor.name.clone(),
+                physical_name: descriptor.name,
                 weight: GgufArray {
-                    name: descriptor.name,
+                    name: weight_name,
                     array: weight,
                 },
                 scales: GgufArray {
-                    name: format!("{prefix}.scales"),
+                    name: scales_name,
                     array: scales,
                 },
             }))
         }
     }
+}
+
+fn converted_output_names<const N: usize>(
+    physical_name: &str,
+    names: Vec<String>,
+) -> Result<[String; N], IoError> {
+    names.try_into().map_err(|names: Vec<String>| {
+        IoError::InvalidFormat(format!(
+            "GGUF tensor {physical_name:?} cataloged {} logical outputs, expected {N}",
+            names.len()
+        ))
+    })
 }
 
 fn array_from_owned_data<T: 'static>(
