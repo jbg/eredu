@@ -143,8 +143,10 @@ native Unicode paths. Windows ARM CUDA and Windows NCCL are not supported.
 
 ## Backend feature selection
 
-Apple features are ignored on non-Apple targets, but portable applications
-should still select their intended backend explicitly.
+Apple features are ignored on non-Apple targets, and Metal-library
+configuration APIs are not exposed there even when the `metal` feature is
+enabled for build-matrix validation. Portable applications should still select
+their intended backend explicitly.
 
 The `eredu-cli` crate has its own `cuda` feature, which enables CUDA in Eredu
 and its MLX implementation layer.

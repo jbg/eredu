@@ -27,7 +27,7 @@ pub fn allocator_memory() -> Result<AllocatorMemoryMetrics, Error> {
 }
 
 /// Overrides the Metal library path used by the MLX runtime.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub fn set_accelerator_library_path(path: impl AsRef<std::path::Path>) -> Result<(), Error> {
     safemlx::metal::set_metallib_path(path).map_err(Into::into)
 }

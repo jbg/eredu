@@ -41,11 +41,13 @@ serve as an undocumented cross-crate integration surface.
 The `eredu` facade is also portable when built with
 `default-features = false`. Concrete adapter and native-platform features stay
 optional; capability features configure an enabled adapter rather than making
-portable contracts depend on it. The facade exposes a flat,
-application-facing local adapter under `eredu::api`; it does not reproduce an
-implementation crate's backend or composition module tree. The current MLX
-feature mapping and native build requirements are documented with the
-[MLX backend](../eredu-backend-mlx/doc/README.md).
+portable contracts depend on it. APIs for target-specific runtime
+configuration are available only on their native targets, even when Cargo
+features are enabled elsewhere for build-matrix validation. The facade exposes
+a flat, application-facing local adapter under `eredu::api`; it does not
+reproduce an implementation crate's backend or composition module tree. The
+current MLX feature mapping and native build requirements are documented with
+the [MLX backend](../eredu-backend-mlx/doc/README.md).
 
 Backend-internal
 fixtures and composition tests are crate-private unit tests; published crates

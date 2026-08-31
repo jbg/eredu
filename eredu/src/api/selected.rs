@@ -7,7 +7,7 @@
 //! The selected backend and its session are not part of the application API.
 
 use std::path::Path;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -1176,7 +1176,7 @@ fn map_local_realtime_error(
 /// Process-global configuration for the selected local runtime.
 #[derive(Debug, Clone, Default)]
 pub struct LocalRuntimeConfiguration {
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     accelerator_library_path: Option<PathBuf>,
     allocator_cache_limit: Option<usize>,
 }
@@ -1186,7 +1186,7 @@ impl LocalRuntimeConfiguration {
     ///
     /// Embedded Apple applications use this when their bundled library cannot
     /// be found through the runtime's default search path.
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     pub fn with_accelerator_library(mut self, path: impl Into<PathBuf>) -> Self {
         self.accelerator_library_path = Some(path.into());
         self
@@ -1203,7 +1203,7 @@ impl LocalRuntimeConfiguration {
 pub fn configure_local_runtime(
     configuration: &LocalRuntimeConfiguration,
 ) -> Result<(), LocalBackendError> {
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     if let Some(path) = &configuration.accelerator_library_path {
         eredu_backend_mlx::set_accelerator_library_path(path)
             .map_err(|error| LocalBackendError::new("runtime configuration", error))?;
