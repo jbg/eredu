@@ -718,10 +718,6 @@ where
         crate::transport::pipeline_with_output_state(0, self.target_layers, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        &self.config.model_type
-    }
-
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         self.decoder.execution_graph()
     }

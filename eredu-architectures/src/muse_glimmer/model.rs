@@ -932,10 +932,6 @@ where
         crate::transport::pipeline_state(1, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        &self.args.model_type
-    }
-
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
             .map_err(Error::backend)

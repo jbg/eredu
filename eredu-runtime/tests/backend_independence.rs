@@ -1018,10 +1018,6 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         ])
     }
 
-    fn model_identity(&self) -> &str {
-        "grouped-fixture"
-    }
-
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::new(
             vec![

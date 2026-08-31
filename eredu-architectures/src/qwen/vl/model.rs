@@ -1553,10 +1553,6 @@ where
         crate::transport::pipeline_state(1, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        self.args.effective_model_type()
-    }
-
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::new(
             vec![

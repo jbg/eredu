@@ -521,8 +521,11 @@ family-specific fields, residency identifiers, or checkpoint roots. Stable
 parameter identities on the visited module are the checkpoint-binding
 namespace. `LayeredArchitecture` extends this contract with execution against a
 specific runtime-state realization; geometry and binding therefore remain
-callable without choosing that state type. Concrete backend adapters use one
-shared visitor rather than family binding tables.
+callable without choosing that state type. Compatibility identity remains the
+single consumed value returned by `ArchitectureParameters::state_identity`;
+the execution lifecycle does not publish a second, ambiguous identity getter.
+Concrete backend adapters use one shared visitor rather than family binding
+tables.
 Pipeline stage loaders use that same visitor for both ordinary decoder families
 and multimodal families, leaving tensor-parallel binding selection generic and
 the role-to-module mapping entirely within the architecture. Distinct pinned

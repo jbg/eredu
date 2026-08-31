@@ -1484,10 +1484,6 @@ where
         crate::transport::pipeline_with_output_state(1, self.target_layers, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        &self.parsed.text.model_type
-    }
-
     fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
         self.canonical_execution_graph()
     }

@@ -566,9 +566,6 @@ where
     /// Declares how the complete mutable-state layout is divided among realized partitions.
     fn state_partition_plan(&self, layout: &StateLayout) -> crate::ArchitectureStatePartitionPlan;
 
-    /// Stable architecture compatibility identity.
-    fn model_identity(&self) -> &str;
-
     /// Declares the dependency graph between ordered execution groups.
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error>;
 

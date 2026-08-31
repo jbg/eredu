@@ -810,10 +810,6 @@ mod tests {
             ])
         }
 
-        fn model_identity(&self) -> &str {
-            "placement-fixture"
-        }
-
         fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
             Ok(self.graph.clone())
         }

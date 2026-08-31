@@ -1966,10 +1966,6 @@ where
         )
     }
 
-    fn model_identity(&self) -> &str {
-        &self.args.model_type
-    }
-
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         self.groups.execution_graph()
     }

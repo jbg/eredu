@@ -3103,10 +3103,6 @@ where
         crate::transport::pipeline_state(0, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        self.args.model_identity()
-    }
-
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         eredu_runtime::ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)
     }

@@ -618,10 +618,6 @@ where
         crate::transport::pipeline_state(0, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        &self.args.model_type
-    }
-
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         self.group.execution_graph()
     }

@@ -632,10 +632,6 @@ where
         crate::transport::pipeline_with_output_state(0, temporal_layers, layout)
     }
 
-    fn model_identity(&self) -> &str {
-        self.config.architecture_fingerprint()
-    }
-
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
             .map_err(Error::backend)
