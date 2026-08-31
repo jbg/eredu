@@ -44,6 +44,15 @@ pub enum CacheStateStrategy {
         /// Maximum retained positions per attention layer.
         window: u64,
     },
+    /// Sliding-window key-only attention, optionally with pooled history.
+    SlidingKey {
+        /// Maximum retained key positions per attention layer.
+        window: u64,
+        /// Total layers retaining local keys.
+        layers: u64,
+        /// Layers that additionally retain append-only pooling state.
+        pooling_layers: u64,
+    },
     /// Full-context and sliding-window attention layers.
     MixedKv {
         /// Number of full-context layers.

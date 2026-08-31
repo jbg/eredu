@@ -625,6 +625,11 @@ physical floating-state width, while fixed-dtype tensors such as FP32 recurrent
 matrices use the width declared by their architecture policy. Concrete backends
 add live allocator, residency, and system-memory observations; they do not
 reconstruct family state geometry or maintain an independent layer count.
+The serialized `CacheStateStrategy` is a public semantic summary of that same
+layout, not of attention equations or checkpoint labels. In particular,
+DeepSeek V4 reports every target and embedded-prediction layer as bounded
+key-only state and separately counts the layers that own append-only pooling
+state; compressed-attention layers are not full-KV layers.
 The same exact estimate declares whether speculative draft weights use a
 separate checkpoint, use configured embedded prediction layers, or are absent.
 A backend maps that declaration to executable or unsupported status according

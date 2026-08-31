@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::rotary::RopeValue;
 use eredu_core::{
+    cache::{LayerCachePolicy, StateTensorRole},
     CacheStateStrategy, CapabilityError, EstimationCompleteness, InputModalities,
     ModelCapabilities, ObservationKind, Observed, SlidingWindowLayerCount, SpeculativeDraftSource,
     StateMemoryLayout,
@@ -138,6 +139,15 @@ fn state_memory_layout<E: std::fmt::Display>(
         field: "state_layout",
         detail: error.to_string(),
     })?;
+    state_memory_layout_from_layout(layout, hidden_size, allocation_granularity, completeness)
+}
+
+fn state_memory_layout_from_layout(
+    layout: RuntimeStateLayout,
+    hidden_size: i32,
+    allocation_granularity: u64,
+    completeness: EstimationCompleteness,
+) -> Result<StateMemoryLayout, CapabilityError> {
     StateMemoryLayout::new(
         layout.layers().clone(),
         layout.layer_prefix_offsets(),
@@ -356,17 +366,63 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
         })
         .transpose()?
         .unwrap_or(effective);
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let compressed = args
-        .attention_schedule
-        .iter()
-        .filter(|policy| {
-            matches!(
-                policy,
-                crate::deepseek::V4AttentionPolicy::Compressed { .. }
-            )
-        })
-        .count() as u64;
+    let layout = crate::deepseek::v4::state_layout(args).map_err(|error| {
+        CapabilityError::InvalidConfiguration {
+            field: "state_layout",
+            detail: error.to_string(),
+        }
+    })?;
+    let mut window = None;
+    let mut pooling_layers = 0_u64;
+    for (layer, policy) in layout.layers().iter().enumerate() {
+        let attention = match policy {
+            LayerCachePolicy::KeyOnly { attention, .. } => attention,
+            LayerCachePolicy::KeyOnlyWithFixedState {
+                attention, tensors, ..
+            } if !tensors.is_empty()
+                && tensors
+                    .iter()
+                    .all(|tensor| matches!(tensor.role, StateTensorRole::Pooling { .. })) =>
+            {
+                pooling_layers += 1;
+                attention
+            }
+            _ => {
+                return Err(CapabilityError::InvalidConfiguration {
+                    field: "state_layout",
+                    detail: format!(
+                        "DeepSeek-V4 layer {layer} is not key-only attention with optional pooling state"
+                    ),
+                })
+            }
+        };
+        let layer_window = match attention {
+            AttentionPolicy::Sliding { window } => u64::from(window.get()),
+            AttentionPolicy::Full => {
+                return Err(CapabilityError::InvalidConfiguration {
+                    field: "state_layout",
+                    detail: format!("DeepSeek-V4 layer {layer} has unbounded attention state"),
+                })
+            }
+        };
+        if window.is_some_and(|window| window != layer_window) {
+            return Err(CapabilityError::InvalidConfiguration {
+                field: "state_layout",
+                detail: format!("DeepSeek-V4 layer {layer} has an inconsistent attention window"),
+            });
+        }
+        window = Some(layer_window);
+    }
+    let window = window.ok_or_else(|| CapabilityError::InvalidConfiguration {
+        field: "state_layout",
+        detail: "DeepSeek-V4 state layout is empty".into(),
+    })?;
+    let layers = u64::try_from(layout.layers().len()).map_err(|_| {
+        CapabilityError::InvalidConfiguration {
+            field: "state_layout",
+            detail: "DeepSeek-V4 state layer count exceeds the capability range".into(),
+        }
+    })?;
     Ok((
         Observed::Available {
             value: native,
@@ -378,16 +434,14 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
             kind: ObservationKind::Exact,
             source: "validated neutral DeepSeek-V4 configuration".into(),
         },
-        CacheStateStrategy::MixedKv {
-            full_layers: compressed,
-            sliding: vec![SlidingWindowLayerCount {
-                layers,
-                window: positive(args.sliding_window, "sliding_window")?,
-            }],
+        CacheStateStrategy::SlidingKey {
+            window,
+            layers,
+            pooling_layers,
         },
         text_modalities(),
-        state_memory_layout(
-            crate::deepseek::v4::state_layout(args),
+        state_memory_layout_from_layout(
+            layout,
             args.hidden_size,
             128,
             EstimationCompleteness::Conservative,
@@ -1104,6 +1158,23 @@ mod tests {
         }))
         .unwrap();
         let v4 = deepseek_v4(&v4_args).unwrap();
+        assert_eq!(
+            v4.capabilities().state_strategy,
+            CacheStateStrategy::SlidingKey {
+                window: 8,
+                layers: 4,
+                pooling_layers: 2,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(v4.capabilities()).unwrap()["state_strategy"],
+            json!({
+                "strategy": "sliding_key",
+                "window": 8,
+                "layers": 4,
+                "pooling_layers": 2
+            })
+        );
         assert_eq!(
             v4.state_layout().layer_layout(),
             crate::deepseek::v4::state_layout(&v4_args)
