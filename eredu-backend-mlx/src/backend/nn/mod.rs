@@ -15,7 +15,6 @@ pub(crate) mod moe;
 pub(crate) mod native_quantization;
 pub(crate) mod nested;
 pub(crate) mod primitives;
-pub(crate) mod quantization;
 pub(crate) mod rope;
 pub(crate) mod routing;
 /// Backend-neutral architecture operators specialized to MLX.

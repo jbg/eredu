@@ -10,8 +10,7 @@
 //!
 //! The bundled MLX C API does not wrap an mmap region as a guaranteed
 //! device-accessible buffer. Native loading therefore stores raw bytes in one
-//! persistent MLX-owned allocation. [`NativeStorageKind`] reports that physical
-//! ownership, while logical views share it through `Arc`.
+//! persistent MLX-owned allocation, while logical views share it through `Arc`.
 
 use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 
@@ -214,99 +213,27 @@ impl NativeQuantizationFormat {
     }
 }
 
-/// How the persistent raw bytes are owned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeStorageKind {
-    /// MLX owns one minimally copied raw byte buffer.
-    ///
-    /// The current C custom-kernel path cannot portably promise that an mmap
-    /// pointer becomes a no-copy Metal buffer. Keeping this distinction in the
-    /// public representation allows a managed external/mmap owner to be added
-    /// without changing logical views or operation dispatch.
-    MlxOwnedCopy,
-}
-
-/// Native operation classes used for backend capability selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeOperation {
-    /// Matrix multiplication with the stored matrix transposed.
-    Linear,
-    /// Matrix multiplication in the stored matrix direction.
-    LinearUntransposed,
-    /// Lookup and dequantize selected physical rows.
-    Embedding,
-    /// Expert-major projection selected by one expert id per input row.
-    GroupedLinear,
-}
-
 /// Device execution backend selected independently of model architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeExecutionBackend {
+enum NativeExecutionBackend {
     /// Custom kernels evaluated through [`MetalKernel`].
     Metal,
     /// Transient dequantization followed by portable MLX operations.
     GenericFallback,
 }
 
-/// Device-independent capability description for a native format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeCapabilities {
-    /// Whether transposed linear execution is available.
-    pub linear: bool,
-    /// Whether untransposed linear execution is available without conversion.
-    pub linear_untransposed: bool,
-    /// Whether native embedding row lookup is available.
-    pub embedding: bool,
-    /// Whether expert-major grouped execution is available.
-    pub grouped_linear: bool,
-}
-
-impl NativeCapabilities {
-    /// Returns whether one operation is supported.
-    pub const fn supports(self, operation: NativeOperation) -> bool {
-        match operation {
-            NativeOperation::Linear => self.linear,
-            NativeOperation::LinearUntransposed => self.linear_untransposed,
-            NativeOperation::Embedding => self.embedding,
-            NativeOperation::GroupedLinear => self.grouped_linear,
-        }
-    }
-}
-
 /// Persistent physical byte storage shared by one or more logical views.
 #[derive(Debug)]
-pub struct NativeStorage {
+struct NativeStorage {
     format: NativeQuantizationFormat,
     endian: GgufEndian,
     bytes: Array,
-    byte_len: usize,
-    kind: NativeStorageKind,
 }
 
 impl NativeStorage {
-    /// Physical native format.
-    pub fn format(&self) -> NativeQuantizationFormat {
-        self.format
-    }
-
-    /// Number of persistent raw checkpoint bytes.
-    pub fn byte_len(&self) -> usize {
-        self.byte_len
-    }
-
-    /// Raw-storage ownership mode.
-    pub fn kind(&self) -> NativeStorageKind {
-        self.kind
-    }
-
     /// Raw MLX byte array consumed by device kernels.
-    pub fn bytes(&self) -> &Array {
+    fn bytes(&self) -> &Array {
         &self.bytes
-    }
-
-    /// Byte order of multibyte fields in the retained blocks.
-    pub fn endian(&self) -> GgufEndian {
-        self.endian
     }
 }
 
@@ -328,7 +255,8 @@ pub struct NativeQuantizedTensor {
 impl NativeQuantizedTensor {
     /// Copies the packed storage to another execution stream while preserving
     /// this tensor's logical matrix and row view.
-    pub fn copy_to_stream(&self, stream: &Stream) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn copy_to_stream(&self, stream: &Stream) -> Result<Self, Exception> {
         let bytes = self.storage.bytes.copy(stream)?;
         eval([&bytes])?;
         Ok(Self {
@@ -336,8 +264,6 @@ impl NativeQuantizedTensor {
                 format: self.storage.format,
                 endian: self.storage.endian,
                 bytes,
-                byte_len: self.storage.byte_len,
-                kind: NativeStorageKind::MlxOwnedCopy,
             }),
             matrix_count: self.matrix_count,
             physical_rows: self.physical_rows,
@@ -350,7 +276,8 @@ impl NativeQuantizedTensor {
     /// Copies one little-endian Q4_K physical matrix bank into raw MLX storage.
     ///
     /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    pub fn from_q4k_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn from_q4k_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
         Self::from_native_bytes(
             data,
             shape,
@@ -365,7 +292,8 @@ impl NativeQuantizedTensor {
     /// Copies one little-endian Q5_K physical matrix bank into raw MLX storage.
     ///
     /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    pub fn from_q5k_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn from_q5k_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
         Self::from_native_bytes(
             data,
             shape,
@@ -380,7 +308,8 @@ impl NativeQuantizedTensor {
     /// Copies one little-endian Q6_K physical matrix bank into raw MLX storage.
     ///
     /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    pub fn from_q6k_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn from_q6k_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
         Self::from_native_bytes(
             data,
             shape,
@@ -395,7 +324,8 @@ impl NativeQuantizedTensor {
     /// Copies one little-endian Q5_1 physical matrix bank into raw MLX storage.
     ///
     /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    pub fn from_q5_1_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn from_q5_1_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
         Self::from_native_bytes(
             data,
             shape,
@@ -410,7 +340,8 @@ impl NativeQuantizedTensor {
     /// Copies one little-endian Q8_0 physical matrix bank into raw MLX storage.
     ///
     /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    pub fn from_q8_0_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn from_q8_0_bytes(data: &[u8], shape: &[i32], stream: &Stream) -> Result<Self, Exception> {
         Self::from_native_bytes(
             data,
             shape,
@@ -435,6 +366,7 @@ impl NativeQuantizedTensor {
         Self::from_native_array(bytes, shape, format, block_values, block_bytes, endian)
     }
 
+    #[cfg(test)]
     fn from_native_bytes(
         data: &[u8],
         shape: &[i32],
@@ -477,8 +409,6 @@ impl NativeQuantizedTensor {
             format,
             endian,
             bytes,
-            byte_len: data.len(),
-            kind: NativeStorageKind::MlxOwnedCopy,
         });
         Ok(Self {
             storage,
@@ -532,9 +462,7 @@ impl NativeQuantizedTensor {
             storage: Arc::new(NativeStorage {
                 format,
                 endian,
-                byte_len: bytes.size(),
                 bytes,
-                kind: NativeStorageKind::MlxOwnedCopy,
             }),
             matrix_count,
             physical_rows,
@@ -545,7 +473,8 @@ impl NativeQuantizedTensor {
     }
 
     /// Physical storage shared by this logical view.
-    pub fn storage(&self) -> &Arc<NativeStorage> {
+    #[cfg(test)]
+    fn storage(&self) -> &Arc<NativeStorage> {
         &self.storage
     }
 
@@ -563,33 +492,21 @@ impl NativeQuantizedTensor {
         }
     }
 
-    /// Number of matrices in the physical bank.
-    pub fn matrix_count(&self) -> i32 {
-        self.matrix_count
-    }
-
-    /// Number of logical output rows per matrix.
-    pub fn rows(&self) -> i32 {
-        self.rows
-    }
-
-    /// Number of input columns per matrix.
-    pub fn columns(&self) -> i32 {
-        self.columns
-    }
-
     /// Logical starting row within every physical matrix.
-    pub fn row_start(&self) -> i32 {
+    #[cfg(test)]
+    fn row_start(&self) -> i32 {
         self.row_start
     }
 
     /// Number of physical rows per matrix.
-    pub fn physical_rows(&self) -> i32 {
+    #[cfg(test)]
+    fn physical_rows(&self) -> i32 {
         self.physical_rows
     }
 
     /// Creates a zero-copy logical row segment inside every physical matrix.
-    pub fn row_view(&self, row_start: i32, rows: i32) -> Result<Self, Exception> {
+    #[cfg(test)]
+    fn row_view(&self, row_start: i32, rows: i32) -> Result<Self, Exception> {
         if row_start < 0 || rows <= 0 || row_start + rows > self.rows {
             return Err(Exception::custom(format!(
                 "native row view {row_start}..{} exceeds {} logical rows",
@@ -607,58 +524,6 @@ impl NativeQuantizedTensor {
         })
     }
 
-    /// Capabilities implemented by this native representation.
-    pub fn capabilities(&self) -> NativeCapabilities {
-        match self.format() {
-            NativeQuantizationFormat::GgufQ4K => NativeCapabilities {
-                linear: self.matrix_count == 1,
-                linear_untransposed: false,
-                embedding: self.matrix_count == 1,
-                grouped_linear: true,
-            },
-            NativeQuantizationFormat::GgufQ5K | NativeQuantizationFormat::GgufQ6K => {
-                NativeCapabilities {
-                    linear: self.matrix_count == 1,
-                    linear_untransposed: false,
-                    embedding: self.matrix_count == 1,
-                    grouped_linear: true,
-                }
-            }
-            NativeQuantizationFormat::GgufQ5_1 => NativeCapabilities {
-                linear: self.matrix_count == 1,
-                linear_untransposed: false,
-                embedding: self.matrix_count == 1,
-                grouped_linear: true,
-            },
-            NativeQuantizationFormat::GgufQ8_0 => NativeCapabilities {
-                linear: self.matrix_count == 1,
-                linear_untransposed: false,
-                embedding: self.matrix_count == 1,
-                grouped_linear: true,
-            },
-            _ => NativeCapabilities {
-                linear: self.matrix_count == 1,
-                linear_untransposed: false,
-                embedding: self.matrix_count == 1,
-                grouped_linear: true,
-            },
-        }
-    }
-
-    /// Native capabilities available on the selected device backend.
-    pub fn capabilities_on(&self, stream: &Stream) -> Result<NativeCapabilities, Exception> {
-        if native_execution_backend(stream)? == NativeExecutionBackend::Metal {
-            Ok(self.capabilities())
-        } else {
-            Ok(NativeCapabilities {
-                linear: false,
-                linear_untransposed: false,
-                embedding: false,
-                grouped_linear: false,
-            })
-        }
-    }
-
     /// Applies this native matrix to `input`.
     ///
     /// Metal uses direct block dequantization. CPU and unsupported devices use
@@ -673,14 +538,6 @@ impl NativeQuantizedTensor {
             return Err(Exception::custom(
                 "native linear expects a single logical matrix",
             ));
-        }
-        let operation = if transpose {
-            NativeOperation::Linear
-        } else {
-            NativeOperation::LinearUntransposed
-        };
-        if !self.capabilities_on(stream)?.supports(operation) {
-            return self.linear_fallback(input, transpose, stream);
         }
         if native_execution_backend(stream)? == NativeExecutionBackend::Metal && transpose {
             return match self.format() {
@@ -1002,7 +859,7 @@ fn is_gpu(stream: &Stream) -> Result<bool, Exception> {
 }
 
 /// Selects a native execution backend without consulting model architecture.
-pub fn native_execution_backend(stream: &Stream) -> Result<NativeExecutionBackend, Exception> {
+fn native_execution_backend(stream: &Stream) -> Result<NativeExecutionBackend, Exception> {
     #[cfg(feature = "cuda")]
     {
         let _ = stream;

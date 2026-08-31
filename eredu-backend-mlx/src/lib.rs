@@ -22,7 +22,7 @@ mod composition;
 
 pub use adapter::*;
 
-pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn, quantization};
+pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn};
 pub(crate) use safemlx::{ops, Array, Dtype, Stream};
 
 #[cfg(test)]

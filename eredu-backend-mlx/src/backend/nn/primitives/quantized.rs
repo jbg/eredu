@@ -6,7 +6,7 @@ use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,
     ops::{
-        self, dequantize_with_mode, quantized_matmul_with_mode, quantized_packed_dimension,
+        dequantize_with_mode, quantized_matmul_with_mode, quantized_packed_dimension,
         QuantizationMode,
     },
     Array, Dtype, Stream,
@@ -56,45 +56,7 @@ pub struct QuantizedEmbedding {
     pub inner: Embedding,
 }
 
-fn build_quantized_embedding_inner(
-    weight: Array,
-    group_size: i32,
-    bits: i32,
-    mode: QuantizationMode,
-    stream: &crate::Stream,
-) -> Result<QuantizedEmbedding, Exception> {
-    let arrays = ops::quantize_with_mode(&weight, group_size, bits, mode, stream)?;
-
-    let inner = Embedding {
-        weight: PhysicalParam::new(arrays.weight),
-    };
-
-    let mut qe = QuantizedEmbedding {
-        group_size,
-        bits,
-        mode,
-        native: None,
-        native_format: None,
-        native_endian: GgufEndian::Little,
-        native_columns: 0,
-        scales: PhysicalParam::new(arrays.scales),
-        biases: PhysicalParam::new(arrays.biases),
-        inner,
-    };
-
-    // Freeze all parameters
-    qe.freeze_parameters(true);
-
-    Ok(qe)
-}
-
 impl QuantizedEmbedding {
-    /// Default group size
-    pub const DEFAULT_GROUP_SIZE: i32 = 64;
-
-    /// Default bits
-    pub const DEFAULT_BITS: i32 = 4;
-
     /// Creates an unloaded quantized embedding with an explicit encoding.
     pub fn unloaded_with_mode(
         embedding_count: i32,
@@ -186,30 +148,6 @@ impl QuantizedEmbedding {
         };
         embedding.freeze_parameters(true);
         Ok(embedding)
-    }
-
-    /// Convert an embedding layer to a quantized embedding layer.
-    ///
-    /// # Params
-    ///
-    /// - `embedding`: The embedding layer to convert.
-    /// - `group_size`: The group size to use for the quantized weight. Default to [`QuantizedEmbedding::DEFAULT_GROUP_SIZE`]
-    /// - `bits`: The bit width to use for the quantized weight. Default to [`QuantizedEmbedding::DEFAULT_BITS`]
-    pub fn try_from_embedding(
-        embedding: Embedding,
-        group_size: impl Into<Option<i32>>,
-        bits: impl Into<Option<i32>>,
-        stream: &crate::Stream,
-    ) -> Result<Self, Exception> {
-        let group_size = group_size.into().unwrap_or(Self::DEFAULT_GROUP_SIZE);
-        let bits = bits.into().unwrap_or(Self::DEFAULT_BITS);
-        build_quantized_embedding_inner(
-            embedding.weight.value,
-            group_size,
-            bits,
-            QuantizationMode::Affine,
-            stream,
-        )
     }
 
     /// Call the embedding layer as a linear layer.

@@ -10,12 +10,80 @@ use safemlx::{
 };
 
 use crate::{
-    module::PhysicalParam, native_quantization::NativeQuantizedTensor, nn,
-    quantization::MaybeQuantized,
+    module::{Module, ModuleParamMut, ModuleParamRef, PhysicalParam, PhysicalParameters},
+    native_quantization::NativeQuantizedTensor,
+    nn,
 };
 
 fn ceil_div(value: i32, divisor: i32) -> i32 {
     (value + divisor - 1) / divisor
+}
+
+/// Backend-owned dense or checkpoint-quantized embedding materialization.
+#[derive(Debug, Clone)]
+pub(crate) enum PhysicalEmbedding {
+    /// Dense embedding weights.
+    Dense(nn::Embedding),
+    /// Packed affine or checkpoint-native embedding weights.
+    Quantized(nn::QuantizedEmbedding),
+}
+
+impl PhysicalEmbedding {
+    pub(crate) fn as_linear(&self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(embedding) => embedding.as_linear(input, stream),
+            Self::Quantized(embedding) => embedding.as_linear(input, stream),
+        }
+    }
+}
+
+impl PhysicalParameters for PhysicalEmbedding {
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        match self {
+            Self::Dense(embedding) => embedding.parameters(),
+            Self::Quantized(embedding) => embedding.parameters(),
+        }
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        match self {
+            Self::Dense(embedding) => embedding.parameters_mut(),
+            Self::Quantized(embedding) => embedding.parameters_mut(),
+        }
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        match self {
+            Self::Dense(embedding) => embedding.trainable_parameters(),
+            Self::Quantized(embedding) => embedding.trainable_parameters(),
+        }
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(embedding) => embedding.freeze_parameters(recursive),
+            Self::Quantized(embedding) => embedding.freeze_parameters(recursive),
+        }
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(embedding) => embedding.unfreeze_parameters(recursive),
+            Self::Quantized(embedding) => embedding.unfreeze_parameters(recursive),
+        }
+    }
+}
+
+impl Module<&Array> for PhysicalEmbedding {
+    type Output = Array;
+    type Error = Exception;
+
+    fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(embedding) => embedding.forward(input, stream),
+            Self::Quantized(embedding) => embedding.forward(input, stream),
+        }
+    }
 }
 
 /// Backend-owned linear materialization for every neutral physical format.
@@ -247,14 +315,14 @@ impl PhysicalLinear {
     }
 }
 
-/// Creates an unloaded embedding using the standard dense or affine parameter tree.
-pub(crate) fn unloaded_maybe_quantized_embedding(
+/// Creates an unloaded embedding using its checkpoint-declared physical format.
+pub(crate) fn unloaded_embedding(
     embedding_count: i32,
     dimensions: i32,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
-) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
-    unloaded_maybe_quantized_embedding_with_dtype(
+) -> Result<PhysicalEmbedding, Exception> {
+    unloaded_embedding_with_dtype(
         embedding_count,
         dimensions,
         quantization,
@@ -263,17 +331,17 @@ pub(crate) fn unloaded_maybe_quantized_embedding(
     )
 }
 
-/// Creates an unloaded embedding using the requested dense dtype or a quantized parameter tree.
-fn unloaded_maybe_quantized_embedding_with_dtype(
+/// Creates an unloaded embedding using the requested dense dtype or packed parameter tree.
+fn unloaded_embedding_with_dtype(
     embedding_count: i32,
     dimensions: i32,
     quantization: Option<WeightQuantization>,
     dense_dtype: Dtype,
     stream: &Stream,
-) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
+) -> Result<PhysicalEmbedding, Exception> {
     match quantization {
         Some(WeightQuantization::GgufIQuant { ggml_type, endian }) => Ok(
-            MaybeQuantized::Quantized(nn::QuantizedEmbedding::unloaded_iq(
+            PhysicalEmbedding::Quantized(nn::QuantizedEmbedding::unloaded_iq(
                 embedding_count,
                 dimensions,
                 ggml_type,
@@ -281,7 +349,7 @@ fn unloaded_maybe_quantized_embedding_with_dtype(
                 stream,
             )?),
         ),
-        Some(config) => Ok(MaybeQuantized::Quantized(
+        Some(config) => Ok(PhysicalEmbedding::Quantized(
             nn::QuantizedEmbedding::unloaded_with_mode(
                 embedding_count,
                 dimensions,
@@ -292,7 +360,7 @@ fn unloaded_maybe_quantized_embedding_with_dtype(
                 stream,
             )?,
         )),
-        None => Ok(MaybeQuantized::Original(nn::Embedding::unloaded(
+        None => Ok(PhysicalEmbedding::Dense(nn::Embedding::unloaded(
             embedding_count,
             dimensions,
             dense_dtype,

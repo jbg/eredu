@@ -2,15 +2,15 @@
 
 use safemlx::{
     error::Result,
-    ops::{argsort, gather_mm, indexing::take_axis, ones_dtype, segment_sum},
+    ops::{argsort, gather_mm, indexing::take_axis, segment_sum},
     Array, Dtype, Stream,
 };
 
 /// Device-side routing plan for grouped expert execution.
 ///
 /// The plan is produced by sorting flattened group/expert ids. `route_indices` maps every sorted
-/// route back to its original flattened route position. For top-k routing, `token_indices` and
-/// `slot_indices` split that flattened position back into `(token, slot)`.
+/// route back to its original flattened route position. For top-k routing,
+/// `token_indices` identifies the source token for each route.
 #[derive(Debug)]
 pub struct GroupedRoutePlan {
     /// Group or expert id for each sorted route.
@@ -19,12 +19,6 @@ pub struct GroupedRoutePlan {
     pub route_indices: Array,
     /// Source row for each sorted route.
     pub token_indices: Array,
-    /// Top-k slot for each sorted route, or zeros for a 1-D grouping input.
-    pub slot_indices: Array,
-    /// Number of routes assigned to each group.
-    pub group_counts: Array,
-    /// Exclusive prefix sum of `group_counts`.
-    pub group_offsets: Array,
 }
 
 /// Sort flattened group ids on-device and return indices useful for grouped kernels.
@@ -35,7 +29,6 @@ pub struct GroupedRoutePlan {
 /// tokens with [`segment_sum_by_index`].
 pub fn group_by_id(
     group_ids: impl AsRef<Array>,
-    num_groups: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<GroupedRoutePlan> {
     let stream = stream.as_ref();
@@ -45,32 +38,18 @@ pub fn group_by_id(
     } else {
         1
     };
-
     let flat_group_ids = group_ids
         .reshape(&[-1], stream)?
         .as_dtype(Dtype::Int32, stream)?;
     let order = argsort(&flat_group_ids, stream)?;
     let sorted_group_ids = flat_group_ids.take(&order, stream)?;
     let route_indices = order.as_dtype(Dtype::Int32, stream)?;
-    let divisor = Array::from_int(top_k);
-    let token_indices = route_indices.floor_divide(&divisor, stream)?;
-    let slot_indices = route_indices.remainder(&divisor, stream)?;
-
-    let counts = ones_dtype(&[flat_group_ids.size() as i32], Dtype::Int32, stream)?.segment_sum(
-        &flat_group_ids,
-        num_groups,
-        0,
-        stream,
-    )?;
-    let offsets = counts.cumsum(0, None, false, stream)?;
+    let token_indices = route_indices.floor_divide(Array::from_int(top_k), stream)?;
 
     Ok(GroupedRoutePlan {
         sorted_group_ids,
         route_indices,
         token_indices,
-        slot_indices,
-        group_counts: counts,
-        group_offsets: offsets,
     })
 }
 
@@ -142,10 +121,9 @@ pub fn segment_sum_by_index(
 /// Build a sorted top-k route plan from `[tokens, top_k]` expert ids.
 pub fn topk_route_plan(
     expert_ids: impl AsRef<Array>,
-    num_experts: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<GroupedRoutePlan> {
-    group_by_id(expert_ids, num_experts, stream)
+    group_by_id(expert_ids, stream)
 }
 
 #[cfg(test)]
@@ -161,7 +139,7 @@ mod tests {
     fn test_group_by_id_topk_plan() {
         let stream = crate::test_stream();
         let experts = Array::from_slice(&[2i32, 0, 1, 2, 0, 1], &[3, 2]);
-        let plan = topk_route_plan(&experts, 3, stream).unwrap();
+        let plan = topk_route_plan(&experts, stream).unwrap();
 
         assert_eq!(
             crate::array::eval_vec::<i32>(&plan.sorted_group_ids),
@@ -174,18 +152,6 @@ mod tests {
         assert_eq!(
             crate::array::eval_vec::<i32>(&plan.token_indices),
             &[0, 2, 1, 2, 0, 1]
-        );
-        assert_eq!(
-            crate::array::eval_vec::<i32>(&plan.slot_indices),
-            &[1, 0, 0, 1, 0, 1]
-        );
-        assert_eq!(
-            crate::array::eval_vec::<i32>(&plan.group_counts),
-            &[2, 2, 2]
-        );
-        assert_eq!(
-            crate::array::eval_vec::<i32>(&plan.group_offsets),
-            &[0, 2, 4]
         );
     }
 
@@ -205,7 +171,7 @@ mod tests {
         )
         .unwrap();
         let group_ids = Array::from_slice(&[2i32, 0, 1, 2], &[4]);
-        let plan = group_by_id(&group_ids, 3, stream).unwrap();
+        let plan = group_by_id(&group_ids, stream).unwrap();
         let sorted_inputs = take_axis(&inputs, &plan.token_indices, 0, stream).unwrap();
         let grouped = grouped_matmul(
             &sorted_inputs,

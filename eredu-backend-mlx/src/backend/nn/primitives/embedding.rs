@@ -3,12 +3,9 @@
 use crate::module::Module;
 use crate::module::PhysicalParam;
 use crate::ops::indexing::TryIndexOp;
-use crate::quantization::Quantizable;
 use crate::{Array, Dtype, Stream};
 use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::error::Exception;
-
-use super::QuantizedEmbedding;
 
 /// Implements a simple lookup table that maps each input integer to a high-dimensional vector.
 ///
@@ -47,21 +44,6 @@ impl Embedding {
     /// weights are tied.
     pub fn as_linear(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
         crate::ops::matmul(x, self.weight.value.transpose(stream)?, stream)
-    }
-}
-
-impl Quantizable for Embedding {
-    type Quantized = QuantizedEmbedding;
-
-    type QuantizationError = Exception;
-
-    fn try_into_quantized(
-        self,
-        group_size: i32,
-        bits: i32,
-        stream: &crate::Stream,
-    ) -> Result<Self::Quantized, Self::QuantizationError> {
-        QuantizedEmbedding::try_from_embedding(self, group_size, bits, stream)
     }
 }
 

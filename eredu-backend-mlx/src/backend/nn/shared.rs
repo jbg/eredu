@@ -54,7 +54,6 @@ use crate::{
     module::{Module, ModuleParamMut, ModuleParamRef, PhysicalParameters},
     nested::NestedValue,
     nn,
-    quantization::MaybeQuantized,
 };
 
 fn bind_linear_companion(weight: &ParameterSpec, mut companion: ParameterSpec) -> ParameterSpec {
@@ -447,7 +446,7 @@ impl Parameterized<MlxTensor> for MlxLinear {
 /// MLX dense-or-quantized token embedding.
 #[derive(Debug, Clone)]
 pub struct MlxEmbedding {
-    module: MaybeQuantized<nn::Embedding>,
+    module: common::linear::PhysicalEmbedding,
     topology: BTreeMap<String, ParameterSpec>,
     vocabulary: i32,
     vocabulary_range: Option<VocabularyParallelRange>,
@@ -505,10 +504,7 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
         input: &MlxTensor,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(match &mut self.module {
-            MaybeQuantized::Original(embedding) => embedding.as_linear(input.as_array(), context),
-            MaybeQuantized::Quantized(embedding) => embedding.as_linear(input.as_array(), context),
-        })
+        compute_tensor(self.module.as_linear(input.as_array(), context))
     }
 }
 
@@ -1284,7 +1280,7 @@ impl NeuralBackend for MlxNeuralBackend {
     }
 
     fn embedding(spec: EmbeddingSpec, context: &Stream) -> Result<MlxEmbedding, ComputeError> {
-        let module = compute(common::linear::unloaded_maybe_quantized_embedding(
+        let module = compute(common::linear::unloaded_embedding(
             spec.vocabulary,
             spec.dimensions,
             spec.format.encoding().weight_quantization(),
@@ -1307,7 +1303,7 @@ impl NeuralBackend for MlxNeuralBackend {
         range.validate_global_rows(spec.vocabulary)?;
         let global = i32::try_from(range.global_vocabulary).map_err(ComputeError::backend)?;
         let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
-        let module = compute(common::linear::unloaded_maybe_quantized_embedding(
+        let module = compute(common::linear::unloaded_embedding(
             local,
             spec.dimensions,
             spec.format.encoding().weight_quantization(),
@@ -1435,10 +1431,7 @@ impl NeuralBackend for MlxNeuralBackend {
             .vocabulary_range
             .clone()
             .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let local = compute(match &mut embedding.module {
-            MaybeQuantized::Original(value) => value.as_linear(input.as_array(), context),
-            MaybeQuantized::Quantized(value) => value.as_linear(input.as_array(), context),
-        })?;
+        let local = compute(embedding.module.as_linear(input.as_array(), context))?;
         let widths = (0..parallel.size())
             .map(|rank| {
                 eredu_core::balanced_contiguous_range(
@@ -2701,9 +2694,9 @@ mod neutral_semantic_operator_tests {
         Array, Device, DeviceType, Dtype,
     };
 
-    use crate::{
-        backend::{nn::tensor::TokenValidationScope, ExecutionContext},
-        quantization::MaybeQuantized,
+    use crate::backend::{
+        nn::{linear::PhysicalEmbedding, tensor::TokenValidationScope},
+        ExecutionContext,
     };
 
     use super::{MlxEmbedding, MlxLinear, MlxNeuralBackend, MlxTensor};
@@ -3016,8 +3009,8 @@ mod neutral_semantic_operator_tests {
 
     fn bind_embedding(embedding: &mut MlxEmbedding, weight: Array, stream: &safemlx::Stream) {
         match &mut embedding.module {
-            MaybeQuantized::Original(embedding) => embedding.weight.value = weight,
-            MaybeQuantized::Quantized(embedding) => {
+            PhysicalEmbedding::Dense(embedding) => embedding.weight.value = weight,
+            PhysicalEmbedding::Quantized(embedding) => {
                 let arrays = quantize_with_mode(
                     &weight,
                     embedding.group_size,
