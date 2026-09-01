@@ -3502,7 +3502,7 @@ fn execute_neutral_routed_partition_group<A, U, F, P>(
 where
     U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     F: 'static,
-    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+    P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
     for<'state> A: eredu_runtime::RoutedLayeredArchitecture<
             MlxNeuralBackend,
@@ -3904,7 +3904,7 @@ fn execute_neutral_routed_output_group<'input, A, U, P>(
 ) -> Result<(crate::MlxTensor, crate::MlxTensor), Error>
 where
     U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
-    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+    P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
     A: eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState, Unit = U>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>,
@@ -4235,7 +4235,7 @@ fn execute_routed_layered_partition_observed<A, U, F, G, Boundary, P>(
 where
     U: eredu_nn::Parameterized<crate::MlxTensor> + Clone,
     F: 'static,
-    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+    P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
     for<'state> A: eredu_runtime::PartitionedLayeredArchitecture<
             MlxNeuralBackend,
@@ -4376,6 +4376,8 @@ fn execute_neutral_decoder_partition_observed<C, P, Bindings>(
 where
     C: eredu_architectures::decoder::Config,
     P: eredu_architectures::decoder::BlockFactory<MlxNeuralBackend, C>,
+    P::FeedForward:
+        eredu_architectures::decoder::TensorParallelFeedForwardOperator<MlxNeuralBackend>,
     eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, P::FeedForward>:
         eredu_nn::Parameterized<crate::MlxTensor> + Clone,
 {
@@ -4420,10 +4422,11 @@ fn execute_neutral_routed_decoder_partition_observed<C, BF, Bindings, P>(
 where
     C: eredu_architectures::decoder::Config,
     BF: eredu_architectures::decoder::BlockFactory<MlxNeuralBackend, C>,
-    BF::FeedForward: eredu_architectures::decoder::RoutedFeedForwardOperator<MlxNeuralBackend>,
+    BF::FeedForward:
+        eredu_architectures::decoder::TensorParallelRoutedFeedForwardOperator<MlxNeuralBackend>,
     eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, BF::FeedForward>:
         eredu_nn::Parameterized<crate::MlxTensor> + Clone,
-    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+    P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let storage_range = stage.range();
@@ -5607,14 +5610,8 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageCompletion, Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(format!(
-                "pipeline model topology {:?} does not match distributed session topology {:?}",
-                self.topology,
-                execution.topology()
-            )));
-        }
-        let pipeline = match execution.pipeline_group() {
+        super::topology::validate_session(self.topology, execution)?;
+        let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
             None if self.topology.pipeline_parallel_size == 1 => execution.world(),
             None => {
@@ -5624,7 +5621,7 @@ impl PipelineModel {
             }
         };
         let tensor = (self.topology.tensor_parallel_size > 1)
-            .then(|| execution.tensor_context())
+            .then(|| execution.partitioned_context(crate::backend::distributed::SHARD_GROUP_ID))
             .transpose()?;
         let stream = execution.stream();
         let token_validation_scope = TokenValidationScope::begin()?;
@@ -5641,7 +5638,7 @@ impl PipelineModel {
                 .successor_rank
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
-            execution.axis_group(eredu_core::ParallelAxis::Expert),
+            execution.selected_group(crate::backend::distributed::ADDRESSABLE_GROUP_ID),
             false,
             stream,
             observer,
@@ -5683,14 +5680,8 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageCompletion, Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(format!(
-                "pipeline model topology {:?} does not match distributed session topology {:?}",
-                self.topology,
-                execution.topology()
-            )));
-        }
-        let pipeline = match execution.pipeline_group() {
+        super::topology::validate_session(self.topology, execution)?;
+        let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
             None if self.topology.pipeline_parallel_size == 1 => execution.world(),
             None => {
@@ -5700,7 +5691,7 @@ impl PipelineModel {
             }
         };
         let tensor = (self.topology.tensor_parallel_size > 1)
-            .then(|| execution.tensor_context())
+            .then(|| execution.partitioned_context(crate::backend::distributed::SHARD_GROUP_ID))
             .transpose()?;
         let stream = execution.stream();
         let token_validation_scope = TokenValidationScope::begin()?;
@@ -5717,7 +5708,7 @@ impl PipelineModel {
                 .successor_rank
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
-            execution.axis_group(eredu_core::ParallelAxis::Expert),
+            execution.selected_group(crate::backend::distributed::ADDRESSABLE_GROUP_ID),
             true,
             stream,
             observer,
@@ -5784,7 +5775,7 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
-        let pipeline = match execution.pipeline_group() {
+        let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
             None if self.topology.pipeline_parallel_size == 1 => execution.world(),
             None => {
@@ -5855,7 +5846,7 @@ impl PipelineModel {
         execution: &crate::backend::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<bool, Exception> {
-        let pipeline = match execution.pipeline_group() {
+        let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
             None if self.topology.pipeline_parallel_size == 1 => execution.world(),
             None => {
@@ -6309,17 +6300,13 @@ impl PipelineModel {
         finished: bool,
         execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(
-                "pipeline sampling topology does not match distributed session".into(),
-            ));
-        }
+        super::topology::validate_session(self.topology, execution)?;
         if batch_size <= 0 {
             return Err(Error::Parallel(format!(
                 "pipeline sampling batch size must be positive, got {batch_size}"
             )));
         }
-        let pipeline = match execution.pipeline_group() {
+        let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
             None if self.topology.pipeline_parallel_size == 1 => execution.world(),
             None => {
@@ -6988,7 +6975,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
     ) -> Result<Option<Array>, Exception> {
         let tensor = self
             .execution
-            .tensor_context()
+            .partitioned_context(crate::backend::distributed::SHARD_GROUP_ID)
             .map_err(|error| Exception::custom(error.to_string()))?;
         let local = if self.model.info.owns_output {
             self.model.stage.fused_embedded_mtp_logits(
@@ -6997,7 +6984,8 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
                 proposal_capacity,
                 cache,
                 Some(&tensor),
-                self.execution.axis_group(eredu_core::ParallelAxis::Expert),
+                self.execution
+                    .selected_group(crate::backend::distributed::ADDRESSABLE_GROUP_ID),
                 stream,
             )
         } else {
@@ -7011,7 +6999,10 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
         local: Result<Option<Array>, Error>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        let pipeline = match self.execution.pipeline_group() {
+        let pipeline = match self
+            .execution
+            .selected_group(crate::backend::distributed::STAGE_GROUP_ID)
+        {
             Some(group) => group,
             None if self.model.topology.pipeline_parallel_size == 1 => self.execution.world(),
             None => {
@@ -7063,7 +7054,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
         let local = if self.model.info.owns_output {
             let tensor = self
                 .execution
-                .tensor_context()
+                .partitioned_context(crate::backend::distributed::SHARD_GROUP_ID)
                 .map_err(|error| Exception::custom(error.to_string()))?;
             self.model
                 .stage
@@ -7073,7 +7064,8 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
                     depth,
                     cache,
                     Some(&tensor),
-                    self.execution.axis_group(eredu_core::ParallelAxis::Expert),
+                    self.execution
+                        .selected_group(crate::backend::distributed::ADDRESSABLE_GROUP_ID),
                     stream,
                 )
                 .map(Some)

@@ -305,7 +305,7 @@ impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -552,7 +552,7 @@ where
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
         R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
         H: FnMut(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,

@@ -129,20 +129,6 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
-    /// Executes a rank-local tensor-parallel routed contribution. Providers
-    /// returning complete outputs may use the ordinary path unchanged.
-    fn forward_grouped_tensor_parallel(
-        &mut self,
-        resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
-        partitions: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        let _ = partitions;
-        self.forward_grouped(resident_bank, request, context)
-            .map(RoutedExpertTensorParallelOutput::Complete)
-    }
-
     /// Executes one ReLU-squared route batch through the same residency boundary.
     fn forward_relu2_routed(
         &mut self,
@@ -150,20 +136,30 @@ where
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+}
 
-    /// Executes a ReLU-squared route batch with an explicit complete or
-    /// rank-local tensor-parallel result.
+/// Additive provider mechanism for tensor-parallel grouped partials.
+pub trait TensorParallelRoutedExpertProvider<B>: RoutedExpertProvider<B>
+where
+    B: GroupedNeuralBackend,
+{
+    /// Executes a rank-local gated-product contribution.
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
+
+    /// Executes a rank-local ReLU-squared contribution.
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        let _ = partitions;
-        self.forward_relu2_routed(resident_bank, request, context)
-            .map(RoutedExpertTensorParallelOutput::Complete)
-    }
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
 }
 
 /// Stable routing metadata supplied by an architecture composition at one
@@ -295,18 +291,6 @@ where
         Ok(output)
     }
 
-    fn forward_grouped_tensor_parallel(
-        &mut self,
-        resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
-        partitions: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        self.provider
-            .forward_grouped_tensor_parallel(resident_bank, request, partitions, context)
-            .map_err(ObservedExpertProviderError::Provider)
-    }
-
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
@@ -321,6 +305,25 @@ where
         self.observe(routes, &output)
             .map_err(ObservedExpertProviderError::Observer)?;
         Ok(output)
+    }
+}
+
+impl<B, P, O, E> TensorParallelRoutedExpertProvider<B> for ObservedExpertProvider<'_, P, O, E>
+where
+    B: GroupedNeuralBackend,
+    P: TensorParallelRoutedExpertProvider<B>,
+    O: ActivationObserver<B::Tensor, E> + ?Sized,
+{
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        self.provider
+            .forward_grouped_tensor_parallel(resident_bank, request, partitions, context)
+            .map_err(ObservedExpertProviderError::Provider)
     }
 
     fn forward_relu2_routed_tensor_parallel(
@@ -355,18 +358,6 @@ where
         resident_bank.forward_grouped(request.input, request.routes, context)
     }
 
-    fn forward_grouped_tensor_parallel(
-        &mut self,
-        resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
-        partitions: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        resident_bank
-            .forward_grouped_tensor_parallel(request.input, request.routes, partitions, context)
-            .map(RoutedExpertTensorParallelOutput::Partial)
-    }
-
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
@@ -374,6 +365,28 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         resident_bank.forward_grouped(request.input, request.routes, context)
+    }
+}
+
+impl<B> TensorParallelRoutedExpertProvider<B> for ResidentExpertProvider
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+{
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        B::gated_product_groups_tensor_parallel(
+            resident_bank,
+            request.input,
+            request.routes,
+            partitions,
+            context,
+        )
+        .map(RoutedExpertTensorParallelOutput::Partial)
     }
 
     fn forward_relu2_routed_tensor_parallel(
@@ -383,8 +396,13 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        resident_bank
-            .forward_grouped_tensor_parallel(request.input, request.routes, partitions, context)
-            .map(RoutedExpertTensorParallelOutput::Partial)
+        B::relu2_groups_tensor_parallel(
+            resident_bank,
+            request.input,
+            request.routes,
+            partitions,
+            context,
+        )
+        .map(RoutedExpertTensorParallelOutput::Partial)
     }
 }

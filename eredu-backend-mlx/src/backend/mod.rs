@@ -1,7 +1,6 @@
 //! MLX backend adapter.
 
-/// Prompt-cache topology conversion for MLX distributed execution.
-pub mod cache;
+pub(crate) mod cache;
 pub(crate) mod compaction;
 pub mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
@@ -19,8 +18,8 @@ pub mod random;
 pub mod residency;
 /// MLX-only tensor, checkpoint, execution, and residency infrastructure.
 pub mod runtime;
-/// MLX process-local device binding for a canonical core rank topology.
-pub mod topology;
+/// MLX process-local device binding for composition-owned rank topology.
+pub(crate) mod topology;
 pub(crate) use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub(crate) use distributed::MlxDistributedSession;
@@ -411,7 +410,10 @@ impl<'a> MlxBackend<'a> {
         topology: crate::backend::MlxParallelContext,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
-        MlxDistributedSession::new(MlxDistributedConfig { topology, world }, &self.stream)
+        let realization =
+            crate::composition::mlx::distributed::topology::collective_realization(topology)?;
+        topology.validate_execution_stream(&self.stream)?;
+        MlxDistributedSession::new(MlxDistributedConfig::new(realization, world), &self.stream)
     }
 }
 
@@ -470,8 +472,13 @@ impl<'a> BackendProvider for MlxBackend<'a> {
                             .into(),
                     )
                 })?;
+                let realization =
+                    crate::composition::mlx::distributed::topology::collective_realization(
+                        topology,
+                    )?;
+                topology.validate_execution_stream(&self.stream)?;
                 Some(MlxDistributedSession::new(
-                    MlxDistributedConfig { topology, world },
+                    MlxDistributedConfig::new(realization, world),
                     &self.stream,
                 )?)
             }

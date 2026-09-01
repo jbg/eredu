@@ -35,27 +35,28 @@ use eredu_core::{
     AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
     AutomaticPlanningBackend, AutomaticPlanningError, BackendDescriptor, BackendId,
     BackendProvider, BackendSession, BoundedResidencyRequirement, CacheStateStrategy,
-    CandidateAdmission, CapabilityError, CollectiveScope, Completion, DeviceCapabilities,
-    DeviceDescriptor, DevicePlan, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, DraftPlacementPlan, DraftingPlan, EstimationCompleteness,
-    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget,
-    ExternalDraftArtifact, FinishReason, GenerationConfigOverrides, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
-    InputTokenCount, Media, ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend,
-    ModelResourceProfile, ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure,
-    MultimodalRequest, MultimodalSegment, ObservationSet, ObservationValue, Observed, ParallelAxis,
-    ParallelTopology, PhysicalMemorySemantics, PreparedModel, PreparedSpeculativeLane,
-    ProposalDecision, RealizedDrafting, RealtimeBackend, RealtimeFrameConvention,
-    RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RgbImage, RuntimeStateEstimate,
-    SamplingPlacement, SemanticEvent, SessionCapabilities, SpeculativeCallbackPublisher,
-    SpeculativeCapability, SpeculativeCommit, SpeculativeDraft, SpeculativeDraftSource,
-    SpeculativeExecutor, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
-    SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
-    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout,
-    StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter,
-    TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
+    CandidateAdmission, CapabilityError, CollectiveGroupDescriptor, CollectiveGroupId,
+    CollectiveScope, Completion, DeviceCapabilities, DeviceDescriptor, DevicePlan,
+    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
+    DraftPlacementPlan, DraftingPlan, EstimationCompleteness, ExecutionPlan,
+    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget, ExternalDraftArtifact,
+    FinishReason, GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, Media,
+    ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelResourceProfile,
+    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
+    MultimodalSegment, ObservationSet, ObservationValue, Observed, PhysicalMemorySemantics,
+    PreparedModel, PreparedSpeculativeLane, ProposalDecision, RealizedDrafting, RealtimeBackend,
+    RealtimeFrameConvention, RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame,
+    RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RgbImage,
+    RuntimeStateEstimate, SamplingPlacement, SemanticEvent, SessionCapabilities,
+    SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit, SpeculativeDraft,
+    SpeculativeDraftSource, SpeculativeExecutor, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
+    SpeculativeGenerationOutput, SpeculativeGenerationVisitor, SpeculativeOutputRuntime,
+    SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling, SpeculativeSemanticConstraint,
+    SpeculativeTokenFilterController, StateMemoryLayout, StaticMemoryReport, Submission,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 use tokenizers::{
@@ -180,8 +181,12 @@ impl BackendProvider for MockBackend {
         Ok(MockSession {
             distributed: MockDistributedSession {
                 descriptor: DistributedSessionDescriptor::new(
-                    ParallelTopology::new(2, 1, 1, 1).unwrap(),
+                    2,
                     0,
+                    vec![
+                        CollectiveGroupDescriptor::new(CollectiveGroupId::new(17), vec![0, 1], 0)
+                            .unwrap(),
+                    ],
                 )
                 .unwrap(),
             },
@@ -244,7 +249,7 @@ impl BackendSession<MockBackend> for MockSession {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct MockDistributedValue(Vec<u32>);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MockDistributedSession {
     descriptor: DistributedSessionDescriptor,
 }
@@ -255,17 +260,11 @@ impl DistributedSession for MockDistributedSession {
     type Error = MockError;
 
     fn descriptor(&self) -> DistributedSessionDescriptor {
-        self.descriptor
+        self.descriptor.clone()
     }
 
     fn capabilities(&self) -> DistributedCapabilities {
-        DistributedCapabilities {
-            world_collectives: true,
-            collective_axes: vec![ParallelAxis::Tensor],
-            point_to_point: true,
-            variable_all_to_all: true,
-            exact_completion: true,
-        }
+        DistributedCapabilities::new(true, [CollectiveGroupId::new(17)], true, true, true)
     }
 
     fn all_reduce_sum(
@@ -273,7 +272,7 @@ impl DistributedSession for MockDistributedSession {
         scope: CollectiveScope,
         input: &Self::Value,
     ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
-        assert_eq!(scope, CollectiveScope::Axis(ParallelAxis::Tensor));
+        assert_eq!(scope, CollectiveScope::Group(CollectiveGroupId::new(17)));
         Ok(Submission {
             output: MockDistributedValue(input.0.iter().map(|value| value * 2).collect()),
             completion: Done,
@@ -332,9 +331,9 @@ impl DistributedSession for MockDistributedSession {
     ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
         assert_eq!(scope, CollectiveScope::World);
         assert_eq!(peer, 1);
-        assert_eq!(value.dtype, TensorDtype::U32);
+        assert_eq!(value.dtype(), &TensorDtype::U32);
         Ok(Submission {
-            output: MockDistributedValue(vec![peer as u32; value.shape.iter().product()]),
+            output: MockDistributedValue(vec![peer as u32; value.shape().iter().product()]),
             completion: Done,
         })
     }
@@ -969,18 +968,21 @@ fn distributed_client_code<B: DistributedBackend>(
     let session = B::distributed_session(runtime.session())
         .expect("the conformance backend must expose its selected distributed session");
     let descriptor = session.descriptor();
-    assert_eq!(descriptor.topology.world_size(), 2);
-    assert_eq!(descriptor.rank, 0);
+    assert_eq!(descriptor.world_size(), 2);
+    assert_eq!(descriptor.rank(), 0);
     let capabilities = session.capabilities();
-    assert!(capabilities.world_collectives);
-    assert_eq!(capabilities.collective_axes, vec![ParallelAxis::Tensor]);
-    assert!(capabilities.point_to_point);
-    assert!(capabilities.variable_all_to_all);
-    assert!(capabilities.exact_completion);
+    assert!(capabilities.world_collectives());
+    assert_eq!(
+        capabilities.collective_groups(),
+        &[CollectiveGroupId::new(17)]
+    );
+    assert!(capabilities.point_to_point());
+    assert!(capabilities.variable_all_to_all());
+    assert!(capabilities.exact_completion());
 
     DistributedProbe {
         reduced: session
-            .all_reduce_sum(CollectiveScope::Axis(ParallelAxis::Tensor), input)
+            .all_reduce_sum(CollectiveScope::Group(CollectiveGroupId::new(17)), input)
             .unwrap()
             .wait()
             .unwrap(),
@@ -1003,10 +1005,7 @@ fn distributed_client_code<B: DistributedBackend>(
             .receive(
                 CollectiveScope::World,
                 1,
-                &ValueDescriptor {
-                    shape: vec![2],
-                    dtype: TensorDtype::U32,
-                },
+                &ValueDescriptor::new(vec![2], TensorDtype::U32).unwrap(),
             )
             .unwrap()
             .wait()
@@ -1708,18 +1707,26 @@ fn assert_prepared_generation_and_speculative_conformance() {
 struct MockRealtimeSession {
     step: u32,
     sampling: RealtimeSampling,
+    rollbacks: std::rc::Rc<std::cell::Cell<usize>>,
+    committed_step: std::rc::Rc<std::cell::Cell<u32>>,
 }
 
 impl SemanticStateTransaction for MockRealtimeSession {
     type Branch = Self;
-    type Error = Infallible;
+    type Error = MockRealtimeError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
         Ok(self.clone())
     }
 
     fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
+        branch.committed_step.set(branch.step);
         *self = branch;
+        Ok(())
+    }
+
+    fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {
+        branch.rollbacks.set(branch.rollbacks.get() + 1);
         Ok(())
     }
 }
@@ -1735,21 +1742,47 @@ impl WorkDescriptor for MockFrame {
     }
 }
 
-struct RealtimeDone;
+#[derive(Debug)]
+struct MockRealtimeError;
 
-impl Completion for RealtimeDone {
-    type Error = Infallible;
-
-    fn is_complete(&self) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-
-    fn wait(&self) -> Result<(), Self::Error> {
-        Ok(())
+impl std::fmt::Display for MockRealtimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("controlled realtime completion failure")
     }
 }
 
-struct MockRealtimeBackend;
+impl std::error::Error for MockRealtimeError {}
+
+struct RealtimeDone {
+    fail: bool,
+}
+
+impl Completion for RealtimeDone {
+    type Error = MockRealtimeError;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        if self.fail {
+            Err(MockRealtimeError)
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        if self.fail {
+            Err(MockRealtimeError)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Default)]
+struct MockRealtimeBackend {
+    fail_next_completion: std::cell::Cell<bool>,
+    rollbacks: std::rc::Rc<std::cell::Cell<usize>>,
+    committed_step: std::rc::Rc<std::cell::Cell<u32>>,
+}
 
 impl RealtimeBackend for MockRealtimeBackend {
     type Model = u64;
@@ -1758,7 +1791,7 @@ impl RealtimeBackend for MockRealtimeBackend {
     type Output = u32;
     type Session = MockRealtimeSession;
     type Completion = RealtimeDone;
-    type Error = Infallible;
+    type Error = MockRealtimeError;
 
     fn name(&self) -> &str {
         "portable-mock-realtime"
@@ -1820,7 +1853,12 @@ impl RealtimeBackend for MockRealtimeBackend {
         _: &Self::Model,
         sampling: RealtimeSampling,
     ) -> Result<Self::Session, Self::Error> {
-        Ok(MockRealtimeSession { step: 0, sampling })
+        Ok(MockRealtimeSession {
+            step: 0,
+            sampling,
+            rollbacks: std::rc::Rc::clone(&self.rollbacks),
+            committed_step: std::rc::Rc::clone(&self.committed_step),
+        })
     }
 
     fn validate_session(&self, _: &Self::Model, _: &Self::Session) -> Result<(), Self::Error> {
@@ -1853,7 +1891,9 @@ impl RealtimeBackend for MockRealtimeBackend {
         session.step += 1;
         Ok(Submission {
             output: *model as u32 + session.step + input.0.iter().sum::<u32>(),
-            completion: RealtimeDone,
+            completion: RealtimeDone {
+                fail: self.fail_next_completion.replace(false),
+            },
         })
     }
 }
@@ -1872,7 +1912,8 @@ impl RealtimeModelLoadingBackend for MockRealtimeBackend {
 }
 
 fn assert_realtime_conformance() {
-    let mut model = load_realtime_model_with_options(MockRealtimeBackend, 23, 0).unwrap();
+    let mut model =
+        load_realtime_model_with_options(MockRealtimeBackend::default(), 23, 0).unwrap();
     assert_eq!(model.backend().name(), "portable-mock-realtime");
     assert_eq!(*model.model(), 23);
     assert!(model.session_capabilities().persistent_cache);
@@ -1886,19 +1927,42 @@ fn assert_realtime_conformance() {
     scheduler
         .register_request(&model, request, RealtimeSampling::greedy())
         .unwrap();
-    scheduler
-        .enqueue(&model, request, MockFrame(vec![2]))
+    let frame = RealtimeInputFrame::new(1, vec![2]);
+    let input = model
+        .backend()
+        .materialize_input(model.model(), &frame)
         .unwrap();
+    scheduler.enqueue(&model, request, input).unwrap();
     let completed = scheduler.run_queued(&mut model).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed.into_iter().next().unwrap().into_parts().1, 26);
+    assert_eq!(model.backend().committed_step.get(), 1);
 
     let sampling = RealtimeSampling::new(0.5, 0.75, 11).unwrap();
     scheduler
         .set_request_sampling(&model, request, sampling)
         .unwrap();
-    let session = scheduler.release_request(request).unwrap();
-    assert_eq!(session.state().sampling, sampling);
+
+    model.backend().fail_next_completion.set(true);
+    let failing_frame = RealtimeInputFrame::new(1, vec![100]);
+    let failing_input = model
+        .backend()
+        .materialize_input(model.model(), &failing_frame)
+        .unwrap();
+    scheduler.enqueue(&model, request, failing_input).unwrap();
+    let error = match scheduler.run_queued(&mut model) {
+        Ok(_) => panic!("controlled completion failure unexpectedly committed"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("controlled realtime completion failure"));
+    assert_eq!(model.backend().rollbacks.get(), 1);
+    assert_eq!(
+        model.backend().committed_step.get(),
+        1,
+        "failed exact completion rolled back"
+    );
 }
 
 #[test]

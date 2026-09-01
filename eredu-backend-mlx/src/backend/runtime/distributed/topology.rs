@@ -10,9 +10,7 @@ use std::{
 use eredu_checkpoint::store::{
     CheckpointSource, ReadPolicy, SafetensorsWeightStore, TensorReadRequest, TensorSelection,
 };
-use eredu_core::{
-    balanced_contiguous_range, ParallelAxis, ParallelRankTopology, SubgroupMembership,
-};
+use eredu_core::{balanced_contiguous_range, CollectiveGroupDescriptor, CollectiveGroupId};
 use eredu_runtime::TensorPlacement;
 use safemlx::{distributed::Group as NativeGroup, Array, Stream};
 
@@ -27,113 +25,210 @@ use crate::backend::MlxParallelContext;
 #[cfg(test)]
 use safemlx::{Device, DeviceType};
 
-/// Backend communication contexts materialized from one Cartesian topology.
+type LogicalRoutePlan = Vec<(usize, Vec<Option<usize>>)>;
+
+/// Backend-only realization of one opaque collective group.
+#[derive(Debug, Clone)]
+pub(crate) struct CollectiveGroupRealization {
+    id: CollectiveGroupId,
+    members: Vec<usize>,
+    local_rank: usize,
+    split_color: usize,
+    logical_routes: Option<LogicalRoutePlan>,
+}
+
+impl CollectiveGroupRealization {
+    pub(crate) fn new(
+        id: CollectiveGroupId,
+        members: Vec<usize>,
+        local_rank: usize,
+        split_color: usize,
+        logical_routes: Option<LogicalRoutePlan>,
+    ) -> Result<Self, Error> {
+        CollectiveGroupDescriptor::new(id, members.clone(), local_rank)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(Self {
+            id,
+            members,
+            local_rank,
+            split_color,
+            logical_routes,
+        })
+    }
+
+    pub(crate) fn descriptor(&self) -> CollectiveGroupDescriptor {
+        CollectiveGroupDescriptor::new(self.id, self.members.clone(), self.local_rank)
+            .expect("collective realization is validated at construction")
+    }
+}
+
+/// Backend-only communication realization selected by architecture composition.
+#[derive(Debug, Clone)]
+pub(crate) struct CollectiveRealization {
+    world_size: usize,
+    global_rank: usize,
+    groups: Vec<CollectiveGroupRealization>,
+}
+
+impl CollectiveRealization {
+    pub(crate) fn new(
+        world_size: usize,
+        global_rank: usize,
+        groups: Vec<CollectiveGroupRealization>,
+    ) -> Result<Self, Error> {
+        if world_size == 0 || global_rank >= world_size {
+            return Err(Error::Parallel(
+                "collective realization has an invalid world rank".into(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        if groups.iter().any(|group| {
+            !ids.insert(group.id)
+                || group.members.iter().any(|member| *member >= world_size)
+                || group.members[group.local_rank] != global_rank
+        }) {
+            return Err(Error::Parallel(
+                "collective realization has invalid or duplicate opaque groups".into(),
+            ));
+        }
+        Ok(Self {
+            world_size,
+            global_rank,
+            groups,
+        })
+    }
+
+    pub(crate) const fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    pub(crate) const fn global_rank(&self) -> usize {
+        self.global_rank
+    }
+
+    pub(crate) fn descriptor(&self) -> eredu_core::DistributedSessionDescriptor {
+        eredu_core::DistributedSessionDescriptor::new(
+            self.world_size,
+            self.global_rank,
+            self.groups
+                .iter()
+                .filter(|group| group.members.len() > 1)
+                .map(CollectiveGroupRealization::descriptor)
+                .collect(),
+        )
+        .expect("collective realization is validated at construction")
+    }
+}
+
+/// Backend communication contexts materialized from opaque group realizations.
 ///
 /// Construction is collective when a non-global subgroup must be split. All
 /// ranks must call [`Self::new`] in the same order. Singleton axes do not own a
 /// communication group, while an axis spanning the complete world borrows the
 /// original group without splitting it.
 pub struct ParallelCommunicators<'a> {
-    topology: MlxParallelContext,
+    realization: CollectiveRealization,
     world: Group,
-    tensor: AxisCommunicator,
-    pipeline: AxisCommunicator,
-    expert: AxisCommunicator,
+    groups: HashMap<CollectiveGroupId, GroupCommunicator>,
     _world: PhantomData<&'a NativeGroup>,
 }
 
-struct AxisCommunicator {
-    membership: SubgroupMembership,
+struct GroupCommunicator {
+    realization: CollectiveGroupRealization,
     native: Option<Group>,
 }
-
-type LogicalRoutePlan = Vec<(usize, Vec<Option<usize>>)>;
 
 impl std::fmt::Debug for ParallelCommunicators<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ParallelCommunicators")
-            .field("topology", &self.topology)
-            .field("tensor", &self.tensor.membership)
-            .field("pipeline", &self.pipeline.membership)
-            .field("expert", &self.expert.membership)
+            .field("realization", &self.realization)
             .finish()
     }
 }
 
 impl<'a> ParallelCommunicators<'a> {
     /// Validates the world group and materializes every required native subgroup.
-    pub fn new(topology: MlxParallelContext, world: &'a NativeGroup) -> Result<Self, Error> {
-        if world.rank() != topology.global_rank || world.size() != topology.world_size {
+    pub(crate) fn new(
+        realization: CollectiveRealization,
+        world: &'a NativeGroup,
+    ) -> Result<Self, Error> {
+        if world.rank() != realization.global_rank || world.size() != realization.world_size {
             return Err(Error::Parallel(format!(
-                "parallel topology expects world rank {}/{} but received {}/{}",
-                topology.global_rank,
-                topology.world_size,
+                "collective realization expects world rank {}/{} but received {}/{}",
+                realization.global_rank,
+                realization.world_size,
                 world.rank(),
                 world.size()
             )));
         }
         let world = Group::native(world);
-        let tensor = Self::materialize(topology, &world, ParallelAxis::Tensor)?;
-        let pipeline = Self::materialize(topology, &world, ParallelAxis::Pipeline)?;
-        let expert = Self::materialize(topology, &world, ParallelAxis::Expert)?;
+        let mut groups = HashMap::new();
+        for group in realization.groups.iter().cloned() {
+            let id = group.id;
+            groups.insert(
+                id,
+                Self::materialize(group, realization.world_size, &world)?,
+            );
+        }
         Ok(Self {
-            topology,
+            realization,
             world,
-            tensor,
-            pipeline,
-            expert,
+            groups,
             _world: PhantomData,
         })
     }
 
     fn materialize(
-        topology: MlxParallelContext,
+        realization: CollectiveGroupRealization,
+        world_size: usize,
         world: &Group,
-        axis: ParallelAxis,
-    ) -> Result<AxisCommunicator, Error> {
-        let membership = topology.subgroup(axis)?;
-        let native = if membership.size == 1 || membership.size == topology.world_size {
+    ) -> Result<GroupCommunicator, Error> {
+        let size = realization.members.len();
+        let native = if size == 1 || size == world_size {
             None
         } else {
-            let color = i32::try_from(membership.color)
-                .map_err(|_| Error::Parallel(format!("{axis:?} subgroup color exceeds i32")))?;
-            let key = i32::try_from(membership.rank)
-                .map_err(|_| Error::Parallel(format!("{axis:?} subgroup rank exceeds i32")))?;
+            let color = i32::try_from(realization.split_color)
+                .map_err(|_| Error::Parallel("collective group split color exceeds i32".into()))?;
+            let key = i32::try_from(realization.local_rank)
+                .map_err(|_| Error::Parallel("collective group local rank exceeds i32".into()))?;
             let group = match world.split(color, Some(key)) {
                 Ok(group) => group,
-                Err(_) if axis != ParallelAxis::Pipeline => world
-                    .logical_subgroup_with_routes(
-                        &membership.global_ranks,
-                        logical_stage_axis_routes(topology, axis)?,
-                    )
-                    .map_err(|error| {
-                        Error::Parallel(format!(
-                            "failed to materialize routed logical {axis:?} subgroup color {} with members {:?}: {error}",
-                            membership.color, membership.global_ranks
-                        ))
-                    })?,
-                Err(_) => world
-                    .logical_subgroup(&membership.global_ranks)
-                    .map_err(|error| {
-                        Error::Parallel(format!(
-                            "failed to materialize native or logical {axis:?} subgroup color {} with members {:?}: {error}",
-                            membership.color, membership.global_ranks
-                        ))
-                    })?,
+                Err(_) => match realization.logical_routes.clone() {
+                    Some(routes) => world
+                        .logical_subgroup_with_routes(&realization.members, routes)
+                        .map_err(|error| {
+                            Error::Parallel(format!(
+                                "failed to materialize routed logical group {} with members {:?}: {error}",
+                                realization.id.value(), realization.members
+                            ))
+                        })?,
+                    None => world
+                        .logical_subgroup(&realization.members)
+                        .map_err(|error| {
+                            Error::Parallel(format!(
+                                "failed to materialize native or logical group {} with members {:?}: {error}",
+                                realization.id.value(), realization.members
+                            ))
+                        })?,
+                },
             };
-            if group.rank() != membership.rank || group.size() != membership.size {
+            if group.rank() != realization.local_rank || group.size() != size {
                 return Err(Error::Parallel(format!(
-                    "{axis:?} subgroup expected rank {}/{} but backend produced {}/{}",
-                    membership.rank,
-                    membership.size,
+                    "collective group {} expected rank {}/{} but backend produced {}/{}",
+                    realization.id.value(),
+                    realization.local_rank,
+                    size,
                     group.rank(),
                     group.size()
                 )));
             }
             Some(group)
         };
-        Ok(AxisCommunicator { membership, native })
+        Ok(GroupCommunicator {
+            realization,
+            native,
+        })
     }
 
     /// Returns the global communication group.
@@ -141,131 +236,82 @@ impl<'a> ParallelCommunicators<'a> {
         &self.world
     }
 
-    /// Returns the native group for a non-singleton axis.
-    pub fn group(&self, axis: ParallelAxis) -> Option<&Group> {
-        let communicator = match axis {
-            ParallelAxis::Tensor => &self.tensor,
-            ParallelAxis::Pipeline => &self.pipeline,
-            ParallelAxis::Expert => &self.expert,
-            ParallelAxis::Data => return None,
-        };
-        if communicator.membership.size == 1 {
+    /// Returns the group for an active opaque collective identity.
+    pub fn group(&self, id: CollectiveGroupId) -> Option<&Group> {
+        let communicator = self.groups.get(&id)?;
+        if communicator.realization.members.len() == 1 {
             None
-        } else if communicator.membership.size == self.topology.world_size {
+        } else if communicator.realization.members.len() == self.realization.world_size {
             Some(&self.world)
         } else {
             communicator.native.as_ref()
         }
     }
 
-    /// Returns the TP collective group, or `None` when TP is inactive.
-    pub fn tensor_group(&self) -> Option<&Group> {
-        self.group(ParallelAxis::Tensor)
-    }
-
-    /// Returns the pipeline-lane consensus group, or `None` when PP is inactive.
-    pub fn pipeline_group(&self) -> Option<&Group> {
-        self.group(ParallelAxis::Pipeline)
-    }
-}
-
-fn logical_stage_axis_routes(
-    topology: MlxParallelContext,
-    axis: ParallelAxis,
-) -> Result<LogicalRoutePlan, Error> {
-    let axis_size = match axis {
-        ParallelAxis::Tensor => topology.tensor_parallel_size,
-        ParallelAxis::Expert => topology.expert_parallel_size,
-        ParallelAxis::Pipeline => {
-            return Err(Error::Parallel(
-                "pipeline lanes do not use stage-local logical routes".into(),
-            ))
-        }
-        ParallelAxis::Data => {
-            return Err(Error::Parallel(
-                "MLX data-parallel logical routes are not implemented".into(),
-            ))
-        }
-    };
-    let stage_width = topology
-        .tensor_parallel_size
-        .checked_mul(topology.expert_parallel_size)
-        .ok_or_else(|| Error::Parallel("stage-local route width overflowed usize".into()))?;
-    let stage_start = topology
-        .pipeline_parallel_rank
-        .checked_mul(stage_width)
-        .ok_or_else(|| Error::Parallel("stage-local route start overflowed usize".into()))?;
-    let cohort = (stage_start..stage_start + stage_width).collect::<Vec<_>>();
-    let local_axis_rank = match axis {
-        ParallelAxis::Tensor => topology.tensor_parallel_rank,
-        ParallelAxis::Expert => topology.expert_parallel_rank,
-        ParallelAxis::Pipeline | ParallelAxis::Data => unreachable!(),
-    };
-    let mut routes = Vec::with_capacity(axis_size);
-    for shift in 0..axis_size {
-        let mut destinations = cohort
+    pub(crate) fn descriptors(&self) -> Vec<CollectiveGroupDescriptor> {
+        self.realization
+            .groups
             .iter()
-            .map(|&source_rank| -> Result<usize, Error> {
-                let source = ParallelRankTopology::new(topology.topology(), source_rank)?;
-                let mut coordinates = source.coordinates();
-                match axis {
-                    ParallelAxis::Tensor => {
-                        coordinates.tensor = (coordinates.tensor + shift) % axis_size;
-                    }
-                    ParallelAxis::Expert => {
-                        coordinates.expert = (coordinates.expert + shift) % axis_size;
-                    }
-                    ParallelAxis::Pipeline => unreachable!(),
-                    ParallelAxis::Data => unreachable!(),
-                }
-                Ok(topology.global_rank_for(coordinates)?)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let mut exchanges = Vec::with_capacity(stage_width);
-        for round in 0..stage_width {
-            let mut local_peer = None;
-            for left in (round % 2..stage_width.saturating_sub(1)).step_by(2) {
-                let right = left + 1;
-                if destinations[left] > destinations[right] {
-                    let left_rank = cohort[left];
-                    let right_rank = cohort[right];
-                    if topology.global_rank == left_rank {
-                        local_peer = Some(right_rank);
-                    } else if topology.global_rank == right_rank {
-                        local_peer = Some(left_rank);
-                    }
-                    destinations.swap(left, right);
-                }
-            }
-            exchanges.push(local_peer);
-        }
-        if destinations != cohort {
-            return Err(Error::Parallel(format!(
-                "failed to construct neighbor route for {axis:?} shift {shift} within stage cohort {cohort:?}"
-            )));
-        }
-        let source_rank = (local_axis_rank + axis_size - shift) % axis_size;
-        routes.push((source_rank, exchanges));
+            .filter(|group| group.members.len() > 1)
+            .map(CollectiveGroupRealization::descriptor)
+            .collect()
     }
-    Ok(routes)
+
+    pub(crate) fn group_ids(&self) -> Vec<CollectiveGroupId> {
+        self.realization
+            .groups
+            .iter()
+            .filter(|group| group.members.len() > 1)
+            .map(|group| group.id)
+            .collect()
+    }
+
+    pub(crate) const fn realization(&self) -> &CollectiveRealization {
+        &self.realization
+    }
 }
 
 /// A validated contiguous slice of a source tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TensorSlice {
     /// Source tensor axis being divided.
-    pub axis: usize,
+    axis: usize,
     /// Inclusive element offset on `axis`.
-    pub start: usize,
+    start: usize,
     /// Exclusive element offset on `axis`.
-    pub end: usize,
+    end: usize,
     /// Shard index.
-    pub index: usize,
+    index: usize,
     /// Total number of equal shards.
-    pub parts: usize,
+    parts: usize,
 }
 
 impl TensorSlice {
+    /// Returns the source tensor axis being divided.
+    pub const fn axis(&self) -> usize {
+        self.axis
+    }
+
+    /// Returns the inclusive element offset on the divided axis.
+    pub const fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Returns the exclusive element offset on the divided axis.
+    pub const fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Returns the zero-based shard index.
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns the total number of equal shards.
+    pub const fn parts(&self) -> usize {
+        self.parts
+    }
+
     /// Validates and calculates an equal contiguous tensor slice.
     pub fn for_shape(
         shape: &[usize],
@@ -832,6 +878,7 @@ pub fn load_partition_from_store_on_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::ParallelAxis;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     fn stream() -> Stream {
@@ -873,7 +920,11 @@ mod tests {
         for rank in 0..18 {
             let topology = topology(rank, 3, 2, 3);
             for axis in [ParallelAxis::Tensor, ParallelAxis::Expert] {
-                let routes = logical_stage_axis_routes(topology, axis).unwrap();
+                let routes =
+                    crate::composition::mlx::distributed::topology::logical_stage_group_routes(
+                        topology, axis,
+                    )
+                    .unwrap();
                 assert_eq!(routes.len(), 3);
                 let mut sources = routes.iter().map(|(source, _)| *source).collect::<Vec<_>>();
                 sources.sort_unstable();
@@ -891,8 +942,8 @@ mod tests {
     #[test]
     fn validates_tensor_slices() {
         let slice = TensorSlice::for_shape(&[4, 12], 1, 2, 3).unwrap();
-        assert_eq!(slice.start, 8);
-        assert_eq!(slice.end, 12);
+        assert_eq!(slice.start(), 8);
+        assert_eq!(slice.end(), 12);
         assert_eq!(slice.local_shape(&[4, 12]), [4, 4]);
         assert!(TensorSlice::for_shape(&[4, 11], 1, 0, 3).is_err());
         assert!(TensorSlice::for_shape(&[4, 12], 2, 0, 3).is_err());

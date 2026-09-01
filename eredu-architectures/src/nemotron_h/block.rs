@@ -322,7 +322,7 @@ impl<B: GroupedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let normalized = self.norm.forward(hidden, context)?;

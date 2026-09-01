@@ -101,7 +101,7 @@ pub fn forward_parallel_with_provider<B, C, P>(
 where
     B: GroupedNeuralBackend,
     C: AttentionCache<B::Tensor>,
-    P: RoutedExpertProvider<B>,
+    P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     P::Error: std::fmt::Display,
 {
     block.forward_tensor_parallel_with_feed_forward(

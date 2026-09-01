@@ -11,9 +11,9 @@ use crate::backend::error::Error;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DeviceAssignment {
     /// MLX device family used by this process.
-    pub device_type: DeviceType,
+    device_type: DeviceType,
     /// Index within this process's visible devices.
-    pub local_index: usize,
+    local_index: usize,
 }
 
 impl DeviceAssignment {
@@ -23,6 +23,16 @@ impl DeviceAssignment {
             device_type,
             local_index,
         }
+    }
+
+    /// Returns the selected MLX device family.
+    pub const fn device_type(self) -> DeviceType {
+        self.device_type
+    }
+
+    /// Returns the process-local device index.
+    pub const fn local_index(self) -> usize {
+        self.local_index
     }
 
     /// Resolves this assignment to an MLX device.
@@ -38,7 +48,7 @@ impl DeviceAssignment {
 pub struct MlxParallelContext {
     rank: ParallelRankTopology,
     /// Explicit process-local MLX device assignment.
-    pub device: DeviceAssignment,
+    device: DeviceAssignment,
 }
 
 impl MlxParallelContext {
@@ -117,6 +127,11 @@ impl MlxParallelContext {
         self.rank
     }
 
+    /// Resolves the process-local execution device selected by composition.
+    pub fn device(self) -> Result<Device, Error> {
+        self.device.device()
+    }
+
     /// Verifies that an execution stream uses the assigned MLX device.
     pub fn validate_execution_stream(self, stream: &Stream) -> Result<(), Error> {
         let actual = stream.get_device()?;
@@ -158,7 +173,7 @@ mod tests {
         assert_eq!(context.rank_topology().global_rank, 3);
         assert_eq!(context.coordinates().pipeline, 1);
         assert_eq!(context.coordinates().tensor, 1);
-        assert_eq!(context.device.local_index, 0);
+        assert_eq!(context.device.local_index(), 0);
     }
 
     #[test]

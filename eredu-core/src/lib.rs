@@ -68,14 +68,15 @@ pub use automatic::{
 };
 pub use backend::{
     load_model, prepare_inspected_model, BackendDescriptor, BackendError, BackendProvider,
-    BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
-    ControlledTextGenerationError, ControlledToken, DeviceCapabilities, DeviceDescriptor,
-    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
-    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
-    SessionCapabilities, SessionCapabilityError, SpeculativeTokenFilterController, Submission,
-    TextGeneration, TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
+    BackendSession, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope, Completion,
+    ControlledTextGeneration, ControlledTextGenerationError, ControlledToken, DeviceCapabilities,
+    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
+    DistributedSessionDescriptor, InspectableBackendSession, ModelCapabilityBackend,
+    ModelLoadError, ModelLoadingBackend, ModelRuntime, MultimodalPreparationBackend,
+    MultimodalPreparationFailure, PreparedModel, SessionCapabilities, SessionCapabilityError,
+    SpeculativeTokenFilterController, Submission, TextGeneration, TextGenerationBackend,
+    TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

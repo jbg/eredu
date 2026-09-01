@@ -540,6 +540,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
         self.group.unit_path(0, index)?;
         block.forward_parallel(
@@ -712,7 +713,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -769,7 +770,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -900,7 +901,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -918,7 +919,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.group.unit_path(group, index)?;

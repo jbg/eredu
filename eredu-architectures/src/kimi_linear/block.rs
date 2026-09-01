@@ -208,6 +208,7 @@ where
     ) -> Result<B::Tensor, Error>
     where
         C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
         self.forward_parallel_with_feed_forward(
             hidden,
@@ -216,7 +217,7 @@ where
             parallel,
             context,
             |policy, input, parallel, context| {
-                crate::decoder::FeedForwardOperator::forward_feed_forward_parallel(
+                crate::decoder::TensorParallelFeedForwardOperator::forward_feed_forward_parallel(
                     policy, input, parallel, context,
                 )
             },

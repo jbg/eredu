@@ -240,7 +240,7 @@ pub fn materialize_model_plan(
             Ok(requirements) => {
                 let policy = plan.policy();
                 let mut request = ReplicatedTextSelectionRequest::new(
-                    policy.residency,
+                    options.weight_residency.layers(),
                     CacheResidencyPolicy::Device,
                 )
                 .with_session(policy.required_session_capabilities)
@@ -269,6 +269,7 @@ pub fn materialize_model_plan(
         }
     };
     if let Some((requirements, selected)) = replicated {
+        let max_cached_shards = selected.residency().max_cached_shards();
         let (artifact, architecture_plan, _policy, _route) = plan.into_parts();
         let kind = prepared_model_kind(&architecture_plan);
         let executable = match artifact {
@@ -283,14 +284,13 @@ pub fn materialize_model_plan(
                     prepared_safetensors_architecture(&architecture_plan)?.clone(),
                     tensors,
                     shards,
-                    options.weight_residency.max_cached_shards(),
+                    max_cached_shards,
                 )?;
                 bind_replicated_text(
                     &architecture_plan,
                     requirements,
                     selected,
                     prepared.store(),
-                    options,
                     stream,
                     weights_stream,
                 )?
@@ -312,7 +312,7 @@ pub fn materialize_model_plan(
                         source.checkpoint().clone(),
                         source.plan().checkpoint(),
                         source.plan().tensor_mapping(),
-                        options.weight_residency.max_cached_shards(),
+                        max_cached_shards,
                     )?,
                 );
                 bind_replicated_text(
@@ -320,7 +320,6 @@ pub fn materialize_model_plan(
                     requirements,
                     selected,
                     store,
-                    options,
                     stream,
                     weights_stream,
                 )?
@@ -412,7 +411,6 @@ fn bind_replicated_text(
     requirements: eredu_runtime::ReplicatedTextRequirements,
     selected: eredu_runtime::SelectedReplicatedTextRealization,
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>, Error> {
@@ -423,7 +421,6 @@ fn bind_replicated_text(
         stream,
         super::replicated_text::BindingVisitor {
             store,
-            options: options.weight_residency.layers(),
             stream,
             weights_stream,
         },

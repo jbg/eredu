@@ -90,7 +90,7 @@ pub use expert::{
     reduce_routed_expert_tensor_parallel, reduce_tensor_parallel_expert_output,
     ObservedExpertProvider, ObservedExpertProviderError, ResidentExpertProvider,
     RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RoutedObservationPoint,
+    RoutedObservationPoint, TensorParallelRoutedExpertProvider,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
@@ -139,11 +139,13 @@ pub use realtime::{
     RealtimeGenerationTransactionError,
 };
 pub use replicated_text::{
-    select_replicated_text_realization, BackendMechanismCapabilities, ParameterTransformTarget,
-    ReplicatedTextArchitecture, ReplicatedTextContractError, ReplicatedTextParameterRequirement,
-    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
-    SelectedParameterRealization, SelectedReplicatedTextRealization, StateResidencyMechanism,
-    WeightLoweringCapability, WeightLoweringKind, WeightResidencyMechanism,
+    select_replicated_text_realization, BackendMechanismCapabilities, GroupedOperationRequirement,
+    ParameterTransformConstraint, ParameterTransformTarget, ReplicatedTextArchitecture,
+    ReplicatedTextContractError, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
+    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextRequirements,
+    ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, SelectedParameterRealization,
+    SelectedReplicatedTextRealization, StateResidencyMechanism, WeightLoweringCapability,
+    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,

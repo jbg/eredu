@@ -720,16 +720,16 @@ impl LocalLoadOptions {
     fn from_backend(
         options: eredu_backend_mlx::backend::config::ModelLoadOptions,
     ) -> Result<Self, crate::AutomaticPlanningError> {
-        if options.parallel_topology().is_some() {
+        if options.has_parallel_execution() {
             return Err(crate::AutomaticPlanningError::Invalid(
                 "selected-local inspection options cannot contain a native parallel context; use a portable execution plan"
                     .into(),
             ));
         }
         Ok(Self {
-            quantization: options.quantization,
-            weight_residency: options.weight_residency,
-            required_session_capabilities: options.required_session_capabilities,
+            quantization: options.quantization(),
+            weight_residency: options.weight_residency(),
+            required_session_capabilities: options.required_session_capabilities(),
         })
     }
 }

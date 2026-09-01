@@ -58,7 +58,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -76,7 +76,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         LayeredModel::forward_unit_parallel_with_provider(
@@ -996,7 +996,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.unit_path_inner(group, index)?;
@@ -1299,7 +1299,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1403,7 +1403,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

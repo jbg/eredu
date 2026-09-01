@@ -84,7 +84,7 @@ pub struct DsparkStatic<B: HyperNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -112,7 +112,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -130,7 +130,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         Model::forward_unit_parallel_with_provider(
@@ -974,7 +974,7 @@ where
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let embedded = B::vocabulary_parallel_lookup(
@@ -1228,7 +1228,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         M: AsMut<Unit<B>>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.pipeline_dspark_proposal_neutral_parallel_inner(
@@ -1539,7 +1539,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.groups.unit_count(group)?;
@@ -2672,7 +2672,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {

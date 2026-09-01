@@ -3,10 +3,12 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
 use eredu_architectures::{
+    configuration,
     decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
     gemma4, gpt_oss,
     llama::{self, LayeredInput, ModelArgs},
     moshi, muse_glimmer, qwen,
+    replicated_text::replicated_text_requirements,
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
@@ -22,7 +24,8 @@ use eredu_nn::{
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, ArchitectureParameters, DeviceState, ExpertPass,
     LayerRuntimeState, LayeredArchitecture, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
-    ParameterBackend, ParameterGroupSpec, PenaltyConfig, PredictionDirective,
+    ParameterBackend, ParameterGroupOwner, ParameterGroupSpec, PenaltyConfig, PredictionDirective,
+    ReplicatedTextParameterOwner, ReplicatedTextParameterPresence, ReplicatedTextParameterRole,
     ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
     RoutedExpertRequest, RuntimeLayerState, RuntimeState, Sampler, SamplingBackend,
     SequentialDecisionDriver, SequentialDecisionMode, SequentialDecisionPlan,
@@ -1272,6 +1275,103 @@ fn shared_decoder_exposes_architecture_owned_static_parameter_bindings() {
             ("output".into(), vec!["lm_head.weight".into()]),
         ])
     );
+}
+
+#[test]
+fn replicated_requirement_catalog_matches_authoritative_architecture_parameters() {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    let config = serde_json::json!({
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "hidden_size": 8,
+        "num_hidden_layers": 1,
+        "intermediate_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "rms_norm_eps": 0.00001,
+        "vocab_size": 32,
+        "max_position_embeddings": 128,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+    });
+    let args = qwen::model_args_from_config_value(&config).unwrap();
+    let model = qwen::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
+    let description = model.parameter_description(&()).unwrap();
+    let mut authoritative = BTreeMap::new();
+    for owned in description.groups() {
+        for member in owned.group().members() {
+            assert!(authoritative
+                .insert(
+                    member.target().to_owned(),
+                    (member.global_shape().to_vec(), owned.owner().clone()),
+                )
+                .is_none());
+        }
+    }
+
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let tensors = authoritative
+        .iter()
+        .map(|(name, (shape, _))| {
+            let elements = shape.iter().product::<usize>();
+            (name.clone(), shape.clone(), vec![0_u8; elements * 4])
+        })
+        .collect::<Vec<_>>();
+    let views = tensors
+        .iter()
+        .map(|(name, shape, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+    let inspection = configuration::inspect_artifact(artifact.path()).unwrap();
+    let requirements = replicated_text_requirements(&inspection).unwrap();
+
+    for (target, (shape, owner)) in &authoritative {
+        let requirement = requirements
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name() == target)
+            .unwrap_or_else(|| panic!("requirement catalog omitted {target}"));
+        assert_eq!(requirement.logical_shape(), shape);
+        assert_eq!(requirement.physical_shape(), Some(shape.as_slice()));
+        assert_eq!(requirement.sources(), std::slice::from_ref(target));
+        assert_eq!(
+            requirement.presence(),
+            &ReplicatedTextParameterPresence::Required
+        );
+        match (owner, requirement.owner()) {
+            (
+                ParameterGroupOwner::StaticRole(expected),
+                ReplicatedTextParameterOwner::StaticRole(actual),
+            ) => assert_eq!(actual, expected),
+            (
+                ParameterGroupOwner::ExecutionUnit { group, global_unit },
+                ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: actual_group,
+                    unit,
+                },
+            ) => {
+                assert_eq!(actual_group, group.as_str());
+                assert_eq!(unit, global_unit);
+            }
+            (expected, actual) => panic!("owner mismatch for {target}: {expected:?} != {actual:?}"),
+        }
+    }
+    assert!(requirements.parameters().iter().any(|parameter| {
+        parameter.role() == ReplicatedTextParameterRole::Normalization
+            && parameter.logical_shape().len() == 1
+    }));
 }
 
 #[test]

@@ -1,8 +1,6 @@
-//! Inspect a pairwise Cartesian distributed topology before loading weights.
-
 //! Inspect MLX Cartesian rank topology construction.
 
-use eredu_backend_mlx::backend::topology::{DeviceAssignment, MlxParallelContext};
+use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelContext};
 use safemlx::{
     distributed::{self, Backend},
     DeviceType,

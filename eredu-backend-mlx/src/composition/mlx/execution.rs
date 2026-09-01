@@ -107,9 +107,11 @@ pub(super) fn prefill_model_tensor_parallel(
     distributed: &MlxDistributedSession<'_>,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let group = distributed.tensor_group().ok_or_else(|| {
-        Error::Parallel("tensor-parallel model session has no tensor communicator".into())
-    })?;
+    let group = distributed
+        .selected_group(crate::backend::distributed::SHARD_GROUP_ID)
+        .ok_or_else(|| {
+            Error::Parallel("tensor-parallel model session has no tensor communicator".into())
+        })?;
     let logits = match executable {
         Executable::Gemma4(_, model, cache) => model
             .prefill_tensor_parallel(input, cache, group, stream)?
@@ -145,9 +147,11 @@ pub(super) fn decode_model_tensor_parallel(
     distributed: &MlxDistributedSession<'_>,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let group = distributed.tensor_group().ok_or_else(|| {
-        Error::Parallel("tensor-parallel model session has no tensor communicator".into())
-    })?;
+    let group = distributed
+        .selected_group(crate::backend::distributed::SHARD_GROUP_ID)
+        .ok_or_else(|| {
+            Error::Parallel("tensor-parallel model session has no tensor communicator".into())
+        })?;
     last_token_logits(
         forward_model_tensor_parallel(executable, input, group, stream)?,
         stream,
@@ -208,9 +212,11 @@ pub(super) fn prefill_model_tensor_parallel_with_observer(
     stream: &Stream,
     observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
 ) -> Result<Array, Error> {
-    let group = distributed.tensor_group().ok_or_else(|| {
-        Error::Parallel("tensor-parallel model session has no tensor communicator".into())
-    })?;
+    let group = distributed
+        .selected_group(crate::backend::distributed::SHARD_GROUP_ID)
+        .ok_or_else(|| {
+            Error::Parallel("tensor-parallel model session has no tensor communicator".into())
+        })?;
     let logits = match executable {
         Executable::Gemma4(_, model, cache) => model
             .prefill_tensor_parallel_with_observer(

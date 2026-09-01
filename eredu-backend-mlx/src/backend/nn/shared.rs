@@ -23,7 +23,8 @@ use eredu_nn::{
     ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
     RelativeAttentionInput, RotaryOperator, RotaryPosition, RotarySpec, SegmentedAttentionInput,
     SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TensorParallelGroupedOutput, TopKGroupSelectorSpec, VocabularyParallelRange,
+    TensorParallelGroupedGatedProductOperator, TensorParallelGroupedOutput,
+    TensorParallelGroupedRelu2Operator, TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use ref_cast::RefCast;
@@ -876,7 +877,9 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
         ))?;
         compute_tensor(output.reshape(input.shape(), context))
     }
+}
 
+impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &MlxTensor,
@@ -955,7 +958,9 @@ impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         ))?;
         compute_tensor(output.reshape(shape, context))
     }
+}
 
+impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &MlxTensor,

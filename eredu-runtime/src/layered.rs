@@ -968,7 +968,7 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: crate::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display;
 }
 
@@ -2089,7 +2089,7 @@ where
     where
         B: eredu_nn::GroupedNeuralBackend,
         A: ParallelRoutedLayeredArchitecture<B, S>,
-        Provider: RoutedExpertProvider<B>,
+        Provider: crate::TensorParallelRoutedExpertProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {

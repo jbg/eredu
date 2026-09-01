@@ -16,7 +16,6 @@ use crate::{
     generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
     observation::{InspectedOutput, ObservationRequest, ObservationSet},
-    topology::{ParallelAxis, ParallelTopology},
 };
 
 /// Stable, extensible description of an execution backend.
@@ -108,69 +107,244 @@ impl SessionCapabilityError {
 /// Fail-closed distributed operations exposed by one selected session.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DistributedCapabilities {
-    /// World-scoped collectives are available.
-    pub world_collectives: bool,
-    /// Active topology axes with subgroup collective support.
-    pub collective_axes: Vec<ParallelAxis>,
-    /// Point-to-point transfers are available.
-    pub point_to_point: bool,
-    /// Variable-count all-to-all exchange is available.
-    pub variable_all_to_all: bool,
-    /// Collective and transfer submissions have exact completion objects.
-    pub exact_completion: bool,
+    world_collectives: bool,
+    collective_groups: Vec<CollectiveGroupId>,
+    point_to_point: bool,
+    variable_all_to_all: bool,
+    exact_completion: bool,
+}
+
+impl DistributedCapabilities {
+    /// Creates an exact mechanism capability report.
+    pub fn new(
+        world_collectives: bool,
+        collective_groups: impl IntoIterator<Item = CollectiveGroupId>,
+        point_to_point: bool,
+        variable_all_to_all: bool,
+        exact_completion: bool,
+    ) -> Self {
+        Self {
+            world_collectives,
+            collective_groups: collective_groups.into_iter().collect(),
+            point_to_point,
+            variable_all_to_all,
+            exact_completion,
+        }
+    }
+
+    /// Returns whether world-scoped collectives are available.
+    pub const fn world_collectives(&self) -> bool {
+        self.world_collectives
+    }
+    /// Returns opaque groups supporting collectives.
+    pub fn collective_groups(&self) -> &[CollectiveGroupId] {
+        &self.collective_groups
+    }
+    /// Returns whether point-to-point transfers are available.
+    pub const fn point_to_point(&self) -> bool {
+        self.point_to_point
+    }
+    /// Returns whether variable-count all-to-all is available.
+    pub const fn variable_all_to_all(&self) -> bool {
+        self.variable_all_to_all
+    }
+    /// Returns whether submissions have exact completion objects.
+    pub const fn exact_completion(&self) -> bool {
+        self.exact_completion
+    }
+}
+
+/// Opaque stable identity of a selected collective group.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CollectiveGroupId(u32);
+
+impl CollectiveGroupId {
+    /// Creates an opaque group identity selected by architecture/runtime composition.
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+    /// Returns the stable numeric representation for serialization and backend maps.
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+/// Ordered membership for one opaque collective group containing this rank.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct CollectiveGroupDescriptor {
+    id: CollectiveGroupId,
+    members: Vec<usize>,
+    local_rank: usize,
+}
+
+impl CollectiveGroupDescriptor {
+    /// Validates ordered group membership and the process-local rank.
+    pub fn new(
+        id: CollectiveGroupId,
+        members: Vec<usize>,
+        local_rank: usize,
+    ) -> Result<Self, BackendError> {
+        if members.is_empty() || local_rank >= members.len() {
+            return Err(BackendError::Preparation {
+                operation: "collective group realization".into(),
+                message: "collective membership must be non-empty and contain local rank".into(),
+            });
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if !members.iter().all(|rank| unique.insert(*rank)) {
+            return Err(BackendError::Preparation {
+                operation: "collective group realization".into(),
+                message: "collective membership contains duplicate world ranks".into(),
+            });
+        }
+        Ok(Self {
+            id,
+            members,
+            local_rank,
+        })
+    }
+
+    /// Returns the opaque group identity.
+    pub const fn id(&self) -> CollectiveGroupId {
+        self.id
+    }
+    /// Returns ordered world-rank membership.
+    pub fn members(&self) -> &[usize] {
+        &self.members
+    }
+    /// Returns this process's rank within the ordered group.
+    pub const fn local_rank(&self) -> usize {
+        self.local_rank
+    }
+}
+
+impl<'de> Deserialize<'de> for CollectiveGroupDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            id: CollectiveGroupId,
+            members: Vec<usize>,
+            local_rank: usize,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.id, raw.members, raw.local_rank).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Scope of a collective or point-to-point operation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "axis", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "group", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CollectiveScope {
     /// All ranks in the selected distributed session.
     World,
-    /// The topology subgroup containing this rank on one axis.
-    Axis(ParallelAxis),
+    /// One opaque selected collective group containing this rank.
+    Group(CollectiveGroupId),
 }
 
 /// Portable shape and element type for a backend-owned received value.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ValueDescriptor {
     /// Row-major logical shape. An empty shape describes a scalar.
-    pub shape: Vec<usize>,
+    shape: Vec<usize>,
     /// Logical element type.
-    pub dtype: TensorDtype,
+    dtype: TensorDtype,
+}
+
+impl ValueDescriptor {
+    /// Validates a portable value shape and element type.
+    pub fn new(shape: Vec<usize>, dtype: TensorDtype) -> Result<Self, BackendError> {
+        if shape.contains(&0) {
+            return Err(BackendError::Preparation {
+                operation: "distributed value descriptor".into(),
+                message: "non-scalar distributed values require positive dimensions".into(),
+            });
+        }
+        Ok(Self { shape, dtype })
+    }
+
+    /// Returns the row-major logical shape.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Returns the logical element type.
+    pub const fn dtype(&self) -> &TensorDtype {
+        &self.dtype
+    }
+}
+
+impl<'de> Deserialize<'de> for ValueDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDescriptor {
+            shape: Vec<usize>,
+            dtype: TensorDtype,
+        }
+
+        let raw = RawDescriptor::deserialize(deserializer)?;
+        Self::new(raw.shape, raw.dtype).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Portable identity of one selected distributed session.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct DistributedSessionDescriptor {
-    /// Backend-neutral Cartesian topology.
-    pub topology: ParallelTopology,
-    /// World rank represented by this process-local session.
-    pub rank: usize,
+    world_size: usize,
+    rank: usize,
+    groups: Vec<CollectiveGroupDescriptor>,
 }
 
 impl DistributedSessionDescriptor {
-    /// Validates that `rank` belongs to `topology`.
-    pub fn new(topology: ParallelTopology, rank: usize) -> Result<Self, BackendError> {
-        let topology = ParallelTopology::new(
-            topology.tensor,
-            topology.pipeline,
-            topology.expert,
-            topology.data,
-        )
-        .map_err(|error| BackendError::Preparation {
-            operation: "distributed session topology".into(),
-            message: error.to_string(),
-        })?;
-        if rank >= topology.world_size() {
+    /// Validates a mechanism-only distributed session realization.
+    pub fn new(
+        world_size: usize,
+        rank: usize,
+        groups: Vec<CollectiveGroupDescriptor>,
+    ) -> Result<Self, BackendError> {
+        if world_size == 0 || rank >= world_size {
             return Err(BackendError::Preparation {
-                operation: "distributed session topology".into(),
-                message: format!(
-                    "rank {rank} is outside topology world size {}",
-                    topology.world_size()
-                ),
+                operation: "distributed session realization".into(),
+                message: format!("rank {rank} is outside world size {world_size}"),
             });
         }
-        Ok(Self { topology, rank })
+        let mut ids = std::collections::BTreeSet::new();
+        for group in &groups {
+            if !ids.insert(group.id())
+                || group.members().iter().any(|member| *member >= world_size)
+                || group.members()[group.local_rank()] != rank
+            {
+                return Err(BackendError::Preparation {
+                    operation: "distributed session realization".into(),
+                    message: "collective groups must have unique IDs, in-range members, and the declared local world rank".into(),
+                });
+            }
+        }
+        Ok(Self {
+            world_size,
+            rank,
+            groups,
+        })
+    }
+
+    /// Returns the total process count.
+    pub const fn world_size(&self) -> usize {
+        self.world_size
+    }
+    /// Returns this process's world rank.
+    pub const fn rank(&self) -> usize {
+        self.rank
+    }
+    /// Returns ordered opaque group realizations.
+    pub fn groups(&self) -> &[CollectiveGroupDescriptor] {
+        &self.groups
     }
 }
 
@@ -181,12 +355,13 @@ impl<'de> Deserialize<'de> for DistributedSessionDescriptor {
     {
         #[derive(Deserialize)]
         struct RawDescriptor {
-            topology: ParallelTopology,
+            world_size: usize,
             rank: usize,
+            groups: Vec<CollectiveGroupDescriptor>,
         }
 
         let raw = RawDescriptor::deserialize(deserializer)?;
-        Self::new(raw.topology, raw.rank).map_err(serde::de::Error::custom)
+        Self::new(raw.world_size, raw.rank, raw.groups).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1328,7 +1503,7 @@ mod tests {
         ));
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct Done;
     impl Completion for Done {
         type Error = Infallible;
@@ -1965,7 +2140,7 @@ mod tests {
         assert!(generation.next().is_none());
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct MockDistributed {
         descriptor: DistributedSessionDescriptor,
     }
@@ -1976,17 +2151,11 @@ mod tests {
         type Error = Infallible;
 
         fn descriptor(&self) -> DistributedSessionDescriptor {
-            self.descriptor
+            self.descriptor.clone()
         }
 
         fn capabilities(&self) -> DistributedCapabilities {
-            DistributedCapabilities {
-                world_collectives: true,
-                collective_axes: vec![ParallelAxis::Tensor],
-                point_to_point: true,
-                variable_all_to_all: true,
-                exact_completion: true,
-            }
+            DistributedCapabilities::new(true, [CollectiveGroupId::new(7)], true, true, true)
         }
 
         fn all_reduce_sum(
@@ -2045,7 +2214,7 @@ mod tests {
             value: &ValueDescriptor,
         ) -> Result<Submission<Vec<u32>, Done>, Infallible> {
             Ok(Submission {
-                output: vec![peer as u32; value.shape.iter().product()],
+                output: vec![peer as u32; value.shape().iter().product()],
                 completion: Done,
             })
         }
@@ -2067,16 +2236,23 @@ mod tests {
 
     #[test]
     fn mock_distributed_session_owns_collective_and_transfer_lifecycle() {
-        let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
+        let tensor_group =
+            CollectiveGroupDescriptor::new(CollectiveGroupId::new(7), vec![0, 1], 0).unwrap();
         let session = MockDistributed {
-            descriptor: DistributedSessionDescriptor::new(topology, 0).unwrap(),
+            descriptor: DistributedSessionDescriptor::new(2, 0, vec![tensor_group]).unwrap(),
         };
         let capabilities = session.capabilities();
-        assert!(capabilities.exact_completion);
-        assert_eq!(capabilities.collective_axes, vec![ParallelAxis::Tensor]);
+        assert!(capabilities.exact_completion());
+        assert_eq!(
+            capabilities.collective_groups(),
+            &[CollectiveGroupId::new(7)]
+        );
         assert_eq!(
             session
-                .all_reduce_sum(CollectiveScope::Axis(ParallelAxis::Tensor), &vec![2, 3])
+                .all_reduce_sum(
+                    CollectiveScope::Group(CollectiveGroupId::new(7)),
+                    &vec![2, 3]
+                )
                 .unwrap()
                 .wait()
                 .unwrap(),
@@ -2087,10 +2263,7 @@ mod tests {
                 .receive(
                     CollectiveScope::World,
                     1,
-                    &ValueDescriptor {
-                        shape: vec![2],
-                        dtype: TensorDtype::U32,
-                    },
+                    &ValueDescriptor::new(vec![2], TensorDtype::U32).unwrap(),
                 )
                 .unwrap()
                 .wait()
@@ -2102,7 +2275,7 @@ mod tests {
         let model_session = MockSession {
             model: 0,
             tokens: Vec::new(),
-            distributed: Some(session),
+            distributed: Some(session.clone()),
         };
         assert_eq!(
             Mock::distributed_session(&model_session)
@@ -2114,23 +2287,26 @@ mod tests {
 
     #[test]
     fn distributed_descriptors_round_trip_and_reject_invalid_ranks() {
-        let descriptor =
-            DistributedSessionDescriptor::new(ParallelTopology::new(2, 3, 1, 1).unwrap(), 4)
-                .unwrap();
+        let descriptor = DistributedSessionDescriptor::new(
+            6,
+            4,
+            vec![CollectiveGroupDescriptor::new(CollectiveGroupId::new(9), vec![1, 4], 1).unwrap()],
+        )
+        .unwrap();
         let encoded = serde_json::to_string(&descriptor).unwrap();
         assert_eq!(
             serde_json::from_str::<DistributedSessionDescriptor>(&encoded).unwrap(),
             descriptor
         );
-        let scope = CollectiveScope::Axis(ParallelAxis::Pipeline);
+        let scope = CollectiveScope::Group(CollectiveGroupId::new(9));
         assert_eq!(
             serde_json::from_str::<CollectiveScope>(&serde_json::to_string(&scope).unwrap())
                 .unwrap(),
             scope
         );
-        assert!(DistributedSessionDescriptor::new(descriptor.topology, 6).is_err());
+        assert!(DistributedSessionDescriptor::new(descriptor.world_size(), 6, Vec::new()).is_err());
         assert!(serde_json::from_str::<DistributedSessionDescriptor>(
-            r#"{"topology":{"tensor":2,"pipeline":3,"expert":1,"data":1},"rank":6}"#
+            r#"{"world_size":6,"rank":6,"groups":[]}"#
         )
         .is_err());
     }

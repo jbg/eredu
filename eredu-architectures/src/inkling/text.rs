@@ -9,7 +9,9 @@ use eredu_nn::{
     LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter,
     ParameterSpec, Parameterized, RelativeAttentionInput, Tensor,
 };
-use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
+use eredu_runtime::{
+    ExpertPass, RoutedExpertProvider, RoutedExpertRequest, TensorParallelRoutedExpertProvider,
+};
 
 use crate::linear_format::standard_expert_projection;
 
@@ -678,7 +680,10 @@ impl<B: GroupedNeuralBackend> SparseMlp<B> {
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         let routes = B::joint_group_selection(
             JointGroupSelectionInput::new(
                 hidden,
@@ -694,7 +699,8 @@ impl<B: GroupedNeuralBackend> SparseMlp<B> {
             )?,
             context,
         )?;
-        let routed = self.routed_experts.forward_grouped_tensor_parallel(
+        let routed = B::gated_product_groups_tensor_parallel(
+            &mut self.routed_experts,
             hidden,
             &GroupSelection::new(
                 routes.primary_indices().clone(),
@@ -714,7 +720,8 @@ impl<B: GroupedNeuralBackend> SparseMlp<B> {
             context,
         )?
         .broadcast_to(&[tokens, self.shared_count], context)?;
-        let shared = self.shared_experts.forward_grouped_tensor_parallel(
+        let shared = B::gated_product_groups_tensor_parallel(
+            &mut self.shared_experts,
             hidden,
             &GroupSelection::new(
                 shared_ids,
@@ -815,7 +822,7 @@ impl<B: GroupedNeuralBackend> SparseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = B::joint_group_selection(
@@ -974,7 +981,10 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         match self {
             Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
             Self::Sparse(sparse) => sparse.forward_parallel(hidden, parallel, context),
@@ -1013,7 +1023,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -1199,7 +1209,10 @@ impl<B: GroupedNeuralBackend> DecoderLayer<B> {
         state: Option<&mut C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         match state {
             Some(state) => {
                 let normalized = self.input_norm.forward(hidden, context)?;
@@ -1351,7 +1364,7 @@ impl<B: GroupedNeuralBackend> DecoderLayer<B> {
     ) -> Result<B::Tensor, Error>
     where
         C: AuxiliaryConvolutionState<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match state {

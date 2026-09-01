@@ -268,7 +268,7 @@ impl<B: GroupedNeuralBackend> PredictionUnit<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let hidden = match (

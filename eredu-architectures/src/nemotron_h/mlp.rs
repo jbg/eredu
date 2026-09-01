@@ -5,7 +5,10 @@ use eredu_nn::{
     LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
     TopKGroupSelectorSpec,
 };
-use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
+use eredu_runtime::{
+    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    TensorParallelRoutedExpertProvider,
+};
 
 use crate::linear_format::standard_expert_projection;
 
@@ -274,7 +277,7 @@ impl<B: GroupedNeuralBackend> SparseMoe<B> {
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.gate.select(input, context)?;

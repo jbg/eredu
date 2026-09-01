@@ -62,6 +62,7 @@ pub(crate) mod array {
 pub mod native {
     use safemlx::Stream;
 
+    pub use crate::backend::topology::{DeviceAssignment, MlxParallelContext};
     pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
@@ -104,6 +105,14 @@ pub mod native {
         world: &'a safemlx::distributed::Group,
     ) -> crate::backend::MlxBackend<'a> {
         crate::backend::MlxBackend::with_distributed_world(stream, weights_stream, world)
+    }
+
+    /// Binds composition-owned semantic topology to otherwise ordinary model options.
+    pub fn parallel_load_options(
+        topology: MlxParallelContext,
+        pipeline_wire: eredu_runtime::PipelineWireContract,
+    ) -> crate::backend::config::ModelLoadOptions {
+        crate::backend::config::ModelLoadOptions::with_parallel(topology, pipeline_wire)
     }
 }
 

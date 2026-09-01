@@ -290,7 +290,7 @@ where
     ) -> Result<B::Tensor, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -700,7 +700,7 @@ impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> V3Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {

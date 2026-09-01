@@ -1,14 +1,19 @@
 //! Dense and routed LFM2 feed-forward policies.
 
 use eredu_nn::{
-    Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator,
-    GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator,
-    LinearSpec, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor,
+    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
-use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
+use eredu_runtime::{
+    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    TensorParallelRoutedExpertProvider,
+};
 
-use crate::{decoder::FeedForwardOperator, linear_format::standard_expert_projection};
+use crate::{
+    decoder::{FeedForwardOperator, TensorParallelFeedForwardOperator},
+    linear_format::standard_expert_projection,
+};
 
 use super::{FeedForwardPolicy, ModelArgs};
 
@@ -298,7 +303,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -308,19 +313,20 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
             }
             Self::Routed(routed) => {
                 let routes = routed.router.select(input, context)?;
-                let output = RoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
-                    provider,
-                    &mut routed.experts,
-                    RoutedExpertRequest {
-                        layer: routed.layer,
-                        input,
-                        routes: &routes,
-                        pass,
-                    },
-                    B::parallel_size(parallel),
-                    context,
-                )
-                .map_err(|error| Error::backend(error.to_string()))?;
+                let output =
+                    TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
+                        provider,
+                        &mut routed.experts,
+                        RoutedExpertRequest {
+                            layer: routed.layer,
+                            input,
+                            routes: &routes,
+                            pass,
+                        },
+                        B::parallel_size(parallel),
+                        context,
+                    )
+                    .map_err(|error| Error::backend(error.to_string()))?;
                 eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             }
         }
@@ -359,7 +365,11 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             }
         }
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
+    for FeedForward<B>
+{
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -373,7 +383,8 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             }
             Self::Routed(routed) => {
                 let routes = routed.router.select(input, context)?;
-                let output = routed.experts.forward_grouped_tensor_parallel(
+                let output = B::gated_product_groups_tensor_parallel(
+                    &mut routed.experts,
                     input,
                     &routes,
                     B::parallel_size(parallel),

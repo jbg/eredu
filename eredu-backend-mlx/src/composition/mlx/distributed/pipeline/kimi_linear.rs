@@ -53,7 +53,7 @@ fn execute_neutral_routed_kimi_partition_observed<P>(
     observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
 ) -> Result<PipelineStageOutput, Error>
 where
-    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+    P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let storage_range = stage.range();

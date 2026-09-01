@@ -9,10 +9,11 @@ use eredu_core::cache::{
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
     BackendMechanismCapabilities, CacheResidencyPolicy, CacheResidencyReport,
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions,
+    DenseDiskStreamReport, GroupedOperationRequirement, LayerwiseRuntime, PagedCacheOptions,
     ReplicatedTextArchitecture, ReplicatedTextRequirements, ReplicatedTextSelectionRequest,
     ResidencyReport, RuntimeState, SelectedReplicatedTextRealization, StateResidencyMechanism,
-    WeightLoweringCapability, WeightLoweringKind, WeightResidencyMechanism,
+    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
+    WeightResidencyMechanism,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -52,26 +53,27 @@ pub(crate) fn capabilities(
 ) -> BackendMechanismCapabilities {
     let mut weight_lowerings = Vec::new();
     for parameter in requirements.parameters() {
+        if !parameter.presence().has_physical_source() {
+            continue;
+        }
         let requested = request
             .quantization()
             .and_then(|requested| parameter.transform_target(requested).ok().flatten())
             .map(|target| target.executable());
         for executable in std::iter::once(parameter.native_executable()).chain(requested) {
-            let kind = if executable == parameter.native_executable()
-                && supports_direct(parameter.source_encoding(), executable)
-            {
-                Some(WeightLoweringKind::Direct)
-            } else if supports_transform(parameter.source_encoding(), executable) {
-                Some(WeightLoweringKind::Transform)
-            } else {
-                None
-            };
+            let descriptor = parameter
+                .lowering_descriptor(executable)
+                .expect("validated replicated parameter forms a lowering query");
+            let kind =
+                if executable == parameter.native_executable() && supports_direct(&descriptor) {
+                    Some(WeightLoweringKind::Direct)
+                } else if supports_transform(&descriptor) {
+                    Some(WeightLoweringKind::Transform)
+                } else {
+                    None
+                };
             if let Some(kind) = kind {
-                let capability = WeightLoweringCapability::new(
-                    parameter.source_encoding().clone(),
-                    executable,
-                    kind,
-                );
+                let capability = WeightLoweringCapability::new(descriptor, kind);
                 if !weight_lowerings.contains(&capability) {
                     weight_lowerings.push(capability);
                 }
@@ -96,6 +98,12 @@ pub(crate) fn capabilities(
         output_observation: true,
         activation_inspection: true,
     })
+    .with_grouped_operations([
+        GroupedOperationRequirement::GatedProduct,
+        GroupedOperationRequirement::GatedProductTensorParallelPartial,
+        GroupedOperationRequirement::Relu2,
+        GroupedOperationRequirement::Relu2TensorParallelPartial,
+    ])
     .with_prompt_cache(true)
     .with_exact_completion(true)
 }
@@ -105,6 +113,8 @@ pub trait ErasedReplicatedTextExecutable {
     fn effective_model_type(&self) -> &str;
     fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate;
     fn selected_session_binding(&self) -> &SelectedSessionBinding;
+    #[cfg(test)]
+    fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency;
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport>;
@@ -212,6 +222,8 @@ where
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
+    #[cfg(test)]
+    selected_residency: eredu_runtime::LayerWeightResidency,
     selected_session: SelectedSessionBinding,
 }
 
@@ -224,7 +236,6 @@ where
     fn new(
         prepared: PreparedReplicatedTextArchitecture<A>,
         store: Arc<dyn CheckpointSource>,
-        options: LayerWeightResidency,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
@@ -233,10 +244,10 @@ where
         let selected_session = SelectedSessionBinding::from_selected(&selected);
         let capability_estimate = prepared.capability_estimate().clone();
         let effective_model_type = prepared.effective_model_type().to_owned();
+        let residency = selected.residency();
         let mut modules = prepared.into_modules();
         let mut architecture = modules.take_architecture();
         let source_architecture = modules.take_source_architecture();
-        validate_residency(&selected, options)?;
         validate_architecture_contract(&architecture, &requirements)?;
         let (store, materialization) = match source_architecture {
             Some(source) => {
@@ -294,12 +305,12 @@ where
             &mut architecture,
             (),
             PhantomData::<MlxKeyValueState>,
-            options,
+            residency,
             stream,
             weights_stream,
             |_| false,
         )?;
-        let execution = if options.is_fully_resident() {
+        let execution = if residency.is_fully_resident() {
             Execution::Resident(LayerwiseRuntime::new_policy_first(
                 policy.into_resident(&architecture, stream, PhantomData::<MlxKeyValueState>)?,
                 architecture,
@@ -324,6 +335,8 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
+            #[cfg(test)]
+            selected_residency: residency,
             selected_session,
         })
     }
@@ -431,6 +444,11 @@ where
 
     fn selected_session_binding(&self) -> &SelectedSessionBinding {
         &self.selected_session
+    }
+
+    #[cfg(test)]
+    fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency {
+        self.selected_residency
     }
 
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
@@ -551,24 +569,6 @@ where
     }
 }
 
-fn validate_residency(
-    selected: &SelectedReplicatedTextRealization,
-    options: LayerWeightResidency,
-) -> Result<(), Error> {
-    let actual = match options {
-        LayerWeightResidency::FullyResident => WeightResidencyMechanism::Resident,
-        LayerWeightResidency::LayerwiseHost(_) => WeightResidencyMechanism::Windowed,
-        LayerWeightResidency::DenseDiskStream(_) => WeightResidencyMechanism::DiskStreamed,
-    };
-    if selected.residency() != actual {
-        return Err(Error::ArchitectureModel(format!(
-            "selected replicated text residency {:?} disagrees with runtime policy {actual:?}",
-            selected.residency()
-        )));
-    }
-    Ok(())
-}
-
 fn selected_transform_quantization(
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<eredu_checkpoint::WeightQuantization, Error> {
@@ -603,7 +603,6 @@ fn selected_transform_quantization(
 /// Family-agnostic MLX visitor that binds neutral parameter topology.
 pub(crate) struct BindingVisitor<'a> {
     pub store: Arc<dyn CheckpointSource>,
-    pub options: LayerWeightResidency,
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
 }
@@ -622,19 +621,83 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for B
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        BoundReplicatedText::new(
-            prepared,
-            self.store,
-            self.options,
-            self.stream,
-            self.weights_stream,
-        )
-        .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+        BoundReplicatedText::new(prepared, self.store, self.stream, self.weights_stream)
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
 }
 
-fn supports_direct(source: &SourceTensorEncoding, executable: LinearFormat) -> bool {
-    match (source, executable) {
+fn valid_packed_geometry(descriptor: &WeightLoweringDescriptor) -> bool {
+    let Some(extent) = descriptor.packed_extent() else {
+        return false;
+    };
+    match descriptor.executable() {
+        LinearFormat::Affine(format) => usize::try_from(format.group_size)
+            .ok()
+            .is_some_and(|group| group != 0 && group <= extent && extent.is_multiple_of(group)),
+        LinearFormat::MxFp4 => extent.is_multiple_of(32),
+        LinearFormat::GgufIQuant { ggml_type, .. } => ggml_type
+            .block_and_bytes()
+            .ok()
+            .and_then(|(block, _)| usize::try_from(block).ok())
+            .is_some_and(|block| extent.is_multiple_of(block)),
+        LinearFormat::E4M3BlockFp8(_) => true,
+        LinearFormat::Dense => true,
+    }
+}
+
+fn valid_direct_source_geometry(descriptor: &WeightLoweringDescriptor) -> bool {
+    let same_unpacked_dimensions = |packed_axis: usize| {
+        descriptor
+            .physical_shape()
+            .iter()
+            .zip(descriptor.logical_shape())
+            .enumerate()
+            .all(|(axis, (physical, logical))| axis == packed_axis || physical == logical)
+    };
+    match descriptor.source() {
+        SourceTensorEncoding::Gguf { ggml_type, .. } => ggml_type
+            .block_and_bytes()
+            .ok()
+            .and_then(|(block, _)| usize::try_from(block).ok())
+            .is_some_and(|block| match descriptor.packed_axis() {
+                Some(axis) if same_unpacked_dimensions(axis) => {
+                    let physical = descriptor.physical_shape()[axis];
+                    let logical = descriptor.logical_shape()[axis];
+                    physical >= logical
+                        && physical.is_multiple_of(block)
+                        && physical - logical < block
+                }
+                Some(_) => false,
+                None => descriptor.physical_shape() == descriptor.logical_shape(),
+            }),
+        SourceTensorEncoding::Safetensors(StoredDtype::U32) => {
+            let Some(axis) = descriptor.packed_axis() else {
+                return false;
+            };
+            if !same_unpacked_dimensions(axis) {
+                return false;
+            }
+            let bits = match descriptor.executable() {
+                LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
+                LinearFormat::MxFp4 => Some(4),
+                _ => None,
+            };
+            bits.is_some_and(|bits| {
+                descriptor.physical_shape()[axis].checked_mul(32)
+                    == descriptor.logical_shape()[axis].checked_mul(bits)
+            }) && valid_packed_geometry(descriptor)
+        }
+        _ => {
+            descriptor.physical_shape() == descriptor.logical_shape()
+                && valid_packed_geometry(descriptor)
+        }
+    }
+}
+
+fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
+    let source = descriptor.source();
+    let executable = descriptor.executable();
+    let supported = match (source, executable) {
         (
             SourceTensorEncoding::Safetensors(
                 StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32,
@@ -671,10 +734,13 @@ fn supports_direct(source: &SourceTensorEncoding, executable: LinearFormat) -> b
                 && NativeQuantizationFormat::from_ggml_type(executable).is_some()
         }
         _ => false,
-    }
+    };
+    supported && (executable == LinearFormat::Dense || valid_direct_source_geometry(descriptor))
 }
 
-fn supports_transform(source: &SourceTensorEncoding, executable: LinearFormat) -> bool {
+fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool {
+    let source = descriptor.source();
+    let executable = descriptor.executable();
     let decodable = match source {
         SourceTensorEncoding::Safetensors(dtype) => matches!(
             dtype,
@@ -687,6 +753,8 @@ fn supports_transform(source: &SourceTensorEncoding, executable: LinearFormat) -
         _ => false,
     };
     decodable
+        && descriptor.physical_shape() == descriptor.logical_shape()
+        && valid_packed_geometry(descriptor)
         && match executable {
             LinearFormat::Affine(format) => format.validate().is_ok(),
             LinearFormat::MxFp4 => true,
@@ -720,18 +788,76 @@ mod tests {
     use eredu_core::{
         cache::LayerCachePolicy, AttentionPolicy, LayerSchedule, ModelConfigurationResolver,
     };
-    use eredu_runtime::{ReplicatedTextParameterRequirement, StateLayout};
+    use eredu_runtime::{
+        ParameterTransformConstraint, ReplicatedTextParameterRequirement, StateLayout,
+        WeightLoweringDescriptor,
+    };
+
+    #[test]
+    fn exact_lowering_rejects_unsupported_encodings_and_incoherent_physical_geometry() {
+        let affine =
+            LinearFormat::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let gguf = |physical_shape| {
+            WeightLoweringDescriptor::new(
+                SourceTensorEncoding::Gguf {
+                    ggml_type: eredu_gguf::GgmlType::Q4_0,
+                    endian: eredu_gguf::Endian::Little,
+                },
+                affine,
+                physical_shape,
+                vec![64, 8],
+                Some(1),
+            )
+            .unwrap()
+        };
+        assert!(supports_direct(&gguf(vec![64, 32])));
+        assert!(!supports_direct(&gguf(vec![63, 32])));
+        assert!(!supports_direct(&gguf(vec![64, 31])));
+        assert!(!supports_direct(&gguf(vec![64, 64])));
+
+        let safetensors = |source, physical_shape| {
+            WeightLoweringDescriptor::new(source, affine, physical_shape, vec![64, 64], Some(1))
+                .unwrap()
+        };
+        assert!(supports_direct(&safetensors(
+            SourceTensorEncoding::Safetensors(StoredDtype::U32),
+            vec![64, 8],
+        )));
+        assert!(!supports_direct(&safetensors(
+            SourceTensorEncoding::Safetensors(StoredDtype::U32),
+            vec![64, 7],
+        )));
+        assert!(!supports_direct(&safetensors(
+            SourceTensorEncoding::Safetensors(StoredDtype::U8),
+            vec![64, 64],
+        )));
+
+        let transform = safetensors(
+            SourceTensorEncoding::Safetensors(StoredDtype::F16),
+            vec![64, 32],
+        );
+        assert!(!supports_transform(&transform));
+    }
 
     #[test]
     fn report_distinguishes_native_and_transforming_lowerings() {
         let parameter = ReplicatedTextParameterRequirement::new(
             "projection.weight",
             vec!["projection.weight".into()],
-            SourceTensorEncoding::Safetensors(StoredDtype::F16),
+            Vec::new(),
+            Some(SourceTensorEncoding::Safetensors(StoredDtype::F16)),
+            Some(vec![64, 64]),
+            vec![64, 64],
             LinearFormat::Dense,
+            eredu_runtime::ReplicatedTextParameterRole::LinearWeight,
+            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
+                group: "decoder".into(),
+                unit: 0,
+            },
+            eredu_runtime::ReplicatedTextParameterPresence::Required,
+            ParameterTransformConstraint::Linear { packed_axis: 1 },
         )
-        .unwrap()
-        .with_affine_transforms();
+        .unwrap();
         let graph = eredu_runtime::ExecutionGraph::chain(["decoder"]).unwrap();
         let requirements = ReplicatedTextRequirements::new(
             eredu_nn::NeuralOperatorCapabilities::NONE,
@@ -758,7 +884,7 @@ mod tests {
         )
         .unwrap();
         let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-            eredu_core::ResidencyRequest::FullyResident,
+            eredu_runtime::LayerWeightResidency::FullyResident,
             CacheResidencyPolicy::Device,
         )
         .with_quantization(eredu_core::QuantizationRequest::Affine {
@@ -1121,7 +1247,7 @@ mod tests {
             eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
                 .unwrap();
         let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-            eredu_core::ResidencyRequest::FullyResident,
+            eredu_runtime::LayerWeightResidency::FullyResident,
             CacheResidencyPolicy::Device,
         );
         let request = request.with_topology(topology.topology());
@@ -1158,7 +1284,7 @@ mod tests {
                     .with_full_attention(true),
             );
             let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-                eredu_core::ResidencyRequest::FullyResident,
+                eredu_runtime::LayerWeightResidency::FullyResident,
                 state.clone(),
             );
             let selected = eredu_runtime::select_replicated_text_realization(
@@ -1202,7 +1328,6 @@ mod tests {
                     &stream,
                     BindingVisitor {
                         store: prepared.store(),
-                        options: LayerWeightResidency::FullyResident,
                         stream: &stream,
                         weights_stream: &weights_stream,
                     },
@@ -1401,11 +1526,16 @@ mod tests {
         }
 
         let (stream, weights_stream) = execution_streams();
+        let mut host = eredu_runtime::LayerwiseLoadOptions::new(
+            eredu_core::residency::OffloadConfig::new(Some(u64::MAX), Some(u64::MAX), 7).unwrap(),
+        );
+        host.max_cached_shards = 3;
+        let disk = eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 30, 2 << 30, 5, 4).unwrap();
         for (model_type, residency) in ["llama", "qwen2"].into_iter().flat_map(|family| {
             [
                 eredu_runtime::WeightResidency::fully_resident(),
-                eredu_runtime::WeightResidency::layerwise_host(Default::default()),
-                eredu_runtime::WeightResidency::dense_disk_stream(Default::default()),
+                eredu_runtime::WeightResidency::layerwise_host(host),
+                eredu_runtime::WeightResidency::dense_disk_stream(disk),
             ]
             .into_iter()
             .map(move |residency| (family, residency))
@@ -1442,6 +1572,7 @@ mod tests {
             let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
                 panic!("ordinary replicated text must use the generic executable")
             };
+            assert_eq!(generic.selected_residency(), residency.layers());
             generic
                 .decode(&Array::from_slice(&[1_u32, 2], &[1, 2]), &stream)
                 .unwrap()

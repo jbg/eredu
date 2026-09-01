@@ -8,9 +8,16 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    TensorParallelRoutedExpertProvider,
 };
 
-use crate::{decoder::FeedForwardOperator, linear_format::standard_expert_projection};
+use crate::{
+    decoder::{
+        FeedForwardOperator, TensorParallelFeedForwardOperator,
+        TensorParallelRoutedFeedForwardOperator,
+    },
+    linear_format::standard_expert_projection,
+};
 
 use super::config::ModelArgs;
 
@@ -66,7 +73,11 @@ impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for R
     {
         RoutedMlp::forward_with_provider(self, input, pass, provider, context)
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelRoutedFeedForwardOperator<B>
+    for RoutedMlp<B>
+{
     fn forward_parallel_with_provider<P>(
         &mut self,
         _layer: usize,
@@ -77,7 +88,7 @@ impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for R
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         RoutedMlp::forward_parallel_with_provider(self, input, pass, parallel, provider, context)
@@ -158,7 +169,7 @@ impl<B: GroupedNeuralBackend> RoutedMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.router.select(input, context)?;
@@ -341,7 +352,11 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedMlp<B> {
             context,
         )
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
+    for RoutedMlp<B>
+{
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,

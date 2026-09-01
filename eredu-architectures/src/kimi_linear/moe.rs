@@ -1,14 +1,19 @@
 //! Kimi dense-prefix and grouped routed-expert feed-forward operators.
 
 use eredu_nn::{
-    Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator,
-    GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator,
-    LinearSpec, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor,
+    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
-use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
+use eredu_runtime::{
+    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    TensorParallelRoutedExpertProvider,
+};
 
-use crate::{decoder::FeedForwardOperator, linear_format::standard_expert_projection};
+use crate::{
+    decoder::{FeedForwardOperator, TensorParallelFeedForwardOperator},
+    linear_format::standard_expert_projection,
+};
 
 use super::{FeedForwardPolicy, ModelArgs};
 
@@ -320,7 +325,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -377,7 +382,11 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             &mut provider,
         )
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
+    for FeedForward<B>
+{
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -391,7 +400,8 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             }
             Self::Sparse(sparse) => {
                 let routes = sparse.router.select(input, context)?;
-                let routed = sparse.experts.forward_grouped_tensor_parallel(
+                let routed = B::gated_product_groups_tensor_parallel(
+                    &mut sparse.experts,
                     input,
                     &routes,
                     B::parallel_size(parallel),

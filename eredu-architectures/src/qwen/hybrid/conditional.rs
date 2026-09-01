@@ -91,7 +91,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -109,7 +109,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match group {
@@ -1382,7 +1382,7 @@ impl<B: GroupedNeuralBackend> ConditionalLayeredModel<B> {
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let state_index = self.state_index(group, index)?;
@@ -1846,7 +1846,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -2082,7 +2082,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

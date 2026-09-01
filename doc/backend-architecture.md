@@ -235,8 +235,12 @@ Replicated text composition has one checked cross-crate construction flow.
 `eredu-architectures` derives `ReplicatedTextRequirements` from the normalized
 architecture and the exact admitted artifact. The requirements contain the
 execution graph and unit layout, group transport, complete state layout,
-canonical logical parameters, admitted source encodings, architecture-valid
-executable formats, and transform constraints. Caller-selected topology,
+complete canonical parameter topology, admitted physical sources and
+encodings, aliases and derivations, logical and physical shapes, ownership,
+presence, architecture-native executable formats, and exact transform
+constraints. Transform constraints include the packed axis, linear input
+extent, affine group size and bit width, or the physical block geometry needed
+by the requested format. Caller-selected topology,
 weight residency, mutable-state residency, load-time transformation, cache,
 observation, persistence, and completion facilities live in a separate
 `ReplicatedTextSelectionRequest`. A concrete backend reports only reusable
@@ -245,6 +249,16 @@ through `BackendMechanismCapabilities`. The neutral selector resolves those
 three values into one
 `SelectedReplicatedTextRealization` before architecture modules or weight
 payloads are constructed.
+
+Selection compares the complete architecture transform constraint with an
+exact backend lowering descriptor. A lowering descriptor identifies the source
+encoding, target executable format, logical shape, and packed axis. A request
+is rejected atomically when either side rejects the geometry; selection never
+silently transforms only the convenient matrices. Rank-one normalization,
+optional bias, tied, derived, and checkpoint-companion parameters remain in the
+requirements even when no transform applies. The resulting per-parameter
+realizations are the only source and format choices consumed by module
+construction and materialization.
 
 Architecture-owned typed dispatch constructs Llama/Mistral and ordinary dense
 Qwen2/Qwen3 modules with the selected executable formats and hands the selected
@@ -255,6 +269,13 @@ constructs state from the architecture-owned layout, and erases the paired
 runtime and state only at the session boundary. The erased interface performs
 one dispatch per session operation; tensor operations and execution-unit
 traversal remain statically dispatched.
+
+The selected realization is also the sole construction authority for exact
+weight-residency limits, mutable-state paging, topology realization, session
+facilities, prompt-cache persistence, and completion ownership. Backend stream,
+device, and native group handles are execution contexts rather than policy.
+Once selection succeeds, the binding visitor receives no second copy of caller
+load options from which it could choose a conflicting policy.
 
 Source storage, executable format, and native lowering are independent values.
 SafeTensors handoff carries the admitted `SafetensorsShards`, including index
@@ -271,7 +292,14 @@ to the layered lifecycle and remains generic over its runtime state. Hybrid
 component state uses the `RuntimeStateComponents` extension; architecture-owned
 routing translates expert identity and assignment into `GroupedNeuralBackend`
 selection and projection mechanisms, independently addressable parameter-bank
-keys, and ordinary collectives; partitioning adds
+keys, and opaque collective-group realizations. Architecture/runtime semantic
+plans translate tensor, pipeline, routed, data, or later axes into ordered
+world-rank memberships, group-local ranks, generic point-to-point routes, and
+required collective operations before invoking a backend. Backend sessions
+materialize groups by opaque identity and never infer why a group exists.
+Tensor-parallel grouped partials are a required additive mechanism separate
+from ordinary grouped execution; selection rejects the missing extension
+before construction. Partitioning adds
 `PartitionedLayeredArchitecture`, boundary schemas, and collective contexts;
 composite models use `PreparedModelInput` and architecture-owned execution
 groups; embedded prediction uses separately identified prediction groups and

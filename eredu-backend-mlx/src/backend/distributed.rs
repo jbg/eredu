@@ -2,8 +2,8 @@
 
 use eredu_core::checkpoint::TensorDtype;
 use eredu_core::{
-    BackendError, CollectiveScope, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, ParallelAxis, ParallelCoordinates, Submission, ValueDescriptor,
+    BackendError, CollectiveGroupId, CollectiveScope, DistributedBackend, DistributedCapabilities,
+    DistributedSession, DistributedSessionDescriptor, Submission, ValueDescriptor,
 };
 use eredu_runtime::Sampler;
 use safemlx::{
@@ -20,15 +20,19 @@ use crate::{
             self,
             completion::DistributedCompletion,
             parallel::{sample_and_synchronize, ParallelExecutionContext, SynchronizedToken},
-            topology::ParallelCommunicators,
+            topology::{CollectiveRealization, ParallelCommunicators},
             Group,
         },
         generation::MlxSamplingBackend,
     },
 };
 
-use super::{MlxBackend, MlxParallelContext};
+use super::MlxBackend;
 use crate::MlxTensor;
+
+pub(crate) const SHARD_GROUP_ID: CollectiveGroupId = CollectiveGroupId::new(1);
+pub(crate) const STAGE_GROUP_ID: CollectiveGroupId = CollectiveGroupId::new(2);
+pub(crate) const ADDRESSABLE_GROUP_ID: CollectiveGroupId = CollectiveGroupId::new(3);
 
 /// Gathers equal-shaped shards along an arbitrary existing tensor axis.
 pub fn all_gather_axis(
@@ -151,11 +155,15 @@ pub fn all_gather_uneven_axis(
 }
 
 /// Inputs needed to attach MLX communication to one selected backend session.
-pub struct MlxDistributedConfig<'a> {
-    /// Validated rank-local topology.
-    pub topology: MlxParallelContext,
-    /// MLX world communicator selected for this complete session.
-    pub world: &'a NativeGroup,
+pub(crate) struct MlxDistributedConfig<'a> {
+    realization: CollectiveRealization,
+    world: &'a NativeGroup,
+}
+
+impl<'a> MlxDistributedConfig<'a> {
+    pub(crate) const fn new(realization: CollectiveRealization, world: &'a NativeGroup) -> Self {
+        Self { realization, world }
+    }
 }
 
 /// MLX communication capability attached to one complete model/session.
@@ -166,63 +174,47 @@ pub struct MlxDistributedConfig<'a> {
 /// backend session.
 #[derive(Debug)]
 pub struct MlxDistributedSession<'a> {
-    topology: MlxParallelContext,
     communicators: ParallelCommunicators<'a>,
     stream: Stream,
 }
 
 impl<'a> MlxDistributedSession<'a> {
     /// Creates a distributed session and validates its execution stream.
-    pub fn new(config: MlxDistributedConfig<'a>, stream: &Stream) -> Result<Self, Error> {
-        config.topology.validate_execution_stream(stream)?;
-        let communicators = ParallelCommunicators::new(config.topology, config.world)?;
+    pub(crate) fn new(config: MlxDistributedConfig<'a>, stream: &Stream) -> Result<Self, Error> {
+        let communicators = ParallelCommunicators::new(config.realization, config.world)?;
         Ok(Self {
-            topology: config.topology,
             communicators,
             stream: stream.clone(),
         })
     }
 
-    /// Returns the validated MLX runtime topology.
-    pub const fn topology(&self) -> MlxParallelContext {
-        self.topology
-    }
-
     /// Returns the execution stream selected for this session.
-    pub const fn stream(&self) -> &Stream {
+    pub(crate) const fn stream(&self) -> &Stream {
         &self.stream
     }
 
     /// Returns the world communicator for the session.
-    pub const fn world(&self) -> &Group {
+    pub(crate) const fn world(&self) -> &Group {
         self.communicators.world()
     }
 
     /// Creates the tensor-parallel execution context, or a replicated context.
-    pub fn tensor_context(&self) -> Result<ParallelExecutionContext<'_>, Error> {
-        match self.communicators.tensor_group() {
-            Some(group) => {
-                ParallelExecutionContext::tensor_parallel(self.topology(), group, &self.stream)
-            }
+    pub(crate) fn partitioned_context(
+        &self,
+        id: CollectiveGroupId,
+    ) -> Result<ParallelExecutionContext<'_>, Error> {
+        match self.communicators.group(id) {
+            Some(group) => ParallelExecutionContext::partitioned(group, &self.stream),
             None => Ok(ParallelExecutionContext::replicated(&self.stream)),
         }
     }
 
-    /// Returns the tensor-parallel communicator when that axis is partitioned.
-    pub fn tensor_group(&self) -> Option<&Group> {
-        self.communicators.tensor_group()
+    /// Returns the communicator for an active opaque group identity.
+    pub(crate) fn selected_group(&self, id: CollectiveGroupId) -> Option<&Group> {
+        self.communicators.group(id)
     }
 
-    /// Returns the communicator for an active typed topology axis.
-    pub fn axis_group(&self, axis: ParallelAxis) -> Option<&Group> {
-        self.communicators.group(axis)
-    }
-
-    /// Returns the pipeline-parallel communicator when that axis is partitioned.
-    pub fn pipeline_group(&self) -> Option<&Group> {
-        self.communicators.pipeline_group()
-    }
-
+    #[cfg(test)]
     fn world_control_consensus(&self, local: [i32; 2]) -> Result<[i32; 2], Error> {
         let world = self.world();
         if world.size() == 1 {
@@ -267,105 +259,59 @@ impl<'a> MlxDistributedSession<'a> {
         Ok(result)
     }
 
-    /// Submits hidden activations to the succeeding pipeline coordinate.
-    pub fn send_pipeline(
+    #[cfg(test)]
+    pub(crate) fn send_selected(
         &self,
-        hidden: &MlxTensor,
+        group: CollectiveGroupId,
+        peer: usize,
+        value: &MlxTensor,
     ) -> Result<DistributedCompletion<MlxTensor>, Error> {
-        let topology = self.topology();
-        if topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size {
-            return Err(Error::Parallel(
-                "the final pipeline stage has no successor".into(),
-            ));
-        }
-        Ok(DistributedSession::send(
-            self,
-            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Pipeline),
-            topology.pipeline_parallel_rank + 1,
-            hidden,
-        )?
-        .completion)
+        Ok(DistributedSession::send(self, CollectiveScope::Group(group), peer, value)?.completion)
     }
 
-    /// Submits a receive from the preceding pipeline coordinate.
-    pub fn receive_pipeline(
+    #[cfg(test)]
+    pub(crate) fn receive_selected(
         &self,
+        group: CollectiveGroupId,
+        peer: usize,
         shape: &[usize],
         dtype: TensorDtype,
     ) -> Result<DistributedCompletion<MlxTensor>, Error> {
-        let topology = self.topology();
-        if topology.pipeline_parallel_rank == 0 {
-            return Err(Error::Parallel(
-                "the first pipeline stage has no predecessor".into(),
-            ));
-        }
         Ok(DistributedSession::receive(
             self,
-            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Pipeline),
-            topology.pipeline_parallel_rank - 1,
-            &ValueDescriptor {
-                shape: shape.to_vec(),
-                dtype,
-            },
+            CollectiveScope::Group(group),
+            peer,
+            &ValueDescriptor::new(shape.to_vec(), dtype).map_err(Error::Backend)?,
         )?
         .completion)
     }
 
+    /// Submits hidden activations to the succeeding pipeline coordinate.
     fn group(&self, scope: CollectiveScope) -> Result<&Group, Error> {
         match scope {
             CollectiveScope::World => Ok(self.world()),
-            CollectiveScope::Axis(ParallelAxis::Data) => {
-                Err(Error::Backend(BackendError::Unsupported {
-                    backend: "mlx".into(),
-                    capability: "data-parallel subgroup".into(),
-                }))
-            }
-            CollectiveScope::Axis(axis) => self.communicators.group(axis).ok_or_else(|| {
+            CollectiveScope::Group(id) => self.communicators.group(id).ok_or_else(|| {
                 Error::Backend(BackendError::Unsupported {
                     backend: "mlx".into(),
-                    capability: format!("{axis:?} collective on a singleton axis"),
+                    capability: format!("collective group {} is inactive", id.value()),
                 })
             }),
+            _ => Err(Error::Backend(BackendError::Unsupported {
+                backend: "mlx".into(),
+                capability: "unknown collective scope".into(),
+            })),
         }
     }
 
     /// Returns whether `scope` is implemented by an MLX logical subgroup.
-    pub fn scope_is_logical(&self, scope: CollectiveScope) -> Result<bool, Error> {
+    #[cfg(test)]
+    pub(crate) fn scope_is_logical(&self, scope: CollectiveScope) -> Result<bool, Error> {
         Ok(self.group(scope)?.is_logical())
-    }
-
-    /// Samples on the canonical final-stage rank and synchronizes generation globally.
-    #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: Sampler<MlxSamplingBackend>>(
-        &self,
-        logits: Option<&MlxTensor>,
-        batch_size: i32,
-        sampler: &mut S,
-        temperature: f32,
-        prng_state: Option<&mut crate::backend::random::RandomState>,
-        finished: bool,
-    ) -> Result<SynchronizedToken, Error> {
-        let topology = self.topology();
-        let sampling_rank = topology.global_rank_for(ParallelCoordinates {
-            tensor: 0,
-            pipeline: topology.pipeline_parallel_size - 1,
-            expert: 0,
-            data: topology.data_parallel_rank,
-        })?;
-        self.sample_and_synchronize_on_rank(
-            logits,
-            batch_size,
-            sampler,
-            temperature,
-            prng_state,
-            finished,
-            sampling_rank,
-        )
     }
 
     /// Samples on an explicitly selected world rank and synchronizes globally.
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize_on_rank<S: Sampler<MlxSamplingBackend>>(
+    pub(crate) fn sample_and_synchronize_on_rank<S: Sampler<MlxSamplingBackend>>(
         &self,
         logits: Option<&MlxTensor>,
         batch_size: i32,
@@ -389,7 +335,8 @@ impl<'a> MlxDistributedSession<'a> {
     }
 
     /// Reaches global failure or cancellation consensus in a fixed order.
-    pub fn operation_consensus(
+    #[cfg(test)]
+    pub(crate) fn operation_consensus(
         &self,
         local_failed: bool,
         local_cancelled: bool,
@@ -400,7 +347,7 @@ impl<'a> MlxDistributedSession<'a> {
     }
 
     fn value_dtype(value: &ValueDescriptor) -> Result<Dtype, Error> {
-        match &value.dtype {
+        match value.dtype() {
             TensorDtype::Bool => Ok(Dtype::Bool),
             TensorDtype::F32 => Ok(Dtype::Float32),
             TensorDtype::F16 => Ok(Dtype::Float16),
@@ -424,7 +371,7 @@ impl<'a> MlxDistributedSession<'a> {
 
     fn value_shape(value: &ValueDescriptor) -> Result<Vec<i32>, Error> {
         value
-            .shape
+            .shape()
             .iter()
             .map(|dimension| {
                 i32::try_from(*dimension).map_err(|_| {
@@ -453,30 +400,16 @@ impl DistributedSession for MlxDistributedSession<'_> {
     type Error = Error;
 
     fn descriptor(&self) -> DistributedSessionDescriptor {
-        let topology = self.topology();
-        DistributedSessionDescriptor::new(topology.topology(), topology.global_rank)
-            .expect("MLX rank belongs to its topology")
+        DistributedSessionDescriptor::new(
+            self.communicators.realization().world_size(),
+            self.communicators.realization().global_rank(),
+            self.communicators.descriptors(),
+        )
+        .expect("MLX collective realization is validated")
     }
 
     fn capabilities(&self) -> DistributedCapabilities {
-        let topology = self.topology();
-        let mut collective_axes = Vec::with_capacity(3);
-        if topology.tensor_parallel_size > 1 {
-            collective_axes.push(eredu_core::topology::ParallelAxis::Tensor);
-        }
-        if topology.pipeline_parallel_size > 1 {
-            collective_axes.push(eredu_core::topology::ParallelAxis::Pipeline);
-        }
-        if topology.expert_parallel_size > 1 {
-            collective_axes.push(eredu_core::topology::ParallelAxis::Expert);
-        }
-        DistributedCapabilities {
-            world_collectives: true,
-            collective_axes,
-            point_to_point: true,
-            variable_all_to_all: true,
-            exact_completion: true,
-        }
+        DistributedCapabilities::new(true, self.communicators.group_ids(), true, true, true)
     }
 
     fn all_reduce_sum(
@@ -584,7 +517,7 @@ impl eredu_core::consensus::ConsensusTransport for MlxDistributedSession<'_> {
     type Error = Error;
 
     fn participant_count(&self) -> usize {
-        self.topology().world_size
+        self.communicators.realization().world_size()
     }
 
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error> {

@@ -1167,7 +1167,7 @@ impl GptOssModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;

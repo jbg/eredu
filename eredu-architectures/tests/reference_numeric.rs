@@ -31,7 +31,8 @@ use eredu_nn::{
     ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
     PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput, RotaryOperator,
     RotaryPosition, RotarySpec, RotarySubspace, SelectiveStateSpaceScanInput,
-    SelectiveStateSpaceScanOutput, Tensor, TensorParallelGroupedOutput, TopKGroupSelectionSpec,
+    SelectiveStateSpaceScanOutput, Tensor, TensorParallelGroupedGatedProductOperator,
+    TensorParallelGroupedOutput, TensorParallelGroupedRelu2Operator, TopKGroupSelectionSpec,
     TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
@@ -43,7 +44,7 @@ use eredu_runtime::{
     RoutedExpertRequest, RoutedExpertTensorParallelOutput, RuntimeLayerState,
     RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
     SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
-    SubmissionBackend, TensorPlacement, TokenDomain,
+    SubmissionBackend, TensorParallelRoutedExpertProvider, TensorPlacement, TokenDomain,
 };
 
 fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
@@ -2264,6 +2265,7 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
 struct NumericContext {
     sliding_attention_calls: Cell<usize>,
     local_layout: Option<Arc<LocalModelLayout>>,
+    mechanisms: Arc<Mutex<Vec<NumericMechanismTrace>>>,
 }
 
 impl NumericContext {
@@ -2271,6 +2273,7 @@ impl NumericContext {
         Self {
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
+            mechanisms: Arc::default(),
         }
     }
 
@@ -2279,6 +2282,26 @@ impl NumericContext {
             .as_deref()
             .and_then(|layout| layout.tensor(target))
     }
+
+    fn record_bank_lookup(&self, key: impl Into<String>) {
+        self.mechanisms
+            .lock()
+            .expect("numeric mechanism trace lock")
+            .push(NumericMechanismTrace::BankLookup(key.into()));
+    }
+
+    fn mechanism_trace(&self) -> Vec<NumericMechanismTrace> {
+        self.mechanisms
+            .lock()
+            .expect("numeric mechanism trace lock")
+            .clone()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum NumericMechanismTrace {
+    BankLookup(String),
+    AllToAll(u64),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2498,7 +2521,7 @@ impl SubmissionBackend for NumericBackend {
 }
 
 impl CollectiveBackend for NumericBackend {
-    type Group = ();
+    type Group = u64;
     type CollectiveError = std::convert::Infallible;
 
     fn all_reduce(
@@ -2519,9 +2542,14 @@ impl CollectiveBackend for NumericBackend {
 
     fn all_to_all(
         value: Self::Tensor,
-        _: &Self::Group,
-        _: &Self::Executor,
+        group: &Self::Group,
+        context: &Self::Executor,
     ) -> Result<Self::Tensor, Self::CollectiveError> {
+        context
+            .mechanisms
+            .lock()
+            .expect("numeric mechanism trace lock")
+            .push(NumericMechanismTrace::AllToAll(*group));
         Ok(value)
     }
 }
@@ -4347,7 +4375,9 @@ impl GroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
         }
         Ok(output)
     }
+}
 
+impl TensorParallelGroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &NumericTensor,
@@ -4453,7 +4483,9 @@ impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
         }
         Ok(output)
     }
+}
 
+impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &NumericTensor,
@@ -6726,28 +6758,46 @@ fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
     assert_eq!(bank.group_count(), 2);
     assert_eq!(bank.intermediate_dimensions(), 3);
 
-    let addressable_bank = plan
-        .local_global_group_indices()
-        .iter()
-        .copied()
-        .map(|identity| (identity, bank.clone()))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(addressable_bank.keys().copied().collect::<Vec<_>>(), [2, 3]);
-
     let grouped_context = NumericContext::default();
-    let mut grouped =
-        NumericBackend::grouped_gated_product(bank.clone(), &grouped_context).unwrap();
-    let hidden = NumericTensor::zeros(vec![1, bank.input_dimensions()]);
+    let bank_key = u64::try_from(plan.local_global_group_indices()[0]).unwrap();
+    let mut addressable_banks = BTreeMap::from([(
+        bank_key,
+        NumericBackend::grouped_gated_product(bank.clone(), &grouped_context).unwrap(),
+    )]);
+    grouped_context.record_bank_lookup(format!("bank:{bank_key}"));
+    let grouped = addressable_banks.get_mut(&bank_key).unwrap();
+    let expert = &mut grouped.experts[0];
+    expert.gate = NumericTensor::new(
+        vec![bank.intermediate_dimensions(), bank.input_dimensions()],
+        vec![1.0; (bank.intermediate_dimensions() * bank.input_dimensions()) as usize],
+    );
+    expert.up = expert.gate.clone();
+    expert.down = NumericTensor::new(
+        vec![bank.output_dimensions(), bank.intermediate_dimensions()],
+        vec![1.0; (bank.output_dimensions() * bank.intermediate_dimensions()) as usize],
+    );
+    let hidden = NumericTensor::new(
+        vec![1, bank.input_dimensions()],
+        vec![1.0; bank.input_dimensions() as usize],
+    );
     let selection = GroupSelection::new(
         NumericTensor::new(vec![1, 1], vec![0.0]),
-        NumericTensor::new(vec![1, 1], vec![1.0]),
-        NumericTensor::new(vec![1, 1], vec![1.0]),
+        NumericTensor::new(vec![1, 1], vec![0.75]),
+        NumericTensor::new(vec![1, 1], vec![0.5]),
     );
     let gathered = grouped
         .forward_grouped(&hidden, &selection, &grouped_context)
         .unwrap();
-    let exchanged = NumericBackend::all_to_all(gathered, &(), &grouped_context).unwrap();
+    assert!(gathered.data.iter().all(|value| *value > 90.0));
+    let exchanged = NumericBackend::all_to_all(gathered, &41, &grouped_context).unwrap();
     assert_eq!(exchanged.shape, [1, bank.output_dimensions()]);
+    assert_eq!(
+        grouped_context.mechanism_trace(),
+        [
+            NumericMechanismTrace::BankLookup("bank:2".into()),
+            NumericMechanismTrace::AllToAll(41),
+        ]
+    );
 }
 
 #[test]
@@ -11860,6 +11910,21 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
     ) -> Result<NumericTensor, Self::Error> {
         self.replicated_calls += 1;
         Ok(request.input.clone())
+    }
+}
+
+impl TensorParallelRoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        _resident_bank: &mut NumericExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        partitions: usize,
+        _: &NumericContext,
+    ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
+        self.tensor_parallel_partitions.push(partitions);
+        Ok(RoutedExpertTensorParallelOutput::Partial(
+            TensorParallelGroupedOutput::new(request.input.clone(), None),
+        ))
     }
 
     fn forward_relu2_routed_tensor_parallel(

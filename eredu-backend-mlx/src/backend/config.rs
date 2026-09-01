@@ -12,13 +12,13 @@ use super::MlxParallelContext;
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct ModelLoadOptions {
     /// Optional weight transformation requested during dense checkpoint loading.
-    pub quantization: Option<QuantizationRequest>,
+    pub(crate) quantization: Option<QuantizationRequest>,
     /// Validated runtime topology paired with its required wire contract.
     parallel: Option<(MlxParallelContext, PipelineWireContract)>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
-    pub weight_residency: WeightResidency,
+    pub(crate) weight_residency: WeightResidency,
     /// Capabilities required from the exact realized model session.
-    pub required_session_capabilities: eredu_core::SessionCapabilities,
+    pub(crate) required_session_capabilities: eredu_core::SessionCapabilities,
 }
 
 impl ModelLoadOptions {
@@ -33,7 +33,7 @@ impl ModelLoadOptions {
     }
 
     /// Adds a validated MLX parallel topology and its activation wire contract.
-    pub fn with_parallel_topology(
+    pub(crate) fn with_parallel_topology(
         mut self,
         topology: MlxParallelContext,
         pipeline_wire: PipelineWireContract,
@@ -44,7 +44,7 @@ impl ModelLoadOptions {
 
     /// Creates load options for a validated MLX parallel topology and
     /// activation wire contract.
-    pub fn with_parallel(
+    pub(crate) fn with_parallel(
         topology: MlxParallelContext,
         pipeline_wire: PipelineWireContract,
     ) -> Self {
@@ -67,7 +67,7 @@ impl ModelLoadOptions {
     }
 
     /// Returns the selected distributed topology, if any.
-    pub const fn parallel_topology(self) -> Option<MlxParallelContext> {
+    pub(crate) const fn parallel_topology(self) -> Option<MlxParallelContext> {
         match self.parallel {
             Some((topology, _)) => Some(topology),
             None => None,
@@ -81,6 +81,26 @@ impl ModelLoadOptions {
             Some((_, wire_contract)) => Some(wire_contract),
             None => None,
         }
+    }
+
+    /// Reports whether composition attached a native parallel execution plan.
+    pub const fn has_parallel_execution(self) -> bool {
+        self.parallel.is_some()
+    }
+
+    /// Returns the requested dense-weight transformation, if any.
+    pub const fn quantization(self) -> Option<QuantizationRequest> {
+        self.quantization
+    }
+
+    /// Returns the selected immutable-weight residency policy.
+    pub const fn weight_residency(self) -> WeightResidency {
+        self.weight_residency
+    }
+
+    /// Returns the capabilities required from the realized session.
+    pub const fn required_session_capabilities(self) -> eredu_core::SessionCapabilities {
+        self.required_session_capabilities
     }
 
     pub(crate) const fn parallel_execution(

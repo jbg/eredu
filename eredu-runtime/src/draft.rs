@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn prediction_groups_and_external_drafting_share_transactional_state() {
+    fn prediction_and_external_draft_groups_drive_transactional_acceptance() {
         let graph = crate::ExecutionGraph::new(
             vec![
                 crate::ExecutionGroupSpec::root("target"),
@@ -90,20 +90,61 @@ mod tests {
             "prediction.0",
         )
         .unwrap();
-        assert_eq!(graph.group_index("external-drafter"), Some(1));
-        assert_eq!(graph.group_index("prediction.0"), Some(2));
+        let mut trace = Vec::new();
+        let execute = |group: &str, input: u32, state: &mut Vec<u32>, trace: &mut Vec<String>| {
+            let group_index = graph
+                .group_index(group)
+                .unwrap_or_else(|| panic!("unknown prediction fixture group {group}"));
+            let output = match group_index {
+                0 => input + 1,
+                1 => input + 3,
+                2 => input + 2,
+                _ => unreachable!("fixture graph has exactly three groups"),
+            };
+            state.push(output);
+            trace.push(graph.groups()[group_index].id().to_owned());
+            output
+        };
 
-        let mut target = vec![10];
-        let mut embedded = DraftStateTransaction::fork(&target);
-        embedded.draft_mut().push(11);
-        embedded.commit_draft(&mut target);
+        let mut canonical = vec![10];
+        let target_output = execute("target", 0, &mut canonical, &mut trace);
+        assert_eq!(target_output, 1);
 
-        let drafter_policy = ("external-drafter", 2usize);
-        let mut external = DraftStateTransaction::fork(&target);
-        external.draft_mut().extend([12, 13]);
-        external.rollback(&mut target);
+        let mut embedded = DraftStateTransaction::fork(&canonical);
+        let embedded_output = execute("prediction.0", 9, embedded.draft_mut(), &mut trace);
+        assert_eq!(embedded_output, 11);
+        embedded.commit_draft(&mut canonical);
 
-        assert_eq!(drafter_policy, ("external-drafter", 2));
-        assert_eq!(target, [10, 11]);
+        let mut accepted_external = DraftStateTransaction::fork(&canonical);
+        let accepted = execute(
+            "external-drafter",
+            9,
+            accepted_external.draft_mut(),
+            &mut trace,
+        );
+        assert_eq!(accepted, 12);
+        accepted_external.commit_draft(&mut canonical);
+
+        let mut rejected_external = DraftStateTransaction::fork(&canonical);
+        let rejected = execute(
+            "external-drafter",
+            10,
+            rejected_external.draft_mut(),
+            &mut trace,
+        );
+        assert_eq!(rejected, 13);
+        rejected_external.rollback(&mut canonical);
+
+        assert_eq!(canonical, [10, 1, 11, 12]);
+        assert!(!canonical.contains(&rejected));
+        assert_eq!(
+            trace,
+            [
+                "target",
+                "prediction.0",
+                "external-drafter",
+                "external-drafter"
+            ]
+        );
     }
 }

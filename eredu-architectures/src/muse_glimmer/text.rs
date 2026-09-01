@@ -8,7 +8,9 @@ use eredu_nn::{
     RotaryOperator, RotaryPosition, RotarySpec, Tensor, TopKGroupSelectionSpec,
     TopKGroupSelectorSpec,
 };
-use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
+use eredu_runtime::{
+    ExpertPass, RoutedExpertProvider, RoutedExpertRequest, TensorParallelRoutedExpertProvider,
+};
 
 use crate::linear_format::standard_expert_projection;
 
@@ -446,7 +448,10 @@ impl<B: GroupedNeuralBackend> SparseMoe<B> {
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
             return Err(Error::backend("invalid Muse-Glimmer MoE hidden geometry"));
         }
@@ -454,7 +459,8 @@ impl<B: GroupedNeuralBackend> SparseMoe<B> {
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
         let routes = self.router.select(&flat, context)?;
         eredu_runtime::reduce_tensor_parallel_expert_output::<B>(
-            self.experts.forward_grouped_tensor_parallel(
+            B::gated_product_groups_tensor_parallel(
+                &mut self.experts,
                 &flat,
                 &routes,
                 B::parallel_size(parallel),
@@ -509,7 +515,7 @@ impl<B: GroupedNeuralBackend> SparseMoe<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
@@ -607,7 +613,10 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         match self {
             Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
             Self::Sparse(sparse) => sparse.forward_parallel(hidden, parallel, context),
@@ -644,7 +653,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -765,7 +774,10 @@ impl<B: GroupedNeuralBackend> TransformerBlock<B> {
         cache: Option<&mut C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         let normalized = self.input_norm.forward(hidden, context)?;
         let attention =
             self.attention
@@ -796,7 +808,7 @@ impl<B: GroupedNeuralBackend> TransformerBlock<B> {
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let normalized = self.input_norm.forward(hidden, context)?;

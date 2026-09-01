@@ -457,7 +457,7 @@ pub(super) enum MlxSpeculativeSessionParts<'session, 'world> {
 
 impl<'a> MlxModelSession<'a> {
     /// Creates a session and validates that its communicator matches the model topology.
-    pub fn from_model(
+    pub(crate) fn from_model(
         model: MlxModel,
         distributed: Option<MlxDistributedSession<'a>>,
         admitted_capabilities: eredu_core::SessionCapabilities,
@@ -466,7 +466,9 @@ impl<'a> MlxModelSession<'a> {
         let topology = model.topology();
         match (topology, distributed.as_ref()) {
             (None, None) => {}
-            (Some(expected), Some(session)) if session.topology() == expected => {}
+            (Some(expected), Some(session)) => {
+                super::distributed::topology::validate_session(expected, session)?;
+            }
             (Some(_), None) => {
                 return Err(Error::Parallel(
                     "distributed MLX model has no session-owned communication".into(),
@@ -476,12 +478,6 @@ impl<'a> MlxModelSession<'a> {
                 return Err(Error::Parallel(
                     "replicated MLX model cannot own distributed communication".into(),
                 ))
-            }
-            (Some(expected), Some(session)) => {
-                return Err(Error::Parallel(format!(
-                    "model topology {expected:?} does not match session topology {:?}",
-                    session.topology()
-                )))
             }
         }
         #[cfg(any(feature = "image", feature = "audio"))]
@@ -830,14 +826,31 @@ impl<'a> MlxModelSession<'a> {
                 finished,
                 distributed,
             ),
-            MlxSessionKind::Complete(_) => distributed.sample_and_synchronize(
-                logits,
-                batch_size,
-                sampler,
-                temperature,
-                prng_state,
-                finished,
-            ),
+            MlxSessionKind::Complete(model) => {
+                let topology = model
+                    .parallel_info()
+                    .map(|info| info.topology())
+                    .ok_or_else(|| {
+                        Error::Parallel(
+                            "distributed complete-model sampling requires selected topology".into(),
+                        )
+                    })?;
+                let sampling_rank = topology.global_rank_for(eredu_core::ParallelCoordinates {
+                    tensor: 0,
+                    pipeline: topology.pipeline_parallel_size - 1,
+                    expert: 0,
+                    data: topology.data_parallel_rank,
+                })?;
+                distributed.sample_and_synchronize_on_rank(
+                    logits,
+                    batch_size,
+                    sampler,
+                    temperature,
+                    prng_state,
+                    finished,
+                    sampling_rank,
+                )
+            }
         }
     }
 
@@ -1151,11 +1164,14 @@ impl<'a> MlxModelSession<'a> {
                     Some(distributed) => forward_model_tensor_parallel_with_observer(
                         model,
                         &input,
-                        distributed.tensor_group().ok_or_else(|| {
-                            Error::Parallel(
-                                "tensor-parallel model session has no tensor communicator".into(),
-                            )
-                        })?,
+                        distributed
+                            .selected_group(crate::backend::distributed::SHARD_GROUP_ID)
+                            .ok_or_else(|| {
+                                Error::Parallel(
+                                    "tensor-parallel model session has no tensor communicator"
+                                        .into(),
+                                )
+                            })?,
                         backend.stream(),
                         observer,
                     )?,

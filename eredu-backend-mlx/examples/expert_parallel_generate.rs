@@ -1,10 +1,7 @@
 //! Minimal MLX sparse-cache Ring expert-parallel generation probe.
 
-use eredu_backend_mlx::backend::{
-    config::ModelLoadOptions,
-    runtime::media::input::{token_ids_part, ModelInput},
-    topology::{DeviceAssignment, MlxParallelContext},
-};
+use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
+use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelContext};
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 use eredu_runtime::{ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency};
@@ -29,9 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         group.size(),
         DeviceAssignment::new(DeviceType::Gpu, local_index),
     )?;
-    let stream = Stream::new_with_device(&topology.device.device()?);
-    let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let options = ModelLoadOptions::with_parallel(
+    let stream = Stream::new_with_device(&topology.device()?);
+    let weights_stream = Stream::new_with_device(&topology.device()?);
+    let options = eredu_backend_mlx::native::parallel_load_options(
         topology,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
     )

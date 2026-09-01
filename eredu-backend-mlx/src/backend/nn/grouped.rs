@@ -659,7 +659,7 @@ impl TopKGroupSelector {
 }
 
 /// Applies selection weights and reduces group-major selection outputs back to source tokens.
-pub fn weighted_route_sum(
+pub(crate) fn weighted_route_sum(
     current: Array,
     top_k_weights: &Array,
     plan: &GroupedSelectionPlan,

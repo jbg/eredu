@@ -130,7 +130,7 @@ fn cartesian_ring_worker() {
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Tensor),
+            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(1)),
             &input,
         )
         .unwrap()
@@ -140,16 +140,21 @@ fn cartesian_ring_worker() {
             values(reduced.as_array()),
             vec![if expected_rank < 2 { 3 } else { 7 }]
         );
-        if execution.topology().pipeline_parallel_rank == 0 {
+        if expected_rank < 2 {
             let value = MlxTensor::from_array(scalar(expected_rank as i32 + 10));
             execution
-                .send_pipeline(&value)
+                .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)
                 .unwrap()
                 .synchronize()
                 .unwrap();
         } else {
             let received = execution
-                .receive_pipeline(&[1], eredu_core::checkpoint::TensorDtype::I32)
+                .receive_selected(
+                    eredu_core::CollectiveGroupId::new(2),
+                    0,
+                    &[1],
+                    eredu_core::checkpoint::TensorDtype::I32,
+                )
                 .unwrap()
                 .into_value()
                 .unwrap();
@@ -165,7 +170,7 @@ fn cartesian_ring_worker() {
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Tensor),
+            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(1)),
             &input,
         )
         .unwrap()
@@ -181,7 +186,7 @@ fn cartesian_ring_worker() {
         );
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert),
+            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3)),
             &input,
         )
         .unwrap()
@@ -194,13 +199,9 @@ fn cartesian_ring_worker() {
 
         // Ring cannot split these EP pairs natively. Exercise the topology-
         // planned logical route with asymmetric counts in both directions.
-        let expert_scope = CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert);
+        let expert_scope = CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3));
         assert!(execution.scope_is_logical(expert_scope).unwrap());
-        let expert_subgroup = execution
-            .topology()
-            .subgroup(eredu_core::ParallelAxis::Expert)
-            .unwrap();
-        let local_rank = expert_subgroup.rank;
+        let local_rank = expected_rank % 2;
         let logical_send = if local_rank == 0 { [0, 2] } else { [1, 0] };
         let logical_recv = if local_rank == 0 { [0, 1] } else { [2, 0] };
         let logical_input =
@@ -215,7 +216,7 @@ fn cartesian_ring_worker() {
         .unwrap()
         .wait()
         .unwrap();
-        let peer_global_rank = expert_subgroup.global_ranks[1 - local_rank];
+        let peer_global_rank = expected_rank ^ 1;
         let destination = local_rank;
         let expected = (0..logical_recv[1 - local_rank])
             .flat_map(|row| {
@@ -234,7 +235,7 @@ fn cartesian_ring_worker() {
         let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert),
+            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3)),
             &input,
         )
         .unwrap()
@@ -244,16 +245,21 @@ fn cartesian_ring_worker() {
             values(reduced.as_array()),
             vec![if expected_rank < 2 { 3 } else { 7 }]
         );
-        if execution.topology().pipeline_parallel_rank == 0 {
+        if expected_rank < 2 {
             let value = MlxTensor::from_array(scalar(expected_rank as i32 + 20));
             execution
-                .send_pipeline(&value)
+                .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)
                 .unwrap()
                 .synchronize()
                 .unwrap();
         } else {
             let received = execution
-                .receive_pipeline(&[1], eredu_core::checkpoint::TensorDtype::I32)
+                .receive_selected(
+                    eredu_core::CollectiveGroupId::new(2),
+                    0,
+                    &[1],
+                    eredu_core::checkpoint::TensorDtype::I32,
+                )
                 .unwrap()
                 .into_value()
                 .unwrap();
@@ -293,7 +299,7 @@ fn cartesian_triple_ring_worker() {
 
     let tp = DistributedSession::all_reduce_sum(
         &execution,
-        CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Tensor),
+        CollectiveScope::Group(eredu_core::CollectiveGroupId::new(1)),
         &input,
     )
     .unwrap()
@@ -310,7 +316,7 @@ fn cartesian_triple_ring_worker() {
 
     let ep = DistributedSession::all_reduce_sum(
         &execution,
-        CollectiveScope::Axis(eredu_core::topology::ParallelAxis::Expert),
+        CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3)),
         &input,
     )
     .unwrap()
@@ -328,13 +334,18 @@ fn cartesian_triple_ring_worker() {
     if topology.pipeline_parallel_rank == 0 {
         let value = MlxTensor::from_array(scalar(expected_rank as i32 + 100));
         execution
-            .send_pipeline(&value)
+            .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)
             .unwrap()
             .synchronize()
             .unwrap();
     } else {
         let received = execution
-            .receive_pipeline(&[1], eredu_core::checkpoint::TensorDtype::I32)
+            .receive_selected(
+                eredu_core::CollectiveGroupId::new(2),
+                0,
+                &[1],
+                eredu_core::checkpoint::TensorDtype::I32,
+            )
             .unwrap()
             .into_value()
             .unwrap();

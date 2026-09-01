@@ -329,13 +329,22 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         match self.runtime.session_mut().speculative_parts_mut()? {
             MlxSpeculativeSessionParts::Complete { model, execution } => {
                 if let Some(execution) = execution {
-                    let topology = execution.topology();
+                    let topology = model
+                        .parallel_info()
+                        .map(|info| info.topology())
+                        .ok_or_else(|| {
+                            Error::Speculative(
+                                "distributed embedded MTP requires selected topology".into(),
+                            )
+                        })?;
                     if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
                         return Err(Error::Speculative(
                             "complete-model embedded MTP requires pure tensor parallelism".into(),
                         ));
                     }
-                    let tensor = execution.tensor_context()?;
+                    super::distributed::topology::validate_session(topology, execution)?;
+                    let tensor = execution
+                        .partitioned_context(crate::backend::distributed::SHARD_GROUP_ID)?;
                     let tensor_group = tensor.group().ok_or_else(|| {
                         Error::Speculative(
                             "distributed embedded MTP requires an active tensor subgroup".into(),
@@ -553,7 +562,8 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 let mut caches = (0..lane_count)
                     .map(|_| model.new_cache())
                     .collect::<Result<Vec<_>, _>>()?;
-                let topology = execution.topology();
+                let topology = model.stage_info().topology;
+                super::distributed::topology::validate_session(topology, execution)?;
                 let sampling_rank = topology
                     .global_rank_for(eredu_core::ParallelCoordinates {
                         tensor: 0,

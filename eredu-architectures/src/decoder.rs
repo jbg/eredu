@@ -1485,7 +1485,10 @@ pub trait FeedForwardOperator<B: NeuralBackend>: eredu_nn::Parameterized<B::Tens
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>;
+}
 
+/// Additive feed-forward execution for tensor-parallel realizations.
+pub trait TensorParallelFeedForwardOperator<B: NeuralBackend>: FeedForwardOperator<B> {
     /// Executes tensor-parallel feed-forward computation.
     fn forward_feed_forward_parallel(
         &mut self,
@@ -1503,7 +1506,9 @@ impl<B: NeuralBackend> FeedForwardOperator<B> for Mlp<B> {
     ) -> Result<B::Tensor, Error> {
         self.forward(input, context)
     }
+}
 
+impl<B: NeuralBackend> TensorParallelFeedForwardOperator<B> for Mlp<B> {
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -1631,7 +1636,10 @@ where
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        F: TensorParallelFeedForwardOperator<B>,
+    {
         let normalized = self.input_norm.forward(input.hidden, context)?;
         let attention = self.self_attention.forward_parallel(
             AttentionInput {
@@ -2452,7 +2460,12 @@ pub trait RoutedFeedForwardOperator<B: GroupedNeuralBackend>: FeedForwardOperato
     where
         P: eredu_runtime::RoutedExpertProvider<B>,
         P::Error: std::fmt::Display;
+}
 
+/// Additive routed feed-forward execution for tensor-parallel realizations.
+pub trait TensorParallelRoutedFeedForwardOperator<B: GroupedNeuralBackend>:
+    RoutedFeedForwardOperator<B> + TensorParallelFeedForwardOperator<B>
+{
     /// Executes tensor-parallel dense or provider-backed routed work.
     #[allow(clippy::too_many_arguments)]
     fn forward_parallel_with_provider<P>(
@@ -2465,7 +2478,7 @@ pub trait RoutedFeedForwardOperator<B: GroupedNeuralBackend>: FeedForwardOperato
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display;
 }
 
@@ -2875,6 +2888,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
+        P::FeedForward: TensorParallelFeedForwardOperator<B>,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_tensor_parallel(
@@ -3245,6 +3259,7 @@ where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    P::FeedForward: TensorParallelFeedForwardOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -3302,6 +3317,7 @@ where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    P::FeedForward: TensorParallelFeedForwardOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -3437,7 +3453,7 @@ where
     B: GroupedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
-    P::FeedForward: RoutedFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelRoutedFeedForwardOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -3455,7 +3471,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::RoutedExpertProvider<B>,
+        R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         R::Error: std::fmt::Display,
     {
         self.forward_block_parallel_with_feed_forward(

@@ -9,6 +9,7 @@ use eredu_nn::{
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
     RoutedExpertProvider, RoutedExpertRequest, RoutingObservation,
+    TensorParallelRoutedExpertProvider,
 };
 
 use crate::linear_format::standard_expert_projection;
@@ -186,7 +187,7 @@ impl<B: GroupedNeuralBackend> RoutedPlusShared<B> {
         mut reduce: F,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {

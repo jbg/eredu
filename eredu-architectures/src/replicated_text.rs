@@ -11,8 +11,10 @@ use eredu_core::{
 };
 use eredu_nn::{AttentionCache, NeuralBackend, NeuralOperatorCapabilities, Tensor};
 use eredu_runtime::{
-    LayerRuntimeState, ReplicatedTextArchitecture, ReplicatedTextParameterRequirement,
-    ReplicatedTextRequirements, RuntimeState, SelectedReplicatedTextRealization,
+    LayerRuntimeState, ParameterTransformConstraint, ReplicatedTextArchitecture,
+    ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
+    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextRequirements,
+    RuntimeState, SelectedReplicatedTextRealization,
 };
 
 use crate::{
@@ -221,6 +223,7 @@ fn validate_selected_handoff(
     let required = requirements
         .parameters()
         .iter()
+        .filter(|parameter| parameter.presence().has_physical_source())
         .map(|parameter| parameter.name())
         .collect::<BTreeSet<_>>();
     let realized = selected
@@ -228,17 +231,20 @@ fn validate_selected_handoff(
         .iter()
         .map(|parameter| parameter.name())
         .collect::<BTreeSet<_>>();
-    if required != realized || selected.parameters().len() != requirements.parameters().len() {
+    if required != realized || selected.parameters().len() != required.len() {
         return Err("selected parameter realization does not match exact requirements".into());
     }
     for requirement in requirements.parameters() {
+        if !requirement.presence().has_physical_source() {
+            continue;
+        }
         let realization = selected
             .parameters()
             .iter()
             .find(|parameter| parameter.name() == requirement.name())
             .expect("parameter identity sets were compared above");
         if realization.sources() != requirement.sources()
-            || realization.source_encoding() != requirement.source_encoding()
+            || Some(realization.source_encoding()) != requirement.source_encoding()
         {
             return Err(format!(
                 "selected source facts for {:?} differ from exact artifact requirements",
@@ -348,6 +354,199 @@ impl EligibleConfig<'_> {
         }
         .map_or(LinearFormat::Dense, LinearFormat::from)
     }
+
+    fn linear_parameter_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>, String> {
+        match self {
+            Self::Llama(args) => decoder_linear_parameter_shapes(*args),
+            Self::Qwen(args) => decoder_linear_parameter_shapes(*args),
+        }
+    }
+
+    fn parameter_root(&self) -> &str {
+        match self {
+            Self::Llama(args) => crate::decoder::Config::parameter_root(*args),
+            Self::Qwen(args) => crate::decoder::Config::parameter_root(*args),
+        }
+    }
+
+    fn tied_embeddings(&self) -> bool {
+        match self {
+            Self::Llama(args) => crate::decoder::Config::tie_word_embeddings(*args),
+            Self::Qwen(args) => crate::decoder::Config::tie_word_embeddings(*args),
+        }
+    }
+
+    fn embedding_shape(&self) -> Result<Vec<usize>, String> {
+        let (vocabulary, hidden) = match self {
+            Self::Llama(args) => (args.vocab_size, args.hidden_size),
+            Self::Qwen(args) => (args.vocab_size, args.hidden_size),
+        };
+        Ok(vec![
+            positive(vocabulary, "vocabulary size")?,
+            positive(hidden, "hidden size")?,
+        ])
+    }
+
+    fn parameter_role(
+        &self,
+        name: &str,
+        companion: bool,
+        linear_shapes: &BTreeMap<String, Vec<usize>>,
+    ) -> ReplicatedTextParameterRole {
+        match self {
+            Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
+            Self::Qwen(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
+        }
+    }
+}
+
+fn positive(value: i32, label: &str) -> Result<usize, String> {
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("decoder {label} must be positive"))
+}
+
+/// Returns the exact affine-projection identities and logical geometry declared
+/// by a normalized decoder. Artifact rank and name suffixes do not determine
+/// transform eligibility.
+fn decoder_linear_parameter_shapes<C: crate::decoder::Config>(
+    config: &C,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    config
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+    let root = config.parameter_root();
+    let fields = config.block_parameter_fields();
+    let hidden = positive(config.hidden_size(), "hidden size")?;
+    let intermediate = positive(config.intermediate_size(), "intermediate size")?;
+    let head = positive(config.head_dim(), "head dimension")?;
+    let query = positive(config.num_attention_heads(), "query-head count")?
+        .checked_mul(head)
+        .ok_or_else(|| "decoder query width overflowed".to_string())?;
+    let key_value = positive(config.num_key_value_heads(), "key/value-head count")?
+        .checked_mul(head)
+        .ok_or_else(|| "decoder key/value width overflowed".to_string())?;
+    let layers = positive(config.num_hidden_layers(), "layer count")?;
+    let mut result = BTreeMap::new();
+    for layer in 0..layers {
+        let layer_prefix = format!("{root}.layers.{layer}");
+        let attention = format!("{layer_prefix}.{}", fields.attention);
+        match config.attention_projection_layout() {
+            crate::decoder::AttentionProjectionLayout::Split => {
+                result.insert(
+                    format!("{attention}.{}.weight", fields.attention_query),
+                    vec![query, hidden],
+                );
+                result.insert(
+                    format!("{attention}.{}.weight", fields.attention_key),
+                    vec![key_value, hidden],
+                );
+                result.insert(
+                    format!("{attention}.{}.weight", fields.attention_value),
+                    vec![key_value, hidden],
+                );
+            }
+            crate::decoder::AttentionProjectionLayout::Fused { field } => {
+                let output =
+                    query
+                        .checked_add(key_value.checked_mul(2).ok_or_else(|| {
+                            "decoder fused attention width overflowed".to_string()
+                        })?)
+                        .ok_or_else(|| "decoder fused attention width overflowed".to_string())?;
+                result.insert(format!("{attention}.{field}.weight"), vec![output, hidden]);
+            }
+        }
+        result.insert(
+            format!("{attention}.{}.weight", fields.attention_output),
+            vec![hidden, query],
+        );
+        let feed_forward = format!("{layer_prefix}.{}", fields.feed_forward);
+        match config.gated_projection_layout() {
+            crate::decoder::GatedProjectionLayout::Split => {
+                result.insert(
+                    format!("{feed_forward}.{}.weight", fields.feed_forward_gate),
+                    vec![intermediate, hidden],
+                );
+                result.insert(
+                    format!("{feed_forward}.{}.weight", fields.feed_forward_up),
+                    vec![intermediate, hidden],
+                );
+            }
+            crate::decoder::GatedProjectionLayout::Fused { field } => {
+                result.insert(
+                    format!("{feed_forward}.{field}.weight"),
+                    vec![
+                        intermediate.checked_mul(2).ok_or_else(|| {
+                            "decoder fused feed-forward width overflowed".to_string()
+                        })?,
+                        hidden,
+                    ],
+                );
+            }
+        }
+        result.insert(
+            format!("{feed_forward}.{}.weight", fields.feed_forward_output),
+            vec![hidden, intermediate],
+        );
+    }
+    if !config.tie_word_embeddings() {
+        result.insert(
+            "lm_head.weight".into(),
+            vec![
+                positive(config.vocabulary_size(), "vocabulary size")?,
+                hidden,
+            ],
+        );
+    }
+    Ok(result)
+}
+
+fn decoder_parameter_role<C: crate::decoder::Config>(
+    config: &C,
+    name: &str,
+    companion: bool,
+    linear_shapes: &BTreeMap<String, Vec<usize>>,
+) -> ReplicatedTextParameterRole {
+    if companion {
+        return ReplicatedTextParameterRole::FormatCompanion;
+    }
+    if linear_shapes.contains_key(name)
+        || (config.tie_word_embeddings() && name == "lm_head.weight")
+    {
+        return ReplicatedTextParameterRole::LinearWeight;
+    }
+    if name == format!("{}.embed_tokens.weight", config.parameter_root()) {
+        return ReplicatedTextParameterRole::Embedding;
+    }
+    if linear_shapes.keys().any(|weight| {
+        weight
+            .strip_suffix(".weight")
+            .is_some_and(|prefix| name == format!("{prefix}.bias"))
+    }) {
+        return ReplicatedTextParameterRole::LinearBias;
+    }
+    let fields = config.block_parameter_fields();
+    if name == format!("{}.norm.weight", config.parameter_root())
+        || (0..usize::try_from(config.num_hidden_layers()).unwrap_or_default()).any(|layer| {
+            let prefix = format!("{}.layers.{layer}", config.parameter_root());
+            name == format!("{prefix}.{}.weight", fields.input_norm)
+                || name == format!("{prefix}.{}.weight", fields.post_attention_norm)
+                || name
+                    == format!(
+                        "{prefix}.{}.{}.weight",
+                        fields.attention, fields.attention_query_norm
+                    )
+                || name
+                    == format!(
+                        "{prefix}.{}.{}.weight",
+                        fields.attention, fields.attention_key_norm
+                    )
+        })
+    {
+        return ReplicatedTextParameterRole::Normalization;
+    }
+    ReplicatedTextParameterRole::Other
 }
 
 /// Derives exact replicated text requirements from an admitted artifact.
@@ -486,6 +685,9 @@ fn safetensors_parameters(
     catalog: &TensorCatalog,
     config: &EligibleConfig<'_>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
+    let linear_shapes = config
+        .linear_parameter_shapes()
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     let selected = architecture.checkpoint_resolution().ok_or_else(|| {
         ReplicatedTextRequirementsError::InvalidArtifact(
             "SafeTensors architecture omitted exact catalog admission".into(),
@@ -511,26 +713,102 @@ fn safetensors_parameters(
     }
     let mut parameters = Vec::new();
     for constraint in constraints {
-        if constraint.role != eredu_checkpoint::schema::TensorRole::Tensor
-            || constraint.shape.len() < 2
-            || !constraint.key.ends_with(".weight")
-        {
-            continue;
-        }
         let source = std::iter::once(&constraint.key)
             .chain(constraint.aliases.iter())
-            .find(|name| selected.source_keys().contains(*name));
-        let Some(source) = source else { continue };
-        let descriptor = catalog.get(source).ok_or_else(|| {
-            ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                "admitted SafeTensors source {source:?} is absent from its catalog"
-            ))
-        })?;
+            .find(|name| selected.source_keys().contains(*name))
+            .cloned();
+        let descriptor = source
+            .as_deref()
+            .map(|source| {
+                catalog.get(source).ok_or_else(|| {
+                    ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                        "admitted SafeTensors source {source:?} is absent from its catalog"
+                    ))
+                })
+            })
+            .transpose()?;
+        let presence = match (constraint.requirement, source.is_some()) {
+            (eredu_checkpoint::schema::TensorRequirement::Required, true) => {
+                ReplicatedTextParameterPresence::Required
+            }
+            (eredu_checkpoint::schema::TensorRequirement::Optional, true) => {
+                ReplicatedTextParameterPresence::OptionalPresent
+            }
+            (eredu_checkpoint::schema::TensorRequirement::Optional, false) => {
+                ReplicatedTextParameterPresence::OptionalAbsent
+            }
+            (eredu_checkpoint::schema::TensorRequirement::Required, false) => {
+                return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                    "required admitted SafeTensors parameter {:?} has no source",
+                    constraint.key
+                )))
+            }
+        };
+        let role = config.parameter_role(
+            &constraint.key,
+            constraint.role == eredu_checkpoint::schema::TensorRole::Companion,
+            &linear_shapes,
+        );
+        let logical_shape = if role == ReplicatedTextParameterRole::Embedding {
+            config
+                .embedding_shape()
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?
+        } else {
+            linear_shapes
+                .get(&constraint.key)
+                .cloned()
+                .unwrap_or_else(|| constraint.shape.clone())
+        };
         parameters.push(parameter_requirement(
             constraint.key.clone(),
-            vec![source.clone()],
-            SourceTensorEncoding::Safetensors(stored_dtype(&descriptor.dtype)?),
+            source.into_iter().collect(),
+            constraint.aliases.clone(),
+            descriptor
+                .map(|descriptor| stored_dtype(&descriptor.dtype))
+                .transpose()?
+                .map(SourceTensorEncoding::Safetensors),
+            descriptor.map(|descriptor| descriptor.shape.clone()),
+            logical_shape,
             config.native_format(&constraint.key),
+            linear_shapes.contains_key(&constraint.key),
+            role,
+            parameter_owner(config, &constraint.key),
+            presence,
+        )?);
+    }
+    if config.tied_embeddings() {
+        parameters.retain(|parameter| parameter.name() != "lm_head.weight");
+        parameters.push(parameter_requirement(
+            "lm_head.weight".into(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            vec![
+                positive(
+                    match config {
+                        EligibleConfig::Llama(args) => args.vocab_size,
+                        EligibleConfig::Qwen(args) => args.vocab_size,
+                    },
+                    "vocabulary size",
+                )
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+                positive(
+                    match config {
+                        EligibleConfig::Llama(args) => args.hidden_size,
+                        EligibleConfig::Qwen(args) => args.hidden_size,
+                    },
+                    "hidden size",
+                )
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            ],
+            LinearFormat::Dense,
+            true,
+            ReplicatedTextParameterRole::LinearWeight,
+            ReplicatedTextParameterOwner::StaticRole("output".into()),
+            ReplicatedTextParameterPresence::Tied {
+                target: format!("{}.embed_tokens.weight", config.parameter_root()),
+            },
         )?);
     }
     finish_parameters(parameters)
@@ -541,6 +819,9 @@ fn gguf_parameters(
     checkpoint: &eredu_gguf::Checkpoint,
     config: &EligibleConfig<'_>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
+    let linear_shapes = config
+        .linear_parameter_shapes()
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     let mut physical = BTreeMap::new();
     for shard in checkpoint.shards() {
         for tensor in shard.tensors() {
@@ -558,9 +839,6 @@ fn gguf_parameters(
     }
     let mut parameters = Vec::new();
     for mapping in architecture.tensor_mapping() {
-        if mapping.layout.shape.len() < 2 || !mapping.layout.name.ends_with(".weight") {
-            continue;
-        }
         let Some((tensor, source_encoding)) = physical.get(mapping.physical_name.as_str()) else {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
                 "admitted GGUF mapping references absent tensor {:?}",
@@ -594,26 +872,144 @@ fn gguf_parameters(
         } else {
             LinearFormat::Dense
         };
+        let companion = mapping.original_name != mapping.physical_name;
+        let presence = if companion {
+            ReplicatedTextParameterPresence::Derived {
+                recipe: format!(
+                    "gguf-output:{}:{}",
+                    mapping.physical_name, mapping.original_name
+                ),
+            }
+        } else {
+            ReplicatedTextParameterPresence::Required
+        };
+        let role = config.parameter_role(&mapping.layout.name, companion, &linear_shapes);
+        let logical_shape = if role == ReplicatedTextParameterRole::Embedding {
+            config
+                .embedding_shape()
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?
+        } else {
+            linear_shapes
+                .get(&mapping.layout.name)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    mapping
+                        .layout
+                        .shape
+                        .iter()
+                        .map(|dimension| {
+                            usize::try_from(*dimension).map_err(|_| {
+                                ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                                    "GGUF logical shape for {:?} exceeds usize",
+                                    mapping.layout.name
+                                ))
+                            })
+                        })
+                        .collect()
+                })?
+        };
         parameters.push(parameter_requirement(
             mapping.layout.name.clone(),
-            vec![mapping.physical_name.clone(), mapping.original_name.clone()],
-            source_encoding.clone(),
-            native,
+            (!companion)
+                .then(|| mapping.physical_name.clone())
+                .into_iter()
+                .collect(),
+            vec![mapping.original_name.clone()],
+            (!companion).then(|| source_encoding.clone()),
+            (!companion)
+                .then(|| {
+                    tensor
+                        .descriptor()
+                        .row_major_shape()
+                        .into_iter()
+                        .map(usize::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| {
+                            ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                                "GGUF physical shape for {:?} exceeds usize",
+                                mapping.physical_name
+                            ))
+                        })
+                })
+                .transpose()?,
+            logical_shape,
+            if companion {
+                LinearFormat::Dense
+            } else {
+                native
+            },
+            !companion && linear_shapes.contains_key(&mapping.layout.name),
+            role,
+            parameter_owner(config, &mapping.layout.name),
+            presence,
         )?);
     }
-    let _ = config;
     finish_parameters(parameters)
 }
 
 fn parameter_requirement(
     name: String,
     sources: Vec<String>,
-    source_encoding: SourceTensorEncoding,
+    aliases: Vec<String>,
+    source_encoding: Option<SourceTensorEncoding>,
+    physical_shape: Option<Vec<usize>>,
+    logical_shape: Vec<usize>,
     native_executable: LinearFormat,
+    transformable: bool,
+    role: ReplicatedTextParameterRole,
+    owner: ReplicatedTextParameterOwner,
+    presence: ReplicatedTextParameterPresence,
 ) -> Result<ReplicatedTextParameterRequirement, ReplicatedTextRequirementsError> {
-    ReplicatedTextParameterRequirement::new(name, sources, source_encoding, native_executable)
-        .map(|requirement| requirement.with_affine_transforms().with_mxfp4_transform())
-        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
+    let transform = if transformable {
+        ParameterTransformConstraint::Linear {
+            packed_axis: logical_shape.len().checked_sub(1).ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "linear parameter has a scalar logical shape".into(),
+                )
+            })?,
+        }
+    } else {
+        ParameterTransformConstraint::None
+    };
+    ReplicatedTextParameterRequirement::new(
+        name,
+        sources,
+        aliases,
+        source_encoding,
+        physical_shape,
+        logical_shape,
+        native_executable,
+        role,
+        owner,
+        presence,
+        transform,
+    )
+    .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
+}
+
+fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextParameterOwner {
+    let layer_prefix = format!("{}.layers.", config.parameter_root());
+    if let Some(rest) = name.strip_prefix(&layer_prefix) {
+        if let Some(layer) = rest
+            .split('.')
+            .next()
+            .and_then(|layer| layer.parse::<usize>().ok())
+        {
+            return ReplicatedTextParameterOwner::ExecutionUnit {
+                group: crate::decoder::TEXT_DECODER_EXECUTION_GROUP.into(),
+                unit: layer,
+            };
+        }
+    }
+    let role = if name.starts_with(&format!("{}.embed_tokens", config.parameter_root())) {
+        "embedding"
+    } else if name == "lm_head.weight" || name == "lm_head.bias" {
+        "output"
+    } else {
+        "norm"
+    };
+    ReplicatedTextParameterOwner::StaticRole(role.into())
 }
 
 fn finish_parameters(
@@ -723,8 +1119,16 @@ mod tests {
         tempfile::TempDir,
         ArtifactInspection<ArtifactArchitecturePlan>,
     ) {
+        inspected_config(config(model_type))
+    }
+
+    fn inspected_config(
+        config: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        ArtifactInspection<ArtifactArchitecturePlan>,
+    ) {
         let root = tempfile::tempdir().unwrap();
-        let config = config(model_type);
         std::fs::write(
             root.path().join("config.json"),
             serde_json::to_vec(&config).unwrap(),
@@ -777,11 +1181,13 @@ mod tests {
             let requirements = replicated_text_requirements(&inspection).unwrap();
             let requests = [
                 eredu_runtime::ReplicatedTextSelectionRequest::new(
-                    eredu_core::ResidencyRequest::FullyResident,
+                    eredu_runtime::LayerWeightResidency::FullyResident,
                     eredu_runtime::CacheResidencyPolicy::Device,
                 ),
                 eredu_runtime::ReplicatedTextSelectionRequest::new(
-                    eredu_core::ResidencyRequest::LayerwiseHost,
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(
+                        eredu_runtime::LayerwiseLoadOptions::default(),
+                    ),
                     eredu_runtime::CacheResidencyPolicy::Device,
                 )
                 .with_quantization(eredu_core::QuantizationRequest::Affine {
@@ -789,7 +1195,9 @@ mod tests {
                     bits: 4,
                 }),
                 eredu_runtime::ReplicatedTextSelectionRequest::new(
-                    eredu_core::ResidencyRequest::DenseDiskStream,
+                    eredu_runtime::LayerWeightResidency::DenseDiskStream(
+                        eredu_runtime::DenseDiskStreamLoadOptions::default(),
+                    ),
                     eredu_runtime::CacheResidencyPolicy::Paged(
                         eredu_runtime::PagedCacheOptions::new(4, 4096, 4096, 1).unwrap(),
                     ),
@@ -811,27 +1219,92 @@ mod tests {
                 );
                 assert!(matches!(
                     request.residency(),
-                    eredu_core::ResidencyRequest::FullyResident
-                        | eredu_core::ResidencyRequest::LayerwiseHost
-                        | eredu_core::ResidencyRequest::DenseDiskStream
+                    eredu_runtime::LayerWeightResidency::FullyResident
+                        | eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                        | eredu_runtime::LayerWeightResidency::DenseDiskStream(_)
                 ));
             }
             assert_eq!(requirements.execution_graph().groups().len(), 1);
             assert_eq!(requirements.state_layout().len(), 1);
             assert!(!requirements.parameters().is_empty());
-            assert!(requirements.parameters().iter().all(|parameter| {
-                matches!(
-                    parameter.source_encoding(),
-                    SourceTensorEncoding::Safetensors(StoredDtype::F32)
-                ) && parameter
+            assert!(requirements.parameters().iter().all(|parameter| matches!(
+                parameter.source_encoding(),
+                Some(SourceTensorEncoding::Safetensors(StoredDtype::F32)) | None
+            )));
+            assert!(requirements.parameters().iter().any(|parameter| parameter
+                .logical_shape()
+                .len()
+                == 1
+                && parameter
                     .transform_target(eredu_core::QuantizationRequest::Affine {
                         group_size: 16,
                         bits: 4,
                     })
                     .unwrap()
-                    .is_some()
-            }));
+                    .is_none()));
         }
+    }
+
+    #[test]
+    fn exact_parameter_topology_preserves_geometry_ownership_aliases_and_ties() {
+        let (_root, inspection) = inspected("qwen3");
+        let requirements = replicated_text_requirements(&inspection).unwrap();
+        let mut identities = BTreeSet::new();
+        for parameter in requirements.parameters() {
+            assert!(identities.insert(parameter.name()));
+            assert!(!parameter.logical_shape().is_empty());
+            match parameter.presence() {
+                ReplicatedTextParameterPresence::Required
+                | ReplicatedTextParameterPresence::OptionalPresent => {
+                    let source = parameter.sources().first().unwrap();
+                    let descriptor = inspection.tensors().get(source).unwrap();
+                    assert_eq!(
+                        parameter.physical_shape(),
+                        Some(descriptor.shape.as_slice())
+                    );
+                    assert!(parameter.source_encoding().is_some());
+                }
+                ReplicatedTextParameterPresence::OptionalAbsent => {
+                    assert!(parameter.sources().is_empty());
+                    assert!(parameter.source_encoding().is_none());
+                }
+                ReplicatedTextParameterPresence::Tied { .. }
+                | ReplicatedTextParameterPresence::Derived { .. } => {}
+                _ => unreachable!("test covers every current presence category"),
+            }
+            assert_eq!(
+                matches!(
+                    parameter.transform_constraint(),
+                    ParameterTransformConstraint::Linear { .. }
+                ),
+                parameter.role() == ReplicatedTextParameterRole::LinearWeight
+            );
+            if let ReplicatedTextParameterOwner::ExecutionUnit { group, unit } = parameter.owner() {
+                assert_eq!(group, crate::decoder::TEXT_DECODER_EXECUTION_GROUP);
+                assert!(*unit < requirements.execution_units().len());
+            }
+        }
+        assert!(requirements.parameters().iter().any(|parameter| {
+            parameter.logical_shape().len() == 1
+                && parameter.role() == ReplicatedTextParameterRole::Normalization
+                && parameter.transform_constraint() == ParameterTransformConstraint::None
+        }));
+
+        let mut tied_config = config("llama");
+        tied_config["tie_word_embeddings"] = serde_json::json!(true);
+        let (_root, tied_inspection) = inspected_config(tied_config);
+        let tied = replicated_text_requirements(&tied_inspection).unwrap();
+        let output = tied
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name() == "lm_head.weight")
+            .unwrap();
+        assert!(matches!(
+            output.presence(),
+            ReplicatedTextParameterPresence::Tied { target }
+                if target == "model.embed_tokens.weight"
+        ));
+        assert!(output.sources().is_empty());
     }
 
     #[test]
@@ -897,7 +1370,7 @@ mod tests {
         let (_root, inspection) = inspected("llama");
         let requirements = replicated_text_requirements(&inspection).unwrap();
         let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-            eredu_core::ResidencyRequest::FullyResident,
+            eredu_runtime::LayerWeightResidency::FullyResident,
             eredu_runtime::CacheResidencyPolicy::Device,
         )
         .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());

@@ -9,10 +9,14 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    TensorParallelRoutedExpertProvider,
 };
 
 use crate::{
-    decoder::{FeedForwardOperator, Mlp},
+    decoder::{
+        FeedForwardOperator, Mlp, TensorParallelFeedForwardOperator,
+        TensorParallelRoutedFeedForwardOperator,
+    },
     linear_format::standard_expert_projection,
 };
 
@@ -237,7 +241,11 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
             context,
         )
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
+    for RoutedGatedProduct<B>
+{
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -246,7 +254,7 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
     ) -> Result<B::Tensor, Error> {
         let routes = self.router.select(input, context)?;
         let mut provider = ResidentExpertProvider;
-        let output = RoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
+        let output = TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
@@ -335,7 +343,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -372,7 +380,11 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             Self::Routed(moe) => moe.forward_feed_forward(input, context),
         }
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
+    for FeedForward<B>
+{
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -401,7 +413,11 @@ impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for F
     {
         FeedForward::forward_with_provider(self, layer, pass, input, context, provider)
     }
+}
 
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelRoutedFeedForwardOperator<B>
+    for FeedForward<B>
+{
     fn forward_parallel_with_provider<P>(
         &mut self,
         layer: usize,
@@ -412,7 +428,7 @@ impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for F
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         FeedForward::forward_with_provider_parallel(

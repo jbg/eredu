@@ -8,6 +8,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
+    TensorParallelRoutedExpertProvider,
 };
 use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
 
@@ -124,6 +125,19 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductGroupProvider<
         .map(MlxTensor::from_array)
     }
 
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
+        _request: RoutedExpertRequest<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        Err(Error::ArchitectureModel(
+            "a gated-product expert cache cannot execute a ReLU2 expert bank".into(),
+        ))
+    }
+}
+
+impl TensorParallelRoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductGroupProvider<'_> {
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
@@ -146,14 +160,15 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductGroupProvider<
         .map(RoutedExpertTensorParallelOutput::Partial)
     }
 
-    fn forward_relu2_routed(
+    fn forward_relu2_routed_tensor_parallel(
         &mut self,
         _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
+        _partitions: usize,
         _stream: &Stream,
-    ) -> Result<MlxTensor, Self::Error> {
+    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
         Err(Error::ArchitectureModel(
-            "a gated-product expert cache cannot execute a ReLU2 expert bank".into(),
+            "a gated-product parameter bank cannot execute a ReLU2 grouped operation".into(),
         ))
     }
 }
@@ -300,6 +315,26 @@ where
         }
     }
 
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
+        _request: RoutedExpertRequest<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        Err(safemlx::error::Exception::custom(
+            "a gated-product executor cannot execute a ReLU2 expert bank",
+        ))
+    }
+}
+
+impl<F> TensorParallelRoutedExpertProvider<MlxNeuralBackend>
+    for GatedProductGroupedExecutorProvider<'_, F>
+where
+    F: FnMut(
+        GatedProductGroupExecution,
+        &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<Array>, safemlx::error::Exception>,
+{
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
@@ -316,14 +351,15 @@ where
         )
     }
 
-    fn forward_relu2_routed(
+    fn forward_relu2_routed_tensor_parallel(
         &mut self,
         _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
+        _partitions: usize,
         _stream: &Stream,
-    ) -> Result<MlxTensor, Self::Error> {
+    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
         Err(safemlx::error::Exception::custom(
-            "a gated-product executor cannot execute a ReLU2 expert bank",
+            "a gated-product executor cannot execute a ReLU2 grouped operation",
         ))
     }
 }
@@ -421,6 +457,23 @@ where
     ) -> Result<MlxTensor, Self::Error> {
         execute_relu2_callback(self.execute, resident_bank, request, stream)
     }
+}
+
+impl<F> TensorParallelRoutedExpertProvider<MlxNeuralBackend> for Relu2GroupedExecutorProvider<'_, F>
+where
+    F: FnMut(Relu2GroupExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
+{
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
+        _request: RoutedExpertRequest<'_, MlxTensor>,
+        _partitions: usize,
+        _stream: &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
+        Err(safemlx::error::Exception::custom(
+            "a ReLU2 executor cannot execute a gated-product grouped operation",
+        ))
+    }
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
@@ -480,6 +533,30 @@ where
         }
     }
 
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
+        _request: RoutedExpertRequest<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        Err(safemlx::error::Exception::custom(
+            "a resident gated-product executor cannot execute a ReLU2 expert bank",
+        ))
+    }
+}
+
+impl<F> TensorParallelRoutedExpertProvider<MlxNeuralBackend>
+    for ResidentGroupedExecutorProvider<'_, F>
+where
+    F: FnMut(
+        &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
+        &Array,
+        &Array,
+        &Array,
+        usize,
+        &Stream,
+    ) -> Result<TensorParallelGroupedOutput<Array>, safemlx::error::Exception>,
+{
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
@@ -499,14 +576,15 @@ where
         .map(RoutedExpertTensorParallelOutput::Partial)
     }
 
-    fn forward_relu2_routed(
+    fn forward_relu2_routed_tensor_parallel(
         &mut self,
         _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
+        _partitions: usize,
         _stream: &Stream,
-    ) -> Result<MlxTensor, Self::Error> {
+    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
         Err(safemlx::error::Exception::custom(
-            "a resident gated-product executor cannot execute a ReLU2 expert bank",
+            "a resident gated-product executor cannot execute a ReLU2 grouped operation",
         ))
     }
 }

@@ -69,7 +69,7 @@ fn text_static_parameter_ownership(
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -360,7 +360,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -378,7 +378,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
@@ -665,6 +665,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
         for (group, hidden) in [(0, vision_hidden), (1, audio_hidden)] {
             let Some(hidden) = hidden else { continue };
@@ -1277,6 +1278,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
     ) -> Result<B::Tensor, Error>
     where
         S::LayerState: AttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
         let policy = self
             .args
@@ -1342,7 +1344,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let policy = self
@@ -2172,7 +2174,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {

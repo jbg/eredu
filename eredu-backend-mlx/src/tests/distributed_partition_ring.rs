@@ -42,7 +42,7 @@ fn partition_ring_worker() {
     .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
 
-    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let stream = Stream::new_with_device(&topology.device().unwrap());
     let mut plan = PlacementPlan::new(topology);
     plan.insert_expected(
         "model.projection.weight",

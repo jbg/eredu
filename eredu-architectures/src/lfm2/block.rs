@@ -9,7 +9,9 @@ use eredu_nn::{
 };
 use eredu_runtime::RuntimeStateComponents;
 
-use crate::decoder::{Attention, AttentionInput, FeedForwardOperator};
+use crate::decoder::{
+    Attention, AttentionInput, FeedForwardOperator, TensorParallelFeedForwardOperator,
+};
 
 use super::{FeedForward, ModelArgs, OperatorPolicy};
 
@@ -260,6 +262,7 @@ impl<B: GroupedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
         let normalized = self.operator_norm.forward(hidden, context)?;
         let mixed = match &mut self.mixer {

@@ -4,6 +4,7 @@ use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_nn::{GroupedGatedProductOperator, GroupedGatedProductSpec};
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
+    TensorParallelRoutedExpertProvider,
 };
 use safemlx::{Array, Stream};
 use crate::composition::grouped_provider::*;
@@ -109,7 +110,7 @@ pub fn distributed_provider<'a>(
     expert_group: Option<&'a Group>,
     cache: &'a AddressableParameterBank,
     statistics: &'a mut RoutingStatistics,
-) -> impl RoutedExpertProvider<MlxNeuralBackend, Error = Error> + 'a {
+) -> impl TensorParallelRoutedExpertProvider<MlxNeuralBackend, Error = Error> + 'a {
     DistributedCachedProvider {
         assignment,
         expert_group,
@@ -236,6 +237,19 @@ impl RoutedExpertProvider<MlxNeuralBackend> for DistributedCachedProvider<'_> {
         ))
     }
 
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
+        _request: RoutedExpertRequest<'_, crate::MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<crate::MlxTensor, Self::Error> {
+        Err(Error::ArchitectureModel(
+            "GPT-OSS cannot execute a ReLU2 grouped operation".into(),
+        ))
+    }
+}
+
+impl TensorParallelRoutedExpertProvider<MlxNeuralBackend> for DistributedCachedProvider<'_> {
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
@@ -292,14 +306,15 @@ impl RoutedExpertProvider<MlxNeuralBackend> for DistributedCachedProvider<'_> {
         ))
     }
 
-    fn forward_relu2_routed(
+    fn forward_relu2_routed_tensor_parallel(
         &mut self,
         _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, crate::MlxTensor>,
+        _partitions: usize,
         _stream: &Stream,
-    ) -> Result<crate::MlxTensor, Self::Error> {
+    ) -> Result<RoutedExpertTensorParallelOutput<crate::MlxTensor>, Self::Error> {
         Err(Error::ArchitectureModel(
-            "GPT-OSS cannot execute a ReLU2 expert bank".into(),
+            "GPT-OSS cannot execute a ReLU2 grouped operation".into(),
         ))
     }
 }

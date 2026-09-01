@@ -13,6 +13,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    TensorParallelRoutedExpertProvider,
 };
 
 use crate::linear_format::standard_expert_projection;
@@ -680,7 +681,7 @@ impl<B: GroupedNeuralBackend> DenseBlock<B> {
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let normalized = self.input_norm.forward(input.hidden, context)?;
@@ -764,7 +765,10 @@ impl<B: GroupedNeuralBackend> DenseBlock<B> {
         input: BlockInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
         let pass = if input.hidden.dim(1) > 1 {
             ExpertPass::Prefill
         } else {

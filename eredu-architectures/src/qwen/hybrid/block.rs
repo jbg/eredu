@@ -8,11 +8,13 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    RuntimeStateComponents,
+    RuntimeStateComponents, TensorParallelRoutedExpertProvider,
 };
 
 use crate::{
-    decoder::{Attention, AttentionInput, FeedForwardOperator, Mlp},
+    decoder::{
+        Attention, AttentionInput, FeedForwardOperator, Mlp, TensorParallelFeedForwardOperator,
+    },
     linear_format::standard_expert_projection,
 };
 
@@ -132,7 +134,7 @@ impl<B: GroupedNeuralBackend> SharedRoutedGatedProduct<B> {
         provider: &mut P,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.router.select(input, context)?;
@@ -421,7 +423,7 @@ impl<B: GroupedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         let normalized = self.input_norm.forward(hidden, context)?;

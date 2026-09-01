@@ -2473,25 +2473,21 @@ pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<
         selections: &GroupSelection<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+}
 
-    /// Executes a rank-local tensor-parallel partial and separates replicated
-    /// selection-weighted down bias for one literal post-reduction addition.
+/// Additive mechanism for tensor-parallel grouped gated-product partials.
+pub trait TensorParallelGroupedGatedProductOperator<T: Tensor>:
+    GroupedGatedProductOperator<T>
+{
+    /// Executes a rank-local partial and separates replicated down bias for one
+    /// literal post-reduction addition.
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &T,
         selections: &GroupSelection<T>,
         partitions: usize,
         context: &T::Context,
-    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
-        if partitions == 1 {
-            return self
-                .forward_grouped(input, selections, context)
-                .map(|reducible| TensorParallelGroupedOutput::new(reducible, None));
-        }
-        Err(Error::backend(
-            "tensor-parallel gated-product groups are not implemented by this backend",
-        ))
-    }
+    ) -> Result<TensorParallelGroupedOutput<T>, Error>;
 }
 
 /// Complete construction specification for packed grouped ReLU-squared groups.
@@ -2580,25 +2576,19 @@ pub trait GroupedRelu2Operator<T: Tensor>: Clone + Debug + Parameterized<T> {
         selections: &GroupSelection<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+}
 
-    /// Executes a rank-local tensor-parallel partial and separates replicated
-    /// selection-weighted down bias for one literal post-reduction addition.
+/// Additive mechanism for tensor-parallel grouped ReLU-squared partials.
+pub trait TensorParallelGroupedRelu2Operator<T: Tensor>: GroupedRelu2Operator<T> {
+    /// Executes a rank-local partial and separates replicated down bias for one
+    /// literal post-reduction addition.
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &T,
         selections: &GroupSelection<T>,
         partitions: usize,
         context: &T::Context,
-    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
-        if partitions == 1 {
-            return self
-                .forward_grouped(input, selections, context)
-                .map(|reducible| TensorParallelGroupedOutput::new(reducible, None));
-        }
-        Err(Error::backend(
-            "tensor-parallel ReLU2 groups are not implemented by this backend",
-        ))
-    }
+    ) -> Result<TensorParallelGroupedOutput<T>, Error>;
 }
 
 /// Neural backend extension for grouped computation.
@@ -2633,6 +2623,55 @@ pub trait GroupedNeuralBackend: NeuralBackend {
         input: JointGroupSelectionInput<'_, Self::Tensor>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<JointGroupSelection<Self::Tensor>, Error>;
+}
+
+/// Grouped backend whose selected realization provides every required
+/// tensor-parallel grouped partial operation.
+pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
+    /// Executes one rank-local gated-product grouped partial.
+    fn gated_product_groups_tensor_parallel(
+        groups: &mut Self::GatedProductGroups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error>;
+
+    /// Executes one rank-local ReLU-squared grouped partial.
+    fn relu2_groups_tensor_parallel(
+        groups: &mut Self::Relu2Groups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error>;
+}
+
+impl<B> TensorParallelGroupedNeuralBackend for B
+where
+    B: GroupedNeuralBackend,
+    B::GatedProductGroups: TensorParallelGroupedGatedProductOperator<B::Tensor>,
+    B::Relu2Groups: TensorParallelGroupedRelu2Operator<B::Tensor>,
+{
+    fn gated_product_groups_tensor_parallel(
+        groups: &mut Self::GatedProductGroups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        groups.forward_grouped_tensor_parallel(input, selections, partitions, context)
+    }
+
+    fn relu2_groups_tensor_parallel(
+        groups: &mut Self::Relu2Groups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        groups.forward_grouped_tensor_parallel(input, selections, partitions, context)
+    }
 }
 
 /// Complete construction specification for one multi-stream residual mix.

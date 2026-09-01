@@ -240,7 +240,7 @@ fn distributed_materialization_uses_the_planned_configuration() {
 
     std::fs::remove_file(checkpoint.path().join("config.json")).unwrap();
 
-    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let stream = Stream::new_with_device(&topology.device().unwrap());
     let error = match load_pipeline_model_with_options(plan, options, &stream, &stream) {
         Ok(model) => {
             assert_eq!(model.stage_info().global_layer_range, 0..1);
@@ -265,7 +265,7 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
     let topology =
         MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
-    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let stream = Stream::new_with_device(&topology.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
         ModelLoadOptions::with_parallel(
@@ -285,7 +285,7 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
     let topology =
         MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
-    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let stream = Stream::new_with_device(&topology.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
         ModelLoadOptions::with_parallel(
@@ -310,7 +310,7 @@ fn inkling_pipeline_reports_static_embedded_mtp_ownership() {
         let topology =
             MlxParallelContext::for_rank(rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
-        let stream = Stream::new_with_device(&topology.device.device().unwrap());
+        let stream = Stream::new_with_device(&topology.device().unwrap());
         let model = load_prepared_pipeline_model(
             checkpoint.path(),
             ModelLoadOptions::with_parallel(
@@ -346,7 +346,7 @@ fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
             .unwrap();
     let wire_contract =
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Bfloat16);
-    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let stream = Stream::new_with_device(&topology.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
         ModelLoadOptions::with_parallel(topology, wire_contract),
@@ -705,7 +705,7 @@ fn pipeline_ring_worker() {
     .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let pipeline_rank = topology.pipeline_parallel_rank;
-    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let stream = Stream::new_with_device(&topology.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
         let backend = crate::native::distributed_backend(&stream, &stream, &native_group);
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {

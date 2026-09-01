@@ -482,7 +482,6 @@ impl ParallelBuildContext {
 /// The group is never retained by model state. In hybrid topologies callers
 /// supply the TP subgroup, whose rank is the tensor-parallel coordinate.
 pub struct ParallelExecutionContext<'a> {
-    topology: Option<MlxParallelContext>,
     group: Option<&'a Group>,
     stream: &'a Stream,
 }
@@ -491,37 +490,19 @@ impl<'a> ParallelExecutionContext<'a> {
     /// Creates a singleton replicated execution context.
     pub const fn replicated(stream: &'a Stream) -> Self {
         Self {
-            topology: None,
             group: None,
             stream,
         }
     }
 
-    /// Creates a tensor-parallel context from a topology-derived subgroup.
-    pub fn tensor_parallel(
-        topology: MlxParallelContext,
-        group: &'a Group,
-        stream: &'a Stream,
-    ) -> Result<Self, Error> {
-        if topology.tensor_parallel_size <= 1 {
+    /// Creates a partitioned execution context from a selected subgroup.
+    pub fn partitioned(group: &'a Group, stream: &'a Stream) -> Result<Self, Error> {
+        if group.size() <= 1 {
             return Err(Error::Parallel(
-                "tensor-parallel execution context requires TP size greater than one".into(),
+                "partitioned execution context requires a group larger than one".into(),
             ));
         }
-        if group.size() != topology.tensor_parallel_size
-            || group.rank() != topology.tensor_parallel_rank
-        {
-            return Err(Error::Parallel(format!(
-                "TP subgroup expects rank {}/{} but received {}/{}",
-                topology.tensor_parallel_rank,
-                topology.tensor_parallel_size,
-                group.rank(),
-                group.size()
-            )));
-        }
-        topology.validate_execution_stream(stream)?;
         Ok(Self {
-            topology: Some(topology),
             group: Some(group),
             stream,
         })
@@ -534,14 +515,12 @@ impl<'a> ParallelExecutionContext<'a> {
 
     /// Returns the tensor-parallel rank.
     pub fn rank(&self) -> usize {
-        self.topology
-            .map_or(0, |topology| topology.tensor_parallel_rank)
+        self.group.map_or(0, Group::rank)
     }
 
     /// Returns the tensor-parallel process count.
     pub fn size(&self) -> usize {
-        self.topology
-            .map_or(1, |topology| topology.tensor_parallel_size)
+        self.group.map_or(1, Group::size)
     }
 
     /// Returns the execution stream.
