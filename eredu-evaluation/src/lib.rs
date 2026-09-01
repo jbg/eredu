@@ -525,7 +525,7 @@ fn encode_pcm<T: Tensor>(
 ) -> Result<Vec<Vec<i32>>, Box<dyn Error>> {
     mimi.reset_encode_state();
     let mut frames = Vec::with_capacity(pcm.len() / FRAME_SAMPLES);
-    for frame in pcm.chunks_exact(FRAME_SAMPLES) {
+    for frame in pcm.as_chunks::<FRAME_SAMPLES>().0 {
         let frame = T::from_f32_slice(frame, &[1, 1, FRAME_SAMPLES as i32], context)?;
         if let Some(tokens) = mimi.encode_step(&frame, context)? {
             frames.push(tokens.to_i32_vec(context)?);
@@ -806,8 +806,10 @@ fn read_f32le(path: &Path) -> Result<Vec<f32>, Box<dyn Error>> {
         )));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -822,10 +824,12 @@ fn rms_dbfs(samples: &[f32]) -> f64 {
 
 fn tail_max_rms_dbfs(samples: &[f32]) -> f64 {
     samples
-        .chunks_exact(FRAME_SAMPLES)
+        .as_chunks::<FRAME_SAMPLES>()
+        .0
+        .iter()
         .rev()
         .take(TAIL_ACTIVITY_FRAMES)
-        .map(rms_dbfs)
+        .map(|frame| rms_dbfs(frame))
         .fold(f64::NEG_INFINITY, f64::max)
 }
 

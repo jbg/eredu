@@ -35,7 +35,9 @@ const NATIVE_TYPES: [GgmlType; 12] = [
 fn unhex(value: &str) -> Vec<u8> {
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -132,9 +134,11 @@ fn zero_blocks_have_no_nonzero_decoded_values() {
         let (_, bytes) = ty.block_and_bytes().unwrap();
         let decoded = converted(ty, 1, &vec![0; bytes as usize], Endian::Little);
         assert!(
-            decoded.chunks_exact(2).all(|pair| {
-                half::f16::from_bits(u16::from_ne_bytes(pair.try_into().unwrap())).to_f32() == 0.0
-            }),
+            decoded
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| { half::f16::from_bits(u16::from_ne_bytes(*pair)).to_f32() == 0.0 }),
             "{ty:?}"
         );
     }
@@ -146,9 +150,11 @@ fn native_affine_blocks_remain_packed_and_support_portable_dequantization() {
         let (_, bytes) = ty.block_and_bytes().unwrap();
         let decoded = converted(ty, 1, &vec![0; bytes as usize], Endian::Little);
         assert!(
-            decoded.chunks_exact(2).all(|pair| {
-                half::f16::from_bits(u16::from_ne_bytes(pair.try_into().unwrap())).to_f32() == 0.0
-            }),
+            decoded
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| { half::f16::from_bits(u16::from_ne_bytes(*pair)).to_f32() == 0.0 }),
             "{ty:?}"
         );
     }
@@ -170,7 +176,7 @@ fn iq_multibyte_fields_obey_declared_gguf_byte_order() {
         .collect::<Vec<_>>();
     little[..2].copy_from_slice(&half::f16::from_f32(1.25).to_bits().to_le_bytes());
     let mut big = little.clone();
-    for pair in big[..66].chunks_exact_mut(2) {
+    for pair in big[..66].as_chunks_mut::<2>().0 {
         pair.reverse();
     }
     assert_eq!(

@@ -125,15 +125,16 @@ fn read_checkpoint_observations(path: &Path) -> Result<ObservationSet, Checkpoin
                 message: format!("tensor {name:?} must be F32, got {:?}", tensor.dtype()),
             });
         }
-        let chunks = tensor.data().chunks_exact(4);
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = tensor.data().as_chunks::<4>();
+        if !remainder.is_empty() {
             return Err(CheckpointParityError::InvalidArtifact {
                 path: tensor_path.clone(),
                 message: format!("tensor {name:?} has a partial F32 value"),
             });
         }
         let values = chunks
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         observations.insert(
             format!("logits.{name}"),

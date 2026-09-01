@@ -1853,8 +1853,10 @@ mod tests {
             .unwrap()
             .as_bytes()
             .unwrap()
-            .chunks_exact(size_of::<i32>())
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<{ size_of::<i32>() }>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect()
     }
 

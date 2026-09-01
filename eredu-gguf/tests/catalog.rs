@@ -113,8 +113,10 @@ fn reads_one_reshaped_contiguous_span_from_a_dense_bank() {
     assert_eq!(selected.shape, [1, 2, 4]);
     let selected = selected
         .data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(selected, values[8..16]);
 }
@@ -261,8 +263,10 @@ fn plans_and_reads_dense_inner_axis_ranges_as_strided_spans() {
     assert_eq!(selected.shape, [4, 2]);
     let selected = selected
         .data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(selected, [1.0, 2.0, 4.0, 5.0, 7.0, 8.0, 10.0, 11.0]);
 }
@@ -309,8 +313,10 @@ fn reads_reordered_dense_indices_on_an_intermediate_axis() {
     assert_eq!(selected.shape, [2, 2, 2]);
     let selected = selected
         .data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(selected, [4.0, 5.0, 0.0, 1.0, 10.0, 11.0, 6.0, 7.0]);
 }
@@ -678,8 +684,10 @@ fn selects_from_a_big_endian_tensor_in_a_noninitial_shard() {
     };
     let selected = selected
         .data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(selected, [3.0, 4.0]);
 }

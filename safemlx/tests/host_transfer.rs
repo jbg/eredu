@@ -42,8 +42,10 @@ fn host_transfer_round_trip_preserves_metadata_and_values() {
     let values = host
         .as_bytes()
         .unwrap()
-        .chunks_exact(size_of::<f32>())
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<{ size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
 
@@ -119,8 +121,10 @@ fn noncontiguous_sources_and_empty_buffers_preserve_logical_geometry() {
     let values = host
         .as_bytes()
         .unwrap()
-        .chunks_exact(size_of::<u32>())
-        .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<{ size_of::<u32>() }>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(values, vec![1, 4, 2, 5, 3, 6]);
 

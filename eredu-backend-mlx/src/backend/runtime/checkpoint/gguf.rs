@@ -600,8 +600,10 @@ fn decode_native<T, const N: usize>(
         )));
     }
     Ok(bytes
-        .chunks_exact(N)
-        .map(|chunk| decode(chunk.try_into().expect("chunk length is exact")))
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .map(|chunk| decode(*chunk))
         .collect())
 }
 

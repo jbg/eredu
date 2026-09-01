@@ -79,7 +79,7 @@ fn signed(value: f32, signs: u8, index: usize) -> f32 {
 }
 
 fn iq2_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(66) {
+    for block in raw.as_chunks::<66>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
         for ib32 in 0..8 {
@@ -106,7 +106,7 @@ fn iq2_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq2_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(74) {
+    for block in raw.as_chunks::<74>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
         let scales = &block[66..74];
@@ -129,7 +129,7 @@ fn iq2_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq2_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(82) {
+    for block in raw.as_chunks::<82>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
         let qh = &block[66..74];
@@ -154,7 +154,7 @@ fn iq2_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq3_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(98) {
+    for block in raw.as_chunks::<98>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
         let scales_and_signs = &block[66..98];
@@ -177,7 +177,7 @@ fn iq3_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq3_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(110) {
+    for block in raw.as_chunks::<110>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
         let qh = &block[66..74];
@@ -211,7 +211,7 @@ fn iq3_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq1_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(50) {
+    for block in raw.as_chunks::<50>().0 {
         let d = half(block, endian);
         let qs = &block[2..34];
         let qh = &block[34..50];
@@ -230,7 +230,7 @@ fn iq1_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq1_m(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(56) {
+    for block in raw.as_chunks::<56>().0 {
         let qs = &block[..32];
         let qh = &block[32..48];
         let scales = &block[48..56];
@@ -269,7 +269,7 @@ fn iq1_m(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq4_nl(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(18) {
+    for block in raw.as_chunks::<18>().0 {
         let d = half(block, endian);
         for &quant in &block[2..18] {
             emit(out, d * f32::from(KVALUES_IQ4NL[usize::from(quant & 0xf)]));
@@ -281,7 +281,7 @@ fn iq4_nl(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
 }
 
 fn iq4_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
-    for block in raw.chunks_exact(136) {
+    for block in raw.as_chunks::<136>().0 {
         let d = half(block, endian);
         let scales_high = word(&block[2..], endian);
         let scales_low = &block[4..8];

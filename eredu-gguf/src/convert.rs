@@ -249,7 +249,7 @@ fn mxfp4(desc: &TensorDescriptor, raw: &[u8]) -> Result<MxFp4Tensor> {
     let blocks = raw.len() / 17;
     let mut weights = Vec::with_capacity(blocks * 4);
     let mut scales = Vec::with_capacity(blocks);
-    for block in raw.chunks_exact(17) {
+    for block in raw.as_chunks::<17>().0 {
         scales.push(block[0]);
         let quants = &block[1..];
         let mut values = [0u8; 32];
@@ -257,7 +257,7 @@ fn mxfp4(desc: &TensorDescriptor, raw: &[u8]) -> Result<MxFp4Tensor> {
             values[index] = quants[index] & 0x0f;
             values[index + 16] = quants[index] >> 4;
         }
-        for group in values.chunks_exact(8) {
+        for group in values.as_chunks::<8>().0 {
             weights.push(
                 group
                     .iter()
@@ -347,7 +347,7 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
     };
     match desc.ggml_type {
         GgmlType::Q4_0 => {
-            for b in raw.chunks_exact(18) {
+            for b in raw.as_chunks::<18>().0 {
                 let d = half(b, endian);
                 out.scales.push(d);
                 out.biases.push(hbits(-8.0 * f16::from_bits(d).to_f32()));
@@ -360,7 +360,7 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
             }
         }
         GgmlType::Q4_1 => {
-            for b in raw.chunks_exact(20) {
+            for b in raw.as_chunks::<20>().0 {
                 out.scales.push(half(b, endian));
                 out.biases.push(half(&b[2..], endian));
                 let mut codes = [0; 32];
@@ -375,7 +375,7 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
             q5(raw, endian, desc.ggml_type == GgmlType::Q5_0, &mut out)
         }
         GgmlType::Q8_0 => {
-            for b in raw.chunks_exact(34) {
+            for b in raw.as_chunks::<34>().0 {
                 let d = half(b, endian);
                 out.scales.push(d);
                 out.biases.push(hbits(-128.0 * f16::from_bits(d).to_f32()));
@@ -465,7 +465,7 @@ fn q45k(raw: &[u8], e: Endian, is_q5: bool, out: &mut AffineTensor) {
 }
 
 fn q6k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
-    for b in raw.chunks_exact(210) {
+    for b in raw.as_chunks::<210>().0 {
         let d = f16::from_bits(half(&b[208..], e)).to_f32();
         for section in 0..2 {
             let ql = &b[section * 64..];
@@ -489,7 +489,7 @@ fn q6k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
 }
 
 fn q2k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
-    for b in raw.chunks_exact(84) {
+    for b in raw.as_chunks::<84>().0 {
         let d = f16::from_bits(half(&b[80..], e)).to_f32();
         let dm = f16::from_bits(half(&b[82..], e)).to_f32();
         let mut all = [0; 256];
@@ -508,7 +508,7 @@ fn q2k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
 }
 
 fn q3k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
-    for b in raw.chunks_exact(110) {
+    for b in raw.as_chunks::<110>().0 {
         let hm = &b[..32];
         let qs = &b[32..96];
         let src = &b[96..108];

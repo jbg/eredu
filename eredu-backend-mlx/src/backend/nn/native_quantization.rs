@@ -752,17 +752,17 @@ fn decode_native_row(
     let mut values = Vec::with_capacity(view.columns as usize);
     match view.format() {
         NativeQuantizationFormat::GgufQ4K => {
-            for block in row.chunks_exact(Q4_K_BLOCK_BYTES as usize) {
+            for block in row.as_chunks::<{ Q4_K_BLOCK_BYTES as usize }>().0 {
                 decode_q4k_block(block, &mut values);
             }
         }
         NativeQuantizationFormat::GgufQ5_1 => {
-            for block in row.chunks_exact(Q5_1_BLOCK_BYTES as usize) {
+            for block in row.as_chunks::<{ Q5_1_BLOCK_BYTES as usize }>().0 {
                 decode_q5_1_block(block, &mut values);
             }
         }
         NativeQuantizationFormat::GgufQ8_0 => {
-            for block in row.chunks_exact(Q8_0_BLOCK_BYTES as usize) {
+            for block in row.as_chunks::<{ Q8_0_BLOCK_BYTES as usize }>().0 {
                 decode_q8_0_block(block, &mut values);
             }
         }
@@ -3134,7 +3134,9 @@ mod tests {
     fn unhex(value: &str) -> Vec<u8> {
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
@@ -3312,7 +3314,7 @@ mod tests {
             match ty {
                 GgmlType::IQ4NL => big[..2].reverse(),
                 GgmlType::IQ2XS => {
-                    for pair in big[..66].chunks_exact_mut(2) {
+                    for pair in big[..66].as_chunks_mut::<2>().0 {
                         pair.reverse();
                     }
                 }

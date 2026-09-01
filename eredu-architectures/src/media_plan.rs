@@ -625,7 +625,9 @@ fn qwen_vision(
     }
     let grid = metadata
         .values
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|row| (row[0], row[1], row[2]))
         .collect::<Vec<_>>();
     let described_patches = grid.iter().try_fold(0u64, |total, (time, height, width)| {
@@ -777,7 +779,9 @@ fn qwen_vision_ingress_with_shape(
         .ok_or_else(|| unsupported(architecture, "prepared Qwen media has no grid_thw metadata"))?;
     let patch_grid = metadata
         .values
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|row| (row[0], row[1], row[2]))
         .collect();
     Ok((
@@ -1197,7 +1201,9 @@ fn gemma_valid_patch_count(
     u64::try_from(
         positions
             .values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter(|pair| pair[0] >= 0 && pair[1] >= 0)
             .count(),
     )
@@ -1733,7 +1739,7 @@ fn muse_glimmer(
     let merge = nonzero_positive(vision.merge_size, "Muse vision merge size")?;
     let mut patches = 0u64;
     let mut positions = 0u64;
-    for entry in grid.values.chunks_exact(3) {
+    for entry in grid.values.as_chunks::<3>().0 {
         if entry.iter().any(|value| *value <= 0)
             || u64::try_from(entry[1]).unwrap_or_default() % merge != 0
             || u64::try_from(entry[2]).unwrap_or_default() % merge != 0
@@ -1820,7 +1826,9 @@ pub fn muse_glimmer_input_part<Tensor>(
                 .as_ref()
                 .expect("Muse-Glimmer shape validation requires a patch grid")
                 .values
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|entry| (entry[0], entry[1], entry[2]))
                 .collect();
             Ok(MuseGlimmerInputPartPlan::Vision {

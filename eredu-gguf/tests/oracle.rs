@@ -61,10 +61,10 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
                     assert_eq!(name, "oracle.weight:[2, 32]");
                     assert_eq!(dtype, "Float16");
                     let expected: Vec<f32> = unhex(data)
-                        .chunks_exact(2)
-                        .map(|b| {
-                            half::f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32()
-                        })
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
                         .collect();
                     for (i, (actual, expected)) in
                         a.dequantize().into_iter().zip(expected).enumerate()
@@ -94,10 +94,10 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
                 );
                 assert_eq!(dtype, "Float16");
                 let expected: Vec<f32> = unhex(d)
-                    .chunks_exact(2)
-                    .map(|b| {
-                        half::f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32()
-                    })
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
                     .collect();
                 let actual = a.dequantize();
                 assert_eq!(actual.len(), expected.len());
