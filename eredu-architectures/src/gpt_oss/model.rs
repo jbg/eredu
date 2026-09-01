@@ -1,6 +1,6 @@
 //! Backend-neutral layered GPT-OSS model assembly.
 
-use eredu_nn::{Error, RoutedNeuralBackend, Tensor};
+use eredu_nn::{Error, GroupedNeuralBackend, Tensor};
 
 use super::{block::GptOssBlockFactory, config::ModelArgs};
 
@@ -8,7 +8,7 @@ use super::{block::GptOssBlockFactory, config::ModelArgs};
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, GptOssBlockFactory>;
 
 /// Builds one layered GPT-OSS model with pinned static modules.
-pub fn new_layered_model<B: RoutedNeuralBackend>(
+pub fn new_layered_model<B: GroupedNeuralBackend>(
     args: ModelArgs,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<LayeredModel<B>, Error> {

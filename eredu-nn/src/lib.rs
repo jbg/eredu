@@ -1529,12 +1529,13 @@ impl<T> Clone for RotaryPosition<'_, T> {
     }
 }
 
-/// Architecture-selected scoring policy for routed experts.
+/// Architecture-selected scoring policy for top-k group selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RoutingScoring {
-    /// Apply softmax across all expert logits before selecting routes.
+#[non_exhaustive]
+pub enum GroupScoring {
+    /// Apply softmax across all group logits before selection.
     Softmax,
-    /// Select the largest raw logits, then softmax only the selected routes.
+    /// Select the largest raw logits, then softmax only the selected entries.
     SelectedSoftmax,
     /// Apply elementwise sigmoid scores before grouped selection.
     Sigmoid,
@@ -1542,61 +1543,170 @@ pub enum RoutingScoring {
     SqrtSoftplus,
 }
 
-/// Backend-neutral top-k routing semantics.
+/// Backend-neutral top-k group-selection semantics.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TopKRoutingSpec {
-    expert_count: i32,
+pub struct TopKGroupSelectionSpec {
+    group_count: i32,
     top_k: i32,
-    scoring: RoutingScoring,
+    scoring: GroupScoring,
     normalize_selected: bool,
     normalization_epsilon: f32,
-    routed_scaling: f32,
-    expert_groups: i32,
+    coefficient_scale: f32,
+    selection_partitions: i32,
     selected_groups: i32,
 }
 
-/// Construction specification for a learned top-k router projection.
+/// Construction specification for a learned top-k selector projection.
 #[derive(Debug, Clone)]
-pub struct TopKRouterSpec {
-    /// Hidden width consumed by the router projection.
-    pub input_dimensions: i32,
-    /// Stable router projection parameter identity.
-    pub weight: ParameterSpec,
-    /// Optional ordinary projection bias. This contributes to router logits
-    /// before scoring, selection, and selected-route normalization.
-    pub bias: Option<ParameterSpec>,
-    /// Optional correction bias used only to choose expert IDs. Gathered
-    /// route scores remain unbiased.
-    pub correction_bias: Option<ParameterSpec>,
+pub struct TopKGroupSelectorSpec {
+    /// Hidden width consumed by the selector projection.
+    input_dimensions: i32,
+    /// Stable selector projection parameter identity.
+    weight: ParameterSpec,
+    /// Optional ordinary projection bias. This contributes to selector logits
+    /// before scoring, selection, and selected-score normalization.
+    bias: Option<ParameterSpec>,
+    /// Optional correction bias used only to choose group IDs. Gathered
+    /// selection scores remain unbiased.
+    correction_bias: Option<ParameterSpec>,
     /// Optional learned scaling applied after weightless RMS normalization of
-    /// the router input.
-    pub input_transform: Option<RouterInputTransformSpec>,
-    /// Optional learned per-expert multiplier gathered after route selection.
-    pub route_scale: Option<ParameterSpec>,
-    /// Physical encoding and exact companion identities of the router projection.
-    pub format: LinearFormatSpec,
+    /// the selector input.
+    input_transform: Option<SelectorInputTransformSpec>,
+    /// Optional learned per-group multiplier gathered after selection.
+    coefficient_scale: Option<ParameterSpec>,
+    /// Physical encoding and exact companion identities of the selector projection.
+    format: LinearFormatSpec,
     /// Architecture-selected scoring and selection semantics.
-    pub routing: TopKRoutingSpec,
+    selection: TopKGroupSelectionSpec,
 }
 
-/// Learned normalization and scale applied before a router projection.
+/// Learned normalization and scale applied before a selector projection.
 #[derive(Debug, Clone)]
-pub struct RouterInputTransformSpec {
+pub struct SelectorInputTransformSpec {
     /// Weightless RMS-normalization epsilon.
-    pub epsilon: f32,
+    epsilon: f32,
     /// Learned feature-wise multiplier.
-    pub scale: ParameterSpec,
+    scale: ParameterSpec,
     /// Whether to additionally multiply by `1 / sqrt(input_dimensions)`.
-    pub inverse_sqrt_dimensions: bool,
+    inverse_sqrt_dimensions: bool,
 }
 
-impl TopKRouterSpec {
+impl SelectorInputTransformSpec {
+    /// Creates a validated selector-input transformation.
+    pub fn new(
+        epsilon: f32,
+        scale: ParameterSpec,
+        inverse_sqrt_dimensions: bool,
+    ) -> Result<Self, Error> {
+        if !epsilon.is_finite() || epsilon < 0.0 {
+            return Err(Error::backend(
+                "selector input RMS epsilon must be finite and nonnegative",
+            ));
+        }
+        Ok(Self {
+            epsilon,
+            scale,
+            inverse_sqrt_dimensions,
+        })
+    }
+
+    /// Returns the RMS epsilon.
+    pub const fn epsilon(&self) -> f32 {
+        self.epsilon
+    }
+    /// Returns the learned input scale.
+    pub const fn scale(&self) -> &ParameterSpec {
+        &self.scale
+    }
+    /// Returns whether inverse-square-root width scaling is selected.
+    pub const fn inverse_sqrt_dimensions(&self) -> bool {
+        self.inverse_sqrt_dimensions
+    }
+}
+
+impl TopKGroupSelectorSpec {
+    /// Creates a selector projection with no optional parameters.
+    pub fn new(
+        input_dimensions: i32,
+        weight: ParameterSpec,
+        format: LinearFormatSpec,
+        selection: TopKGroupSelectionSpec,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            input_dimensions,
+            weight,
+            bias: None,
+            correction_bias: None,
+            input_transform: None,
+            coefficient_scale: None,
+            format,
+            selection,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Adds an ordinary projection bias.
+    pub fn with_bias(mut self, bias: ParameterSpec) -> Result<Self, Error> {
+        self.bias = Some(bias);
+        self.validate()?;
+        Ok(self)
+    }
+    /// Adds a selection-only correction bias.
+    pub fn with_correction_bias(mut self, bias: ParameterSpec) -> Result<Self, Error> {
+        self.correction_bias = Some(bias);
+        self.validate()?;
+        Ok(self)
+    }
+    /// Adds an input normalization transformation.
+    pub fn with_input_transform(mut self, transform: SelectorInputTransformSpec) -> Self {
+        self.input_transform = Some(transform);
+        self
+    }
+    /// Adds a learned coefficient multiplier.
+    pub fn with_coefficient_scale(mut self, scale: ParameterSpec) -> Self {
+        self.coefficient_scale = Some(scale);
+        self
+    }
+    /// Returns the input width.
+    pub const fn input_dimensions(&self) -> i32 {
+        self.input_dimensions
+    }
+    /// Returns the selector projection parameter.
+    pub const fn weight(&self) -> &ParameterSpec {
+        &self.weight
+    }
+    /// Returns the ordinary projection bias.
+    pub const fn bias(&self) -> Option<&ParameterSpec> {
+        self.bias.as_ref()
+    }
+    /// Returns the selection correction bias.
+    pub const fn correction_bias(&self) -> Option<&ParameterSpec> {
+        self.correction_bias.as_ref()
+    }
+    /// Returns the optional input transformation.
+    pub const fn input_transform(&self) -> Option<&SelectorInputTransformSpec> {
+        self.input_transform.as_ref()
+    }
+    /// Returns the learned coefficient multiplier.
+    pub const fn coefficient_scale(&self) -> Option<&ParameterSpec> {
+        self.coefficient_scale.as_ref()
+    }
+    /// Returns the physical projection format.
+    pub const fn format(&self) -> &LinearFormatSpec {
+        &self.format
+    }
+    /// Returns the group-selection semantics.
+    pub const fn selection(&self) -> TopKGroupSelectionSpec {
+        self.selection
+    }
+
     /// Validates positive input geometry.
     pub fn validate(&self) -> Result<(), Error> {
         self.format.validate_for_weight(&self.weight)?;
         if self.input_dimensions <= 0 {
             return Err(Error::backend(format!(
-                "router input dimensions must be positive, got {}",
+                "selector input dimensions must be positive, got {}",
                 self.input_dimensions
             )));
         }
@@ -1606,7 +1716,7 @@ impl TopKRouterSpec {
             .is_some_and(|transform| !transform.epsilon.is_finite() || transform.epsilon < 0.0)
         {
             return Err(Error::backend(
-                "router input RMS epsilon must be finite and nonnegative",
+                "selector input RMS epsilon must be finite and nonnegative",
             ));
         }
         if self
@@ -1616,93 +1726,97 @@ impl TopKRouterSpec {
             .is_some_and(|(bias, correction_bias)| bias.id == correction_bias.id)
         {
             return Err(Error::backend(
-                "router projection bias and correction bias require distinct parameter identities",
+                "selector projection bias and correction bias require distinct parameter identities",
             ));
         }
         Ok(())
     }
 }
 
-impl TopKRoutingSpec {
-    /// Creates a validated routed-expert selection policy.
+impl TopKGroupSelectionSpec {
+    /// Creates a validated top-k group-selection policy.
     pub fn new(
-        expert_count: i32,
+        group_count: i32,
         top_k: i32,
-        scoring: RoutingScoring,
+        scoring: GroupScoring,
         normalize_selected: bool,
     ) -> Result<Self, Error> {
-        if expert_count <= 0 {
+        if group_count <= 0 {
             return Err(Error::backend(format!(
-                "expert count must be positive, got {expert_count}"
+                "group count must be positive, got {group_count}"
             )));
         }
-        if top_k <= 0 || top_k > expert_count {
+        if top_k <= 0 || top_k > group_count {
             return Err(Error::backend(format!(
-                "top-k route count must be in 1..={expert_count}, got {top_k}"
+                "top-k selection count must be in 1..={group_count}, got {top_k}"
             )));
         }
         Ok(Self {
-            expert_count,
+            group_count,
             top_k,
             scoring,
             normalize_selected,
             normalization_epsilon: 0.0,
-            routed_scaling: 1.0,
-            expert_groups: 1,
+            coefficient_scale: 1.0,
+            selection_partitions: 1,
             selected_groups: 1,
         })
     }
 
-    /// Selects grouped routing semantics.
-    pub fn with_groups(mut self, expert_groups: i32, selected_groups: i32) -> Result<Self, Error> {
-        if expert_groups <= 0
+    /// Selects grouped selection semantics.
+    pub fn with_groups(
+        mut self,
+        selection_partitions: i32,
+        selected_groups: i32,
+    ) -> Result<Self, Error> {
+        if selection_partitions <= 0
             || selected_groups <= 0
-            || selected_groups > expert_groups
-            || self.expert_count % expert_groups != 0
-            || self.top_k > selected_groups * (self.expert_count / expert_groups)
+            || selected_groups > selection_partitions
+            || self.group_count % selection_partitions != 0
+            || self.top_k > selected_groups * (self.group_count / selection_partitions)
         {
             return Err(Error::backend(format!(
-                "invalid grouped routing geometry: experts={} top_k={} groups={expert_groups} selected_groups={selected_groups}",
-                self.expert_count, self.top_k
+                "invalid grouped selection geometry: group_count={} top_k={} partitions={selection_partitions} selected_partitions={selected_groups}",
+                self.group_count, self.top_k
             )));
         }
-        self.expert_groups = expert_groups;
+        self.selection_partitions = selection_partitions;
         self.selected_groups = selected_groups;
         Ok(self)
     }
 
-    /// Selects denominator epsilon and final routed contribution scale.
+    /// Selects denominator epsilon and final grouped contribution scale.
     pub fn with_weight_policy(
         mut self,
         normalization_epsilon: f32,
-        routed_scaling: f32,
+        coefficient_scale: f32,
     ) -> Result<Self, Error> {
         if !normalization_epsilon.is_finite()
             || normalization_epsilon < 0.0
-            || !routed_scaling.is_finite()
-            || routed_scaling <= 0.0
+            || !coefficient_scale.is_finite()
+            || coefficient_scale <= 0.0
         {
             return Err(Error::backend(
-                "routing normalization epsilon must be finite and nonnegative and routed scaling must be finite and positive",
+                "selection normalization epsilon must be finite and nonnegative and grouped scaling must be finite and positive",
             ));
         }
         self.normalization_epsilon = normalization_epsilon;
-        self.routed_scaling = routed_scaling;
+        self.coefficient_scale = coefficient_scale;
         Ok(self)
     }
 
-    /// Returns the total number of routed experts.
-    pub const fn expert_count(self) -> i32 {
-        self.expert_count
+    /// Returns the total number of selectable groups.
+    pub const fn group_count(self) -> i32 {
+        self.group_count
     }
 
-    /// Returns the number of selected experts per token.
+    /// Returns the number of selected groups per token.
     pub const fn top_k(self) -> i32 {
         self.top_k
     }
 
     /// Returns the score transformation applied before selection.
-    pub const fn scoring(self) -> RoutingScoring {
+    pub const fn scoring(self) -> GroupScoring {
         self.scoring
     }
 
@@ -1716,56 +1830,183 @@ impl TopKRoutingSpec {
         self.normalization_epsilon
     }
 
-    /// Returns the final routed contribution multiplier.
-    pub const fn routed_scaling(self) -> f32 {
-        self.routed_scaling
+    /// Returns the final grouped contribution multiplier.
+    pub const fn coefficient_scale(self) -> f32 {
+        self.coefficient_scale
     }
 
-    /// Returns the number of equal contiguous expert groups.
-    pub const fn expert_groups(self) -> i32 {
-        self.expert_groups
+    /// Returns the number of equal contiguous groups.
+    pub const fn selection_partitions(self) -> i32 {
+        self.selection_partitions
     }
 
-    /// Returns the number of groups eligible for expert selection.
+    /// Returns the number of groups eligible for group selection.
     pub const fn selected_groups(self) -> i32 {
         self.selected_groups
     }
 }
 
-/// Backend-native result of one top-k route selection.
+/// Backend-native result of one top-k group selection.
 #[derive(Debug, Clone)]
-pub struct RoutingResult<T> {
-    /// Selected expert IDs shaped `[..., top_k]`.
-    pub expert_ids: T,
+pub struct GroupSelection<T> {
+    /// Selected group IDs shaped `[..., top_k]`.
+    group_indices: T,
     /// Selected scores before optional top-k renormalization.
-    pub selected_scores: T,
-    /// Final normalized or unnormalized route weights.
-    pub route_weights: T,
+    selected_scores: T,
+    /// Final normalized or unnormalized selection weights.
+    coefficients: T,
 }
 
-/// Joint sigmoid routing request with selected routed experts and always-on
-/// shared experts normalized in one probability distribution.
+impl<T> GroupSelection<T> {
+    /// Creates one selected group batch.
+    pub fn new(group_indices: T, selected_scores: T, coefficients: T) -> Self {
+        Self {
+            group_indices,
+            selected_scores,
+            coefficients,
+        }
+    }
+    /// Returns selected group indices.
+    pub const fn group_indices(&self) -> &T {
+        &self.group_indices
+    }
+    /// Returns selected pre-normalization scores.
+    pub const fn selected_scores(&self) -> &T {
+        &self.selected_scores
+    }
+    /// Returns final group coefficients.
+    pub const fn coefficients(&self) -> &T {
+        &self.coefficients
+    }
+}
+
+/// Geometry for joint selected-group and always-on-group weighting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointGroupSelectionSpec {
+    selectable_groups: i32,
+    always_on_groups: i32,
+    top_k: i32,
+    coefficient_scale: f32,
+}
+
+impl JointGroupSelectionSpec {
+    /// Creates validated joint-selection geometry.
+    pub fn new(
+        selectable_groups: i32,
+        always_on_groups: i32,
+        top_k: i32,
+        coefficient_scale: f32,
+    ) -> Result<Self, Error> {
+        if selectable_groups <= 0
+            || always_on_groups <= 0
+            || top_k <= 0
+            || top_k > selectable_groups
+            || !coefficient_scale.is_finite()
+            || coefficient_scale <= 0.0
+        {
+            return Err(Error::backend(format!(
+                "invalid joint group-selection geometry selectable={selectable_groups} always_on={always_on_groups} top_k={top_k} coefficient_scale={coefficient_scale}"
+            )));
+        }
+        Ok(Self {
+            selectable_groups,
+            always_on_groups,
+            top_k,
+            coefficient_scale,
+        })
+    }
+
+    /// Returns the number of selectable groups.
+    pub const fn selectable_groups(self) -> i32 {
+        self.selectable_groups
+    }
+
+    /// Returns the number of always-on groups.
+    pub const fn always_on_groups(self) -> i32 {
+        self.always_on_groups
+    }
+
+    /// Returns the selected group count per row.
+    pub const fn top_k(self) -> i32 {
+        self.top_k
+    }
+
+    /// Returns the fixed coefficient multiplier.
+    pub const fn coefficient_scale(self) -> f32 {
+        self.coefficient_scale
+    }
+}
+
+/// Joint sigmoid selection request with selected groups and always-on
+/// shared groups normalized in one probability distribution.
 #[derive(Debug, Clone, Copy)]
-pub struct JointExpertRoutingInput<'a, T> {
+pub struct JointGroupSelectionInput<'a, T> {
     /// Hidden states shaped `[..., hidden]`.
-    pub hidden: &'a T,
-    /// Projection shaped `[routed_experts + shared_experts, hidden]`.
-    pub weight: &'a T,
-    /// Correction bias used only for routed top-k selection.
-    pub correction_bias: &'a T,
-    /// Learned scalar multiplier applied to all final route weights.
-    pub global_scale: &'a T,
-    /// Number of selectable routed experts.
-    pub routed_experts: i32,
-    /// Number of always-on shared experts.
-    pub shared_experts: i32,
-    /// Number of routed experts selected per token.
-    pub top_k: i32,
-    /// Fixed multiplier applied before the learned global scale.
-    pub route_scale: f32,
+    hidden: &'a T,
+    /// Projection shaped `[selectable_groups + always_on_groups, hidden]`.
+    weight: &'a T,
+    /// Correction bias used only for grouped top-k selection.
+    correction_bias: &'a T,
+    /// Learned scalar multiplier applied to all final selection weights.
+    global_scale: &'a T,
+    /// Joint-selection geometry.
+    selection: JointGroupSelectionSpec,
 }
 
-impl<T: Tensor> JointExpertRoutingInput<'_, T> {
+impl<'a, T: Tensor> JointGroupSelectionInput<'a, T> {
+    /// Creates a validated joint group-selection request.
+    pub fn new(
+        hidden: &'a T,
+        weight: &'a T,
+        correction_bias: &'a T,
+        global_scale: &'a T,
+        selection: JointGroupSelectionSpec,
+    ) -> Result<Self, Error> {
+        let input = Self {
+            hidden,
+            weight,
+            correction_bias,
+            global_scale,
+            selection,
+        };
+        input.validate()?;
+        Ok(input)
+    }
+    /// Returns hidden states.
+    pub const fn hidden(&self) -> &'a T {
+        self.hidden
+    }
+    /// Returns the selection projection.
+    pub const fn weight(&self) -> &'a T {
+        self.weight
+    }
+    /// Returns the selection-only correction bias.
+    pub const fn correction_bias(&self) -> &'a T {
+        self.correction_bias
+    }
+    /// Returns the learned global scale.
+    pub const fn global_scale(&self) -> &'a T {
+        self.global_scale
+    }
+    /// Returns the number of selectable groups.
+    pub const fn selectable_groups(&self) -> i32 {
+        self.selection.selectable_groups()
+    }
+    /// Returns the number of always-on groups.
+    pub const fn always_on_groups(&self) -> i32 {
+        self.selection.always_on_groups()
+    }
+    /// Returns the selected group count per row.
+    pub const fn top_k(&self) -> i32 {
+        self.selection.top_k()
+    }
+    /// Returns the fixed coefficient multiplier.
+    pub const fn coefficient_scale(&self) -> f32 {
+        self.selection.coefficient_scale()
+    }
+}
+
+impl<T: Tensor> JointGroupSelectionInput<'_, T> {
     /// Validates exact projection, bias, and scalar geometry.
     pub fn validate(&self) -> Result<(), Error> {
         let hidden = self.hidden.shape();
@@ -1774,42 +2015,63 @@ impl<T: Tensor> JointExpertRoutingInput<'_, T> {
         let scale = self.global_scale.shape();
         let hidden_width = hidden.last().copied().unwrap_or(0);
         if hidden.len() < 2
-            || weight != [self.routed_experts + self.shared_experts, hidden_width]
-            || bias != [self.routed_experts]
+            || weight
+                != [
+                    self.selectable_groups() + self.always_on_groups(),
+                    hidden_width,
+                ]
+            || bias != [self.selectable_groups()]
             || scale != [1]
-            || self.routed_experts <= 0
-            || self.shared_experts <= 0
-            || self.top_k <= 0
-            || self.top_k > self.routed_experts
-            || !self.route_scale.is_finite()
-            || self.route_scale <= 0.0
         {
             return Err(Error::backend(format!(
-                "invalid joint expert routing geometry hidden={hidden:?} weight={weight:?} bias={bias:?} scale={scale:?} routed={} shared={} top_k={} route_scale={}",
-                self.routed_experts,
-                self.shared_experts,
-                self.top_k,
-                self.route_scale
+                "invalid joint group selection tensors hidden={hidden:?} weight={weight:?} bias={bias:?} scale={scale:?} selectable={} always_on={} top_k={}",
+                self.selectable_groups(),
+                self.always_on_groups(),
+                self.top_k(),
             )));
         }
         Ok(())
     }
 }
 
-/// Backend-native result of joint routed and shared expert weighting.
+/// Backend-native result of joint grouped and shared group weighting.
 #[derive(Debug, Clone)]
-pub struct JointExpertRoutingResult<T> {
-    /// Selected routed expert IDs shaped `[tokens, top_k]`; integer dtype is
-    /// backend-defined and accepted by the corresponding expert operator.
-    pub routed_ids: T,
-    /// Routed expert weights shaped `[tokens, top_k]`.
-    pub routed_weights: T,
-    /// Always-on shared expert weights shaped `[tokens, shared_experts]`.
-    pub shared_weights: T,
+pub struct JointGroupSelection<T> {
+    /// Selected primary group IDs shaped `[tokens, top_k]`; integer dtype is
+    /// backend-defined and accepted by the corresponding group operator.
+    primary_indices: T,
+    /// Grouped group weights shaped `[tokens, top_k]`.
+    primary_coefficients: T,
+    /// Always-on shared group weights shaped `[tokens, always_on_groups]`.
+    always_on_coefficients: T,
 }
 
-/// Activation applied to the gate branch of a routed gated product.
+impl<T> JointGroupSelection<T> {
+    /// Creates one joint selection result.
+    pub fn new(primary_indices: T, primary_coefficients: T, always_on_coefficients: T) -> Self {
+        Self {
+            primary_indices,
+            primary_coefficients,
+            always_on_coefficients,
+        }
+    }
+    /// Returns selected primary-group indices.
+    pub const fn primary_indices(&self) -> &T {
+        &self.primary_indices
+    }
+    /// Returns primary-group coefficients.
+    pub const fn primary_coefficients(&self) -> &T {
+        &self.primary_coefficients
+    }
+    /// Returns always-on group coefficients.
+    pub const fn always_on_coefficients(&self) -> &T {
+        &self.always_on_coefficients
+    }
+}
+
+/// Activation applied to the gate branch of a grouped gated product.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum GatedProductActivation {
     /// `gate * sigmoid(sigmoid_multiplier * gate)`.
     Silu,
@@ -1817,7 +2079,7 @@ pub enum GatedProductActivation {
     GeluApproximate,
 }
 
-/// Validated equation policy for a gated product expert.
+/// Validated equation policy for a gated product group.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GatedProductPolicy {
     activation: GatedProductActivation,
@@ -1928,43 +2190,92 @@ impl Default for GatedProductPolicy {
     }
 }
 
-/// Statically dispatched top-k router.
-pub trait RoutingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
-    /// Selects expert IDs and route weights without host materialization.
-    fn route(&mut self, logits: &T, context: &T::Context) -> Result<RoutingResult<T>, Error>;
+/// Statically dispatched top-k selector.
+pub trait GroupSelectionOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Selects group IDs and selection weights without host materialization.
+    fn select(&mut self, logits: &T, context: &T::Context) -> Result<GroupSelection<T>, Error>;
 
-    /// Computes scores and weights for caller-selected global expert IDs.
-    fn route_selected(
+    /// Computes scores and weights for caller-selected global group IDs.
+    fn select_indices(
         &mut self,
         input: &T,
-        expert_ids: &T,
+        group_indices: &T,
         context: &T::Context,
-    ) -> Result<RoutingResult<T>, Error>;
+    ) -> Result<GroupSelection<T>, Error>;
 }
 
-/// Parameter identities for one gated-product expert or one packed expert axis.
+/// Parameter identities for one gated-product group or one packed group axis.
 #[derive(Debug, Clone)]
-pub struct GatedProductExpertParameters {
+pub struct GatedProductGroupParameters {
     /// Gating projection weight.
-    pub gate: ExpertProjectionSpec,
+    gate: GroupedProjectionSpec,
     /// Up projection weight.
-    pub up: ExpertProjectionSpec,
+    up: GroupedProjectionSpec,
     /// Down projection weight.
-    pub down: ExpertProjectionSpec,
+    down: GroupedProjectionSpec,
 }
 
-/// One expert projection identity and optional physical encoding.
+impl GatedProductGroupParameters {
+    /// Creates one independently addressable gated-product parameter group.
+    pub fn new(
+        gate: GroupedProjectionSpec,
+        up: GroupedProjectionSpec,
+        down: GroupedProjectionSpec,
+    ) -> Self {
+        Self { gate, up, down }
+    }
+    /// Returns the gate projection.
+    pub const fn gate(&self) -> &GroupedProjectionSpec {
+        &self.gate
+    }
+    /// Returns the up projection.
+    pub const fn up(&self) -> &GroupedProjectionSpec {
+        &self.up
+    }
+    /// Returns the down projection.
+    pub const fn down(&self) -> &GroupedProjectionSpec {
+        &self.down
+    }
+}
+
+/// One group projection identity and optional physical encoding.
 #[derive(Debug, Clone)]
-pub struct ExpertProjectionSpec {
+pub struct GroupedProjectionSpec {
     /// Stable logical parameter identity.
-    pub weight: ParameterSpec,
+    weight: ParameterSpec,
     /// Optional ordinary per-output projection bias.
-    pub bias: Option<ParameterSpec>,
+    bias: Option<ParameterSpec>,
     /// Complete physical checkpoint encoding and exact companion identities.
-    pub format: LinearFormatSpec,
+    format: LinearFormatSpec,
 }
 
-impl ExpertProjectionSpec {
+impl GroupedProjectionSpec {
+    /// Creates one validated grouped projection description.
+    pub fn new(
+        weight: ParameterSpec,
+        bias: Option<ParameterSpec>,
+        format: LinearFormatSpec,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            weight,
+            bias,
+            format,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+    /// Returns the matrix parameter.
+    pub const fn weight(&self) -> &ParameterSpec {
+        &self.weight
+    }
+    /// Returns the optional output bias.
+    pub const fn bias(&self) -> Option<&ParameterSpec> {
+        self.bias.as_ref()
+    }
+    /// Returns the physical matrix format.
+    pub const fn format(&self) -> &LinearFormatSpec {
+        &self.format
+    }
     fn validate(&self) -> Result<(), Error> {
         self.format.validate_for_weight(&self.weight)
     }
@@ -1978,69 +2289,125 @@ impl ExpertProjectionSpec {
     }
 }
 
-/// Logical parameter layout for a gated-product expert bank.
+/// Logical parameter layout for a gated-product bank.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // Packed layout stays inline on the construction hot path.
-pub enum GatedProductExpertLayout {
+#[non_exhaustive]
+pub enum GatedProductGroupLayout {
     /// Component-major fused gate-then-up and down tensors whose leading axis
-    /// indexes experts.
+    /// indexes groups.
     Packed {
         /// Concatenated gate/up projection.
-        gate_up: ExpertProjectionSpec,
+        gate_up: GroupedProjectionSpec,
         /// Down projection.
-        down: ExpertProjectionSpec,
+        down: GroupedProjectionSpec,
     },
-    /// Independently materialized expert parameter triples in expert-ID order.
-    Independent(Vec<GatedProductExpertParameters>),
+    /// Independently materialized group parameter triples in group-ID order.
+    Independent(Vec<GatedProductGroupParameters>),
 }
 
-/// Complete architecture-owned construction specification for routed gated-product experts.
+/// Complete architecture-owned construction specification for grouped gated-product groups.
 #[derive(Debug, Clone)]
-pub struct GatedProductExpertBankSpec {
-    /// Number of routed experts.
-    pub expert_count: i32,
+pub struct GroupedGatedProductSpec {
+    /// Number of groups.
+    group_count: i32,
     /// Input hidden width.
-    pub input_dimensions: i32,
-    /// Per-expert intermediate width.
-    pub intermediate_dimensions: i32,
+    input_dimensions: i32,
+    /// Per-group intermediate width.
+    intermediate_dimensions: i32,
     /// Output hidden width.
-    pub output_dimensions: i32,
+    output_dimensions: i32,
     /// Exact gate activation, bounds, multiplier, and up offset.
-    pub policy: GatedProductPolicy,
+    policy: GatedProductPolicy,
     /// Stable logical parameter identities and storage organization.
-    pub layout: GatedProductExpertLayout,
+    layout: GatedProductGroupLayout,
 }
 
-impl GatedProductExpertBankSpec {
-    /// Validates positive geometry and exact independent-expert cardinality.
+impl GroupedGatedProductSpec {
+    /// Creates one validated grouped gated-product mechanism request.
+    pub fn new(
+        group_count: i32,
+        input_dimensions: i32,
+        intermediate_dimensions: i32,
+        output_dimensions: i32,
+        policy: GatedProductPolicy,
+        layout: GatedProductGroupLayout,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            group_count,
+            input_dimensions,
+            intermediate_dimensions,
+            output_dimensions,
+            policy,
+            layout,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+    /// Returns a copy with placement-resolved group geometry.
+    pub fn with_group_geometry(
+        mut self,
+        group_count: i32,
+        intermediate_dimensions: i32,
+    ) -> Result<Self, Error> {
+        self.group_count = group_count;
+        self.intermediate_dimensions = intermediate_dimensions;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Returns the number of parameter groups.
+    pub const fn group_count(&self) -> i32 {
+        self.group_count
+    }
+    /// Returns the input width.
+    pub const fn input_dimensions(&self) -> i32 {
+        self.input_dimensions
+    }
+    /// Returns the per-group intermediate width.
+    pub const fn intermediate_dimensions(&self) -> i32 {
+        self.intermediate_dimensions
+    }
+    /// Returns the output width.
+    pub const fn output_dimensions(&self) -> i32 {
+        self.output_dimensions
+    }
+    /// Returns the gated-product equation policy.
+    pub const fn policy(&self) -> GatedProductPolicy {
+        self.policy
+    }
+    /// Returns the parameter-bank layout.
+    pub const fn layout(&self) -> &GatedProductGroupLayout {
+        &self.layout
+    }
+    /// Validates positive geometry and exact independent-group cardinality.
     pub fn validate(&self) -> Result<(), Error> {
         for (name, value) in [
-            ("expert_count", self.expert_count),
+            ("group_count", self.group_count),
             ("input_dimensions", self.input_dimensions),
             ("intermediate_dimensions", self.intermediate_dimensions),
             ("output_dimensions", self.output_dimensions),
         ] {
             if value <= 0 {
                 return Err(Error::backend(format!(
-                    "gated-product expert-bank {name} must be positive, got {value}"
+                    "gated-product group-bank {name} must be positive, got {value}"
                 )));
             }
         }
         self.policy.validate()?;
-        if let GatedProductExpertLayout::Independent(experts) = &self.layout {
-            let expected = usize::try_from(self.expert_count).map_err(Error::backend)?;
-            if experts.len() != expected {
+        if let GatedProductGroupLayout::Independent(groups) = &self.layout {
+            let expected = usize::try_from(self.group_count).map_err(Error::backend)?;
+            if groups.len() != expected {
                 return Err(Error::backend(format!(
-                    "independent gated-product bank has {} experts, expected {expected}",
-                    experts.len()
+                    "independent gated-product bank has {} groups, expected {expected}",
+                    groups.len()
                 )));
             }
         }
         let projections = match &self.layout {
-            GatedProductExpertLayout::Packed { gate_up, down } => vec![gate_up, down],
-            GatedProductExpertLayout::Independent(experts) => experts
+            GatedProductGroupLayout::Packed { gate_up, down } => vec![gate_up, down],
+            GatedProductGroupLayout::Independent(groups) => groups
                 .iter()
-                .flat_map(|expert| [&expert.gate, &expert.up, &expert.down])
+                .flat_map(|group| [&group.gate, &group.up, &group.down])
                 .collect(),
         };
         let mut identities = std::collections::BTreeSet::new();
@@ -2050,7 +2417,7 @@ impl GatedProductExpertBankSpec {
                 let identity = &parameter.id;
                 if !identities.insert(identity) {
                     return Err(Error::backend(format!(
-                        "gated-product expert parameter identity {identity} is duplicated"
+                        "gated-product group parameter identity {identity} is duplicated"
                     )));
                 }
             }
@@ -2059,78 +2426,133 @@ impl GatedProductExpertBankSpec {
     }
 }
 
-/// Rank-local routed expert output split around the tensor-parallel reduction.
+/// Rank-local grouped output split around the tensor-parallel reduction.
 #[derive(Debug, Clone)]
-pub struct TensorParallelExpertOutput<T> {
+pub struct TensorParallelGroupedOutput<T> {
     /// Rank-local projection contribution to all-sum.
-    pub reducible: T,
-    /// Replicated route-weighted down bias added once after all-sum.
-    pub post_reduce: Option<T>,
+    reducible: T,
+    /// Replicated selection-weighted down bias added once after all-sum.
+    post_reduce: Option<T>,
 }
 
-/// Statically dispatched routed gated-product expert bank.
-pub trait GatedProductExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+impl<T> TensorParallelGroupedOutput<T> {
+    /// Creates one rank-local grouped projection output.
+    pub fn new(reducible: T, post_reduce: Option<T>) -> Self {
+        Self {
+            reducible,
+            post_reduce,
+        }
+    }
+    /// Returns the rank-local reducible tensor.
+    pub const fn reducible(&self) -> &T {
+        &self.reducible
+    }
+    /// Returns the optional post-reduction term.
+    pub const fn post_reduce(&self) -> Option<&T> {
+        self.post_reduce.as_ref()
+    }
+    /// Consumes the output into its reduction contribution and post-reduction term.
+    pub fn into_parts(self) -> (T, Option<T>) {
+        (self.reducible, self.post_reduce)
+    }
+}
+
+/// Statically dispatched grouped gated-product bank.
+pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     /// Returns the architecture-owned construction specification used by this bank.
     ///
     /// Runtime providers use this metadata when they substitute cached or remote
     /// parameters for the resident bank, so every execution path retains the
     /// same geometry, encoding, bias, and activation policy.
-    fn spec(&self) -> &GatedProductExpertBankSpec;
+    fn spec(&self) -> &GroupedGatedProductSpec;
 
-    /// Executes selected experts and combines their outputs by route weight.
-    fn forward_routed(
+    /// Executes selected groups and combines their outputs by selection weight.
+    fn forward_grouped(
         &mut self,
         input: &T,
-        routes: &RoutingResult<T>,
+        selections: &GroupSelection<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
 
     /// Executes a rank-local tensor-parallel partial and separates replicated
-    /// route-weighted down bias for one literal post-reduction addition.
-    fn forward_routed_tensor_parallel(
+    /// selection-weighted down bias for one literal post-reduction addition.
+    fn forward_grouped_tensor_parallel(
         &mut self,
         input: &T,
-        routes: &RoutingResult<T>,
+        selections: &GroupSelection<T>,
         partitions: usize,
         context: &T::Context,
-    ) -> Result<TensorParallelExpertOutput<T>, Error> {
+    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
         if partitions == 1 {
             return self
-                .forward_routed(input, routes, context)
-                .map(|reducible| TensorParallelExpertOutput {
-                    reducible,
-                    post_reduce: None,
-                });
+                .forward_grouped(input, selections, context)
+                .map(|reducible| TensorParallelGroupedOutput::new(reducible, None));
         }
         Err(Error::backend(
-            "tensor-parallel gated-product experts are not implemented by this backend",
+            "tensor-parallel gated-product groups are not implemented by this backend",
         ))
     }
 }
 
-/// Complete construction specification for packed routed ReLU-squared experts.
+/// Complete construction specification for packed grouped ReLU-squared groups.
 #[derive(Debug, Clone)]
-pub struct Relu2ExpertBankSpec {
-    /// Number of routed experts.
-    pub expert_count: i32,
+pub struct GroupedRelu2Spec {
+    /// Number of groups.
+    group_count: i32,
     /// Input and output hidden width.
-    pub hidden_dimensions: i32,
-    /// Per-expert intermediate width.
-    pub intermediate_dimensions: i32,
+    hidden_dimensions: i32,
+    /// Per-group intermediate width.
+    intermediate_dimensions: i32,
     /// Packed up-projection identity and physical format.
-    pub up: ExpertProjectionSpec,
+    up: GroupedProjectionSpec,
     /// Packed down-projection identity and physical format.
-    pub down: ExpertProjectionSpec,
+    down: GroupedProjectionSpec,
 }
 
-impl Relu2ExpertBankSpec {
+impl GroupedRelu2Spec {
+    /// Creates one validated grouped ReLU-squared mechanism request.
+    pub fn new(
+        group_count: i32,
+        hidden_dimensions: i32,
+        intermediate_dimensions: i32,
+        up: GroupedProjectionSpec,
+        down: GroupedProjectionSpec,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            group_count,
+            hidden_dimensions,
+            intermediate_dimensions,
+            up,
+            down,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+    /// Returns the number of parameter groups.
+    pub const fn group_count(&self) -> i32 {
+        self.group_count
+    }
+    /// Returns the input and output width.
+    pub const fn hidden_dimensions(&self) -> i32 {
+        self.hidden_dimensions
+    }
+    /// Returns the per-group intermediate width.
+    pub const fn intermediate_dimensions(&self) -> i32 {
+        self.intermediate_dimensions
+    }
+    /// Returns the up projection.
+    pub const fn up(&self) -> &GroupedProjectionSpec {
+        &self.up
+    }
+    /// Returns the down projection.
+    pub const fn down(&self) -> &GroupedProjectionSpec {
+        &self.down
+    }
     /// Validates positive geometry.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.expert_count <= 0
-            || self.hidden_dimensions <= 0
-            || self.intermediate_dimensions <= 0
+        if self.group_count <= 0 || self.hidden_dimensions <= 0 || self.intermediate_dimensions <= 0
         {
-            return Err(Error::backend("invalid ReLU2 expert-bank geometry"));
+            return Err(Error::backend("invalid ReLU2 group-bank geometry"));
         }
         self.up.validate()?;
         self.down.validate()?;
@@ -2139,7 +2561,7 @@ impl Relu2ExpertBankSpec {
             for parameter in projection.parameters() {
                 if !identities.insert(&parameter.id) {
                     return Err(Error::backend(format!(
-                        "ReLU2 expert parameter identity {} is duplicated",
+                        "ReLU2 group parameter identity {} is duplicated",
                         parameter.id
                     )));
                 }
@@ -2149,65 +2571,68 @@ impl Relu2ExpertBankSpec {
     }
 }
 
-/// Statically dispatched routed ReLU-squared expert bank.
-pub trait Relu2ExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
-    /// Executes selected experts and combines their outputs by route weight.
-    fn forward_routed(
+/// Statically dispatched grouped ReLU-squared bank.
+pub trait GroupedRelu2Operator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Executes selected groups and combines their outputs by selection weight.
+    fn forward_grouped(
         &mut self,
         input: &T,
-        routes: &RoutingResult<T>,
+        selections: &GroupSelection<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
 
     /// Executes a rank-local tensor-parallel partial and separates replicated
-    /// route-weighted down bias for one literal post-reduction addition.
-    fn forward_routed_tensor_parallel(
+    /// selection-weighted down bias for one literal post-reduction addition.
+    fn forward_grouped_tensor_parallel(
         &mut self,
         input: &T,
-        routes: &RoutingResult<T>,
+        selections: &GroupSelection<T>,
         partitions: usize,
         context: &T::Context,
-    ) -> Result<TensorParallelExpertOutput<T>, Error> {
+    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
         if partitions == 1 {
             return self
-                .forward_routed(input, routes, context)
-                .map(|reducible| TensorParallelExpertOutput {
-                    reducible,
-                    post_reduce: None,
-                });
+                .forward_grouped(input, selections, context)
+                .map(|reducible| TensorParallelGroupedOutput::new(reducible, None));
         }
         Err(Error::backend(
-            "tensor-parallel ReLU2 experts are not implemented by this backend",
+            "tensor-parallel ReLU2 groups are not implemented by this backend",
         ))
     }
 }
 
-/// Neural backend extension for routed expert architectures.
-pub trait RoutedNeuralBackend: NeuralBackend {
-    /// Concrete top-k router.
-    type Router: RoutingOperator<Self::Tensor>;
-    /// Concrete packed or independently materialized expert bank.
-    type GatedProductExpertBank: GatedProductExpertBankOperator<Self::Tensor>;
-    /// Concrete packed routed ReLU-squared expert bank.
-    type Relu2ExpertBank: Relu2ExpertBankOperator<Self::Tensor>;
+/// Neural backend extension for grouped computation.
+pub trait GroupedNeuralBackend: NeuralBackend {
+    /// Concrete top-k selector.
+    type Selector: GroupSelectionOperator<Self::Tensor>;
+    /// Concrete packed or independently materialized gated-product bank.
+    type GatedProductGroups: GroupedGatedProductOperator<Self::Tensor>;
+    /// Concrete packed or independently materialized ReLU-squared bank.
+    type Relu2Groups: GroupedRelu2Operator<Self::Tensor>;
 
-    /// Builds a router with architecture-selected top-k semantics.
-    fn top_k_router(
-        spec: TopKRouterSpec,
+    /// Builds a selector with architecture-selected top-k semantics.
+    fn top_k_group_selector(
+        spec: TopKGroupSelectorSpec,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Router, Error>;
+    ) -> Result<Self::Selector, Error>;
 
-    /// Builds a routed gated-product expert bank.
-    fn gated_product_expert_bank(
-        spec: GatedProductExpertBankSpec,
+    /// Builds a grouped gated-product bank.
+    fn grouped_gated_product(
+        spec: GroupedGatedProductSpec,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::GatedProductExpertBank, Error>;
+    ) -> Result<Self::GatedProductGroups, Error>;
 
-    /// Builds a routed ReLU-squared expert bank.
-    fn relu2_expert_bank(
-        spec: Relu2ExpertBankSpec,
+    /// Builds a grouped ReLU-squared bank.
+    fn grouped_relu2(
+        spec: GroupedRelu2Spec,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Relu2ExpertBank, Error>;
+    ) -> Result<Self::Relu2Groups, Error>;
+
+    /// Selects primary groups and jointly normalizes always-on group coefficients.
+    fn joint_group_selection(
+        input: JointGroupSelectionInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<JointGroupSelection<Self::Tensor>, Error>;
 }
 
 /// Complete construction specification for one multi-stream residual mix.
@@ -2788,8 +3213,8 @@ impl NeuralOperatorCapabilities {
     pub const ATTENTION_SINKS: Self = Self(1 << 14);
     /// Learned relative-profile attention.
     pub const RELATIVE_ATTENTION: Self = Self(1 << 15);
-    /// Joint routed/shared expert selection.
-    pub const JOINT_EXPERT_ROUTING: Self = Self(1 << 16);
+    /// Joint grouped/shared group selection.
+    pub const JOINT_GROUP_SELECTION: Self = Self(1 << 16);
     /// Weightless RMS normalization.
     pub const RMS_NORM_WITHOUT_WEIGHT: Self = Self(1 << 17);
     /// Grouped block-diagonal linear projection.
@@ -2903,8 +3328,8 @@ impl NeuralOperatorCapabilities {
                 "relative_attention",
             ),
             (
-                NeuralOperatorCapabilities::JOINT_EXPERT_ROUTING,
-                "joint_expert_routing",
+                NeuralOperatorCapabilities::JOINT_GROUP_SELECTION,
+                "joint_group_selection",
             ),
             (
                 NeuralOperatorCapabilities::RMS_NORM_WITHOUT_WEIGHT,
@@ -3349,17 +3774,6 @@ pub trait NeuralBackend: Sized + 'static {
         let _ = (input, context);
         Err(Error::backend(
             "relative-profile attention is not implemented by this backend",
-        ))
-    }
-    /// Selects routed experts and jointly normalizes them with always-on shared
-    /// experts without materializing indices or logits on the host.
-    fn joint_expert_routing(
-        input: JointExpertRoutingInput<'_, Self::Tensor>,
-        context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<JointExpertRoutingResult<Self::Tensor>, Error> {
-        let _ = (input, context);
-        Err(Error::backend(
-            "joint routed/shared expert weighting is not implemented by this backend",
         ))
     }
     /// Applies RMS normalization without a learned scale.
@@ -4594,38 +5008,34 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
 }
 
 #[cfg(test)]
-mod routed_contract_tests {
+mod grouped_contract_tests {
     use super::*;
 
     fn dense_format() -> LinearFormatSpec {
         LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap()
     }
 
-    fn parameters(prefix: &str) -> GatedProductExpertParameters {
-        GatedProductExpertParameters {
-            gate: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(format!("{prefix}.gate.weight")).unwrap(),
-                bias: None,
-                format: dense_format(),
-            },
-            up: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(format!("{prefix}.up.weight")).unwrap(),
-                bias: None,
-                format: dense_format(),
-            },
-            down: ExpertProjectionSpec {
-                weight: ParameterSpec::trainable(format!("{prefix}.down.weight")).unwrap(),
-                bias: None,
-                format: dense_format(),
-            },
-        }
+    fn parameters(prefix: &str) -> GatedProductGroupParameters {
+        let projection = |name| {
+            GroupedProjectionSpec::new(
+                ParameterSpec::trainable(name).unwrap(),
+                None,
+                dense_format(),
+            )
+            .unwrap()
+        };
+        GatedProductGroupParameters::new(
+            projection(format!("{prefix}.gate.weight")),
+            projection(format!("{prefix}.up.weight")),
+            projection(format!("{prefix}.down.weight")),
+        )
     }
 
     #[test]
-    fn top_k_routing_policy_rejects_invalid_selection_counts() {
-        assert!(TopKRoutingSpec::new(8, 2, RoutingScoring::Softmax, true).is_ok());
-        assert!(TopKRoutingSpec::new(0, 1, RoutingScoring::Softmax, false).is_err());
-        assert!(TopKRoutingSpec::new(8, 9, RoutingScoring::Softmax, false).is_err());
+    fn top_k_selection_policy_rejects_invalid_counts() {
+        assert!(TopKGroupSelectionSpec::new(8, 2, GroupScoring::Softmax, true).is_ok());
+        assert!(TopKGroupSelectionSpec::new(0, 1, GroupScoring::Softmax, false).is_err());
+        assert!(TopKGroupSelectionSpec::new(8, 9, GroupScoring::Softmax, false).is_err());
     }
 
     #[test]
@@ -4656,74 +5066,60 @@ mod routed_contract_tests {
     }
 
     #[test]
-    fn router_projection_and_correction_biases_require_distinct_identities() {
-        let shared_bias = ParameterSpec::trainable("router.bias").unwrap();
-        let spec = TopKRouterSpec {
-            input_dimensions: 4,
-            weight: ParameterSpec::trainable("router.weight").unwrap(),
-            bias: Some(shared_bias.clone()),
-            correction_bias: Some(shared_bias),
-            input_transform: None,
-            route_scale: None,
-            format: dense_format(),
-            routing: TopKRoutingSpec::new(2, 1, RoutingScoring::SelectedSoftmax, false).unwrap(),
-        };
+    fn selector_projection_and_correction_biases_require_distinct_identities() {
+        let shared_bias = ParameterSpec::trainable("selector.bias").unwrap();
+        let spec = TopKGroupSelectorSpec::new(
+            4,
+            ParameterSpec::trainable("selector.weight").unwrap(),
+            dense_format(),
+            TopKGroupSelectionSpec::new(2, 1, GroupScoring::SelectedSoftmax, false).unwrap(),
+        )
+        .unwrap()
+        .with_bias(shared_bias.clone())
+        .unwrap();
 
-        assert!(spec.validate().is_err());
+        assert!(spec.with_correction_bias(shared_bias).is_err());
     }
 
     #[test]
-    fn independent_expert_layout_requires_exact_cardinality() {
-        let valid = GatedProductExpertBankSpec {
-            expert_count: 2,
-            input_dimensions: 16,
-            intermediate_dimensions: 8,
-            output_dimensions: 16,
-            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-            layout: GatedProductExpertLayout::Independent(vec![parameters("e0"), parameters("e1")]),
-        };
-        assert!(valid.validate().is_ok());
-        let invalid = GatedProductExpertBankSpec {
-            layout: GatedProductExpertLayout::Independent(vec![parameters("e0")]),
-            ..valid
-        };
-        assert!(invalid.validate().is_err());
+    fn independent_group_layout_requires_exact_cardinality() {
+        assert!(GroupedGatedProductSpec::new(
+            2,
+            16,
+            8,
+            16,
+            eredu_nn::GatedProductPolicy::ordinary_silu(),
+            GatedProductGroupLayout::Independent(vec![parameters("e0"), parameters("e1")]),
+        )
+        .is_ok());
+        assert!(GroupedGatedProductSpec::new(
+            2,
+            16,
+            8,
+            16,
+            eredu_nn::GatedProductPolicy::ordinary_silu(),
+            GatedProductGroupLayout::Independent(vec![parameters("e0")]),
+        )
+        .is_err());
     }
 
     #[test]
     fn gated_product_bank_rejects_reused_projection_bias_identity() {
-        let shared = ParameterSpec::trainable("experts.gate_up").unwrap();
-        let spec = GatedProductExpertBankSpec {
-            expert_count: 1,
-            input_dimensions: 4,
-            intermediate_dimensions: 2,
-            output_dimensions: 4,
-            policy: GatedProductPolicy::ordinary_silu(),
-            layout: GatedProductExpertLayout::Packed {
-                gate_up: ExpertProjectionSpec {
-                    weight: shared.clone(),
-                    bias: Some(shared),
-                    format: dense_format(),
-                },
-                down: ExpertProjectionSpec {
-                    weight: ParameterSpec::trainable("experts.down").unwrap(),
-                    bias: None,
-                    format: dense_format(),
-                },
-            },
-        };
-
-        assert!(spec.validate().is_err());
+        let shared = ParameterSpec::trainable("groups.gate_up").unwrap();
+        let gate_up = GroupedProjectionSpec::new(shared.clone(), Some(shared), dense_format());
+        assert!(gate_up.is_err());
     }
 
     #[test]
-    fn quantized_expert_projection_requires_explicit_companion_identities() {
+    fn quantized_group_projection_requires_explicit_companion_identities() {
         let format =
             LinearFormat::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
-        let projection = |format| ExpertProjectionSpec {
-            weight: ParameterSpec::trainable("arbitrary.expert.matrix").unwrap(),
-            bias: None,
-            format,
+        let projection = |format| {
+            GroupedProjectionSpec::new(
+                ParameterSpec::trainable("arbitrary.group.matrix").unwrap(),
+                None,
+                format,
+            )
         };
         assert!(LinearFormatSpec::unscaled(format).is_err());
         assert!(projection(
@@ -4734,7 +5130,6 @@ mod routed_contract_tests {
             )
             .unwrap()
         )
-        .validate()
         .is_ok());
     }
 }

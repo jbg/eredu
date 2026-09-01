@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use eredu_nn::{
-    Error, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec, Parameterized,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -33,17 +34,17 @@ fn inferred_expert_pass<T: Tensor>(input: &T) -> ExpertPass {
 /// Qwen3 top-k router and packed expert bank.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct RoutedGatedProduct<B: RoutedNeuralBackend> {
+pub struct RoutedGatedProduct<B: GroupedNeuralBackend> {
     /// Global decoder layer used for runtime expert identity.
     #[parameter(skip)]
     pub layer: usize,
     /// Learned top-k router.
-    pub router: B::Router,
+    pub router: B::Selector,
     /// Packed or provider-materialized expert bank.
-    pub experts: B::GatedProductExpertBank,
+    pub experts: B::GatedProductGroups,
 }
 
-impl<B: RoutedNeuralBackend> RoutedGatedProduct<B> {
+impl<B: GroupedNeuralBackend> RoutedGatedProduct<B> {
     /// Builds one unloaded Qwen3-MoE feed-forward block.
     pub fn new(
         args: &ModelArgs,
@@ -54,30 +55,26 @@ impl<B: RoutedNeuralBackend> RoutedGatedProduct<B> {
             return Err(Error::backend("routed Qwen block requires Qwen3-MoE args"));
         }
         let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-        let routing = TopKRoutingSpec::new(
+        let routing = TopKGroupSelectionSpec::new(
             args.num_experts,
             args.num_experts_per_tok,
-            RoutingScoring::Softmax,
+            GroupScoring::Softmax,
             args.norm_topk_prob,
         )?;
         let router_name = format!("{prefix}.gate.weight");
-        let router = B::top_k_router(
-            TopKRouterSpec {
-                input_dimensions: args.hidden_size,
-                weight: ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
-                bias: None,
-                correction_bias: None,
-                input_transform: None,
-                route_scale: None,
-                format: crate::linear_format::standard_linear_format(
+        let router = B::top_k_group_selector(
+            TopKGroupSelectorSpec::new(
+                args.hidden_size,
+                ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
+                crate::linear_format::standard_linear_format(
                     &router_name,
                     args.weight_quantization_for(&router_name).into(),
                 )?,
                 routing,
-            },
+            )?,
             context,
         )?;
-        let experts = B::gated_product_expert_bank(expert_bank_spec(args, layer)?, context)?;
+        let experts = B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?;
         Ok(Self {
             layer,
             router,
@@ -87,20 +84,17 @@ impl<B: RoutedNeuralBackend> RoutedGatedProduct<B> {
 }
 
 /// Returns the architecture-owned routed expert specification for one layer.
-pub fn expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<GatedProductExpertBankSpec, Error> {
+pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
     let experts_prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     let gate_up_name = format!("{experts_prefix}.gate_up_proj");
     let down_name = format!("{experts_prefix}.down_proj");
-    Ok(GatedProductExpertBankSpec {
-        expert_count: args.num_experts,
-        input_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size,
-        output_dimensions: args.hidden_size,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        layout: GatedProductExpertLayout::Packed {
+    GroupedGatedProductSpec::new(
+        args.num_experts,
+        args.hidden_size,
+        args.moe_intermediate_size,
+        args.hidden_size,
+        eredu_nn::GatedProductPolicy::ordinary_silu(),
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(
                 &gate_up_name,
                 None,
@@ -112,7 +106,7 @@ pub fn expert_bank_spec(
                 args.weight_quantization_for(&down_name).into(),
             )?,
         },
-    })
+    )
 }
 
 /// Returns the architecture-owned routed expert specification at rank-local geometry.
@@ -124,22 +118,18 @@ pub(crate) fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<GatedProductExpertBankSpec, Error> {
-    let mut spec = expert_bank_spec(args, layer)?;
-    spec.expert_count = expert_count;
-    spec.intermediate_dimensions = intermediate_dimensions;
-    spec.validate()?;
-    Ok(spec)
+) -> Result<GroupedGatedProductSpec, Error> {
+    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
 /// Derives complete expert ownership and rank-local bank geometry from Qwen.
 ///
 /// The normalized architecture and its optional planner-derived geometry are
 /// the only inputs that may determine expert cardinality or localized width.
-pub fn expert_realization_plan<B: RoutedNeuralBackend>(
+pub fn expert_realization_plan<B: GroupedNeuralBackend>(
     architecture: &super::RoutedLayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<GatedProductExpertBankSpec>>, Error> {
+) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
     let args = architecture.args();
     if !args.is_moe() {
         return Ok(None);
@@ -203,39 +193,39 @@ mod tests {
         .unwrap();
         let global = expert_bank_spec(&args, 1).unwrap();
         let local = localized_expert_bank_spec(&args, 1, 2, 4).unwrap();
-        assert_eq!(local.expert_count, 2);
-        assert_eq!(local.intermediate_dimensions, 4);
-        assert_eq!(local.policy, global.policy);
-        let GatedProductExpertLayout::Packed {
+        assert_eq!(local.group_count(), 2);
+        assert_eq!(local.intermediate_dimensions(), 4);
+        assert_eq!(local.policy(), global.policy());
+        let GatedProductGroupLayout::Packed {
             gate_up: global_gate_up,
             down: global_down,
-        } = global.layout
+        } = global.layout()
         else {
             panic!("Qwen experts must be packed");
         };
-        let GatedProductExpertLayout::Packed {
+        let GatedProductGroupLayout::Packed {
             gate_up: local_gate_up,
             down: local_down,
-        } = local.layout
+        } = local.layout()
         else {
             panic!("Qwen experts must be packed");
         };
-        assert_eq!(local_gate_up.weight, global_gate_up.weight);
-        assert_eq!(local_gate_up.format, global_gate_up.format);
-        assert_eq!(local_down.weight, global_down.weight);
-        assert_eq!(local_down.format, global_down.format);
+        assert_eq!(local_gate_up.weight(), global_gate_up.weight());
+        assert_eq!(local_gate_up.format(), global_gate_up.format());
+        assert_eq!(local_down.weight(), global_down.weight());
+        assert_eq!(local_down.format(), global_down.format());
     }
 }
 
-impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
+impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let routes = self.router.route(input, context)?;
+        let routes = self.router.select(input, context)?;
         let mut provider = ResidentExpertProvider;
-        RoutedExpertProvider::<B>::forward_routed(
+        RoutedExpertProvider::<B>::forward_grouped(
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
@@ -254,9 +244,9 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let routes = self.router.route(input, context)?;
+        let routes = self.router.select(input, context)?;
         let mut provider = ResidentExpertProvider;
-        let output = RoutedExpertProvider::<B>::forward_routed_tensor_parallel(
+        let output = RoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
@@ -275,14 +265,14 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
 /// One Qwen feed-forward policy used by the single decoder block type.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: RoutedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend> {
     /// Dense SwiGLU used by Qwen2 and dense Qwen3.
     Dense(Mlp<B>),
     /// Top-k routed gated-product used by Qwen3-MoE.
     Routed(RoutedGatedProduct<B>),
 }
 
-impl<B: RoutedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend> FeedForward<B> {
     /// Builds the validated dense or routed policy for one layer.
     pub fn new(
         args: &ModelArgs,
@@ -316,9 +306,9 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
         match self {
             Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
             Self::Routed(moe) => {
-                let routes = moe.router.route(input, context)?;
+                let routes = moe.router.select(input, context)?;
                 provider
-                    .forward_routed(
+                    .forward_grouped(
                         &mut moe.experts,
                         RoutedExpertRequest {
                             layer,
@@ -351,9 +341,9 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
         match self {
             Self::Dense(mlp) => mlp.forward_feed_forward_parallel(input, parallel, context),
             Self::Routed(moe) => {
-                let routes = moe.router.route(input, context)?;
+                let routes = moe.router.select(input, context)?;
                 let output = provider
-                    .forward_routed_tensor_parallel(
+                    .forward_grouped_tensor_parallel(
                         &mut moe.experts,
                         RoutedExpertRequest {
                             layer,
@@ -371,7 +361,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
     }
 }
 
-impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
+impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -396,7 +386,7 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
     }
 }
 
-impl<B: RoutedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for FeedForward<B> {
+impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for FeedForward<B> {
     fn forward_with_provider<P>(
         &mut self,
         layer: usize,

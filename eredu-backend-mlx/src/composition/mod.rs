@@ -1,5 +1,10 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
+pub(crate) mod grouped_provider;
+// Multi-process adapters are also entry points for manually launched native validation.
+#[allow(dead_code)]
+pub(crate) mod expert_dispatch;
+
 use ref_cast::RefCast;
 use safemlx::error::Exception;
 use safemlx::Array;
@@ -9,6 +14,19 @@ use eredu_nn::Parameterized;
 use eredu_runtime::{ArchitectureParameters, StaticParameterVisitor, StaticUnitBindings};
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
+
+impl From<eredu_runtime::ExpertCacheLoadOptions>
+    for crate::backend::runtime::residency::parameter_bank::ParameterBankOptions
+{
+    fn from(options: eredu_runtime::ExpertCacheLoadOptions) -> Self {
+        Self::new(
+            options.experts,
+            options.compact_bank_scratch_bytes,
+            options.prefill_compact_bank_target_bytes,
+        )
+        .expect("architecture-owned expert-cache options were already validated")
+    }
+}
 
 /// Derives prompt-cache identity for a complete replicated realization through
 /// the architecture's neutral mutable-state contract.
@@ -79,7 +97,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
                 path: routing.path,
                 selected_experts: routing.selected_experts.as_array(),
                 selected_scores: routing.selected_scores.as_array(),
-                route_weights: routing.route_weights.as_array(),
+                coefficients: routing.coefficients.as_array(),
                 routed_output: routing.routed_output.as_array(),
                 local_routed_output: routing.local_routed_output.map(crate::MlxTensor::as_array),
                 reduced_routed_output: routing
@@ -200,8 +218,8 @@ pub(crate) fn architecture_expert_units(
     units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
     store: &dyn CheckpointSource,
     layout: Option<&eredu_runtime::LocalModelLayout>,
-) -> Result<Vec<crate::backend::runtime::residency::expert_cache::ExpertCatalogEntry>, Error> {
-    use crate::backend::runtime::residency::expert_cache::ExpertCatalogEntry;
+) -> Result<Vec<crate::backend::runtime::residency::parameter_bank::ParameterBankEntry>, Error> {
+    use crate::backend::runtime::residency::parameter_bank::ParameterBankEntry;
     use eredu_runtime::{OffloadUnit, WeightBinding};
 
     units
@@ -243,9 +261,13 @@ pub(crate) fn architecture_expert_units(
                     Error::ArchitectureModel(format!("expert {identity:?} byte total overflowed"))
                 })
             })?;
-            Ok(ExpertCatalogEntry::new(
-                identity,
-                OffloadUnit::new(identity.unit_id(), bindings)?,
+            let key = crate::backend::runtime::residency::parameter_bank::ParameterBankKey::new(
+                identity.layer,
+                identity.global_expert,
+            );
+            Ok(ParameterBankEntry::new(
+                key,
+                OffloadUnit::new(key.unit_id(), bindings)?,
                 bytes,
             )?)
         })

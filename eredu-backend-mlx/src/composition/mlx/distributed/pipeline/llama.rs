@@ -11,12 +11,12 @@ use crate::{
         error::Error,
         nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
-            cache::state::MlxHybridState,
-            distributed::{expert::RoutingStatistics, parallel::ParallelExecutionContext},
-            residency::expert_cache::ExpertCache,
+            cache::state::MlxHybridState, distributed::parallel::ParallelExecutionContext,
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
     },
+    composition::expert_dispatch::RoutingStatistics,
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_group_unit_count, architecture_parallel_layout,
         architecture_parameter_unit_owner, base_info, build_pipeline_layer_storage,
@@ -60,8 +60,8 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
-        self.expert_cache.as_ref()
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
+        self.parameter_bank.as_ref()
     }
 }
 
@@ -210,7 +210,7 @@ pub(super) fn load_llama_pipeline(
         dense_layers: None,
         expert_realization: None,
         expert_assignment: None,
-        expert_cache: None,
+        parameter_bank: None,
         routing_statistics: RoutingStatistics::default(),
     };
     let static_roles = parameter_description.select_static_roles(&stage.partition);

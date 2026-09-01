@@ -2,8 +2,9 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::{
-    Error, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec, Parameterized,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -40,17 +41,17 @@ fn inferred_pass<T: Tensor>(input: &T) -> ExpertPass {
 /// GPT-OSS SelectedSoftmax router and canonical biased MXFP4 expert bank.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct RoutedMlp<B: RoutedNeuralBackend> {
+pub struct RoutedMlp<B: GroupedNeuralBackend> {
     /// Global layer identity used by runtime expert providers.
     #[parameter(skip)]
     pub layer: usize,
     /// Learned biased router.
-    pub router: B::Router,
+    pub router: B::Selector,
     /// Canonical component-major expert bank.
-    pub experts: B::GatedProductExpertBank,
+    pub experts: B::GatedProductGroups,
 }
 
-impl<B: RoutedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for RoutedMlp<B> {
+impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for RoutedMlp<B> {
     fn forward_with_provider<P>(
         &mut self,
         _layer: usize,
@@ -83,7 +84,7 @@ impl<B: RoutedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for Ro
     }
 }
 
-impl<B: RoutedNeuralBackend> RoutedMlp<B> {
+impl<B: GroupedNeuralBackend> RoutedMlp<B> {
     /// Builds one unloaded GPT-OSS routed feed-forward operator.
     pub fn new(
         args: &ModelArgs,
@@ -93,33 +94,26 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
         let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
         let router_weight = format!("{prefix}.router.weight");
         let router_bias = format!("{prefix}.router.bias");
-        let routing = TopKRoutingSpec::new(
+        let routing = TopKGroupSelectionSpec::new(
             args.num_local_experts,
             args.num_experts_per_tok,
-            RoutingScoring::SelectedSoftmax,
+            GroupScoring::SelectedSoftmax,
             false,
         )?;
-        let router = B::top_k_router(
-            TopKRouterSpec {
-                input_dimensions: args.hidden_size,
-                weight: ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-                bias: Some(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?),
-                correction_bias: None,
-                input_transform: None,
-                route_scale: None,
-                // Published routers remain dense unless the checkpoint itself
-                // carries an exact native encoding for this identity.
-                format: crate::linear_format::standard_linear_format(
-                    &router_weight,
-                    args.checkpoint_weight_quantization_for(&router_weight)
-                        .into(),
-                )?,
-                routing,
-            },
-            context,
-        )?;
+        let selector = TopKGroupSelectorSpec::new(
+            args.hidden_size,
+            ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
+            crate::linear_format::standard_linear_format(
+                &router_weight,
+                args.checkpoint_weight_quantization_for(&router_weight)
+                    .into(),
+            )?,
+            routing,
+        )?
+        .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)?;
+        let router = B::top_k_group_selector(selector, context)?;
 
-        let experts = B::gated_product_expert_bank(expert_bank_spec(args, layer)?, context)?;
+        let experts = B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?;
         Ok(Self {
             layer,
             router,
@@ -139,9 +133,9 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.router.route(input, context)?;
+        let routes = self.router.select(input, context)?;
         provider
-            .forward_routed(
+            .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -167,9 +161,9 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.router.route(input, context)?;
+        let routes = self.router.select(input, context)?;
         let output = provider
-            .forward_routed_tensor_parallel(
+            .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -186,22 +180,19 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
 }
 
 /// Returns the architecture-owned routed expert specification for one layer.
-pub fn expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<GatedProductExpertBankSpec, Error> {
+pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
     let expert_prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     let gate_up_weight = format!("{expert_prefix}.gate_up_proj");
     let gate_up_bias = format!("{expert_prefix}.gate_up_proj_bias");
     let down_weight = format!("{expert_prefix}.down_proj");
     let down_bias = format!("{expert_prefix}.down_proj_bias");
-    Ok(GatedProductExpertBankSpec {
-        expert_count: args.num_local_experts,
-        input_dimensions: args.hidden_size,
-        intermediate_dimensions: args.intermediate_size,
-        output_dimensions: args.hidden_size,
-        policy: args.gated_product_policy,
-        layout: GatedProductExpertLayout::Packed {
+    GroupedGatedProductSpec::new(
+        args.num_local_experts,
+        args.hidden_size,
+        args.intermediate_size,
+        args.hidden_size,
+        args.gated_product_policy,
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(
                 &gate_up_weight,
                 Some(&gate_up_bias),
@@ -213,7 +204,7 @@ pub fn expert_bank_spec(
                 WeightQuantization::MxFp4.into(),
             )?,
         },
-    })
+    )
 }
 
 /// Returns the architecture-owned routed expert specification at rank-local geometry.
@@ -225,19 +216,15 @@ pub(crate) fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<GatedProductExpertBankSpec, Error> {
-    let mut spec = expert_bank_spec(args, layer)?;
-    spec.expert_count = expert_count;
-    spec.intermediate_dimensions = intermediate_dimensions;
-    spec.validate()?;
-    Ok(spec)
+) -> Result<GroupedGatedProductSpec, Error> {
+    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
 /// Derives complete expert ownership and rank-local bank geometry from GPT-OSS.
-pub fn expert_realization_plan<B: RoutedNeuralBackend>(
+pub fn expert_realization_plan<B: GroupedNeuralBackend>(
     architecture: &super::LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<GatedProductExpertBankSpec>>, Error> {
+) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
     let args = architecture.args();
     let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
     let local_experts = i32::try_from(
@@ -315,33 +302,33 @@ mod tests {
         let args = args();
         let global = expert_bank_spec(&args, 0).unwrap();
         let local = localized_expert_bank_spec(&args, 0, 2, 32).unwrap();
-        assert_eq!(local.expert_count, 2);
-        assert_eq!(local.intermediate_dimensions, 32);
-        assert_eq!(local.policy, global.policy);
-        let GatedProductExpertLayout::Packed {
+        assert_eq!(local.group_count(), 2);
+        assert_eq!(local.intermediate_dimensions(), 32);
+        assert_eq!(local.policy(), global.policy());
+        let GatedProductGroupLayout::Packed {
             gate_up: global_gate_up,
             down: global_down,
-        } = global.layout
+        } = global.layout()
         else {
             panic!("GPT-OSS experts must be packed");
         };
-        let GatedProductExpertLayout::Packed {
+        let GatedProductGroupLayout::Packed {
             gate_up: local_gate_up,
             down: local_down,
-        } = local.layout
+        } = local.layout()
         else {
             panic!("GPT-OSS experts must be packed");
         };
-        assert_eq!(local_gate_up.weight, global_gate_up.weight);
-        assert_eq!(local_gate_up.bias, global_gate_up.bias);
-        assert_eq!(local_gate_up.format, global_gate_up.format);
-        assert_eq!(local_down.weight, global_down.weight);
-        assert_eq!(local_down.bias, global_down.bias);
-        assert_eq!(local_down.format, global_down.format);
+        assert_eq!(local_gate_up.weight(), global_gate_up.weight());
+        assert_eq!(local_gate_up.bias(), global_gate_up.bias());
+        assert_eq!(local_gate_up.format(), global_gate_up.format());
+        assert_eq!(local_down.weight(), global_down.weight());
+        assert_eq!(local_down.bias(), global_down.bias());
+        assert_eq!(local_down.format(), global_down.format());
     }
 }
 
-impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedMlp<B> {
+impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedMlp<B> {
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,

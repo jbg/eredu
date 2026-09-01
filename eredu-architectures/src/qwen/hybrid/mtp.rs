@@ -1,9 +1,9 @@
 //! Graph-visible Qwen embedded multi-token prediction component.
 
 use eredu_nn::{
-    AttentionCache, Error, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, ParameterSpec, Parameterized, RoutedNeuralBackend,
-    Tensor,
+    AttentionCache, Error, GroupedNeuralBackend, LinearOperator, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, ParameterSpec,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
 
@@ -57,7 +57,7 @@ pub enum ForwardMode {
 /// One configured prediction depth using the checkpoint-shared fusion policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct PredictionUnit<B: RoutedNeuralBackend> {
+pub struct PredictionUnit<B: GroupedNeuralBackend> {
     /// Learned-offset normalization of the target hidden state.
     pub hidden_norm: B::Normalization,
     /// Learned-offset normalization of the next-token embedding.
@@ -70,7 +70,7 @@ pub struct PredictionUnit<B: RoutedNeuralBackend> {
     pub final_norm: B::Normalization,
 }
 
-impl<B: RoutedNeuralBackend> PredictionUnit<B> {
+impl<B: GroupedNeuralBackend> PredictionUnit<B> {
     /// Builds one actual configured prediction depth.
     pub fn new(
         config: &HybridConfig,

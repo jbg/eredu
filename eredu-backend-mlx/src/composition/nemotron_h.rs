@@ -12,6 +12,8 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
@@ -41,9 +43,8 @@ use crate::backend::{
             layerwise::{quantize_module_store_with_bindings, shard_layer_bindings},
         },
         media::input,
-        residency::expert_cache::ExpertCatalogEntry,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport},
-        residency::expert_provider::CachedRelu2ExpertProvider,
+        residency::parameter_bank::ParameterBankEntry,
+        residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
     },
 };
 use eredu_core::cache::{
@@ -200,14 +201,14 @@ impl NemotronHBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
         if !self.external_experts {
             return Ok(None);
         }
         realization
-            .map(crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization)
+            .map(crate::composition::expert_dispatch::ExpertAssignment::from_realization)
             .transpose()
             .and_then(|assignment| {
                 assignment
@@ -230,7 +231,7 @@ impl NemotronHBindings {
         global_layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
@@ -293,7 +294,7 @@ impl NemotronHExecution {
 pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     expert_catalog_selected(args, store, |_, _| true)
 }
 
@@ -302,7 +303,7 @@ pub fn expert_catalog_selected(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = eredu_architectures::nemotron_h::expert_residency_catalog(store, args)
         .map_err(Error::ArchitectureModel)?;
     let units = catalog.into_units_selected_by_owner(owns_unit);
@@ -310,14 +311,12 @@ pub fn expert_catalog_selected(
 }
 
 fn cached_provider<'a>(
-    cache: &'a ExpertCache,
+    cache: &'a AddressableParameterBank,
     args: &'a ModelArgs,
-    realization: &'a eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
-) -> CachedRelu2ExpertProvider<
-    'a,
-    impl FnMut(usize) -> Result<eredu_nn::Relu2ExpertBankSpec, Error> + 'a,
-> {
-    CachedRelu2ExpertProvider::new(cache, move |layer| {
+    realization: &'a eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
+) -> CachedRelu2GroupProvider<'a, impl FnMut(usize) -> Result<eredu_nn::GroupedRelu2Spec, Error> + 'a>
+{
+    CachedRelu2GroupProvider::new(cache, move |layer| {
         eredu_architectures::nemotron_h::realized_expert_bank_spec(realization, args, layer)
             .cloned()
             .ok_or_else(|| {
@@ -418,7 +417,7 @@ fn load_neutral(
         state_layout,
         execution,
         expert_realization,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: None,
         parallel_rank: None,
     })
@@ -613,7 +612,7 @@ fn load_neutral_parallel(
         state_layout,
         execution,
         expert_realization,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: Some(info),
         parallel_rank: rank,
     })
@@ -719,8 +718,8 @@ pub struct NemotronHModel {
     state_layout: eredu_runtime::StateLayout,
     execution: NemotronHExecution,
     expert_realization:
-        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>>,
-    expert_cache: Option<ExpertCache>,
+        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>,
+    parameter_bank: Option<AddressableParameterBank>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
 }
@@ -812,10 +811,10 @@ impl NemotronHModel {
     }
 
     /// Returns independent expert-cache telemetry when enabled.
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Into::into)
     }
@@ -938,7 +937,7 @@ impl NemotronHModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let realization = self.expert_realization.clone().ok_or_else(|| {
                 Error::ArchitectureModel(
@@ -946,10 +945,10 @@ impl NemotronHModel {
                 )
             })?;
             let result = {
-                let mut provider = cached_provider(&expert_cache, &args, &realization);
+                let mut provider = cached_provider(&parameter_bank, &args, &realization);
                 self.forward_with_provider(tokens, None, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         let input = eredu_architectures::nemotron_h::EmbeddedInput::target(
@@ -1055,8 +1054,8 @@ impl NemotronHModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let expert_cache = self.expert_cache.take();
-        let result = match expert_cache.as_ref() {
+        let parameter_bank = self.parameter_bank.take();
+        let result = match parameter_bank.as_ref() {
             Some(cache_store) => {
                 let args = self.args.clone();
                 let realization = self.expert_realization.clone().ok_or_else(|| {
@@ -1073,7 +1072,7 @@ impl NemotronHModel {
                 stream,
             ),
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let (logits, context) = result.map_err(|error| Exception::custom(error.to_string()))?;
         let hidden = context
             .target_capture()
@@ -1101,8 +1100,8 @@ impl NemotronHModel {
             crate::composition::tensor_ref(hidden),
             depth,
         );
-        let expert_cache = self.expert_cache.take();
-        let result = match expert_cache.as_ref() {
+        let parameter_bank = self.parameter_bank.take();
+        let result = match parameter_bank.as_ref() {
             Some(cache_store) => {
                 let args = self.args.clone();
                 let realization = self.expert_realization.clone().ok_or_else(|| {
@@ -1118,7 +1117,7 @@ impl NemotronHModel {
                 stream,
             ),
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let (logits, context) = result.map_err(|error| Exception::custom(error.to_string()))?;
         let hidden = context
             .target_capture()
@@ -1240,18 +1239,18 @@ impl NemotronHModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-            match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.clone();
                     let realization = self.expert_realization.clone().ok_or_else(|| {
                         Error::ArchitectureModel(
                             "Nemotron-H expert cache has no architecture realization".into(),
                         )
                     })?;
-                    let mut provider = cached_provider(expert_cache, &args, &realization);
+                    let mut provider = cached_provider(parameter_bank, &args, &realization);
                     self.forward_observed_with_provider(
                         tokens,
                         mask,
@@ -1274,7 +1273,7 @@ impl NemotronHModel {
                 }
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
@@ -1694,7 +1693,7 @@ pub fn load_nemotron_h_model(
             expert_options.is_some(),
         )?;
         if let Some(expert_options) = expert_options {
-            attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+            attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
         }
         return Ok(model);
     }
@@ -1707,12 +1706,12 @@ pub fn load_nemotron_h_model(
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {
-        attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
     Ok(model)
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut NemotronHModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -1720,7 +1719,7 @@ fn attach_expert_cache(
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
     let entries = expert_catalog(&model.args, store.as_ref())?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -1814,7 +1813,7 @@ pub(crate) fn load_nemotron_h_gguf_model(
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {
-        attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
     Ok(model)
 }

@@ -11,12 +11,12 @@ use eredu_architectures::{
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionMask, AttentionRequest,
-    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GatedProductExpertBankOperator,
-    GatedProductExpertBankSpec, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, PadMode,
-    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, Tensor, TopKRouterSpec,
+    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GroupSelection,
+    GroupSelectionOperator, GroupedGatedProductOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, GroupedRelu2Operator, GroupedRelu2Spec, Index, LinearOperator,
+    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
+    NormalizationScale, PadMode, ParameterMetadata, ParameterVisitor, ParameterVisitorMut,
+    Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor, TopKGroupSelectorSpec,
     VocabularyParallelRange,
 };
 use eredu_runtime::{
@@ -250,7 +250,7 @@ struct ReferenceLinear {
     output: i32,
     weight: ReferenceTensor,
     metadata: ParameterMetadata,
-    expert_spec: Option<GatedProductExpertBankSpec>,
+    expert_spec: Option<GroupedGatedProductSpec>,
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceLinear {
@@ -284,59 +284,55 @@ impl LinearOperator<ReferenceTensor> for ReferenceLinear {
     }
 }
 
-impl RoutingOperator<ReferenceTensor> for ReferenceLinear {
-    fn route(
+impl GroupSelectionOperator<ReferenceTensor> for ReferenceLinear {
+    fn select(
         &mut self,
         input: &ReferenceTensor,
         _: &(),
-    ) -> Result<RoutingResult<ReferenceTensor>, Error> {
+    ) -> Result<GroupSelection<ReferenceTensor>, Error> {
         let tokens = input.shape()[..input.shape().len() - 1]
             .iter()
             .product::<i32>();
         let routes = ReferenceTensor(vec![tokens, self.output]);
-        Ok(RoutingResult {
-            expert_ids: routes.clone(),
-            selected_scores: routes.clone(),
-            route_weights: routes,
-        })
+        Ok(GroupSelection::new(routes.clone(), routes.clone(), routes))
     }
 
-    fn route_selected(
+    fn select_indices(
         &mut self,
         _input: &ReferenceTensor,
-        expert_ids: &ReferenceTensor,
+        group_indices: &ReferenceTensor,
         _: &(),
-    ) -> Result<RoutingResult<ReferenceTensor>, Error> {
-        Ok(RoutingResult {
-            expert_ids: expert_ids.clone(),
-            selected_scores: expert_ids.clone(),
-            route_weights: expert_ids.clone(),
-        })
+    ) -> Result<GroupSelection<ReferenceTensor>, Error> {
+        Ok(GroupSelection::new(
+            group_indices.clone(),
+            group_indices.clone(),
+            group_indices.clone(),
+        ))
     }
 }
 
-impl GatedProductExpertBankOperator<ReferenceTensor> for ReferenceLinear {
-    fn spec(&self) -> &GatedProductExpertBankSpec {
+impl GroupedGatedProductOperator<ReferenceTensor> for ReferenceLinear {
+    fn spec(&self) -> &GroupedGatedProductSpec {
         self.expert_spec
             .as_ref()
             .expect("reference expert bank retains its construction spec")
     }
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
         input: &ReferenceTensor,
-        _: &RoutingResult<ReferenceTensor>,
+        _: &GroupSelection<ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Error> {
         Ok(input.clone())
     }
 }
 
-impl Relu2ExpertBankOperator<ReferenceTensor> for ReferenceLinear {
-    fn forward_routed(
+impl GroupedRelu2Operator<ReferenceTensor> for ReferenceLinear {
+    fn forward_grouped(
         &mut self,
         input: &ReferenceTensor,
-        _: &RoutingResult<ReferenceTensor>,
+        _: &GroupSelection<ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Error> {
         Ok(input.clone())
@@ -618,55 +614,74 @@ impl NeuralBackend for ReferenceBackend {
     }
 }
 
-impl RoutedNeuralBackend for ReferenceBackend {
-    type Router = ReferenceLinear;
-    type GatedProductExpertBank = ReferenceLinear;
-    type Relu2ExpertBank = ReferenceLinear;
+impl GroupedNeuralBackend for ReferenceBackend {
+    type Selector = ReferenceLinear;
+    type GatedProductGroups = ReferenceLinear;
+    type Relu2Groups = ReferenceLinear;
 
-    fn top_k_router(spec: TopKRouterSpec, _: &()) -> Result<Self::Router, Error> {
+    fn joint_group_selection(
+        input: eredu_nn::JointGroupSelectionInput<'_, Self::Tensor>,
+        _: &(),
+    ) -> Result<eredu_nn::JointGroupSelection<Self::Tensor>, Error> {
+        input.validate()?;
+        let tokens = input.hidden().shape()[..input.hidden().shape().len() - 1]
+            .iter()
+            .product::<i32>();
+        Ok(eredu_nn::JointGroupSelection::new(
+            ReferenceTensor(vec![tokens, input.top_k()]),
+            ReferenceTensor(vec![tokens, input.top_k()]),
+            ReferenceTensor(vec![tokens, input.always_on_groups()]),
+        ))
+    }
+
+    fn top_k_group_selector(spec: TopKGroupSelectorSpec, _: &()) -> Result<Self::Selector, Error> {
         Ok(ReferenceLinear {
-            output: spec.routing.top_k(),
-            weight: ReferenceTensor(vec![spec.routing.expert_count(), spec.input_dimensions]),
-            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            output: spec.selection().top_k(),
+            weight: ReferenceTensor(vec![
+                spec.selection().group_count(),
+                spec.input_dimensions(),
+            ]),
+            metadata: ParameterMetadata::from_spec(spec.weight(), spec.weight().trainable),
             expert_spec: None,
         })
     }
 
-    fn gated_product_expert_bank(
-        spec: GatedProductExpertBankSpec,
+    fn grouped_gated_product(
+        spec: GroupedGatedProductSpec,
         _: &(),
-    ) -> Result<Self::GatedProductExpertBank, Error> {
-        let weight = match &spec.layout {
-            eredu_nn::GatedProductExpertLayout::Packed { gate_up, .. } => gate_up.weight.clone(),
-            eredu_nn::GatedProductExpertLayout::Independent(experts) => {
-                experts[0].gate.weight.clone()
+    ) -> Result<Self::GatedProductGroups, Error> {
+        let weight = match &spec.layout() {
+            eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } => gate_up.weight().clone(),
+            eredu_nn::GatedProductGroupLayout::Independent(experts) => {
+                experts[0].gate().weight().clone()
             }
+            _ => return Err(Error::backend("unsupported grouped parameter layout")),
         };
         Ok(ReferenceLinear {
-            output: spec.output_dimensions,
+            output: spec.output_dimensions(),
             weight: ReferenceTensor(vec![
-                spec.expert_count,
-                2 * spec.intermediate_dimensions,
-                spec.input_dimensions,
+                spec.group_count(),
+                2 * spec.intermediate_dimensions(),
+                spec.input_dimensions(),
             ]),
             metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
             expert_spec: Some(spec),
         })
     }
 
-    fn relu2_expert_bank(
-        spec: Relu2ExpertBankSpec,
-        _: &(),
-    ) -> Result<Self::Relu2ExpertBank, Error> {
+    fn grouped_relu2(spec: GroupedRelu2Spec, _: &()) -> Result<Self::Relu2Groups, Error> {
         spec.validate()?;
         Ok(ReferenceLinear {
-            output: spec.hidden_dimensions,
+            output: spec.hidden_dimensions(),
             weight: ReferenceTensor(vec![
-                spec.expert_count,
-                spec.intermediate_dimensions,
-                spec.hidden_dimensions,
+                spec.group_count(),
+                spec.intermediate_dimensions(),
+                spec.hidden_dimensions(),
             ]),
-            metadata: ParameterMetadata::from_spec(&spec.up.weight, spec.up.weight.trainable),
+            metadata: ParameterMetadata::from_spec(
+                spec.up().weight(),
+                spec.up().weight().trainable,
+            ),
             expert_spec: None,
         })
     }
@@ -2860,7 +2875,7 @@ struct ProbeExpertProvider {
 impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
     type Error = std::convert::Infallible;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
         _resident_bank: &mut ReferenceLinear,
         request: RoutedExpertRequest<'_, ReferenceTensor>,
@@ -2870,7 +2885,7 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
             request.layer,
             request.pass,
             request.input.shape().to_vec(),
-            request.routes.expert_ids.shape().to_vec(),
+            request.routes.group_indices().shape().to_vec(),
         ));
         Ok(request.input.clone())
     }
@@ -2885,7 +2900,7 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
             request.layer,
             request.pass,
             request.input.shape().to_vec(),
-            request.routes.expert_ids.shape().to_vec(),
+            request.routes.group_indices().shape().to_vec(),
         ));
         Ok(request.input.clone())
     }
@@ -2903,12 +2918,12 @@ impl eredu_runtime::ActivationObserver<ReferenceTensor, Error> for ProbeObserver
 
     fn observe_routing(
         &mut self,
-        routing: eredu_runtime::RoutingObservation<'_, ReferenceTensor>,
+        selection: eredu_runtime::RoutingObservation<'_, ReferenceTensor>,
     ) -> Result<(), Error> {
         self.route_shapes.push((
-            routing.selected_experts.shape().to_vec(),
-            routing.route_weights.shape().to_vec(),
-            routing.expert_count,
+            selection.selected_experts.shape().to_vec(),
+            selection.coefficients.shape().to_vec(),
+            selection.expert_count,
         ));
         Ok(())
     }

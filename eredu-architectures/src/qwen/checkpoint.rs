@@ -292,14 +292,14 @@ pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &ModelArgs,
     layer: usize,
-    expert_ids: &[usize],
+    group_indices: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    if expert_ids.is_empty() {
+    if group_indices.is_empty() {
         return Err("rank-local Qwen expert recipes require at least one expert".into());
     }
     let mut unique = std::collections::BTreeSet::new();
     let mut grouped = BTreeMap::<String, Vec<DerivedWeightRecipe>>::new();
-    for &expert in expert_ids {
+    for &expert in group_indices {
         if !unique.insert(expert) {
             return Err(format!(
                 "rank-local Qwen expert recipe contains duplicate expert {expert}"

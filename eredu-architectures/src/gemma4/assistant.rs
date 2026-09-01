@@ -14,9 +14,9 @@ use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
 use eredu_nn::{
     multimodal::{masked_output_projection, MaskedOutputProjectionInput},
-    AttentionCache, AttentionStateSource, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator,
-    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter,
-    ParameterSpec, Parameterized, RotaryPosition, RoutedNeuralBackend, Tensor,
+    AttentionCache, AttentionStateSource, EmbeddingOperator, EmbeddingSpec, Error,
+    GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryPosition, Tensor,
 };
 use serde::Deserialize;
 
@@ -667,7 +667,7 @@ impl<B: NeuralBackend> MaskedHead<B> {
 /// Neutral external Gemma assistant, built from ordinary shared-KV blocks.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Assistant<B: RoutedNeuralBackend> {
+pub struct Assistant<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     config: AssistantConfig,
     layers: Vec<DenseBlock<B>>,
@@ -679,7 +679,7 @@ pub struct Assistant<B: RoutedNeuralBackend> {
     masked_head: Option<MaskedHead<B>>,
 }
 
-impl<B: RoutedNeuralBackend> Assistant<B> {
+impl<B: GroupedNeuralBackend> Assistant<B> {
     /// Builds an unloaded assistant under released SafeTensors identities.
     pub fn new(
         config: AssistantConfig,

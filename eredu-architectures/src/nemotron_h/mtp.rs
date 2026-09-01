@@ -1,8 +1,8 @@
 //! Graph-visible embedded multi-token prediction units.
 
 use eredu_nn::{
-    AttentionCache, Error, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, Error, GroupedNeuralBackend, LinearOperator, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
 
@@ -56,7 +56,7 @@ pub enum ForwardMode {
 /// One physical operator inside an appended MTP prediction group.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct PredictionUnit<B: RoutedNeuralBackend> {
+pub struct PredictionUnit<B: GroupedNeuralBackend> {
     /// First-unit normalization of the current token embedding.
     pub embedding_norm: Option<B::Normalization>,
     /// First-unit normalization of the prior hidden state.
@@ -69,7 +69,7 @@ pub struct PredictionUnit<B: RoutedNeuralBackend> {
     pub final_norm: Option<B::Normalization>,
 }
 
-impl<B: RoutedNeuralBackend> PredictionUnit<B> {
+impl<B: GroupedNeuralBackend> PredictionUnit<B> {
     /// Builds one physical unit at a prediction-depth-relative position.
     pub fn new(
         args: &ModelArgs,

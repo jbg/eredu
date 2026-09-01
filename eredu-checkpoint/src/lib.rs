@@ -72,6 +72,7 @@ pub enum StoredDtype {
 /// This remains distinct from [`LinearFormat`], which describes the format
 /// selected for an executable neural operator.
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SourceTensorEncoding {
     /// Scalar storage in a SafeTensors payload.
     Safetensors(StoredDtype),

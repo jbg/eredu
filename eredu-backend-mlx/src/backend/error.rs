@@ -117,9 +117,11 @@ pub enum Error {
     #[error(transparent)]
     Residency(#[from] crate::backend::runtime::residency::manager::ResidencyError),
 
-    /// Invalid sparse expert catalog, routing, capacity, or execution request.
+    /// Invalid addressable parameter-bank catalog, capacity, or execution request.
     #[error(transparent)]
-    ExpertCache(#[from] crate::backend::runtime::residency::expert_cache::ExpertCacheError),
+    AddressableParameterBank(
+        #[from] crate::backend::runtime::residency::parameter_bank::AddressableParameterBankError,
+    ),
 
     /// Invalid runtime parallel topology, tensor placement, or partition request.
     #[error("parallel placement error: {0}")]

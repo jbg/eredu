@@ -749,17 +749,17 @@ fn transform_target(
                 candidate.preflight_bounded(source)?;
                 let candidate_rows = (candidate_end - matrix_start)
                     .checked_mul(rows)
-                    .ok_or_else(|| quantization_error("expert batch row count overflow"))?;
+                    .ok_or_else(|| quantization_error("leading batch row count overflow"))?;
                 let candidate_elements = candidate_rows
                     .checked_mul(columns)
-                    .ok_or_else(|| quantization_error("expert batch element count overflow"))?;
+                    .ok_or_else(|| quantization_error("leading batch element count overflow"))?;
                 let candidate_output_bytes = output_row_bytes
                     .checked_mul(candidate_rows as u64)
-                    .ok_or_else(|| quantization_error("expert batch output size overflow"))?;
+                    .ok_or_else(|| quantization_error("leading batch output size overflow"))?;
                 let candidate_peak = candidate
                     .peak_materialization_bytes(source)?
                     .checked_add(candidate_output_bytes)
-                    .ok_or_else(|| quantization_error("expert batch working-set overflow"))?;
+                    .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
                 if candidate_elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS
                     && candidate_peak <= tile_budget
                 {
@@ -779,14 +779,14 @@ fn transform_target(
             recipe.preflight_bounded(source)?;
             let batch_rows = (matrix_end - matrix_start)
                 .checked_mul(rows)
-                .ok_or_else(|| quantization_error("expert batch row count overflow"))?;
+                .ok_or_else(|| quantization_error("leading batch row count overflow"))?;
             let batch_output_bytes = output_row_bytes
                 .checked_mul(batch_rows as u64)
-                .ok_or_else(|| quantization_error("expert batch output size overflow"))?;
+                .ok_or_else(|| quantization_error("leading batch output size overflow"))?;
             let batch_peak = recipe
                 .peak_materialization_bytes(source)?
                 .checked_add(batch_output_bytes)
-                .ok_or_else(|| quantization_error("expert batch working-set overflow"))?;
+                .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
             if batch_peak > tile_budget {
                 return Err(quantization_error(format!(
                     "bounded quantization target {:?} cannot admit one leading matrix within the {}-byte tile slot",

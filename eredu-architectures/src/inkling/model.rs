@@ -6,8 +6,8 @@ use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
-    Index, LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
-    ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
+    GroupedNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
@@ -35,7 +35,7 @@ pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
 /// Pinned text, audio, and image modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: RoutedNeuralBackend> {
+pub struct StaticModules<B: GroupedNeuralBackend> {
     /// Token embedding table.
     pub embeddings: B::Embedding,
     /// Required normalization after complete text/media assembly.
@@ -52,7 +52,7 @@ pub struct StaticModules<B: RoutedNeuralBackend> {
     pub vision: Option<VisionStatic<B>>,
 }
 
-impl<B: RoutedNeuralBackend> StaticModules<B> {
+impl<B: GroupedNeuralBackend> StaticModules<B> {
     fn new(args: &ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let text = &args.text_config;
         let norm = |name: &str| {
@@ -225,7 +225,7 @@ enum PreparedPart<T> {
 /// A streamable hMLP stage or text decoder layer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: RoutedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend> {
     /// Folded hMLP image stage.
     Vision(VisionLayer<B>),
     /// Stateful text decoder layer.
@@ -234,7 +234,7 @@ pub enum Unit<B: RoutedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
@@ -267,7 +267,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
@@ -309,7 +309,7 @@ pub struct ForwardContext<T> {
 }
 
 /// Inkling architecture shared by resident, layerwise, and streamed runtimes.
-pub struct LayeredModel<B: RoutedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend> {
     args: ModelArgs,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<Arc<LocalGeometry>>,
@@ -388,7 +388,7 @@ impl InklingStateLayouts {
     }
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -466,7 +466,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     /// Enters or resumes a routed text partition through the family embedding
     /// boundary.
     pub fn begin_routed_text_partition(
@@ -1216,7 +1216,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
@@ -1533,7 +1533,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
@@ -1752,7 +1752,7 @@ fn slice_component<T: Tensor>(
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
 {

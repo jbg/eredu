@@ -1,7 +1,7 @@
-//! Mixture-of-experts routing and packed expert implementations.
+//! Group selection and packed grouped-projection implementations.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_nn::{GatedProductActivation, GatedProductPolicy, TensorParallelExpertOutput};
+use eredu_nn::{GatedProductActivation, GatedProductPolicy, TensorParallelGroupedOutput};
 
 use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::{
@@ -20,16 +20,17 @@ use crate::{
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
 };
 
-use super::layers::{relu2, silu};
-use super::routing::{
-    gather_grouped_rows, gather_route_values, grouped_matmul, topk_route_plan, GroupedRoutePlan,
+use super::grouping::{
+    gather_grouped_rows, gather_selection_values, grouped_matmul, topk_group_plan,
+    GroupedSelectionPlan,
 };
+use super::layers::{relu2, silu};
 
-/// Applies one affine- or MXFP4-packed expert projection to expert-major rows.
+/// Applies one affine- or MXFP4-packed group projection to group-major rows.
 ///
-/// The packed weight and its metadata keep the expert dimension leading, so
-/// this is usable by any checkpoint layout once split experts have been
-/// assembled into `[experts, output, input]` banks.
+/// The packed weight and its metadata keep the group dimension leading, so
+/// this is usable by any checkpoint layout once split groups have been
+/// assembled into `[groups, output, input]` banks.
 pub fn packed_grouped_linear(
     input: &Array,
     weight: &Array,
@@ -76,7 +77,7 @@ pub fn packed_grouped_linear_with_transpose(
     )
 }
 
-/// Applies a packed grouped projection with explicit route-order metadata.
+/// Applies a packed grouped projection with explicit selection-order metadata.
 #[allow(clippy::too_many_arguments)]
 pub fn packed_grouped_linear_with_options(
     input: &Array,
@@ -92,7 +93,7 @@ pub fn packed_grouped_linear_with_options(
     let mode =
         crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(quantization)
             .map_err(|error| Exception::custom(error.to_string()))?;
-    let routes = input.dim(0);
+    let selections = input.dim(0);
     let out_features = if transpose {
         weight.dim(-2)
     } else {
@@ -101,7 +102,7 @@ pub fn packed_grouped_linear_with_options(
     if quantization.group_size() == 16 {
         if !transpose {
             return Err(Exception::custom(
-                "group-16 affine expert projections require transposed packed weights",
+                "group-16 affine group projections require transposed packed weights",
             ));
         }
         let selected_weight = weight.take_axis(group_ids, 0, stream)?;
@@ -110,7 +111,7 @@ pub fn packed_grouped_linear_with_options(
             .map(|biases| biases.take_axis(group_ids, 0, stream))
             .transpose()?;
         return quantized_matmul_with_mode(
-            input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+            input.reshape(&[selections, 1, input.dim(-1)], stream)?,
             &selected_weight,
             &selected_scales,
             selected_biases.as_ref(),
@@ -120,12 +121,12 @@ pub fn packed_grouped_linear_with_options(
             mode,
             stream,
         )?
-        .reshape(&[routes, out_features], stream);
+        .reshape(&[selections, out_features], stream);
     }
 
-    let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
+    let lhs_indices = arange::<i32, u32>(0, selections, 1, stream)?;
     gather_qmm_with_mode(
-        input.reshape(&[routes, 1, input.dim(-1)], stream)?,
+        input.reshape(&[selections, 1, input.dim(-1)], stream)?,
         weight,
         scales,
         biases,
@@ -138,23 +139,23 @@ pub fn packed_grouped_linear_with_options(
         mode,
         stream,
     )?
-    .reshape(&[routes, out_features], stream)
+    .reshape(&[selections, out_features], stream)
 }
 
-/// Router score transform used before top-k expert selection.
+/// Selector score transform used before top-k group selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum TopKRouterScoreFunction {
+pub enum TopKGroupScoring {
     /// Softmax scores before top-k selection.
     Softmax,
-    /// Select raw logits first, then softmax only the selected routes.
+    /// Select raw logits first, then softmax only the selected entries.
     SelectedSoftmax,
-    /// Sigmoid router scores.
+    /// Sigmoid selector scores.
     Sigmoid,
-    /// Square-root softplus router scores.
+    /// Square-root softplus selector scores.
     SqrtSoftplus,
 }
 
-impl TopKRouterScoreFunction {
+impl TopKGroupScoring {
     fn requires_fp32(self) -> bool {
         matches!(self, Self::Sigmoid | Self::SqrtSoftplus)
     }
@@ -169,89 +170,89 @@ impl TopKRouterScoreFunction {
     }
 }
 
-/// Configuration for a reusable top-k MoE router.
+/// Configuration for a reusable top-k MoE selector.
 #[derive(Debug, Clone, Copy)]
-pub struct TopKRouterConfig {
-    /// Number of selected experts per token.
+pub struct TopKGroupSelectorConfig {
+    /// Number of selected groups per token.
     pub top_k: i32,
-    /// Total number of routed experts.
-    pub num_experts: i32,
-    /// Hidden dimension consumed by the router projection.
+    /// Total number of selectable groups.
+    pub group_count: i32,
+    /// Hidden dimension consumed by the selector projection.
     pub hidden_size: i32,
-    /// Score transform to apply to router logits.
-    pub score_function: TopKRouterScoreFunction,
+    /// Score transform to apply to selector logits.
+    pub score_function: TopKGroupScoring,
     /// Whether selected top-k weights are normalized after gathering.
     pub norm_topk_prob: bool,
     /// Optional epsilon added to the normalization denominator.
     pub normalization_epsilon: f32,
-    /// Final multiplier applied to gathered routing weights.
-    pub routed_scaling_factor: f32,
-    /// Number of routing groups.
+    /// Final multiplier applied to gathered selection weights.
+    pub coefficient_scale: f32,
+    /// Number of selection groups.
     pub n_group: i32,
-    /// Number of routing groups selected before expert top-k.
+    /// Number of selection groups selected before group top-k.
     pub topk_group: i32,
-    /// Whether to allocate an ordinary per-expert projection output bias.
+    /// Whether to allocate an ordinary per-group projection output bias.
     pub projection_bias: bool,
-    /// Whether to allocate a selection-only expert score correction bias.
+    /// Whether to allocate a selection-only group score correction bias.
     pub score_correction_bias: bool,
     /// Optional epsilon for weightless RMS normalization before projection.
     pub input_rms_epsilon: Option<f32>,
     /// Whether normalized inputs receive an additional inverse-sqrt-width scale.
     pub input_inverse_sqrt_dimensions: bool,
-    /// Whether to allocate learned per-expert route multipliers.
-    pub route_scale: bool,
+    /// Whether to allocate learned per-group selection multipliers.
+    pub learned_coefficient_scale: bool,
 }
 
-/// Reusable top-k router for sparse MoE layers.
+/// Reusable top-k selector for sparse MoE layers.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
-pub struct TopKRouter {
-    /// Number of selected experts per token.
+pub struct TopKGroupSelector {
+    /// Number of selected groups per token.
     pub top_k: i32,
-    /// Total number of routed experts.
-    pub num_experts: i32,
-    /// Logical input width of the router projection.
+    /// Total number of selectable groups.
+    pub group_count: i32,
+    /// Logical input width of the selector projection.
     pub input_dims: i32,
-    /// Router score transform.
-    pub score_function: TopKRouterScoreFunction,
+    /// Selector score transform.
+    pub score_function: TopKGroupScoring,
     /// Whether selected probabilities are normalized.
     pub norm_topk_prob: bool,
     /// Optional epsilon added to the normalization denominator.
     pub normalization_epsilon: f32,
-    /// Final multiplier applied to routing weights.
-    pub routed_scaling_factor: f32,
-    /// Number of routing groups.
+    /// Final multiplier applied to selection weights.
+    pub coefficient_scale: f32,
+    /// Number of selection groups.
     pub n_group: i32,
-    /// Number of selected routing groups.
+    /// Number of selected partitions.
     pub topk_group: i32,
     #[param]
-    /// Router projection weight.
+    /// Selector projection weight.
     pub weight: PhysicalParam<Array>,
     #[param]
-    /// Optional ordinary projection output bias applied to router logits.
+    /// Optional ordinary projection output bias applied to selector logits.
     pub bias: PhysicalParam<Option<Array>>,
     #[param]
-    /// Optional affine scales for a packed router projection.
+    /// Optional affine scales for a packed selector projection.
     pub scales: PhysicalParam<Option<Array>>,
     #[param]
-    /// Optional affine biases for a packed router projection.
+    /// Optional affine biases for a packed selector projection.
     pub biases: PhysicalParam<Option<Array>>,
     #[param]
-    /// Optional score correction bias used only when choosing experts.
+    /// Optional score correction bias used only when choosing groups.
     pub e_score_correction_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional learned feature scale applied to RMS-normalized inputs.
     pub input_scale: PhysicalParam<Option<Array>>,
     #[param]
-    /// Optional learned multiplier gathered for each selected expert.
-    pub route_scale: PhysicalParam<Option<Array>>,
-    /// Optional router-input RMS epsilon.
+    /// Optional learned multiplier gathered for each selected group.
+    pub learned_coefficient_scale: PhysicalParam<Option<Array>>,
+    /// Optional selector-input RMS epsilon.
     pub input_rms_epsilon: Option<f32>,
-    /// Whether normalized router inputs are divided by the square root of width.
+    /// Whether normalized selector inputs are divided by the square root of width.
     pub input_inverse_sqrt_dimensions: bool,
-    /// Affine group size, or zero for a dense router.
+    /// Affine group size, or zero for a dense selector.
     pub group_size: i32,
-    /// Affine bit width, or zero for a dense router.
+    /// Affine bit width, or zero for a dense selector.
     pub bits: i32,
     /// Packed quantization encoding.
     pub mode: QuantizationMode,
@@ -259,29 +260,29 @@ pub struct TopKRouter {
     pub iquant: Option<WeightQuantization>,
 }
 
-/// Selected expert ids plus the score and weight arrays produced by a top-k router.
-pub struct TopKRouterOutput {
-    /// Selected expert ids with shape `[tokens, top_k]`.
+/// Selected group ids plus the score and weight arrays produced by a top-k selector.
+pub struct GroupSelectionOutput {
+    /// Selected group ids with shape `[tokens, top_k]`.
     pub indices: Array,
-    /// Router probabilities or scores gathered at the selected ids.
+    /// Selector probabilities or scores gathered at the selected ids.
     pub scores: Array,
-    /// Final routing weights after optional normalization/scaling.
+    /// Final selection weights after optional normalization/scaling.
     pub weights: Array,
 }
 
-impl TopKRouter {
-    /// Creates an unloaded dense or affine-packed router.
+impl TopKGroupSelector {
+    /// Creates an unloaded dense or affine-packed selector.
     pub fn new_with_quantization(
-        config: TopKRouterConfig,
+        config: TopKGroupSelectorConfig,
         quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Self::new_with_quantization_and_dtype(config, quantization, Dtype::Float32, stream)
     }
 
-    /// Creates an unloaded dense or affine-packed router with an explicit dense dtype.
+    /// Creates an unloaded dense or affine-packed selector with an explicit dense dtype.
     pub fn new_with_quantization_and_dtype(
-        config: TopKRouterConfig,
+        config: TopKGroupSelectorConfig,
         quantization: Option<WeightQuantization>,
         dense_dtype: Dtype,
         stream: &Stream,
@@ -289,7 +290,7 @@ impl TopKRouter {
         if let Some(quantization) = quantization {
             if config.hidden_size <= 0 || config.hidden_size % quantization.group_size() != 0 {
                 return Err(Exception::custom(format!(
-                    "affine router hidden dimension {} is not divisible by group size {}",
+                    "affine selector hidden dimension {} is not divisible by group size {}",
                     config.hidden_size,
                     quantization.group_size()
                 )));
@@ -303,12 +304,12 @@ impl TopKRouter {
             .unwrap_or(QuantizationMode::Affine);
         Ok(Self {
             top_k: config.top_k,
-            num_experts: config.num_experts,
+            group_count: config.group_count,
             input_dims: config.hidden_size,
             score_function: config.score_function,
             norm_topk_prob: config.norm_topk_prob,
             normalization_epsilon: config.normalization_epsilon,
-            routed_scaling_factor: config.routed_scaling_factor,
+            coefficient_scale: config.coefficient_scale,
             n_group: config.n_group,
             topk_group: config.topk_group,
             weight: match quantization {
@@ -316,12 +317,12 @@ impl TopKRouter {
                     let (block_values, block_bytes) =
                         ggml_type.block_and_bytes().map_err(|_| {
                             Exception::custom(format!(
-                                "{ggml_type:?} has no native router block geometry"
+                                "{ggml_type:?} has no native selector block geometry"
                             ))
                         })?;
                     PhysicalParam::<Array>::unloaded(
                         &[
-                            config.num_experts,
+                            config.group_count,
                             config.hidden_size / block_values as i32 * block_bytes as i32,
                         ],
                         Dtype::Uint8,
@@ -330,21 +331,21 @@ impl TopKRouter {
                 }
                 Some(quantization) => PhysicalParam::<Array>::unloaded(
                     &[
-                        config.num_experts,
+                        config.group_count,
                         quantized_packed_dimension(config.hidden_size, quantization.bits()),
                     ],
                     Dtype::Uint32,
                     stream,
                 )?,
                 None => PhysicalParam::<Array>::unloaded(
-                    &[config.num_experts, config.hidden_size],
+                    &[config.group_count, config.hidden_size],
                     dense_dtype,
                     stream,
                 )?,
             },
             bias: if config.projection_bias {
                 PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[config.num_experts],
+                    &[config.group_count],
                     dense_dtype,
                     stream,
                 )?
@@ -354,7 +355,7 @@ impl TopKRouter {
             scales: if let Some(quantization) = affine {
                 PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
-                        config.num_experts,
+                        config.group_count,
                         config.hidden_size / quantization.group_size(),
                     ],
                     if quantization == WeightQuantization::MxFp4 {
@@ -370,7 +371,7 @@ impl TopKRouter {
             biases: if let Some(quantization) = affine.filter(|q| q.has_biases()) {
                 PhysicalParam::<Option<Array>>::unloaded_some(
                     &[
-                        config.num_experts,
+                        config.group_count,
                         config.hidden_size / quantization.group_size(),
                     ],
                     Dtype::Float16,
@@ -381,7 +382,7 @@ impl TopKRouter {
             },
             e_score_correction_bias: if config.score_correction_bias {
                 PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[config.num_experts],
+                    &[config.group_count],
                     dense_dtype,
                     stream,
                 )?
@@ -397,9 +398,9 @@ impl TopKRouter {
             } else {
                 PhysicalParam::new(None)
             },
-            route_scale: if config.route_scale {
+            learned_coefficient_scale: if config.learned_coefficient_scale {
                 PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[config.num_experts],
+                    &[config.group_count],
                     dense_dtype,
                     stream,
                 )?
@@ -415,19 +416,19 @@ impl TopKRouter {
         })
     }
 
-    /// Returns selected ids, pre-normalization selected scores, and final route weights.
-    pub fn forward_routes_with_selection_bias(
+    /// Returns selected ids, pre-normalization selected scores, and final selection weights.
+    pub fn select_with_selection_bias(
         &mut self,
         hidden_states: &Array,
         selection_bias: Option<&Array>,
         stream: &Stream,
-    ) -> Result<TopKRouterOutput, Exception> {
+    ) -> Result<GroupSelectionOutput, Exception> {
         let flat = self.transform_input(hidden_states, stream)?;
         let logits = if let Some(iquant) = self.iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ selector format");
             NativeQuantizedTensor::from_iq_array(
                 self.weight.value.clone(),
-                &[self.num_experts, self.input_dims],
+                &[self.group_count, self.input_dims],
                 ggml_type,
                 endian,
             )?
@@ -477,7 +478,7 @@ impl TopKRouter {
 
         let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
         let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
-        if self.score_function == TopKRouterScoreFunction::SelectedSoftmax {
+        if self.score_function == TopKGroupScoring::SelectedSoftmax {
             top_k_weights = softmax_axis(&top_k_weights, -1, true, stream)?;
         }
         let selected_scores = top_k_weights.clone();
@@ -489,15 +490,15 @@ impl TopKRouter {
             }
             top_k_weights = top_k_weights.divide(denominator, stream)?;
         }
-        if self.routed_scaling_factor != 1.0 {
+        if self.coefficient_scale != 1.0 {
             top_k_weights =
-                top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+                top_k_weights.multiply(Array::from_f32(self.coefficient_scale), stream)?;
         }
-        if let Some(scale) = self.route_scale.as_ref() {
+        if let Some(scale) = self.learned_coefficient_scale.as_ref() {
             top_k_weights =
                 top_k_weights.multiply(scale.take_axis(&top_k_index, 0, stream)?, stream)?;
         }
-        Ok(TopKRouterOutput {
+        Ok(GroupSelectionOutput {
             indices: top_k_index,
             scores: selected_scores,
             weights: top_k_weights,
@@ -505,19 +506,19 @@ impl TopKRouter {
     }
 
     /// Returns caller-selected ids, their raw transformed scores, and final
-    /// normalized/scaled route weights.
-    pub fn forward_routes_with_routing_indices(
+    /// normalized/scaled selection weights.
+    pub fn select_indices(
         &mut self,
         hidden_states: &Array,
-        expert_indices: &Array,
+        group_indices: &Array,
         stream: &Stream,
-    ) -> Result<TopKRouterOutput, Exception> {
+    ) -> Result<GroupSelectionOutput, Exception> {
         let flat = self.transform_input(hidden_states, stream)?;
         let logits = if let Some(iquant) = self.iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ selector format");
             NativeQuantizedTensor::from_iq_array(
                 self.weight.value.clone(),
-                &[self.num_experts, self.input_dims],
+                &[self.group_count, self.input_dims],
                 ggml_type,
                 endian,
             )?
@@ -557,9 +558,9 @@ impl TopKRouter {
             None => logits,
         };
         let scores = self.score_function.apply(logits, stream)?;
-        let expert_indices = expert_indices.reshape(&[-1, self.top_k], stream)?;
-        let mut weights = take_along_axis(scores, &expert_indices, -1, stream)?;
-        if self.score_function == TopKRouterScoreFunction::SelectedSoftmax {
+        let group_indices = group_indices.reshape(&[-1, self.top_k], stream)?;
+        let mut weights = take_along_axis(scores, &group_indices, -1, stream)?;
+        if self.score_function == TopKGroupScoring::SelectedSoftmax {
             weights = softmax_axis(&weights, -1, true, stream)?;
         }
         let selected_scores = weights.clone();
@@ -569,14 +570,14 @@ impl TopKRouter {
                 .add(Array::from_f32(self.normalization_epsilon), stream)?;
             weights = weights.divide(denominator, stream)?;
         }
-        if self.routed_scaling_factor != 1.0 {
-            weights = weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+        if self.coefficient_scale != 1.0 {
+            weights = weights.multiply(Array::from_f32(self.coefficient_scale), stream)?;
         }
-        if let Some(scale) = self.route_scale.as_ref() {
-            weights = weights.multiply(scale.take_axis(&expert_indices, 0, stream)?, stream)?;
+        if let Some(scale) = self.learned_coefficient_scale.as_ref() {
+            weights = weights.multiply(scale.take_axis(&group_indices, 0, stream)?, stream)?;
         }
-        Ok(TopKRouterOutput {
-            indices: expert_indices,
+        Ok(GroupSelectionOutput {
+            indices: group_indices,
             scores: selected_scores,
             weights,
         })
@@ -589,7 +590,7 @@ impl TopKRouter {
         };
         let epsilon = self
             .input_rms_epsilon
-            .expect("router input scale requires an RMS epsilon");
+            .expect("selector input scale requires an RMS epsilon");
         let variance = mean_axis(&flat.square(stream)?, -1, true, stream)?;
         let normalized = flat.multiply(
             rsqrt(variance.add(Array::from_f32(epsilon), stream)?, stream)?,
@@ -614,18 +615,16 @@ impl TopKRouter {
         if self.n_group <= 0
             || self.topk_group <= 0
             || self.topk_group > self.n_group
-            || self.num_experts % self.n_group != 0
+            || self.group_count % self.n_group != 0
         {
-            return Err(Exception::custom(
-                "invalid grouped MoE router configuration",
-            ));
+            return Err(Exception::custom("invalid grouped selector configuration"));
         }
 
         let tokens = scores_for_choice.dim(0);
-        let experts_per_group = self.num_experts / self.n_group;
+        let entries_per_partition = self.group_count / self.n_group;
         let grouped =
-            scores_for_choice.reshape(&[tokens, self.n_group, experts_per_group], stream)?;
-        let group_top = 2.min(experts_per_group);
+            scores_for_choice.reshape(&[tokens, self.n_group, entries_per_partition], stream)?;
+        let group_top = 2.min(entries_per_partition);
         let group_scores = sum_axis(
             &topk_axis(grouped, group_top, -1, stream)?,
             -1,
@@ -635,12 +634,12 @@ impl TopKRouter {
         let group_idx = argpartition_axis(&group_scores, -self.topk_group, -1, stream)?
             .try_index_device((.., -self.topk_group..), stream)?;
 
-        let expert_group_ids: Vec<i32> = (0..self.num_experts)
-            .map(|expert| expert / experts_per_group)
+        let partition_ids: Vec<i32> = (0..self.group_count)
+            .map(|group| group / entries_per_partition)
             .collect();
-        let expert_group_ids = Array::from_slice(&expert_group_ids, &[1, 1, self.num_experts]);
+        let partition_ids = Array::from_slice(&partition_ids, &[1, 1, self.group_count]);
         let selected_groups = group_idx.try_index_device((.., .., NewAxis), stream)?;
-        let group_mask = selected_groups.eq(expert_group_ids, stream)?;
+        let group_mask = selected_groups.eq(partition_ids, stream)?;
         let group_mask = sum_axis(
             &group_mask.as_dtype(Dtype::Int32, stream)?,
             1,
@@ -659,29 +658,29 @@ impl TopKRouter {
     }
 }
 
-/// Applies route weights and reduces expert-major route outputs back to source tokens.
+/// Applies selection weights and reduces group-major selection outputs back to source tokens.
 pub fn weighted_route_sum(
     current: Array,
     top_k_weights: &Array,
-    plan: &GroupedRoutePlan,
+    plan: &GroupedSelectionPlan,
     num_tokens: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let weights = gather_route_values(top_k_weights, plan, stream)?
+    let weights = gather_selection_values(top_k_weights, plan, stream)?
         .try_index_device((.., NewAxis), stream)?;
     let weighted = current.multiply(weights, stream)?;
 
-    // Each route index is unique, so restore the expert-major rows with a
+    // Each selection index is unique, so restore the group-major rows with a
     // collision-free scatter and reduce the original top-k slots in their
     // stable order. A segment sum can use unordered GPU atomics here; the
-    // resulting roundoff was sufficient to change near-tied downstream routing
+    // resulting roundoff was sufficient to change near-tied downstream selection
     // decisions between identical passes.
-    let routes = weighted.dim(0);
+    let selections = weighted.dim(0);
     let width = weighted.dim(-1);
     let ordered = scatter_single(
-        zeros_dtype(&[routes, width], weighted.dtype(), stream)?,
-        &plan.route_indices,
-        weighted.reshape(&[routes, 1, width], stream)?,
+        zeros_dtype(&[selections, width], weighted.dtype(), stream)?,
+        &plan.selection_indices,
+        weighted.reshape(&[selections, 1, width], stream)?,
         0,
         stream,
     )?;
@@ -690,15 +689,15 @@ pub fn weighted_route_sum(
     sum_axis(ordered, 1, false, stream)
 }
 
-/// Packed routed ReLU2 expert bank with dense, affine, MXFP4, or GGUF-native IQ storage.
+/// Packed grouped ReLU2 bank with dense, affine, MXFP4, or GGUF-native IQ storage.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
-pub struct PackedRelu2Experts {
-    /// Number of routed experts.
-    pub num_experts: i32,
-    /// Model hidden dimension.
+pub struct PackedRelu2Groups {
+    /// Number of groups.
+    pub group_count: i32,
+    /// Input and output feature dimension.
     pub hidden_size: i32,
-    /// Per-expert intermediate dimension.
+    /// Per-group intermediate dimension.
     pub intermediate_size: i32,
     /// Optional affine or MXFP4 settings for the up-projection bank.
     pub up_quantization: Option<WeightQuantization>,
@@ -709,36 +708,36 @@ pub struct PackedRelu2Experts {
     /// Optional checkpoint-native IQ settings for the down-projection bank.
     pub down_iquant: Option<WeightQuantization>,
     #[param]
-    /// Expert up-projection weights.
+    /// Group up-projection weights.
     pub up_proj: PhysicalParam<Array>,
     #[param]
-    /// Expert up-projection packed scales.
+    /// Group up-projection packed scales.
     pub up_proj_scales: PhysicalParam<Option<Array>>,
     #[param]
-    /// Expert up-projection affine biases, absent for MXFP4.
+    /// Group up-projection affine biases, absent for MXFP4.
     pub up_proj_biases: PhysicalParam<Option<Array>>,
     #[param]
-    /// Expert down-projection weights.
+    /// Group down-projection weights.
     pub down_proj: PhysicalParam<Array>,
     #[param]
-    /// Expert down-projection packed scales.
+    /// Group down-projection packed scales.
     pub down_proj_scales: PhysicalParam<Option<Array>>,
     #[param]
-    /// Expert down-projection affine biases, absent for MXFP4.
+    /// Group down-projection affine biases, absent for MXFP4.
     pub down_proj_biases: PhysicalParam<Option<Array>>,
 }
 
-impl PackedRelu2Experts {
-    /// Creates an unloaded dense, packed, or checkpoint-native IQ expert bank.
+impl PackedRelu2Groups {
+    /// Creates an unloaded dense, packed, or checkpoint-native IQ group bank.
     pub fn new(
-        num_experts: i32,
+        group_count: i32,
         hidden_size: i32,
         intermediate_size: i32,
         quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Self::new_with_dtype(
-            num_experts,
+            group_count,
             hidden_size,
             intermediate_size,
             quantization,
@@ -747,9 +746,9 @@ impl PackedRelu2Experts {
         )
     }
 
-    /// Creates an unloaded expert bank with an explicit dense weight dtype.
+    /// Creates an unloaded group bank with an explicit dense weight dtype.
     pub fn new_with_dtype(
-        num_experts: i32,
+        group_count: i32,
         hidden_size: i32,
         intermediate_size: i32,
         quantization: [Option<WeightQuantization>; 2],
@@ -768,16 +767,16 @@ impl PackedRelu2Experts {
                           in_features: i32,
                           quantization: Option<WeightQuantization>,
                           iquant: Option<WeightQuantization>|
-         -> Result<ExpertProjectionParams, Exception> {
+         -> Result<GroupProjectionParams, Exception> {
             if let Some(iquant) = iquant {
-                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ group format");
                 let (block_values, block_bytes) = ggml_type
                     .block_and_bytes()
                     .expect("canonical IQ block geometry");
                 return Ok((
                     PhysicalParam::<Array>::unloaded(
                         &[
-                            num_experts,
+                            group_count,
                             out_features,
                             in_features / block_values as i32 * block_bytes as i32,
                         ],
@@ -792,7 +791,7 @@ impl PackedRelu2Experts {
                 Some(quantization) => Ok((
                     PhysicalParam::<Array>::unloaded(
                         &[
-                            num_experts,
+                            group_count,
                             out_features,
                             quantized_packed_dimension(in_features, quantization.bits()),
                         ],
@@ -801,7 +800,7 @@ impl PackedRelu2Experts {
                     )?,
                     PhysicalParam::<Option<Array>>::unloaded_some(
                         &[
-                            num_experts,
+                            group_count,
                             out_features,
                             in_features / quantization.group_size(),
                         ],
@@ -815,7 +814,7 @@ impl PackedRelu2Experts {
                     if quantization.has_biases() {
                         PhysicalParam::<Option<Array>>::unloaded_some(
                             &[
-                                num_experts,
+                                group_count,
                                 out_features,
                                 in_features / quantization.group_size(),
                             ],
@@ -828,7 +827,7 @@ impl PackedRelu2Experts {
                 )),
                 None => Ok((
                     PhysicalParam::<Array>::unloaded(
-                        &[num_experts, out_features, in_features],
+                        &[group_count, out_features, in_features],
                         dense_dtype,
                         stream,
                     )?,
@@ -846,7 +845,7 @@ impl PackedRelu2Experts {
             down_iquant,
         )?;
         Ok(Self {
-            num_experts,
+            group_count,
             hidden_size,
             intermediate_size,
             up_quantization,
@@ -862,7 +861,7 @@ impl PackedRelu2Experts {
         })
     }
 
-    /// Evaluates routed experts and reduces route outputs back to tokens.
+    /// Evaluates selected groups and reduces their outputs back to tokens.
     pub fn forward(
         &mut self,
         hidden_states: &Array,
@@ -871,13 +870,13 @@ impl PackedRelu2Experts {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
-        let plan = topk_route_plan(top_k_index, stream)?;
+        let plan = topk_group_plan(top_k_index, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let hidden = if let Some(iquant) = self.up_iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
             let native = NativeQuantizedTensor::from_iq_array(
                 self.up_proj.value.clone(),
-                &[self.num_experts, self.intermediate_size, self.hidden_size],
+                &[self.group_count, self.intermediate_size, self.hidden_size],
                 ggml_type,
                 endian,
             )?;
@@ -890,7 +889,7 @@ impl PackedRelu2Experts {
                     self.up_proj_scales
                         .as_ref()
                         .as_ref()
-                        .expect("quantized expert scales"),
+                        .expect("quantized group scales"),
                     self.up_proj_biases.as_ref().as_ref(),
                     &plan.sorted_group_ids,
                     quantization,
@@ -907,10 +906,10 @@ impl PackedRelu2Experts {
         };
         let hidden = relu2(hidden, stream)?;
         let current = if let Some(iquant) = self.down_iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
             let native = NativeQuantizedTensor::from_iq_array(
                 self.down_proj.value.clone(),
-                &[self.num_experts, self.hidden_size, self.intermediate_size],
+                &[self.group_count, self.hidden_size, self.intermediate_size],
                 ggml_type,
                 endian,
             )?;
@@ -923,7 +922,7 @@ impl PackedRelu2Experts {
                     self.down_proj_scales
                         .as_ref()
                         .as_ref()
-                        .expect("quantized expert scales"),
+                        .expect("quantized group scales"),
                     self.down_proj_biases.as_ref().as_ref(),
                     &plan.sorted_group_ids,
                     quantization,
@@ -949,32 +948,29 @@ impl PackedRelu2Experts {
         top_k_weights: &Array,
         partitions: usize,
         stream: &Stream,
-    ) -> Result<TensorParallelExpertOutput<Array>, Exception> {
+    ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
         if partitions == 0 {
             return Err(Exception::custom(
                 "tensor-parallel partition count must be positive",
             ));
         }
         self.forward(hidden_states, top_k_index, top_k_weights, stream)
-            .map(|reducible| TensorParallelExpertOutput {
-                reducible,
-                post_reduce: None,
-            })
+            .map(|reducible| TensorParallelGroupedOutput::new(reducible, None))
     }
 }
 
-const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
-const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
+const GROUPED_PROJECTION_CHUNK_THRESHOLD: i32 = 64;
+const GROUPED_PROJECTION_CHUNK_TOKENS: i32 = 32;
 
-/// Packed gated-product expert bank with optional MLX affine or MXFP4 projections.
+/// Packed gated-product bank with optional MLX affine or MXFP4 projections.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
-pub struct PackedGatedProductExperts {
-    /// Number of experts.
-    pub num_experts: i32,
-    /// Model hidden dimension.
+pub struct PackedGatedProductGroups {
+    /// Number of groups.
+    pub group_count: i32,
+    /// Input and output feature dimension.
     pub hidden_dim: i32,
-    /// Per-expert intermediate dimension.
+    /// Per-group intermediate dimension.
     pub intermediate_dim: i32,
     /// Exact gate activation, bounds, sigmoid multiplier, and up offset.
     pub policy: GatedProductPolicy,
@@ -989,10 +985,10 @@ pub struct PackedGatedProductExperts {
     /// Whether weights/scales use checkpoint-native block FP8 with E8M0 scales.
     pub native_fp8_e8m0: bool,
     #[param]
-    /// Concatenated gate/up weights shaped `[experts, 2 * intermediate, hidden]`.
+    /// Concatenated gate/up weights shaped `[groups, 2 * intermediate, hidden]`.
     pub gate_up_proj: PhysicalParam<Array>,
     #[param]
-    /// Optional ordinary gate/up output bias shaped `[experts, 2 * intermediate]`.
+    /// Optional ordinary gate/up output bias shaped `[groups, 2 * intermediate]`.
     pub gate_up_proj_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Gate/up quantization scales.
@@ -1001,10 +997,10 @@ pub struct PackedGatedProductExperts {
     /// Gate/up quantization biases.
     pub gate_up_proj_biases: PhysicalParam<Option<Array>>,
     #[param]
-    /// Down weights shaped `[experts, hidden, intermediate]`.
+    /// Down weights shaped `[groups, hidden, intermediate]`.
     pub down_proj: PhysicalParam<Array>,
     #[param]
-    /// Optional ordinary down output bias shaped `[experts, hidden]`.
+    /// Optional ordinary down output bias shaped `[groups, hidden]`.
     pub down_proj_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Down quantization scales.
@@ -1014,16 +1010,16 @@ pub struct PackedGatedProductExperts {
     pub down_proj_biases: PhysicalParam<Option<Array>>,
 }
 
-type ExpertProjectionParams = (
+type GroupProjectionParams = (
     PhysicalParam<Array>,
     PhysicalParam<Option<Array>>,
     PhysicalParam<Option<Array>>,
 );
 
-impl PackedGatedProductExperts {
-    /// Creates an unloaded packed expert bank.
+impl PackedGatedProductGroups {
+    /// Creates an unloaded packed group bank.
     pub fn new(
-        num_experts: i32,
+        group_count: i32,
         hidden_dim: i32,
         intermediate_dim: i32,
         gate_up_affine: Option<WeightQuantization>,
@@ -1032,7 +1028,7 @@ impl PackedGatedProductExperts {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Self::new_with_dtype(
-            num_experts,
+            group_count,
             hidden_dim,
             intermediate_dim,
             gate_up_affine,
@@ -1043,9 +1039,9 @@ impl PackedGatedProductExperts {
         )
     }
 
-    /// Creates an unloaded packed expert bank with an explicit dense weight dtype.
+    /// Creates an unloaded packed group bank with an explicit dense weight dtype.
     pub fn new_with_dtype(
-        num_experts: i32,
+        group_count: i32,
         hidden_dim: i32,
         intermediate_dim: i32,
         gate_up_affine: Option<WeightQuantization>,
@@ -1066,16 +1062,16 @@ impl PackedGatedProductExperts {
                           in_features: i32,
                           quantization: Option<WeightQuantization>,
                           iquant: Option<WeightQuantization>|
-         -> Result<ExpertProjectionParams, Exception> {
+         -> Result<GroupProjectionParams, Exception> {
             if let Some(iquant) = iquant {
-                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ group format");
                 let (block_values, block_bytes) = ggml_type
                     .block_and_bytes()
                     .expect("canonical IQ block geometry");
                 Ok((
                     PhysicalParam::<Array>::unloaded(
                         &[
-                            num_experts,
+                            group_count,
                             out_features,
                             in_features / block_values as i32 * block_bytes as i32,
                         ],
@@ -1088,14 +1084,14 @@ impl PackedGatedProductExperts {
             } else if let Some(quantization) = quantization {
                 if in_features % quantization.group_size() != 0 {
                     return Err(Exception::custom(format!(
-                        "packed expert input width {in_features} is not divisible by {quantization:?} group size {}",
+                        "packed group input width {in_features} is not divisible by {quantization:?} group size {}",
                         quantization.group_size(),
                     )));
                 }
                 Ok((
                     PhysicalParam::<Array>::unloaded(
                         &[
-                            num_experts,
+                            group_count,
                             out_features,
                             quantized_packed_dimension(in_features, quantization.bits()),
                         ],
@@ -1104,7 +1100,7 @@ impl PackedGatedProductExperts {
                     )?,
                     PhysicalParam::<Option<Array>>::unloaded_some(
                         &[
-                            num_experts,
+                            group_count,
                             out_features,
                             in_features / quantization.group_size(),
                         ],
@@ -1118,7 +1114,7 @@ impl PackedGatedProductExperts {
                     if quantization.has_biases() {
                         PhysicalParam::<Option<Array>>::unloaded_some(
                             &[
-                                num_experts,
+                                group_count,
                                 out_features,
                                 in_features / quantization.group_size(),
                             ],
@@ -1132,7 +1128,7 @@ impl PackedGatedProductExperts {
             } else {
                 Ok((
                     PhysicalParam::<Array>::unloaded(
-                        &[num_experts, out_features, in_features],
+                        &[group_count, out_features, in_features],
                         dense_dtype,
                         stream,
                     )?,
@@ -1150,7 +1146,7 @@ impl PackedGatedProductExperts {
         let (down_proj, down_proj_scales, down_proj_biases) =
             projection(hidden_dim, intermediate_dim, down_affine, down_iquant)?;
         Ok(Self {
-            num_experts,
+            group_count,
             hidden_dim,
             intermediate_dim,
             policy: GatedProductPolicy::ordinary_silu(),
@@ -1162,7 +1158,7 @@ impl PackedGatedProductExperts {
             gate_up_proj,
             gate_up_proj_bias: if projection_biases[0] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[num_experts, 2 * intermediate_dim],
+                    &[group_count, 2 * intermediate_dim],
                     dense_dtype,
                     stream,
                 )?
@@ -1174,7 +1170,7 @@ impl PackedGatedProductExperts {
             down_proj,
             down_proj_bias: if projection_biases[1] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[num_experts, hidden_dim],
+                    &[group_count, hidden_dim],
                     dense_dtype,
                     stream,
                 )?
@@ -1195,17 +1191,17 @@ impl PackedGatedProductExperts {
         Ok(self)
     }
 
-    /// Rebuilds projection storage for native block-FP8 expert tensors.
+    /// Rebuilds projection storage for native block-FP8 group tensors.
     pub fn with_native_fp8_e8m0(mut self, stream: &Stream) -> Result<Self, Exception> {
         let ceil128 = |value: i32| (value + 127) / 128;
         self.gate_up_proj = PhysicalParam::<Array>::unloaded(
-            &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
+            &[self.group_count, 2 * self.intermediate_dim, self.hidden_dim],
             Dtype::Uint8,
             stream,
         )?;
         self.gate_up_proj_scales = PhysicalParam::<Option<Array>>::unloaded_some(
             &[
-                self.num_experts,
+                self.group_count,
                 ceil128(2 * self.intermediate_dim),
                 ceil128(self.hidden_dim),
             ],
@@ -1213,13 +1209,13 @@ impl PackedGatedProductExperts {
             stream,
         )?;
         self.down_proj = PhysicalParam::<Array>::unloaded(
-            &[self.num_experts, self.hidden_dim, self.intermediate_dim],
+            &[self.group_count, self.hidden_dim, self.intermediate_dim],
             Dtype::Uint8,
             stream,
         )?;
         self.down_proj_scales = PhysicalParam::<Option<Array>>::unloaded_some(
             &[
-                self.num_experts,
+                self.group_count,
                 ceil128(self.hidden_dim),
                 ceil128(self.intermediate_dim),
             ],
@@ -1238,7 +1234,7 @@ impl PackedGatedProductExperts {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
-        let plan = topk_route_plan(top_k_index, stream)?;
+        let plan = topk_group_plan(top_k_index, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let gate_up = if self.native_fp8_e8m0 {
             crate::backend::nn::fp8::grouped_linear(
@@ -1252,10 +1248,10 @@ impl PackedGatedProductExperts {
                 stream,
             )?
         } else if let Some(iquant) = self.gate_up_iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
             let native = NativeQuantizedTensor::from_iq_array(
                 self.gate_up_proj.value.clone(),
-                &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
+                &[self.group_count, 2 * self.intermediate_dim, self.hidden_dim],
                 ggml_type,
                 endian,
             )?;
@@ -1313,6 +1309,11 @@ impl PackedGatedProductExperts {
             GatedProductActivation::GeluApproximate => {
                 super::layers::gelu_approximate(gate, stream)?
             }
+            _ => {
+                return Err(Exception::custom(
+                    "unsupported grouped gated-product activation",
+                ))
+            }
         };
         let activated = gate.multiply(up, stream)?;
         let output = if self.native_fp8_e8m0 {
@@ -1327,10 +1328,10 @@ impl PackedGatedProductExperts {
                 stream,
             )?
         } else if let Some(iquant) = self.down_iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
             let native = NativeQuantizedTensor::from_iq_array(
                 self.down_proj.value.clone(),
-                &[self.num_experts, self.hidden_dim, self.intermediate_dim],
+                &[self.group_count, self.hidden_dim, self.intermediate_dim],
                 ggml_type,
                 endian,
             )?;
@@ -1364,7 +1365,7 @@ impl PackedGatedProductExperts {
         weighted_route_sum(output, top_k_weights, &plan, num_tokens, stream)
     }
 
-    /// Evaluates selected experts and reduces route outputs back to source tokens.
+    /// Evaluates selected groups and reduces selection outputs back to source tokens.
     pub fn forward(
         &mut self,
         hidden_states: &Array,
@@ -1373,13 +1374,13 @@ impl PackedGatedProductExperts {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
-        if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
+        if num_tokens <= GROUPED_PROJECTION_CHUNK_THRESHOLD {
             return self.forward_chunk(hidden_states, top_k_index, top_k_weights, stream);
         }
         let mut outputs = Vec::new();
         let mut start = 0;
         while start < num_tokens {
-            let end = (start + ROUTED_EXPERT_CHUNK_TOKENS).min(num_tokens);
+            let end = (start + GROUPED_PROJECTION_CHUNK_TOKENS).min(num_tokens);
             outputs.push(self.forward_chunk(
                 &hidden_states.try_index_device((start..end, ..), stream)?,
                 &top_k_index.try_index_device((start..end, ..), stream)?,
@@ -1391,7 +1392,7 @@ impl PackedGatedProductExperts {
         concatenate_axis(&outputs, 0, stream)
     }
 
-    /// Separates the rank-local projection contribution from replicated routed
+    /// Separates the rank-local projection contribution from replicated grouped
     /// down bias so the latter can be added literally once after all-sum.
     pub fn forward_tensor_parallel(
         &mut self,
@@ -1400,7 +1401,7 @@ impl PackedGatedProductExperts {
         top_k_weights: &Array,
         partitions: usize,
         stream: &Stream,
-    ) -> Result<TensorParallelExpertOutput<Array>, Exception> {
+    ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
         if partitions == 0 {
             return Err(Exception::custom(
                 "tensor-parallel partition count must be positive",
@@ -1408,24 +1409,21 @@ impl PackedGatedProductExperts {
         }
         let output = self.forward(hidden_states, top_k_index, top_k_weights, stream)?;
         let Some(bias) = self.down_proj_bias.as_ref() else {
-            return Ok(TensorParallelExpertOutput {
-                reducible: output,
-                post_reduce: None,
-            });
+            return Ok(TensorParallelGroupedOutput::new(output, None));
         };
-        let plan = topk_route_plan(top_k_index, stream)?;
-        let routed_bias = bias.take_axis(&plan.sorted_group_ids, 0, stream)?;
+        let plan = topk_group_plan(top_k_index, stream)?;
+        let selected_bias = bias.take_axis(&plan.sorted_group_ids, 0, stream)?;
         let bias = weighted_route_sum(
-            routed_bias,
+            selected_bias,
             top_k_weights,
             &plan,
             hidden_states.dim(0),
             stream,
         )?;
-        Ok(TensorParallelExpertOutput {
-            reducible: output.subtract(&bias, stream)?,
-            post_reduce: Some(bias),
-        })
+        Ok(TensorParallelGroupedOutput::new(
+            output.subtract(&bias, stream)?,
+            Some(bias),
+        ))
     }
 }
 
@@ -1437,69 +1435,65 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
-    fn mlx_selected_softmax_router_applies_input_and_expert_scales() {
+    fn mlx_selected_softmax_selector_applies_input_and_group_scales() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
-        let mut router = TopKRouter::new_with_quantization(
-            TopKRouterConfig {
+        let mut selector = TopKGroupSelector::new_with_quantization(
+            TopKGroupSelectorConfig {
                 top_k: 2,
-                num_experts: 3,
+                group_count: 3,
                 hidden_size: 2,
-                score_function: TopKRouterScoreFunction::SelectedSoftmax,
+                score_function: TopKGroupScoring::SelectedSoftmax,
                 norm_topk_prob: false,
                 normalization_epsilon: 0.0,
-                routed_scaling_factor: 1.0,
+                coefficient_scale: 1.0,
                 n_group: 1,
                 topk_group: 1,
                 projection_bias: false,
                 score_correction_bias: false,
                 input_rms_epsilon: Some(0.0),
                 input_inverse_sqrt_dimensions: true,
-                route_scale: true,
+                learned_coefficient_scale: true,
             },
             None,
             stream,
         )
         .unwrap();
-        router.weight = PhysicalParam::new(Array::from_slice(
+        selector.weight = PhysicalParam::new(Array::from_slice(
             &[1.0_f32, 0.0, 0.0, 1.0, -1.0, 0.0],
             &[3, 2],
         ));
-        router.input_scale = PhysicalParam::new(Some(Array::from_slice(&[2.0_f32, 1.0], &[2])));
-        router.route_scale =
+        selector.input_scale = PhysicalParam::new(Some(Array::from_slice(&[2.0_f32, 1.0], &[2])));
+        selector.learned_coefficient_scale =
             PhysicalParam::new(Some(Array::from_slice(&[2.0_f32, 3.0, 5.0], &[3])));
-        let output = router
-            .forward_routes_with_selection_bias(
-                &Array::from_slice(&[3.0_f32, 4.0], &[1, 2]),
-                None,
-                stream,
-            )
+        let output = selector
+            .select_with_selection_bias(&Array::from_slice(&[3.0_f32, 4.0], &[1, 2]), None, stream)
             .unwrap();
         eval([&output.indices, &output.scores, &output.weights]).unwrap();
         let first = 0.4_f32.exp() / (0.4_f32.exp() + 1.0);
         let mut seen = [false; 2];
-        for route in 0..2 {
-            let expert = output
+        for selection in 0..2 {
+            let group = output
                 .indices
-                .try_index_device((0, route), stream)
+                .try_index_device((0, selection), stream)
                 .unwrap()
                 .item::<i32>(stream);
             let score = output
                 .scores
-                .try_index_device((0, route), stream)
+                .try_index_device((0, selection), stream)
                 .unwrap()
                 .item::<f32>(stream);
             let weight = output
                 .weights
-                .try_index_device((0, route), stream)
+                .try_index_device((0, selection), stream)
                 .unwrap()
                 .item::<f32>(stream);
-            let (expected_score, expected_weight) = match expert {
+            let (expected_score, expected_weight) = match group {
                 0 => (first, 2.0 * first),
                 1 => (1.0 - first, 3.0 * (1.0 - first)),
-                other => panic!("unexpected selected expert {other}"),
+                other => panic!("unexpected selected group {other}"),
             };
-            seen[expert as usize] = true;
+            seen[group as usize] = true;
             assert!((score - expected_score).abs() < 1e-5);
             assert!((weight - expected_weight).abs() < 1e-5);
         }
@@ -1511,67 +1505,63 @@ mod tests {
     fn mlx_projection_bias_affects_selected_softmax_while_correction_is_selection_only() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
-        let mut router = TopKRouter::new_with_quantization(
-            TopKRouterConfig {
+        let mut selector = TopKGroupSelector::new_with_quantization(
+            TopKGroupSelectorConfig {
                 top_k: 2,
-                num_experts: 3,
+                group_count: 3,
                 hidden_size: 1,
-                score_function: TopKRouterScoreFunction::SelectedSoftmax,
+                score_function: TopKGroupScoring::SelectedSoftmax,
                 norm_topk_prob: false,
                 normalization_epsilon: 0.0,
-                routed_scaling_factor: 1.0,
+                coefficient_scale: 1.0,
                 n_group: 1,
                 topk_group: 1,
                 projection_bias: true,
                 score_correction_bias: true,
                 input_rms_epsilon: None,
                 input_inverse_sqrt_dimensions: false,
-                route_scale: false,
+                learned_coefficient_scale: false,
             },
             None,
             stream,
         )
         .unwrap();
-        router.weight = PhysicalParam::new(Array::from_slice(&[0.0_f32; 3], &[3, 1]));
-        router.bias = PhysicalParam::new(Some(Array::from_slice(
+        selector.weight = PhysicalParam::new(Array::from_slice(&[0.0_f32; 3], &[3, 1]));
+        selector.bias = PhysicalParam::new(Some(Array::from_slice(
             &[0.0_f32, 2.0_f32.ln(), 4.0_f32.ln()],
             &[3],
         )));
-        router.e_score_correction_bias =
+        selector.e_score_correction_bias =
             PhysicalParam::new(Some(Array::from_slice(&[10.0_f32, 0.0, 0.0], &[3])));
 
-        let output = router
-            .forward_routes_with_selection_bias(
-                &Array::from_slice(&[1.0_f32], &[1, 1]),
-                None,
-                stream,
-            )
+        let output = selector
+            .select_with_selection_bias(&Array::from_slice(&[1.0_f32], &[1, 1]), None, stream)
             .unwrap();
         eval([&output.indices, &output.scores, &output.weights]).unwrap();
 
         let mut seen = [false; 3];
-        for route in 0..2 {
-            let expert = output
+        for selection in 0..2 {
+            let group = output
                 .indices
-                .try_index_device((0, route), stream)
+                .try_index_device((0, selection), stream)
                 .unwrap()
                 .item::<i32>(stream);
             let score = output
                 .scores
-                .try_index_device((0, route), stream)
+                .try_index_device((0, selection), stream)
                 .unwrap()
                 .item::<f32>(stream);
             let weight = output
                 .weights
-                .try_index_device((0, route), stream)
+                .try_index_device((0, selection), stream)
                 .unwrap()
                 .item::<f32>(stream);
-            let expected = match expert {
+            let expected = match group {
                 0 => 0.2,
                 2 => 0.8,
-                other => panic!("unexpected selected expert {other}"),
+                other => panic!("unexpected selected group {other}"),
             };
-            seen[expert as usize] = true;
+            seen[group as usize] = true;
             assert!((score - expected).abs() < 1e-5);
             assert!((weight - expected).abs() < 1e-5);
         }
@@ -1586,7 +1576,7 @@ mod tests {
         let policy =
             GatedProductPolicy::new(GatedProductActivation::Silu, Some(2.0), Some(1.5), 1.7, 1.0)
                 .unwrap();
-        let mut bank = PackedGatedProductExperts::new(1, 1, 1, None, None, [true, true], stream)
+        let mut bank = PackedGatedProductGroups::new(1, 1, 1, None, None, [true, true], stream)
             .unwrap()
             .with_policy(policy)
             .unwrap();
@@ -1612,10 +1602,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime construction"]
-    fn mlx_mxfp4_expert_bank_rejects_indivisible_projection_width() {
+    fn mlx_mxfp4_group_bank_rejects_indivisible_projection_width() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
-        let error = PackedGatedProductExperts::new(
+        let error = PackedGatedProductGroups::new(
             1,
             33,
             32,
@@ -1635,30 +1625,30 @@ mod tests {
         let stream = execution.stream();
         let rank = |down_weight: f32| {
             let mut bank =
-                PackedGatedProductExperts::new(1, 1, 1, None, None, [false, true], stream).unwrap();
+                PackedGatedProductGroups::new(1, 1, 1, None, None, [false, true], stream).unwrap();
             bank.gate_up_proj = PhysicalParam::new(Array::from_slice(&[1.0_f32, 1.0], &[1, 2, 1]));
             bank.down_proj = PhysicalParam::new(Array::from_slice(&[down_weight], &[1, 1, 1]));
             bank.down_proj_bias = PhysicalParam::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
             bank
         };
         let input = Array::from_slice(&[1.0_f32], &[1, 1]);
-        let expert = Array::from_slice(&[0_i32], &[1, 1]);
+        let group = Array::from_slice(&[0_i32], &[1, 1]);
         let route_weight = Array::from_slice(&[0.25_f32], &[1, 1]);
         let mut rank_zero = rank(2.0);
         let mut rank_one = rank(3.0);
         let output_zero = rank_zero
-            .forward_tensor_parallel(&input, &expert, &route_weight, 2, stream)
+            .forward_tensor_parallel(&input, &group, &route_weight, 2, stream)
             .unwrap();
         let output_one = rank_one
-            .forward_tensor_parallel(&input, &expert, &route_weight, 2, stream)
+            .forward_tensor_parallel(&input, &group, &route_weight, 2, stream)
             .unwrap();
-        let bias = output_zero.post_reduce.as_ref().unwrap();
-        eval([&output_zero.reducible, &output_one.reducible, bias]).unwrap();
+        let bias = output_zero.post_reduce().unwrap();
+        eval([output_zero.reducible(), output_one.reducible(), bias]).unwrap();
 
         let gated = 1.0 / (1.0 + (-1.0_f32).exp());
         let expected = 0.25 * (5.0 * gated + 5.0);
-        let reduced = output_zero.reducible.item::<f32>(stream)
-            + output_one.reducible.item::<f32>(stream)
+        let reduced = output_zero.reducible().clone().item::<f32>(stream)
+            + output_one.reducible().clone().item::<f32>(stream)
             + bias.clone().item::<f32>(stream);
         assert!((reduced - expected).abs() < 1e-5);
     }

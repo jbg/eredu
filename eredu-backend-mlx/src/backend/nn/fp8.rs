@@ -1,16 +1,16 @@
 //! Architecture-neutral block-scaled FP8 projections.
 //!
 //! Checkpoints store E4M3 bytes together with one inverse scale per 128x128
-//! weight block. Conventional dense and routed-expert projections dynamically
+//! weight block. Conventional ungrouped and grouped projections dynamically
 //! quantize each 128-value activation block to E4M3 using the checkpoint's
 //! declared block-scaled FP8 execution scheme. GPU operations consume both
-//! packed representations directly, including rank-3 expert banks, without
+//! packed representations directly, including rank-3 grouped banks, without
 //! expanding a complete weight bank. CPU execution uses a deliberately slow
 //! dequantized reference path for correctness tests and functional fallback.
 
 use std::cell::RefCell;
 
-use super::routing::grouped_matmul;
+use super::grouping::grouped_matmul;
 #[cfg(feature = "cuda")]
 use safemlx::fast::CudaKernel;
 use safemlx::fast::CustomKernelConfig;
@@ -137,13 +137,13 @@ fn is_cpu_stream(stream: &Stream) -> Result<bool, Exception> {
 }
 
 fn dequantize_grouped(weight: &Array, scale: &Array, stream: &Stream) -> Result<Array, Exception> {
-    let experts = weight.dim(0);
+    let groups = weight.dim(0);
     let out_dim = weight.dim(1);
     let in_dim = weight.dim(2);
     let scale = Array::repeat_axis::<f32>(decode_scale(scale, stream)?, 128, 1, stream)?;
     let scale = Array::repeat_axis::<f32>(scale, 128, 2, stream)?;
     weight.from_fp8(Dtype::Float32, stream)?.multiply(
-        scale.try_index_device((..experts, ..out_dim, ..in_dim), stream)?,
+        scale.try_index_device((..groups, ..out_dim, ..in_dim), stream)?,
         stream,
     )
 }
@@ -621,7 +621,7 @@ fn linear_scalar_kernel() -> Result<MetalKernel, Exception> {
     )
 }
 
-/// Applies a rank-3 block-scaled E4M3 expert bank to expert-major rows.
+/// Applies a rank-3 block-scaled E4M3 group bank to group-major rows.
 pub fn grouped_linear(
     input: &Array,
     weight: &Array,
@@ -638,15 +638,15 @@ pub fn grouped_linear(
     let output_dtype = activation_dtype(input)?;
     let routes = input.dim(0);
     let in_dim = input.dim(1);
-    let experts = weight.dim(0);
+    let groups = weight.dim(0);
     let out_dim = weight.dim(1);
     if routes != group_ids.dim(0)
         || routes <= 0
-        || experts <= 0
+        || groups <= 0
         || out_dim <= 0
         || in_dim <= 0
         || weight.dim(2) != in_dim
-        || scale.dim(0) != experts
+        || scale.dim(0) != groups
         || scale.dim(1) != ceil_div(out_dim, SCALE_BLOCK)
         || scale.dim(2) != ceil_div(in_dim, SCALE_BLOCK)
     {
@@ -754,13 +754,13 @@ fn grouped_linear_kernel_cuda() -> Result<CudaKernel, Exception> {
             "uint32_t out_col = blockIdx.x * blockDim.x + threadIdx.x;",
             "uint32_t route = blockIdx.y;",
             "uint32_t lane_k = threadIdx.y;",
-            "uint32_t expert = uint32_t(group_ids[route]);",
+            "uint32_t group = uint32_t(group_ids[route]);",
             "__shared__ float partial[REDUCTION_TILE][OUT_TILE];",
             "float acc = 0.0f;",
             "if (out_col < OUT_DIM) {",
             " for (uint32_t k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
-            "  uint32_t wi = (expert * OUT_DIM + out_col) * IN_DIM + k;",
-            "  uint32_t si = (expert * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
+            "  uint32_t wi = (group * OUT_DIM + out_col) * IN_DIM + k;",
+            "  uint32_t si = (group * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
             "  float xs = float(input_scale[route * SCALE_COLS + k / SCALE_BLOCK]);",
             "  acc += fp8_e4m3_to_float(input[route * IN_DIM + k]) * fp8_e4m3_to_float(weight[wi]) * xs * float(scale[si]);",
             " }",
@@ -858,14 +858,14 @@ fn grouped_linear_kernel() -> Result<MetalKernel, Exception> {
             "uint route = thread_position_in_grid.y / 16;",
             "uint lane_k = thread_position_in_grid.y % 16;",
             "uint local_col = thread_position_in_grid.x % 16;",
-            "uint expert = uint(group_ids[route]);",
+            "uint group = uint(group_ids[route]);",
             "uint input_base = route * IN_DIM;",
             "threadgroup float partial[REDUCTION_TILE][OUT_TILE];",
             "float acc = 0.0f;",
             "if (out_col < OUT_DIM) {",
             " for (uint k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
-            "  uint wi = (expert * OUT_DIM + out_col) * IN_DIM + k;",
-            "  uint si = (expert * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
+            "  uint wi = (group * OUT_DIM + out_col) * IN_DIM + k;",
+            "  uint si = (group * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
             "  float xs = float(input_scale[route * SCALE_COLS + k / SCALE_BLOCK]);",
             "  acc += fp8_e4m3_to_float(input[input_base + k]) * fp8_e4m3_to_float(weight[wi]) * xs * float(scale[si]);",
             " }",
@@ -894,11 +894,11 @@ fn grouped_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
             "uint elem = thread_position_in_grid.x;",
             "uint out_col = elem % OUT_DIM;",
             "uint route = elem / OUT_DIM;",
-            "uint expert = uint(group_ids[route]);",
+            "uint group = uint(group_ids[route]);",
             "float acc = 0.0f;",
-            "uint weight_base = (expert * OUT_DIM + out_col) * IN_DIM;",
+            "uint weight_base = (group * OUT_DIM + out_col) * IN_DIM;",
             "uint input_base = route * IN_DIM;",
-            "uint scale_base = (expert * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS;",
+            "uint scale_base = (group * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS;",
             "for (uint k = 0; k < IN_DIM; ++k) {",
             " float w = fp8_e4m3_to_float(weight[weight_base + k]);",
             " uint scale_col = k / SCALE_BLOCK;",

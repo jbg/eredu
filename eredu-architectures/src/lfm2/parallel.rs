@@ -1,6 +1,6 @@
 //! Semantic tensor-parallel placement for LFM2 physical blocks.
 
-use eredu_nn::{RoutedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
@@ -291,7 +291,7 @@ pub fn local_geometry(
 }
 
 /// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = vec![
@@ -336,7 +336,7 @@ pub fn static_parallel_parameter_groups<B: RoutedNeuralBackend>(
 }
 
 /// Declares semantic groups for one scheduled LFM2 block.
-pub fn layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
     block: &Block<B>,
     args: &ModelArgs,
     layer: usize,

@@ -1,8 +1,9 @@
 //! Nemotron-H dense and routed ReLU-squared feed-forward operators.
 
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Relu2ExpertBankSpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, GroupScoring, GroupSelectionOperator, GroupedNeuralBackend, GroupedRelu2Spec,
+    LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -13,14 +14,14 @@ use super::ModelArgs;
 /// Dense up/ReLU²/down projection pair.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseMlp<B: RoutedNeuralBackend> {
+pub struct DenseMlp<B: GroupedNeuralBackend> {
     /// Up projection.
     pub up_proj: B::Linear,
     /// Down projection.
     pub down_proj: B::Linear,
 }
 
-impl<B: RoutedNeuralBackend> DenseMlp<B> {
+impl<B: GroupedNeuralBackend> DenseMlp<B> {
     /// Builds one unloaded dense MLP.
     pub fn new(
         args: &ModelArgs,
@@ -87,21 +88,21 @@ impl<B: RoutedNeuralBackend> DenseMlp<B> {
     }
 }
 
-/// Grouped sigmoid routing, packed ReLU² experts, and one shared expert.
+/// Grouped sigmoid selection: routing, packed ReLU² experts, and one shared expert.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMoe<B: RoutedNeuralBackend> {
+pub struct SparseMoe<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Grouped correction-bias router.
-    pub gate: B::Router,
+    pub gate: B::Selector,
     /// Packed routed experts.
-    pub experts: B::Relu2ExpertBank,
+    pub experts: B::Relu2Groups,
     /// Always-executed shared expert.
     pub shared_experts: DenseMlp<B>,
 }
 
-impl<B: RoutedNeuralBackend> SparseMoe<B> {
+impl<B: GroupedNeuralBackend> SparseMoe<B> {
     /// Builds one unloaded sparse unit at placement-resolved widths.
     pub fn new(
         args: &ModelArgs,
@@ -130,34 +131,29 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let gate_weight = format!("{prefix}.gate.weight");
-        let routing = TopKRoutingSpec::new(
+        let routing = TopKGroupSelectionSpec::new(
             args.n_routed_experts,
             args.num_experts_per_tok,
-            RoutingScoring::Sigmoid,
+            GroupScoring::Sigmoid,
             args.norm_topk_prob,
         )?
         .with_groups(args.n_group, args.topk_group)?
         .with_weight_policy(1e-20, args.routed_scaling_factor)?;
-        let gate = B::top_k_router(
-            TopKRouterSpec {
-                input_dimensions: args.hidden_size,
-                weight: ParameterSpec::trainable(&gate_weight).map_err(Error::backend)?,
-                bias: None,
-                correction_bias: Some(
-                    ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
-                        .map_err(Error::backend)?,
-                ),
-                input_transform: None,
-                route_scale: None,
-                format: crate::linear_format::standard_linear_format(
-                    &gate_weight,
-                    args.weight_quantization_for(&gate_weight).into(),
-                )?,
-                routing,
-            },
-            context,
+        let selector = TopKGroupSelectorSpec::new(
+            args.hidden_size,
+            ParameterSpec::trainable(&gate_weight).map_err(Error::backend)?,
+            crate::linear_format::standard_linear_format(
+                &gate_weight,
+                args.weight_quantization_for(&gate_weight).into(),
+            )?,
+            routing,
+        )?
+        .with_correction_bias(
+            ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
+                .map_err(Error::backend)?,
         )?;
-        let experts = B::relu2_expert_bank(
+        let gate = B::top_k_group_selector(selector, context)?;
+        let experts = B::grouped_relu2(
             expert_bank_spec_at(
                 args,
                 &format!("{prefix}.experts"),
@@ -205,7 +201,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.gate.route(input, context)?;
+        let routes = self.gate.select(input, context)?;
         let routed = provider
             .forward_relu2_routed(
                 &mut self.experts,
@@ -238,7 +234,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.gate.route(input, context)?;
+        let routes = self.gate.select(input, context)?;
         let routed = provider
             .forward_relu2_routed(
                 &mut self.experts,
@@ -255,9 +251,9 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(eredu_runtime::RoutingObservation {
             path,
-            selected_experts: &routes.expert_ids,
-            selected_scores: &routes.selected_scores,
-            route_weights: &routes.route_weights,
+            selected_experts: routes.group_indices(),
+            selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(),
             routed_output: &routed,
             local_routed_output: None,
             reduced_routed_output: None,
@@ -281,7 +277,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.gate.route(input, context)?;
+        let routes = self.gate.select(input, context)?;
         let routed = provider
             .forward_relu2_routed_tensor_parallel(
                 &mut self.experts,
@@ -311,31 +307,29 @@ fn expert_bank_spec_at(
     experts_prefix: &str,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<Relu2ExpertBankSpec, Error> {
+) -> Result<GroupedRelu2Spec, Error> {
     let up_name = format!("{experts_prefix}.up_proj");
     let down_name = format!("{experts_prefix}.down_proj");
-    let spec = Relu2ExpertBankSpec {
+    GroupedRelu2Spec::new(
         expert_count,
-        hidden_dimensions: args.hidden_size,
+        args.hidden_size,
         intermediate_dimensions,
-        up: standard_expert_projection(
+        standard_expert_projection(
             &up_name,
             None,
             args.weight_quantization_for(&up_name).into(),
         )?,
-        down: standard_expert_projection(
+        standard_expert_projection(
             &down_name,
             None,
             args.weight_quantization_for(&down_name).into(),
         )?,
-    };
-    spec.validate()?;
-    Ok(spec)
+    )
 }
 
 /// Returns the architecture-owned ReLU-squared expert specification for one
 /// target or appended MTP layer.
-pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<Relu2ExpertBankSpec, Error> {
+pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedRelu2Spec, Error> {
     localized_expert_bank_spec(
         args,
         layer,
@@ -351,7 +345,7 @@ pub fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<Relu2ExpertBankSpec, Error> {
+) -> Result<GroupedRelu2Spec, Error> {
     let target_layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
     let (policy, experts_prefix) = if layer < target_layers {
         let policy = args
@@ -399,26 +393,26 @@ mod tests {
     fn localized_specs_resolve_target_and_mtp_parameter_identity() {
         let args = args();
         let target = localized_expert_bank_spec(&args, 3, 2, 4).unwrap();
-        assert_eq!(target.expert_count, 2);
-        assert_eq!(target.intermediate_dimensions, 4);
+        assert_eq!(target.group_count(), 2);
+        assert_eq!(target.intermediate_dimensions(), 4);
         assert_eq!(
-            target.up.weight.id.as_str(),
+            target.up().weight().id.as_str(),
             "model.layers.3.moe.experts.up_proj"
         );
         assert_eq!(
-            target.down.weight.id.as_str(),
+            target.down().weight().id.as_str(),
             "model.layers.3.moe.experts.down_proj"
         );
 
         let mtp = expert_bank_spec(&args, 5).unwrap();
-        assert_eq!(mtp.expert_count, 4);
-        assert_eq!(mtp.intermediate_dimensions, 8);
+        assert_eq!(mtp.group_count(), 4);
+        assert_eq!(mtp.intermediate_dimensions(), 8);
         assert_eq!(
-            mtp.up.weight.id.as_str(),
+            mtp.up().weight().id.as_str(),
             "model.mtp.layers.1.mixer.experts.up_proj"
         );
         assert_eq!(
-            mtp.down.weight.id.as_str(),
+            mtp.down().weight().id.as_str(),
             "model.mtp.layers.1.mixer.experts.down_proj"
         );
     }

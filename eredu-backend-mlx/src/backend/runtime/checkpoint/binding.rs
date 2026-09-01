@@ -115,7 +115,7 @@ where
 /// Replaces global binding sources with architecture-produced rank-local recipes.
 ///
 /// Recipe keys are exact architecture-logical parameter targets. This lowering
-/// knows nothing about family expert axes or physical checkpoint layouts; those
+/// knows nothing about architecture-specific axes or physical checkpoint layouts; those
 /// have already been expressed by the recipes.
 pub fn apply_rank_local_parameter_recipes(
     bindings: Vec<WeightBinding>,
@@ -802,7 +802,7 @@ fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
         || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
         // Dense module placeholders default to F32, while direct checkpoint
         // bindings replace them with the checkpoint's native floating dtype.
-        // Derived bindings (including key rewrites and expert stacking) must
+        // Derived bindings (including key rewrites and leading-axis stacking) must
         // follow the same rule or valid BF16 checkpoints are rejected solely
         // because their public tensor names require a recipe.
         || (is_floating_recipe_dtype(expected) && is_floating_recipe_dtype(actual))

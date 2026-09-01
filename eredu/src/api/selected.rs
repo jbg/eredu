@@ -607,11 +607,11 @@ impl LocalModel {
         self.inner
             .runtime
             .session()
-            .expert_cache_report()
+            .parameter_bank_report()
             .map(|report| {
                 report
                     .as_ref()
-                    .map(eredu_backend_mlx::expert_cache_telemetry)
+                    .map(eredu_backend_mlx::parameter_bank_telemetry)
             })
             .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))
     }
@@ -1330,8 +1330,8 @@ pub enum LocalExpertCacheBenchmarkError {
 
 #[derive(Clone, Copy)]
 struct ExpertSnapshot {
-    prefill: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
-    decode: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
+    prefill: eredu_backend_mlx::backend::runtime::residency::parameter_bank::BankPassStatistics,
+    decode: eredu_backend_mlx::backend::runtime::residency::parameter_bank::BankPassStatistics,
     host_resident_experts: usize,
     host_resident_bytes: u64,
     device_resident_experts: usize,
@@ -1343,49 +1343,55 @@ fn expert_snapshot(model: &LocalModel) -> Result<ExpertSnapshot, LocalExpertCach
         .inner
         .runtime
         .session()
-        .expert_cache_report()
+        .parameter_bank_report()
         .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))?
         .ok_or(LocalExpertCacheBenchmarkError::ExpertCacheUnavailable)?;
     Ok(ExpertSnapshot {
-        prefill: report.prefill,
-        decode: report.decode,
-        host_resident_experts: report.host_resident_experts,
-        host_resident_bytes: report.host_resident_bytes,
-        device_resident_experts: report.device_resident_experts,
-        device_resident_bytes: report.device_resident_bytes,
+        prefill: *report.bulk(),
+        decode: *report.incremental(),
+        host_resident_experts: report.host_resident_entries(),
+        host_resident_bytes: report.host_resident_bytes(),
+        device_resident_experts: report.device_resident_entries(),
+        device_resident_bytes: report.device_resident_bytes(),
     })
 }
 
 fn benchmark_sample(
     elapsed: Duration,
-    before: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
-    after: eredu_backend_mlx::backend::runtime::residency::expert_cache::ExpertPassStatistics,
+    before: eredu_backend_mlx::backend::runtime::residency::parameter_bank::BankPassStatistics,
+    after: eredu_backend_mlx::backend::runtime::residency::parameter_bank::BankPassStatistics,
     occupancy: ExpertSnapshot,
 ) -> LocalExpertCacheBenchmarkSample {
     LocalExpertCacheBenchmarkSample {
         elapsed,
         requested_routes: after
-            .requested_routes
-            .saturating_sub(before.requested_routes),
+            .requested_selections()
+            .saturating_sub(before.requested_selections()),
         distinct_experts: after
-            .distinct_experts
-            .saturating_sub(before.distinct_experts),
+            .distinct_entries()
+            .saturating_sub(before.distinct_entries()),
         coalesced_duplicates: after
-            .coalesced_duplicates
-            .saturating_sub(before.coalesced_duplicates),
-        compact_banks: after.compact_banks.saturating_sub(before.compact_banks),
+            .coalesced_duplicates()
+            .saturating_sub(before.coalesced_duplicates()),
+        compact_banks: after.compact_banks().saturating_sub(before.compact_banks()),
         compact_bank_bytes: after
-            .compact_bank_bytes
-            .saturating_sub(before.compact_bank_bytes),
-        host_hits: after.host.hits.saturating_sub(before.host.hits),
-        host_misses: after.host.misses.saturating_sub(before.host.misses),
-        host_evictions: after.host.evictions.saturating_sub(before.host.evictions),
-        device_hits: after.device.hits.saturating_sub(before.device.hits),
-        device_misses: after.device.misses.saturating_sub(before.device.misses),
+            .compact_bank_bytes()
+            .saturating_sub(before.compact_bank_bytes()),
+        host_hits: after.host().hits().saturating_sub(before.host().hits()),
+        host_misses: after.host().misses().saturating_sub(before.host().misses()),
+        host_evictions: after
+            .host()
+            .evictions()
+            .saturating_sub(before.host().evictions()),
+        device_hits: after.device().hits().saturating_sub(before.device().hits()),
+        device_misses: after
+            .device()
+            .misses()
+            .saturating_sub(before.device().misses()),
         device_evictions: after
-            .device
-            .evictions
-            .saturating_sub(before.device.evictions),
+            .device()
+            .evictions()
+            .saturating_sub(before.device().evictions()),
         host_resident_experts: occupancy.host_resident_experts,
         host_resident_bytes: occupancy.host_resident_bytes,
         device_resident_experts: occupancy.device_resident_experts,

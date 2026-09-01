@@ -1070,7 +1070,7 @@ fn pipeline_ring_worker() {
     let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
     let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
     assert!(!(dense_stream && layerwise_host));
-    let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
+    let parameter_bank = std::env::var_os(EXPERT_CACHE).is_some();
     let requantize = std::env::var_os(REQUANTIZE).is_some();
     let (requested_quantization, requested_weight_quantization) =
         if family == FixtureFamily::NemotronH {
@@ -1106,7 +1106,7 @@ fn pipeline_ring_worker() {
     };
     let layerwise_options =
         || LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-    let mut model = if expert_cache {
+    let mut model = if parameter_bank {
         let non_experts = if dense_stream {
             NonExpertWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
@@ -1236,7 +1236,7 @@ fn pipeline_ring_worker() {
             );
         }
     }
-    if requantize && !dense_stream && !layerwise_host && !expert_cache {
+    if requantize && !dense_stream && !layerwise_host && !parameter_bank {
         let materialization = info
             .materialization
             .as_ref()
@@ -1257,8 +1257,8 @@ fn pipeline_ring_worker() {
             "rank {expected_rank} admitted slack beyond its packed stage or smallest legal row tile"
         );
     }
-    if expert_cache {
-        let report = model.expert_cache_report().unwrap();
+    if parameter_bank {
+        let report = model.parameter_bank_report().unwrap();
         let predictor_expert_layers = usize::from(
             info.owns_output
                 && matches!(
@@ -1275,19 +1275,19 @@ fn pipeline_ring_worker() {
             FixtureFamily::Inkling | FixtureFamily::InklingMultimodal | FixtureFamily::InklingGguf
         )) * expert_layers;
         let expected_experts = (expert_layers + predictor_expert_layers)
-            * info.local_expert_ids.len()
+            * info.local_group_indices.len()
             + shared_inkling_experts;
         assert_eq!(report.is_some(), expected_experts > 0);
         if let Some(report) = report {
-            assert_eq!(report.owned_experts, expected_experts);
-            assert!(report.owned_bytes > 0);
-            assert_eq!(report.device_resident_experts, 0);
+            assert_eq!(report.owned_entries(), expected_experts);
+            assert!(report.owned_bytes() > 0);
+            assert_eq!(report.device_resident_entries(), 0);
             if requantize {
                 assert_eq!(
-                    report.weight_quantization,
+                    report.weight_quantization(),
                     Some(requested_weight_quantization)
                 );
-                let materialization = report.materialization.as_ref().unwrap();
+                let materialization = report.materialization().unwrap();
                 assert!(materialization.transformed_weights > 0);
                 assert!(materialization.source_tiles > 0);
                 assert!(materialization.output_bytes < materialization.source_bytes_read);
@@ -1581,13 +1581,14 @@ fn pipeline_ring_worker() {
                 <= 1
         );
     }
-    if expert_cache {
-        if let Some(report) = model.expert_cache_report().unwrap() {
-            let requests = report.prefill.device.requests + report.decode.device.requests;
+    if parameter_bank {
+        if let Some(report) = model.parameter_bank_report().unwrap() {
+            let requests =
+                report.bulk().device().requests() + report.incremental().device().requests();
             if requests > 0 {
-                assert!(report.device_resident_experts > 0);
+                assert!(report.device_resident_entries() > 0);
             } else {
-                assert_eq!(report.device_resident_experts, 0);
+                assert_eq!(report.device_resident_entries(), 0);
             }
         }
     }
@@ -5443,12 +5444,12 @@ fn ring_four_process_deepseek_v4_pipeline_expert() {
 /// caching in the full admitted Cartesian topology.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_deepseek_v4_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_deepseek_v4_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::DeepSeekV4,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5456,12 +5457,12 @@ fn ring_eight_process_deepseek_v4_streamed_triple_axis_expert_cache() {
 /// independently cached across TP, PP, and EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_deepseek_resident_nonexpert_triple_axis_expert_cache() {
+fn ring_eight_process_deepseek_resident_nonexpert_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::DeepSeek,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5469,12 +5470,12 @@ fn ring_eight_process_deepseek_resident_nonexpert_triple_axis_expert_cache() {
 /// caching across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_deepseek_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_deepseek_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::DeepSeek,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5487,7 +5488,7 @@ fn ring_four_process_deepseek_cached_tensor_expert_model_parity() {
         false,
         FixtureFamily::DeepSeek,
         "tp-ep",
-        WorkerMode::OpaqueSessionExpertCache,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5500,7 +5501,7 @@ fn ring_four_process_deepseek_v4_cached_tensor_expert_model_parity() {
         false,
         FixtureFamily::DeepSeekV4,
         "tp-ep",
-        WorkerMode::OpaqueSessionExpertCache,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5508,11 +5509,11 @@ fn ring_four_process_deepseek_v4_cached_tensor_expert_model_parity() {
 /// across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_deepseek_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_deepseek_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::DeepSeek,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5520,24 +5521,24 @@ fn ring_eight_process_deepseek_layerwise_host_triple_axis_expert_cache() {
 /// caching across TP, PP, and EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_deepseek_gguf_triple_axis_expert_cache() {
+fn ring_eight_process_deepseek_gguf_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::DeepSeekGguf,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Covers independent DeepSeek expert caching for TP+PP with EP inactive.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_deepseek_tensor_pipeline_expert_cache_without_ep() {
+fn ring_four_process_deepseek_tensor_pipeline_parameter_bank_without_ep() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::DeepSeek,
         "tp-pp",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5545,12 +5546,12 @@ fn ring_four_process_deepseek_tensor_pipeline_expert_cache_without_ep() {
 /// compressed MLA state reusable.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_deepseek_expert_cache_session() {
+fn ring_four_process_deepseek_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::DeepSeek,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5649,12 +5650,12 @@ fn ring_eight_process_gpt_oss_triple_axis() {
 /// Exercises GPT-OSS triple-axis dense streaming with independent expert caches.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_gpt_oss_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_gpt_oss_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::GptOss,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5662,42 +5663,46 @@ fn ring_eight_process_gpt_oss_streamed_triple_axis_expert_cache() {
 /// caching across TP=2 x PP=2 x EP=2.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_gpt_oss_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_gpt_oss_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::GptOss,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Exercises canonical type-39 GPT-OSS GGUF across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_gpt_oss_gguf_triple_axis_expert_cache() {
+fn ring_eight_process_gpt_oss_gguf_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::GptOssGguf,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Covers independent GPT-OSS expert caching when PP is active without EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_gpt_oss_pipeline_expert_cache() {
-    run_ring_pipeline_mode(false, FixtureFamily::GptOss, WorkerMode::ExpertCache);
+fn ring_two_process_gpt_oss_pipeline_parameter_bank() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        WorkerMode::AddressableParameterBank,
+    );
 }
 
 /// Verifies opaque-session execution with GPT-OSS cached experts.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_gpt_oss_pipeline_expert_cache_session() {
+fn ring_four_process_gpt_oss_pipeline_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::GptOss,
         "pp-ep",
-        WorkerMode::OpaqueSessionExpertCache,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5751,12 +5756,12 @@ fn ring_eight_process_lfm2_moe_triple_axis() {
 /// across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_lfm2_moe_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_lfm2_moe_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Lfm2Moe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5764,11 +5769,11 @@ fn ring_eight_process_lfm2_moe_streamed_triple_axis_expert_cache() {
 /// across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_lfm2_moe_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_lfm2_moe_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Lfm2Moe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5776,31 +5781,35 @@ fn ring_eight_process_lfm2_moe_layerwise_host_triple_axis_expert_cache() {
 /// and independent expert caching across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_lfm2_moe_gguf_triple_axis_expert_cache() {
+fn ring_eight_process_lfm2_moe_gguf_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Lfm2MoeGguf,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Covers independent LFM2 expert caching when PP is active without EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_lfm2_moe_pipeline_expert_cache() {
-    run_ring_pipeline_mode(false, FixtureFamily::Lfm2Moe, WorkerMode::ExpertCache);
+fn ring_two_process_lfm2_moe_pipeline_parameter_bank() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Lfm2Moe,
+        WorkerMode::AddressableParameterBank,
+    );
 }
 
 /// Verifies opaque-session execution with LFM2 cached experts.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_lfm2_moe_pipeline_expert_cache_session() {
+fn ring_four_process_lfm2_moe_pipeline_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Lfm2Moe,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5864,12 +5873,12 @@ fn ring_eight_process_kimi_linear_triple_axis() {
 /// expert cache across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_kimi_linear_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_kimi_linear_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::KimiLinear,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5877,11 +5886,11 @@ fn ring_eight_process_kimi_linear_streamed_triple_axis_expert_cache() {
 /// routed experts across TP, PP, and EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_kimi_linear_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_kimi_linear_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::KimiLinear,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5889,24 +5898,24 @@ fn ring_eight_process_kimi_linear_layerwise_host_triple_axis_expert_cache() {
 /// independent expert cache across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_kimi_linear_gguf_triple_axis_expert_cache() {
+fn ring_eight_process_kimi_linear_gguf_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::KimiLinearGguf,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Covers independent Kimi expert caching for TP+PP with EP inactive.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_kimi_linear_tensor_pipeline_expert_cache_without_ep() {
+fn ring_four_process_kimi_linear_tensor_pipeline_parameter_bank_without_ep() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::KimiLinear,
         "tp-pp",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5914,12 +5923,12 @@ fn ring_four_process_kimi_linear_tensor_pipeline_expert_cache_without_ep() {
 /// Kimi's recurrent or compressed-latent state reusable.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_kimi_linear_expert_cache_session() {
+fn ring_four_process_kimi_linear_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::KimiLinear,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5959,12 +5968,12 @@ fn ring_eight_process_nemotron_h_moe_triple_axis() {
 /// Nemotron-H routed experts across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_nemotron_h_moe_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_nemotron_h_moe_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::NemotronH,
         "tp-pp-ep",
-        WorkerMode::ExpertCacheRequantize,
+        WorkerMode::AddressableParameterBankRequantize,
     );
 }
 
@@ -5972,11 +5981,11 @@ fn ring_eight_process_nemotron_h_moe_streamed_triple_axis_expert_cache() {
 /// Nemotron-H routed experts across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_nemotron_h_moe_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_nemotron_h_moe_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::NemotronH,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -5984,31 +5993,35 @@ fn ring_eight_process_nemotron_h_moe_layerwise_host_triple_axis_expert_cache() {
 /// reads, and independent expert caching across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_nemotron_h_moe_gguf_triple_axis_expert_cache() {
+fn ring_eight_process_nemotron_h_moe_gguf_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::NemotronHGguf,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Covers independent Nemotron-H expert caching when PP is active without EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_nemotron_h_moe_pipeline_expert_cache() {
-    run_ring_pipeline_mode(false, FixtureFamily::NemotronH, WorkerMode::ExpertCache);
+fn ring_two_process_nemotron_h_moe_pipeline_parameter_bank() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::NemotronH,
+        WorkerMode::AddressableParameterBank,
+    );
 }
 
 /// Verifies cached-expert session execution for Nemotron-H stateful stages.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_session() {
+fn ring_four_process_nemotron_h_moe_pipeline_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::NemotronH,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6016,12 +6029,12 @@ fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_session() {
 /// caches under PP+EP, including persistence and synchronized decode.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_nemotron_h_quantized_pipeline_expert_cache() {
+fn ring_four_process_nemotron_h_quantized_pipeline_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::NemotronH,
         "pp-ep",
-        WorkerMode::ExpertCacheRequantize,
+        WorkerMode::AddressableParameterBankRequantize,
     );
 }
 
@@ -6180,12 +6193,12 @@ fn ring_eight_process_qwen3_vl_moe_triple_axis() {
 /// routed experts across TP=2 x PP=2 x EP=2.
 #[test]
 #[ignore = "requires the MLX Ring backend, eight loopback CPU ranks, and the synthetic Qwen3-VL-MoE media fixture"]
-fn ring_eight_process_qwen3_vl_moe_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_qwen3_vl_moe_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Qwen3VlMoe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6193,11 +6206,11 @@ fn ring_eight_process_qwen3_vl_moe_streamed_triple_axis_expert_cache() {
 /// cached routed experts across all three parallel axes.
 #[test]
 #[ignore = "requires the MLX Ring backend, eight loopback CPU ranks, and the synthetic Qwen3-VL-MoE host-layerwise media fixture"]
-fn ring_eight_process_qwen3_vl_moe_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_qwen3_vl_moe_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Qwen3VlMoe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6210,7 +6223,7 @@ fn ring_eight_process_qwen35_moe_multimodal_streamed_triple_axis() {
         true,
         FixtureFamily::Qwen35MoeMultimodal,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6222,7 +6235,7 @@ fn ring_eight_process_qwen35_moe_multimodal_layerwise_host_triple_axis() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Qwen35MoeMultimodal,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6254,12 +6267,12 @@ fn ring_eight_process_qwen3_next_moe_triple_axis() {
 /// caches, bounded reads, prompt-cache reload, and synchronized decode.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_qwen35_moe_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_qwen35_moe_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Qwen35Moe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6267,30 +6280,34 @@ fn ring_eight_process_qwen35_moe_streamed_triple_axis_expert_cache() {
 /// caching across TP, PP, and EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_qwen3_next_moe_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_qwen3_next_moe_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Qwen3NextMoe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Covers independent hybrid expert caching when PP is active without EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_qwen35_moe_pipeline_expert_cache() {
-    run_ring_pipeline_mode(false, FixtureFamily::Qwen35Moe, WorkerMode::ExpertCache);
+fn ring_two_process_qwen35_moe_pipeline_parameter_bank() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35Moe,
+        WorkerMode::AddressableParameterBank,
+    );
 }
 
 /// Verifies cached Qwen hybrid expert execution through one session.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_qwen35_moe_pipeline_expert_cache_session() {
+fn ring_four_process_qwen35_moe_pipeline_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen35Moe,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6335,12 +6352,12 @@ fn ring_four_process_qwen3_moe_fully_resident_load_time_quantization() {
 /// expert caches across PP=2 x EP=2, including persistence and generation.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_resident_nonexpert_pipeline_expert_cache() {
+fn ring_qwen3_moe_resident_nonexpert_pipeline_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen3Moe,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6348,12 +6365,12 @@ fn ring_qwen3_moe_resident_nonexpert_pipeline_expert_cache() {
 /// and corresponding-coordinate pipeline lanes in an eight-rank topology.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_streamed_tensor_pipeline_expert_cache() {
+fn ring_qwen3_moe_streamed_tensor_pipeline_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Qwen3Moe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6361,11 +6378,11 @@ fn ring_qwen3_moe_streamed_tensor_pipeline_expert_cache() {
 /// independent expert caching for Qwen3-MoE across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_layerwise_host_tensor_pipeline_expert_cache() {
+fn ring_qwen3_moe_layerwise_host_tensor_pipeline_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Qwen3Moe,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6373,35 +6390,35 @@ fn ring_qwen3_moe_layerwise_host_tensor_pipeline_expert_cache() {
 /// stage-local ownership in a PP=2 x EP=2 topology.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_gguf_layerwise_host_pipeline_expert_cache() {
+fn ring_qwen3_moe_gguf_layerwise_host_pipeline_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Qwen3MoeGguf,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Exercises stage-local cached expert selections and bounded reads from GGUF.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_gguf_pipeline_expert_cache() {
+fn ring_qwen3_moe_gguf_pipeline_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Qwen3MoeGguf,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Verifies one session owns both pipeline communication and expert caches.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_pipeline_expert_cache_session() {
+fn ring_qwen3_moe_pipeline_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen3Moe,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6410,28 +6427,36 @@ fn ring_qwen3_moe_pipeline_expert_cache_session() {
 /// synchronized generation are exercised by the shared worker.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_pipeline_expert_cache_without_ep() {
-    run_ring_pipeline_mode(false, FixtureFamily::Qwen3Moe, WorkerMode::ExpertCache);
+fn ring_qwen3_moe_pipeline_parameter_bank_without_ep() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        WorkerMode::AddressableParameterBank,
+    );
 }
 
 /// Verifies TP-sharded cached experts and dense-streamed non-experts compose
 /// across TP=2 x PP=2 while EP remains inactive.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_streamed_tensor_pipeline_expert_cache_without_ep() {
+fn ring_qwen3_moe_streamed_tensor_pipeline_parameter_bank_without_ep() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Qwen3Moe,
         "tp-pp",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Exercises PP-only cache ownership and bounded reads from canonical GGUF.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_gguf_pipeline_expert_cache_without_ep() {
-    run_ring_pipeline_mode(true, FixtureFamily::Qwen3MoeGguf, WorkerMode::ExpertCache);
+fn ring_qwen3_moe_gguf_pipeline_parameter_bank_without_ep() {
+    run_ring_pipeline_mode(
+        true,
+        FixtureFamily::Qwen3MoeGguf,
+        WorkerMode::AddressableParameterBank,
+    );
 }
 
 /// Executes the Qwen3-MoE triple-axis path from a canonical GGUF and verifies
@@ -6714,12 +6739,12 @@ fn ring_eight_process_inkling_triple_axis() {
 /// expert caches across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_inkling_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_inkling_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Inkling,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6727,11 +6752,11 @@ fn ring_eight_process_inkling_streamed_triple_axis_expert_cache() {
 /// independently cached routed experts across TP, PP, and EP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_inkling_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_inkling_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::Inkling,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6739,12 +6764,12 @@ fn ring_eight_process_inkling_layerwise_host_triple_axis_expert_cache() {
 /// expert caching across all three axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_inkling_gguf_triple_axis_expert_cache() {
+fn ring_eight_process_inkling_gguf_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::InklingGguf,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6752,24 +6777,24 @@ fn ring_eight_process_inkling_gguf_triple_axis_expert_cache() {
 /// without constructing an EP communicator.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_inkling_tensor_pipeline_expert_cache_without_ep() {
+fn ring_four_process_inkling_tensor_pipeline_parameter_bank_without_ep() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Inkling,
         "tp-pp",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
 /// Verifies each Inkling stage's expert cache remains session-owned.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_inkling_expert_cache_session() {
+fn ring_four_process_inkling_parameter_bank_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Inkling,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6777,12 +6802,12 @@ fn ring_four_process_inkling_expert_cache_session() {
 /// caches under PP+EP, including persistence and synchronized decode.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_inkling_quantized_pipeline_expert_cache() {
+fn ring_four_process_inkling_quantized_pipeline_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::Inkling,
         "pp-ep",
-        WorkerMode::ExpertCacheRequantize,
+        WorkerMode::AddressableParameterBankRequantize,
     );
 }
 
@@ -6826,12 +6851,12 @@ fn ring_eight_process_inkling_multimodal_triple_axis() {
 /// independent expert caches across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_inkling_multimodal_streamed_triple_axis_expert_cache() {
+fn ring_eight_process_inkling_multimodal_streamed_triple_axis_parameter_bank() {
     run_ring_cartesian_pipeline_mode(
         true,
         FixtureFamily::InklingMultimodal,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6839,11 +6864,11 @@ fn ring_eight_process_inkling_multimodal_streamed_triple_axis_expert_cache() {
 /// independent expert caches across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_eight_process_inkling_multimodal_layerwise_host_triple_axis_expert_cache() {
+fn ring_eight_process_inkling_multimodal_layerwise_host_triple_axis_parameter_bank() {
     run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::InklingMultimodal,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::AddressableParameterBank,
     );
 }
 
@@ -6909,7 +6934,7 @@ fn run_ring_cartesian_pipeline_mode(
             FixtureFamily::NemotronH
                 if matches!(
                     mode,
-                    WorkerMode::ExpertCacheRequantize | WorkerMode::Requantize
+                    WorkerMode::AddressableParameterBankRequantize | WorkerMode::Requantize
                 ) =>
             {
                 write_nemotron_quantizable_fixture(checkpoint.path())
@@ -6934,7 +6959,7 @@ fn run_ring_cartesian_pipeline_mode(
             FixtureFamily::Inkling
                 if matches!(
                     mode,
-                    WorkerMode::ExpertCacheRequantize | WorkerMode::Requantize
+                    WorkerMode::AddressableParameterBankRequantize | WorkerMode::Requantize
                 ) =>
             {
                 write_inkling_quantizable_fixture(checkpoint.path())
@@ -7021,13 +7046,13 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
 enum WorkerMode {
     Standard,
     FinalOutputIntervention,
-    ExpertCache,
-    ExpertCacheRequantize,
+    AddressableParameterBank,
+    AddressableParameterBankRequantize,
     Requantize,
     OpaqueSession,
     OpaqueInspection,
     OpaqueTextGeneration,
-    OpaqueSessionExpertCache,
+    OpaqueSessionAddressableParameterBank,
     OpaqueMuseImage,
     OpaqueInklingMedia,
     OpaqueInklingMtp,
@@ -7210,10 +7235,10 @@ fn run_ring_pipeline_processes(
             WorkerMode::FinalOutputIntervention => {
                 command.env(FINAL_OUTPUT_INTERVENTION, "1");
             }
-            WorkerMode::ExpertCache => {
+            WorkerMode::AddressableParameterBank => {
                 command.env(EXPERT_CACHE, "1");
             }
-            WorkerMode::ExpertCacheRequantize => {
+            WorkerMode::AddressableParameterBankRequantize => {
                 command.env(EXPERT_CACHE, "1");
                 command.env(REQUANTIZE, "1");
             }
@@ -7231,7 +7256,7 @@ fn run_ring_pipeline_processes(
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_TEXT_GENERATION, "1");
             }
-            WorkerMode::OpaqueSessionExpertCache => {
+            WorkerMode::OpaqueSessionAddressableParameterBank => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(EXPERT_CACHE, "1");
             }

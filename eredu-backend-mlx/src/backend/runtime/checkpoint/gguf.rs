@@ -523,8 +523,24 @@ fn convert_tensor(
             let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
             let weight = array_from_owned_data(affine.weights, &weight_shape, host_owned)?;
-            let scales = array_from_owned_data(affine.scales, &scale_shape, host_owned)?;
-            let biases = array_from_owned_data(affine.biases, &scale_shape, host_owned)?;
+            let scales = array_from_owned_data(
+                affine
+                    .scales
+                    .into_iter()
+                    .map(half::f16::from_bits)
+                    .collect(),
+                &scale_shape,
+                host_owned,
+            )?;
+            let biases = array_from_owned_data(
+                affine
+                    .biases
+                    .into_iter()
+                    .map(half::f16::from_bits)
+                    .collect(),
+                &scale_shape,
+                host_owned,
+            )?;
             Ok(GgufTensor::Affine(GgufAffineTensor {
                 physical_name: descriptor.name,
                 bits: affine.bits,

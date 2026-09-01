@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
 };
@@ -16,29 +18,20 @@ use crate::{
         nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
             cache::{residency::CacheResidencyManager, state::MlxHybridState},
-            distributed::{
-                expert::{
-                    dispatch_local_with, dispatch_replicated_with, ExpertAssignment,
-                    RoutingStatistics,
-                },
-                parallel::ParallelExecutionContext,
-            },
+            distributed::parallel::ParallelExecutionContext,
             execution::layerwise::PipelineStageQuantizationSelection,
-            residency::{
-                expert_cache::ExpertCache,
-                expert_provider::{
-                    Relu2ExpertExecution, Relu2ExpertExecutorProvider,
-                    ResidentExpertExecutorProvider,
-                },
-            },
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
+    },
+    composition::expert_dispatch::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_parallel_layout,
         architecture_parameter_unit_owner, architecture_prediction_group,
         architecture_prediction_group_id, architecture_prediction_unit_ranges, base_info,
-        build_pipeline_expert_cache, build_pipeline_layer_storage,
+        build_pipeline_layer_storage, build_pipeline_parameter_bank,
         execute_neutral_routed_output_group, execute_resident_distributed_experts,
         execute_routed_layered_partition_observed, load_architecture_static_parameters,
         local_architecture_parameter_bindings, materialize_pipeline_cache_layers,
@@ -92,7 +85,7 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 
@@ -156,19 +149,19 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
                 &mut self.expert_storage,
                 PipelineExpertStorage::ExternalEmpty,
             );
-            let PipelineExpertStorage::External(expert_cache) = storage else {
+            let PipelineExpertStorage::External(parameter_bank) = storage else {
                 unreachable!("checked external Nemotron-H expert storage")
             };
             let mut statistics = std::mem::take(&mut self.routing_statistics);
-            let mut execute = |execution: Relu2ExpertExecution, stream: &Stream| {
+            let mut execute = |execution: Relu2GroupExecution, stream: &Stream| {
                 execute_pipeline_cached_nemotron_h(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     ExpertPass::Decode,
-                    expert_cache.as_ref(),
+                    parameter_bank.as_ref(),
                     &assignment,
                     expert_group,
                     &mut statistics,
@@ -186,7 +179,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
                 stream,
             );
             self.routing_statistics = statistics;
-            self.expert_storage = PipelineExpertStorage::External(expert_cache);
+            self.expert_storage = PipelineExpertStorage::External(parameter_bank);
             return result;
         }
         if expert_group.is_some() && self.mtp_depth_has_routed_experts(depth)? {
@@ -195,7 +188,7 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
             ));
         }
         self.forward_mtp_draft_neutral::<
-                    fn(Relu2ExpertExecution, &Stream) -> Result<Array, Exception>,
+                    fn(Relu2GroupExecution, &Stream) -> Result<Array, Exception>,
                 >(hidden, tokens, depth, cache, execution, None, stream)
     }
 
@@ -281,20 +274,20 @@ impl PipelineForward for NemotronHPipelinePartition {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_nemotron_h(
-    spec: &eredu_nn::Relu2ExpertBankSpec,
+    spec: &eredu_nn::GroupedRelu2Spec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_relu2(
             spec,
@@ -307,9 +300,15 @@ fn execute_pipeline_cached_nemotron_h(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     Ok(returned.reduced_output)
@@ -323,15 +322,15 @@ pub(super) fn load_nemotron_h_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::NemotronH], "Nemotron-H")?;
-    let explicit_expert_cache = expert_cache_options.is_some();
-    let expert_cache_options = expert_cache_options
+    let explicit_parameter_bank = parameter_bank_options.is_some();
+    let parameter_bank_options = parameter_bank_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
-    let external_experts = expert_cache_options.is_some();
+    let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         NemotronHBindings::new_external_experts()
     } else {
@@ -453,7 +452,7 @@ pub(super) fn load_nemotron_h_pipeline(
                 .keys()
                 .any(|(group, unit)| stage.partition.owns_unit(group.as_str(), *unit))
         }) {
-            info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+            info.local_group_indices = assignment.local_global_group_indices().to_vec();
         }
     }
     let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
@@ -655,7 +654,7 @@ pub(super) fn load_nemotron_h_pipeline(
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 &[eredu_runtime::ParameterRole::ExpertIntermediate]
             } else {
                 &[]
@@ -712,29 +711,29 @@ pub(super) fn load_nemotron_h_pipeline(
         .into_iter()
         .filter(|entry| {
             stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                assignment.owner(entry.identity().index()) == Some(assignment.rank())
             })
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
-                expert_cache_options,
+                parameter_bank_options,
                 expert_quantization,
                 weights_stream,
                 stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| {
                     Error::Parallel("Nemotron-H pipeline expert byte total overflowed".into())
                 })?;
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let checkpoint_diagnostics = if explicit_expert_cache {
+    let checkpoint_diagnostics = if explicit_parameter_bank {
         store.source_diagnostics()?
     } else {
         checkpoint_diagnostics_before_deferred
@@ -836,21 +835,21 @@ impl NemotronHPipelinePartition {
         } else {
             ExpertPass::Decode
         };
-        let expert_cache = self.expert_storage.cache();
+        let parameter_bank = self.expert_storage.cache();
         let decoder_range = self.range();
-        if let Some(expert_cache) = expert_cache {
+        if let Some(parameter_bank) = parameter_bank {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Nemotron-H external experts have no assignment".into())
             })?;
-            let mut execute = |execution: Relu2ExpertExecution, stream: &Stream| {
+            let mut execute = |execution: Relu2GroupExecution, stream: &Stream| {
                 execute_pipeline_cached_nemotron_h(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -858,7 +857,7 @@ impl NemotronHPipelinePartition {
                 )
                 .map_err(|error| Exception::custom(error.to_string()))
             };
-            let mut provider = Relu2ExpertExecutorProvider::new(&mut execute);
+            let mut provider = Relu2GroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -883,7 +882,7 @@ impl NemotronHPipelinePartition {
                 Error::Parallel("Nemotron-H expert assignment requires its EP communicator".into())
             })?;
             let mut execute =
-                |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+                |bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups,
                  routed_hidden: &Array,
                  ids: &Array,
                  weights: &Array,
@@ -901,7 +900,7 @@ impl NemotronHPipelinePartition {
                         context,
                     )
                 };
-            let mut provider = ResidentExpertExecutorProvider::new(&mut execute);
+            let mut provider = ResidentGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -951,7 +950,7 @@ impl NemotronHPipelinePartition {
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Error>
     where
-        F: FnMut(Relu2ExpertExecution, &Stream) -> Result<Array, Exception>,
+        F: FnMut(Relu2GroupExecution, &Stream) -> Result<Array, Exception>,
     {
         let tensor_group = execution
             .filter(|execution| execution.is_tensor_parallel())
@@ -972,7 +971,7 @@ impl NemotronHPipelinePartition {
             depth,
         };
         let (logits, hidden) = if let Some(execute) = execute {
-            let mut provider = Relu2ExpertExecutorProvider::new(execute);
+            let mut provider = Relu2GroupedExecutorProvider::new(execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
                 input,

@@ -279,7 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn owns_ordered_parts_and_round_trips_wire_values_without_backend_types() {
+    fn composite_input_extension_binds_typed_parts_to_a_multi_group_graph() {
+        let graph = crate::ExecutionGraph::new(
+            vec![
+                crate::ExecutionGroupSpec::root("vision"),
+                crate::ExecutionGroupSpec::with_dependencies("text", ["vision"]),
+            ],
+            "text",
+        )
+        .unwrap();
         let input = PreparedModelInput::new(
             vec![
                 PreparedInputPart::new(
@@ -312,6 +320,8 @@ mod tests {
         let rebuilt =
             PreparedModelInput::from_identity_wire_values(identity, values, describe).unwrap();
         assert_eq!(rebuilt, input);
+        assert_eq!(graph.execution_order(), [0, 1]);
+        assert_eq!(graph.output(), 1);
         assert_eq!(rebuilt.wire_values()[2].marker, 3);
         assert_eq!(
             rebuilt.parts()[1].extents(),

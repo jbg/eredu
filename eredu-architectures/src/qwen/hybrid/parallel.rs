@@ -1,6 +1,6 @@
 //! Semantic tensor-parallel placement for shared Qwen hybrid units.
 
-use eredu_nn::{RoutedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
@@ -414,7 +414,7 @@ fn local_config_at(
     Ok(local)
 }
 
-fn norm_groups<B: RoutedNeuralBackend>(
+fn norm_groups<B: GroupedNeuralBackend>(
     block: &Block<B>,
     root: &str,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -434,7 +434,7 @@ fn norm_groups<B: RoutedNeuralBackend>(
     ])
 }
 
-fn block_groups<B: RoutedNeuralBackend>(
+fn block_groups<B: GroupedNeuralBackend>(
     block: &Block<B>,
     config: &HybridConfig,
     root: &str,
@@ -597,7 +597,7 @@ fn block_groups<B: RoutedNeuralBackend>(
 }
 
 /// Declares semantic placement for a target or configured prediction unit.
-pub fn unit_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn unit_parallel_parameter_groups<B: GroupedNeuralBackend>(
     unit: &Unit<B>,
     config: &HybridConfig,
     group: usize,

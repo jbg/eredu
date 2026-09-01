@@ -32,7 +32,8 @@ pub use crate::decoder::{
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    Error, NeuralBackend, NormalizationConstructionSpec, ParameterSpec, RoutedNeuralBackend, Tensor,
+    Error, GroupedNeuralBackend, NeuralBackend, NormalizationConstructionSpec, ParameterSpec,
+    Tensor,
 };
 use eredu_runtime::{ModelStateIdentity, StateLayout};
 
@@ -131,7 +132,7 @@ pub struct RoutedQwenBlockFactory;
 
 impl<B> crate::decoder::BlockFactory<B, ModelArgs> for RoutedQwenBlockFactory
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     type FeedForward = FeedForward<B>;
 
@@ -158,7 +159,7 @@ where
 }
 
 /// Builds a Qwen block for a backend adapter that dynamically admits dense or MoE configuration.
-pub fn new_routed_block<B: RoutedNeuralBackend>(
+pub fn new_routed_block<B: GroupedNeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
@@ -186,7 +187,7 @@ mod tests {
     use super::*;
 
     // This generic body is a compile-time contract: none of these dense Qwen
-    // entry points may acquire a RoutedNeuralBackend bound.
+    // entry points may acquire a GroupedNeuralBackend bound.
     #[allow(dead_code)]
     fn dense_qwen_accepts_any_neural_backend<B: NeuralBackend>(
         args: ModelArgs,

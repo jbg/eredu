@@ -75,4 +75,35 @@ mod tests {
         verified.commit_verified();
         assert_eq!(canonical, [1, 2, 3, 5]);
     }
+
+    #[test]
+    fn prediction_groups_and_external_drafting_share_transactional_state() {
+        let graph = crate::ExecutionGraph::new(
+            vec![
+                crate::ExecutionGroupSpec::root("target"),
+                crate::ExecutionGroupSpec::root("external-drafter"),
+                crate::ExecutionGroupSpec::with_dependencies(
+                    "prediction.0",
+                    ["target", "external-drafter"],
+                ),
+            ],
+            "prediction.0",
+        )
+        .unwrap();
+        assert_eq!(graph.group_index("external-drafter"), Some(1));
+        assert_eq!(graph.group_index("prediction.0"), Some(2));
+
+        let mut target = vec![10];
+        let mut embedded = DraftStateTransaction::fork(&target);
+        embedded.draft_mut().push(11);
+        embedded.commit_draft(&mut target);
+
+        let drafter_policy = ("external-drafter", 2usize);
+        let mut external = DraftStateTransaction::fork(&target);
+        external.draft_mut().extend([12, 13]);
+        external.rollback(&mut target);
+
+        assert_eq!(drafter_policy, ("external-drafter", 2));
+        assert_eq!(target, [10, 11]);
+    }
 }

@@ -57,7 +57,7 @@ pub const DEEPSEEK_V4: C = C::INDEXED_ATTENTION
 
 /// Inkling learned-relative attention and routed/shared expert requirements.
 pub const INKLING: C = C::RELATIVE_ATTENTION
-    .union(C::JOINT_EXPERT_ROUTING)
+    .union(C::JOINT_GROUP_SELECTION)
     .union(C::FROM_I32_SLICE)
     .union(C::BROADCAST_TO);
 

@@ -13,7 +13,7 @@ use std::{
 };
 
 use eredu_architectures::{media_plan::QwenVisionIngressPlan, qwen::ModelArgs};
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::GroupedNeuralBackend;
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use eredu_core::cache::{
@@ -43,8 +43,10 @@ use crate::{
     },
     backend::runtime::execution::layerwise::{quantize_parameterized_store, shard_layer_bindings},
     backend::runtime::media::input,
-    backend::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
     backend::runtime::residency::manager::ResidentUnitLease,
+    backend::runtime::residency::parameter_bank::{
+        AddressableParameterBank, ParameterBankResidencyReport,
+    },
 };
 
 struct MaterializedQwenIngress {
@@ -207,7 +209,7 @@ fn load_neutral_qwen(
         },
         move |_ordinal, address, _path, unit, store, _stream| {
             let index = address.index();
-            let recipes = if external_experts {
+            let recipes = if external_experts || !binding_args.is_moe() {
                 BTreeMap::new()
             } else {
                 qwen_unit_recipes(store, &binding_args, index)?
@@ -243,7 +245,7 @@ fn load_neutral_qwen(
         parallel_info: None,
         parallel_rank: None,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }
 
@@ -312,7 +314,7 @@ pub struct QwenModel {
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: QwenExecution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
 }
 
 impl QwenModel {
@@ -354,10 +356,10 @@ impl QwenModel {
     }
 
     /// Returns independent expert residency telemetry when configured.
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Error::from)
     }
@@ -468,13 +470,13 @@ impl QwenModel {
         cache: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider = expert::cached_provider(&expert_cache, &args);
-                self.forward_with_expert_provider(inputs, None, cache, &mut provider, stream)
+                let mut provider = expert::cached_provider(&parameter_bank, &args);
+                self.forward_with_grouped_provider(inputs, None, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         self.validate_cache(cache)?;
@@ -514,11 +516,11 @@ impl QwenModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-        let result = match expert_cache.as_ref() {
-            Some(expert_cache) => {
-                let mut provider = expert::cached_provider(expert_cache, &args);
+        let result = match parameter_bank.as_ref() {
+            Some(parameter_bank) => {
+                let mut provider = expert::cached_provider(parameter_bank, &args);
                 self.forward_observed_with_provider(
                     inputs,
                     mask,
@@ -542,7 +544,7 @@ impl QwenModel {
                 )
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let output = result?;
         eredu_runtime::observe_model_logits(observer.inner, &output).map_err(Error::from)
     }
@@ -606,11 +608,11 @@ impl QwenModel {
         group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider = expert::cached_provider(&expert_cache, &args);
-                self.forward_tensor_expert_provider(
+                let mut provider = expert::cached_provider(&parameter_bank, &args);
+                self.forward_tensor_grouped_provider(
                     inputs,
                     None,
                     cache,
@@ -619,7 +621,7 @@ impl QwenModel {
                     stream,
                 )
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         self.validate_cache(cache)?;
@@ -664,7 +666,7 @@ impl QwenModel {
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
         let args = self.args.clone();
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let pass = if inputs.dim(1) > 1 {
                 eredu_runtime::ExpertPass::Prefill
@@ -677,9 +679,9 @@ impl QwenModel {
                 mask: None,
             };
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match expert_cache.as_ref() {
-                Some(expert_cache) => {
-                    let mut provider = expert::cached_provider(expert_cache, &args);
+            let output = match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
+                    let mut provider = expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         QwenExecution::TensorParallelResident(runtime) => runtime
                             .forward_parallel_with_provider_and_observer(
@@ -744,11 +746,11 @@ impl QwenModel {
                 .map(crate::MlxTensor::into_array)
                 .map_err(Error::from)
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
-    fn forward_with_expert_provider<P>(
+    fn forward_with_grouped_provider<P>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -811,7 +813,7 @@ impl QwenModel {
         Ok(output.into_array())
     }
 
-    fn forward_tensor_expert_provider<P>(
+    fn forward_tensor_grouped_provider<P>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -993,7 +995,7 @@ pub fn load_safetensors(
             expert_options.is_some(),
         )?;
         if let Some(options) = expert_options {
-            attach_qwen_expert_cache(&mut model, options, stream, weights_stream)?;
+            attach_qwen_parameter_bank(&mut model, options, stream, weights_stream)?;
         }
         return Ok(model);
     }
@@ -1006,12 +1008,12 @@ pub fn load_safetensors(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_qwen_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_qwen_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
 
-fn attach_qwen_expert_cache(
+fn attach_qwen_parameter_bank(
     model: &mut QwenModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -1032,7 +1034,7 @@ fn attach_qwen_expert_cache(
     }
     let store = model.checkpoint_store_arc();
     let entries = expert::expert_catalog(&model.args, store.as_ref())?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -1090,7 +1092,7 @@ fn load_neutral_qwen_parallel(
             stream,
             std::marker::PhantomData::<MlxKeyValueState>,
         )?;
-        let recipes = if external_experts {
+        let recipes = if external_experts || !args.is_moe() {
             BTreeMap::new()
         } else {
             qwen_unit_recipes(store.as_ref(), &args, address.index())?
@@ -1141,7 +1143,7 @@ fn load_neutral_qwen_parallel(
                 stream,
                 std::marker::PhantomData::<MlxKeyValueState>,
             )?;
-            let recipes = if external_experts {
+            let recipes = if external_experts || !binding_args.is_moe() {
                 BTreeMap::new()
             } else {
                 qwen_unit_recipes(store, &binding_args, index)?
@@ -1205,7 +1207,7 @@ fn load_neutral_qwen_parallel(
         parallel_info: Some(parallel_info),
         parallel_rank,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }
 
@@ -1334,7 +1336,7 @@ pub(crate) fn load_qwen_gguf_model(
     };
     let mut model = model;
     if let Some(options) = expert_options {
-        attach_qwen_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_qwen_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -1373,9 +1375,9 @@ impl QwenPipelineBindings {
         index: usize,
         layer: &mut MlxModule<NeutralBlock>,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<(), Error> {
         if let (Some(assignment), eredu_architectures::qwen::FeedForward::Routed(moe)) =
@@ -1384,7 +1386,7 @@ impl QwenPipelineBindings {
             let plan = realization.ok_or_else(|| {
                 Error::Parallel("Qwen expert assignment has no architecture realization".into())
             })?;
-            if assignment.local_global_expert_ids() != plan.local_global_expert_ids() {
+            if assignment.local_global_group_indices() != plan.local_global_group_indices() {
                 return Err(Error::Parallel(
                     "Qwen native assignment disagrees with architecture realization".into(),
                 ));
@@ -1398,7 +1400,7 @@ impl QwenPipelineBindings {
                     ))
                 })?;
             moe.experts =
-                <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(spec, stream)
+                <MlxNeuralBackend as GroupedNeuralBackend>::grouped_gated_product(spec, stream)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
         }
         Ok(())
@@ -1412,7 +1414,7 @@ impl QwenPipelineBindings {
         index: usize,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
@@ -1430,7 +1432,7 @@ impl QwenPipelineBindings {
             .map_err(|error| Error::Parallel(error.to_string()))?,
             ParameterRole::ExpertIntermediate,
         );
-        let recipes = if self.external_experts {
+        let recipes = if self.external_experts || !architecture.args().is_moe() {
             BTreeMap::new()
         } else {
             qwen_unit_recipes(store, architecture.args(), index)?
@@ -1453,7 +1455,7 @@ impl QwenPipelineBindings {
                     store,
                     architecture.args(),
                     index,
-                    assignment.local_global_expert_ids(),
+                    assignment.local_global_group_indices(),
                 )
                 .map_err(Error::ArchitectureModel)?,
             )?,
@@ -1468,9 +1470,9 @@ impl QwenPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
                 "Qwen has no architecture expert realization".into(),
@@ -1478,10 +1480,8 @@ impl QwenPipelineBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
-                    plan,
-                )
-                .map(Some)
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
+                    .map(Some)
             }
         }
     }
@@ -1504,7 +1504,7 @@ impl QwenPipelineBindings {
             .map_err(|error| Error::Parallel(error.to_string()))?,
             ParameterRole::ExpertIntermediate,
         );
-        let recipes = if self.external_experts {
+        let recipes = if self.external_experts || !architecture.args().is_moe() {
             BTreeMap::new()
         } else {
             qwen_unit_recipes(store, architecture.args(), index)?

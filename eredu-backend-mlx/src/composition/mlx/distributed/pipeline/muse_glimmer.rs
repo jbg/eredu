@@ -1,5 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::runtime::distributed::Group;
 use eredu_architectures::{muse_glimmer as muse_glimmer_arch, ModelKind};
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
@@ -18,29 +20,20 @@ use crate::{
             checkpoint::{
                 binding::populate_module_from_lease, quantization::should_quantize_on_load,
             },
-            distributed::{
-                completion::synchronize_outputs,
-                expert::{
-                    dispatch_local_with, dispatch_replicated_with, ExpertAssignment,
-                    RoutingStatistics,
-                },
-                parallel::ParallelExecutionContext,
-            },
+            distributed::{completion::synchronize_outputs, parallel::ParallelExecutionContext},
             execution::layerwise::PipelineStageQuantizationSelection,
-            residency::{
-                expert_cache::ExpertCache,
-                expert_provider::{
-                    GatedProductExpertExecution, GatedProductExpertExecutorProvider,
-                },
-            },
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
+    },
+    composition::expert_dispatch::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_group_by_id, architecture_group_unit_count,
         architecture_parallel_layout, architecture_parameter_unit_owner,
-        architecture_partition_range, base_info, build_pipeline_expert_cache,
-        build_pipeline_layer_storage, checkpoint_backing_shards,
+        architecture_partition_range, base_info, build_pipeline_layer_storage,
+        build_pipeline_parameter_bank, checkpoint_backing_shards,
         execute_routed_layered_partition_observed, load_architecture_static_parameters,
         media_architecture_transport, pipeline_binding_units, preflight_pipeline_realization,
         quantize_pipeline_stage_store, validate_admitted_pipeline_kind,
@@ -86,7 +79,7 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 }
@@ -321,12 +314,12 @@ pub(super) fn load_muse_glimmer_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::MuseGlimmer], "Muse-Glimmer")?;
-    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         MuseGlimmerPipelineBindings::new_external_experts()
     } else {
@@ -474,7 +467,7 @@ pub(super) fn load_muse_glimmer_pipeline(
                 )
             })?)?;
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
         stage.expert_assignment = Some(assignment);
         stage.expert_storage = PipelineExpertStorage::ExternalEmpty;
     }
@@ -624,7 +617,7 @@ pub(super) fn load_muse_glimmer_pipeline(
         let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 &[eredu_runtime::ParameterRole::ExpertIntermediate]
             } else {
                 &[]
@@ -694,17 +687,17 @@ pub(super) fn load_muse_glimmer_pipeline(
             store.as_ref(),
             parallel_layout.as_ref(),
         )?;
-        let cache = build_pipeline_expert_cache(
+        let cache = build_pipeline_parameter_bank(
             Arc::clone(&store),
             entries,
-            expert_cache_options,
+            parameter_bank_options,
             expert_quantization,
             weights_stream,
             stream,
         )?;
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
-            .checked_add(cache.report()?.owned_bytes)
+            .checked_add(cache.report()?.owned_bytes())
             .ok_or_else(|| Error::Parallel("Muse-Glimmer expert bytes overflowed".into()))?;
         stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
     }
@@ -965,14 +958,14 @@ impl MuseGlimmerPipelinePartition {
             caches,
         )?;
         let assignment = self.expert_assignment.clone();
-        let expert_cache = self.expert_storage.cache();
+        let parameter_bank = self.expert_storage.cache();
         if let Some(assignment) = assignment.as_ref() {
             validate_pipeline_expert_dispatch(
                 assignment,
                 expert_group,
                 self.expert_storage.is_external(),
             )?;
-        } else if expert_group.is_some() || expert_cache.is_some() {
+        } else if expert_group.is_some() || parameter_bank.is_some() {
             return Err(Error::Parallel(
                 "Muse-Glimmer stage has expert transport without an ownership assignment".into(),
             ));
@@ -984,19 +977,19 @@ impl MuseGlimmerPipelinePartition {
         };
         self.routing_statistics = RoutingStatistics::default();
         let decoder_range = self.range();
-        if let Some(expert_cache) = expert_cache {
+        if let Some(parameter_bank) = parameter_bank {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Muse-Glimmer external experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, stream: &Stream| {
                 execute_pipeline_cached_muse_glimmer(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -1005,7 +998,7 @@ impl MuseGlimmerPipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -1046,20 +1039,20 @@ impl MuseGlimmerPipelinePartition {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_muse_glimmer(
-    spec: &eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GroupedGatedProductSpec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
@@ -1072,9 +1065,15 @@ fn execute_pipeline_cached_muse_glimmer(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     Ok(returned.reduced_output)

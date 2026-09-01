@@ -167,11 +167,6 @@ impl<'a> ParallelCommunicators<'a> {
     pub fn pipeline_group(&self) -> Option<&Group> {
         self.group(ParallelAxis::Pipeline)
     }
-
-    /// Returns the EP exchange group, or `None` when EP is inactive.
-    pub fn expert_group(&self) -> Option<&Group> {
-        self.group(ParallelAxis::Expert)
-    }
 }
 
 fn logical_stage_axis_routes(

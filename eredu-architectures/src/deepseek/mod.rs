@@ -45,12 +45,9 @@ pub use config::{
 pub fn v3_expert_realization_plan<B>(
     architecture: &v3::Model<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<
-    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
-    eredu_nn::Error,
->
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 where
-    B: eredu_nn::RoutedNeuralBackend + eredu_nn::BlockwiseAttentionBackend,
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::BlockwiseAttentionBackend,
 {
     let args = architecture.args();
     let global_experts =
@@ -107,9 +104,9 @@ where
 pub fn v4_expert_realization_plan<B>(
     architecture: &v4::Model<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>, eredu_nn::Error>
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error>
 where
-    B: eredu_nn::HyperNeuralBackend + eredu_nn::RoutedNeuralBackend,
+    B: eredu_nn::HyperNeuralBackend + eredu_nn::GroupedNeuralBackend,
 {
     let args = architecture.args();
     let global_experts =

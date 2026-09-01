@@ -31,8 +31,8 @@ pub use parallel::{
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, NormalizationOperator,
-    RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
+    NormalizationOperator, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
@@ -53,13 +53,13 @@ pub struct ForwardContext<T> {
 }
 
 /// Shared layered LFM2 lifecycle over a heterogeneous physical schedule.
-pub struct LayeredModel<B: RoutedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend> {
     args: ModelArgs,
     decoder: HybridDecoder<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -113,7 +113,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
@@ -515,7 +515,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -643,7 +643,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -714,7 +714,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -799,7 +799,7 @@ where
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -845,7 +845,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

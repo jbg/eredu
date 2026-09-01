@@ -1,7 +1,7 @@
 //! Shared pre-normalized residual block specialized to GPT-OSS routed experts.
 
 use eredu_nn::{
-    AttentionCache, Error, NormalizationConstructionSpec, ParameterSpec, RoutedNeuralBackend,
+    AttentionCache, Error, GroupedNeuralBackend, NormalizationConstructionSpec, ParameterSpec,
     Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider};
@@ -18,7 +18,7 @@ pub struct GptOssBlockFactory;
 
 impl<B> BlockFactory<B, ModelArgs> for GptOssBlockFactory
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     type FeedForward = RoutedMlp<B>;
 
@@ -62,7 +62,7 @@ where
 }
 
 /// Builds one unloaded global GPT-OSS decoder layer.
-pub fn new_block<B: RoutedNeuralBackend>(
+pub fn new_block<B: GroupedNeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
@@ -79,7 +79,7 @@ pub fn forward_with_provider<B, C, P>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     C: AttentionCache<B::Tensor>,
     P: RoutedExpertProvider<B>,
     P::Error: std::fmt::Display,
@@ -99,7 +99,7 @@ pub fn forward_parallel_with_provider<B, C, P>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     C: AttentionCache<B::Tensor>,
     P: RoutedExpertProvider<B>,
     P::Error: std::fmt::Display,

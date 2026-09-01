@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, Index, LinearOperator,
-    NormalizationOperator, Parameterized, RotaryPosition, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
+    LinearOperator, NormalizationOperator, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
@@ -69,7 +69,7 @@ fn text_static_parameter_ownership(
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -261,7 +261,7 @@ mod ownership_tests {
 /// Pinned text and native media modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: RoutedNeuralBackend> {
+pub struct StaticModules<B: GroupedNeuralBackend> {
     /// Main token embedding table and final text projections.
     pub text: model_text::StaticTextModules<B>,
     /// Optional pinned image phases.
@@ -316,7 +316,7 @@ enum PreparedPart<T> {
 /// A streamable image, audio, or decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: RoutedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend> {
     /// Vision encoder block.
     Vision(VisionLayer<B>),
     /// Audio encoder block.
@@ -327,7 +327,7 @@ pub enum Unit<B: RoutedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -360,7 +360,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -511,13 +511,13 @@ impl<T> TextBoundary<T> {
 }
 
 /// One Gemma architecture used by resident, layerwise, and streamed runtimes.
-pub struct LayeredModel<B: RoutedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend> {
     args: FamilyConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<LocalGeometry>,
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -614,7 +614,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     /// Executes one media unit for a continuation request whose primary
     /// layered forward context lives on another pipeline owner.
     pub fn forward_partition_media_continuation(
@@ -1690,7 +1690,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -2172,7 +2172,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -2380,8 +2380,8 @@ fn slice_component<T: Tensor>(
 // media without changing their stable parameter identities.
 pub(crate) mod model_text {
     use eredu_nn::{
-        EmbeddingSpec, Error, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-        ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
+        EmbeddingSpec, Error, GroupedNeuralBackend, LinearOperator, LinearSpec,
+        NormalizationConstructionSpec, ParameterSpec, Parameterized, Tensor,
     };
 
     use super::super::ModelArgs;
@@ -2389,7 +2389,7 @@ pub(crate) mod model_text {
     /// Pinned Gemma text modules.
     #[derive(Debug, Clone, Parameterized)]
     #[parameterized(tensor = "B::Tensor")]
-    pub struct StaticTextModules<B: RoutedNeuralBackend> {
+    pub struct StaticTextModules<B: GroupedNeuralBackend> {
         /// Main token embedding table.
         pub embeddings: B::Embedding,
         /// Optional per-layer token identity table.
@@ -2404,7 +2404,7 @@ pub(crate) mod model_text {
         pub head: Option<B::Linear>,
     }
 
-    impl<B: RoutedNeuralBackend> StaticTextModules<B> {
+    impl<B: GroupedNeuralBackend> StaticTextModules<B> {
         pub(super) fn new(
             args: &ModelArgs,
             context: &<B::Tensor as Tensor>::Context,
@@ -2636,7 +2636,7 @@ pub(crate) mod model_text {
         }
     }
 
-    pub(super) fn args_cap<B: RoutedNeuralBackend>(
+    pub(super) fn args_cap<B: GroupedNeuralBackend>(
         logits: B::Tensor,
         cap: Option<f32>,
         context: &<B::Tensor as Tensor>::Context,

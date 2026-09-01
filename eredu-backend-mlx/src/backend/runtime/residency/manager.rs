@@ -406,9 +406,9 @@ impl ResidencyManager {
         self.acquire_with_demand(id, tier, 1)
     }
 
-    /// Ensures residency and records route-weighted demand for eviction policy.
+    /// Ensures residency and records weighted demand for eviction policy.
     ///
-    /// `demand` may be larger than one when duplicate routed-expert requests
+    /// `demand` may be larger than one when duplicate entry requests
     /// share a single acquisition. Frequency counters saturate on overflow.
     pub fn acquire_with_demand(
         &self,
@@ -421,7 +421,7 @@ impl ResidencyManager {
             .ok_or(ResidencyError::StatePoisoned)
     }
 
-    /// Acquires a deterministic expert set with one batched residency transition.
+    /// Acquires a deterministic entry set with one batched residency transition.
     ///
     /// Missing copies reserve capacity before any materialization starts. All
     /// requested units are protected from eviction, all lazy outputs are
@@ -1125,7 +1125,7 @@ fn ensure_many_resident(
                             ) =>
                     {
                         // Earlier units in this batch can pin the only cached
-                        // shard while a later cross-shard expert is prepared.
+                        // shard while a later cross-shard entry is prepared.
                         // Their output arrays are complete evaluation roots, so
                         // detach those leases and retry the current unit.
                         eval(prepared.iter().flat_map(|(_, item)| item.arrays.values())).map_err(

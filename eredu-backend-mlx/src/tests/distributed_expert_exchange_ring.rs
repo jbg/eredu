@@ -10,14 +10,14 @@ use std::{
 
 use crate::{
     backend::error::Error,
-    backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
-    backend::runtime::{
-        distributed::expert::{
-            dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
-            AllToAllVPlan, DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport,
-            ShardedRouteBlocks,
-        },
-        residency::expert_cache::{ExpertCache, ExpertCatalogEntry, ExpertRouteBatch},
+    backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
+    backend::runtime::residency::parameter_bank::{
+        AddressableParameterBank, BankAccessClass, ParameterBankEntry, ParameterBankKey,
+        ParameterBankSelection,
+    },
+    composition::expert_dispatch::{
+        dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
+        DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
     },
     module::PhysicalParam,
 };
@@ -71,7 +71,7 @@ fn assert_f32_close(actual: &Array, expected: &[f32]) {
 }
 
 fn full_dispatch_blocks(rank: usize, stream: &Stream) -> ShardedRouteBlocks {
-    let (hidden, global_expert_ids, original_route_indices, weights) = if rank == 0 {
+    let (hidden, global_group_indices, original_route_indices, weights) = if rank == 0 {
         (
             [vec![2.0, 1.0], vec![1.0, 2.0]],
             [vec![1, 0], vec![3, 2]],
@@ -91,7 +91,7 @@ fn full_dispatch_blocks(rank: usize, stream: &Stream) -> ShardedRouteBlocks {
             .iter()
             .map(|values| f32_array(values, &[2, 1], stream))
             .collect(),
-        global_expert_ids: global_expert_ids
+        global_group_indices: global_group_indices
             .iter()
             .map(|values| i32_array(values, &[2], stream))
             .collect(),
@@ -108,8 +108,8 @@ fn full_dispatch_blocks(rank: usize, stream: &Stream) -> ShardedRouteBlocks {
     }
 }
 
-fn relu2_bank(stream: &Stream) -> PackedRelu2Experts {
-    let mut bank = PackedRelu2Experts::new(2, 1, 1, [None, None], stream).unwrap();
+fn relu2_bank(stream: &Stream) -> PackedRelu2Groups {
+    let mut bank = PackedRelu2Groups::new(2, 1, 1, [None, None], stream).unwrap();
     bank.up_proj = PhysicalParam::new(f32_array(&[1.0, 2.0], &[2, 1, 1], stream));
     bank.down_proj = PhysicalParam::new(f32_array(&[1.0, 10.0], &[2, 1, 1], stream));
     bank
@@ -121,13 +121,13 @@ impl LocalExpertBank for ScaledGatedProductExperts {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
-        local_expert_ids: &Array,
+        local_group_indices: &Array,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let shape = hidden.shape().to_vec();
-        eval([hidden, local_expert_ids])?;
+        eval([hidden, local_group_indices])?;
         let hidden = hidden.evaluated()?;
-        let ids = local_expert_ids.evaluated()?;
+        let ids = local_group_indices.evaluated()?;
         let values = hidden.as_slice::<f32>();
         let ids = ids.as_slice::<i32>();
         let output = values
@@ -152,25 +152,29 @@ fn scaled_route_output(hidden: f32, local_expert: usize, weight: f32) -> f32 {
 }
 
 fn execute_cached_qwen_routes(
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
+    let access = match pass {
+        ExpertPass::Prefill => BankAccessClass::Bulk,
+        ExpertPass::Decode => BankAccessClass::Incremental,
+    };
+    Ok(cache.execute_selections_bounded(
+        ParameterBankSelection::new(
             0,
             &routes.hidden,
-            &routes.global_expert_ids,
+            &routes.global_group_indices,
             &routes.weights,
-            pass,
+            access,
         ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
-            let mut bank = PackedGatedProductExperts {
+            let mut bank = PackedGatedProductGroups {
                 policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                num_experts: acquired.identities().len() as i32,
+                group_count: acquired.identities().len() as i32,
                 hidden_dim: 1,
                 intermediate_dim: 1,
                 gate_up_affine: None,
@@ -187,11 +191,11 @@ fn execute_cached_qwen_routes(
                 down_proj_scales: PhysicalParam::new(None),
                 down_proj_biases: PhysicalParam::new(None),
             };
-            cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
-            let compact_routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
+            cache.record_compact_bank(access, acquired.scratch_bytes(), started.elapsed())?;
+            let compact_selections = acquired.compact_selections().reshape(&[-1, 1], stream)?;
             let unit_weights =
                 safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, &compact_routes, &unit_weights, stream)?)
+            Ok(bank.forward(hidden, &compact_selections, &unit_weights, stream)?)
         },
     )?)
 }
@@ -275,7 +279,7 @@ fn expert_exchange_ring_worker() {
     let empty_blocks = if expected_rank == 0 {
         ShardedRouteBlocks {
             hidden: vec![empty_hidden.clone(), empty_hidden.clone()],
-            global_expert_ids: vec![empty_i32.clone(), empty_i32.clone()],
+            global_group_indices: vec![empty_i32.clone(), empty_i32.clone()],
             original_route_indices: vec![empty_i32.clone(), empty_i32.clone()],
             weights: vec![empty_f32.clone(), empty_f32.clone()],
             top_k: 2,
@@ -284,7 +288,7 @@ fn expert_exchange_ring_worker() {
     } else {
         ShardedRouteBlocks {
             hidden: vec![empty_hidden, f32_array(&[2.0], &[1, 1], &stream)],
-            global_expert_ids: vec![empty_i32.clone(), i32_array(&[2], &[1], &stream)],
+            global_group_indices: vec![empty_i32.clone(), i32_array(&[2], &[1], &stream)],
             original_route_indices: vec![empty_i32, i32_array(&[1], &[1], &stream)],
             weights: vec![empty_f32, f32_array(&[0.5], &[1], &stream)],
             top_k: 2,
@@ -340,9 +344,9 @@ fn expert_exchange_ring_worker() {
     let qwen_hidden = f32_array(&[1.0, 2.0], &[2, 1], &stream);
     let qwen_ids = i32_array(&[0, 1, 2, 3], &[2, 2], &stream);
     let qwen_weights = f32_array(&[0.25, 0.75, 0.4, 0.6], &[2, 2], &stream);
-    let mut full_qwen = PackedGatedProductExperts {
+    let mut full_qwen = PackedGatedProductGroups {
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        num_experts: 4,
+        group_count: 4,
         hidden_dim: 1,
         intermediate_dim: 1,
         gate_up_affine: None,
@@ -366,7 +370,7 @@ fn expert_exchange_ring_worker() {
     let store =
         Arc::new(SafetensorsWeightStore::open(std::env::var_os(PAYLOAD_FILE).unwrap()).unwrap());
     let entries = qwen_assignment
-        .local_global_expert_ids()
+        .local_global_group_indices()
         .iter()
         .copied()
         .map(|expert| {
@@ -395,11 +399,12 @@ fn expert_exchange_ring_worker() {
                 )
                 .unwrap(),
             ];
-            let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
-            ExpertCatalogEntry::new(identity, unit, 12).unwrap()
+            let key = ParameterBankKey::new(identity.layer, identity.global_expert);
+            let unit = OffloadUnit::new(key.unit_id(), bindings).unwrap();
+            ParameterBankEntry::new(key, unit, 12).unwrap()
         })
         .collect::<Vec<_>>();
-    let cache = ExpertCache::new(
+    let cache = AddressableParameterBank::new(
         store,
         entries,
         ExpertCacheLoadOptions::new(OffloadConfig::new(Some(24), Some(24), 1).unwrap(), 24, 24)
@@ -440,10 +445,10 @@ fn expert_exchange_ring_worker() {
         expected_qwen.as_slice::<f32>(),
     );
     let report = cache.report().unwrap();
-    assert_eq!(report.owned_experts, 2);
-    assert_eq!(report.prefill.distinct_experts, 2);
-    assert_eq!(report.decode.distinct_experts, 2);
-    assert_eq!(report.decode.device.hits, 2);
+    assert_eq!(report.owned_entries(), 2);
+    assert_eq!(report.bulk().distinct_entries(), 2);
+    assert_eq!(report.incremental().distinct_entries(), 2);
+    assert_eq!(report.incremental().device().hits(), 2);
 }
 
 struct ChildGuard(Vec<Child>);

@@ -2,8 +2,8 @@
 
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, Index, LinearOperator,
-    NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
+    LinearOperator, NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
@@ -37,7 +37,7 @@ enum PreparedPart<T> {
 /// Pinned hybrid text and shared-vision modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct ConditionalStaticModules<B: RoutedNeuralBackend> {
+pub struct ConditionalStaticModules<B: GroupedNeuralBackend> {
     /// Hybrid token embedding, final normalization, and vocabulary head.
     pub text: crate::decoder::StaticModules<B>,
     /// Shared Qwen patch, position, and merger modules.
@@ -47,7 +47,7 @@ pub struct ConditionalStaticModules<B: RoutedNeuralBackend> {
 /// One conditional vision, target-text, or MTP unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum ConditionalUnit<B: RoutedNeuralBackend> {
+pub enum ConditionalUnit<B: GroupedNeuralBackend> {
     /// Shared vision block.
     Vision(VisionBlock<B>),
     /// Hybrid recurrent/full-attention target block.
@@ -58,7 +58,7 @@ pub enum ConditionalUnit<B: RoutedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -91,7 +91,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -326,7 +326,7 @@ impl<T> ConditionalForwardContext<T> {
 }
 
 /// One neutral conditional Qwen3.5 graph.
-pub struct ConditionalLayeredModel<B: RoutedNeuralBackend> {
+pub struct ConditionalLayeredModel<B: GroupedNeuralBackend> {
     parsed: ParsedHybridConfig,
     static_modules: ConditionalStaticModules<B>,
     target_layers: usize,
@@ -334,7 +334,7 @@ pub struct ConditionalLayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<ConditionalLocalGeometry>>,
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
     for ConditionalLayeredModel<B>
 {
     type DefinitionError = Error;
@@ -401,7 +401,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
     }
 }
 
-impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
+impl<B: GroupedNeuralBackend> ConditionalLayeredModel<B> {
     #[allow(clippy::too_many_arguments)]
     fn begin_distributed_partition<S>(
         &mut self,
@@ -1437,7 +1437,7 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1846,7 +1846,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -2082,7 +2082,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

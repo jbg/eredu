@@ -2,10 +2,11 @@
 
 use eredu_nn::{
     AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator, Parameter,
-    ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
-    RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductOperator,
+    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
+    RotaryOperator, RotaryPosition, RotarySpec, Tensor, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -16,7 +17,7 @@ use super::{DecoderConfig, LocalGeometry, WeightConvention};
 /// RMS normalization whose checkpoint scale may store `(scale - 1)`.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct CenteredRmsNorm<B: RoutedNeuralBackend> {
+pub struct CenteredRmsNorm<B: GroupedNeuralBackend> {
     /// Stored scale parameter.
     pub weight: Parameter<B::Tensor>,
     #[parameter(skip)]
@@ -27,7 +28,7 @@ pub struct CenteredRmsNorm<B: RoutedNeuralBackend> {
     effective_scale: Option<B::Tensor>,
 }
 
-impl<B: RoutedNeuralBackend> CenteredRmsNorm<B> {
+impl<B: GroupedNeuralBackend> CenteredRmsNorm<B> {
     fn new(
         dimensions: i32,
         epsilon: f32,
@@ -72,7 +73,7 @@ impl<B: RoutedNeuralBackend> CenteredRmsNorm<B> {
 /// Gated grouped-query attention with per-layer RoPE/NoPE policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Attention<B: RoutedNeuralBackend> {
+pub struct Attention<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     query_heads: i32,
     #[parameter(skip)]
@@ -107,7 +108,7 @@ pub struct Attention<B: RoutedNeuralBackend> {
     pub rotary: B::Rotary,
 }
 
-impl<B: RoutedNeuralBackend> Attention<B> {
+impl<B: GroupedNeuralBackend> Attention<B> {
     /// Builds one unloaded scheduled attention unit.
     pub fn new(
         args: &DecoderConfig,
@@ -318,7 +319,7 @@ impl<B: RoutedNeuralBackend> Attention<B> {
 /// Dense SwiGLU branch.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Mlp<B: RoutedNeuralBackend> {
+pub struct Mlp<B: GroupedNeuralBackend> {
     /// Gate projection.
     pub gate: B::Linear,
     /// Up projection.
@@ -327,7 +328,7 @@ pub struct Mlp<B: RoutedNeuralBackend> {
     pub down: B::Linear,
 }
 
-impl<B: RoutedNeuralBackend> Mlp<B> {
+impl<B: GroupedNeuralBackend> Mlp<B> {
     fn new(
         args: &DecoderConfig,
         layer: usize,
@@ -384,16 +385,16 @@ impl<B: RoutedNeuralBackend> Mlp<B> {
 /// Softmax top-k routed gated-product branch used by Muse-Glimmer MoE checkpoints.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMoe<B: RoutedNeuralBackend> {
+pub struct SparseMoe<B: GroupedNeuralBackend> {
     /// Learned softmax router.
-    pub router: B::Router,
+    pub router: B::Selector,
     /// Packed routed expert bank.
-    pub experts: B::GatedProductExpertBank,
+    pub experts: B::GatedProductGroups,
     #[parameter(skip)]
     hidden_size: i32,
 }
 
-impl<B: RoutedNeuralBackend> SparseMoe<B> {
+impl<B: GroupedNeuralBackend> SparseMoe<B> {
     fn new(
         args: &DecoderConfig,
         layer: usize,
@@ -401,29 +402,25 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
     ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.mlp");
         Ok(Self {
-            router: B::top_k_router(
-                TopKRouterSpec {
-                    input_dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(format!("{prefix}.gate.weight"))
+            router: B::top_k_group_selector(
+                TopKGroupSelectorSpec::new(
+                    args.hidden_size,
+                    ParameterSpec::trainable(format!("{prefix}.gate.weight"))
                         .map_err(Error::backend)?,
-                    bias: None,
-                    correction_bias: None,
-                    input_transform: None,
-                    route_scale: None,
-                    format: crate::linear_format::standard_linear_format(
+                    crate::linear_format::standard_linear_format(
                         &format!("{prefix}.gate.weight"),
                         args.linear_format_for(&format!("{prefix}.gate.weight")),
                     )?,
-                    routing: TopKRoutingSpec::new(
+                    TopKGroupSelectionSpec::new(
                         args.num_experts,
                         args.num_experts_per_tok,
-                        RoutingScoring::Softmax,
+                        GroupScoring::Softmax,
                         args.norm_topk_prob,
                     )?,
-                },
+                )?,
                 context,
             )?,
-            experts: B::gated_product_expert_bank(expert_bank_spec(args, layer)?, context)?,
+            experts: B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?,
             hidden_size: args.hidden_size,
         })
     }
@@ -438,9 +435,9 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         }
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
-        let routes = self.router.route(&flat, context)?;
+        let routes = self.router.select(&flat, context)?;
         self.experts
-            .forward_routed(&flat, &routes, context)?
+            .forward_grouped(&flat, &routes, context)?
             .reshape(&shape, context)
     }
 
@@ -455,9 +452,9 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         }
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
-        let routes = self.router.route(&flat, context)?;
+        let routes = self.router.select(&flat, context)?;
         eredu_runtime::reduce_tensor_parallel_expert_output::<B>(
-            self.experts.forward_routed_tensor_parallel(
+            self.experts.forward_grouped_tensor_parallel(
                 &flat,
                 &routes,
                 B::parallel_size(parallel),
@@ -486,9 +483,9 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         }
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
-        let routes = self.router.route(&flat, context)?;
+        let routes = self.router.select(&flat, context)?;
         provider
-            .forward_routed(
+            .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer,
@@ -520,9 +517,9 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         }
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
-        let routes = self.router.route(&flat, context)?;
+        let routes = self.router.select(&flat, context)?;
         let output = provider
-            .forward_routed_tensor_parallel(
+            .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer,
@@ -544,21 +541,21 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
 pub fn expert_bank_spec(
     args: &DecoderConfig,
     layer: usize,
-) -> Result<GatedProductExpertBankSpec, Error> {
+) -> Result<GroupedGatedProductSpec, Error> {
     let prefix = format!("model.layers.{layer}.mlp.experts");
     let gate_up = format!("{prefix}.gate_up_proj");
     let down = format!("{prefix}.down_proj");
-    Ok(GatedProductExpertBankSpec {
-        expert_count: args.num_experts,
-        input_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size,
-        output_dimensions: args.hidden_size,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        layout: GatedProductExpertLayout::Packed {
+    GroupedGatedProductSpec::new(
+        args.num_experts,
+        args.hidden_size,
+        args.moe_intermediate_size,
+        args.hidden_size,
+        eredu_nn::GatedProductPolicy::ordinary_silu(),
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(&gate_up, None, args.linear_format_for(&gate_up))?,
             down: standard_expert_projection(&down, None, args.linear_format_for(&down))?,
         },
-    })
+    )
 }
 
 /// Returns the same architecture-owned bank at placement-resolved geometry.
@@ -567,25 +564,21 @@ pub(crate) fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<GatedProductExpertBankSpec, Error> {
-    let mut spec = expert_bank_spec(args, layer)?;
-    spec.expert_count = expert_count;
-    spec.intermediate_dimensions = intermediate_dimensions;
-    spec.validate()?;
-    Ok(spec)
+) -> Result<GroupedGatedProductSpec, Error> {
+    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
 /// Dense or routed feed-forward branch selected by normalized checkpoint geometry.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: RoutedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend> {
     /// Dense SwiGLU branch.
     Dense(Mlp<B>),
     /// Softmax top-k routed gated-product branch.
     Sparse(SparseMoe<B>),
 }
 
-impl<B: RoutedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend> FeedForward<B> {
     fn new(
         args: &DecoderConfig,
         layer: usize,
@@ -665,7 +658,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
 /// One post-normalized decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct TransformerBlock<B: RoutedNeuralBackend> {
+pub struct TransformerBlock<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Gated self-attention.
@@ -682,7 +675,7 @@ pub struct TransformerBlock<B: RoutedNeuralBackend> {
     pub post_feed_forward_norm: CenteredRmsNorm<B>,
 }
 
-impl<B: RoutedNeuralBackend> TransformerBlock<B> {
+impl<B: GroupedNeuralBackend> TransformerBlock<B> {
     /// Builds one unloaded block.
     pub fn new(
         args: &DecoderConfig,
@@ -831,7 +824,7 @@ impl<B: RoutedNeuralBackend> TransformerBlock<B> {
 /// Pinned token embedding, final norm, and tied/untied vocabulary head.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: RoutedNeuralBackend> {
+pub struct StaticModules<B: GroupedNeuralBackend> {
     /// Token table.
     pub embeddings: B::Embedding,
     /// Final learned RMS norm.
@@ -846,7 +839,7 @@ pub struct StaticModules<B: RoutedNeuralBackend> {
     logit_cap: f32,
 }
 
-impl<B: RoutedNeuralBackend> StaticModules<B> {
+impl<B: GroupedNeuralBackend> StaticModules<B> {
     /// Builds pinned modules.
     pub fn new(
         args: &DecoderConfig,

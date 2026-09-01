@@ -27,7 +27,8 @@ use super::{
 };
 use crate::{
     backend::runtime::{
-        execution::layerwise::LayerwiseModelError, residency::expert_cache::ExpertCacheReport,
+        execution::layerwise::LayerwiseModelError,
+        residency::parameter_bank::ParameterBankResidencyReport,
     },
     backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
 };
@@ -608,16 +609,16 @@ pub fn residency_telemetry(report: &ResidencyReport) -> ResidencyTelemetry {
 }
 
 /// Converts an MLX routed-expert cache snapshot into neutral telemetry.
-pub fn expert_cache_telemetry(report: &ExpertCacheReport) -> ExpertCacheTelemetry {
+pub fn parameter_bank_telemetry(report: &ParameterBankResidencyReport) -> ExpertCacheTelemetry {
     ExpertCacheTelemetry {
-        owned_experts: report.owned_experts,
-        owned_bytes: report.owned_bytes,
-        host_resident_experts: report.host_resident_experts,
-        device_resident_experts: report.device_resident_experts,
-        host_resident_bytes: report.host_resident_bytes,
-        device_resident_bytes: report.device_resident_bytes,
-        peak_host_resident_bytes: report.peak_host_resident_bytes,
-        peak_device_resident_bytes: report.peak_device_resident_bytes,
+        owned_experts: report.owned_entries(),
+        owned_bytes: report.owned_bytes(),
+        host_resident_experts: report.host_resident_entries(),
+        device_resident_experts: report.device_resident_entries(),
+        host_resident_bytes: report.host_resident_bytes(),
+        device_resident_bytes: report.device_resident_bytes(),
+        peak_host_resident_bytes: report.peak_host_resident_bytes(),
+        peak_device_resident_bytes: report.peak_device_resident_bytes(),
     }
 }
 

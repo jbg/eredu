@@ -1,6 +1,6 @@
 //! Semantic placement and rank-local geometry for Nemotron-H physical units.
 
-use eredu_nn::{RoutedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     partitioned_projection_group, LocalModelLayout, MemberSharding, ParallelPlanError,
@@ -427,7 +427,7 @@ pub fn local_geometry(
 }
 
 /// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = vec![
@@ -471,7 +471,7 @@ pub fn static_parallel_parameter_groups<B: RoutedNeuralBackend>(
     Ok(groups)
 }
 
-fn dense_groups<B: RoutedNeuralBackend>(
+fn dense_groups<B: GroupedNeuralBackend>(
     root: &str,
     mlp: &DenseMlp<B>,
     width: i32,
@@ -498,7 +498,7 @@ fn dense_groups<B: RoutedNeuralBackend>(
 }
 
 /// Declares semantic groups for one target physical block.
-pub fn layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
     block: &Block<B>,
     args: &ModelArgs,
     layer: usize,
@@ -507,7 +507,7 @@ pub fn layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
     block_parallel_parameter_groups(block, args, &root)
 }
 
-fn block_parallel_parameter_groups<B: RoutedNeuralBackend>(
+fn block_parallel_parameter_groups<B: GroupedNeuralBackend>(
     block: &Block<B>,
     args: &ModelArgs,
     root: &str,
@@ -643,7 +643,7 @@ fn block_parallel_parameter_groups<B: RoutedNeuralBackend>(
 }
 
 /// Declares semantic placement for one target or appended prediction unit.
-pub fn unit_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn unit_parallel_parameter_groups<B: GroupedNeuralBackend>(
     unit: &Unit<B>,
     args: &ModelArgs,
     flat: usize,
@@ -661,7 +661,7 @@ pub fn unit_parallel_parameter_groups<B: RoutedNeuralBackend>(
     }
 }
 
-fn prediction_parallel_parameter_groups<B: RoutedNeuralBackend>(
+fn prediction_parallel_parameter_groups<B: GroupedNeuralBackend>(
     unit: &PredictionUnit<B>,
     args: &ModelArgs,
     physical: usize,

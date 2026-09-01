@@ -8,10 +8,10 @@ use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
-    Error, FusedProjectionLayout, FusedProjectionSegment, GatedProductPolicy, Index,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    Error, FusedProjectionLayout, FusedProjectionSegment, GatedProductPolicy, GroupedNeuralBackend,
+    Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, Parameter, ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RotarySubspace, RoutedNeuralBackend, Tensor, VocabularyParallelRange,
+    RotarySubspace, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
@@ -2439,7 +2439,7 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
-pub trait RoutedFeedForwardOperator<B: RoutedNeuralBackend>: FeedForwardOperator<B> {
+pub trait RoutedFeedForwardOperator<B: GroupedNeuralBackend>: FeedForwardOperator<B> {
     /// Executes replicated dense or provider-backed routed work.
     fn forward_with_provider<P>(
         &mut self,
@@ -3386,7 +3386,7 @@ where
 
 impl<B, C, P, S> eredu_runtime::RoutedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: RoutedFeedForwardOperator<B>,
@@ -3434,7 +3434,7 @@ where
 
 impl<B, C, P, S> eredu_runtime::ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: RoutedFeedForwardOperator<B>,

@@ -19,24 +19,24 @@ use eredu_nn::{
     CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
     CompressedAttentionState, CompressedAttentionView, ConvolutionActivation,
     EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, FusedProjectionLayout,
-    FusedProjectionSegment, GatedDeltaScanInput, GatedDeltaScanOutput,
-    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    GatedProductPolicy, GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection,
+    FusedProjectionSegment, GatedDeltaScanInput, GatedDeltaScanOutput, GatedProductGroupLayout,
+    GatedProductPolicy, GatedShortConvolution, GatedShortConvolutionSpec, GroupSelection,
+    GroupSelectionOperator, GroupedGatedProductOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, GroupedRelu2Operator, GroupedRelu2Spec, HyperConnection,
     HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
-    JointExpertRoutingInput, JointExpertRoutingResult, LinearOperator, LinearSpec,
-    LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, PadMode, ParameterMetadata, ParameterSpec,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
-    RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
-    RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend, RoutingOperator,
-    RoutingResult, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TensorParallelExpertOutput, TopKRouterSpec, TopKRoutingSpec, VocabularyParallelRange,
+    JointGroupSelection, JointGroupSelectionInput, LinearOperator, LinearSpec, LowRankProjection,
+    LowRankProjectionSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
+    NormalizationScale, PadMode, ParameterMetadata, ParameterSpec, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
+    PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput, RotaryOperator,
+    RotaryPosition, RotarySpec, RotarySubspace, SelectiveStateSpaceScanInput,
+    SelectiveStateSpaceScanOutput, Tensor, TensorParallelGroupedOutput, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    ArchitectureParameters, CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress,
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook,
+    ArchitectureParameters, CollectiveBackend, CompositeLayeredTraversalHook, DeviceState,
+    ExecutionUnitAddress, ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook,
     LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
     MemberSharding, ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
     ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
@@ -2497,6 +2497,35 @@ impl SubmissionBackend for NumericBackend {
     }
 }
 
+impl CollectiveBackend for NumericBackend {
+    type Group = ();
+    type CollectiveError = std::convert::Infallible;
+
+    fn all_reduce(
+        value: Self::Tensor,
+        _: &Self::Group,
+        _: &Self::Executor,
+    ) -> Result<Self::Tensor, Self::CollectiveError> {
+        Ok(value)
+    }
+
+    fn all_gather(
+        value: Self::Tensor,
+        _: &Self::Group,
+        _: &Self::Executor,
+    ) -> Result<Self::Tensor, Self::CollectiveError> {
+        Ok(value)
+    }
+
+    fn all_to_all(
+        value: Self::Tensor,
+        _: &Self::Group,
+        _: &Self::Executor,
+    ) -> Result<Self::Tensor, Self::CollectiveError> {
+        Ok(value)
+    }
+}
+
 struct NumericBlockwiseAttention {
     queries: NumericTensor,
     scale: f32,
@@ -3072,6 +3101,7 @@ impl NeuralBackend for NumericBackend {
                 0.5 * value
                     * (1.0 + (0.797_884_6 * (value + 0.044_715 * value * value * value)).tanh())
             }),
+            _ => return Err(Error::backend("unsupported gated-product activation")),
         };
         gate.zip(&up, |left, right| left * right)
     }
@@ -3159,72 +3189,6 @@ impl NeuralBackend for NumericBackend {
             }
         }
         Ok(output)
-    }
-
-    fn joint_expert_routing(
-        input: JointExpertRoutingInput<'_, NumericTensor>,
-        _: &NumericContext,
-    ) -> Result<JointExpertRoutingResult<NumericTensor>, Error> {
-        input.validate()?;
-        let hidden = input.hidden.shape.last().copied().unwrap() as usize;
-        let tokens = input.hidden.data.len() / hidden;
-        let experts = input.weight.shape[0] as usize;
-        let routed = input.routed_experts as usize;
-        let shared = experts - routed;
-        let top_k = input.top_k as usize;
-        let global_scale = *input
-            .global_scale
-            .data
-            .first()
-            .ok_or_else(|| Error::backend("numeric global route scale is empty"))?;
-        let mut routed_ids = NumericTensor::zeros(vec![tokens as i32, input.top_k]);
-        let mut routed_weights = NumericTensor::zeros(vec![tokens as i32, input.top_k]);
-        let mut shared_weights = NumericTensor::zeros(vec![tokens as i32, shared as i32]);
-        for token in 0..tokens {
-            let logits = (0..experts)
-                .map(|expert| {
-                    (0..hidden)
-                        .map(|column| {
-                            input.hidden.data[token * hidden + column]
-                                * input.weight.data[expert * hidden + column]
-                        })
-                        .sum::<f32>()
-                })
-                .collect::<Vec<_>>();
-            let mut order = (0..routed).collect::<Vec<_>>();
-            order.sort_by(|left, right| {
-                let score = |expert: usize| {
-                    1.0 / (1.0 + (-logits[expert]).exp()) + input.correction_bias.data[expert]
-                };
-                score(*right)
-                    .total_cmp(&score(*left))
-                    .then_with(|| left.cmp(right))
-            });
-            order.truncate(top_k);
-            let mut selected = order
-                .iter()
-                .map(|expert| 1.0 / (1.0 + (-logits[*expert]).exp()))
-                .collect::<Vec<_>>();
-            selected.extend(
-                logits[routed..]
-                    .iter()
-                    .map(|logit| 1.0 / (1.0 + (-logit).exp())),
-            );
-            let denominator = selected.iter().sum::<f32>();
-            let scale = input.route_scale * global_scale / denominator;
-            for (slot, expert) in order.into_iter().enumerate() {
-                routed_ids.data[token * top_k + slot] = expert as f32;
-                routed_weights.data[token * top_k + slot] = selected[slot] * scale;
-            }
-            for expert in 0..shared {
-                shared_weights.data[token * shared + expert] = selected[top_k + expert] * scale;
-            }
-        }
-        Ok(JointExpertRoutingResult {
-            routed_ids,
-            routed_weights,
-            shared_weights,
-        })
     }
 
     fn indexed_attention(
@@ -3979,10 +3943,10 @@ fn select_pooled_positions(
 #[derive(Debug, Clone)]
 struct NumericRouter {
     linear: NumericLinear,
-    routing: TopKRoutingSpec,
+    selection: TopKGroupSelectionSpec,
     correction_bias: Option<(NumericTensor, ParameterMetadata)>,
     input_transform: Option<(f32, NumericTensor, ParameterMetadata, bool)>,
-    route_scale: Option<(NumericTensor, ParameterMetadata)>,
+    coefficient_scale: Option<(NumericTensor, ParameterMetadata)>,
 }
 
 impl Parameterized<NumericTensor> for NumericRouter {
@@ -3997,7 +3961,7 @@ impl Parameterized<NumericTensor> for NumericRouter {
         if let Some((_, value, metadata, _)) = &self.input_transform {
             visit(metadata, value, visitor);
         }
-        if let Some((value, metadata)) = &self.route_scale {
+        if let Some((value, metadata)) = &self.coefficient_scale {
             visit(metadata, value, visitor);
         }
     }
@@ -4013,7 +3977,7 @@ impl Parameterized<NumericTensor> for NumericRouter {
         if let Some((_, value, metadata, _)) = &mut self.input_transform {
             visit_mut(metadata, value, visitor);
         }
-        if let Some((value, metadata)) = &mut self.route_scale {
+        if let Some((value, metadata)) = &mut self.coefficient_scale {
             visit_mut(metadata, value, visitor);
         }
     }
@@ -4026,7 +3990,7 @@ impl Parameterized<NumericTensor> for NumericRouter {
         if let Some((_, _, metadata, _)) = &mut self.input_transform {
             metadata.trainable = trainable;
         }
-        if let Some((_, metadata)) = &mut self.route_scale {
+        if let Some((_, metadata)) = &mut self.coefficient_scale {
             metadata.trainable = trainable;
         }
     }
@@ -4056,25 +4020,25 @@ impl NumericRouter {
     }
 }
 
-impl RoutingOperator<NumericTensor> for NumericRouter {
-    fn route(
+impl GroupSelectionOperator<NumericTensor> for NumericRouter {
+    fn select(
         &mut self,
         input: &NumericTensor,
         context: &NumericContext,
-    ) -> Result<RoutingResult<NumericTensor>, Error> {
+    ) -> Result<GroupSelection<NumericTensor>, Error> {
         let input = self.transformed_input(input);
         let logits = self.linear.forward(&input, context)?;
-        let experts = self.routing.expert_count() as usize;
-        let top_k = self.routing.top_k() as usize;
+        let experts = self.selection.group_count() as usize;
+        let top_k = self.selection.top_k() as usize;
         let tokens = logits.data.len() / experts;
         let route_shape = vec![tokens as i32, top_k as i32];
-        let mut expert_ids = NumericTensor::zeros(route_shape.clone());
+        let mut group_indices = NumericTensor::zeros(route_shape.clone());
         let mut selected_scores = NumericTensor::zeros(route_shape.clone());
-        let mut route_weights = NumericTensor::zeros(route_shape);
+        let mut coefficients = NumericTensor::zeros(route_shape);
         for token in 0..tokens {
             let row = &logits.data[token * experts..(token + 1) * experts];
-            let scores: Vec<f32> = match self.routing.scoring() {
-                eredu_nn::RoutingScoring::Softmax => {
+            let scores: Vec<f32> = match self.selection.scoring() {
+                eredu_nn::GroupScoring::Softmax => {
                     let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                     let exponentials = row
                         .iter()
@@ -4083,15 +4047,16 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                     let sum = exponentials.iter().sum::<f32>();
                     exponentials.iter().map(|value| *value / sum).collect()
                 }
-                eredu_nn::RoutingScoring::SelectedSoftmax => row.to_vec(),
-                eredu_nn::RoutingScoring::Sigmoid => row
+                eredu_nn::GroupScoring::SelectedSoftmax => row.to_vec(),
+                eredu_nn::GroupScoring::Sigmoid => row
                     .iter()
                     .map(|value| 1.0 / (1.0 + (-value).exp()))
                     .collect(),
-                eredu_nn::RoutingScoring::SqrtSoftplus => row
+                eredu_nn::GroupScoring::SqrtSoftplus => row
                     .iter()
                     .map(|value| (1.0 + value.exp()).ln().sqrt())
                     .collect(),
+                _ => return Err(Error::backend("unsupported group scoring policy")),
             };
             let selection = scores
                 .iter()
@@ -4104,8 +4069,8 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                             .map_or(0.0, |(bias, _)| bias.data[expert])
                 })
                 .collect::<Vec<_>>();
-            let groups = self.routing.expert_groups() as usize;
-            let selected_groups = self.routing.selected_groups() as usize;
+            let groups = self.selection.selection_partitions() as usize;
+            let selected_groups = self.selection.selected_groups() as usize;
             let experts_per_group = experts / groups;
             let mut group_order = (0..groups).collect::<Vec<_>>();
             group_order.sort_by(|left, right| {
@@ -4127,7 +4092,7 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                 .iter()
                 .map(|expert| scores[*expert])
                 .collect::<Vec<_>>();
-            let selected = if self.routing.scoring() == eredu_nn::RoutingScoring::SelectedSoftmax {
+            let selected = if self.selection.scoring() == eredu_nn::GroupScoring::SelectedSoftmax {
                 let maximum = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let exponentials = selected
                     .iter()
@@ -4142,46 +4107,46 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
             for (route, expert) in order.iter().copied().take(top_k).enumerate() {
                 let selected = selected[route];
                 let index = token * top_k + route;
-                expert_ids.data[index] = expert as f32;
+                group_indices.data[index] = expert as f32;
                 selected_scores.data[index] = selected;
-                route_weights.data[index] = if self.routing.normalize_selected() {
-                    selected / (selected_sum + self.routing.normalization_epsilon())
+                coefficients.data[index] = if self.selection.normalize_selected() {
+                    selected / (selected_sum + self.selection.normalization_epsilon())
                 } else {
                     selected
-                } * self.routing.routed_scaling()
+                } * self.selection.coefficient_scale()
                     * self
-                        .route_scale
+                        .coefficient_scale
                         .as_ref()
                         .map_or(1.0, |(scale, _)| scale.data[expert]);
             }
         }
-        Ok(RoutingResult {
-            expert_ids,
+        Ok(GroupSelection::new(
+            group_indices,
             selected_scores,
-            route_weights,
-        })
+            coefficients,
+        ))
     }
 
-    fn route_selected(
+    fn select_indices(
         &mut self,
         input: &NumericTensor,
-        expert_ids: &NumericTensor,
+        group_indices: &NumericTensor,
         context: &NumericContext,
-    ) -> Result<RoutingResult<NumericTensor>, Error> {
+    ) -> Result<GroupSelection<NumericTensor>, Error> {
         let input = self.transformed_input(input);
         let logits = self.linear.forward(&input, context)?;
-        let experts = self.routing.expert_count() as usize;
-        let top_k = self.routing.top_k() as usize;
+        let experts = self.selection.group_count() as usize;
+        let top_k = self.selection.top_k() as usize;
         let tokens = logits.data.len() / experts;
-        if expert_ids.shape != [tokens as i32, top_k as i32] {
+        if group_indices.shape != [tokens as i32, top_k as i32] {
             return Err(Error::backend("caller-selected route geometry mismatch"));
         }
-        let mut selected_scores = NumericTensor::zeros(expert_ids.shape.clone());
-        let mut route_weights = NumericTensor::zeros(expert_ids.shape.clone());
+        let mut selected_scores = NumericTensor::zeros(group_indices.shape.clone());
+        let mut coefficients = NumericTensor::zeros(group_indices.shape.clone());
         for token in 0..tokens {
             let row = &logits.data[token * experts..(token + 1) * experts];
-            let scores = match self.routing.scoring() {
-                eredu_nn::RoutingScoring::Softmax => {
+            let scores = match self.selection.scoring() {
+                eredu_nn::GroupScoring::Softmax => {
                     let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                     let values = row
                         .iter()
@@ -4193,27 +4158,28 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                         .map(|value| value / sum)
                         .collect::<Vec<_>>()
                 }
-                eredu_nn::RoutingScoring::SelectedSoftmax => row.to_vec(),
-                eredu_nn::RoutingScoring::Sigmoid => row
+                eredu_nn::GroupScoring::SelectedSoftmax => row.to_vec(),
+                eredu_nn::GroupScoring::Sigmoid => row
                     .iter()
                     .map(|value| 1.0 / (1.0 + (-value).exp()))
                     .collect(),
-                eredu_nn::RoutingScoring::SqrtSoftplus => row
+                eredu_nn::GroupScoring::SqrtSoftplus => row
                     .iter()
                     .map(|value| (1.0 + value.exp()).ln().sqrt())
                     .collect(),
+                _ => return Err(Error::backend("unsupported group scoring policy")),
             };
             let mut sum = 0.0;
             for route in 0..top_k {
                 let index = token * top_k + route;
-                let expert = expert_ids.data[index] as usize;
-                if expert >= experts || expert as f32 != expert_ids.data[index] {
+                let expert = group_indices.data[index] as usize;
+                if expert >= experts || expert as f32 != group_indices.data[index] {
                     return Err(Error::backend("caller-selected expert id is invalid"));
                 }
                 selected_scores.data[index] = scores[expert];
                 sum += scores[expert];
             }
-            if self.routing.scoring() == eredu_nn::RoutingScoring::SelectedSoftmax {
+            if self.selection.scoring() == eredu_nn::GroupScoring::SelectedSoftmax {
                 let start = token * top_k;
                 let maximum = selected_scores.data[start..start + top_k]
                     .iter()
@@ -4231,23 +4197,23 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
             }
             for route in 0..top_k {
                 let index = token * top_k + route;
-                let expert = expert_ids.data[index] as usize;
-                route_weights.data[index] = if self.routing.normalize_selected() {
-                    selected_scores.data[index] / (sum + self.routing.normalization_epsilon())
+                let expert = group_indices.data[index] as usize;
+                coefficients.data[index] = if self.selection.normalize_selected() {
+                    selected_scores.data[index] / (sum + self.selection.normalization_epsilon())
                 } else {
                     selected_scores.data[index]
-                } * self.routing.routed_scaling()
+                } * self.selection.coefficient_scale()
                     * self
-                        .route_scale
+                        .coefficient_scale
                         .as_ref()
                         .map_or(1.0, |(scale, _)| scale.data[expert]);
             }
         }
-        Ok(RoutingResult {
-            expert_ids: expert_ids.clone(),
+        Ok(GroupSelection::new(
+            group_indices.clone(),
             selected_scores,
-            route_weights,
-        })
+            coefficients,
+        ))
     }
 }
 
@@ -4266,7 +4232,7 @@ struct NumericExpertBank {
     experts: Vec<NumericExpert>,
     parameters: Vec<(NumericTensor, ParameterMetadata)>,
     policy: eredu_nn::GatedProductPolicy,
-    spec: GatedProductExpertBankSpec,
+    spec: GroupedGatedProductSpec,
 }
 
 fn numeric_expert_bank_spec(
@@ -4274,31 +4240,34 @@ fn numeric_expert_bank_spec(
     hidden: i32,
     intermediate: i32,
     policy: GatedProductPolicy,
-) -> GatedProductExpertBankSpec {
+) -> GroupedGatedProductSpec {
     let parameter = |name| ParameterSpec::trainable(name).unwrap();
-    GatedProductExpertBankSpec {
+    GroupedGatedProductSpec::new(
         expert_count,
-        input_dimensions: hidden,
-        intermediate_dimensions: intermediate,
-        output_dimensions: hidden,
+        hidden,
+        intermediate,
+        hidden,
         policy,
-        layout: GatedProductExpertLayout::Packed {
-            gate_up: eredu_nn::ExpertProjectionSpec {
-                weight: parameter("test.experts.gate_up_proj"),
-                bias: None,
-                format: dense_linear_format(),
-            },
-            down: eredu_nn::ExpertProjectionSpec {
-                weight: parameter("test.experts.down_proj"),
-                bias: None,
-                format: dense_linear_format(),
-            },
+        GatedProductGroupLayout::Packed {
+            gate_up: eredu_nn::GroupedProjectionSpec::new(
+                parameter("test.experts.gate_up_proj"),
+                None,
+                dense_linear_format(),
+            )
+            .unwrap(),
+            down: eredu_nn::GroupedProjectionSpec::new(
+                parameter("test.experts.down_proj"),
+                None,
+                dense_linear_format(),
+            )
+            .unwrap(),
         },
-    }
+    )
+    .unwrap()
 }
 
 #[derive(Debug, Clone)]
-struct NumericRelu2ExpertBank {
+struct NumericRelu2Groups {
     expert_count: usize,
     hidden: usize,
     intermediate: usize,
@@ -4306,7 +4275,7 @@ struct NumericRelu2ExpertBank {
     down: (NumericTensor, ParameterMetadata),
 }
 
-impl Parameterized<NumericTensor> for NumericRelu2ExpertBank {
+impl Parameterized<NumericTensor> for NumericRelu2Groups {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, NumericTensor>,
@@ -4329,17 +4298,17 @@ impl Parameterized<NumericTensor> for NumericRelu2ExpertBank {
     }
 }
 
-impl Relu2ExpertBankOperator<NumericTensor> for NumericRelu2ExpertBank {
-    fn forward_routed(
+impl GroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
+    fn forward_grouped(
         &mut self,
         input: &NumericTensor,
-        routes: &RoutingResult<NumericTensor>,
+        routes: &GroupSelection<NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         let tokens = input.data.len() / self.hidden;
-        let top_k = routes.expert_ids.shape[1] as usize;
-        if routes.expert_ids.shape != [tokens as i32, top_k as i32]
-            || routes.route_weights.shape != routes.expert_ids.shape
+        let top_k = routes.group_indices().shape[1] as usize;
+        if routes.group_indices().shape != [tokens as i32, top_k as i32]
+            || routes.coefficients().shape != routes.group_indices().shape
         {
             return Err(Error::backend("numeric ReLU2 route geometry mismatch"));
         }
@@ -4351,7 +4320,7 @@ impl Relu2ExpertBankOperator<NumericTensor> for NumericRelu2ExpertBank {
             );
             for route in 0..top_k {
                 let route_index = token * top_k + route;
-                let expert = routes.expert_ids.data[route_index] as usize;
+                let expert = routes.group_indices().data[route_index] as usize;
                 if expert >= self.expert_count {
                     return Err(Error::backend("numeric ReLU2 expert id is out of range"));
                 }
@@ -4369,7 +4338,7 @@ impl Relu2ExpertBankOperator<NumericTensor> for NumericRelu2ExpertBank {
                 let activated =
                     linear(&token_input, &up, None)?.map(|value| value.max(0.0).powi(2));
                 let expert_output = linear(&activated, &down, None)?;
-                let weight = routes.route_weights.data[route_index];
+                let weight = routes.coefficients().data[route_index];
                 for dimension in 0..self.hidden {
                     output.data[token * self.hidden + dimension] +=
                         weight * expert_output.data[dimension];
@@ -4379,17 +4348,17 @@ impl Relu2ExpertBankOperator<NumericTensor> for NumericRelu2ExpertBank {
         Ok(output)
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
         input: &NumericTensor,
-        routes: &RoutingResult<NumericTensor>,
+        routes: &GroupSelection<NumericTensor>,
         _: usize,
         context: &NumericContext,
-    ) -> Result<TensorParallelExpertOutput<NumericTensor>, Error> {
-        Ok(TensorParallelExpertOutput {
-            reducible: self.forward_routed(input, routes, context)?,
-            post_reduce: None,
-        })
+    ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+        Ok(TensorParallelGroupedOutput::new(
+            self.forward_grouped(input, routes, context)?,
+            None,
+        ))
     }
 }
 
@@ -4419,22 +4388,22 @@ impl Parameterized<NumericTensor> for NumericExpertBank {
     }
 }
 
-impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
-    fn spec(&self) -> &GatedProductExpertBankSpec {
+impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
+    fn spec(&self) -> &GroupedGatedProductSpec {
         &self.spec
     }
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
         input: &NumericTensor,
-        routes: &RoutingResult<NumericTensor>,
+        routes: &GroupSelection<NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         let hidden = input.shape.last().copied().unwrap() as usize;
         let tokens = input.data.len() / hidden;
-        let top_k = routes.expert_ids.shape[1] as usize;
-        if routes.expert_ids.shape != [tokens as i32, top_k as i32]
-            || routes.route_weights.shape != routes.expert_ids.shape
+        let top_k = routes.group_indices().shape[1] as usize;
+        if routes.group_indices().shape != [tokens as i32, top_k as i32]
+            || routes.coefficients().shape != routes.group_indices().shape
         {
             return Err(Error::backend("numeric expert route geometry mismatch"));
         }
@@ -4446,7 +4415,7 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
             );
             for route in 0..top_k {
                 let route_index = token * top_k + route;
-                let expert_id = routes.expert_ids.data[route_index] as usize;
+                let expert_id = routes.group_indices().data[route_index] as usize;
                 let expert = self
                     .experts
                     .get(expert_id)
@@ -4465,6 +4434,7 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
                         0.5 * value
                             * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
                     }
+                    _ => panic!("unsupported gated-product activation in numeric backend"),
                 });
                 let up = linear(&token_input, &expert.up, expert.up_bias.as_ref())?.map(|value| {
                     self.policy
@@ -4474,7 +4444,7 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
                 });
                 let activated = gate.zip(&up, |left, right| left * right)?;
                 let expert_output = linear(&activated, &expert.down, expert.down_bias.as_ref())?;
-                let weight = routes.route_weights.data[route_index];
+                let weight = routes.coefficients().data[route_index];
                 for dimension in 0..hidden {
                     output.data[token * hidden + dimension] +=
                         weight * expert_output.data[dimension];
@@ -4484,13 +4454,13 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
         Ok(output)
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
         input: &NumericTensor,
-        routes: &RoutingResult<NumericTensor>,
+        routes: &GroupSelection<NumericTensor>,
         _: usize,
         context: &NumericContext,
-    ) -> Result<TensorParallelExpertOutput<NumericTensor>, Error> {
+    ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
         let mut local = self.clone();
         let has_down_bias = local
             .experts
@@ -4499,22 +4469,22 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
         for expert in &mut local.experts {
             expert.down_bias = None;
         }
-        let reducible = local.forward_routed(input, routes, context)?;
+        let reducible = local.forward_grouped(input, routes, context)?;
         let post_reduce = if has_down_bias {
             let hidden = input.shape.last().copied().unwrap() as usize;
             let tokens = input.data.len() / hidden;
-            let top_k = routes.expert_ids.shape[1] as usize;
+            let top_k = routes.group_indices().shape[1] as usize;
             let mut bias = NumericTensor::zeros(input.shape.clone());
             for token in 0..tokens {
                 for route in 0..top_k {
                     let route_index = token * top_k + route;
-                    let expert = routes.expert_ids.data[route_index] as usize;
+                    let expert = routes.group_indices().data[route_index] as usize;
                     let down_bias = self
                         .experts
                         .get(expert)
                         .and_then(|expert| expert.down_bias.as_ref())
                         .ok_or_else(|| Error::backend("numeric expert down-bias mismatch"))?;
-                    let weight = routes.route_weights.data[route_index];
+                    let weight = routes.coefficients().data[route_index];
                     for dimension in 0..hidden {
                         bias.data[token * hidden + dimension] += weight * down_bias.data[dimension];
                     }
@@ -4524,10 +4494,7 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
         } else {
             None
         };
-        Ok(TensorParallelExpertOutput {
-            reducible,
-            post_reduce,
-        })
+        Ok(TensorParallelGroupedOutput::new(reducible, post_reduce))
     }
 }
 
@@ -4749,99 +4716,167 @@ impl Sampler<NumericBackend> for NumericSampler {
     }
 }
 
-impl RoutedNeuralBackend for NumericBackend {
-    type Router = NumericRouter;
-    type GatedProductExpertBank = NumericExpertBank;
-    type Relu2ExpertBank = NumericRelu2ExpertBank;
+impl GroupedNeuralBackend for NumericBackend {
+    type Selector = NumericRouter;
+    type GatedProductGroups = NumericExpertBank;
+    type Relu2Groups = NumericRelu2Groups;
 
-    fn top_k_router(spec: TopKRouterSpec, context: &NumericContext) -> Result<Self::Router, Error> {
+    fn joint_group_selection(
+        input: JointGroupSelectionInput<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<JointGroupSelection<NumericTensor>, Error> {
+        input.validate()?;
+        let hidden = input.hidden().shape.last().copied().unwrap() as usize;
+        let tokens = input.hidden().data.len() / hidden;
+        let groups = input.weight().shape[0] as usize;
+        let selectable = input.selectable_groups() as usize;
+        let always_on = groups - selectable;
+        let top_k = input.top_k() as usize;
+        let global_scale = *input
+            .global_scale()
+            .data
+            .first()
+            .ok_or_else(|| Error::backend("numeric global coefficient scale is empty"))?;
+        let mut primary_indices = NumericTensor::zeros(vec![tokens as i32, input.top_k()]);
+        let mut primary_coefficients = NumericTensor::zeros(vec![tokens as i32, input.top_k()]);
+        let mut always_on_coefficients =
+            NumericTensor::zeros(vec![tokens as i32, always_on as i32]);
+        for token in 0..tokens {
+            let logits = (0..groups)
+                .map(|group| {
+                    (0..hidden)
+                        .map(|column| {
+                            input.hidden().data[token * hidden + column]
+                                * input.weight().data[group * hidden + column]
+                        })
+                        .sum::<f32>()
+                })
+                .collect::<Vec<_>>();
+            let mut order = (0..selectable).collect::<Vec<_>>();
+            order.sort_by(|left, right| {
+                let score = |group: usize| {
+                    1.0 / (1.0 + (-logits[group]).exp()) + input.correction_bias().data[group]
+                };
+                score(*right)
+                    .total_cmp(&score(*left))
+                    .then_with(|| left.cmp(right))
+            });
+            order.truncate(top_k);
+            let mut selected = order
+                .iter()
+                .map(|group| 1.0 / (1.0 + (-logits[*group]).exp()))
+                .collect::<Vec<_>>();
+            selected.extend(
+                logits[selectable..]
+                    .iter()
+                    .map(|logit| 1.0 / (1.0 + (-logit).exp())),
+            );
+            let scale = input.coefficient_scale() * global_scale / selected.iter().sum::<f32>();
+            for (slot, group) in order.into_iter().enumerate() {
+                primary_indices.data[token * top_k + slot] = group as f32;
+                primary_coefficients.data[token * top_k + slot] = selected[slot] * scale;
+            }
+            for group in 0..always_on {
+                always_on_coefficients.data[token * always_on + group] =
+                    selected[top_k + group] * scale;
+            }
+        }
+        Ok(JointGroupSelection::new(
+            primary_indices,
+            primary_coefficients,
+            always_on_coefficients,
+        ))
+    }
+
+    fn top_k_group_selector(
+        spec: TopKGroupSelectorSpec,
+        context: &NumericContext,
+    ) -> Result<Self::Selector, Error> {
         spec.validate()?;
-        let routing = spec.routing;
+        let routing = spec.selection();
         let linear = Self::linear(
             LinearSpec {
-                input: spec.input_dimensions,
-                output: routing.expert_count(),
-                weight: spec.weight,
-                bias: spec.bias,
-                format: spec.format,
+                input: spec.input_dimensions(),
+                output: routing.group_count(),
+                weight: spec.weight().clone(),
+                bias: spec.bias().cloned(),
+                format: spec.format().clone(),
             },
             context,
         )?;
-        let correction_bias = spec.correction_bias.map(|parameter_spec| {
-            let value = parameter(&parameter_spec, vec![routing.expert_count()], true);
-            let metadata = ParameterMetadata::from_spec(&parameter_spec, parameter_spec.trainable);
+        let correction_bias = spec.correction_bias().map(|parameter_spec| {
+            let value = parameter(parameter_spec, vec![routing.group_count()], true);
+            let metadata = ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable);
             (value, metadata)
         });
-        let input_transform = spec.input_transform.map(|transform| {
-            let value = parameter(&transform.scale, vec![spec.input_dimensions], true);
+        let input_transform = spec.input_transform().map(|transform| {
+            let value = parameter(transform.scale(), vec![spec.input_dimensions()], true);
             let metadata =
-                ParameterMetadata::from_spec(&transform.scale, transform.scale.trainable);
+                ParameterMetadata::from_spec(transform.scale(), transform.scale().trainable);
             (
-                transform.epsilon,
+                transform.epsilon(),
                 value,
                 metadata,
-                transform.inverse_sqrt_dimensions,
+                transform.inverse_sqrt_dimensions(),
             )
         });
-        let route_scale = spec.route_scale.map(|parameter_spec| {
-            let value = parameter(&parameter_spec, vec![routing.expert_count()], true);
-            let metadata = ParameterMetadata::from_spec(&parameter_spec, parameter_spec.trainable);
+        let coefficient_scale = spec.coefficient_scale().map(|parameter_spec| {
+            let value = parameter(parameter_spec, vec![routing.group_count()], true);
+            let metadata = ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable);
             (value, metadata)
         });
         Ok(NumericRouter {
             linear,
-            routing,
+            selection: routing,
             correction_bias,
             input_transform,
-            route_scale,
+            coefficient_scale,
         })
     }
 
-    fn gated_product_expert_bank(
-        spec: GatedProductExpertBankSpec,
+    fn grouped_gated_product(
+        spec: GroupedGatedProductSpec,
         context: &NumericContext,
-    ) -> Result<Self::GatedProductExpertBank, Error> {
+    ) -> Result<Self::GatedProductGroups, Error> {
         spec.validate()?;
         let construction_spec = spec.clone();
-        let expert_count = spec.expert_count as usize;
-        let hidden = spec.input_dimensions;
-        let intermediate = spec.intermediate_dimensions;
-        let policy = spec.policy;
+        let expert_count = spec.group_count() as usize;
+        let hidden = spec.input_dimensions();
+        let intermediate = spec.intermediate_dimensions();
+        let policy = spec.policy();
         let mut experts = Vec::with_capacity(expert_count);
         let mut parameters = Vec::new();
-        match spec.layout {
-            GatedProductExpertLayout::Packed { gate_up, down } => {
+        match spec.layout() {
+            GatedProductGroupLayout::Packed { gate_up, down } => {
                 let packed_gate_up = local_parameter(
-                    &gate_up.weight,
-                    vec![spec.expert_count, 2 * intermediate, hidden],
+                    gate_up.weight(),
+                    vec![spec.group_count(), 2 * intermediate, hidden],
                     false,
                     context,
                 )?;
                 let packed_down = local_parameter(
-                    &down.weight,
-                    vec![spec.expert_count, spec.output_dimensions, intermediate],
+                    down.weight(),
+                    vec![spec.group_count(), spec.output_dimensions(), intermediate],
                     false,
                     context,
                 )?;
                 let packed_gate_up_bias = gate_up
-                    .bias
-                    .as_ref()
+                    .bias()
                     .map(|bias| {
                         local_parameter(
                             bias,
-                            vec![spec.expert_count, 2 * intermediate],
+                            vec![spec.group_count(), 2 * intermediate],
                             false,
                             context,
                         )
                     })
                     .transpose()?;
                 let packed_down_bias = down
-                    .bias
-                    .as_ref()
+                    .bias()
                     .map(|bias| {
                         local_parameter(
                             bias,
-                            vec![spec.expert_count, spec.output_dimensions],
+                            vec![spec.group_count(), spec.output_dimensions()],
                             false,
                             context,
                         )
@@ -4849,7 +4884,7 @@ impl RoutedNeuralBackend for NumericBackend {
                     .transpose()?;
                 let gate_up_per_expert = (2 * intermediate * hidden) as usize;
                 let projection_per_expert = (intermediate * hidden) as usize;
-                let down_per_expert = (spec.output_dimensions * intermediate) as usize;
+                let down_per_expert = (spec.output_dimensions() * intermediate) as usize;
                 for expert in 0..expert_count {
                     let gate_up_start = expert * gate_up_per_expert;
                     let down_start = expert * down_per_expert;
@@ -4882,13 +4917,13 @@ impl RoutedNeuralBackend for NumericBackend {
                             )
                         }),
                         down: NumericTensor::new(
-                            vec![spec.output_dimensions, intermediate],
+                            vec![spec.output_dimensions(), intermediate],
                             packed_down.data[down_start..down_start + down_per_expert].to_vec(),
                         ),
                         down_bias: packed_down_bias.as_ref().map(|bias| {
-                            let width = spec.output_dimensions as usize;
+                            let width = spec.output_dimensions() as usize;
                             NumericTensor::new(
-                                vec![spec.output_dimensions],
+                                vec![spec.output_dimensions()],
                                 bias.data[expert * width..(expert + 1) * width].to_vec(),
                             )
                         }),
@@ -4896,18 +4931,15 @@ impl RoutedNeuralBackend for NumericBackend {
                 }
                 parameters.push((
                     packed_gate_up,
-                    ParameterMetadata::from_spec(&gate_up.weight, gate_up.weight.trainable),
+                    ParameterMetadata::from_spec(gate_up.weight(), gate_up.weight().trainable),
                 ));
-                if let (Some(parameter_spec), Some(value)) =
-                    (gate_up.bias.as_ref(), packed_gate_up_bias)
-                {
+                if let (Some(parameter_spec), Some(value)) = (gate_up.bias(), packed_gate_up_bias) {
                     parameters.push((
                         value,
                         ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable),
                     ));
                 }
-                if let (Some(parameter_spec), Some(value)) = (down.bias.as_ref(), packed_down_bias)
-                {
+                if let (Some(parameter_spec), Some(value)) = (down.bias(), packed_down_bias) {
                     parameters.push((
                         value,
                         ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable),
@@ -4915,47 +4947,44 @@ impl RoutedNeuralBackend for NumericBackend {
                 }
                 parameters.push((
                     packed_down,
-                    ParameterMetadata::from_spec(&down.weight, down.weight.trainable),
+                    ParameterMetadata::from_spec(down.weight(), down.weight().trainable),
                 ));
             }
-            GatedProductExpertLayout::Independent(specs) => {
+            GatedProductGroupLayout::Independent(specs) => {
                 for expert_spec in specs {
                     let gate = local_parameter(
-                        &expert_spec.gate.weight,
+                        expert_spec.gate().weight(),
                         vec![intermediate, hidden],
                         false,
                         context,
                     )?;
                     let up = local_parameter(
-                        &expert_spec.up.weight,
+                        expert_spec.up().weight(),
                         vec![intermediate, hidden],
                         false,
                         context,
                     )?;
                     let down = local_parameter(
-                        &expert_spec.down.weight,
-                        vec![spec.output_dimensions, intermediate],
+                        expert_spec.down().weight(),
+                        vec![spec.output_dimensions(), intermediate],
                         false,
                         context,
                     )?;
                     let gate_bias = expert_spec
-                        .gate
-                        .bias
-                        .as_ref()
+                        .gate()
+                        .bias()
                         .map(|bias| local_parameter(bias, vec![intermediate], false, context))
                         .transpose()?;
                     let up_bias = expert_spec
-                        .up
-                        .bias
-                        .as_ref()
+                        .up()
+                        .bias()
                         .map(|bias| local_parameter(bias, vec![intermediate], false, context))
                         .transpose()?;
                     let down_bias = expert_spec
-                        .down
-                        .bias
-                        .as_ref()
+                        .down()
+                        .bias()
                         .map(|bias| {
-                            local_parameter(bias, vec![spec.output_dimensions], false, context)
+                            local_parameter(bias, vec![spec.output_dimensions()], false, context)
                         })
                         .transpose()?;
                     experts.push(NumericExpert {
@@ -4970,33 +4999,31 @@ impl RoutedNeuralBackend for NumericBackend {
                         (
                             gate,
                             ParameterMetadata::from_spec(
-                                &expert_spec.gate.weight,
-                                expert_spec.gate.weight.trainable,
+                                expert_spec.gate().weight(),
+                                expert_spec.gate().weight().trainable,
                             ),
                         ),
                         (
                             up,
                             ParameterMetadata::from_spec(
-                                &expert_spec.up.weight,
-                                expert_spec.up.weight.trainable,
+                                expert_spec.up().weight(),
+                                expert_spec.up().weight().trainable,
                             ),
                         ),
                         (
                             down,
                             ParameterMetadata::from_spec(
-                                &expert_spec.down.weight,
-                                expert_spec.down.weight.trainable,
+                                expert_spec.down().weight(),
+                                expert_spec.down().weight().trainable,
                             ),
                         ),
                     ]);
                     for (projection, value) in [
-                        (&expert_spec.gate, gate_bias),
-                        (&expert_spec.up, up_bias),
-                        (&expert_spec.down, down_bias),
+                        (expert_spec.gate(), gate_bias),
+                        (expert_spec.up(), up_bias),
+                        (expert_spec.down(), down_bias),
                     ] {
-                        if let (Some(parameter_spec), Some(value)) =
-                            (projection.bias.as_ref(), value)
-                        {
+                        if let (Some(parameter_spec), Some(value)) = (projection.bias(), value) {
                             parameters.push((
                                 value,
                                 ParameterMetadata::from_spec(
@@ -5008,6 +5035,7 @@ impl RoutedNeuralBackend for NumericBackend {
                     }
                 }
             }
+            _ => return Err(Error::backend("unsupported grouped parameter layout")),
         }
         Ok(NumericExpertBank {
             experts,
@@ -5017,42 +5045,42 @@ impl RoutedNeuralBackend for NumericBackend {
         })
     }
 
-    fn relu2_expert_bank(
-        spec: Relu2ExpertBankSpec,
+    fn grouped_relu2(
+        spec: GroupedRelu2Spec,
         context: &NumericContext,
-    ) -> Result<Self::Relu2ExpertBank, Error> {
+    ) -> Result<Self::Relu2Groups, Error> {
         spec.validate()?;
         let up = local_parameter(
-            &spec.up.weight,
+            spec.up().weight(),
             vec![
-                spec.expert_count,
-                spec.intermediate_dimensions,
-                spec.hidden_dimensions,
+                spec.group_count(),
+                spec.intermediate_dimensions(),
+                spec.hidden_dimensions(),
             ],
             true,
             context,
         )?;
         let down = local_parameter(
-            &spec.down.weight,
+            spec.down().weight(),
             vec![
-                spec.expert_count,
-                spec.hidden_dimensions,
-                spec.intermediate_dimensions,
+                spec.group_count(),
+                spec.hidden_dimensions(),
+                spec.intermediate_dimensions(),
             ],
             true,
             context,
         )?;
-        Ok(NumericRelu2ExpertBank {
-            expert_count: spec.expert_count as usize,
-            hidden: spec.hidden_dimensions as usize,
-            intermediate: spec.intermediate_dimensions as usize,
+        Ok(NumericRelu2Groups {
+            expert_count: spec.group_count() as usize,
+            hidden: spec.hidden_dimensions() as usize,
+            intermediate: spec.intermediate_dimensions() as usize,
             up: (
                 up,
-                ParameterMetadata::from_spec(&spec.up.weight, spec.up.weight.trainable),
+                ParameterMetadata::from_spec(spec.up().weight(), spec.up().weight().trainable),
             ),
             down: (
                 down,
-                ParameterMetadata::from_spec(&spec.down.weight, spec.down.weight.trainable),
+                ParameterMetadata::from_spec(spec.down().weight(), spec.down().weight().trainable),
             ),
         })
     }
@@ -6662,7 +6690,7 @@ fn dense_qwen_construction_rejects_moe_configuration() {
 }
 
 #[test]
-fn qwen_expert_realization_owns_assignment_and_tp_local_bank_geometry() {
+fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
     let mut value = config("qwen3_moe", false);
     value["num_attention_heads"] = 4.into();
     value["num_key_value_heads"] = 2.into();
@@ -6693,10 +6721,33 @@ fn qwen_expert_realization_owns_assignment_and_tp_local_bank_geometry() {
 
     assert_eq!(plan.global_expert_count(), 4);
     assert_eq!(plan.owners(), [0, 0, 1, 1]);
-    assert_eq!(plan.local_global_expert_ids(), [2, 3]);
+    assert_eq!(plan.local_global_group_indices(), [2, 3]);
     let bank = plan.unit_spec("text_decoder", 0).unwrap();
-    assert_eq!(bank.expert_count, 2);
-    assert_eq!(bank.intermediate_dimensions, 3);
+    assert_eq!(bank.group_count(), 2);
+    assert_eq!(bank.intermediate_dimensions(), 3);
+
+    let addressable_bank = plan
+        .local_global_group_indices()
+        .iter()
+        .copied()
+        .map(|identity| (identity, bank.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(addressable_bank.keys().copied().collect::<Vec<_>>(), [2, 3]);
+
+    let grouped_context = NumericContext::default();
+    let mut grouped =
+        NumericBackend::grouped_gated_product(bank.clone(), &grouped_context).unwrap();
+    let hidden = NumericTensor::zeros(vec![1, bank.input_dimensions()]);
+    let selection = GroupSelection::new(
+        NumericTensor::new(vec![1, 1], vec![0.0]),
+        NumericTensor::new(vec![1, 1], vec![1.0]),
+        NumericTensor::new(vec![1, 1], vec![1.0]),
+    );
+    let gathered = grouped
+        .forward_grouped(&hidden, &selection, &grouped_context)
+        .unwrap();
+    let exchanged = NumericBackend::all_to_all(gathered, &(), &grouped_context).unwrap();
+    assert_eq!(exchanged.shape, [1, bank.output_dimensions()]);
 }
 
 #[test]
@@ -8708,10 +8759,13 @@ fn gpt_oss_tp2_matches_replicated_with_biased_packed_experts() {
     );
     let expert_input = NumericTensor::new([1, 32], vec![0.25; 32]);
     let mut global_expert = unit.mlp.clone();
-    let global_routes = global_expert.router.route(&expert_input, &context).unwrap();
+    let global_routes = global_expert
+        .router
+        .select(&expert_input, &context)
+        .unwrap();
     let global_expert_output = global_expert
         .experts
-        .forward_routed(&expert_input, &global_routes, &context)
+        .forward_grouped(&expert_input, &global_routes, &context)
         .unwrap();
     let mut partials = layouts
         .iter()
@@ -8732,21 +8786,21 @@ fn gpt_oss_tp2_matches_replicated_with_biased_packed_experts() {
             let routes = local
                 .mlp
                 .router
-                .route(&expert_input, &local_context)
+                .select(&expert_input, &local_context)
                 .unwrap();
             local
                 .mlp
                 .experts
-                .forward_routed_tensor_parallel(&expert_input, &routes, 2, &local_context)
+                .forward_grouped_tensor_parallel(&expert_input, &routes, 2, &local_context)
                 .unwrap()
         })
         .collect::<Vec<_>>();
     let expert_reconstructed = partials
         .remove(0)
-        .reducible
-        .add(&partials[0].reducible, &context)
+        .reducible()
+        .add(partials[0].reducible(), &context)
         .unwrap()
-        .add(partials[0].post_reduce.as_ref().unwrap(), &context)
+        .add(partials[0].post_reduce().as_ref().unwrap(), &context)
         .unwrap();
     assert_tensor_close(
         &expert_reconstructed,
@@ -10590,18 +10644,19 @@ fn reference_router_and_packed_experts_match_analytical_values() {
             weight_metadata: ParameterMetadata::from_spec(&router_spec, true),
             bias: None,
         },
-        routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::Softmax, true).unwrap(),
+        selection: TopKGroupSelectionSpec::new(3, 2, eredu_nn::GroupScoring::Softmax, true)
+            .unwrap(),
         correction_bias: None,
         input_transform: None,
-        route_scale: None,
+        coefficient_scale: None,
     };
     let input = NumericTensor::new(vec![1, 2], vec![1.0, 0.0]);
-    let routes = router.route(&input, &context).unwrap();
-    assert_eq!(routes.expert_ids.data, [2.0, 1.0]);
-    assert_close(routes.selected_scores.data[0], 4.0 / 7.0);
-    assert_close(routes.selected_scores.data[1], 2.0 / 7.0);
-    assert_close(routes.route_weights.data[0], 2.0 / 3.0);
-    assert_close(routes.route_weights.data[1], 1.0 / 3.0);
+    let routes = router.select(&input, &context).unwrap();
+    assert_eq!(routes.group_indices().data, [2.0, 1.0]);
+    assert_close(routes.selected_scores().data[0], 4.0 / 7.0);
+    assert_close(routes.selected_scores().data[1], 2.0 / 7.0);
+    assert_close(routes.coefficients().data[0], 2.0 / 3.0);
+    assert_close(routes.coefficients().data[1], 1.0 / 3.0);
 
     let mut experts = NumericExpertBank {
         experts: vec![
@@ -10626,13 +10681,13 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         spec: numeric_expert_bank_spec(2, 2, 1, eredu_nn::GatedProductPolicy::ordinary_silu()),
     };
-    let routes = RoutingResult {
-        expert_ids: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
-        selected_scores: NumericTensor::new(vec![1, 2], vec![0.25, 0.75]),
-        route_weights: NumericTensor::new(vec![1, 2], vec![0.25, 0.75]),
-    };
+    let routes = GroupSelection::new(
+        NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
+        NumericTensor::new(vec![1, 2], vec![0.25, 0.75]),
+        NumericTensor::new(vec![1, 2], vec![0.25, 0.75]),
+    );
     let output = experts
-        .forward_routed(
+        .forward_grouped(
             &NumericTensor::new(vec![1, 2], vec![2.0, 1.0]),
             &routes,
             &context,
@@ -10650,7 +10705,7 @@ struct RecordingNumericExpertProvider {
 impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
     type Error = Error;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
         resident_bank: &mut NumericExpertBank,
         request: RoutedExpertRequest<'_, NumericTensor>,
@@ -10659,19 +10714,19 @@ impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
         self.calls.push((
             request.layer,
             request.pass,
-            request.routes.expert_ids.data.clone(),
-            request.routes.route_weights.data.clone(),
+            request.routes.group_indices().data.clone(),
+            request.routes.coefficients().data.clone(),
         ));
-        resident_bank.forward_routed(request.input, request.routes, context)
+        resident_bank.forward_grouped(request.input, request.routes, context)
     }
 
     fn forward_relu2_routed(
         &mut self,
-        resident_bank: &mut NumericRelu2ExpertBank,
+        resident_bank: &mut NumericRelu2Groups,
         request: RoutedExpertRequest<'_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
-        resident_bank.forward_routed(request.input, request.routes, context)
+        resident_bank.forward_grouped(request.input, request.routes, context)
     }
 }
 
@@ -10702,22 +10757,22 @@ fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
         spec: numeric_expert_bank_spec(2, 2, 1, eredu_nn::GatedProductPolicy::ordinary_silu()),
     };
     let input = NumericTensor::new(vec![2, 2], vec![2.0, 1.0, -1.0, 3.0]);
-    let routes = RoutingResult {
+    let routes = GroupSelection::new(
         // Deliberately reverse the route order for the second token. The
         // provider receives architecture-selected order rather than sorting
         // by expert identity for its cache acquisition.
-        expert_ids: NumericTensor::new(vec![2, 2], vec![0.0, 1.0, 1.0, 0.0]),
-        selected_scores: NumericTensor::new(vec![2, 2], vec![0.8, 0.2, 0.6, 0.4]),
-        route_weights: NumericTensor::new(vec![2, 2], vec![0.75, 0.25, 0.6, 0.4]),
-    };
+        NumericTensor::new(vec![2, 2], vec![0.0, 1.0, 1.0, 0.0]),
+        NumericTensor::new(vec![2, 2], vec![0.8, 0.2, 0.6, 0.4]),
+        NumericTensor::new(vec![2, 2], vec![0.75, 0.25, 0.6, 0.4]),
+    );
     let mut direct_bank = bank.clone();
     let expected = direct_bank
-        .forward_routed(&input, &routes, &context)
+        .forward_grouped(&input, &routes, &context)
         .unwrap();
 
     let mut provider = RecordingNumericExpertProvider::default();
     let actual = provider
-        .forward_routed(
+        .forward_grouped(
             &mut bank,
             RoutedExpertRequest {
                 layer: 7,
@@ -10746,7 +10801,7 @@ fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
         expert.down_bias = None;
     }
     let without_bias = direct_bank
-        .forward_routed(&input, &routes, &context)
+        .forward_grouped(&input, &routes, &context)
         .unwrap();
     assert_ne!(actual.data, without_bias.data);
 }
@@ -10755,15 +10810,20 @@ fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
 fn selected_softmax_router_applies_rms_input_and_per_expert_scales() {
     let weight = ParameterSpec::trainable("router.selected.weight").unwrap();
     let input_scale = ParameterSpec::trainable("router.selected.input_scale").unwrap();
-    let route_scale = ParameterSpec::trainable("router.selected.route_scale").unwrap();
+    let coefficient_scale = ParameterSpec::trainable("router.selected.coefficient_scale").unwrap();
     let mut router = NumericRouter {
         linear: NumericLinear {
             weight: NumericTensor::new(vec![3, 2], vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.0]),
             weight_metadata: ParameterMetadata::from_spec(&weight, true),
             bias: None,
         },
-        routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::SelectedSoftmax, false)
-            .unwrap(),
+        selection: TopKGroupSelectionSpec::new(
+            3,
+            2,
+            eredu_nn::GroupScoring::SelectedSoftmax,
+            false,
+        )
+        .unwrap(),
         correction_bias: None,
         input_transform: Some((
             0.0,
@@ -10771,41 +10831,40 @@ fn selected_softmax_router_applies_rms_input_and_per_expert_scales() {
             ParameterMetadata::from_spec(&input_scale, true),
             true,
         )),
-        route_scale: Some((
+        coefficient_scale: Some((
             NumericTensor::new(vec![3], vec![2.0, 3.0, 5.0]),
-            ParameterMetadata::from_spec(&route_scale, true),
+            ParameterMetadata::from_spec(&coefficient_scale, true),
         )),
     };
     let routes = router
-        .route(
+        .select(
             &NumericTensor::new(vec![1, 2], vec![3.0, 4.0]),
             &NumericContext::default(),
         )
         .unwrap();
     let first = 0.4_f32.exp() / (0.4_f32.exp() + 1.0);
-    assert_eq!(routes.expert_ids.data, [0.0, 1.0]);
-    assert_close(routes.selected_scores.data[0], first);
-    assert_close(routes.selected_scores.data[1], 1.0 - first);
-    assert_close(routes.route_weights.data[0], 2.0 * first);
-    assert_close(routes.route_weights.data[1], 3.0 * (1.0 - first));
+    assert_eq!(routes.group_indices().data, [0.0, 1.0]);
+    assert_close(routes.selected_scores().data[0], first);
+    assert_close(routes.selected_scores().data[1], 1.0 - first);
+    assert_close(routes.coefficients().data[0], 2.0 * first);
+    assert_close(routes.coefficients().data[1], 3.0 * (1.0 - first));
 }
 
 #[test]
 fn selected_softmax_router_projection_bias_affects_ids_and_weights() {
-    let mut router = NumericBackend::top_k_router(
-        TopKRouterSpec {
-            input_dimensions: 1,
-            weight: ParameterSpec::trainable("router.biased.weight").unwrap(),
-            bias: Some(ParameterSpec::trainable("router.biased.bias").unwrap()),
-            correction_bias: Some(
-                ParameterSpec::trainable("router.biased.correction_bias").unwrap(),
-            ),
-            input_transform: None,
-            route_scale: None,
-            format: dense_linear_format(),
-            routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::SelectedSoftmax, false)
+    let mut router = NumericBackend::top_k_group_selector(
+        TopKGroupSelectorSpec::new(
+            1,
+            ParameterSpec::trainable("router.biased.weight").unwrap(),
+            dense_linear_format(),
+            TopKGroupSelectionSpec::new(3, 2, eredu_nn::GroupScoring::SelectedSoftmax, false)
                 .unwrap(),
-        },
+        )
+        .unwrap()
+        .with_bias(ParameterSpec::trainable("router.biased.bias").unwrap())
+        .unwrap()
+        .with_correction_bias(ParameterSpec::trainable("router.biased.correction_bias").unwrap())
+        .unwrap(),
         &NumericContext::default(),
     )
     .unwrap();
@@ -10827,17 +10886,17 @@ fn selected_softmax_router_projection_bias_affects_ids_and_weights() {
     router.correction_bias.as_mut().unwrap().0 = NumericTensor::new(vec![3], vec![10.0, 0.0, 0.0]);
 
     let routes = router
-        .route(
+        .select(
             &NumericTensor::new(vec![1, 1], vec![1.0]),
             &NumericContext::default(),
         )
         .unwrap();
 
-    assert_eq!(routes.expert_ids.data, [0.0, 2.0]);
-    assert_close(routes.selected_scores.data[0], 0.2);
-    assert_close(routes.selected_scores.data[1], 0.8);
-    assert_close(routes.route_weights.data[0], 0.2);
-    assert_close(routes.route_weights.data[1], 0.8);
+    assert_eq!(routes.group_indices().data, [0.0, 2.0]);
+    assert_close(routes.selected_scores().data[0], 0.2);
+    assert_close(routes.selected_scores().data[1], 0.8);
+    assert_close(routes.coefficients().data[0], 0.2);
+    assert_close(routes.coefficients().data[1], 0.8);
 }
 
 #[test]
@@ -10860,13 +10919,13 @@ fn routed_gated_experts_support_approximate_gelu() {
             eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
         ),
     };
-    let routes = RoutingResult {
-        expert_ids: NumericTensor::new(vec![1, 1], vec![0.0]),
-        selected_scores: NumericTensor::new(vec![1, 1], vec![1.0]),
-        route_weights: NumericTensor::new(vec![1, 1], vec![1.0]),
-    };
+    let routes = GroupSelection::new(
+        NumericTensor::new(vec![1, 1], vec![0.0]),
+        NumericTensor::new(vec![1, 1], vec![1.0]),
+        NumericTensor::new(vec![1, 1], vec![1.0]),
+    );
     let output = experts
-        .forward_routed(
+        .forward_grouped(
             &NumericTensor::new(vec![1, 1], vec![1.0]),
             &routes,
             &NumericContext::default(),
@@ -10887,26 +10946,29 @@ fn gated_product_policy_and_projection_biases_match_analytical_value() {
         1.0,
     )
     .unwrap();
-    let mut bank = NumericBackend::gated_product_expert_bank(
-        GatedProductExpertBankSpec {
-            expert_count: 1,
-            input_dimensions: 1,
-            intermediate_dimensions: 1,
-            output_dimensions: 1,
+    let mut bank = NumericBackend::grouped_gated_product(
+        GroupedGatedProductSpec::new(
+            1,
+            1,
+            1,
+            1,
             policy,
-            layout: GatedProductExpertLayout::Packed {
-                gate_up: eredu_nn::ExpertProjectionSpec {
-                    weight: parameter("experts.gate_up_proj"),
-                    bias: Some(parameter("experts.gate_up_proj_bias")),
-                    format: dense_linear_format(),
-                },
-                down: eredu_nn::ExpertProjectionSpec {
-                    weight: parameter("experts.down_proj"),
-                    bias: Some(parameter("experts.down_proj_bias")),
-                    format: dense_linear_format(),
-                },
+            GatedProductGroupLayout::Packed {
+                gate_up: eredu_nn::GroupedProjectionSpec::new(
+                    parameter("experts.gate_up_proj"),
+                    Some(parameter("experts.gate_up_proj_bias")),
+                    dense_linear_format(),
+                )
+                .unwrap(),
+                down: eredu_nn::GroupedProjectionSpec::new(
+                    parameter("experts.down_proj"),
+                    Some(parameter("experts.down_proj_bias")),
+                    dense_linear_format(),
+                )
+                .unwrap(),
             },
-        },
+        )
+        .unwrap(),
         &NumericContext::default(),
     )
     .unwrap();
@@ -10924,13 +10986,13 @@ fn gated_product_policy_and_projection_biases_match_analytical_value() {
     bank.experts[0].up_bias = Some(NumericTensor::new(vec![1], vec![-3.0]));
     bank.experts[0].down = NumericTensor::new(vec![1, 1], vec![2.0]);
     bank.experts[0].down_bias = Some(NumericTensor::new(vec![1], vec![5.0]));
-    let routes = RoutingResult {
-        expert_ids: NumericTensor::new(vec![1, 1], vec![0.0]),
-        selected_scores: NumericTensor::new(vec![1, 1], vec![0.25]),
-        route_weights: NumericTensor::new(vec![1, 1], vec![0.25]),
-    };
+    let routes = GroupSelection::new(
+        NumericTensor::new(vec![1, 1], vec![0.0]),
+        NumericTensor::new(vec![1, 1], vec![0.25]),
+        NumericTensor::new(vec![1, 1], vec![0.25]),
+    );
     let output = bank
-        .forward_routed(
+        .forward_grouped(
             &NumericTensor::new(vec![1, 1], vec![7.0]),
             &routes,
             &NumericContext::default(),
@@ -11781,7 +11843,7 @@ struct TypedRelu2ProviderProbe {
 impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
     type Error = std::convert::Infallible;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
         _resident_bank: &mut NumericExpertBank,
         request: RoutedExpertRequest<'_, NumericTensor>,
@@ -11792,7 +11854,7 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut NumericRelu2ExpertBank,
+        _resident_bank: &mut NumericRelu2Groups,
         request: RoutedExpertRequest<'_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
@@ -11802,17 +11864,14 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
-        _resident_bank: &mut NumericRelu2ExpertBank,
+        _resident_bank: &mut NumericRelu2Groups,
         request: RoutedExpertRequest<'_, NumericTensor>,
         partitions: usize,
         _: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
         self.tensor_parallel_partitions.push(partitions);
         Ok(RoutedExpertTensorParallelOutput::Partial(
-            TensorParallelExpertOutput {
-                reducible: request.input.clone(),
-                post_reduce: None,
-            },
+            TensorParallelGroupedOutput::new(request.input.clone(), None),
         ))
     }
 }
@@ -12380,7 +12439,7 @@ fn nemotron_h_sliding_attention_is_chunk_invariant() {
 fn grouped_sigmoid_and_caller_selected_routes_preserve_unbiased_scores() {
     let router_weight = ParameterSpec::trainable("router.weight").unwrap();
     let correction = ParameterSpec::trainable("router.correction_bias").unwrap();
-    let routing = TopKRoutingSpec::new(4, 1, eredu_nn::RoutingScoring::Sigmoid, true)
+    let routing = TopKGroupSelectionSpec::new(4, 1, eredu_nn::GroupScoring::Sigmoid, true)
         .unwrap()
         .with_groups(2, 1)
         .unwrap()
@@ -12392,37 +12451,38 @@ fn grouped_sigmoid_and_caller_selected_routes_preserve_unbiased_scores() {
             weight_metadata: ParameterMetadata::from_spec(&router_weight, true),
             bias: None,
         },
-        routing,
+        selection: routing,
         correction_bias: Some((
             NumericTensor::new(vec![4], vec![0.0, 0.0, 2.0, 0.0]),
             ParameterMetadata::from_spec(&correction, true),
         )),
         input_transform: None,
-        route_scale: None,
+        coefficient_scale: None,
     };
     let input = NumericTensor::new(vec![1, 1], vec![1.0]);
-    let learned = router.route(&input, &NumericContext::default()).unwrap();
-    assert_eq!(learned.expert_ids.data, [2.0]);
+    let learned = router.select(&input, &NumericContext::default()).unwrap();
+    assert_eq!(learned.group_indices().data, [2.0]);
     assert_close(
-        learned.selected_scores.data[0],
+        learned.selected_scores().data[0],
         1.0 / (1.0 + (-3.0_f32).exp()),
     );
-    assert_close(learned.route_weights.data[0], 2.0);
+    assert_close(learned.coefficients().data[0], 2.0);
 
-    router.routing = TopKRoutingSpec::new(4, 1, eredu_nn::RoutingScoring::SqrtSoftplus, true)
-        .unwrap()
-        .with_weight_policy(1e-20, 1.5)
-        .unwrap();
+    router.selection =
+        TopKGroupSelectionSpec::new(4, 1, eredu_nn::GroupScoring::SqrtSoftplus, true)
+            .unwrap()
+            .with_weight_policy(1e-20, 1.5)
+            .unwrap();
     let selected = router
-        .route_selected(
+        .select_indices(
             &input,
             &NumericTensor::new(vec![1, 1], vec![3.0]),
             &NumericContext::default(),
         )
         .unwrap();
-    assert_eq!(selected.expert_ids.data, [3.0]);
-    assert_close(selected.selected_scores.data[0], 2.0_f32.ln().sqrt());
-    assert_close(selected.route_weights.data[0], 1.5);
+    assert_eq!(selected.group_indices().data, [3.0]);
+    assert_close(selected.selected_scores().data[0], 2.0_f32.ln().sqrt());
+    assert_close(selected.coefficients().data[0], 1.5);
 }
 
 #[test]
@@ -13037,9 +13097,9 @@ fn v4_observer_reports_sparse_indexes_hyper_streams_and_routes() {
 
         fn observe_routing(
             &mut self,
-            routing: eredu_runtime::RoutingObservation<'_, NumericTensor>,
+            selection: eredu_runtime::RoutingObservation<'_, NumericTensor>,
         ) -> Result<(), Error> {
-            self.paths.push(format!("{}.routing", routing.path));
+            self.paths.push(format!("{}.routing", selection.path));
             Ok(())
         }
     }

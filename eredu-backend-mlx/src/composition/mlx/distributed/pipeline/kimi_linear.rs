@@ -1,9 +1,11 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
-use eredu_nn::{RoutedNeuralBackend, TensorParallelExpertOutput};
+use eredu_nn::{GroupedNeuralBackend, TensorParallelGroupedOutput};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
 };
@@ -14,30 +16,20 @@ use crate::{
         error::Error,
         nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
-            cache::state::MlxHybridState,
-            distributed::{
-                expert::{
-                    dispatch_local_with, dispatch_replicated_with, ExpertAssignment,
-                    RoutingStatistics,
-                },
-                parallel::ParallelExecutionContext,
-            },
+            cache::state::MlxHybridState, distributed::parallel::ParallelExecutionContext,
             execution::layerwise::PipelineStageQuantizationSelection,
-            residency::{
-                expert_cache::ExpertCache,
-                expert_provider::{
-                    GatedProductExpertExecution, GatedProductExpertExecutionMode,
-                    GatedProductExpertExecutorProvider, ResidentExpertExecutorProvider,
-                },
-            },
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
+    },
+    composition::expert_dispatch::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::kimi_linear::KimiLinearBindings,
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_group_unit_count, architecture_parallel_layout,
-        architecture_parameter_unit_owner, base_info, build_pipeline_expert_cache,
-        build_pipeline_layer_storage, checkpoint_backing_shards, decoder_architecture_transport,
+        architecture_parameter_unit_owner, base_info, build_pipeline_layer_storage,
+        build_pipeline_parameter_bank, checkpoint_backing_shards, decoder_architecture_transport,
         execute_resident_distributed_experts, execute_routed_layered_partition_observed,
         load_architecture_static_parameters, pipeline_binding_units, quantize_pipeline_stage_store,
         validate_admitted_pipeline_kind, validate_pipeline_expert_dispatch, BoundPipelineBindings,
@@ -114,7 +106,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 }
@@ -253,20 +245,20 @@ impl PipelineForward for KimiLinearPipelinePartition {
 /// An executable, rank-local piece of a pipeline-parallel model.
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_kimi_linear(
-    spec: &eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GroupedGatedProductSpec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
@@ -279,9 +271,15 @@ fn execute_pipeline_cached_kimi_linear(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     if returned.reduced_output.shape() != hidden.shape() {
@@ -302,14 +300,14 @@ pub(super) fn load_kimi_linear_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::KimiLinear], "Kimi Linear")?;
-    let expert_cache_options = expert_cache_options
+    let parameter_bank_options = parameter_bank_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
-    let binding_adapter = if expert_cache_options.is_some() {
+    let binding_adapter = if parameter_bank_options.is_some() {
         KimiLinearBindings::new_external_experts()
     } else {
         KimiLinearBindings::new()
@@ -332,7 +330,7 @@ pub(super) fn load_kimi_linear_pipeline(
         })
         .transpose()?
         .unwrap_or_else(|| source_args.clone());
-    let target_binding_adapter = if expert_cache_options.is_some() {
+    let target_binding_adapter = if parameter_bank_options.is_some() {
         KimiLinearBindings::new_external_experts()
     } else {
         KimiLinearBindings::new()
@@ -400,8 +398,11 @@ pub(super) fn load_kimi_linear_pipeline(
             Arc::clone(&geometry),
             &parameter_description,
         )?;
-    let mut stage =
-        KimiLinearPipelinePartition::new(architecture, partition, expert_cache_options.is_some())?;
+    let mut stage = KimiLinearPipelinePartition::new(
+        architecture,
+        partition,
+        parameter_bank_options.is_some(),
+    )?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
     let expert_realization = eredu_architectures::kimi_linear::expert_realization_plan(
         &stage.architecture,
@@ -419,7 +420,7 @@ pub(super) fn load_kimi_linear_pipeline(
                 .keys()
                 .any(|(group, unit)| stage.partition.owns_unit(group.as_str(), *unit))
         }) {
-            info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+            info.local_group_indices = assignment.local_global_group_indices().to_vec();
         }
     }
     let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
@@ -496,7 +497,7 @@ pub(super) fn load_kimi_linear_pipeline(
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
             )?;
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 loaded.load_excluding_roles(
                     architecture_parameter_unit_owner::<_, MlxHybridState>(
                         architecture,
@@ -549,7 +550,7 @@ pub(super) fn load_kimi_linear_pipeline(
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 &[eredu_runtime::ParameterRole::ExpertIntermediate]
             } else {
                 &[]
@@ -597,7 +598,7 @@ pub(super) fn load_kimi_linear_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    if let Some(options) = expert_cache_options {
+    if let Some(options) = parameter_bank_options {
         let catalog = eredu_architectures::kimi_linear::expert_residency_catalog(
             store.as_ref(),
             &source_args,
@@ -618,7 +619,7 @@ pub(super) fn load_kimi_linear_pipeline(
             parallel_layout.as_ref(),
         )?;
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
                 Some(options),
@@ -628,7 +629,7 @@ pub(super) fn load_kimi_linear_pipeline(
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| {
                     Error::Parallel("Kimi Linear pipeline expert byte total overflowed".into())
                 })?;
@@ -667,7 +668,7 @@ impl KimiLinearPipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -685,7 +686,7 @@ impl KimiLinearPipelinePartition {
                     context,
                 )
             };
-        let mut provider = ResidentExpertExecutorProvider::new(&mut execute);
+        let mut provider = ResidentGroupedExecutorProvider::new(&mut execute);
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
@@ -741,14 +742,14 @@ impl KimiLinearPipelinePartition {
             ExpertPass::Decode
         };
         let mut statistics = std::mem::take(&mut self.routing_statistics);
-        let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+        let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
             let mode = execution.mode;
             execute_pipeline_cached_kimi_linear(
                 &execution.spec,
                 execution.layer,
                 &execution.hidden,
-                &execution.expert_ids,
-                &execution.route_weights,
+                &execution.group_indices,
+                &execution.coefficients,
                 pass,
                 &cache,
                 &assignment,
@@ -757,21 +758,18 @@ impl KimiLinearPipelinePartition {
                 context,
             )
             .map(|reducible| match mode {
-                GatedProductExpertExecutionMode::Complete => {
+                GatedProductGroupExecutionMode::Complete => {
                     eredu_runtime::RoutedExpertTensorParallelOutput::Complete(reducible)
                 }
-                GatedProductExpertExecutionMode::TensorParallel { .. } => {
+                GatedProductGroupExecutionMode::TensorParallel { .. } => {
                     eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
-                        TensorParallelExpertOutput {
-                            reducible,
-                            post_reduce: None,
-                        },
+                        TensorParallelGroupedOutput::new(reducible, None),
                     )
                 }
             })
             .map_err(|error| Exception::custom(error.to_string()))
         };
-        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+        let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
         let result = execute_neutral_routed_kimi_partition_observed(
             self,
             input,

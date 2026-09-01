@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
-use eredu_core::{QuantizationRequest, ResidencyRequest, SessionCapabilities};
+use eredu_core::{ParallelTopology, QuantizationRequest, ResidencyRequest, SessionCapabilities};
 use eredu_nn::{NeuralBackend, NeuralOperatorCapabilities};
 
 use crate::{
@@ -26,6 +26,7 @@ where
 
 /// Backend implementation route for one source-to-executable weight lowering.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum WeightLoweringKind {
     /// The admitted source encoding is retained by the executable operator.
     Direct,
@@ -37,16 +38,47 @@ pub enum WeightLoweringKind {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WeightLoweringCapability {
     /// Admitted source encoding.
-    pub source: SourceTensorEncoding,
+    source: SourceTensorEncoding,
     /// Backend-neutral executable format produced by the lowering.
-    pub executable: LinearFormat,
+    executable: LinearFormat,
     /// Whether the lowering is direct or transforming.
-    pub kind: WeightLoweringKind,
+    kind: WeightLoweringKind,
 }
 
-/// Residency mechanism implemented for ordinary replicated execution units.
+impl WeightLoweringCapability {
+    /// Creates one exact backend lowering mechanism.
+    pub fn new(
+        source: SourceTensorEncoding,
+        executable: LinearFormat,
+        kind: WeightLoweringKind,
+    ) -> Self {
+        Self {
+            source,
+            executable,
+            kind,
+        }
+    }
+
+    /// Returns the admitted source encoding.
+    pub const fn source(&self) -> &SourceTensorEncoding {
+        &self.source
+    }
+
+    /// Returns the executable format produced by this mechanism.
+    pub const fn executable(&self) -> LinearFormat {
+        self.executable
+    }
+
+    /// Returns whether materialization retains or transforms the source.
+    pub const fn kind(&self) -> WeightLoweringKind {
+        self.kind
+    }
+}
+
+/// Weight-residency mechanism implemented by a backend.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ReplicatedTextResidency {
+#[non_exhaustive]
+pub enum WeightResidencyMechanism {
     /// All parameters remain device resident.
     Resident,
     /// A bounded device window is staged from host storage.
@@ -55,9 +87,10 @@ pub enum ReplicatedTextResidency {
     DiskStreamed,
 }
 
-/// Residency of the selected mutable state representation.
+/// Mutable-state residency mechanism implemented by a backend.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ReplicatedTextStateResidency {
+#[non_exhaustive]
+pub enum StateResidencyMechanism {
     /// State tensors remain on the execution device.
     Device,
     /// State blocks use bounded paged storage.
@@ -68,109 +101,480 @@ pub enum ReplicatedTextStateResidency {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParameterTransformTarget {
     /// Requested load-time transform.
-    pub request: QuantizationRequest,
+    request: QuantizationRequest,
     /// Executable format produced for this parameter.
-    pub executable: LinearFormat,
+    executable: LinearFormat,
+}
+
+impl ParameterTransformTarget {
+    /// Creates one architecture-admitted load-time transform target.
+    pub const fn new(request: QuantizationRequest, executable: LinearFormat) -> Self {
+        Self {
+            request,
+            executable,
+        }
+    }
+
+    /// Returns the caller request selecting this transform.
+    pub const fn request(&self) -> QuantizationRequest {
+        self.request
+    }
+
+    /// Returns the architecture-admitted executable format.
+    pub const fn executable(&self) -> LinearFormat {
+        self.executable
+    }
 }
 
 /// Exact admitted source and executable constraints for one logical parameter.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextParameterRequirement {
     /// Canonical logical parameter identity.
-    pub name: String,
+    name: String,
     /// Physical outputs admitted as sources for this logical parameter.
-    pub sources: Vec<String>,
+    sources: Vec<String>,
     /// Encoding of the selected physical source.
-    pub source_encoding: SourceTensorEncoding,
+    source_encoding: SourceTensorEncoding,
     /// Architecture-selected native executable format.
-    pub native_executable: LinearFormat,
-    /// Architecture-valid load-time transformations.
-    pub transform_targets: Vec<ParameterTransformTarget>,
+    native_executable: LinearFormat,
+    /// Architecture permits validated affine load-time transforms.
+    affine_transforms: bool,
+    /// Architecture permits the MXFP4 load-time transform.
+    mxfp4_transform: bool,
+}
+
+impl ReplicatedTextParameterRequirement {
+    /// Creates one exact logical-parameter requirement.
+    pub fn new(
+        name: impl Into<String>,
+        sources: Vec<String>,
+        source_encoding: SourceTensorEncoding,
+        native_executable: LinearFormat,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(ReplicatedTextContractError::invalid(
+                "logical parameter identity is empty",
+            ));
+        }
+        if sources.is_empty() || sources.iter().any(|source| source.trim().is_empty()) {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "logical parameter {name:?} has no valid physical source"
+            )));
+        }
+        Ok(Self {
+            name,
+            sources,
+            source_encoding,
+            native_executable,
+            affine_transforms: false,
+            mxfp4_transform: false,
+        })
+    }
+
+    /// Permits validated affine load-time transforms for this parameter.
+    pub const fn with_affine_transforms(mut self) -> Self {
+        self.affine_transforms = true;
+        self
+    }
+
+    /// Permits the MXFP4 load-time transform for this parameter.
+    pub const fn with_mxfp4_transform(mut self) -> Self {
+        self.mxfp4_transform = true;
+        self
+    }
+
+    /// Returns the canonical logical identity.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns exact admitted physical source identities.
+    pub fn sources(&self) -> &[String] {
+        &self.sources
+    }
+
+    /// Returns the admitted physical source encoding.
+    pub const fn source_encoding(&self) -> &SourceTensorEncoding {
+        &self.source_encoding
+    }
+
+    /// Returns the architecture-native executable format.
+    pub const fn native_executable(&self) -> LinearFormat {
+        self.native_executable
+    }
+
+    /// Resolves a caller transform through architecture-owned constraints.
+    pub fn transform_target(
+        &self,
+        request: QuantizationRequest,
+    ) -> Result<Option<ParameterTransformTarget>, ReplicatedTextContractError> {
+        let executable = match request {
+            QuantizationRequest::Affine { group_size, bits } if self.affine_transforms => {
+                let group_size = i32::try_from(group_size).map_err(|_| {
+                    ReplicatedTextContractError::invalid("affine group size exceeds i32")
+                })?;
+                Some(LinearFormat::Affine(
+                    eredu_checkpoint::AffineQuantization::new(group_size, i32::from(bits))
+                        .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?,
+                ))
+            }
+            QuantizationRequest::MxFp4 if self.mxfp4_transform => Some(LinearFormat::MxFp4),
+            _ => None,
+        };
+        Ok(executable.map(|executable| ParameterTransformTarget::new(request, executable)))
+    }
+}
+
+/// Invalid public replicated-text contract construction.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("invalid replicated text contract: {message}")]
+pub struct ReplicatedTextContractError {
+    message: String,
+}
+
+impl ReplicatedTextContractError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Returns the stable semantic diagnostic.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
     /// Optional neural operations required by the architecture equations.
-    pub operators: NeuralOperatorCapabilities,
+    operators: NeuralOperatorCapabilities,
     /// Stable architecture-owned execution graph.
-    pub execution_graph: ExecutionGraph,
+    execution_graph: ExecutionGraph,
     /// Exact group-major execution-unit geometry.
-    pub execution_units: ExecutionUnitLayout,
+    execution_units: ExecutionUnitLayout,
     /// Architecture-owned transport semantics in graph-group order.
-    pub group_transports: Vec<ArchitectureGroupTransport>,
+    group_transports: Vec<ArchitectureGroupTransport>,
     /// Complete architecture-owned mutable-state geometry.
-    pub state_layout: StateLayout,
+    state_layout: StateLayout,
     /// Canonical logical parameter requirements.
-    pub parameters: Vec<ReplicatedTextParameterRequirement>,
-    /// Exact session facilities required by the caller.
-    pub session: SessionCapabilities,
-    /// Prompt-cache persistence is part of the admitted lifecycle.
-    pub prompt_cache: bool,
-    /// Submitted native work must expose exact completion ownership.
-    pub exact_completion: bool,
+    parameters: Vec<ReplicatedTextParameterRequirement>,
 }
 
-/// Family-neutral backend mechanism report used for replicated text selection.
+impl ReplicatedTextRequirements {
+    /// Creates exact requirements from architecture and admitted-artifact facts only.
+    pub fn new(
+        operators: NeuralOperatorCapabilities,
+        execution_graph: ExecutionGraph,
+        execution_units: ExecutionUnitLayout,
+        group_transports: Vec<ArchitectureGroupTransport>,
+        state_layout: StateLayout,
+        parameters: Vec<ReplicatedTextParameterRequirement>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if group_transports.len() != execution_graph.groups().len() {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "{} group transports do not match {} execution groups",
+                group_transports.len(),
+                execution_graph.groups().len()
+            )));
+        }
+        let mut names = BTreeSet::new();
+        if parameters
+            .iter()
+            .any(|parameter| !names.insert(parameter.name()))
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "logical parameter identities are not unique",
+            ));
+        }
+        Ok(Self {
+            operators,
+            execution_graph,
+            execution_units,
+            group_transports,
+            state_layout,
+            parameters,
+        })
+    }
+
+    /// Returns required optional neural-operation semantics.
+    pub const fn operators(&self) -> NeuralOperatorCapabilities {
+        self.operators
+    }
+    /// Returns the architecture-owned execution graph.
+    pub const fn execution_graph(&self) -> &ExecutionGraph {
+        &self.execution_graph
+    }
+    /// Returns group-major execution-unit geometry.
+    pub const fn execution_units(&self) -> &ExecutionUnitLayout {
+        &self.execution_units
+    }
+    /// Returns architecture-owned group transports.
+    pub fn group_transports(&self) -> &[ArchitectureGroupTransport] {
+        &self.group_transports
+    }
+    /// Returns complete mutable-state geometry.
+    pub const fn state_layout(&self) -> &StateLayout {
+        &self.state_layout
+    }
+    /// Returns canonical logical parameter requirements.
+    pub fn parameters(&self) -> &[ReplicatedTextParameterRequirement] {
+        &self.parameters
+    }
+}
+
+/// Family- and execution-class-neutral backend mechanism report.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ReplicatedTextBackendCapabilities {
+pub struct BackendMechanismCapabilities {
     /// Optional neural operations implemented by the backend.
-    pub operators: NeuralOperatorCapabilities,
+    operators: NeuralOperatorCapabilities,
     /// Exact admitted source-to-executable lowerings.
-    pub weight_lowerings: Vec<WeightLoweringCapability>,
+    weight_lowerings: Vec<WeightLoweringCapability>,
     /// Ordinary parameter residency mechanisms.
-    pub residencies: Vec<ReplicatedTextResidency>,
+    weight_residencies: Vec<WeightResidencyMechanism>,
     /// Mutable-state residency mechanisms.
-    pub state_residencies: Vec<ReplicatedTextStateResidency>,
+    state_residencies: Vec<StateResidencyMechanism>,
     /// Exact session facilities implemented by the constructed session.
-    pub session: SessionCapabilities,
+    session: SessionCapabilities,
     /// Prompt-cache persistence mechanism is available.
-    pub prompt_cache: bool,
+    prompt_cache: bool,
     /// Exact completion ownership is implemented for submitted work.
-    pub exact_completion: bool,
+    exact_completion: bool,
+}
+
+impl BackendMechanismCapabilities {
+    /// Creates a fail-closed mechanism report.
+    pub fn new(
+        operators: NeuralOperatorCapabilities,
+        weight_lowerings: Vec<WeightLoweringCapability>,
+        weight_residencies: Vec<WeightResidencyMechanism>,
+        state_residencies: Vec<StateResidencyMechanism>,
+    ) -> Self {
+        Self {
+            operators,
+            weight_lowerings,
+            weight_residencies,
+            state_residencies,
+            session: SessionCapabilities::default(),
+            prompt_cache: false,
+            exact_completion: false,
+        }
+    }
+
+    /// Adds supported session-observation and persistence mechanisms.
+    pub const fn with_session(mut self, session: SessionCapabilities) -> Self {
+        self.session = session;
+        self
+    }
+    /// Declares prompt-cache persistence support.
+    pub const fn with_prompt_cache(mut self, supported: bool) -> Self {
+        self.prompt_cache = supported;
+        self
+    }
+    /// Declares exact native-completion ownership support.
+    pub const fn with_exact_completion(mut self, supported: bool) -> Self {
+        self.exact_completion = supported;
+        self
+    }
+    /// Returns neural-operation mechanisms.
+    pub const fn operators(&self) -> NeuralOperatorCapabilities {
+        self.operators
+    }
+    /// Returns source-to-executable weight-lowering mechanisms.
+    pub fn weight_lowerings(&self) -> &[WeightLoweringCapability] {
+        &self.weight_lowerings
+    }
+    /// Returns weight-residency mechanisms.
+    pub fn weight_residencies(&self) -> &[WeightResidencyMechanism] {
+        &self.weight_residencies
+    }
+    /// Returns mutable-state residency mechanisms.
+    pub fn state_residencies(&self) -> &[StateResidencyMechanism] {
+        &self.state_residencies
+    }
+    /// Returns session-observation and persistence mechanisms.
+    pub const fn session(&self) -> SessionCapabilities {
+        self.session
+    }
+    /// Returns whether prompt-cache persistence is supported.
+    pub const fn prompt_cache(&self) -> bool {
+        self.prompt_cache
+    }
+    /// Returns whether exact native-completion ownership is supported.
+    pub const fn exact_completion(&self) -> bool {
+        self.exact_completion
+    }
 }
 
 /// Caller choices resolved while selecting one replicated text realization.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextSelectionRequest {
+    /// Requested execution topology.
+    topology: Option<ParallelTopology>,
     /// Requested ordinary parameter residency.
-    pub residency: ResidencyRequest,
+    residency: ResidencyRequest,
     /// Requested mutable-state implementation and its exact residency policy.
-    pub state: CacheResidencyPolicy,
+    state: CacheResidencyPolicy,
     /// Optional load-time transform.
-    pub quantization: Option<QuantizationRequest>,
+    quantization: Option<QuantizationRequest>,
+    /// Requested optional session facilities.
+    session: SessionCapabilities,
+    /// Whether prompt-cache persistence is requested.
+    prompt_cache: bool,
+    /// Whether exact completion ownership is requested.
+    exact_completion: bool,
+}
+
+impl ReplicatedTextSelectionRequest {
+    /// Creates a replicated request with fail-closed optional facilities.
+    pub fn new(residency: ResidencyRequest, state: CacheResidencyPolicy) -> Self {
+        Self {
+            topology: None,
+            residency,
+            state,
+            quantization: None,
+            session: SessionCapabilities::default(),
+            prompt_cache: false,
+            exact_completion: false,
+        }
+    }
+    /// Sets the requested topology.
+    pub const fn with_topology(mut self, topology: ParallelTopology) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+    /// Sets the optional load-time transform.
+    pub const fn with_quantization(mut self, quantization: QuantizationRequest) -> Self {
+        self.quantization = Some(quantization);
+        self
+    }
+    /// Sets requested session facilities.
+    pub const fn with_session(mut self, session: SessionCapabilities) -> Self {
+        self.session = session;
+        self
+    }
+    /// Requests prompt-cache persistence.
+    pub const fn with_prompt_cache(mut self, required: bool) -> Self {
+        self.prompt_cache = required;
+        self
+    }
+    /// Requests exact completion ownership.
+    pub const fn with_exact_completion(mut self, required: bool) -> Self {
+        self.exact_completion = required;
+        self
+    }
+    /// Returns the requested topology, where `None` means replicated.
+    pub const fn topology(&self) -> Option<ParallelTopology> {
+        self.topology
+    }
+    /// Returns the requested weight residency.
+    pub const fn residency(&self) -> ResidencyRequest {
+        self.residency
+    }
+    /// Returns the requested state policy.
+    pub const fn state(&self) -> &CacheResidencyPolicy {
+        &self.state
+    }
+    /// Returns the requested transform.
+    pub const fn quantization(&self) -> Option<QuantizationRequest> {
+        self.quantization
+    }
+    /// Returns requested session facilities.
+    pub const fn session(&self) -> SessionCapabilities {
+        self.session
+    }
+    /// Returns whether prompt-cache persistence is requested.
+    pub const fn prompt_cache(&self) -> bool {
+        self.prompt_cache
+    }
+    /// Returns whether exact completion ownership is requested.
+    pub const fn exact_completion(&self) -> bool {
+        self.exact_completion
+    }
 }
 
 /// Selected lowering for one canonical logical parameter.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedParameterRealization {
     /// Canonical logical parameter identity.
-    pub name: String,
+    name: String,
     /// Physical outputs admitted as sources for this logical parameter.
-    pub sources: Vec<String>,
+    sources: Vec<String>,
     /// Admitted physical encoding.
-    pub source_encoding: SourceTensorEncoding,
+    source_encoding: SourceTensorEncoding,
     /// Exact executable format used to construct the architecture module.
-    pub executable: LinearFormat,
+    executable: LinearFormat,
     /// Backend lowering selected for materialization.
-    pub lowering: WeightLoweringKind,
+    lowering: WeightLoweringKind,
+}
+
+impl SelectedParameterRealization {
+    /// Returns the canonical logical identity.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// Returns admitted physical source identities.
+    pub fn sources(&self) -> &[String] {
+        &self.sources
+    }
+    /// Returns the admitted source encoding.
+    pub const fn source_encoding(&self) -> &SourceTensorEncoding {
+        &self.source_encoding
+    }
+    /// Returns the selected executable format.
+    pub const fn executable(&self) -> LinearFormat {
+        self.executable
+    }
+    /// Returns the selected backend lowering kind.
+    pub const fn lowering(&self) -> WeightLoweringKind {
+        self.lowering
+    }
 }
 
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
     /// Selected ordinary parameter residency.
-    pub residency: ReplicatedTextResidency,
+    residency: WeightResidencyMechanism,
     /// Selected mutable-state implementation and its exact residency policy.
-    pub state: CacheResidencyPolicy,
+    state: CacheResidencyPolicy,
     /// Exact per-parameter source, executable format, and lowering.
-    pub parameters: Vec<SelectedParameterRealization>,
+    parameters: Vec<SelectedParameterRealization>,
     /// Required observation facilities admitted by the backend.
-    pub session: SessionCapabilities,
+    session: SessionCapabilities,
     /// Prompt-cache persistence is selected for this lifecycle.
-    pub prompt_cache: bool,
+    prompt_cache: bool,
     /// Exact completion ownership selected for this lifecycle.
-    pub exact_completion: bool,
+    exact_completion: bool,
+}
+
+impl SelectedReplicatedTextRealization {
+    /// Returns selected weight residency.
+    pub const fn residency(&self) -> WeightResidencyMechanism {
+        self.residency
+    }
+    /// Returns selected mutable-state policy.
+    pub const fn state(&self) -> &CacheResidencyPolicy {
+        &self.state
+    }
+    /// Returns exact per-parameter realizations.
+    pub fn parameters(&self) -> &[SelectedParameterRealization] {
+        &self.parameters
+    }
+    /// Returns selected session facilities.
+    pub const fn session(&self) -> SessionCapabilities {
+        self.session
+    }
+    /// Returns whether prompt-cache persistence was selected.
+    pub const fn prompt_cache(&self) -> bool {
+        self.prompt_cache
+    }
+    /// Returns whether exact completion ownership was selected.
+    pub const fn exact_completion(&self) -> bool {
+        self.exact_completion
+    }
 }
 
 /// Complete fail-closed selection diagnostic.
@@ -191,9 +595,15 @@ impl ReplicatedTextSelectionError {
 pub fn select_replicated_text_realization(
     requirements: &ReplicatedTextRequirements,
     request: &ReplicatedTextSelectionRequest,
-    capabilities: &ReplicatedTextBackendCapabilities,
+    capabilities: &BackendMechanismCapabilities,
 ) -> Result<SelectedReplicatedTextRealization, ReplicatedTextSelectionError> {
     let mut issues = Vec::new();
+    if request
+        .topology
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        issues.push("replicated execution topology".into());
+    }
     if !capabilities.operators.contains(requirements.operators) {
         issues.extend(
             capabilities
@@ -204,39 +614,39 @@ pub fn select_replicated_text_realization(
         );
     }
     let residency = match request.residency {
-        ResidencyRequest::FullyResident => Some(ReplicatedTextResidency::Resident),
-        ResidencyRequest::LayerwiseHost => Some(ReplicatedTextResidency::Windowed),
-        ResidencyRequest::DenseDiskStream => Some(ReplicatedTextResidency::DiskStreamed),
+        ResidencyRequest::FullyResident => Some(WeightResidencyMechanism::Resident),
+        ResidencyRequest::LayerwiseHost => Some(WeightResidencyMechanism::Windowed),
+        ResidencyRequest::DenseDiskStream => Some(WeightResidencyMechanism::DiskStreamed),
         ResidencyRequest::ExpertCache => {
             issues.push("independently addressable parameter-bank residency".into());
             None
         }
     };
     if let Some(residency) = residency {
-        if !capabilities.residencies.contains(&residency) {
+        if !capabilities.weight_residencies.contains(&residency) {
             issues.push(format!("weight residency {residency:?}"));
         }
     }
     let state_residency = match &request.state {
-        CacheResidencyPolicy::Device => ReplicatedTextStateResidency::Device,
-        CacheResidencyPolicy::Paged(_) => ReplicatedTextStateResidency::Paged,
+        CacheResidencyPolicy::Device => StateResidencyMechanism::Device,
+        CacheResidencyPolicy::Paged(_) => StateResidencyMechanism::Paged,
     };
     if !capabilities.state_residencies.contains(&state_residency) {
         issues.push(format!("state residency {state_residency:?}"));
     }
     for (required, supported, name) in [
         (
-            requirements.session.persistent_cache,
+            request.session.persistent_cache,
             capabilities.session.persistent_cache,
             "persistent_cache",
         ),
         (
-            requirements.session.output_observation,
+            request.session.output_observation,
             capabilities.session.output_observation,
             "output_observation",
         ),
         (
-            requirements.session.activation_inspection,
+            request.session.activation_inspection,
             capabilities.session.activation_inspection,
             "activation_inspection",
         ),
@@ -245,10 +655,10 @@ pub fn select_replicated_text_realization(
             issues.push(format!("session capability {name}"));
         }
     }
-    if requirements.prompt_cache && !capabilities.prompt_cache {
+    if request.prompt_cache && !capabilities.prompt_cache {
         issues.push("prompt-cache persistence".into());
     }
-    if requirements.exact_completion && !capabilities.exact_completion {
+    if request.exact_completion && !capabilities.exact_completion {
         issues.push("exact completion ownership".into());
     }
 
@@ -263,11 +673,13 @@ pub fn select_replicated_text_realization(
             continue;
         }
         let executable = match request.quantization {
-            Some(request) => parameter
-                .transform_targets
-                .iter()
-                .find(|target| target.request == request)
-                .map(|target| target.executable),
+            Some(request) => match parameter.transform_target(request) {
+                Ok(target) => target.map(|target| target.executable()),
+                Err(error) => {
+                    issues.push(error.to_string());
+                    None
+                }
+            },
             None => Some(parameter.native_executable),
         };
         let Some(executable) = executable else {
@@ -301,9 +713,9 @@ pub fn select_replicated_text_realization(
         residency: residency.expect("unsupported residency returned an issue"),
         state: request.state.clone(),
         parameters,
-        session: requirements.session,
-        prompt_cache: requirements.prompt_cache,
-        exact_completion: requirements.exact_completion,
+        session: request.session,
+        prompt_cache: request.prompt_cache,
+        exact_completion: request.exact_completion,
     })
 }
 
@@ -329,11 +741,11 @@ mod tests {
         let graph =
             ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
         let execution_units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
-        ReplicatedTextRequirements {
-            operators: NeuralOperatorCapabilities::EXP,
-            execution_graph: graph,
+        ReplicatedTextRequirements::new(
+            NeuralOperatorCapabilities::EXP,
+            graph,
             execution_units,
-            group_transports: vec![ArchitectureGroupTransport {
+            vec![ArchitectureGroupTransport {
                 placement: ArchitectureGroupPlacement::Pipeline,
                 kind: ArchitectureGroupKind::Decoder,
                 first_owner_static_roles: vec!["embedding".into()],
@@ -342,7 +754,7 @@ mod tests {
                 parallel_subgroup: None,
                 request_optional: false,
             }],
-            state_layout: StateLayout::new(
+            StateLayout::new(
                 LayerSchedule::new(
                     1,
                     vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap()],
@@ -350,105 +762,100 @@ mod tests {
                 .unwrap(),
             )
             .unwrap(),
-            parameters: vec![ReplicatedTextParameterRequirement {
-                name: "model.layers.0.mlp.weight".into(),
-                sources: vec!["blk.0.ffn.weight".into()],
-                source_encoding: SourceTensorEncoding::Safetensors(StoredDtype::F16),
-                native_executable: LinearFormat::Dense,
-                transform_targets: vec![ParameterTransformTarget {
-                    request: QuantizationRequest::Affine {
-                        group_size: 64,
-                        bits: 4,
-                    },
-                    executable: LinearFormat::Affine(AffineQuantization::new(64, 4).unwrap()),
-                }],
-            }],
-            session: SessionCapabilities {
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: true,
-            },
-            prompt_cache: true,
-            exact_completion: true,
-        }
+            vec![ReplicatedTextParameterRequirement::new(
+                "model.layers.0.mlp.weight",
+                vec!["blk.0.ffn.weight".into()],
+                SourceTensorEncoding::Safetensors(StoredDtype::F16),
+                LinearFormat::Dense,
+            )
+            .unwrap()
+            .with_affine_transforms()],
+        )
+        .unwrap()
     }
 
-    fn capabilities() -> ReplicatedTextBackendCapabilities {
+    fn capabilities() -> BackendMechanismCapabilities {
         let source = SourceTensorEncoding::Safetensors(StoredDtype::F16);
-        ReplicatedTextBackendCapabilities {
-            operators: NeuralOperatorCapabilities::EXP,
-            weight_lowerings: vec![
-                WeightLoweringCapability {
-                    source: source.clone(),
-                    executable: LinearFormat::Dense,
-                    kind: WeightLoweringKind::Direct,
-                },
-                WeightLoweringCapability {
+        BackendMechanismCapabilities::new(
+            NeuralOperatorCapabilities::EXP,
+            vec![
+                WeightLoweringCapability::new(
+                    source.clone(),
+                    LinearFormat::Dense,
+                    WeightLoweringKind::Direct,
+                ),
+                WeightLoweringCapability::new(
                     source,
-                    executable: LinearFormat::Affine(AffineQuantization::new(64, 4).unwrap()),
-                    kind: WeightLoweringKind::Transform,
-                },
+                    LinearFormat::Affine(AffineQuantization::new(64, 4).unwrap()),
+                    WeightLoweringKind::Transform,
+                ),
             ],
-            residencies: vec![
-                ReplicatedTextResidency::Resident,
-                ReplicatedTextResidency::Windowed,
-                ReplicatedTextResidency::DiskStreamed,
+            vec![
+                WeightResidencyMechanism::Resident,
+                WeightResidencyMechanism::Windowed,
+                WeightResidencyMechanism::DiskStreamed,
             ],
-            state_residencies: vec![
-                ReplicatedTextStateResidency::Device,
-                ReplicatedTextStateResidency::Paged,
+            vec![
+                StateResidencyMechanism::Device,
+                StateResidencyMechanism::Paged,
             ],
-            session: SessionCapabilities {
+        )
+        .with_session(SessionCapabilities {
+            persistent_cache: true,
+            output_observation: true,
+            activation_inspection: true,
+        })
+        .with_prompt_cache(true)
+        .with_exact_completion(true)
+    }
+
+    fn request(residency: ResidencyRequest) -> ReplicatedTextSelectionRequest {
+        ReplicatedTextSelectionRequest::new(residency, paged_state())
+            .with_session(SessionCapabilities {
                 persistent_cache: true,
                 output_observation: true,
                 activation_inspection: true,
-            },
-            prompt_cache: true,
-            exact_completion: true,
-        }
+            })
+            .with_prompt_cache(true)
+            .with_exact_completion(true)
     }
 
     #[test]
     fn selection_is_deterministic_and_keeps_source_format_distinct() {
-        let request = ReplicatedTextSelectionRequest {
-            residency: ResidencyRequest::DenseDiskStream,
-            state: paged_state(),
-            quantization: Some(QuantizationRequest::Affine {
+        let request = request(ResidencyRequest::DenseDiskStream).with_quantization(
+            QuantizationRequest::Affine {
                 group_size: 64,
                 bits: 4,
-            }),
-        };
+            },
+        );
         let left =
             select_replicated_text_realization(&requirements(), &request, &capabilities()).unwrap();
         let right =
             select_replicated_text_realization(&requirements(), &request, &capabilities()).unwrap();
         assert_eq!(left, right);
-        assert_eq!(left.residency, ReplicatedTextResidency::DiskStreamed);
-        assert_eq!(left.state, paged_state());
-        assert_eq!(left.parameters[0].lowering, WeightLoweringKind::Transform);
+        assert_eq!(left.residency(), WeightResidencyMechanism::DiskStreamed);
+        assert_eq!(left.state(), &paged_state());
+        assert_eq!(
+            left.parameters()[0].lowering(),
+            WeightLoweringKind::Transform
+        );
         assert_ne!(
-            format!("{:?}", left.parameters[0].source_encoding),
-            format!("{:?}", left.parameters[0].executable)
+            format!("{:?}", left.parameters()[0].source_encoding()),
+            format!("{:?}", left.parameters()[0].executable())
         );
     }
 
     #[test]
     fn selection_reports_all_missing_mechanisms_together() {
-        let mut capabilities = capabilities();
-        capabilities.operators = NeuralOperatorCapabilities::NONE;
-        capabilities.weight_lowerings.clear();
-        capabilities.residencies.clear();
-        capabilities.state_residencies.clear();
-        capabilities.session = SessionCapabilities::default();
-        capabilities.prompt_cache = false;
-        capabilities.exact_completion = false;
+        let capabilities = BackendMechanismCapabilities::new(
+            NeuralOperatorCapabilities::NONE,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let error = select_replicated_text_realization(
             &requirements(),
-            &ReplicatedTextSelectionRequest {
-                residency: ResidencyRequest::LayerwiseHost,
-                state: paged_state(),
-                quantization: None,
-            },
+            &request(ResidencyRequest::LayerwiseHost),
             &capabilities,
         )
         .unwrap_err();

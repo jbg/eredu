@@ -1,9 +1,11 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
 };
@@ -14,30 +16,20 @@ use crate::{
         error::Error,
         nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
-            cache::state::MlxHybridState,
-            distributed::{
-                expert::{
-                    dispatch_local_with, dispatch_replicated_with, ExpertAssignment,
-                    RoutingStatistics,
-                },
-                parallel::ParallelExecutionContext,
-            },
+            cache::state::MlxHybridState, distributed::parallel::ParallelExecutionContext,
             execution::layerwise::PipelineStageQuantizationSelection,
-            residency::{
-                expert_cache::ExpertCache,
-                expert_provider::{
-                    GatedProductExpertExecution, GatedProductExpertExecutorProvider,
-                    ResidentExpertExecutorProvider,
-                },
-            },
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
+    },
+    composition::expert_dispatch::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::lfm2::Lfm2Bindings,
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_group_unit_count, architecture_parallel_layout,
-        architecture_parameter_unit_owner, base_info, build_pipeline_expert_cache,
-        build_pipeline_layer_storage, decoder_architecture_transport,
+        architecture_parameter_unit_owner, base_info, build_pipeline_layer_storage,
+        build_pipeline_parameter_bank, decoder_architecture_transport,
         execute_layered_partition_observed, execute_resident_distributed_experts,
         execute_routed_layered_partition_observed, load_architecture_static_parameters,
         pipeline_binding_units, quantize_pipeline_stage_store, validate_admitted_pipeline_kind,
@@ -144,7 +136,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 }
@@ -269,20 +261,20 @@ impl PipelineForward for Lfm2PipelinePartition {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_lfm2(
-    spec: &eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GroupedGatedProductSpec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
@@ -295,9 +287,15 @@ fn execute_pipeline_cached_lfm2(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     Ok(returned.reduced_output)
@@ -312,14 +310,14 @@ pub(super) fn load_lfm2_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Lfm2], "LFM2")?;
-    let expert_cache_options = expert_cache_options
+    let parameter_bank_options = parameter_bank_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
-    let binding_adapter = if expert_cache_options.is_some() {
+    let binding_adapter = if parameter_bank_options.is_some() {
         Lfm2Bindings::new_external_experts()
     } else {
         Lfm2Bindings::new()
@@ -343,7 +341,7 @@ pub(super) fn load_lfm2_pipeline(
         },
     )?;
     let expert_quantization = quantize_on_load;
-    let target_binding_adapter = if expert_cache_options.is_some() {
+    let target_binding_adapter = if parameter_bank_options.is_some() {
         Lfm2Bindings::new_external_experts()
     } else {
         Lfm2Bindings::new()
@@ -434,7 +432,7 @@ pub(super) fn load_lfm2_pipeline(
             &parameter_description,
         )?;
     let mut stage =
-        Lfm2PipelinePartition::new(architecture, partition, expert_cache_options.is_some())?;
+        Lfm2PipelinePartition::new(architecture, partition, parameter_bank_options.is_some())?;
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
     let expert_realization = eredu_architectures::lfm2::expert_realization_plan(
         &stage.architecture,
@@ -452,7 +450,7 @@ pub(super) fn load_lfm2_pipeline(
                 .keys()
                 .any(|(group, unit)| stage.partition.owns_unit(group.as_str(), *unit))
         }) {
-            info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+            info.local_group_indices = assignment.local_global_group_indices().to_vec();
         }
     }
     let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
@@ -532,7 +530,7 @@ pub(super) fn load_lfm2_pipeline(
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
             )?;
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 loaded.load_excluding_roles(
                     architecture_parameter_unit_owner::<_, MlxHybridState>(
                         architecture,
@@ -575,7 +573,7 @@ pub(super) fn load_lfm2_pipeline(
         stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 &[eredu_runtime::ParameterRole::ExpertIntermediate]
             } else {
                 &[]
@@ -622,7 +620,7 @@ pub(super) fn load_lfm2_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    if let Some(options) = expert_cache_options {
+    if let Some(options) = parameter_bank_options {
         let catalog =
             eredu_architectures::lfm2::expert_residency_catalog(store.as_ref(), &source_args)
                 .map_err(Error::ArchitectureModel)?;
@@ -641,7 +639,7 @@ pub(super) fn load_lfm2_pipeline(
             parallel_layout.as_ref(),
         )?;
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
                 Some(options),
@@ -651,7 +649,7 @@ pub(super) fn load_lfm2_pipeline(
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| {
                     Error::Parallel("LFM2 pipeline expert byte total overflowed".into())
                 })?;
@@ -690,7 +688,7 @@ impl Lfm2PipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -708,7 +706,7 @@ impl Lfm2PipelinePartition {
                     context,
                 )
             };
-        let mut provider = ResidentExpertExecutorProvider::new(&mut execute);
+        let mut provider = ResidentGroupedExecutorProvider::new(&mut execute);
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
@@ -764,13 +762,13 @@ impl Lfm2PipelinePartition {
             ExpertPass::Decode
         };
         let mut statistics = std::mem::take(&mut self.routing_statistics);
-        let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+        let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
             execute_pipeline_cached_lfm2(
                 &execution.spec,
                 execution.layer,
                 &execution.hidden,
-                &execution.expert_ids,
-                &execution.route_weights,
+                &execution.group_indices,
+                &execution.coefficients,
                 pass,
                 &cache,
                 &assignment,
@@ -781,7 +779,7 @@ impl Lfm2PipelinePartition {
             .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
             .map_err(|error| Exception::custom(error.to_string()))
         };
-        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+        let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
         let result = execute_neutral_routed_lfm2_partition_observed(
             self,
             input,

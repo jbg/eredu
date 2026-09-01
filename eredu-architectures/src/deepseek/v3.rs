@@ -5,8 +5,8 @@ use std::sync::Arc;
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
-    Error, GatedProductExpertBankOperator, LinearOperator, NormalizationOperator, Parameterized,
-    RoutedNeuralBackend, Tensor,
+    Error, GroupedGatedProductOperator, GroupedNeuralBackend, LinearOperator,
+    NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
@@ -62,16 +62,16 @@ pub fn state_identity(
 /// One target or appended prediction execution unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
+pub enum Unit<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
     /// Ordinary target decoder block.
     Target(V3Block<B>),
     /// One embedded prediction depth.
     Prediction(V3PredictionLayer<B>),
 }
 
-impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Unit<B> {
+impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> Unit<B> {
     /// Returns the exact routed bank specification retained by this realized unit.
-    pub fn expert_bank_spec(&self) -> Option<&eredu_nn::GatedProductExpertBankSpec> {
+    pub fn expert_bank_spec(&self) -> Option<&eredu_nn::GroupedGatedProductSpec> {
         let feed_forward = match self {
             Self::Target(block) => &block.feed_forward,
             Self::Prediction(prediction) => &prediction.decoder.feed_forward,
@@ -85,7 +85,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Unit<B> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -113,7 +113,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -277,17 +277,17 @@ pub enum TargetPartitionInput<'a, T> {
 
 /// Thin target-model architecture over the shared V3 block and generic
 /// resident/layerwise execution lifecycle.
-pub struct Model<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
+pub struct Model<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
     args: V3Args,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
     parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
-    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     type DefinitionError = Error;
 
@@ -340,7 +340,7 @@ where
     }
 }
 
-impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
+impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Builds the unloaded pinned V3 modules.
     pub fn new(args: V3Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
@@ -402,7 +402,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Installs the architecture-derived expert realization used by every unit factory.
     pub fn install_expert_realization(
         &mut self,
-        realization: crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
         self.expert_realization = Some(realization);
     }
@@ -458,7 +458,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
             };
             match (feed_forward, spec) {
                 (super::block::V3FeedForward::Routed(moe), Some(spec)) => {
-                    moe.experts = B::gated_product_expert_bank(spec.clone(), context)?;
+                    moe.experts = B::grouped_gated_product(spec.clone(), context)?;
                 }
                 (super::block::V3FeedForward::Routed(_), None) => {
                     return Err(Error::backend(format!(
@@ -1065,7 +1065,7 @@ fn prediction_groups(args: &V3Args) -> Result<SequentialPredictionGroups, Error>
 
 impl<B, S> LayeredArchitecture<B, S> for Model<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -1315,7 +1315,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -1465,7 +1465,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1565,7 +1565,7 @@ pub fn moe_policy(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
 pub fn expert_bank_spec(
     args: &V3Args,
     layer: usize,
-) -> Result<eredu_nn::GatedProductExpertBankSpec, Error> {
+) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
     let policy = if layer < usize::try_from(args.num_hidden_layers).map_err(Error::backend)? {
         moe_policy(args, layer)?
     } else {
@@ -1579,12 +1579,8 @@ pub(crate) fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<eredu_nn::GatedProductExpertBankSpec, Error> {
-    let mut spec = expert_bank_spec(args, layer)?;
-    spec.expert_count = expert_count;
-    spec.intermediate_dimensions = intermediate_dimensions;
-    spec.validate()?;
-    Ok(spec)
+) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
+    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
 pub(crate) fn prediction_moe_policy(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
@@ -1611,7 +1607,7 @@ fn moe_policy_for_layer(args: &V3Args, layer: usize) -> Result<MoePolicy, Error>
             .moe_intermediate_size
             .checked_mul(args.n_shared_experts)
             .ok_or_else(|| Error::backend("V3 shared expert width overflowed"))?,
-        scoring: eredu_nn::RoutingScoring::Sigmoid,
+        scoring: eredu_nn::GroupScoring::Sigmoid,
         normalize_routes: args.norm_topk_prob,
         normalization_epsilon: 1e-20,
         routed_scaling: args.routed_scaling_factor,

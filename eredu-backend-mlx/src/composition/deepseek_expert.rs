@@ -4,18 +4,17 @@ use std::{collections::BTreeSet, ops::Range};
 
 use eredu_architectures::deepseek::{self, V3Args, V4Args};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::{
     error::Error,
-    runtime::residency::{
-        expert_cache::{ExpertCache, ExpertCatalogEntry},
-        expert_provider::CachedGatedProductExpertProvider,
-    },
+    runtime::residency::parameter_bank::{AddressableParameterBank, ParameterBankEntry},
 };
 
 pub fn v3_catalog(
     args: &V3Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     v3_catalog_selected(args, store, |_, _| true)
 }
 
@@ -24,7 +23,7 @@ pub fn v3_catalog_selected(
     args: &V3Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = deepseek::v3_expert_residency_catalog(store, args, None)
         .map_err(Error::ArchitectureModel)?;
     lower_selected_catalog(catalog, store, owns_unit)
@@ -50,7 +49,7 @@ pub fn v3_parallel_catalog_selected(
     intermediate: Range<usize>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = deepseek::v3_expert_residency_catalog(store, args, Some(intermediate))
         .map_err(Error::ArchitectureModel)?;
     lower_selected_catalog(catalog, store, owns_unit)
@@ -59,7 +58,7 @@ pub fn v3_parallel_catalog_selected(
 pub fn v4_catalog(
     args: &V4Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     v4_catalog_selected(args, store, |_, _| true)
 }
 
@@ -68,7 +67,7 @@ pub fn v4_catalog_selected(
     args: &V4Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = deepseek::v4_expert_residency_catalog(store, args, None)
         .map_err(Error::ArchitectureModel)?;
     lower_selected_catalog(catalog, store, owns_unit)
@@ -90,7 +89,7 @@ pub fn v4_parallel_catalog_selected(
     intermediate: Range<usize>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = deepseek::v4_expert_residency_catalog(store, args, Some(intermediate))
         .map_err(Error::ArchitectureModel)?;
     lower_selected_catalog(catalog, store, owns_unit)
@@ -100,7 +99,7 @@ fn lower_selected_catalog(
     catalog: eredu_architectures::ExpertResidencyCatalog,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let units = catalog.into_units_selected_by_owner(owns_unit);
     crate::composition::architecture_expert_units(units, store, None)
 }
@@ -116,17 +115,17 @@ fn checkpoint_keys(catalog: &eredu_architectures::ExpertResidencyCatalog) -> BTr
 }
 
 pub const fn v3_provider<'a>(
-    cache: &'a ExpertCache,
+    cache: &'a AddressableParameterBank,
     _args: &V3Args,
-) -> CachedGatedProductExpertProvider<'a> {
-    CachedGatedProductExpertProvider::new(cache)
+) -> CachedGatedProductGroupProvider<'a> {
+    CachedGatedProductGroupProvider::new(cache)
 }
 
 pub const fn v4_provider<'a>(
-    cache: &'a ExpertCache,
+    cache: &'a AddressableParameterBank,
     _args: &V4Args,
-) -> CachedGatedProductExpertProvider<'a> {
-    CachedGatedProductExpertProvider::new(cache)
+) -> CachedGatedProductGroupProvider<'a> {
+    CachedGatedProductGroupProvider::new(cache)
 }
 
 #[cfg(test)]
@@ -180,6 +179,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected.len(), 4);
-        assert!(selected.iter().all(|entry| entry.identity().layer == 2));
+        assert!(selected
+            .iter()
+            .all(|entry| entry.identity().namespace() == 2));
     }
 }

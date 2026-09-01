@@ -4,19 +4,18 @@ use std::collections::BTreeSet;
 
 use eredu_architectures::gemma4::ModelArgs;
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::{
     error::Error,
-    runtime::residency::{
-        expert_cache::{ExpertCache, ExpertCatalogEntry},
-        expert_provider::CachedGatedProductExpertProvider,
-    },
+    runtime::residency::parameter_bank::{AddressableParameterBank, ParameterBankEntry},
 };
 
 /// Returns one independently leasable cache unit for every routed expert.
 pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = eredu_architectures::gemma4::expert_residency_catalog(store, args)
         .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
@@ -43,10 +42,10 @@ pub fn checkpoint_keys(
 }
 
 pub const fn cached_provider<'a>(
-    cache: &'a ExpertCache,
+    cache: &'a AddressableParameterBank,
     _args: &ModelArgs,
-) -> CachedGatedProductExpertProvider<'a> {
-    CachedGatedProductExpertProvider::new(cache)
+) -> CachedGatedProductGroupProvider<'a> {
+    CachedGatedProductGroupProvider::new(cache)
 }
 
 #[cfg(test)]

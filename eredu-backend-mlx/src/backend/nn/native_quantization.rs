@@ -241,7 +241,7 @@ impl NativeStorage {
 ///
 /// Physical rows are `[matrix, physical_row, input]`. `row_start..row_start +
 /// rows` selects the logical rows inside every matrix, which represents fused
-/// gate/up expert banks without splitting or repacking their bytes.
+/// gate/up group banks without splitting or repacking their bytes.
 #[derive(Debug, Clone)]
 pub struct NativeQuantizedTensor {
     storage: Arc<NativeStorage>,
@@ -483,7 +483,7 @@ impl NativeQuantizedTensor {
         self.storage.format
     }
 
-    /// Logical shape, including an expert/matrix dimension when present.
+    /// Logical shape, including an group/matrix dimension when present.
     pub fn shape(&self) -> Vec<i32> {
         if self.matrix_count == 1 {
             vec![self.rows, self.columns]
@@ -799,17 +799,17 @@ fn native_grouped_linear_cpu(
     let routes = input.dim(0);
     let mut output = vec![0.0f32; routes as usize * weight.rows as usize];
     for route in 0..routes as usize {
-        let expert = ids[route];
-        if expert < 0 || expert >= weight.matrix_count {
+        let group = ids[route];
+        if group < 0 || group >= weight.matrix_count {
             return Err(Exception::custom(format!(
-                "native grouped expert {expert} is outside 0..{}",
+                "native group {group} is outside 0..{}",
                 weight.matrix_count
             )));
         }
         let input_row =
             &input_values[route * weight.columns as usize..(route + 1) * weight.columns as usize];
         for output_row in 0..weight.rows {
-            let weights = decode_native_row(raw, weight, expert, output_row)?;
+            let weights = decode_native_row(raw, weight, group, output_row)?;
             output[route * weight.rows as usize + output_row as usize] =
                 dot_f32(input_row, &weights);
         }
@@ -817,7 +817,7 @@ fn native_grouped_linear_cpu(
     Array::from_slice(&output, &[routes, weight.rows]).copy(stream)
 }
 
-/// Applies an expert-major native quantized matrix bank.
+/// Applies an group-major native quantized matrix bank.
 pub fn native_grouped_linear(
     input: &Array,
     weight: &NativeQuantizedTensor,
@@ -1746,8 +1746,8 @@ fn iq_grouped_kernel(
             "uint item = thread_position_in_grid.y;",
             "uint row = item / OUT_DIM;",
             "uint out_col = item % OUT_DIM;",
-            "uint expert = uint(group_ids[row]);",
-            "uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            "uint group = uint(group_ids[row]);",
+            "uint physical_row = group * PHYSICAL_ROWS + ROW_START + out_col;",
             "uint row_base = physical_row * BLOCKS * BLOCK_BYTES;",
             "float acc = 0.0f;",
             "for (uint col = lane; col < IN_DIM; col += 32) {",
@@ -2433,8 +2433,8 @@ fn q4k_grouped_kernel() -> Result<MetalKernel, Exception> {
         ["out"],
         [
             Q4K_TILED_PROLOGUE,
-            "uint expert = uint(group_ids[row]);",
-            "uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            "uint group = uint(group_ids[row]);",
+            "uint physical_row = group * PHYSICAL_ROWS + ROW_START + out_col;",
             "uint matrix_base = physical_row * BLOCKS * 144;",
             Q4K_ACCUMULATE,
             Q4K_TILED_EPILOGUE,
@@ -2457,8 +2457,8 @@ fn q5_1_grouped_kernel() -> Result<MetalKernel, Exception> {
             "uint out_col = thread_position_in_grid.y % OUT_GRID;",
             "float acc = 0.0f;",
             "if (out_col < OUT_DIM) {",
-            " uint expert = uint(group_ids[row]);",
-            " uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            " uint group = uint(group_ids[row]);",
+            " uint physical_row = group * PHYSICAL_ROWS + ROW_START + out_col;",
             " uint matrix_base = physical_row * BLOCKS * 24;",
             " for (uint block = lane; block < BLOCKS; block += REDUCTION_TILE) {",
             "  uint base = matrix_base + block * 24;",
@@ -2600,8 +2600,8 @@ fn q8_0_grouped_kernel() -> Result<MetalKernel, Exception> {
             "uint out_col = thread_position_in_grid.y % OUT_GRID;",
             "float acc = 0.0f;",
             "if (out_col < OUT_DIM) {",
-            " uint expert = uint(group_ids[row]);",
-            " uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            " uint group = uint(group_ids[row]);",
+            " uint physical_row = group * PHYSICAL_ROWS + ROW_START + out_col;",
             " uint matrix_base = physical_row * BLOCKS * 34;",
             " for (uint block = 0; block < BLOCKS; ++block) {",
             "  uint base = matrix_base + block * 34;",
@@ -3487,16 +3487,16 @@ mod tests {
             .unwrap()
             .item::<bool>(&stream));
 
-        let mut expert_raw = Vec::new();
+        let mut group_raw = Vec::new();
         for _ in 0..4 {
-            expert_raw.extend(sample_block());
+            group_raw.extend(sample_block());
         }
-        let experts =
-            NativeQuantizedTensor::from_q4k_bytes(&expert_raw, &[2, 2, 256], &stream).unwrap();
+        let groups =
+            NativeQuantizedTensor::from_q4k_bytes(&group_raw, &[2, 2, 256], &stream).unwrap();
         let group_ids = Array::from_slice(&[1i32, 0], &[2]);
-        let grouped = native_grouped_linear(&input, &experts, &group_ids, &stream).unwrap();
+        let grouped = native_grouped_linear(&input, &groups, &group_ids, &stream).unwrap();
         assert_eq!(grouped.shape(), &[2, 2]);
-        let selected = experts
+        let selected = groups
             .dequantize(&stream)
             .unwrap()
             .try_index_device(&group_ids, &stream)
@@ -3825,13 +3825,13 @@ mod tests {
             .unwrap()
             .item::<bool>(&stream));
 
-        let expert_bank =
+        let group_bank =
             NativeQuantizedTensor::from_q4k_bytes(&raw, &[67, 1, 512], &stream).unwrap();
         let group_ids = Array::from_slice(&[66i32, 1, 4], &[3])
             .copy(&stream)
             .unwrap();
-        let actual = native_grouped_linear(&input, &expert_bank, &group_ids, &stream).unwrap();
-        let selected = expert_bank
+        let actual = native_grouped_linear(&input, &group_bank, &group_ids, &stream).unwrap();
+        let selected = group_bank
             .dequantize(&stream)
             .unwrap()
             .try_index_device(&group_ids, &stream)
@@ -3928,18 +3928,18 @@ mod tests {
     #[ignore = "requires an accessible Metal device"]
     fn q8_0_metal_grouped_matches_float_with_repeated_ids() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
-        let experts = 3;
+        let groups = 3;
         let output = 5;
         let input_dim = 64;
         let routes = 4;
         let mut raw = Vec::new();
-        for index in 0..(experts * output * input_dim / 32) {
+        for index in 0..(groups * output * input_dim / 32) {
             let mut block = sample_q8_0_block();
             block[2] = block[2].wrapping_add(index as u8);
             raw.extend(block);
         }
         let native =
-            NativeQuantizedTensor::from_q8_0_bytes(&raw, &[experts, output, input_dim], &stream)
+            NativeQuantizedTensor::from_q8_0_bytes(&raw, &[groups, output, input_dim], &stream)
                 .unwrap();
         let input = Array::from_slice(
             &(0..routes * input_dim)

@@ -10,7 +10,7 @@ use serde_json::Value;
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
 use super::realization::{
-    requires_distributed_stage, ExpertCacheBinding, FamilyBinding, GgufBinding,
+    requires_distributed_stage, AddressableParameterBankBinding, FamilyBinding, GgufBinding,
 };
 #[cfg(test)]
 use super::ModelLoadOptions;
@@ -166,12 +166,12 @@ fn validate_quantization_capability(
     ))
 }
 
-fn validate_expert_cache_capability(
+fn validate_parameter_bank_capability(
     kind: ModelKind,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
     if capabilities.independently_addressable_experts()
-        && ExpertCacheBinding::for_kind(kind).is_some()
+        && AddressableParameterBankBinding::for_kind(kind).is_some()
     {
         return Ok(());
     }
@@ -202,7 +202,7 @@ fn validate_preparation_capability_intersection(
     }
     validate_quantization_capability(kind, format, policy, capabilities)?;
     if policy.residency == eredu_core::ResidencyRequest::ExpertCache {
-        validate_expert_cache_capability(kind, capabilities)?;
+        validate_parameter_bank_capability(kind, capabilities)?;
     }
     Ok(())
 }
@@ -326,7 +326,7 @@ pub(crate) fn inspected_session_capabilities(
 mod admission_policy_tests {
     use super::*;
 
-    fn expert_cache_options() -> ModelLoadOptions {
+    fn parameter_bank_options() -> ModelLoadOptions {
         ModelLoadOptions::default().with_weight_residency(
             eredu_runtime::WeightResidency::with_expert_cache(
                 eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -449,8 +449,8 @@ mod admission_policy_tests {
     }
 
     #[test]
-    fn expert_cache_admits_normalized_gemma4_and_muse_glimmer_moe() {
-        let options = expert_cache_options();
+    fn parameter_bank_admits_normalized_gemma4_and_muse_glimmer_moe() {
+        let options = parameter_bank_options();
         validate_safetensors_preparation_for_test(ModelKind::Gemma4, &gemma4_config(true), options)
             .unwrap();
         validate_safetensors_preparation_for_test(
@@ -562,8 +562,8 @@ mod admission_policy_tests {
     }
 
     #[test]
-    fn expert_cache_rejects_dense_variants_of_mixed_families() {
-        let options = expert_cache_options();
+    fn parameter_bank_rejects_dense_variants_of_mixed_families() {
+        let options = parameter_bank_options();
         for (kind, config) in [
             (ModelKind::DeepSeekV3, dense_deepseek_v3_config()),
             (ModelKind::Gemma4, gemma4_config(false)),

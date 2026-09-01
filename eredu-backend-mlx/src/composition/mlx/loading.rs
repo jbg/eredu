@@ -23,8 +23,9 @@ use crate::{
 };
 
 use super::realization::{
-    requires_distributed_stage, CompleteTensorParallelBinding as TensorParallelBinding,
-    ExpertCacheBinding, FamilyBinding, FixedGgufBinding, GgufBinding, QuantizedGgufBinding,
+    requires_distributed_stage, AddressableParameterBankBinding,
+    CompleteTensorParallelBinding as TensorParallelBinding, FamilyBinding, FixedGgufBinding,
+    GgufBinding, QuantizedGgufBinding,
 };
 
 /// MLX arrays, modules, and media preprocessing from one GGUF artifact.
@@ -227,27 +228,45 @@ pub fn materialize_model_plan(
 ) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
-    let replicated = match eredu_architectures::replicated_text::replicated_text_requirements(
-        plan.inspection(),
-        plan.policy(),
-    ) {
-        Ok(requirements) => {
-            let selected = select_replicated_text_realization(
-                &requirements,
-                &ReplicatedTextSelectionRequest {
-                    residency: plan.policy().residency,
-                    state: CacheResidencyPolicy::Device,
-                    quantization: plan.policy().quantization,
-                },
-                &super::replicated_text::capabilities(&requirements),
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            Some((requirements, selected))
+    let replicated = if plan
+        .policy()
+        .topology
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        None
+    } else {
+        match eredu_architectures::replicated_text::replicated_text_requirements(plan.inspection())
+        {
+            Ok(requirements) => {
+                let policy = plan.policy();
+                let mut request = ReplicatedTextSelectionRequest::new(
+                    policy.residency,
+                    CacheResidencyPolicy::Device,
+                )
+                .with_session(policy.required_session_capabilities)
+                .with_prompt_cache(true)
+                .with_exact_completion(true);
+                if let Some(topology) = policy.topology {
+                    request = request.with_topology(topology);
+                }
+                if let Some(quantization) = policy.quantization {
+                    request = request.with_quantization(quantization);
+                }
+                let selected = select_replicated_text_realization(
+                    &requirements,
+                    &request,
+                    &super::replicated_text::capabilities(&requirements, &request),
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                Some((requirements, selected))
+            }
+            Err(
+                eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(
+                    _,
+                ),
+            ) => None,
+            Err(error) => return Err(Error::ArchitectureModel(error.to_string())),
         }
-        Err(eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(
-            _,
-        )) => None,
-        Err(error) => return Err(Error::ArchitectureModel(error.to_string())),
     };
     if let Some((requirements, selected)) = replicated {
         let (artifact, architecture_plan, _policy, _route) = plan.into_parts();
@@ -1148,37 +1167,37 @@ pub(super) fn materialize_safetensors(
 ) -> Result<Executable, Error> {
     let kind = artifact.architecture().model_kind();
     let quantization = options.weight_quantization()?;
-    if let (Some(expert_cache), Some(non_expert)) = (
+    if let (Some(parameter_bank), Some(non_expert)) = (
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),
     ) {
-        let binding = ExpertCacheBinding::for_kind(kind)
+        let binding = AddressableParameterBankBinding::for_kind(kind)
             .ok_or_else(|| Error::ArchitectureModel(format!(
                 "independent expert caching is unavailable for the normalized {} architecture on MLX",
                 kind.canonical_name()
             )))?;
         return match binding {
-            ExpertCacheBinding::KimiLinear => Ok(Executable::kimi_linear(
+            AddressableParameterBankBinding::KimiLinear => Ok(Executable::kimi_linear(
                 kind,
                 crate::composition::kimi_linear::load_kimi_linear_model(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::DeepSeek => Ok(Executable::deepseek(
+            AddressableParameterBankBinding::DeepSeek => Ok(Executable::deepseek(
                 kind,
                 Box::new(crate::composition::deepseek::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?),
             )?),
-            ExpertCacheBinding::GptOss => Ok(Executable::gpt_oss(
+            AddressableParameterBankBinding::GptOss => Ok(Executable::gpt_oss(
                 kind,
                 crate::composition::gpt_oss::load_safetensors(
                     artifact,
@@ -1188,91 +1207,91 @@ pub(super) fn materialize_safetensors(
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Gemma4 => Ok(Executable::gemma4(
+            AddressableParameterBankBinding::Gemma4 => Ok(Executable::gemma4(
                 kind,
                 crate::composition::gemma4::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Inkling => Ok(Executable::inkling(
+            AddressableParameterBankBinding::Inkling => Ok(Executable::inkling(
                 kind,
                 crate::composition::inkling::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Lfm2 => Ok(Executable::lfm2(
+            AddressableParameterBankBinding::Lfm2 => Ok(Executable::lfm2(
                 kind,
                 crate::composition::lfm2::load_lfm2_model(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::MuseGlimmer => Ok(Executable::muse_glimmer(
+            AddressableParameterBankBinding::MuseGlimmer => Ok(Executable::muse_glimmer(
                 kind,
                 crate::composition::muse_glimmer::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::NemotronH => Ok(Executable::nemotron_h(
+            AddressableParameterBankBinding::NemotronH => Ok(Executable::nemotron_h(
                 kind,
                 crate::composition::nemotron_h::load_nemotron_h_model(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Qwen => Ok(Executable::qwen(
+            AddressableParameterBankBinding::Qwen => Ok(Executable::qwen(
                 kind,
                 crate::composition::qwen::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Qwen3Next => Ok(Executable::qwen3_next(
+            AddressableParameterBankBinding::Qwen3Next => Ok(Executable::qwen3_next(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Qwen3VlMoe => Ok(Executable::qwen3_vl_moe(
+            AddressableParameterBankBinding::Qwen3VlMoe => Ok(Executable::qwen3_vl_moe(
                 kind,
                 crate::composition::qwen::vl::load_safetensors_with_residency(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )?),
-            ExpertCacheBinding::Qwen35 => Ok(Executable::qwen35(
+            AddressableParameterBankBinding::Qwen35 => Ok(Executable::qwen35(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
                     quantization,
                     stream,
                     weights_stream,

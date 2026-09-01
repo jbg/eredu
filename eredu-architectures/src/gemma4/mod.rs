@@ -53,13 +53,11 @@ pub use vision::{
 };
 
 /// Derives complete expert ownership and rank-local bank geometry from Gemma 4.
-pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<
-    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
-    eredu_nn::Error,
-> {
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
+{
     let args = architecture.args();
     let sparse_layers = args
         .text

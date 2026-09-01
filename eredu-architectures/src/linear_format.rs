@@ -1,7 +1,7 @@
 //! Shared physical-format declarations for architecture operators and parallel plans.
 
 use eredu_checkpoint::LinearFormat;
-use eredu_nn::{Error, ExpertProjectionSpec, LinearFormatSpec, ParameterSpec};
+use eredu_nn::{Error, GroupedProjectionSpec, LinearFormatSpec, ParameterSpec};
 use eredu_runtime::{ParallelPlanError, ParameterMemberSpec};
 
 fn expert_parameter(name: &str) -> Result<ParameterSpec, Error> {
@@ -86,12 +86,12 @@ pub(crate) fn standard_expert_projection(
     weight_name: &str,
     bias_name: Option<&str>,
     format: LinearFormat,
-) -> Result<ExpertProjectionSpec, Error> {
-    Ok(ExpertProjectionSpec {
-        weight: expert_parameter(weight_name)?,
-        bias: bias_name.map(expert_parameter).transpose()?,
-        format: standard_expert_format(weight_name, format)?,
-    })
+) -> Result<GroupedProjectionSpec, Error> {
+    GroupedProjectionSpec::new(
+        expert_parameter(weight_name)?,
+        bias_name.map(expert_parameter).transpose()?,
+        standard_expert_format(weight_name, format)?,
+    )
 }
 
 /// Declares the canonical dense-matrix and packed-expert companion convention.

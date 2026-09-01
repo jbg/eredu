@@ -1,8 +1,8 @@
 //! Runtime ownership boundary for routed expert acquisition and residency.
 
 use eredu_nn::{
-    GatedProductExpertBankOperator, Relu2ExpertBankOperator, RoutedNeuralBackend, RoutingResult,
-    Tensor, TensorParallelExpertOutput,
+    GroupSelection, GroupedGatedProductOperator, GroupedNeuralBackend, GroupedRelu2Operator,
+    Tensor, TensorParallelGroupedOutput,
 };
 
 use crate::ExpertPass;
@@ -15,7 +15,7 @@ pub struct RoutedExpertRequest<'a, T> {
     /// Flattened token rows submitted to the selected experts.
     pub input: &'a T,
     /// Backend-native selected expert IDs, scores, and weights.
-    pub routes: &'a RoutingResult<T>,
+    pub routes: &'a GroupSelection<T>,
     /// Whether this route batch belongs to prefill or decode.
     pub pass: ExpertPass,
 }
@@ -25,20 +25,20 @@ pub enum RoutedExpertTensorParallelOutput<T> {
     /// Provider already completed every required collective and bias addition.
     Complete(T),
     /// Caller must all-sum `reducible`, then add `post_reduce` exactly once.
-    Partial(TensorParallelExpertOutput<T>),
+    Partial(TensorParallelGroupedOutput<T>),
 }
 
 /// Completes one rank-local expert output with one all-sum and one post-bias add.
 pub fn reduce_tensor_parallel_expert_output<B>(
-    output: TensorParallelExpertOutput<B::Tensor>,
+    output: TensorParallelGroupedOutput<B::Tensor>,
     parallel: &B::ParallelContext,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, eredu_nn::Error>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
-    let reduced = B::sum_parallel(output.reducible, parallel, context)?;
-    match output.post_reduce {
+    let reduced = B::sum_parallel(output.reducible().clone(), parallel, context)?;
+    match output.post_reduce().cloned() {
         Some(bias) => reduced.add(&bias, context),
         None => Ok(reduced),
     }
@@ -46,22 +46,22 @@ where
 
 /// Combines two rank-local expert partials without introducing another collective.
 pub fn combine_tensor_parallel_expert_outputs<B>(
-    left: TensorParallelExpertOutput<B::Tensor>,
-    right: TensorParallelExpertOutput<B::Tensor>,
+    left: TensorParallelGroupedOutput<B::Tensor>,
+    right: TensorParallelGroupedOutput<B::Tensor>,
     context: &<B::Tensor as Tensor>::Context,
-) -> Result<TensorParallelExpertOutput<B::Tensor>, eredu_nn::Error>
+) -> Result<TensorParallelGroupedOutput<B::Tensor>, eredu_nn::Error>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
-    let post_reduce = match (left.post_reduce, right.post_reduce) {
+    let post_reduce = match (left.post_reduce().cloned(), right.post_reduce().cloned()) {
         (Some(left), Some(right)) => Some(left.add(&right, context)?),
         (Some(bias), None) | (None, Some(bias)) => Some(bias),
         (None, None) => None,
     };
-    Ok(TensorParallelExpertOutput {
-        reducible: left.reducible.add(&right.reducible, context)?,
+    Ok(TensorParallelGroupedOutput::new(
+        left.reducible().add(right.reducible(), context)?,
         post_reduce,
-    })
+    ))
 }
 
 /// Combines routed/shared provider outputs while requiring one coherent TP mode.
@@ -71,7 +71,7 @@ pub fn combine_routed_expert_tensor_parallel<B>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     match (left, right) {
         (
@@ -98,7 +98,7 @@ pub fn reduce_routed_expert_tensor_parallel<B>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, eredu_nn::Error>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     match output {
         RoutedExpertTensorParallelOutput::Complete(output) => Ok(output),
@@ -116,37 +116,37 @@ where
 /// storage, transfers, compact-bank construction, and execution kernels.
 pub trait RoutedExpertProvider<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     /// Provider-specific acquisition or execution failure.
     type Error;
 
     /// Executes one typed route batch while retaining its acquired resources.
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        resident_bank: &mut B::GatedProductExpertBank,
+        resident_bank: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
     /// Executes a rank-local tensor-parallel routed contribution. Providers
     /// returning complete outputs may use the ordinary path unchanged.
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
-        resident_bank: &mut B::GatedProductExpertBank,
+        resident_bank: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         let _ = partitions;
-        self.forward_routed(resident_bank, request, context)
+        self.forward_grouped(resident_bank, request, context)
             .map(RoutedExpertTensorParallelOutput::Complete)
     }
 
     /// Executes one ReLU-squared route batch through the same residency boundary.
     fn forward_relu2_routed(
         &mut self,
-        resident_bank: &mut B::Relu2ExpertBank,
+        resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
@@ -155,7 +155,7 @@ where
     /// rank-local tensor-parallel result.
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut B::Relu2ExpertBank,
+        resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
@@ -250,7 +250,7 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
 
     fn observe<T, ObservationError>(
         &mut self,
-        routes: &eredu_nn::RoutingResult<T>,
+        routes: &eredu_nn::GroupSelection<T>,
         output: &T,
     ) -> Result<(), ObservationError>
     where
@@ -258,9 +258,9 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
     {
         self.observer.observe_routing(RoutingObservation {
             path: self.point.path(),
-            selected_experts: &routes.expert_ids,
-            selected_scores: &routes.selected_scores,
-            route_weights: &routes.route_weights,
+            selected_experts: routes.group_indices(),
+            selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(),
             routed_output: output,
             local_routed_output: None,
             reduced_routed_output: None,
@@ -273,43 +273,43 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
 
 impl<B, P, O, E> RoutedExpertProvider<B> for ObservedExpertProvider<'_, P, O, E>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     P: RoutedExpertProvider<B>,
     O: ActivationObserver<B::Tensor, E> + ?Sized,
 {
     type Error = ObservedExpertProviderError<P::Error, E>;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        resident_bank: &mut B::GatedProductExpertBank,
+        resident_bank: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         let routes = request.routes;
         let output = self
             .provider
-            .forward_routed(resident_bank, request, context)
+            .forward_grouped(resident_bank, request, context)
             .map_err(ObservedExpertProviderError::Provider)?;
         self.observe(routes, &output)
             .map_err(ObservedExpertProviderError::Observer)?;
         Ok(output)
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
-        resident_bank: &mut B::GatedProductExpertBank,
+        resident_bank: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         self.provider
-            .forward_routed_tensor_parallel(resident_bank, request, partitions, context)
+            .forward_grouped_tensor_parallel(resident_bank, request, partitions, context)
             .map_err(ObservedExpertProviderError::Provider)
     }
 
     fn forward_relu2_routed(
         &mut self,
-        resident_bank: &mut B::Relu2ExpertBank,
+        resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
@@ -325,7 +325,7 @@ where
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut B::Relu2ExpertBank,
+        resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
@@ -342,49 +342,49 @@ pub struct ResidentExpertProvider;
 
 impl<B> RoutedExpertProvider<B> for ResidentExpertProvider
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     type Error = eredu_nn::Error;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        resident_bank: &mut B::GatedProductExpertBank,
+        resident_bank: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        resident_bank.forward_routed(request.input, request.routes, context)
+        resident_bank.forward_grouped(request.input, request.routes, context)
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
-        resident_bank: &mut B::GatedProductExpertBank,
+        resident_bank: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         resident_bank
-            .forward_routed_tensor_parallel(request.input, request.routes, partitions, context)
+            .forward_grouped_tensor_parallel(request.input, request.routes, partitions, context)
             .map(RoutedExpertTensorParallelOutput::Partial)
     }
 
     fn forward_relu2_routed(
         &mut self,
-        resident_bank: &mut B::Relu2ExpertBank,
+        resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        resident_bank.forward_routed(request.input, request.routes, context)
+        resident_bank.forward_grouped(request.input, request.routes, context)
     }
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut B::Relu2ExpertBank,
+        resident_bank: &mut B::Relu2Groups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         resident_bank
-            .forward_routed_tensor_parallel(request.input, request.routes, partitions, context)
+            .forward_grouped_tensor_parallel(request.input, request.routes, partitions, context)
             .map(RoutedExpertTensorParallelOutput::Partial)
     }
 }

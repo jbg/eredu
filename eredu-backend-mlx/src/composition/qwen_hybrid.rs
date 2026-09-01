@@ -97,6 +97,8 @@ pub(crate) fn prompt_token_ids(
     safemlx::ops::concatenate_axis(&tokens, 1, stream)
 }
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::{
     error::Error,
     nn::shared::{MlxNeuralBackend, MlxModule},
@@ -125,8 +127,7 @@ use crate::backend::{
         },
         media::input,
         residency::{
-            expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::CachedGatedProductExpertProvider,
+            parameter_bank::{AddressableParameterBank, ParameterBankEntry},
         },
     },
 };
@@ -438,9 +439,9 @@ impl QwenConditionalPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error>
     {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
@@ -449,7 +450,7 @@ impl QwenConditionalPipelineBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(
                     plan,
                 )
                 .map(Some)
@@ -534,9 +535,9 @@ impl QwenHybridPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error>
     {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
@@ -545,7 +546,7 @@ impl QwenHybridPipelineBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(
                     plan,
                 )
                 .map(Some)
@@ -562,7 +563,7 @@ impl QwenHybridPipelineBindings {
         global_layer: &MlxModule<Block>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
@@ -578,7 +579,7 @@ pub fn expert_catalog_selected(
     store: &dyn CheckpointSource,
     layout: Option<&eredu_runtime::LocalModelLayout>,
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = hybrid::expert_residency_catalog(store, config)
         .map_err(Error::ArchitectureModel)?;
     let units = catalog.into_units_selected_by_owner(owns_unit);
@@ -586,10 +587,10 @@ pub fn expert_catalog_selected(
 }
 
 const fn cached_provider<'a>(
-    cache: &'a ExpertCache,
+    cache: &'a AddressableParameterBank,
     _config: &HybridConfig,
-) -> CachedGatedProductExpertProvider<'a> {
-    CachedGatedProductExpertProvider::new(cache)
+) -> CachedGatedProductGroupProvider<'a> {
+    CachedGatedProductGroupProvider::new(cache)
 }
 
 fn prepare_hybrid_gguf_store(
@@ -737,7 +738,7 @@ pub(crate) fn load_gguf(
         )?
     };
     if let Some(expert_options) = expert_options {
-        attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -795,7 +796,7 @@ pub struct QwenHybridModel {
     parsed: ParsedHybridConfig,
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
 }
 
 impl QwenHybridModel {
@@ -848,16 +849,15 @@ impl QwenHybridModel {
         }
     }
 
-    pub fn expert_cache_report(
+    pub fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        Ok(self
-            .expert_cache
+        Ok(self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()?)
     }
 
@@ -971,13 +971,13 @@ impl QwenHybridModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let config = self.parsed.text.clone();
             let result = {
-                let mut provider = cached_provider(&expert_cache, &config);
+                let mut provider = cached_provider(&parameter_bank, &config);
                 self.forward_with_provider(tokens, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         if self.parsed.vision.is_some() {
@@ -1312,13 +1312,13 @@ impl QwenHybridModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let config = self.parsed.text.clone();
             let result = {
-                let mut provider = cached_provider(&expert_cache, &config);
+                let mut provider = cached_provider(&parameter_bank, &config);
                 self.forward_mtp_with_provider(input, tokens, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         if self.parsed.vision.is_some() {
@@ -1937,7 +1937,7 @@ pub fn load_safetensors_with_residency(
             weights_stream,
         )?;
         if let Some(expert_options) = expert_options {
-            attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+            attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
         }
         return Ok(model);
     }
@@ -1957,7 +1957,7 @@ pub fn load_safetensors_with_residency(
         weights_stream,
     )?;
     if let Some(expert_options) = expert_options {
-        attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -2037,7 +2037,7 @@ fn load_conditional_store(
         parsed,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }
 
@@ -2113,11 +2113,11 @@ fn load_store(
         parsed,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut QwenHybridModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -2125,7 +2125,7 @@ fn attach_expert_cache(
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
     let entries = expert_catalog_selected(model.args(), store.as_ref(), None, |_, _| true)?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,

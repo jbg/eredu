@@ -1,5 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
@@ -20,27 +22,21 @@ use crate::{
             checkpoint::binding::build_module_bindings,
             distributed::{
                 completion::synchronize_outputs,
-                expert::{
-                    dispatch_local_with, dispatch_replicated_with, ExpertAssignment,
-                    RoutingStatistics,
-                },
-                parallel::{routed_expert_intermediate_range, ParallelExecutionContext},
+                parallel::{logical_unit_channel_range, ParallelExecutionContext},
             },
             execution::layerwise::shard_layer_bindings,
-            residency::{
-                expert_cache::ExpertCache,
-                expert_provider::{
-                    GatedProductExpertExecution, GatedProductExpertExecutorProvider,
-                },
-            },
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
+    },
+    composition::expert_dispatch::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_parallel_layout,
         architecture_parameter_unit_owner, architecture_prediction_group,
-        architecture_single_prediction_units, base_info, build_pipeline_expert_cache,
-        build_pipeline_layer_storage, execute_routed_layered_partition_observed,
+        architecture_single_prediction_units, base_info, build_pipeline_layer_storage,
+        build_pipeline_parameter_bank, execute_routed_layered_partition_observed,
         load_architecture_static_parameters, localized_gated_expert_width,
         partition_owns_architecture_units, prediction_architecture_transport,
         split_static_binding_units_by_owner, validate_admitted_pipeline_kind,
@@ -95,22 +91,22 @@ impl DeepSeekV3PipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let expert_cache = self.expert_storage.cache();
+        let parameter_bank = self.expert_storage.cache();
         let assignment = self.expert_assignment.as_ref();
         let statistics = &mut self.routing_statistics;
-        if let Some(expert_cache) = expert_cache {
+        if let Some(parameter_bank) = parameter_bank {
             let assignment = assignment.ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V3 external experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
                 execute_pipeline_cached_neutral_deepseek(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     statistics,
@@ -119,7 +115,7 @@ impl DeepSeekV3PipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -194,7 +190,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 }
@@ -273,19 +269,19 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
                 "neutral DeepSeek V3 MTP cache depth {depth} is unavailable"
             ))
         })?;
-        let output = if let Some(expert_cache) = self.expert_storage.cache() {
+        let output = if let Some(parameter_bank) = self.expert_storage.cache() {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V3 MTP experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
                 execute_pipeline_cached_neutral_deepseek(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     ExpertPass::Decode,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -294,7 +290,7 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             match tensor_group {
                 Some(group) => self
                     .architecture
@@ -477,22 +473,22 @@ impl DeepSeekV4PipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let expert_cache = self.expert_storage.cache();
+        let parameter_bank = self.expert_storage.cache();
         let assignment = self.expert_assignment.as_ref();
         let statistics = &mut self.routing_statistics;
-        if let Some(expert_cache) = expert_cache {
+        if let Some(parameter_bank) = parameter_bank {
             let assignment = assignment.ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V4 external experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
                 execute_pipeline_cached_neutral_deepseek(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     statistics,
@@ -501,7 +497,7 @@ impl DeepSeekV4PipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -576,7 +572,7 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 
@@ -735,19 +731,19 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
             .architecture
             .begin_partition_prediction_hidden(crate::composition::tensor_ref(hidden), stream)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let output = if let Some(expert_cache) = self.expert_storage.cache() {
+        let output = if let Some(parameter_bank) = self.expert_storage.cache() {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("neutral DeepSeek V4 MTP experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
                 execute_pipeline_cached_neutral_deepseek(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     ExpertPass::Decode,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -756,7 +752,7 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             match tensor_group {
                 Some(group) => self
                     .architecture
@@ -901,19 +897,19 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         };
         let mut proposal = caches.clone();
         let anchor = crate::MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
-        let logits = if let Some(expert_cache) = self.expert_storage.cache() {
+        let logits = if let Some(parameter_bank) = self.expert_storage.cache() {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("neutral DSpark experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
                 execute_pipeline_cached_neutral_deepseek(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     ExpertPass::Decode,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -922,7 +918,7 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error: Error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             match tensor_group {
                 Some(group) => self
                     .architecture
@@ -1063,20 +1059,20 @@ impl PipelineForward for DeepSeekV4PipelinePartition {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_deepseek(
-    spec: &eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GroupedGatedProductSpec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
@@ -1089,9 +1085,15 @@ fn execute_pipeline_cached_neutral_deepseek(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     Ok(returned.reduced_output)
@@ -1144,12 +1146,12 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV3], "DeepSeek-V3")?;
-    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v3_store(
@@ -1251,7 +1253,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
     info.global_embedded_mtp_layers = prediction_units.len();
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
     }
     info.materialization = materialization.clone();
     let geometry = architecture.shared_parallel_geometry();
@@ -1500,8 +1502,9 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
                 let realization = expert_realization
                     .as_ref()
                     .expect("external V3 experts have an architecture realization");
-                let intermediate = routed_expert_intermediate_range(
+                let intermediate = logical_unit_channel_range(
                     layout,
+                    eredu_runtime::ParameterRole::ExpertIntermediate,
                     realization.global_expert_count(),
                     localized_gated_expert_width(realization, "DeepSeek V3")?,
                 )?;
@@ -1520,22 +1523,20 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
         };
         let entries = catalog
             .into_iter()
-            .filter(|entry| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-            })
+            .filter(|entry| assignment.owner(entry.identity().index()) == Some(assignment.rank()))
             .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
-                expert_cache_options,
+                parameter_bank_options,
                 None,
                 weights_stream,
                 stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| {
                     Error::Parallel("neutral DeepSeek V3 expert byte total overflowed".into())
                 })?;
@@ -1552,7 +1553,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
             .any(|(group, unit)| partition.owns_unit(group.as_str(), *unit))
     });
     if !owns_routed_units {
-        info.local_expert_ids.clear();
+        info.local_group_indices.clear();
     }
     let stage = DeepSeekV3PipelinePartition {
         architecture,
@@ -1575,12 +1576,12 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV4], "DeepSeek-V4")?;
-    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v4_store(
@@ -1672,7 +1673,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
     info.global_embedded_mtp_layers = prediction_units.len();
     if let Some(assignment) = &expert_assignment {
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
     }
     info.materialization = materialization.clone();
     let geometry = architecture.shared_parallel_geometry();
@@ -1917,8 +1918,9 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
             .expect("external expert assignment");
         let catalog = match &parallel_layout {
             Some(layout) => {
-                let intermediate = routed_expert_intermediate_range(
+                let intermediate = logical_unit_channel_range(
                     layout,
+                    eredu_runtime::ParameterRole::ExpertIntermediate,
                     expert_realization.global_expert_count(),
                     localized_gated_expert_width(&expert_realization, "DeepSeek V4")?,
                 )?;
@@ -1937,22 +1939,20 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
         };
         let entries = catalog
             .into_iter()
-            .filter(|entry| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-            })
+            .filter(|entry| assignment.owner(entry.identity().index()) == Some(assignment.rank()))
             .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
-                expert_cache_options,
+                parameter_bank_options,
                 None,
                 weights_stream,
                 stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| {
                     Error::Parallel("neutral DeepSeek V4 expert byte total overflowed".into())
                 })?;
@@ -1967,7 +1967,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
         .keys()
         .any(|(group, unit)| partition.owns_unit(group.as_str(), *unit));
     if !owns_routed_units {
-        info.local_expert_ids.clear();
+        info.local_group_indices.clear();
     }
     let stage = DeepSeekV4PipelinePartition {
         architecture,

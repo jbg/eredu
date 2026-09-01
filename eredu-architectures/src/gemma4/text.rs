@@ -4,12 +4,12 @@ use std::collections::HashMap;
 
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
-    AttentionCache, AttentionStateSource, AttentionValueSource, Error, GatedProductExpertBankSpec,
-    GatedProductExpertLayout, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend,
-    RouterInputTransformSpec, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec,
-    TopKRoutingSpec,
+    AttentionCache, AttentionStateSource, AttentionValueSource, Error, GatedProductGroupLayout,
+    GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySpec, RotarySubspace, SelectorInputTransformSpec, Tensor, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -276,7 +276,7 @@ impl<B: NeuralBackend> Attention<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: RoutedNeuralBackend,
+        B: GroupedNeuralBackend,
     {
         let attended = self.attend(input, context)?;
         B::row_parallel_linear(&mut self.output, &attended, parallel, context)
@@ -370,7 +370,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: RoutedNeuralBackend,
+        B: GroupedNeuralBackend,
     {
         let gate = self.gate.forward(input, context)?;
         let gate = B::Tensor::gelu(&gate, context)?;
@@ -384,7 +384,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
 /// routed block wrapper so the dense residual is shared exactly.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseBlock<B: RoutedNeuralBackend> {
+pub struct DenseBlock<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Stateful self attention.
@@ -392,9 +392,9 @@ pub struct DenseBlock<B: RoutedNeuralBackend> {
     /// Dense gated-GELU branch.
     pub mlp: DenseMlp<B>,
     /// Optional selected-softmax sparse router.
-    pub router: Option<B::Router>,
+    pub router: Option<B::Selector>,
     /// Optional packed GELU-gated expert bank.
-    pub experts: Option<B::GatedProductExpertBank>,
+    pub experts: Option<B::GatedProductGroups>,
     /// Pre-attention normalization.
     pub input_norm: B::Normalization,
     /// Attention-delta normalization.
@@ -435,7 +435,7 @@ pub struct BlockInput<'a, T, C> {
     pub rotary_position: Option<RotaryPosition<'a, T>>,
 }
 
-impl<B: RoutedNeuralBackend> DenseBlock<B> {
+impl<B: GroupedNeuralBackend> DenseBlock<B> {
     /// Builds one unloaded dense block.
     pub fn new(
         args: &ModelArgs,
@@ -494,36 +494,32 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                 .ok_or_else(|| Error::backend("Gemma 4 sparse block has no top-k count"))?;
             let router_prefix = format!("{prefix}.router");
             let router_weight = format!("{router_prefix}.proj.weight");
-            let router = B::top_k_router(
-                TopKRouterSpec {
-                    input_dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-                    bias: None,
-                    correction_bias: None,
-                    input_transform: Some(RouterInputTransformSpec {
-                        epsilon: args.rms_norm_eps,
-                        scale: ParameterSpec::trainable(format!("{router_prefix}.scale"))
-                            .map_err(Error::backend)?,
-                        inverse_sqrt_dimensions: true,
-                    }),
-                    route_scale: Some(
-                        ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
-                            .map_err(Error::backend)?,
-                    ),
-                    format: crate::linear_format::standard_linear_format(
-                        &router_weight,
-                        args.linear_format_for(&router_weight),
-                    )?,
-                    routing: TopKRoutingSpec::new(
-                        expert_count,
-                        top_k,
-                        RoutingScoring::SelectedSoftmax,
-                        false,
-                    )?,
-                },
-                context,
-            )?;
-            let experts = B::gated_product_expert_bank(
+            let selector = TopKGroupSelectorSpec::new(
+                args.hidden_size,
+                ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
+                crate::linear_format::standard_linear_format(
+                    &router_weight,
+                    args.linear_format_for(&router_weight),
+                )?,
+                TopKGroupSelectionSpec::new(
+                    expert_count,
+                    top_k,
+                    GroupScoring::SelectedSoftmax,
+                    false,
+                )?,
+            )?
+            .with_input_transform(SelectorInputTransformSpec::new(
+                args.rms_norm_eps,
+                ParameterSpec::trainable(format!("{router_prefix}.scale"))
+                    .map_err(Error::backend)?,
+                true,
+            )?)
+            .with_coefficient_scale(
+                ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
+                    .map_err(Error::backend)?,
+            );
+            let router = B::top_k_group_selector(selector, context)?;
+            let experts = B::grouped_gated_product(
                 expert_bank_spec_at(args, &format!("{prefix}.experts.switch_glu"))?,
                 context,
             )?;
@@ -631,9 +627,9 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                     .as_mut()
                     .ok_or_else(|| Error::backend("sparse Gemma block has no routed input norm"))?
                     .forward(&flat, context)?;
-                let routes = router.route(&flat, context)?;
+                let routes = router.select(&flat, context)?;
                 let routed = provider
-                    .forward_routed(
+                    .forward_grouped(
                         experts,
                         RoutedExpertRequest {
                             layer: self.layer,
@@ -717,9 +713,9 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                     .as_mut()
                     .ok_or_else(|| Error::backend("sparse Gemma block has no routed input norm"))?
                     .forward(&flat, context)?;
-                let routes = router.route(&flat, context)?;
+                let routes = router.select(&flat, context)?;
                 let routed = provider
-                    .forward_routed_tensor_parallel(
+                    .forward_grouped_tensor_parallel(
                         experts,
                         RoutedExpertRequest {
                             layer: self.layer,
@@ -780,10 +776,7 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
 }
 
 /// Returns the architecture-owned routed expert specification for one sparse layer.
-pub fn expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<GatedProductExpertBankSpec, Error> {
+pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
     expert_bank_spec_at(
         args,
         &format!("model.language_model.layers.{layer}.experts.switch_glu"),
@@ -796,18 +789,14 @@ pub(crate) fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<GatedProductExpertBankSpec, Error> {
-    let mut spec = expert_bank_spec(args, layer)?;
-    spec.expert_count = expert_count;
-    spec.intermediate_dimensions = intermediate_dimensions;
-    spec.validate()?;
-    Ok(spec)
+) -> Result<GroupedGatedProductSpec, Error> {
+    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
 fn expert_bank_spec_at(
     args: &ModelArgs,
     experts_prefix: &str,
-) -> Result<GatedProductExpertBankSpec, Error> {
+) -> Result<GroupedGatedProductSpec, Error> {
     let expert_count = args
         .num_experts
         .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert count"))?;
@@ -816,13 +805,13 @@ fn expert_bank_spec_at(
         .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert width"))?;
     let gate_up_name = format!("{experts_prefix}.gate_up_proj");
     let down_name = format!("{experts_prefix}.down_proj");
-    Ok(GatedProductExpertBankSpec {
+    GroupedGatedProductSpec::new(
         expert_count,
-        input_dimensions: args.hidden_size,
-        intermediate_dimensions: expert_width,
-        output_dimensions: args.hidden_size,
-        policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
-        layout: GatedProductExpertLayout::Packed {
+        args.hidden_size,
+        expert_width,
+        args.hidden_size,
+        eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(
                 &gate_up_name,
                 None,
@@ -830,5 +819,5 @@ fn expert_bank_spec_at(
             )?,
             down: standard_expert_projection(&down_name, None, args.linear_format_for(&down_name))?,
         },
-    })
+    )
 }

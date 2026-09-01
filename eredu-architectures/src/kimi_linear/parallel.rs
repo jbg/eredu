@@ -1,6 +1,6 @@
 //! Semantic tensor-parallel placement for Kimi physical blocks.
 
-use eredu_nn::{BlockwiseAttentionBackend, RoutedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::{BlockwiseAttentionBackend, GroupedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
@@ -298,7 +298,7 @@ pub fn static_parallel_parameter_groups<B>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     let mut groups = vec![
         module_parameter_group::<B::Tensor, _>(
@@ -342,7 +342,7 @@ pub fn layer_parallel_parameter_groups<B>(
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     let root = format!("model.layers.{layer}");
     let mut groups = Vec::new();

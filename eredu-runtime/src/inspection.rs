@@ -98,7 +98,7 @@ pub struct RoutingObservation<'a, T> {
     /// Selected scores before optional top-k renormalization.
     pub selected_scores: &'a T,
     /// Final route weights applied to expert outputs.
-    pub route_weights: &'a T,
+    pub coefficients: &'a T,
     /// Combined routed expert contribution.
     pub routed_output: &'a T,
     /// Rank-local contribution before expert-parallel reduction.

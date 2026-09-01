@@ -36,7 +36,7 @@ pub use parallel::{
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
-    Error, NormalizationOperator, RoutedNeuralBackend, Tensor,
+    Error, GroupedNeuralBackend, NormalizationOperator, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
@@ -63,7 +63,7 @@ impl<T> ForwardContext<T> {
 /// Layered Kimi lifecycle over one heterogeneous physical schedule.
 pub struct LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     args: ModelArgs,
     static_modules: StaticModules<B>,
@@ -73,7 +73,7 @@ where
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     type DefinitionError = Error;
 
@@ -128,7 +128,7 @@ where
 
 impl<B> LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Builds unloaded static modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
@@ -588,7 +588,7 @@ where
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -712,7 +712,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -769,7 +769,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -854,7 +854,7 @@ where
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -900,7 +900,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {

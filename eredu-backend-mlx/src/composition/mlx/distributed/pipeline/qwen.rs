@@ -1,10 +1,12 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
     LayeredArchitecture,
@@ -20,31 +22,21 @@ use crate::{
             checkpoint::{
                 binding::populate_module_from_lease, quantization::should_quantize_on_load,
             },
-            distributed::{
-                completion::synchronize_outputs,
-                expert::{
-                    dispatch_local_with, dispatch_replicated_with, ExpertAssignment,
-                    RoutingStatistics,
-                },
-                parallel::ParallelExecutionContext,
-            },
+            distributed::{completion::synchronize_outputs, parallel::ParallelExecutionContext},
             execution::layerwise::PipelineStageQuantizationSelection,
-            residency::{
-                expert_cache::ExpertCache,
-                expert_provider::{
-                    GatedProductExpertExecution, GatedProductExpertExecutorProvider,
-                    ResidentExpertExecutorProvider,
-                },
-            },
+            residency::parameter_bank::AddressableParameterBank,
         },
         MlxParallelContext,
+    },
+    composition::expert_dispatch::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_group_by_id, architecture_group_id,
         architecture_group_unit_count, architecture_parallel_layout,
         architecture_parameter_unit_owner, architecture_partition_group_range,
         architecture_prediction_group, architecture_single_prediction_units, base_info,
-        build_pipeline_expert_cache, build_pipeline_layer_storage, checkpoint_backing_shards,
+        build_pipeline_layer_storage, build_pipeline_parameter_bank, checkpoint_backing_shards,
         checkpoint_unit_backing_shards, construct_qwen_partition_unit,
         decoder_architecture_transport, execute_neutral_decoder_partition_observed,
         execute_neutral_routed_decoder_partition_observed, execute_neutral_routed_output_group,
@@ -192,8 +184,8 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
-        self.expert_cache.as_ref()
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
+        self.parameter_bank.as_ref()
     }
 }
 
@@ -207,11 +199,11 @@ impl PipelineForward for QwenPipelinePartition {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        if self.expert_cache.is_none() && self.expert_assignment.is_none() {
+        if self.parameter_bank.is_none() && self.expert_assignment.is_none() {
             execute_neutral_decoder_partition_observed(
                 self, input, step, mask, cache, None, stream, None,
             )
-        } else if self.expert_cache.is_some() {
+        } else if self.parameter_bank.is_some() {
             self.forward_external_experts_neutral(
                 input, step, mask, cache, None, None, stream, None,
             )
@@ -234,7 +226,7 @@ impl PipelineForward for QwenPipelinePartition {
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            if self.expert_cache.is_some() {
+            if self.parameter_bank.is_some() {
                 return self.forward_external_experts_neutral(
                     input,
                     step,
@@ -262,7 +254,7 @@ impl PipelineForward for QwenPipelinePartition {
         match execution {
             Some(execution)
                 if execution.is_tensor_parallel()
-                    && self.expert_cache.is_none()
+                    && self.parameter_bank.is_none()
                     && self.expert_assignment.is_none() =>
             {
                 execute_neutral_decoder_partition_observed(
@@ -277,7 +269,7 @@ impl PipelineForward for QwenPipelinePartition {
                 )
             }
             Some(execution) if execution.is_tensor_parallel() => {
-                if self.expert_cache.is_some() {
+                if self.parameter_bank.is_some() {
                     self.forward_external_experts_neutral(
                         input,
                         step,
@@ -301,7 +293,7 @@ impl PipelineForward for QwenPipelinePartition {
                     )
                 }
             }
-            _ if self.expert_cache.is_some() => self.forward_external_experts_neutral(
+            _ if self.parameter_bank.is_some() => self.forward_external_experts_neutral(
                 input, step, mask, cache, None, None, stream, observer,
             ),
             _ => execute_neutral_decoder_partition_observed(
@@ -510,19 +502,19 @@ impl QwenVlPipelinePartition {
         };
         let cache = self.expert_storage.cache();
         let decoder_range = self.range();
-        if let Some(expert_cache) = cache {
+        if let Some(parameter_bank) = cache {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Qwen3-VL external experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, stream: &Stream| {
                 execute_pipeline_cached_qwen3(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     tensor_group,
@@ -532,7 +524,7 @@ impl QwenVlPipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -602,7 +594,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 }
@@ -1030,21 +1022,21 @@ impl QwenConditionalPipelinePartition {
             ExpertPass::Decode
         };
         self.routing_statistics = RoutingStatistics::default();
-        let expert_cache = self.expert_storage.cache();
+        let parameter_bank = self.expert_storage.cache();
         let decoder_range = self.range();
-        if let Some(expert_cache) = expert_cache {
+        if let Some(parameter_bank) = parameter_bank {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("conditional Qwen external experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, stream: &Stream| {
                 execute_pipeline_cached_neutral_qwen_hybrid(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -1053,7 +1045,7 @@ impl QwenConditionalPipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -1108,7 +1100,7 @@ impl QwenConditionalPipelinePartition {
         })?;
         let prediction_group =
             architecture_prediction_group::<_, MlxHybridState>(&self.architecture, depth)?;
-        let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+        let mut execute = |execution: GatedProductGroupExecution, stream: &Stream| {
             let cache = self.expert_storage.cache().ok_or_else(|| {
                 Exception::custom("conditional Qwen3.5 MTP external expert cache is unavailable")
             })?;
@@ -1119,8 +1111,8 @@ impl QwenConditionalPipelinePartition {
                 &execution.spec,
                 execution.layer,
                 &execution.hidden,
-                &execution.expert_ids,
-                &execution.route_weights,
+                &execution.group_indices,
+                &execution.coefficients,
                 ExpertPass::Decode,
                 cache,
                 assignment,
@@ -1137,7 +1129,7 @@ impl QwenConditionalPipelinePartition {
             depth,
         };
         let (logits, hidden) = if self.expert_storage.cache().is_some() {
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
                 input,
@@ -1202,7 +1194,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 
@@ -1534,12 +1526,12 @@ pub(super) fn load_qwen_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Qwen2, ModelKind::Qwen3], "Qwen")?;
-    let binding_adapter = if expert_cache_options.is_some() {
+    let binding_adapter = if parameter_bank_options.is_some() {
         crate::composition::qwen::QwenPipelineBindings::new_external_experts()
     } else {
         crate::composition::qwen::QwenPipelineBindings::new()
@@ -1593,7 +1585,7 @@ pub(super) fn load_qwen_pipeline(
     let mut stage = QwenPipelinePartition::new(
         seed_architecture,
         range.clone(),
-        expert_cache_options.is_some(),
+        parameter_bank_options.is_some(),
         stream,
     )?;
     let seed_architecture = stage
@@ -1639,7 +1631,7 @@ pub(super) fn load_qwen_pipeline(
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
     }
     let geometry = stage
         .architecture
@@ -1754,7 +1746,7 @@ pub(super) fn load_qwen_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 loaded.load_excluding_roles(
                     architecture_parameter_unit_owner::<_, PipelineRangeState<'_>>(
                         &stage.architecture,
@@ -1796,7 +1788,7 @@ pub(super) fn load_qwen_pipeline(
         let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
-            if expert_cache_options.is_some() {
+            if parameter_bank_options.is_some() {
                 &[eredu_runtime::ParameterRole::ExpertIntermediate]
             } else {
                 &[]
@@ -1844,7 +1836,7 @@ pub(super) fn load_qwen_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    if let Some(options) = expert_cache_options {
+    if let Some(options) = parameter_bank_options {
         let catalog =
             eredu_architectures::qwen::expert_residency_catalog(store.as_ref(), &source_args)
                 .map_err(Error::ArchitectureModel)?;
@@ -1862,7 +1854,7 @@ pub(super) fn load_qwen_pipeline(
             store.as_ref(),
             parallel_layout.as_ref(),
         )?;
-        let cache = build_pipeline_expert_cache(
+        let cache = build_pipeline_parameter_bank(
             Arc::clone(&store),
             entries,
             Some(options),
@@ -1870,12 +1862,12 @@ pub(super) fn load_qwen_pipeline(
             weights_stream,
             stream,
         )?;
-        let owned_expert_bytes = cache.report()?.owned_bytes;
+        let owned_expert_bytes = cache.report()?.owned_bytes();
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
             .checked_add(owned_expert_bytes)
             .ok_or_else(|| Error::Parallel("Qwen pipeline expert byte total overflowed".into()))?;
-        stage.expert_cache = Some(cache);
+        stage.parameter_bank = Some(cache);
     }
     let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.payload_shard_paths.clone();
@@ -1893,7 +1885,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -1902,9 +1894,9 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
         &[ModelKind::Qwen3Vl, ModelKind::Qwen3VlMoe],
         "Qwen3-VL",
     )?;
-    let expert_cache_options = expert_cache_options
+    let parameter_bank_options = parameter_bank_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
-    let external_experts = expert_cache_options.is_some();
+    let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         QwenVlPipelineBindings::new_external_experts()
     } else {
@@ -1999,7 +1991,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
         binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     if let Some(assignment) = expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
     }
     let parameter_description = architecture
         .parameter_description(stream)
@@ -2244,7 +2236,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    if let Some(options) = expert_cache_options {
+    if let Some(options) = parameter_bank_options {
         let catalog =
             eredu_architectures::qwen::expert_residency_catalog(store.as_ref(), &source_args.text)
                 .map_err(Error::ArchitectureModel)?;
@@ -2262,7 +2254,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
             store.as_ref(),
             parallel_layout.as_ref(),
         )?;
-        let cache = build_pipeline_expert_cache(
+        let cache = build_pipeline_parameter_bank(
             Arc::clone(&store),
             entries,
             Some(options),
@@ -2272,7 +2264,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
         )?;
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
-            .checked_add(cache.report()?.owned_bytes)
+            .checked_add(cache.report()?.owned_bytes())
             .ok_or_else(|| Error::Parallel("Qwen3-VL expert bytes overflowed".into()))?;
         stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
     }
@@ -2340,7 +2332,7 @@ impl QwenPipelinePartition {
             dense_layers: None,
             expert_realization: None,
             expert_assignment: None,
-            expert_cache: None,
+            parameter_bank: None,
             routing_statistics: RoutingStatistics::default(),
             _geometry: std::marker::PhantomData,
         })
@@ -2366,7 +2358,7 @@ impl QwenPipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -2384,7 +2376,7 @@ impl QwenPipelinePartition {
                     context,
                 )
             };
-        let mut provider = ResidentExpertExecutorProvider::new(&mut execute);
+        let mut provider = ResidentGroupedExecutorProvider::new(&mut execute);
         let pass = if step.sequence_length > 1 {
             ExpertPass::Prefill
         } else {
@@ -2424,7 +2416,7 @@ impl QwenPipelinePartition {
         })?;
         validate_pipeline_expert_dispatch(&assignment, expert_group, true)?;
         let cache = self
-            .expert_cache
+            .parameter_bank
             .take()
             .ok_or_else(|| Error::Parallel("external Qwen expert cache is unavailable".into()))?;
         let pass = if step.sequence_length > 1 {
@@ -2436,13 +2428,13 @@ impl QwenPipelinePartition {
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
         let mut statistics = std::mem::take(&mut self.routing_statistics);
-        let mut execute = |execution: GatedProductExpertExecution, context: &Stream| {
+        let mut execute = |execution: GatedProductGroupExecution, context: &Stream| {
             execute_pipeline_cached_qwen3(
                 &execution.spec,
                 execution.layer,
                 &execution.hidden,
-                &execution.expert_ids,
-                &execution.route_weights,
+                &execution.group_indices,
+                &execution.coefficients,
                 pass,
                 &cache,
                 &assignment,
@@ -2454,7 +2446,7 @@ impl QwenPipelinePartition {
             .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
             .map_err(|error| Exception::custom(error.to_string()))
         };
-        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+        let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
         let result = execute_neutral_routed_decoder_partition_observed(
             self,
             input,
@@ -2468,20 +2460,20 @@ impl QwenPipelinePartition {
             observer,
         );
         self.routing_statistics = statistics;
-        self.expert_cache = Some(cache);
+        self.parameter_bank = Some(cache);
         result
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_qwen3(
-    spec: &eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GroupedGatedProductSpec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     _tensor_group: Option<&Group>,
@@ -2489,7 +2481,7 @@ fn execute_pipeline_cached_qwen3(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
@@ -2502,9 +2494,15 @@ fn execute_pipeline_cached_qwen3(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     Ok(returned.reduced_output)
@@ -2512,20 +2510,20 @@ fn execute_pipeline_cached_qwen3(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_qwen_hybrid(
-    spec: &eredu_nn::GatedProductExpertBankSpec,
+    spec: &eredu_nn::GroupedGatedProductSpec,
     global_layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     pass: ExpertPass,
-    cache: &ExpertCache,
+    cache: &AddressableParameterBank,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::composition::expert_dispatch::DispatchedRoutes,
                    stream: &Stream| {
         crate::composition::mlx::distributed::expert::execute_cached_gated_product(
             spec,
@@ -2538,9 +2536,15 @@ fn execute_pipeline_cached_neutral_qwen_hybrid(
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
+            hidden,
+            group_indices,
+            weights,
+            assignment,
+            group,
+            stream,
+            execute,
         )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+        None => dispatch_local_with(hidden, group_indices, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
     Ok(returned.reduced_output)
@@ -2607,21 +2611,21 @@ impl QwenHybridPipelinePartition {
             ExpertPass::Decode
         };
         let assignment = self.expert_assignment.clone();
-        let expert_cache = self.expert_storage.cache();
+        let parameter_bank = self.expert_storage.cache();
         let decoder_range = self.range();
-        if let Some(expert_cache) = expert_cache {
+        if let Some(parameter_bank) = parameter_bank {
             let assignment = assignment.as_ref().ok_or_else(|| {
                 Error::Parallel("Qwen hybrid external experts have no assignment".into())
             })?;
-            let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+            let mut execute = |execution: GatedProductGroupExecution, stream: &Stream| {
                 execute_pipeline_cached_neutral_qwen_hybrid(
                     &execution.spec,
                     execution.layer,
                     &execution.hidden,
-                    &execution.expert_ids,
-                    &execution.route_weights,
+                    &execution.group_indices,
+                    &execution.coefficients,
                     pass,
-                    expert_cache,
+                    parameter_bank,
                     assignment,
                     expert_group,
                     &mut self.routing_statistics,
@@ -2630,7 +2634,7 @@ impl QwenHybridPipelinePartition {
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
                 .map_err(|error| Exception::custom(error.to_string()))
             };
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_routed_layered_partition_observed(
                 &mut self.architecture,
                 &self.partition,
@@ -2688,7 +2692,7 @@ impl QwenHybridPipelinePartition {
             .ok_or_else(|| Error::Parallel(format!("Qwen hybrid has no MTP depth {depth}")))?;
         let prediction_group =
             architecture_prediction_group::<_, MlxHybridState>(&self.architecture, depth)?;
-        let mut execute = |execution: GatedProductExpertExecution, stream: &Stream| {
+        let mut execute = |execution: GatedProductGroupExecution, stream: &Stream| {
             let cache = self.expert_storage.cache().ok_or_else(|| {
                 Exception::custom("Qwen hybrid MTP external expert cache is unavailable")
             })?;
@@ -2699,8 +2703,8 @@ impl QwenHybridPipelinePartition {
                 &execution.spec,
                 execution.layer,
                 &execution.hidden,
-                &execution.expert_ids,
-                &execution.route_weights,
+                &execution.group_indices,
+                &execution.coefficients,
                 ExpertPass::Decode,
                 cache,
                 assignment,
@@ -2717,7 +2721,7 @@ impl QwenHybridPipelinePartition {
             depth,
         };
         let (logits, hidden) = if self.expert_storage.cache().is_some() {
-            let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+            let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
                 input,
@@ -2782,7 +2786,7 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         self.dense_layers.as_ref()
     }
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         self.expert_storage.cache()
     }
 
@@ -2935,7 +2939,7 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -2944,10 +2948,10 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
         &[ModelKind::Qwen3Next, ModelKind::Qwen35],
         "Qwen hybrid",
     )?;
-    let explicit_expert_cache = expert_cache_options.is_some();
-    let expert_cache_options = expert_cache_options
+    let explicit_parameter_bank = parameter_bank_options.is_some();
+    let parameter_bank_options = parameter_bank_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
-    let external_experts = expert_cache_options.is_some();
+    let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         QwenHybridPipelineBindings::new_external_experts()
     } else {
@@ -3050,7 +3054,7 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
         binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     if let Some(assignment) = expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
     }
     let geometry = architecture.shared_parallel_geometry();
     let parameter_description = architecture
@@ -3325,27 +3329,27 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
         .into_iter()
         .filter(|entry| {
             stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                assignment.owner(entry.identity().index()) == Some(assignment.rank())
             })
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
-                expert_cache_options,
+                parameter_bank_options,
                 expert_quantization,
                 weights_stream,
                 stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| Error::Parallel("Qwen hybrid expert bytes overflowed".into()))?;
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let checkpoint_diagnostics = if explicit_expert_cache {
+    let checkpoint_diagnostics = if explicit_parameter_bank {
         store.source_diagnostics()?
     } else {
         checkpoint_diagnostics_before_deferred
@@ -3383,15 +3387,15 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Qwen35], "conditional Qwen3.5")?;
-    let explicit_expert_cache = expert_cache_options.is_some();
-    let expert_cache_options = expert_cache_options
+    let explicit_parameter_bank = parameter_bank_options.is_some();
+    let parameter_bank_options = parameter_bank_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
-    let external_experts = expert_cache_options.is_some();
+    let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         QwenConditionalPipelineBindings::new_external_experts()
     } else {
@@ -3498,7 +3502,7 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
         binding_adapter.expert_parallel_assignment(expert_realization.as_ref())?;
     if let Some(assignment) = expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        info.local_group_indices = assignment.local_global_group_indices().to_vec();
     }
     let parameter_description = architecture
         .parameter_description(stream)
@@ -3831,29 +3835,29 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
         .into_iter()
         .filter(|entry| {
             stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                assignment.owner(entry.identity().index()) == Some(assignment.rank())
             })
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
+            let cache = build_pipeline_parameter_bank(
                 Arc::clone(&store),
                 entries,
-                expert_cache_options,
+                parameter_bank_options,
                 expert_quantization,
                 weights_stream,
                 stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+                .checked_add(cache.report()?.owned_bytes())
                 .ok_or_else(|| {
                     Error::Parallel("conditional Qwen3.5 expert bytes overflowed".into())
                 })?;
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let diagnostics = if explicit_expert_cache {
+    let diagnostics = if explicit_parameter_bank {
         store.source_diagnostics()?
     } else {
         diagnostics_before_deferred

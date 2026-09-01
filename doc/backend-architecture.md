@@ -236,10 +236,13 @@ Replicated text composition has one checked cross-crate construction flow.
 architecture and the exact admitted artifact. The requirements contain the
 execution graph and unit layout, group transport, complete state layout,
 canonical logical parameters, admitted source encodings, architecture-valid
-executable formats and transforms, and required session facilities. A concrete
-backend reports only mechanism support through
-`ReplicatedTextBackendCapabilities`. The neutral selector resolves those two
-values and the requested residency policy into one
+executable formats, and transform constraints. Caller-selected topology,
+weight residency, mutable-state residency, load-time transformation, cache,
+observation, persistence, and completion facilities live in a separate
+`ReplicatedTextSelectionRequest`. A concrete backend reports only reusable
+neural, lowering, residency, state-storage, session, and completion mechanisms
+through `BackendMechanismCapabilities`. The neutral selector resolves those
+three values into one
 `SelectedReplicatedTextRealization` before architecture modules or weight
 payloads are constructed.
 
@@ -265,12 +268,15 @@ telemetry.
 
 `ReplicatedTextArchitecture` adds only ordinary borrowed text-input formation
 to the layered lifecycle and remains generic over its runtime state. Hybrid
-component state uses a different `RuntimeState`; routed computation adds
-`RoutedLayeredArchitecture` and mechanism-oriented expert providers;
-partitioning adds `PartitionedLayeredArchitecture` and collective contexts;
-composite models use architecture-owned inputs and execution groups; embedded
-prediction uses separately identified prediction groups and transactional
-draft state; and realtime models use the frame-oriented realtime contracts.
+component state uses the `RuntimeStateComponents` extension; architecture-owned
+routing translates expert identity and assignment into `GroupedNeuralBackend`
+selection and projection mechanisms, independently addressable parameter-bank
+keys, and ordinary collectives; partitioning adds
+`PartitionedLayeredArchitecture`, boundary schemas, and collective contexts;
+composite models use `PreparedModelInput` and architecture-owned execution
+groups; embedded prediction uses separately identified prediction groups and
+`DraftStateTransaction`; and realtime models use the frame-oriented realtime
+contracts.
 None of these execution classes adds routing, media, partition, prediction, or
 frame requirements to replicated text selection or to `NeuralBackend`.
 
@@ -306,12 +312,11 @@ Backend pipeline composition supplies physical group placement and consumes
 family-owned local geometry; it does not create an ownership probe or populate
 state in a second pass.
 
-The ordinary Qwen decoder, block, and layered lifecycle are dense construction
-surfaces and require only `NeuralBackend`. Concrete adapters that dynamically
-admit both dense and Qwen MoE configurations use the separate routed Qwen
-lifecycle, which requires `RoutedNeuralBackend`. A backend implementing dense
-Qwen is therefore not required to provide a router or either expert-bank
-implementation.
+The ordinary Qwen decoder, block, and layered lifecycle uses only the base
+neural mechanisms. Qwen architectures that select sparse groups use a separate
+architecture lifecycle and the grouped-computation extension traits. A backend
+used for the ordinary lifecycle is therefore not required to provide grouped
+selection or grouped projection mechanisms.
 
 External RoPE maps and their family aliases are architecture configuration
 input, not a backend contract. Architectures normalize them into the closed
@@ -378,7 +383,7 @@ after geometry parsing; cache identity, backend metadata, and complete or
 partitioned model reporting derive it from the same retained field. The
 portable `LoadedTextModelConfig` requires both identities, and the
 facade carries the resolved family through artifact loading rather than exposing
-the effective type under the ambiguous legacy `model_type` name. Portable
+the effective type under the ambiguous `model_type` name. Portable
 capability records, execution telemetry, rank-local parallel summaries, and
 layerwise residency metadata likewise expose this identity only as
 `effective_model_type`; serialized telemetry and capability records use that
@@ -410,7 +415,7 @@ Architecture-owned SafeTensors conversion plans likewise enumerate every exact
 dense source, packed-weight output, scale companion, optional affine-bias
 companion, and the complete output model configuration. Concrete backends
 execute those plans literally. They do not select tensors by suffix, rank,
-dtype, size, or substring; derive companion identities; canonicalize legacy
+dtype, size, or substring; derive companion identities; canonicalize alternate
 names; or inject compatibility metadata into `config.json`. Conversion fails
 closed when a declared source is absent or any declared output collides with
 another checkpoint tensor. Conversion obtains payload paths from canonical
@@ -464,26 +469,28 @@ composition binds those recipes without reconstructing the segment equation.
 Family recipe APIs derive their own checkpoint roots; in particular, Gemma 4
 and Qwen expert recipe callers provide only the catalog, normalized
 configuration, and layer identity, never a backend-selected layer namespace.
-Independent expert residency is exposed as a validated neutral catalog. Each
-catalog entry carries the router/cache identity, the owning architecture group,
-unit index and parameter path, expert-parallel versus replicated placement,
-exact acquired-bank binding names, exact logical parameter targets, and
-checkpoint-derived recipes. Each parameter also declares whether it must be
-preserved or is a load-time-quantizable projection; quantizable projections
-carry the exact local scale and affine-bias companion binding names. Backends
-filter neutral expert catalogs by the architecture's owning group and
-group-local unit before lowering them to backend cache entries. Router/cache
-identity is not an ownership address and must not be flattened back into one.
-Backends consume the remaining declaration directly and never infer eligibility
-or companion identity from binding spelling, dtype, or rank. Family code owns
+Independent expert residency is exposed to composition as a validated neutral
+architecture catalog. Each entry carries expert identity, its owning group,
+unit index, parameter path, and placement. Composition maps that identity to a
+generic `ParameterBankKey` and supplies atomic bindings plus byte geometry to
+the backend's addressable parameter bank. Backend cache policy and telemetry
+refer only to keys, access classes, storage tiers, compact banks, and bytes.
+Each architecture entry also carries exact acquired-bank binding names, logical
+parameter targets, and checkpoint-derived recipes. Each parameter declares
+whether it must be preserved or is a load-time-quantizable projection;
+quantizable projections carry exact local scale and affine-bias companion
+binding names. Composition filters the architecture catalog by owning group and
+group-local unit before lowering it to backend bank entries. Expert identity is
+not a backend ownership address. The backend consumes the resulting atomic
+declaration directly and never infers eligibility or companion identity from
+binding spelling, dtype, or rank. Family code owns
 sparse-layer selection, routed versus shared-bank scheduling, expert counts,
 and cache-layer numbering. Physical checkpoint keys excluded from ordinary
 layer residency while experts are independently resident are projected from
 the complete architecture catalog; backend composition does not rediscover
 them by walking family layer policies or rebuilding per-layer recipes.
 This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, LFM2,
-Kimi Linear, and later
-families: each architecture checkpoint module emits its complete
+Kimi Linear, and other sparse families: each architecture checkpoint module emits its complete
 `ExpertResidencyCatalog`, including compact acquired-bank names and every
 per-expert or rank-local selection recipe. Backend family adapters may request
 and filter that catalog, but do not calculate a parallel expert topology.
@@ -514,10 +521,9 @@ or architecture-declared static-role ownership. A stage's raw layer-range
 endpoint is not an ownership signal. Backend stage metadata exposes input and
 output ownership from the realized partition; pipeline coordinates describe
 transport adjacency, not boundary ownership.
-Concrete backends lower catalog entries into native storage and may apply the
-declared unit path to a rank-local placement; they do not rebuild the schedule,
-instantiate a family block to discover expert parameters, or match parameter
-targets by substring or suffix.
+Composition lowers architecture catalog entries into native storage requests;
+reusable backends do not rebuild the schedule, receive expert identity,
+instantiate a family block, or match parameter targets by substring or suffix.
 They also normalize physical checkpoint format metadata onto canonical runtime
 parameters, including fused expert projections, so each backend consumes the
 same family-specific quantization identities. Load-time quantization derives
@@ -604,7 +610,7 @@ reintroduce checkpoint roots into a backend.
 physical checkpoint encoding; `eredu-nn` does not re-export that checkpoint-owned
 type. `eredu-nn::LinearFormatSpec` combines the encoding with the exact scale and
 affine-bias companion parameters required by neural construction.
-Ordinary linear, embedding, router, and expert construction specifications use
+Ordinary linear, embedding, group-selector, and grouped-projection construction specifications use
 it directly, and architecture parallel plans return the same declaration for
 encoded parameters. Neutral runtime code derives packed shapes and remaps
 declared sharding geometry from that typed declaration. Architectures may
@@ -619,17 +625,16 @@ that semantic link to build bounded targets whose weight and companion output
 names are all explicit; bounded materializers reject missing or colliding
 identities and never manufacture them from the weight name.
 
-Routed expert banks retain and expose their architecture-owned construction
-specification. Resident, cached, distributed, and future backend execution
-paths all consume that same geometry, projection encoding, bias layout, and
-activation policy. Each expert projection also declares the exact identities
-of its scale and affine-bias companions; reusable backends bind those identities
-to native slots without imposing projection suffixes or synthesizing checkpoint
-names. Backend residency adapters must not reconstruct a parallel family
-descriptor from model arguments. Architecture APIs derive localized
-expert-bank specifications for placement-resolved expert counts and projection
-widths while preserving canonical parameter identities and physical formats;
-backend composition only materializes those returned specifications.
+Routed architectures retain and expose their architecture-owned construction
+specification. Architecture/runtime composition translates that semantic
+geometry into grouped projection specifications before invoking a backend.
+Resident, cached, and distributed execution consume the same projection
+encoding, bias layout, and activation policy. Each projection declares the
+exact identities of its scale and affine-bias companions; reusable backends
+bind those identities to native slots without imposing projection suffixes or
+synthesizing checkpoint names. Architecture APIs derive localized grouped-bank
+specifications for placement-resolved expert counts and projection widths while
+preserving canonical parameter identities and physical formats.
 Cache-backed distributed callbacks receive the specification from the resident
 unit bank or directly from that unit's realization-plan entry, including for
 ReLU-squared banks and appended prediction units; they never rebuild it from a
@@ -641,8 +646,8 @@ and the exact rank-local bank specification for every routed execution unit.
 Each plan entry uses the same canonical execution-group and group-local unit
 address as the architecture execution layout and expert-residency catalog;
 group aliases are not interchangeable ownership addresses.
-Distributed preflight consumes the plan's global count, and a concrete backend
-lowers the declared owner map into its native dispatch representation without
+Distributed composition consumes the plan's global count and lowers the
+declared owner map into group indices plus ordinary collective calls without
 running another assignment policy. The plan's presence or absence is also the
 only authority for whether the realized architecture has routed execution
 units; composition must not inspect a family schedule or configuration count
@@ -658,22 +663,22 @@ GPT-OSS, LFM2, Kimi Linear, Nemotron-H, Muse-Glimmer, Inkling, Gemma 4, and
 DeepSeek V3/V4 expose family-specific realization entry points over their
 constructed neutral architectures. These entry points select routed units,
 preserve canonical parameter formats, and apply planner-derived local widths
-before a backend sees the plan. Family adapters accept the plan rather than the
-family configuration or parallel topology when creating their native dispatch
-assignment. A backend assignment type is only a validated lowering of the
-plan's owner map; it exposes no independent balanced, round-robin, or explicit
-policy engine. DeepSeek pipeline unit factories install the plan before
+before grouped backend mechanisms are selected. Family composition accepts the
+plan rather than the family configuration or parallel topology when creating
+dispatch assignment. The adapter exposes no independent balanced, round-robin,
+or explicit policy engine. DeepSeek pipeline unit factories install the plan before
 constructing target or prediction units, and tensor-parallel expert-cache
 selection derives
 its local width from the same plan entries rather than from family arguments.
-Distributed expert callbacks also
+Distributed architecture callbacks also
 carry whether the requested result is globally complete or a rank-local
 tensor-parallel contribution, so EP recombination preserves the reducible and
 post-reduction terms without inventing or repeating a TP collective.
 Observed routed execution asks the neutral `RoutedLayeredArchitecture` for each
 unit's optional observation point. The architecture supplies both the semantic
-module path and expert cardinality; backend composition only adapts native
-tensors to the neutral observer and cannot invent family path segments.
+module path and expert cardinality; composition adapts native tensors to the
+neutral observer before calling grouped backend mechanisms and cannot invent
+family path segments.
 Activation observers likewise derive unit input, output, and nested operator
 names from the architecture's canonical `unit_path`; concrete composition must
 not reconstruct a family path from a group or layer index.
@@ -810,8 +815,8 @@ tensor sharding, pipeline staging, and expert partitioning. Each axis is
 declared from the parsed family variant rather than inferred from parameter
 addressability or a broad family identity. Independent expert residency
 remains a separate artifact capability because it does not imply an
-expert-parallel execution plan. Distributed backend preflight consumes these
-facts from that exact normalized report instead of reconstructing support from
+expert-parallel execution plan. Distributed composition consumes these facts
+from that exact normalized report instead of reconstructing support from
 raw or wrapper `model_type` values. GGUF inspection, planning, and
 materialization all validate requested preparation against the architecture
 plan retained by portable admission. A backend must not reparse the raw GGUF
@@ -838,7 +843,7 @@ selection likewise use the decoder group count from that description, before
 constructing any rank-local units.
 Placement retains the neutral `ArchitectureGroupKind` vocabulary directly;
 backend composition does not rename architecture-authored semantic kinds into
-a legacy execution-group type.
+an untyped execution-group category.
 Rank-local materialization traverses the canonical units exposed by its
 `ArchitecturePartition`, so composite vision, target, and prediction ordering
 is never restated by a backend loader. Dense-stream storage indexes those
@@ -1321,7 +1326,7 @@ The primary decoder and embedded-prediction groups have explicit stable
 identities, so multimodal ingress ends at the declared primary boundary and
 prediction runs only in the architecture-declared identity order. Their
 semantic kinds remain useful for lifecycle classification but do not select
-either group. Backend expert-routing guards consume those declared identities;
+either group. Composition dispatch guards consume those declared identities;
 they do not reconstruct family prediction-group names from depth indices.
 
 Pipeline ingress uses the same canonical execution graph through
@@ -1455,6 +1460,6 @@ These rules are recorded in the repository-root
 [architecture rules](../AGENTS.md). We intentionally do not enforce them by
 inspecting the Cargo dependency graph, scanning Rust source for substrings, or
 asserting a particular file layout: those checks couple architecture to
-repository shape and migration artifacts instead of semantic ownership.
+repository shape instead of semantic ownership.
 Repeated violations should be made unrepresentable with a crate boundary or
 visibility change.

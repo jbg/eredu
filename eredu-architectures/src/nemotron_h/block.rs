@@ -1,8 +1,8 @@
 //! Exact Nemotron-H physical-unit normalization and residual order.
 
 use eredu_nn::{
-    AttentionCache, Error, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
-    Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, Error, GroupedNeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
 
@@ -16,7 +16,7 @@ use super::{
 /// One scheduled physical operator.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Operator<B: RoutedNeuralBackend> {
+pub enum Operator<B: GroupedNeuralBackend> {
     /// Mamba2 state-space operator.
     Mamba(Mamba2<B>),
     /// No-positional grouped-query attention.
@@ -30,7 +30,7 @@ pub enum Operator<B: RoutedNeuralBackend> {
 /// One pre-normalized residual Nemotron-H physical unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Block<B: RoutedNeuralBackend> {
+pub struct Block<B: GroupedNeuralBackend> {
     /// Scheduled operator.
     pub operator: Operator<B>,
     /// Unit pre-normalization.
@@ -39,7 +39,7 @@ pub struct Block<B: RoutedNeuralBackend> {
     residual_in_fp32: bool,
 }
 
-impl<B: RoutedNeuralBackend> Block<B> {
+impl<B: GroupedNeuralBackend> Block<B> {
     /// Builds one global-geometry physical unit.
     pub fn new(
         args: &ModelArgs,

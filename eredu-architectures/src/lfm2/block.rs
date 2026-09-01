@@ -3,8 +3,9 @@
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
     AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    GatedShortConvolution, GatedShortConvolutionSpec, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RotarySpec, RoutedNeuralBackend, Tensor,
+    GatedShortConvolution, GatedShortConvolutionSpec, GroupedNeuralBackend, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, RotarySpec,
+    Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -15,7 +16,7 @@ use super::{FeedForward, ModelArgs, OperatorPolicy};
 /// Scheduled LFM2 token mixer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum TokenMixer<B: RoutedNeuralBackend> {
+pub enum TokenMixer<B: GroupedNeuralBackend> {
     /// Grouped-query self attention.
     Attention(Attention<B>),
     /// Gated causal short convolution.
@@ -25,7 +26,7 @@ pub enum TokenMixer<B: RoutedNeuralBackend> {
 /// One exact LFM2 decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Block<B: RoutedNeuralBackend> {
+pub struct Block<B: GroupedNeuralBackend> {
     /// Scheduled token mixer.
     pub mixer: TokenMixer<B>,
     /// Scheduled dense or routed feed-forward operator.
@@ -64,7 +65,7 @@ impl BlockGeometry {
     }
 }
 
-impl<B: RoutedNeuralBackend> Block<B> {
+impl<B: GroupedNeuralBackend> Block<B> {
     /// Builds one unloaded block from the normalized physical schedule.
     pub fn new(
         args: &ModelArgs,

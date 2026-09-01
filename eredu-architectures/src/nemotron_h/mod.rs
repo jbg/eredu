@@ -35,10 +35,10 @@ pub use parallel::{
 };
 
 /// Derives complete expert ownership and rank-local ReLU-squared bank geometry.
-pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>>, eredu_nn::Error> {
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>, eredu_nn::Error> {
     let args = architecture.args();
     if !args.has_sparse_moe_layers() {
         return Ok(None);
@@ -128,10 +128,10 @@ pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
 
 /// Resolves an identity-layer callback to its architecture-owned local bank spec.
 pub fn realized_expert_bank_spec<'a>(
-    plan: &'a crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
+    plan: &'a crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
     args: &ModelArgs,
     identity_layer: usize,
-) -> Option<&'a eredu_nn::Relu2ExpertBankSpec> {
+) -> Option<&'a eredu_nn::GroupedRelu2Spec> {
     let target = usize::try_from(args.num_hidden_layers).ok()?;
     if identity_layer < target {
         return plan.unit_spec("target", identity_layer);

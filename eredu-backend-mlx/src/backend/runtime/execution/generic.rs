@@ -123,7 +123,7 @@ pub trait MlxUnitPopulator<U> {
     /// Populates the parameters owned by the execution-unit residency policy.
     ///
     /// Most units own every materialized parameter. Architectures with an
-    /// independently managed parameter class (for example, an expert cache)
+    /// independently managed addressable parameter class
     /// override this method with the same exclusion used while binding the
     /// unit. Keeping the ownership decision on the populator makes resident,
     /// bounded, and dense-stream execution follow one contract.

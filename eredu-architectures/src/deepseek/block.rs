@@ -1,10 +1,10 @@
 //! Shared DeepSeek decoder-block sequencing.
 
 use eredu_nn::{
-    BlockwiseAttentionBackend, CompressedAttentionCache, Error, HyperConnection,
-    HyperConnectionSpec, HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    PoolingAttentionCache, RoutedNeuralBackend, Tensor,
+    BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend,
+    HyperConnection, HyperConnectionSpec, HyperNeuralBackend, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec,
+    Parameterized, PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
@@ -33,7 +33,7 @@ pub struct DenseSwiGlu<B: NeuralBackend> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct V4Block<B>
 where
-    B: HyperNeuralBackend + RoutedNeuralBackend,
+    B: HyperNeuralBackend + GroupedNeuralBackend,
 {
     /// Scheduled V4 attention operator.
     pub attention: V4Attention<B>,
@@ -50,7 +50,7 @@ where
 
 impl<B> V4Block<B>
 where
-    B: HyperNeuralBackend + RoutedNeuralBackend,
+    B: HyperNeuralBackend + GroupedNeuralBackend,
 {
     /// Builds one unloaded target block, including its optional token-to-expert
     /// table for hash-routed prefix layers.
@@ -525,7 +525,7 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
 /// Dense-prefix or routed/shared V3 feed-forward policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum V3FeedForward<B: RoutedNeuralBackend> {
+pub enum V3FeedForward<B: GroupedNeuralBackend> {
     /// Dense-prefix SwiGLU.
     Dense(DenseSwiGlu<B>),
     /// Routed plus shared experts.
@@ -535,7 +535,7 @@ pub enum V3FeedForward<B: RoutedNeuralBackend> {
 /// One backend-neutral V3 target or MTP decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct V3Block<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
+pub struct V3Block<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
     /// V3 multi-head latent attention.
     pub attention: V3Attention<B>,
     /// Schedule-selected dense or sparse feed-forward layer.
@@ -544,7 +544,7 @@ pub struct V3Block<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
     post_attention_norm: B::Normalization,
 }
 
-impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> V3Block<B> {
+impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> V3Block<B> {
     /// Builds one unloaded target block from the validated layer schedule.
     pub fn new(
         args: &V3Args,

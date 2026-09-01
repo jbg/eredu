@@ -2,8 +2,8 @@
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, LinearOperator,
-    NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
+    LinearOperator, NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
@@ -26,7 +26,7 @@ use super::{
 /// One target or configured prediction execution unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: RoutedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend> {
     /// Ordinary hybrid decoder block.
     Target(Block<B>),
     /// One embedded prediction depth.
@@ -35,7 +35,7 @@ pub enum Unit<B: RoutedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -63,7 +63,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -119,7 +119,7 @@ impl<T> ForwardContext<T> {
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     /// Resumes an already embedded target partition in the canonical layered context.
     pub fn resume_target_partition(
         &self,
@@ -168,7 +168,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 }
 
 /// One neutral layered model for Qwen3-Next and every Qwen3.5 text policy.
-pub struct LayeredModel<B: RoutedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend> {
     config: HybridConfig,
     decoder: HybridDecoder<B>,
     target_layers: usize,
@@ -176,7 +176,7 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -241,7 +241,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules and the exact configured graph.
     pub fn new(
         config: HybridConfig,
@@ -681,7 +681,7 @@ fn static_spec(config: &HybridConfig) -> Result<StaticModuleSpec, Error> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -922,7 +922,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1056,7 +1056,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

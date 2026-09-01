@@ -15,7 +15,7 @@ use eredu_checkpoint::{store::WeightStoreDiagnostics, WeightQuantization};
 use eredu_core::{
     MaterializationRoute, ModelArtifact, ModelPreparationPlan, PreparedInputIdentity,
 };
-use eredu_nn::{Parameterized, RoutedNeuralBackend, TensorParallelExpertOutput};
+use eredu_nn::{GroupedNeuralBackend, Parameterized, TensorParallelGroupedOutput};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureParameters, DenseDiskStreamLoadOptions,
     LayerWeightResidency, LayeredArchitecture, LayerwiseLoadOptions, OffloadUnit, ResidencyReport,
@@ -67,10 +67,6 @@ use crate::{
     },
     backend::runtime::checkpoint::store::open_gguf_checkpoint_source,
     backend::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
-    backend::runtime::distributed::expert::{
-        dispatch_replicated, dispatch_replicated_tensor_parallel, ExpertAssignment,
-        RoutingStatistics,
-    },
     backend::runtime::distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
     backend::runtime::execution::layerwise::{
         packed_weight_companions, quantize_pipeline_stage_store_with, shard_layer_bindings,
@@ -78,14 +74,18 @@ use crate::{
         PipelineStageQuantizationSelection,
     },
     backend::runtime::media::{prepared_identity_wire_arrays, PreparedModelInput},
-    backend::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
-    },
     backend::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
     },
+    backend::runtime::residency::parameter_bank::{
+        AddressableParameterBank, ParameterBankEntry, ParameterBankResidencyReport,
+    },
     backend::MlxParallelContext,
     backend::ModelLoadOptions,
+    composition::expert_dispatch::{
+        dispatch_replicated, dispatch_replicated_tensor_parallel, ExpertAssignment,
+        RoutingStatistics,
+    },
     composition::llama::checkpoint as llama_checkpoint,
     composition::mlx::speculative::embedded::{EmbeddedMtpOutput, EmbeddedMtpTarget},
     composition::{
@@ -450,16 +450,16 @@ fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
     )
 }
 
-fn build_pipeline_expert_cache(
+fn build_pipeline_parameter_bank(
     store: SharedCheckpointSource,
-    entries: Vec<ExpertCatalogEntry>,
+    entries: Vec<ParameterBankEntry>,
     options: Option<ExpertCacheLoadOptions>,
     quantization: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
-) -> Result<ExpertCache, Error> {
+) -> Result<AddressableParameterBank, Error> {
     Ok(match (options, quantization) {
-        (Some(options), Some(quantization)) => ExpertCache::new_quantized_shared(
+        (Some(options), Some(quantization)) => AddressableParameterBank::new_quantized_shared(
             store,
             entries,
             options,
@@ -467,21 +467,21 @@ fn build_pipeline_expert_cache(
             weights_stream.clone(),
             stream.clone(),
         )?,
-        (Some(options), None) => ExpertCache::new_shared(
+        (Some(options), None) => AddressableParameterBank::new_shared(
             store,
             entries,
             options,
             weights_stream.clone(),
             stream.clone(),
         )?,
-        (None, Some(quantization)) => ExpertCache::new_quantized_resident_shared(
+        (None, Some(quantization)) => AddressableParameterBank::new_quantized_resident_shared(
             store,
             entries,
             quantization,
             weights_stream.clone(),
             stream.clone(),
         )?,
-        (None, None) => ExpertCache::new_resident_shared(
+        (None, None) => AddressableParameterBank::new_resident_shared(
             store,
             entries,
             weights_stream.clone(),
@@ -534,7 +534,7 @@ pub struct PipelineStageInfo {
     /// Total routed experts in global model geometry, when applicable.
     pub global_expert_count: Option<usize>,
     /// Checkpoint-global expert ids owned by this stage rank.
-    pub local_expert_ids: Vec<usize>,
+    pub local_group_indices: Vec<usize>,
     /// Previous stage's global rank, if any.
     pub predecessor_rank: Option<usize>,
     /// Next stage's global rank, if any.
@@ -1851,9 +1851,9 @@ struct DecoderPipelineRealization<A, G, C, L> {
     layers: Vec<L>,
     dense_layers: Option<PipelineLayerStorage>,
     expert_realization:
-        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     expert_assignment: Option<ExpertAssignment>,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
     routing_statistics: RoutingStatistics,
 }
 
@@ -1863,9 +1863,9 @@ struct DecoderPipelineBuilder<A, G, C, L> {
     layers: Vec<L>,
     dense_layers: Option<PipelineLayerStorage>,
     expert_realization:
-        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
+        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     expert_assignment: Option<ExpertAssignment>,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
     routing_statistics: RoutingStatistics,
     _geometry: std::marker::PhantomData<G>,
 }
@@ -1886,7 +1886,7 @@ impl<A, G, C, L> DecoderPipelineBuilder<A, G, C, L> {
             dense_layers: self.dense_layers,
             expert_realization: self.expert_realization,
             expert_assignment: self.expert_assignment,
-            expert_cache: self.expert_cache,
+            parameter_bank: self.parameter_bank,
             routing_statistics: self.routing_statistics,
         }
     }
@@ -1924,7 +1924,7 @@ fn construct_qwen_partition_unit(
     bindings: &crate::composition::qwen::QwenPipelineBindings,
     index: usize,
     realization: Option<
-        &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     >,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
@@ -1942,7 +1942,7 @@ fn construct_gpt_oss_partition_unit(
     bindings: &crate::composition::gpt_oss::GptOssPipelineBindings,
     index: usize,
     realization: Option<
-        &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+        &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     >,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
@@ -2067,7 +2067,7 @@ type QwenConditionalPipelinePartition = MediaPipelineRealization<
 enum PipelineExpertStorage {
     LayerLocal,
     ExternalEmpty,
-    External(Box<ExpertCache>),
+    External(Box<AddressableParameterBank>),
 }
 
 impl PipelineExpertStorage {
@@ -2075,7 +2075,7 @@ impl PipelineExpertStorage {
         !matches!(self, Self::LayerLocal)
     }
 
-    fn cache(&self) -> Option<&ExpertCache> {
+    fn cache(&self) -> Option<&AddressableParameterBank> {
         match self {
             Self::External(cache) => Some(cache.as_ref()),
             Self::LayerLocal | Self::ExternalEmpty => None,
@@ -2313,7 +2313,7 @@ trait PipelinePartitionMetadata {
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage>;
 
-    fn expert_cache(&self) -> Option<&ExpertCache> {
+    fn parameter_bank(&self) -> Option<&AddressableParameterBank> {
         None
     }
 
@@ -2330,9 +2330,9 @@ trait PipelinePartitionMetadata {
             .transpose()
     }
 
-    fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache()
-            .map(ExpertCache::report)
+    fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank()
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Error::from)
     }
@@ -3424,31 +3424,31 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn execute_resident_distributed_experts(
-    bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+    bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups,
     hidden: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     partitions: usize,
     assignment: &ExpertAssignment,
     group: &Group,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
-) -> Result<TensorParallelExpertOutput<Array>, Exception> {
-    if hidden.ndim() < 2 || expert_ids.ndim() < 2 || weights.shape() != expert_ids.shape() {
+) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
+    if hidden.ndim() < 2 || group_indices.ndim() < 2 || weights.shape() != group_indices.shape() {
         return Err(Exception::custom(
             "distributed expert routing requires hidden [..., hidden] and matching [..., top_k] routes",
         ));
     }
     let hidden_shape = hidden.shape().to_vec();
     let hidden_width = hidden.dim(-1);
-    let top_k = expert_ids.dim(-1);
+    let top_k = group_indices.dim(-1);
     let hidden = hidden.reshape(&[-1, hidden_width], stream)?;
-    let expert_ids = expert_ids.reshape(&[-1, top_k], stream)?;
+    let group_indices = group_indices.reshape(&[-1, top_k], stream)?;
     let weights = weights.reshape(&[-1, top_k], stream)?;
-    let mut output = if partitions > 1 {
+    let output = if partitions > 1 {
         let returned = dispatch_replicated_tensor_parallel(
             &hidden,
-            &expert_ids,
+            &group_indices,
             &weights,
             assignment,
             bank,
@@ -3462,7 +3462,7 @@ fn execute_resident_distributed_experts(
     } else {
         let returned = dispatch_replicated(
             &hidden,
-            &expert_ids,
+            &group_indices,
             &weights,
             assignment,
             bank,
@@ -3471,17 +3471,14 @@ fn execute_resident_distributed_experts(
         )
         .map_err(|error| Exception::custom(error.to_string()))?;
         statistics.accumulate(&returned.statistics);
-        TensorParallelExpertOutput {
-            reducible: returned.reduced_output,
-            post_reduce: None,
-        }
+        TensorParallelGroupedOutput::new(returned.reduced_output, None)
     };
-    output.reducible = output.reducible.reshape(&hidden_shape, stream)?;
-    output.post_reduce = output
-        .post_reduce
+    let (reducible, post_reduce) = output.into_parts();
+    let reducible = reducible.reshape(&hidden_shape, stream)?;
+    let post_reduce = post_reduce
         .map(|value| value.reshape(&hidden_shape, stream))
         .transpose()?;
-    Ok(output)
+    Ok(TensorParallelGroupedOutput::new(reducible, post_reduce))
 }
 
 /// Provider-aware form of the canonical neutral group executor.
@@ -5184,8 +5181,8 @@ impl PipelineModel {
     }
 
     /// Returns stage-local independent expert-cache telemetry when enabled.
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.stage.expert_cache_report()
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.stage.parameter_bank_report()
     }
 
     /// Allocates cache entries only for locally owned decoder layers.
@@ -5644,7 +5641,7 @@ impl PipelineModel {
                 .successor_rank
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
-            execution.expert_group(),
+            execution.axis_group(eredu_core::ParallelAxis::Expert),
             false,
             stream,
             observer,
@@ -5720,7 +5717,7 @@ impl PipelineModel {
                 .successor_rank
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
-            execution.expert_group(),
+            execution.axis_group(eredu_core::ParallelAxis::Expert),
             true,
             stream,
             observer,
@@ -7000,7 +6997,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
                 proposal_capacity,
                 cache,
                 Some(&tensor),
-                self.execution.expert_group(),
+                self.execution.axis_group(eredu_core::ParallelAxis::Expert),
                 stream,
             )
         } else {
@@ -7076,7 +7073,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
                     depth,
                     cache,
                     Some(&tensor),
-                    self.execution.expert_group(),
+                    self.execution.axis_group(eredu_core::ParallelAxis::Expert),
                     stream,
                 )
                 .map(Some)
@@ -7195,7 +7192,7 @@ fn base_info(
         concurrent_residency_peak_bytes: 0,
         observed_concurrent_residency_peak_bytes: 0,
         global_expert_count: None,
-        local_expert_ids: Vec::new(),
+        local_group_indices: Vec::new(),
         predecessor_rank: topology
             .pipeline_predecessor()
             .expect("validated topology has valid pipeline predecessor geometry"),
@@ -8856,7 +8853,7 @@ where
 fn validate_distributed_stage_capabilities(
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
     topology: MlxParallelContext,
-    expert_cache: bool,
+    parameter_bank: bool,
     artifact: &str,
     architecture: &str,
 ) -> Result<(), Error> {
@@ -8871,7 +8868,7 @@ fn validate_distributed_stage_capabilities(
             "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
         ))
     };
-    if expert_cache && !capabilities.independently_addressable_experts() {
+    if parameter_bank && !capabilities.independently_addressable_experts() {
         return Err(unsupported("independent expert-residency"));
     }
     Ok(())
@@ -8923,7 +8920,7 @@ pub fn load_pipeline_model_with_options(
     };
     let (artifact, architecture_plan, _policy, route) = plan.into_parts();
     let model_kind = architecture_plan.model_kind();
-    let (expert_cache, dense_stream) = match route {
+    let (parameter_bank, dense_stream) = match route {
         MaterializationRoute::Resident => (None, None),
         MaterializationRoute::Layerwise => {
             let layers = layer_residency().ok_or_else(|| {
@@ -8977,7 +8974,7 @@ pub fn load_pipeline_model_with_options(
             validate_distributed_stage_capabilities(
                 capabilities,
                 topology,
-                expert_cache.is_some(),
+                parameter_bank.is_some(),
                 "GGUF",
                 architecture.metadata_name(),
             )?;
@@ -9010,7 +9007,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9050,7 +9047,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9077,7 +9074,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9096,7 +9093,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9119,7 +9116,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9140,7 +9137,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9161,7 +9158,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9182,7 +9179,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9203,7 +9200,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9223,7 +9220,7 @@ pub fn load_pipeline_model_with_options(
                             wire_contract,
                             quantization,
                             dense_stream,
-                            expert_cache,
+                            parameter_bank,
                             stream,
                             weights_stream,
                         )
@@ -9236,7 +9233,7 @@ pub fn load_pipeline_model_with_options(
                             wire_contract,
                             quantization,
                             dense_stream,
-                            expert_cache,
+                            parameter_bank,
                             stream,
                             weights_stream,
                         )
@@ -9258,7 +9255,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9277,7 +9274,7 @@ pub fn load_pipeline_model_with_options(
                         wire_contract,
                         quantization,
                         dense_stream,
-                        expert_cache,
+                        parameter_bank,
                         stream,
                         weights_stream,
                     )
@@ -9314,7 +9311,7 @@ pub fn load_pipeline_model_with_options(
     validate_distributed_stage_capabilities(
         capabilities,
         topology,
-        expert_cache.is_some(),
+        parameter_bank.is_some(),
         "SafeTensors",
         artifact.effective_model_type(),
     )?;
@@ -9343,7 +9340,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9358,7 +9355,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9373,7 +9370,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9387,7 +9384,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9401,7 +9398,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9415,7 +9412,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9429,7 +9426,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9443,7 +9440,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9457,7 +9454,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9474,7 +9471,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9490,7 +9487,7 @@ pub fn load_pipeline_model_with_options(
                     wire_contract,
                     quantization,
                     dense_stream,
-                    expert_cache,
+                    parameter_bank,
                     stream,
                     weights_stream,
                 )
@@ -9503,7 +9500,7 @@ pub fn load_pipeline_model_with_options(
                     wire_contract,
                     quantization,
                     dense_stream,
-                    expert_cache,
+                    parameter_bank,
                     stream,
                     weights_stream,
                 )
@@ -9518,7 +9515,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9533,7 +9530,7 @@ pub fn load_pipeline_model_with_options(
                 wire_contract,
                 quantization,
                 dense_stream,
-                expert_cache,
+                parameter_bank,
                 stream,
                 weights_stream,
             )
@@ -9616,23 +9613,23 @@ fn preflight_pipeline_realization<S>(
 }
 
 fn localized_gated_expert_width(
-    realization: &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+    realization: &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     family: &str,
 ) -> Result<usize, Error> {
-    let local_experts = realization.local_global_expert_ids().len();
+    let local_experts = realization.local_global_group_indices().len();
     let mut width = None;
     for spec in realization.unit_specs().values() {
-        let spec_experts = usize::try_from(spec.expert_count).map_err(|_| {
+        let spec_groups = usize::try_from(spec.group_count()).map_err(|_| {
             Error::Parallel(format!(
                 "{family} expert realization has an invalid localized expert count"
             ))
         })?;
-        if spec_experts != local_experts {
+        if spec_groups != local_experts {
             return Err(Error::Parallel(format!(
-                "{family} expert realization bank has {spec_experts} local experts, expected {local_experts}"
+                "{family} grouped realization has {spec_groups} local groups, expected {local_experts}"
             )));
         }
-        let spec_width = usize::try_from(spec.intermediate_dimensions).map_err(|_| {
+        let spec_width = usize::try_from(spec.intermediate_dimensions()).map_err(|_| {
             Error::Parallel(format!(
                 "{family} expert realization has an invalid localized expert width"
             ))

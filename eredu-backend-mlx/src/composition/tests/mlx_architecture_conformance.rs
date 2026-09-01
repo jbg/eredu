@@ -902,7 +902,7 @@ fn neutral_deepseek_v4_forward_executes_on_mlx() {
 
 #[test]
 fn deepseek_unit_factories_use_installed_expert_realizations() {
-    use eredu_nn::GatedProductExpertBankOperator;
+    use eredu_nn::GroupedGatedProductOperator;
 
     let execution = mlx_execution();
     let stream = execution.stream();
@@ -922,14 +922,14 @@ fn deepseek_unit_factories_use_installed_expert_realizations() {
         "tie_word_embeddings":false
     }))
     .unwrap();
-    let mut expected_v3_target =
-        eredu_architectures::deepseek::v3::expert_bank_spec(&v3_args, 1).unwrap();
-    expected_v3_target.expert_count = 2;
-    expected_v3_target.intermediate_dimensions = 3;
-    let mut expected_v3_mtp =
-        eredu_architectures::deepseek::v3::expert_bank_spec(&v3_args, 2).unwrap();
-    expected_v3_mtp.expert_count = 2;
-    expected_v3_mtp.intermediate_dimensions = 3;
+    let expected_v3_target = eredu_architectures::deepseek::v3::expert_bank_spec(&v3_args, 1)
+        .unwrap()
+        .with_group_geometry(2, 3)
+        .unwrap();
+    let expected_v3_mtp = eredu_architectures::deepseek::v3::expert_bank_spec(&v3_args, 2)
+        .unwrap()
+        .with_group_geometry(2, 3)
+        .unwrap();
     let v3_plan = eredu_architectures::ExpertRealizationPlan::balanced(
         4,
         topology,
@@ -958,17 +958,17 @@ fn deepseek_unit_factories_use_installed_expert_realizations() {
         panic!("V3 sparse target factory returned a dense MLP")
     };
     assert_eq!(
-        v3_target.experts.spec().expert_count,
-        expected_v3_target.expert_count
+        v3_target.experts.spec().group_count(),
+        expected_v3_target.group_count()
     );
     assert_eq!(
-        v3_target.experts.spec().intermediate_dimensions,
-        expected_v3_target.intermediate_dimensions
+        v3_target.experts.spec().intermediate_dimensions(),
+        expected_v3_target.intermediate_dimensions()
     );
     let v3_mtp = v3.construct_unit(1, 0, stream).unwrap();
     assert_eq!(
-        v3_mtp.expert_bank_spec().unwrap().expert_count,
-        expected_v3_mtp.expert_count
+        v3_mtp.expert_bank_spec().unwrap().group_count(),
+        expected_v3_mtp.group_count()
     );
 
     let v4_args = eredu_architectures::deepseek::parse_v4_config(&serde_json::json!({
@@ -983,9 +983,10 @@ fn deepseek_unit_factories_use_installed_expert_realizations() {
         "norm_topk_prob":true,"num_nextn_predict_layers":1
     }))
     .unwrap();
-    let mut expected_v4 = eredu_architectures::deepseek::v4::expert_bank_spec(&v4_args, 0).unwrap();
-    expected_v4.expert_count = 2;
-    expected_v4.intermediate_dimensions = 3;
+    let expected_v4 = eredu_architectures::deepseek::v4::expert_bank_spec(&v4_args, 0)
+        .unwrap()
+        .with_group_geometry(2, 3)
+        .unwrap();
     let v4_plan = eredu_architectures::ExpertRealizationPlan::balanced(
         4,
         topology,
@@ -1003,16 +1004,16 @@ fn deepseek_unit_factories_use_installed_expert_realizations() {
         panic!("V4 target factory returned a prediction unit")
     };
     assert_eq!(
-        v4_target.feed_forward.experts.spec().expert_count,
-        expected_v4.expert_count
+        v4_target.feed_forward.experts.spec().group_count(),
+        expected_v4.group_count()
     );
     assert_eq!(
         v4_target
             .feed_forward
             .experts
             .spec()
-            .intermediate_dimensions,
-        expected_v4.intermediate_dimensions
+            .intermediate_dimensions(),
+        expected_v4.intermediate_dimensions()
     );
 }
 

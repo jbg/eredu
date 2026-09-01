@@ -4,7 +4,7 @@
 pub mod cache;
 /// Checkpoint loading, storage, binding, and conversion.
 pub mod checkpoint;
-/// MLX distributed placement, routing, and transport.
+/// MLX distributed placement, collectives, and transport.
 pub mod distributed;
 /// MLX model execution engines and observability hooks.
 pub mod execution;

@@ -4,10 +4,10 @@ use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    RelativeAttentionInput, RoutedNeuralBackend, RoutingResult, Tensor,
+    GatedProductGroupLayout, GroupSelection, GroupedGatedProductOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, JointGroupSelectionInput, JointGroupSelectionSpec, LinearOperator,
+    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter,
+    ParameterSpec, Parameterized, RelativeAttentionInput, Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -368,7 +368,7 @@ impl<B: NeuralBackend> Attention<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: RoutedNeuralBackend,
+        B: GroupedNeuralBackend,
     {
         let batch = hidden.dim(0);
         let sequence = hidden.dim(1);
@@ -547,7 +547,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: RoutedNeuralBackend,
+        B: GroupedNeuralBackend,
     {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
@@ -560,7 +560,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
 /// Sparse Inkling branch with jointly normalized routed and shared experts.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMlp<B: RoutedNeuralBackend> {
+pub struct SparseMlp<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     routed_count: i32,
     #[parameter(skip)]
@@ -568,7 +568,7 @@ pub struct SparseMlp<B: RoutedNeuralBackend> {
     #[parameter(skip)]
     top_k: i32,
     #[parameter(skip)]
-    route_scale: f32,
+    coefficient_scale: f32,
     /// Joint routed/shared router projection.
     pub router_weight: Parameter<B::Tensor>,
     /// Routed top-k correction bias.
@@ -576,12 +576,12 @@ pub struct SparseMlp<B: RoutedNeuralBackend> {
     /// Learned global route multiplier.
     pub global_scale: Parameter<B::Tensor>,
     /// Selectable routed experts.
-    pub routed_experts: B::GatedProductExpertBank,
+    pub routed_experts: B::GatedProductGroups,
     /// Always-on shared experts.
-    pub shared_experts: B::GatedProductExpertBank,
+    pub shared_experts: B::GatedProductGroups,
 }
 
-impl<B: RoutedNeuralBackend> SparseMlp<B> {
+impl<B: GroupedNeuralBackend> SparseMlp<B> {
     fn new_at(
         args: &TextArgs,
         block_root: &str,
@@ -589,13 +589,13 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
     ) -> Result<Self, Error> {
         let prefix = format!("{block_root}.moe");
         let bank = |field: &str, count| {
-            B::gated_product_expert_bank(expert_bank_spec_at(args, &prefix, field, count)?, context)
+            B::grouped_gated_product(expert_bank_spec_at(args, &prefix, field, count)?, context)
         };
         Ok(Self {
             routed_count: args.n_routed_experts,
             shared_count: args.n_shared_experts,
             top_k: args.num_experts_per_tok,
-            route_scale: args.route_scale,
+            coefficient_scale: args.route_scale,
             router_weight: Parameter::unloaded(
                 ParameterSpec::trainable(format!("{prefix}.router.weight"))
                     .map_err(Error::backend)?,
@@ -627,26 +627,28 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let routes = B::joint_expert_routing(
-            JointExpertRoutingInput {
+        let routes = B::joint_group_selection(
+            JointGroupSelectionInput::new(
                 hidden,
-                weight: self.router_weight.as_ref(),
-                correction_bias: self.router_bias.as_ref(),
-                global_scale: self.global_scale.as_ref(),
-                routed_experts: self.routed_count,
-                shared_experts: self.shared_count,
-                top_k: self.top_k,
-                route_scale: self.route_scale,
-            },
+                self.router_weight.as_ref(),
+                self.router_bias.as_ref(),
+                self.global_scale.as_ref(),
+                JointGroupSelectionSpec::new(
+                    self.routed_count,
+                    self.shared_count,
+                    self.top_k,
+                    self.coefficient_scale,
+                )?,
+            )?,
             context,
         )?;
-        let routed = self.routed_experts.forward_routed(
+        let routed = self.routed_experts.forward_grouped(
             hidden,
-            &RoutingResult {
-                expert_ids: routes.routed_ids,
-                selected_scores: routes.routed_weights.clone(),
-                route_weights: routes.routed_weights,
-            },
+            &GroupSelection::new(
+                routes.primary_indices().clone(),
+                routes.primary_coefficients().clone(),
+                routes.primary_coefficients().clone(),
+            ),
             context,
         )?;
         let tokens = hidden.shape()[..hidden.shape().len() - 1]
@@ -659,13 +661,13 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             context,
         )?
         .broadcast_to(&[tokens, self.shared_count], context)?;
-        let shared = self.shared_experts.forward_routed(
+        let shared = self.shared_experts.forward_grouped(
             hidden,
-            &RoutingResult {
-                expert_ids: shared_ids,
-                selected_scores: routes.shared_weights.clone(),
-                route_weights: routes.shared_weights,
-            },
+            &GroupSelection::new(
+                shared_ids,
+                routes.always_on_coefficients().clone(),
+                routes.always_on_coefficients().clone(),
+            ),
             context,
         )?;
         routed.add(&shared, context)
@@ -677,26 +679,28 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let routes = B::joint_expert_routing(
-            JointExpertRoutingInput {
+        let routes = B::joint_group_selection(
+            JointGroupSelectionInput::new(
                 hidden,
-                weight: self.router_weight.as_ref(),
-                correction_bias: self.router_bias.as_ref(),
-                global_scale: self.global_scale.as_ref(),
-                routed_experts: self.routed_count,
-                shared_experts: self.shared_count,
-                top_k: self.top_k,
-                route_scale: self.route_scale,
-            },
+                self.router_weight.as_ref(),
+                self.router_bias.as_ref(),
+                self.global_scale.as_ref(),
+                JointGroupSelectionSpec::new(
+                    self.routed_count,
+                    self.shared_count,
+                    self.top_k,
+                    self.coefficient_scale,
+                )?,
+            )?,
             context,
         )?;
-        let routed = self.routed_experts.forward_routed_tensor_parallel(
+        let routed = self.routed_experts.forward_grouped_tensor_parallel(
             hidden,
-            &RoutingResult {
-                expert_ids: routes.routed_ids,
-                selected_scores: routes.routed_weights.clone(),
-                route_weights: routes.routed_weights,
-            },
+            &GroupSelection::new(
+                routes.primary_indices().clone(),
+                routes.primary_coefficients().clone(),
+                routes.primary_coefficients().clone(),
+            ),
             B::parallel_size(parallel),
             context,
         )?;
@@ -710,13 +714,13 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             context,
         )?
         .broadcast_to(&[tokens, self.shared_count], context)?;
-        let shared = self.shared_experts.forward_routed_tensor_parallel(
+        let shared = self.shared_experts.forward_grouped_tensor_parallel(
             hidden,
-            &RoutingResult {
-                expert_ids: shared_ids,
-                selected_scores: routes.shared_weights.clone(),
-                route_weights: routes.shared_weights,
-            },
+            &GroupSelection::new(
+                shared_ids,
+                routes.always_on_coefficients().clone(),
+                routes.always_on_coefficients().clone(),
+            ),
             B::parallel_size(parallel),
             context,
         )?;
@@ -738,26 +742,28 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = B::joint_expert_routing(
-            JointExpertRoutingInput {
+        let routes = B::joint_group_selection(
+            JointGroupSelectionInput::new(
                 hidden,
-                weight: self.router_weight.as_ref(),
-                correction_bias: self.router_bias.as_ref(),
-                global_scale: self.global_scale.as_ref(),
-                routed_experts: self.routed_count,
-                shared_experts: self.shared_count,
-                top_k: self.top_k,
-                route_scale: self.route_scale,
-            },
+                self.router_weight.as_ref(),
+                self.router_bias.as_ref(),
+                self.global_scale.as_ref(),
+                JointGroupSelectionSpec::new(
+                    self.routed_count,
+                    self.shared_count,
+                    self.top_k,
+                    self.coefficient_scale,
+                )?,
+            )?,
             context,
         )?;
-        let routed_routes = RoutingResult {
-            expert_ids: routes.routed_ids,
-            selected_scores: routes.routed_weights.clone(),
-            route_weights: routes.routed_weights,
-        };
+        let routed_routes = GroupSelection::new(
+            routes.primary_indices().clone(),
+            routes.primary_coefficients().clone(),
+            routes.primary_coefficients().clone(),
+        );
         let routed = provider
-            .forward_routed(
+            .forward_grouped(
                 &mut self.routed_experts,
                 RoutedExpertRequest {
                     layer,
@@ -778,13 +784,13 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             context,
         )?
         .broadcast_to(&[tokens, self.shared_count], context)?;
-        let shared_routes = RoutingResult {
-            expert_ids: shared_ids,
-            selected_scores: routes.shared_weights.clone(),
-            route_weights: routes.shared_weights,
-        };
+        let shared_routes = GroupSelection::new(
+            shared_ids,
+            routes.always_on_coefficients().clone(),
+            routes.always_on_coefficients().clone(),
+        );
         let shared = provider
-            .forward_routed(
+            .forward_grouped(
                 &mut self.shared_experts,
                 RoutedExpertRequest {
                     layer: shared_layer,
@@ -812,26 +818,28 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = B::joint_expert_routing(
-            JointExpertRoutingInput {
+        let routes = B::joint_group_selection(
+            JointGroupSelectionInput::new(
                 hidden,
-                weight: self.router_weight.as_ref(),
-                correction_bias: self.router_bias.as_ref(),
-                global_scale: self.global_scale.as_ref(),
-                routed_experts: self.routed_count,
-                shared_experts: self.shared_count,
-                top_k: self.top_k,
-                route_scale: self.route_scale,
-            },
+                self.router_weight.as_ref(),
+                self.router_bias.as_ref(),
+                self.global_scale.as_ref(),
+                JointGroupSelectionSpec::new(
+                    self.routed_count,
+                    self.shared_count,
+                    self.top_k,
+                    self.coefficient_scale,
+                )?,
+            )?,
             context,
         )?;
-        let routed_routes = RoutingResult {
-            expert_ids: routes.routed_ids,
-            selected_scores: routes.routed_weights.clone(),
-            route_weights: routes.routed_weights,
-        };
+        let routed_routes = GroupSelection::new(
+            routes.primary_indices().clone(),
+            routes.primary_coefficients().clone(),
+            routes.primary_coefficients().clone(),
+        );
         let routed = provider
-            .forward_routed_tensor_parallel(
+            .forward_grouped_tensor_parallel(
                 &mut self.routed_experts,
                 RoutedExpertRequest {
                     layer,
@@ -853,13 +861,13 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             context,
         )?
         .broadcast_to(&[tokens, self.shared_count], context)?;
-        let shared_routes = RoutingResult {
-            expert_ids: shared_ids,
-            selected_scores: routes.shared_weights.clone(),
-            route_weights: routes.shared_weights,
-        };
+        let shared_routes = GroupSelection::new(
+            shared_ids,
+            routes.always_on_coefficients().clone(),
+            routes.always_on_coefficients().clone(),
+        );
         let shared = provider
-            .forward_routed_tensor_parallel(
+            .forward_grouped_tensor_parallel(
                 &mut self.shared_experts,
                 RoutedExpertRequest {
                     layer: shared_layer,
@@ -881,7 +889,7 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
 pub fn expert_bank_spec(
     args: &ModelArgs,
     cache_layer: usize,
-) -> Result<GatedProductExpertBankSpec, Error> {
+) -> Result<GroupedGatedProductSpec, Error> {
     let layers = args.text_config.num_hidden_layers as usize;
     let (layer, field, count) = if cache_layer < layers {
         (cache_layer, "experts", args.text_config.n_routed_experts)
@@ -906,18 +914,15 @@ pub(crate) fn localized_expert_bank_specs(
     layer: usize,
     local: &TextArgs,
     routed_expert_count: i32,
-) -> Result<(GatedProductExpertBankSpec, GatedProductExpertBankSpec), Error> {
-    let mut routed = expert_bank_spec(args, layer)?;
-    routed.expert_count = routed_expert_count;
-    routed.intermediate_dimensions = local.moe_intermediate_size();
-    routed.validate()?;
+) -> Result<(GroupedGatedProductSpec, GroupedGatedProductSpec), Error> {
+    let routed = expert_bank_spec(args, layer)?
+        .with_group_geometry(routed_expert_count, local.moe_intermediate_size())?;
     let cache_layer = usize::try_from(args.text_config.num_hidden_layers)
         .map_err(Error::backend)?
         .checked_add(layer)
         .ok_or_else(|| Error::backend("Inkling shared expert layer overflowed"))?;
-    let mut shared = expert_bank_spec(args, cache_layer)?;
-    shared.intermediate_dimensions = local.moe_intermediate_size();
-    shared.validate()?;
+    let shared = expert_bank_spec(args, cache_layer)?
+        .with_group_geometry(1, local.moe_intermediate_size())?;
     Ok((routed, shared))
 }
 
@@ -926,33 +931,33 @@ fn expert_bank_spec_at(
     prefix: &str,
     field: &str,
     count: i32,
-) -> Result<GatedProductExpertBankSpec, Error> {
+) -> Result<GroupedGatedProductSpec, Error> {
     let gate_up = format!("{prefix}.{field}.gate_up_proj");
     let down = format!("{prefix}.{field}.down_proj");
-    Ok(GatedProductExpertBankSpec {
-        expert_count: count,
-        input_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size(),
-        output_dimensions: args.hidden_size,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        layout: GatedProductExpertLayout::Packed {
+    GroupedGatedProductSpec::new(
+        count,
+        args.hidden_size,
+        args.moe_intermediate_size(),
+        args.hidden_size,
+        eredu_nn::GatedProductPolicy::ordinary_silu(),
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(&gate_up, None, args.linear_format_for(&gate_up))?,
             down: standard_expert_projection(&down, None, args.linear_format_for(&down))?,
         },
-    })
+    )
 }
 
 /// Dense or sparse feed-forward branch selected by the normalized schedule.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: RoutedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend> {
     /// Dense SwiGLU branch.
     Dense(DenseMlp<B>),
     /// Routed plus shared expert branch.
     Sparse(SparseMlp<B>),
 }
 
-impl<B: RoutedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend> FeedForward<B> {
     fn forward(
         &mut self,
         hidden: &B::Tensor,
@@ -1029,7 +1034,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
 /// One ordinary Inkling decoder layer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DecoderLayer<B: RoutedNeuralBackend> {
+pub struct DecoderLayer<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     #[parameter(skip)]
@@ -1048,7 +1053,7 @@ pub struct DecoderLayer<B: RoutedNeuralBackend> {
     pub feed_forward_convolution: CausalDepthwiseConvolution<B>,
 }
 
-impl<B: RoutedNeuralBackend> DecoderLayer<B> {
+impl<B: GroupedNeuralBackend> DecoderLayer<B> {
     /// Builds one scheduled decoder layer.
     pub fn new(
         args: &TextArgs,
@@ -1450,7 +1455,7 @@ impl<T: Tensor> AuxiliaryConvolutionState<T> for NoCache {
 /// Inkling token embedding, ordinary decoder layers, and final norm.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct TextModel<B: RoutedNeuralBackend> {
+pub struct TextModel<B: GroupedNeuralBackend> {
     /// Token embedding table.
     pub embeddings: B::Embedding,
     /// Required post-embedding RMS normalization.
@@ -1467,7 +1472,7 @@ pub struct TextModel<B: RoutedNeuralBackend> {
     output_vocabulary: i32,
 }
 
-impl<B: RoutedNeuralBackend> TextModel<B> {
+impl<B: GroupedNeuralBackend> TextModel<B> {
     /// Builds the complete neutral text model.
     pub fn new(args: &TextArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let norm = |name: &str| {

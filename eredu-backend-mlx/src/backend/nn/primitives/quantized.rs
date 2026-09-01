@@ -45,7 +45,7 @@ pub struct QuantizedEmbedding {
 
     /// Scales
     #[param]
-    pub scales: PhysicalParam<Array>,
+    pub scales: PhysicalParam<Option<Array>>,
 
     /// Biases
     #[param]
@@ -91,7 +91,7 @@ impl QuantizedEmbedding {
             native_format: None,
             native_endian: GgufEndian::Little,
             native_columns: 0,
-            scales: PhysicalParam::<Array>::unloaded(
+            scales: PhysicalParam::<Option<Array>>::unloaded_some(
                 &[embedding_count, dimensions / group_size],
                 scale_dtype,
                 stream,
@@ -136,7 +136,7 @@ impl QuantizedEmbedding {
             native_format: Some(format),
             native_endian: endian,
             native_columns: dimensions,
-            scales: PhysicalParam::<Array>::unloaded(&[1], Dtype::Float32, stream)?,
+            scales: PhysicalParam::new(None),
             biases: PhysicalParam::new(None),
             inner: Embedding {
                 weight: PhysicalParam::<Array>::unloaded(
@@ -171,10 +171,15 @@ impl QuantizedEmbedding {
             )?;
             return native.linear(x.as_ref(), true, stream);
         }
+        let scales = self
+            .scales
+            .value
+            .as_ref()
+            .ok_or_else(|| Exception::custom("quantized embedding has no scale parameter"))?;
         quantized_matmul_with_mode(
             x.as_ref(),
             &self.inner.weight,
-            &self.scales,
+            scales,
             self.biases.value.as_ref(),
             true,
             self.group_size,
@@ -205,7 +210,12 @@ impl Module<&Array> for QuantizedEmbedding {
         let s = x.shape();
         let x = x.flatten(None, None, stream)?;
         let w = self.inner.weight.try_index_device(&x, stream)?;
-        let scales = self.scales.try_index_device(&x, stream)?;
+        let scales = self
+            .scales
+            .value
+            .as_ref()
+            .ok_or_else(|| Exception::custom("quantized embedding has no scale parameter"))?
+            .try_index_device(&x, stream)?;
         let biases = self
             .biases
             .value

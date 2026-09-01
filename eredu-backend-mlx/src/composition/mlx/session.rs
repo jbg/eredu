@@ -98,7 +98,7 @@ impl RuntimeActivationObserver<MlxTensor, Exception> for InspectionCollector<'_>
             routing.selected_experts,
         );
         self.capture(&format!("{root}.selected_scores"), routing.selected_scores);
-        self.capture(&format!("{root}.route_weights"), routing.route_weights);
+        self.capture(&format!("{root}.coefficients"), routing.coefficients);
         self.capture(&format!("{root}.routed_output"), routing.routed_output);
         if let Some(value) = routing.local_routed_output {
             self.capture(&format!("{root}.local_routed_output"), value);
@@ -233,7 +233,7 @@ where
                 path: routing.path,
                 selected_experts: MlxTensor::ref_cast(routing.selected_experts),
                 selected_scores: MlxTensor::ref_cast(routing.selected_scores),
-                route_weights: MlxTensor::ref_cast(routing.route_weights),
+                coefficients: MlxTensor::ref_cast(routing.coefficients),
                 routed_output: MlxTensor::ref_cast(routing.routed_output),
                 local_routed_output: routing.local_routed_output.map(MlxTensor::ref_cast),
                 reduced_routed_output: routing.reduced_routed_output.map(MlxTensor::ref_cast),
@@ -505,6 +505,13 @@ impl<'a> MlxModelSession<'a> {
                 "realized MLX session capabilities {realized_capabilities:?} do not match pre-materialization admission {admitted_capabilities:?}"
             )));
         }
+        if let MlxSessionKind::Complete(model) = &inner {
+            if let Some(selected) = model.selected_session_binding() {
+                selected
+                    .validate_bound_mechanisms(realized_capabilities, true, true)
+                    .map_err(Error::ArchitectureModel)?;
+            }
+        }
         Ok(Self {
             inner,
             floating_state_dtype_bytes,
@@ -567,13 +574,15 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
-    pub fn expert_cache_report(
+    pub fn parameter_bank_report(
         &self,
-    ) -> Result<Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>, Error>
-    {
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Error,
+    > {
         match &self.inner {
-            MlxSessionKind::Complete(model) => model.expert_cache_report(),
-            MlxSessionKind::Pipeline(model, _) => model.expert_cache_report(),
+            MlxSessionKind::Complete(model) => model.parameter_bank_report(),
+            MlxSessionKind::Pipeline(model, _) => model.parameter_bank_report(),
         }
     }
 

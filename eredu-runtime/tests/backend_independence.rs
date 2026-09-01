@@ -9,7 +9,11 @@ use std::{
 };
 
 use eredu_core::{
-    cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule, TokenFilter,
+    cache::{
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+        StateTensorPolicy, StateTensorRole,
+    },
+    AttentionPolicy, Completion, LayerSchedule, TokenFilter,
 };
 use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy, Index,
@@ -26,11 +30,11 @@ use eredu_runtime::{
     LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
     LayerwisePolicy, LayerwiseRuntime, ParameterBackend, PartitionOwnership, PenaltyConfig,
     PredictionDirective, ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime,
-    RuntimeLayerState, Sampler, SamplingBackend, SequentialDecisionBoundary,
-    SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
-    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId,
-    StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut,
-    SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
+    RuntimeLayerState, RuntimeStateComponents, Sampler, SamplingBackend,
+    SequentialDecisionBoundary, SequentialDecisionDriver, SequentialDecisionError,
+    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
+    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor,
+    StaticParameterVisitorMut, SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -326,6 +330,76 @@ impl NeuralBackend for FakeBackend {
     }
 }
 
+struct PartitionCollectiveBackend;
+
+impl NeuralBackend for PartitionCollectiveBackend {
+    type Tensor = FakeTensor;
+    type Linear = FakeOperator;
+    type Embedding = FakeOperator;
+    type Normalization = FakeOperator;
+    type Rotary = FakeOperator;
+    type ParallelContext = ();
+
+    fn linear(_: LinearSpec, _: &()) -> Result<Self::Linear, Error> {
+        Ok(FakeOperator)
+    }
+    fn embedding(_: EmbeddingSpec, _: &()) -> Result<Self::Embedding, Error> {
+        Ok(FakeOperator)
+    }
+    fn normalization(
+        _: NormalizationConstructionSpec,
+        _: &(),
+    ) -> Result<Self::Normalization, Error> {
+        Ok(FakeOperator)
+    }
+    fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {
+        Ok(FakeOperator)
+    }
+    fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
+        Ok(input)
+    }
+    fn gated_product(
+        gate: Self::Tensor,
+        _: Self::Tensor,
+        _: GatedProductPolicy,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        Ok(gate)
+    }
+    fn attention(
+        queries: Self::Tensor,
+        _: Self::Tensor,
+        _: Self::Tensor,
+        _: f32,
+        _: Option<&Self::Tensor>,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        Ok(queries)
+    }
+    fn sliding_window_attention(
+        queries: Self::Tensor,
+        _: Self::Tensor,
+        _: Self::Tensor,
+        _: f32,
+        _: i32,
+        _: i32,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        Ok(queries)
+    }
+    fn causal_mask(sequence: i32, _: i32, _: Option<i32>, _: &()) -> Result<Self::Tensor, Error> {
+        Ok(FakeTensor(vec![sequence, sequence]))
+    }
+    fn row_parallel_linear(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        LinearOperator::forward(linear, input, context)
+    }
+}
+
 impl SamplingBackend for FakeBackend {
     type Logits = FakeTensor;
     type Token = FakeTensor;
@@ -493,6 +567,61 @@ impl SubmissionBackend for FakeBackend {
     }
 }
 
+impl SubmissionBackend for PartitionCollectiveBackend {
+    type Executor = ();
+    type OwnedExecutor = ();
+    type Completion = Done;
+
+    fn fork_executors(_: &(), count: usize) -> Result<Vec<Self::OwnedExecutor>, Infallible> {
+        Ok(vec![(); count])
+    }
+
+    fn submit<'a, I>(_: &(), _: I) -> Result<Self::Completion, Infallible>
+    where
+        FakeTensor: 'a,
+        I: IntoIterator<Item = &'a FakeTensor>,
+    {
+        Ok(Done)
+    }
+
+    fn order_after(_: &Done, _: &()) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    fn retain_until_complete<T: Send + 'static>(_: &(), _: &Done, _: T) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+impl CollectiveBackend for PartitionCollectiveBackend {
+    type Group = ();
+    type CollectiveError = Infallible;
+
+    fn all_reduce(
+        value: Self::Tensor,
+        _: &Self::Group,
+        _: &Self::Executor,
+    ) -> Result<Self::Tensor, Self::CollectiveError> {
+        Ok(value)
+    }
+
+    fn all_gather(
+        value: Self::Tensor,
+        _: &Self::Group,
+        _: &Self::Executor,
+    ) -> Result<Self::Tensor, Self::CollectiveError> {
+        Ok(value)
+    }
+
+    fn all_to_all(
+        value: Self::Tensor,
+        _: &Self::Group,
+        _: &Self::Executor,
+    ) -> Result<Self::Tensor, Self::CollectiveError> {
+        Ok(value)
+    }
+}
+
 impl ParameterBackend for FakeBackend {
     type Parameter = FakeTensor;
     type MaterializedWeight = FakeTensor;
@@ -574,22 +703,8 @@ impl TransferBackend for FakeBackend {
     }
 }
 
-impl CollectiveBackend for FakeBackend {
-    type Group = ();
-    type CollectiveError = Infallible;
-    fn all_reduce(value: Self::Tensor, _: &(), _: &()) -> Result<Self::Tensor, Infallible> {
-        Ok(value)
-    }
-    fn all_gather(value: Self::Tensor, _: &(), _: &()) -> Result<Self::Tensor, Infallible> {
-        Ok(value)
-    }
-    fn all_to_all(value: Self::Tensor, _: &(), _: &()) -> Result<Self::Tensor, Infallible> {
-        Ok(value)
-    }
-}
-
 #[test]
-fn runtime_capabilities_compile_and_run_without_mlx() {
+fn minimal_text_backend_compiles_without_optional_execution_extensions() {
     let host = FakeTensor(vec![2, 3]);
     let (mut parameter, transfer) = FakeBackend::promote(&(), &host).unwrap();
     assert_eq!(parameter, host);
@@ -725,6 +840,107 @@ impl ResettableRuntimeLayerState<FakeBackend> for FakeLayerState {
         self.0 = 0;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct HybridLayerState {
+    position: i32,
+    recurrent: Option<FakeTensor>,
+    convolution: Option<FakeTensor>,
+}
+
+impl RuntimeLayerState<FakeBackend> for HybridLayerState {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a FakeTensor>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.recurrent
+            .iter()
+            .chain(self.convolution.iter())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+impl RuntimeStateComponents<FakeBackend> for HybridLayerState {
+    fn position(&self) -> i32 {
+        self.position
+    }
+
+    fn fixed_component(
+        &mut self,
+        role: StateTensorRole,
+    ) -> Result<&mut Option<FakeTensor>, StateError> {
+        match role {
+            StateTensorRole::Recurrent => Ok(&mut self.recurrent),
+            StateTensorRole::Convolution { slot: 0 } => Ok(&mut self.convolution),
+            _ => Err(StateError::UnknownComponent { role }),
+        }
+    }
+
+    fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
+        self.position = self
+            .position
+            .checked_add(tokens)
+            .ok_or_else(|| StateError::InvalidAdvance("fixture position overflow".into()))?;
+        Ok(())
+    }
+}
+
+#[test]
+fn heterogeneous_state_uses_the_component_extension_contract() {
+    let fixed = |role| {
+        StateTensorPolicy::new(
+            role,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(4).unwrap(),
+            ],
+            StateTensorDtype::Floating,
+            MutableStateResidency::LayerScopedOffloadable,
+        )
+        .unwrap()
+    };
+    let policy = LayerCachePolicy::key_value_with_fixed_state(
+        AttentionPolicy::Full,
+        1,
+        4,
+        vec![
+            fixed(StateTensorRole::Recurrent),
+            StateTensorPolicy::new(
+                StateTensorRole::Convolution { slot: 0 },
+                vec![
+                    StateTensorDimension::Batch,
+                    StateTensorDimension::fixed(4).unwrap(),
+                ],
+                StateTensorDtype::Floating,
+                MutableStateResidency::AlwaysDeviceMutable,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let layout = StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
+    let mut state = DeviceState::<FakeBackend, HybridLayerState>::create(layout, |_, _| {
+        Ok::<_, Infallible>(HybridLayerState {
+            position: 0,
+            recurrent: Some(FakeTensor(vec![1, 4])),
+            convolution: Some(FakeTensor(vec![1, 4])),
+        })
+    })
+    .unwrap();
+    let layer = eredu_runtime::LayerRuntimeState::layer(&mut state, 0).unwrap();
+    RuntimeStateComponents::<FakeBackend>::advance_fixed(layer, 2).unwrap();
+    assert_eq!(RuntimeStateComponents::<FakeBackend>::position(layer), 2);
+    assert_eq!(
+        RuntimeStateComponents::<FakeBackend>::fixed_component(
+            layer,
+            StateTensorRole::Convolution { slot: 0 },
+        )
+        .unwrap()
+        .as_ref()
+        .unwrap(),
+        &FakeTensor(vec![1, 4])
+    );
 }
 
 #[test]
@@ -1123,7 +1339,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
 }
 
 #[test]
-fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
+fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     type FixtureState = DeviceState<FakeBackend, FakeLayerState>;
 
     let architecture = GroupedFixture {
@@ -1152,6 +1368,9 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
     partition
         .validate_architecture::<FakeBackend, FixtureState, _>(&architecture)
         .expect("derived partition revalidates");
+    let boundary = FakeTensor(vec![1, 8]);
+    let exchanged = PartitionCollectiveBackend::all_to_all(boundary.clone(), &(), &()).unwrap();
+    assert_eq!(exchanged, boundary);
 }
 
 #[test]

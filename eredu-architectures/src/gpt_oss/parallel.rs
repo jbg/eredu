@@ -1,6 +1,6 @@
 //! Semantic TP/PP/EP placement for neutral GPT-OSS blocks.
 
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
@@ -42,7 +42,7 @@ fn expert_member_sharding(
 }
 
 /// Declares attention, sinks, router, biased expert bank, and norms for a layer.
-pub fn layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
     block: &TransformerBlock<B>,
     args: &ModelArgs,
     layer: usize,
@@ -71,7 +71,7 @@ pub fn layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
 }
 
 /// Declares pinned embedding, final norm, and separate head placement.
-pub fn static_parameter_groups<B: RoutedNeuralBackend>(
+pub fn static_parameter_groups<B: GroupedNeuralBackend>(
     modules: &crate::decoder::StaticModules<B>,
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {

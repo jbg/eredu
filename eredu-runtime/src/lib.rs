@@ -139,11 +139,11 @@ pub use realtime::{
     RealtimeGenerationTransactionError,
 };
 pub use replicated_text::{
-    select_replicated_text_realization, ParameterTransformTarget, ReplicatedTextArchitecture,
-    ReplicatedTextBackendCapabilities, ReplicatedTextParameterRequirement,
-    ReplicatedTextRequirements, ReplicatedTextResidency, ReplicatedTextSelectionError,
-    ReplicatedTextSelectionRequest, ReplicatedTextStateResidency, SelectedParameterRealization,
-    SelectedReplicatedTextRealization, WeightLoweringCapability, WeightLoweringKind,
+    select_replicated_text_realization, BackendMechanismCapabilities, ParameterTransformTarget,
+    ReplicatedTextArchitecture, ReplicatedTextContractError, ReplicatedTextParameterRequirement,
+    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
+    SelectedParameterRealization, SelectedReplicatedTextRealization, StateResidencyMechanism,
+    WeightLoweringCapability, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,

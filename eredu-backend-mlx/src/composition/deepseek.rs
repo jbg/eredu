@@ -35,8 +35,8 @@ use crate::backend::{
             MlxUnitPopulator,
         },
         execution::layerwise::quantize_module_store_with_bindings,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport},
         residency::manager::ResidentUnitLease,
+        residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
     },
 };
 use eredu_core::cache::{
@@ -194,7 +194,7 @@ enum DeepSeekModelInner {
         /// Validated neutral configuration.
         args: V3Args,
         execution: V3Execution,
-        expert_cache: Option<ExpertCache>,
+        parameter_bank: Option<AddressableParameterBank>,
         materialization: Option<eredu_runtime::WeightMaterializationReport>,
     },
     /// DeepSeek-V4 target and MTP/DSpark graph.
@@ -202,7 +202,7 @@ enum DeepSeekModelInner {
         /// Validated neutral configuration.
         args: V4Args,
         execution: V4Execution,
-        expert_cache: Option<ExpertCache>,
+        parameter_bank: Option<AddressableParameterBank>,
         materialization: Option<eredu_runtime::WeightMaterializationReport>,
     },
 }
@@ -407,7 +407,7 @@ impl DeepSeekModel {
             inner: DeepSeekModelInner::V3 {
                 args,
                 execution,
-                expert_cache: None,
+                parameter_bank: None,
                 materialization: None,
             },
         })
@@ -486,7 +486,7 @@ impl DeepSeekModel {
             inner: DeepSeekModelInner::V4 {
                 args,
                 execution,
-                expert_cache: None,
+                parameter_bank: None,
                 materialization: None,
             },
         })
@@ -549,7 +549,7 @@ impl DeepSeekModel {
     fn run_v3<'a>(
         args: &V3Args,
         execution: &mut V3Execution,
-        expert_cache: Option<&ExpertCache>,
+        parameter_bank: Option<&AddressableParameterBank>,
         input: deepseek::mtp::EmbeddedInput<'a, crate::MlxTensor>,
         state: &mut V3State,
         pass: eredu_runtime::ExpertPass,
@@ -561,7 +561,7 @@ impl DeepSeekModel {
         ),
         Error,
     > {
-        if let Some(cache) = expert_cache {
+        if let Some(cache) = parameter_bank {
             let mut provider = crate::composition::deepseek_expert::v3_provider(cache, args);
             match execution {
                 V3Execution::Resident(runtime) => runtime
@@ -636,7 +636,7 @@ impl DeepSeekModel {
     fn run_v4<'a>(
         args: &V4Args,
         execution: &mut V4Execution,
-        expert_cache: Option<&ExpertCache>,
+        parameter_bank: Option<&AddressableParameterBank>,
         input: deepseek::mtp::EmbeddedInput<'a, crate::MlxTensor>,
         state: &mut V4State,
         pass: eredu_runtime::ExpertPass,
@@ -648,7 +648,7 @@ impl DeepSeekModel {
         ),
         Error,
     > {
-        if let Some(cache) = expert_cache {
+        if let Some(cache) = parameter_bank {
             let mut provider = crate::composition::deepseek_expert::v4_provider(cache, args);
             match execution {
                 V4Execution::Resident(runtime) => runtime
@@ -737,14 +737,14 @@ impl DeepSeekModel {
                 DeepSeekModelInner::V3 {
                     args,
                     execution,
-                    expert_cache,
+                    parameter_bank,
                     ..
                 },
                 DeepSeekStateInner::V3(state),
             ) => Self::run_v3(
                 args,
                 execution,
-                expert_cache.as_ref(),
+                parameter_bank.as_ref(),
                 deepseek::mtp::EmbeddedInput::target(crate::composition::tensor_ref(tokens), None),
                 state,
                 pass,
@@ -755,14 +755,14 @@ impl DeepSeekModel {
                 DeepSeekModelInner::V4 {
                     args,
                     execution,
-                    expert_cache,
+                    parameter_bank,
                     ..
                 },
                 DeepSeekStateInner::V4(state),
             ) => Self::run_v4(
                 args,
                 execution,
-                expert_cache.as_ref(),
+                parameter_bank.as_ref(),
                 deepseek::mtp::EmbeddedInput::target(crate::composition::tensor_ref(tokens), None),
                 state,
                 pass,
@@ -794,11 +794,11 @@ impl DeepSeekModel {
                 DeepSeekModelInner::V3 {
                     args,
                     execution,
-                    expert_cache,
+                    parameter_bank,
                     ..
                 },
                 DeepSeekStateInner::V3(state),
-            ) => if let Some(cache) = expert_cache {
+            ) => if let Some(cache) = parameter_bank {
                 let mut provider = crate::composition::deepseek_expert::v3_provider(cache, args);
                 match execution {
                     V3Execution::Resident(runtime) => runtime.forward_with_unit_executor(
@@ -923,11 +923,11 @@ impl DeepSeekModel {
                 DeepSeekModelInner::V4 {
                     args,
                     execution,
-                    expert_cache,
+                    parameter_bank,
                     ..
                 },
                 DeepSeekStateInner::V4(state),
-            ) => if let Some(cache) = expert_cache {
+            ) => if let Some(cache) = parameter_bank {
                 let mut provider = crate::composition::deepseek_expert::v4_provider(cache, args);
                 match execution {
                     V4Execution::Resident(runtime) => runtime.forward_with_unit_executor(
@@ -1103,7 +1103,7 @@ impl DeepSeekModel {
                 DeepSeekModelInner::V3 {
                     args,
                     execution,
-                    expert_cache,
+                    parameter_bank,
                     ..
                 },
                 DeepSeekStateInner::V3(state),
@@ -1111,7 +1111,7 @@ impl DeepSeekModel {
                 let (logits, context) = Self::run_v3(
                     args,
                     execution,
-                    expert_cache.as_ref(),
+                    parameter_bank.as_ref(),
                     input,
                     state,
                     pass,
@@ -1129,7 +1129,7 @@ impl DeepSeekModel {
                 DeepSeekModelInner::V4 {
                     args,
                     execution,
-                    expert_cache,
+                    parameter_bank,
                     ..
                 },
                 DeepSeekStateInner::V4(state),
@@ -1137,7 +1137,7 @@ impl DeepSeekModel {
                 let (logits, context) = Self::run_v4(
                     args,
                     execution,
-                    expert_cache.as_ref(),
+                    parameter_bank.as_ref(),
                     input,
                     state,
                     pass,
@@ -1290,7 +1290,7 @@ impl DeepSeekModel {
         }
     }
 
-    fn attach_expert_cache(
+    fn attach_parameter_bank(
         &mut self,
         options: eredu_runtime::ExpertCacheLoadOptions,
         stream: &Stream,
@@ -1299,11 +1299,13 @@ impl DeepSeekModel {
         let store = self.checkpoint_store_arc();
         match &mut self.inner {
             DeepSeekModelInner::V3 {
-                args, expert_cache, ..
+                args,
+                parameter_bank,
+                ..
             } => {
                 let entries =
                     crate::composition::deepseek_expert::v3_catalog(args, store.as_ref())?;
-                *expert_cache = Some(ExpertCache::new_shared(
+                *parameter_bank = Some(AddressableParameterBank::new_shared(
                     store,
                     entries,
                     options,
@@ -1312,11 +1314,13 @@ impl DeepSeekModel {
                 )?);
             }
             DeepSeekModelInner::V4 {
-                args, expert_cache, ..
+                args,
+                parameter_bank,
+                ..
             } => {
                 let entries =
                     crate::composition::deepseek_expert::v4_catalog(args, store.as_ref())?;
-                *expert_cache = Some(ExpertCache::new_shared(
+                *parameter_bank = Some(AddressableParameterBank::new_shared(
                     store,
                     entries,
                     options,
@@ -1328,14 +1332,14 @@ impl DeepSeekModel {
         Ok(())
     }
 
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
         let cache = match &self.inner {
-            DeepSeekModelInner::V3 { expert_cache, .. }
-            | DeepSeekModelInner::V4 { expert_cache, .. } => expert_cache,
+            DeepSeekModelInner::V3 { parameter_bank, .. }
+            | DeepSeekModelInner::V4 { parameter_bank, .. } => parameter_bank,
         };
         cache
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Into::into)
     }
@@ -1799,7 +1803,7 @@ pub fn load_safetensors(
                 expert_options.is_some(),
             )?;
             if let Some(options) = expert_options {
-                model.attach_expert_cache(options, stream, weights_stream)?;
+                model.attach_parameter_bank(options, stream, weights_stream)?;
             }
             if let Some(report) = materialization {
                 model.set_materialization(report);
@@ -1825,7 +1829,7 @@ pub fn load_safetensors(
                 expert_options.is_some(),
             )?;
             if let Some(options) = expert_options {
-                model.attach_expert_cache(options, stream, weights_stream)?;
+                model.attach_parameter_bank(options, stream, weights_stream)?;
             }
             if let Some(report) = materialization {
                 model.set_materialization(report);
@@ -1903,7 +1907,7 @@ pub fn load_gguf(
     };
     let mut model = model;
     if let Some(options) = expert_options {
-        model.attach_expert_cache(options, stream, weights_stream)?;
+        model.attach_parameter_bank(options, stream, weights_stream)?;
     }
     Ok(model)
 }

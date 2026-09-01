@@ -40,25 +40,21 @@ pub use parallel::{
 };
 
 /// Derives complete expert ownership and local bank geometry for Qwen hybrid text/MTP units.
-pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<
-    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
-    eredu_nn::Error,
-> {
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
+{
     let geometry = architecture.shared_parallel_geometry();
     realization_plan(architecture.config(), geometry.as_deref(), topology)
 }
 
 /// Derives complete expert ownership and local bank geometry for conditional Qwen hybrid units.
-pub fn conditional_expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+pub fn conditional_expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     architecture: &ConditionalLayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<
-    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
-    eredu_nn::Error,
-> {
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
+{
     let geometry = architecture.shared_parallel_geometry();
     realization_plan(
         &architecture.parsed().text,
@@ -71,10 +67,8 @@ fn realization_plan(
     config: &HybridConfig,
     geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<
-    Option<crate::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>>,
-    eredu_nn::Error,
-> {
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
+{
     if !config.is_moe() {
         return Ok(None);
     }

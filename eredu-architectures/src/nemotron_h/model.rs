@@ -1,8 +1,8 @@
 //! Unified resident and bounded-residency Nemotron-H lifecycle.
 
 use eredu_nn::{
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, NormalizationOperator,
-    Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
+    NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
@@ -21,7 +21,7 @@ use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules
 /// One target or appended prediction physical unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: RoutedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend> {
     /// Ordinary target-model unit.
     Target(Block<B>),
     /// One physical unit in an MTP prediction group.
@@ -30,7 +30,7 @@ pub enum Unit<B: RoutedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -58,7 +58,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -219,7 +219,7 @@ impl<T> ForwardContext<T> {
 }
 
 /// Shared layered Nemotron-H model including graph-visible MTP groups.
-pub struct LayeredModel<B: RoutedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend> {
     args: ModelArgs,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
@@ -227,10 +227,10 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     prediction_steps: usize,
     prediction_pattern: usize,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
-    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>,
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -292,7 +292,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded static modules and validates target plus MTP schedules.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
@@ -500,7 +500,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Installs the architecture-derived expert realization used by every unit factory.
     pub fn install_expert_realization(
         &mut self,
-        realization: crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>,
+        realization: crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
     ) {
         self.expert_realization = Some(realization);
     }
@@ -508,7 +508,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Borrows the architecture-derived expert realization used by unit factories.
     pub fn expert_realization_plan(
         &self,
-    ) -> Option<&crate::ExpertRealizationPlan<eredu_nn::Relu2ExpertBankSpec>> {
+    ) -> Option<&crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>> {
         self.expert_realization.as_ref()
     }
 
@@ -583,7 +583,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                         "Nemotron-H realization names non-sparse unit {owner_group}.{index}"
                     )));
                 };
-                moe.experts = B::relu2_expert_bank(spec.clone(), context)?;
+                moe.experts = B::grouped_relu2(spec.clone(), context)?;
             }
         }
         Ok(unit)
@@ -1028,7 +1028,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1299,7 +1299,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1403,7 +1403,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

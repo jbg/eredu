@@ -2,7 +2,7 @@
 
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
-    AttentionCache, EmbeddingLookupPolicy, Error, Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, Error, GroupedNeuralBackend, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
@@ -65,7 +65,7 @@ pub struct ForwardContext<T> {
 /// Pinned text and media modules shared by every storage policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: RoutedNeuralBackend> {
+pub struct StaticModules<B: GroupedNeuralBackend> {
     /// Text embedding, final norm, and output head.
     pub text: TextStaticModules<B>,
     /// Optional patch/position modules, merge adapter, and language projection.
@@ -75,7 +75,7 @@ pub struct StaticModules<B: RoutedNeuralBackend> {
 /// A streamable native-vision block or decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: RoutedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend> {
     /// Vision encoder block.
     Vision(VisionBlock<B>),
     /// Text decoder block.
@@ -84,7 +84,7 @@ pub enum Unit<B: RoutedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -117,7 +117,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -150,13 +150,13 @@ where
 }
 
 /// The same architecture object used by resident and bounded runtimes.
-pub struct LayeredModel<B: RoutedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend> {
     args: DecoderConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -225,7 +225,7 @@ impl<B: RoutedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layere
     }
 }
 
-impl<B: RoutedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend> LayeredModel<B> {
     #[allow(clippy::too_many_arguments)]
     fn begin_text_partition<S>(
         &mut self,
@@ -891,7 +891,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -1182,7 +1182,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -1288,7 +1288,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: RoutedNeuralBackend,
+    B: GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {

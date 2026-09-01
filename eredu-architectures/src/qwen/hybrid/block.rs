@@ -1,10 +1,10 @@
 //! Shared Qwen3-Next/Qwen3.5 decoder block.
 
 use eredu_nn::{
-    AttentionCache, Error, GatedProductExpertBankSpec, GatedProductExpertLayout, LinearOperator,
-    LinearSpec, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
-    ParameterSpec, Parameterized, RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingScoring,
-    Tensor, TopKRouterSpec, TopKRoutingSpec,
+    AttentionCache, Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator,
+    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, ParameterSpec,
+    Parameterized, RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -21,7 +21,7 @@ use super::{HybridConfig, HybridLayerPolicy, LinearAttention};
 /// Scheduled hybrid token mixer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum TokenMixer<B: RoutedNeuralBackend> {
+pub enum TokenMixer<B: GroupedNeuralBackend> {
     /// Gated-delta recurrent attention.
     Linear(LinearAttention<B>),
     /// Gated grouped-query self attention.
@@ -31,20 +31,20 @@ pub enum TokenMixer<B: RoutedNeuralBackend> {
 /// Routed experts plus the always-on Qwen shared expert.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SharedRoutedGatedProduct<B: RoutedNeuralBackend> {
+pub struct SharedRoutedGatedProduct<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Learned top-k router.
-    pub router: B::Router,
+    pub router: B::Selector,
     /// Packed routed expert bank.
-    pub experts: B::GatedProductExpertBank,
+    pub experts: B::GatedProductGroups,
     /// Always-on dense shared expert.
     pub shared_expert: Mlp<B>,
     /// Scalar gate applied to the shared expert output.
     pub shared_expert_gate: B::Linear,
 }
 
-impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
+impl<B: GroupedNeuralBackend> SharedRoutedGatedProduct<B> {
     fn new(
         config: &HybridConfig,
         layer: usize,
@@ -52,30 +52,26 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("{prefix}.mlp");
-        let routing = TopKRoutingSpec::new(
+        let routing = TopKGroupSelectionSpec::new(
             config.num_experts,
             config.num_experts_per_tok,
-            RoutingScoring::Softmax,
+            GroupScoring::Softmax,
             config.norm_topk_prob,
         )?;
         let router_name = format!("{prefix}.gate.weight");
-        let router = B::top_k_router(
-            TopKRouterSpec {
-                input_dimensions: config.hidden_size,
-                weight: parameter(&router_name)?,
-                bias: None,
-                correction_bias: None,
-                input_transform: None,
-                route_scale: None,
-                format: crate::linear_format::standard_linear_format(
+        let router = B::top_k_group_selector(
+            TopKGroupSelectorSpec::new(
+                config.hidden_size,
+                parameter(&router_name)?,
+                crate::linear_format::standard_linear_format(
                     &router_name,
                     config.quantization.into(),
                 )?,
                 routing,
-            },
+            )?,
             context,
         )?;
-        let experts = B::gated_product_expert_bank(
+        let experts = B::grouped_gated_product(
             expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
             context,
         )?;
@@ -110,9 +106,9 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.router.route(input, context)?;
+        let routes = self.router.select(input, context)?;
         let routed = provider
-            .forward_routed(
+            .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -139,9 +135,9 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.router.route(input, context)?;
+        let routes = self.router.select(input, context)?;
         let routed = provider
-            .forward_routed_tensor_parallel(
+            .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -163,10 +159,13 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
                     routed.add(&shared, context)?,
                 ))
             }
-            eredu_runtime::RoutedExpertTensorParallelOutput::Partial(mut routed) => {
-                routed.reducible = routed.reducible.add(&shared, context)?;
+            eredu_runtime::RoutedExpertTensorParallelOutput::Partial(routed) => {
+                let (reducible, post_reduce) = routed.into_parts();
                 Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
-                    routed,
+                    eredu_nn::TensorParallelGroupedOutput::new(
+                        reducible.add(&shared, context)?,
+                        post_reduce,
+                    ),
                 ))
             }
         }
@@ -177,7 +176,7 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
 pub fn expert_bank_spec(
     config: &HybridConfig,
     layer: usize,
-) -> Result<GatedProductExpertBankSpec, Error> {
+) -> Result<GroupedGatedProductSpec, Error> {
     let target = config.num_hidden_layers as usize;
     let root = if layer < target {
         format!("model.layers.{layer}.mlp.experts")
@@ -190,16 +189,16 @@ pub fn expert_bank_spec(
 fn expert_bank_spec_at(
     config: &HybridConfig,
     expert_prefix: &str,
-) -> Result<GatedProductExpertBankSpec, Error> {
+) -> Result<GroupedGatedProductSpec, Error> {
     let gate_up_name = format!("{expert_prefix}.gate_up_proj");
     let down_name = format!("{expert_prefix}.down_proj");
-    Ok(GatedProductExpertBankSpec {
-        expert_count: config.num_experts,
-        input_dimensions: config.hidden_size,
-        intermediate_dimensions: config.moe_intermediate_size,
-        output_dimensions: config.hidden_size,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        layout: GatedProductExpertLayout::Packed {
+    GroupedGatedProductSpec::new(
+        config.num_experts,
+        config.hidden_size,
+        config.moe_intermediate_size,
+        config.hidden_size,
+        eredu_nn::GatedProductPolicy::ordinary_silu(),
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(
                 &gate_up_name,
                 None,
@@ -207,7 +206,7 @@ fn expert_bank_spec_at(
             )?,
             down: standard_expert_projection(&down_name, None, config.linear_format(&down_name))?,
         },
-    })
+    )
 }
 
 /// Returns the canonical expert bank at rank-local cardinality and width.
@@ -216,25 +215,21 @@ pub(crate) fn localized_expert_bank_spec(
     layer: usize,
     expert_count: i32,
     intermediate_dimensions: i32,
-) -> Result<GatedProductExpertBankSpec, Error> {
-    let mut spec = expert_bank_spec(config, layer)?;
-    spec.expert_count = expert_count;
-    spec.intermediate_dimensions = intermediate_dimensions;
-    spec.validate()?;
-    Ok(spec)
+) -> Result<GroupedGatedProductSpec, Error> {
+    expert_bank_spec(config, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
 /// Dense or routed/shared-expert feed-forward policy selected by configuration.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: RoutedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend> {
     /// Dense SwiGLU.
     Dense(Mlp<B>),
     /// Routed SwiGLU plus an always-on shared expert.
     Routed(SharedRoutedGatedProduct<B>),
 }
 
-impl<B: RoutedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend> FeedForward<B> {
     fn new(
         config: &HybridConfig,
         layer: usize,
@@ -275,7 +270,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
 /// One pre-normalized hybrid decoder block for every dense/MoE family form.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Block<B: RoutedNeuralBackend> {
+pub struct Block<B: GroupedNeuralBackend> {
     /// Recurrent or full-attention policy.
     pub mixer: TokenMixer<B>,
     /// Dense or routed/shared-expert policy.
@@ -286,7 +281,7 @@ pub struct Block<B: RoutedNeuralBackend> {
     pub post_attention_norm: B::Normalization,
 }
 
-impl<B: RoutedNeuralBackend> Block<B> {
+impl<B: GroupedNeuralBackend> Block<B> {
     /// Builds one global-geometry physical decoder layer.
     pub fn new(
         config: &HybridConfig,
@@ -466,7 +461,7 @@ impl<B: RoutedNeuralBackend> Block<B> {
     }
 }
 
-fn new_attention<B: RoutedNeuralBackend>(
+fn new_attention<B: GroupedNeuralBackend>(
     config: &HybridConfig,
     root: &str,
     context: &<B::Tensor as Tensor>::Context,
@@ -536,7 +531,7 @@ fn new_attention<B: RoutedNeuralBackend>(
     )
 }
 
-fn new_mlp<B: RoutedNeuralBackend>(
+fn new_mlp<B: GroupedNeuralBackend>(
     config: &HybridConfig,
     prefix: &str,
     intermediate: i32,
@@ -571,7 +566,7 @@ fn new_mlp<B: RoutedNeuralBackend>(
     ))
 }
 
-fn new_linear<B: RoutedNeuralBackend>(
+fn new_linear<B: GroupedNeuralBackend>(
     config: &HybridConfig,
     prefix: &str,
     input: i32,

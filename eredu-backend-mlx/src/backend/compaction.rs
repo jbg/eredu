@@ -1,4 +1,4 @@
-//! Device-side compaction used by MLX distributed routing.
+//! Device-side compaction used by MLX distributed selection.
 
 use safemlx::{
     error::{Exception, Result},

@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_completion_publishes_schedule_cache_sampler_and_random_atomically() {
+    fn realtime_frame_extension_publishes_ingress_and_state_atomically() {
         let mut state = state();
         let mut branch = state.branch().unwrap();
         mutate_every_component(&mut branch);

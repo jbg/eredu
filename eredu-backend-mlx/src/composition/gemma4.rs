@@ -60,7 +60,7 @@ use crate::backend::{
             },
         },
         media::input,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport},
+        residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
     },
 };
 
@@ -279,7 +279,7 @@ pub struct Gemma4Model {
     args: FamilyConfig,
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
 }
 
@@ -562,10 +562,10 @@ impl Gemma4Model {
         }
     }
 
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Into::into)
     }
@@ -607,10 +607,10 @@ impl Gemma4Model {
         }
         let output_group = self.execution.output_group()?;
         let mut final_text_hidden = None;
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.text.clone();
             let mut provider =
-                crate::composition::gemma4_expert::cached_provider(&expert_cache, &args);
+                crate::composition::gemma4_expert::cached_provider(&parameter_bank, &args);
             let result = match &mut self.execution {
                 Execution::Resident(runtime) => runtime
                     .forward_with_unit_executor_and_activation_hook(
@@ -665,7 +665,7 @@ impl Gemma4Model {
                 Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
             };
             drop(provider);
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             let (logits, forward) =
                 result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let hidden = final_text_hidden.ok_or_else(|| {
@@ -733,14 +733,14 @@ impl Gemma4Model {
                 "Gemma 4 cache layout mismatch".into(),
             ));
         }
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.text.clone();
                     let mut provider =
-                        crate::composition::gemma4_expert::cached_provider(expert_cache, &args);
+                        crate::composition::gemma4_expert::cached_provider(parameter_bank, &args);
                     let positions = input
                         .parts
                         .iter()
@@ -797,7 +797,7 @@ impl Gemma4Model {
                 },
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         eredu_runtime::observe_model_logits(observer, logits.as_array())
             .map(crate::MlxTensor::from_array)
@@ -1079,14 +1079,14 @@ impl Gemma4Model {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            let output = match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.text.clone();
                     let mut provider =
-                        crate::composition::gemma4_expert::cached_provider(expert_cache, &args);
+                        crate::composition::gemma4_expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         Execution::ParallelResident(runtime) => runtime
                             .forward_parallel_with_provider_and_observer(
@@ -1140,7 +1140,7 @@ impl Gemma4Model {
             .map_err(|error| Error::Parallel(error.to_string()))?;
             eredu_runtime::observe_model_logits(&mut neutral, &output).map_err(Error::from)
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
@@ -1151,10 +1151,10 @@ impl Gemma4Model {
         group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.text.clone();
             let mut provider =
-                crate::composition::gemma4_expert::cached_provider(&expert_cache, &args);
+                crate::composition::gemma4_expert::cached_provider(&parameter_bank, &args);
             let result = match &mut self.execution {
                 Execution::ParallelResident(runtime) => runtime
                     .forward_parallel_with_unit_executor(
@@ -1231,14 +1231,14 @@ impl Gemma4Model {
                 ),
                 Execution::Resident(_) | Execution::Bounded(_) => {
                     drop(provider);
-                    self.expert_cache = Some(expert_cache);
+                    self.parameter_bank = Some(parameter_bank);
                     return Err(Error::Parallel(
                         "Gemma 4 model was not loaded for tensor parallelism".into(),
                     ));
                 }
             };
             drop(provider);
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result.map_err(|error| Error::Parallel(error.to_string()));
         }
         match &mut self.execution {
@@ -1820,7 +1820,7 @@ fn load_store(
         state_layout,
         args,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: None,
     })
 }
@@ -1981,7 +1981,7 @@ fn load_parallel_store(
         args,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: Some(parallel_info),
     })
 }
@@ -2016,7 +2016,7 @@ pub fn load_gguf_tensor_parallel(
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut Gemma4Model,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -2025,7 +2025,7 @@ fn attach_expert_cache(
     let store = model.checkpoint_store_arc();
     let entries =
         crate::composition::gemma4_expert::expert_catalog(&model.args.text, store.as_ref())?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -2075,7 +2075,7 @@ pub fn load_safetensors(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -2100,7 +2100,7 @@ pub fn load_gguf(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }

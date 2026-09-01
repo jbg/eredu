@@ -390,49 +390,50 @@ impl ParallelPlanBuilder {
     }
 }
 
-/// Returns the planner-owned source-channel range for one routed expert bank.
+/// Returns the planner-owned channel range for a typed rank-three parameter role.
 ///
 /// Quantized plans may partition in blocks rather than individual channels, so
-/// the architecture-local bank width must be mapped through the planner's
+/// the architecture-local width must be mapped through the planner's
 /// logical range rather than multiplied by a tensor-parallel rank.
-pub(crate) fn routed_expert_intermediate_range(
+pub(crate) fn logical_unit_channel_range(
     layout: &LocalModelLayout<TensorPlacement>,
-    global_experts: usize,
+    role: ParameterRole,
+    global_units: usize,
     local_width: usize,
 ) -> Result<std::ops::Range<usize>, Error> {
     let mut selected = None;
     for (target, tensor) in layout.tensors().filter(|(_, tensor)| {
-        tensor.role() == ParameterRole::ExpertIntermediate
+        tensor.role() == role
             && tensor.global_shape().len() == 3
-            && tensor.global_shape().first().copied() == Some(global_experts)
+            && tensor.global_shape().first().copied() == Some(global_units)
     }) {
         let units = tensor.logical_units().ok_or_else(|| {
             Error::Parallel(format!(
-                "routed expert tensor {target:?} has no logical partition domain"
+                "rank-three parameter {target:?} has no logical partition domain"
             ))
         })?;
         let logical = tensor.logical_range().ok_or_else(|| {
             Error::Parallel(format!(
-                "routed expert tensor {target:?} has no local logical range"
+                "rank-three parameter {target:?} has no local logical range"
             ))
         })?;
         if units == 0 || logical.is_empty() || !local_width.is_multiple_of(logical.len()) {
             return Err(Error::Parallel(format!(
-                "routed expert tensor {target:?} maps local width {local_width} onto incompatible logical range {logical:?} of {units} units"
+                "rank-three parameter {target:?} maps local width {local_width} onto incompatible logical range {logical:?} of {units} units"
             )));
         }
         let channels_per_unit = local_width / logical.len();
         let range = (logical.start * channels_per_unit)..(logical.end * channels_per_unit);
         if selected.as_ref().is_some_and(|current| current != &range) {
             return Err(Error::Parallel(
-                "routed expert tensors have inconsistent intermediate ranges".into(),
+                "rank-three parameters have inconsistent channel ranges".into(),
             ));
         }
         selected = Some(range);
     }
     selected.ok_or_else(|| {
         Error::Parallel(format!(
-            "parallel plan has no routed expert bank with {global_experts} experts"
+            "parallel plan has no rank-three {role:?} parameter with {global_units} leading units"
         ))
     })
 }
@@ -881,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn routed_expert_range_preserves_uneven_balanced_slice() {
+    fn logical_unit_channel_range_preserves_uneven_balanced_slice() {
         let expected = [0..3, 3..5];
         for (rank, expected) in expected.into_iter().enumerate() {
             let mut planner = ParallelPlanBuilder::new(topology(rank, 2));
@@ -913,7 +914,13 @@ mod tests {
             let (_, local) = planner.finish().unwrap();
 
             assert_eq!(
-                routed_expert_intermediate_range(&local, 4, expected.len()).unwrap(),
+                logical_unit_channel_range(
+                    &local,
+                    ParameterRole::ExpertIntermediate,
+                    4,
+                    expected.len(),
+                )
+                .unwrap(),
                 expected
             );
         }

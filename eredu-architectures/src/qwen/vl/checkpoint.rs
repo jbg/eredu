@@ -159,7 +159,7 @@ pub fn rank_local_unit_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &ModelArgs,
     flat: usize,
-    expert_ids: &[usize],
+    group_indices: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
     let vision_layers = args.vision.layer_count();
     if flat < vision_layers {
@@ -167,7 +167,7 @@ pub fn rank_local_unit_recipes<C: RecipeCatalog + ?Sized>(
             "Qwen3-VL unit {flat} is a vision unit and has no expert bank"
         ));
     }
-    qwen::rank_local_expert_recipes(catalog, &args.text, flat - vision_layers, expert_ids)
+    qwen::rank_local_expert_recipes(catalog, &args.text, flat - vision_layers, group_indices)
 }
 
 #[cfg(test)]

@@ -2,8 +2,6 @@
 
 /// Backend-independent ownership for submitted distributed work.
 pub mod completion;
-/// Expert assignment, routing, and exchange mechanics.
-pub mod expert;
 mod group;
 /// Architecture-neutral tensor-parallel planning and execution contexts.
 pub mod parallel;

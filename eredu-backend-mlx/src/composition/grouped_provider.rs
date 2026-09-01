@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use eredu_nn::{
-    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    Relu2ExpertBankSpec, TensorParallelExpertOutput,
+    GatedProductGroupLayout, GroupedGatedProductOperator, GroupedGatedProductSpec,
+    GroupedRelu2Spec, TensorParallelGroupedOutput,
 };
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
@@ -13,30 +13,39 @@ use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::module::PhysicalParam;
 
-use crate::backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts};
+use crate::backend::error::Error;
+use crate::backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups};
 use crate::backend::nn::shared::MlxNeuralBackend;
-use crate::backend::runtime::residency::expert_cache::{ExpertCache, ExpertRouteBatch};
-use crate::backend::Error;
+use crate::backend::runtime::residency::parameter_bank::{
+    AddressableParameterBank, BankAccessClass, ParameterBankSelection,
+};
 use crate::MlxTensor;
 
 fn wrap_parallel_output(
-    output: TensorParallelExpertOutput<Array>,
-) -> TensorParallelExpertOutput<MlxTensor> {
-    TensorParallelExpertOutput {
-        reducible: MlxTensor::from_array(output.reducible),
-        post_reduce: output.post_reduce.map(MlxTensor::from_array),
+    output: TensorParallelGroupedOutput<Array>,
+) -> TensorParallelGroupedOutput<MlxTensor> {
+    TensorParallelGroupedOutput::new(
+        MlxTensor::from_array(output.reducible().clone()),
+        output.post_reduce().cloned().map(MlxTensor::from_array),
+    )
+}
+
+fn bank_access_class(pass: ExpertPass) -> BankAccessClass {
+    match pass {
+        ExpertPass::Prefill => BankAccessClass::Bulk,
+        ExpertPass::Decode => BankAccessClass::Incremental,
     }
 }
 
 /// Executes independently cached ReLU2 experts through a layer-spec factory.
-pub struct CachedRelu2ExpertProvider<'a, F> {
-    cache: &'a ExpertCache,
+pub struct CachedRelu2GroupProvider<'a, F> {
+    cache: &'a AddressableParameterBank,
     spec_for_layer: F,
 }
 
-impl<'a, F> CachedRelu2ExpertProvider<'a, F> {
+impl<'a, F> CachedRelu2GroupProvider<'a, F> {
     /// Creates a cached provider using the supplied layer-spec factory.
-    pub const fn new(cache: &'a ExpertCache, spec_for_layer: F) -> Self {
+    pub const fn new(cache: &'a AddressableParameterBank, spec_for_layer: F) -> Self {
         Self {
             cache,
             spec_for_layer,
@@ -44,15 +53,15 @@ impl<'a, F> CachedRelu2ExpertProvider<'a, F> {
     }
 }
 
-impl<F> RoutedExpertProvider<MlxNeuralBackend> for CachedRelu2ExpertProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for CachedRelu2GroupProvider<'_, F>
 where
-    F: FnMut(usize) -> Result<Relu2ExpertBankSpec, Error>,
+    F: FnMut(usize) -> Result<GroupedRelu2Spec, Error>,
 {
     type Error = Error;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -63,7 +72,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -72,8 +81,8 @@ where
             &(self.spec_for_layer)(request.layer)?,
             request.layer,
             request.input.as_array(),
-            request.routes.expert_ids.as_array(),
-            request.routes.route_weights.as_array(),
+            request.routes.group_indices().as_array(),
+            request.routes.coefficients().as_array(),
             request.pass,
             stream,
         )
@@ -82,23 +91,23 @@ where
 }
 
 /// Executes independently cached gated-product experts with resident-bank semantics.
-pub struct CachedGatedProductExpertProvider<'a> {
-    cache: &'a ExpertCache,
+pub struct CachedGatedProductGroupProvider<'a> {
+    cache: &'a AddressableParameterBank,
 }
 
-impl<'a> CachedGatedProductExpertProvider<'a> {
+impl<'a> CachedGatedProductGroupProvider<'a> {
     /// Creates a gated-product provider backed by an expert cache.
-    pub const fn new(cache: &'a ExpertCache) -> Self {
+    pub const fn new(cache: &'a AddressableParameterBank) -> Self {
         Self { cache }
     }
 }
 
-impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider<'_> {
+impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductGroupProvider<'_> {
     type Error = Error;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -107,17 +116,17 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider
             resident_bank.spec(),
             request.layer,
             request.input.as_array(),
-            request.routes.expert_ids.as_array(),
-            request.routes.route_weights.as_array(),
+            request.routes.group_indices().as_array(),
+            request.routes.coefficients().as_array(),
             request.pass,
             stream,
         )
         .map(MlxTensor::from_array)
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -127,8 +136,8 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider
             resident_bank.spec(),
             request.layer,
             request.input.as_array(),
-            request.routes.expert_ids.as_array(),
-            request.routes.route_weights.as_array(),
+            request.routes.group_indices().as_array(),
+            request.routes.coefficients().as_array(),
             request.pass,
             partitions,
             stream,
@@ -139,7 +148,7 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -149,102 +158,9 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider
     }
 }
 
-/// Adapts a distributed callback that owns expert acquisition and collectives.
-pub struct ExpertExecutorProvider<'a, F> {
-    execute: &'a mut F,
-}
-
-impl<'a, F> ExpertExecutorProvider<'a, F> {
-    /// Wraps a callback that owns expert execution and communication.
-    pub const fn new(execute: &'a mut F) -> Self {
-        Self { execute }
-    }
-}
-
-fn execute_routed_callback<F>(
-    execute: &mut F,
-    request: RoutedExpertRequest<'_, MlxTensor>,
-    stream: &Stream,
-) -> Result<MlxTensor, safemlx::error::Exception>
-where
-    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, safemlx::error::Exception>,
-{
-    if request.input.as_array().ndim() < 2 {
-        return Err(safemlx::error::Exception::custom(format!(
-            "routed expert input must have a hidden dimension, got {:?}",
-            request.input.as_array().shape()
-        )));
-    }
-    let original_shape = request.input.as_array().shape().to_vec();
-    let hidden = request
-        .input
-        .as_array()
-        .reshape(&[-1, request.input.as_array().dim(-1)], stream)?;
-    let expert_ids = request
-        .routes
-        .expert_ids
-        .as_array()
-        .reshape(&[-1, request.routes.expert_ids.as_array().dim(-1)], stream)?;
-    let route_weights = request.routes.route_weights.as_array().reshape(
-        &[-1, request.routes.route_weights.as_array().dim(-1)],
-        stream,
-    )?;
-    let output = execute(request.layer, &hidden, &expert_ids, &route_weights, stream)?;
-    output
-        .reshape(&original_shape, stream)
-        .map(MlxTensor::from_array)
-}
-
-impl<F> RoutedExpertProvider<MlxNeuralBackend> for ExpertExecutorProvider<'_, F>
-where
-    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, safemlx::error::Exception>,
-{
-    type Error = safemlx::error::Exception;
-
-    fn forward_routed(
-        &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
-        request: RoutedExpertRequest<'_, MlxTensor>,
-        stream: &Stream,
-    ) -> Result<MlxTensor, Self::Error> {
-        execute_routed_callback(self.execute, request, stream)
-    }
-
-    fn forward_routed_tensor_parallel(
-        &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
-        request: RoutedExpertRequest<'_, MlxTensor>,
-        _partitions: usize,
-        stream: &Stream,
-    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
-        execute_routed_callback(self.execute, request, stream)
-            .map(RoutedExpertTensorParallelOutput::Complete)
-    }
-
-    fn forward_relu2_routed(
-        &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
-        request: RoutedExpertRequest<'_, MlxTensor>,
-        stream: &Stream,
-    ) -> Result<MlxTensor, Self::Error> {
-        execute_routed_callback(self.execute, request, stream)
-    }
-
-    fn forward_relu2_routed_tensor_parallel(
-        &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
-        request: RoutedExpertRequest<'_, MlxTensor>,
-        _partitions: usize,
-        stream: &Stream,
-    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
-        execute_routed_callback(self.execute, request, stream)
-            .map(RoutedExpertTensorParallelOutput::Complete)
-    }
-}
-
 /// Completion contract requested from a gated-product expert callback.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum GatedProductExpertExecutionMode {
+pub enum GatedProductGroupExecutionMode {
     /// Execute the ordinary bank and return a globally complete output.
     Complete,
     /// Execute a rank-local TP contribution and preserve its post-reduce term.
@@ -255,28 +171,28 @@ pub enum GatedProductExpertExecutionMode {
 }
 
 /// Architecture-owned geometry and tensors supplied to an expert callback.
-pub struct GatedProductExpertExecution {
+pub struct GatedProductGroupExecution {
     /// Global decoder layer requesting expert execution.
     pub layer: usize,
     /// Rank-local bank specification retained by the architecture module.
-    pub spec: GatedProductExpertBankSpec,
+    pub spec: GroupedGatedProductSpec,
     /// Flattened token rows submitted to the selected experts.
     pub hidden: Array,
     /// Selected global expert identities.
-    pub expert_ids: Array,
-    /// Route weights aligned with `expert_ids`.
-    pub route_weights: Array,
+    pub group_indices: Array,
+    /// Route weights aligned with `group_indices`.
+    pub coefficients: Array,
     /// Required complete or rank-local tensor-parallel result contract.
-    pub mode: GatedProductExpertExecutionMode,
+    pub mode: GatedProductGroupExecutionMode,
 }
 
 /// Adapts a callback that explicitly preserves complete versus rank-local TP
 /// expert semantics and consumes the architecture-owned local bank geometry.
-pub struct GatedProductExpertExecutorProvider<'a, F> {
+pub struct GatedProductGroupedExecutorProvider<'a, F> {
     execute: &'a mut F,
 }
 
-impl<'a, F> GatedProductExpertExecutorProvider<'a, F> {
+impl<'a, F> GatedProductGroupedExecutorProvider<'a, F> {
     /// Wraps a callback preserving complete versus rank-local output semantics.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
@@ -294,16 +210,16 @@ fn reshape_gated_product_callback_output(
             .map(MlxTensor::from_array)
             .map(RoutedExpertTensorParallelOutput::Complete),
         RoutedExpertTensorParallelOutput::Partial(output) => {
-            let reducible = output.reducible.reshape(original_shape, stream)?;
-            let post_reduce = output
-                .post_reduce
+            let (reducible, post_reduce) = output.into_parts();
+            let reducible = reducible.reshape(original_shape, stream)?;
+            let post_reduce = post_reduce
                 .map(|value| value.reshape(original_shape, stream))
                 .transpose()?;
             Ok(RoutedExpertTensorParallelOutput::Partial(
-                TensorParallelExpertOutput {
-                    reducible: MlxTensor::from_array(reducible),
-                    post_reduce: post_reduce.map(MlxTensor::from_array),
-                },
+                TensorParallelGroupedOutput::new(
+                    MlxTensor::from_array(reducible),
+                    post_reduce.map(MlxTensor::from_array),
+                ),
             ))
         }
     }
@@ -311,14 +227,14 @@ fn reshape_gated_product_callback_output(
 
 fn execute_gated_product_callback<F>(
     execute: &mut F,
-    resident_bank: &<MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+    resident_bank: &<MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
     request: RoutedExpertRequest<'_, MlxTensor>,
-    mode: GatedProductExpertExecutionMode,
+    mode: GatedProductGroupExecutionMode,
     stream: &Stream,
 ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, safemlx::error::Exception>
 where
     F: FnMut(
-        GatedProductExpertExecution,
+        GatedProductGroupExecution,
         &Stream,
     ) -> Result<RoutedExpertTensorParallelOutput<Array>, safemlx::error::Exception>,
 {
@@ -333,22 +249,21 @@ where
         .input
         .as_array()
         .reshape(&[-1, request.input.as_array().dim(-1)], stream)?;
-    let expert_ids = request
-        .routes
-        .expert_ids
-        .as_array()
-        .reshape(&[-1, request.routes.expert_ids.as_array().dim(-1)], stream)?;
-    let route_weights = request.routes.route_weights.as_array().reshape(
-        &[-1, request.routes.route_weights.as_array().dim(-1)],
+    let group_indices = request.routes.group_indices().as_array().reshape(
+        &[-1, request.routes.group_indices().as_array().dim(-1)],
+        stream,
+    )?;
+    let coefficients = request.routes.coefficients().as_array().reshape(
+        &[-1, request.routes.coefficients().as_array().dim(-1)],
         stream,
     )?;
     let output = execute(
-        GatedProductExpertExecution {
+        GatedProductGroupExecution {
             layer: request.layer,
             spec: resident_bank.spec().clone(),
             hidden,
-            expert_ids,
-            route_weights,
+            group_indices,
+            coefficients,
             mode,
         },
         stream,
@@ -356,18 +271,18 @@ where
     reshape_gated_product_callback_output(output, &original_shape, stream)
 }
 
-impl<F> RoutedExpertProvider<MlxNeuralBackend> for GatedProductExpertExecutorProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for GatedProductGroupedExecutorProvider<'_, F>
 where
     F: FnMut(
-        GatedProductExpertExecution,
+        GatedProductGroupExecution,
         &Stream,
     ) -> Result<RoutedExpertTensorParallelOutput<Array>, safemlx::error::Exception>,
 {
     type Error = safemlx::error::Exception;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -375,7 +290,7 @@ where
             self.execute,
             resident_bank,
             request,
-            GatedProductExpertExecutionMode::Complete,
+            GatedProductGroupExecutionMode::Complete,
             stream,
         )? {
             RoutedExpertTensorParallelOutput::Complete(output) => Ok(output),
@@ -385,9 +300,9 @@ where
         }
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -396,14 +311,14 @@ where
             self.execute,
             resident_bank,
             request,
-            GatedProductExpertExecutionMode::TensorParallel { partitions },
+            GatedProductGroupExecutionMode::TensorParallel { partitions },
             stream,
         )
     }
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -414,25 +329,25 @@ where
 }
 
 /// Architecture-owned geometry and tensors supplied to a ReLU2 expert callback.
-pub struct Relu2ExpertExecution {
+pub struct Relu2GroupExecution {
     /// Global decoder or prediction layer requesting expert execution.
     pub layer: usize,
     /// Rank-local bank specification retained by the architecture module.
-    pub spec: Relu2ExpertBankSpec,
+    pub spec: GroupedRelu2Spec,
     /// Flattened token rows submitted to the selected experts.
     pub hidden: Array,
     /// Selected global expert identities.
-    pub expert_ids: Array,
-    /// Route weights aligned with `expert_ids`.
-    pub route_weights: Array,
+    pub group_indices: Array,
+    /// Route weights aligned with `group_indices`.
+    pub coefficients: Array,
 }
 
 /// Adapts a distributed ReLU2 callback that consumes the resident unit spec.
-pub struct Relu2ExpertExecutorProvider<'a, F> {
+pub struct Relu2GroupedExecutorProvider<'a, F> {
     execute: &'a mut F,
 }
 
-impl<'a, F> Relu2ExpertExecutorProvider<'a, F> {
+impl<'a, F> Relu2GroupedExecutorProvider<'a, F> {
     /// Wraps a callback that executes a ReLU2 expert request.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
@@ -441,12 +356,12 @@ impl<'a, F> Relu2ExpertExecutorProvider<'a, F> {
 
 fn execute_relu2_callback<F>(
     execute: &mut F,
-    resident_bank: &<MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+    resident_bank: &<MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
     request: RoutedExpertRequest<'_, MlxTensor>,
     stream: &Stream,
 ) -> Result<MlxTensor, safemlx::error::Exception>
 where
-    F: FnMut(Relu2ExpertExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
+    F: FnMut(Relu2GroupExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
 {
     if request.input.as_array().ndim() < 2 {
         return Err(safemlx::error::Exception::custom(format!(
@@ -459,22 +374,21 @@ where
         .input
         .as_array()
         .reshape(&[-1, request.input.as_array().dim(-1)], stream)?;
-    let expert_ids = request
-        .routes
-        .expert_ids
-        .as_array()
-        .reshape(&[-1, request.routes.expert_ids.as_array().dim(-1)], stream)?;
-    let route_weights = request.routes.route_weights.as_array().reshape(
-        &[-1, request.routes.route_weights.as_array().dim(-1)],
+    let group_indices = request.routes.group_indices().as_array().reshape(
+        &[-1, request.routes.group_indices().as_array().dim(-1)],
+        stream,
+    )?;
+    let coefficients = request.routes.coefficients().as_array().reshape(
+        &[-1, request.routes.coefficients().as_array().dim(-1)],
         stream,
     )?;
     execute(
-        Relu2ExpertExecution {
+        Relu2GroupExecution {
             layer: request.layer,
             spec: resident_bank.spec().clone(),
             hidden,
-            expert_ids,
-            route_weights,
+            group_indices,
+            coefficients,
         },
         stream,
     )?
@@ -482,15 +396,15 @@ where
     .map(MlxTensor::from_array)
 }
 
-impl<F> RoutedExpertProvider<MlxNeuralBackend> for Relu2ExpertExecutorProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for Relu2GroupedExecutorProvider<'_, F>
 where
-    F: FnMut(Relu2ExpertExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
+    F: FnMut(Relu2GroupExecution, &Stream) -> Result<Array, safemlx::error::Exception>,
 {
     type Error = safemlx::error::Exception;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -501,7 +415,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -510,7 +424,7 @@ where
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         _partitions: usize,
         stream: &Stream,
@@ -521,56 +435,54 @@ where
 }
 
 /// Adapts a distributed callback that consumes the resident rank-local bank.
-pub struct ResidentExpertExecutorProvider<'a, F> {
+pub struct ResidentGroupedExecutorProvider<'a, F> {
     execute: &'a mut F,
 }
 
-impl<'a, F> ResidentExpertExecutorProvider<'a, F> {
+impl<'a, F> ResidentGroupedExecutorProvider<'a, F> {
     /// Wraps a callback that executes against a resident rank-local bank.
     pub const fn new(execute: &'a mut F) -> Self {
         Self { execute }
     }
 }
 
-impl<F> RoutedExpertProvider<MlxNeuralBackend> for ResidentExpertExecutorProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for ResidentGroupedExecutorProvider<'_, F>
 where
     F: FnMut(
-        &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         &Array,
         &Array,
         &Array,
         usize,
         &Stream,
-    ) -> Result<TensorParallelExpertOutput<Array>, safemlx::error::Exception>,
+    ) -> Result<TensorParallelGroupedOutput<Array>, safemlx::error::Exception>,
 {
     type Error = safemlx::error::Exception;
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         let output = (self.execute)(
             resident_bank,
             request.input.as_array(),
-            request.routes.expert_ids.as_array(),
-            request.routes.route_weights.as_array(),
+            request.routes.group_indices().as_array(),
+            request.routes.coefficients().as_array(),
             1,
             stream,
         )?;
-        match output.post_reduce {
-            Some(bias) => output
-                .reducible
-                .add(&bias, stream)
-                .map(MlxTensor::from_array),
-            None => Ok(MlxTensor::from_array(output.reducible)),
+        let (reducible, post_reduce) = output.into_parts();
+        match post_reduce {
+            Some(bias) => reducible.add(&bias, stream).map(MlxTensor::from_array),
+            None => Ok(MlxTensor::from_array(reducible)),
         }
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -578,8 +490,8 @@ where
         (self.execute)(
             resident_bank,
             request.input.as_array(),
-            request.routes.expert_ids.as_array(),
-            request.routes.route_weights.as_array(),
+            request.routes.group_indices().as_array(),
+            request.routes.coefficients().as_array(),
             partitions,
             stream,
         )
@@ -589,7 +501,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -607,10 +519,10 @@ where
 mod tests {
     use super::*;
     use crate::backend::ExecutionContext;
-    use eredu_nn::{GatedProductExpertLayout, RoutingResult};
+    use eredu_nn::{GatedProductGroupLayout, GroupSelection};
     use safemlx::{Device, DeviceType};
 
-    fn localized_qwen_spec() -> GatedProductExpertBankSpec {
+    fn localized_qwen_spec() -> GroupedGatedProductSpec {
         let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
             "model_type": "qwen3_moe",
             "hidden_size": 16,
@@ -629,22 +541,18 @@ mod tests {
             "tie_word_embeddings": false
         }))
         .unwrap();
-        let mut spec = eredu_architectures::qwen::expert_bank_spec(&args, 0).unwrap();
-        spec.expert_count = 2;
-        spec.intermediate_dimensions = 4;
-        spec
+        eredu_architectures::qwen::expert_bank_spec(&args, 0)
+            .unwrap()
+            .with_group_geometry(2, 4)
+            .unwrap()
     }
 
-    fn test_routes() -> (MlxTensor, RoutingResult<MlxTensor>) {
+    fn test_routes() -> (MlxTensor, GroupSelection<MlxTensor>) {
         let hidden = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 16], &[1, 16]));
-        let expert_ids = MlxTensor::from_array(Array::from_slice(&[0_i32], &[1, 1]));
+        let group_indices = MlxTensor::from_array(Array::from_slice(&[0_i32], &[1, 1]));
         let weights = MlxTensor::from_array(Array::from_slice(&[1.0_f32], &[1, 1]));
         let selected_scores = weights.clone();
-        let routes = RoutingResult {
-            expert_ids,
-            selected_scores,
-            route_weights: weights,
-        };
+        let routes = GroupSelection::new(group_indices, selected_scores, weights);
         (hidden, routes)
     }
 
@@ -655,25 +563,25 @@ mod tests {
         let stream = execution.stream();
         let gated_spec = localized_qwen_spec();
         let mut gated_bank =
-            <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::gated_product_expert_bank(
+            <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::grouped_gated_product(
                 gated_spec.clone(),
                 stream,
             )
             .unwrap();
         let (hidden, routes) = test_routes();
         let mut gated_observed = false;
-        let mut execute = |execution: GatedProductExpertExecution, _stream: &Stream| {
-            assert_eq!(execution.spec.expert_count, gated_spec.expert_count);
+        let mut execute = |execution: GatedProductGroupExecution, _stream: &Stream| {
+            assert_eq!(execution.spec.group_count(), gated_spec.group_count());
             assert_eq!(
-                execution.spec.intermediate_dimensions,
-                gated_spec.intermediate_dimensions
+                execution.spec.intermediate_dimensions(),
+                gated_spec.intermediate_dimensions()
             );
             gated_observed = true;
             Ok(RoutedExpertTensorParallelOutput::Complete(execution.hidden))
         };
-        let mut provider = GatedProductExpertExecutorProvider::new(&mut execute);
+        let mut provider = GatedProductGroupedExecutorProvider::new(&mut execute);
         provider
-            .forward_routed(
+            .forward_grouped(
                 &mut gated_bank,
                 RoutedExpertRequest {
                     layer: 0,
@@ -686,33 +594,27 @@ mod tests {
             .unwrap();
         assert!(gated_observed);
 
-        let GatedProductExpertLayout::Packed { gate_up, down } = gated_spec.layout else {
+        let GatedProductGroupLayout::Packed { gate_up, down } = gated_spec.layout().clone() else {
             panic!("Qwen test specification must use packed experts")
         };
-        let relu_spec = Relu2ExpertBankSpec {
-            expert_count: 2,
-            hidden_dimensions: 16,
-            intermediate_dimensions: 4,
-            up: gate_up,
-            down,
-        };
-        let mut relu_bank = <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::relu2_expert_bank(
+        let relu_spec = GroupedRelu2Spec::new(2, 16, 4, gate_up, down).unwrap();
+        let mut relu_bank = <MlxNeuralBackend as eredu_nn::GroupedNeuralBackend>::grouped_relu2(
             relu_spec.clone(),
             stream,
         )
         .unwrap();
         let (hidden, routes) = test_routes();
         let mut relu_observed = false;
-        let mut execute = |execution: Relu2ExpertExecution, _stream: &Stream| {
-            assert_eq!(execution.spec.expert_count, relu_spec.expert_count);
+        let mut execute = |execution: Relu2GroupExecution, _stream: &Stream| {
+            assert_eq!(execution.spec.group_count(), relu_spec.group_count());
             assert_eq!(
-                execution.spec.intermediate_dimensions,
-                relu_spec.intermediate_dimensions
+                execution.spec.intermediate_dimensions(),
+                relu_spec.intermediate_dimensions()
             );
             relu_observed = true;
             Ok(execution.hidden)
         };
-        let mut provider = Relu2ExpertExecutorProvider::new(&mut execute);
+        let mut provider = Relu2GroupedExecutorProvider::new(&mut execute);
         provider
             .forward_relu2_routed(
                 &mut relu_bank,
@@ -732,12 +634,12 @@ mod tests {
 /// Executes one cached route batch with a compact bank retained by the cache.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cached_gated_product(
-    cache: &ExpertCache,
-    spec: &GatedProductExpertBankSpec,
+    cache: &AddressableParameterBank,
+    spec: &GroupedGatedProductSpec,
     layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
-    route_weights: &Array,
+    group_indices: &Array,
+    coefficients: &Array,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
@@ -746,8 +648,8 @@ pub fn execute_cached_gated_product(
         spec,
         layer,
         hidden,
-        expert_ids,
-        route_weights,
+        group_indices,
+        coefficients,
         pass,
         None,
         stream,
@@ -757,38 +659,38 @@ pub fn execute_cached_gated_product(
 /// Executes one cached tensor-parallel route batch with exact-once down bias.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cached_gated_product_tensor_parallel(
-    cache: &ExpertCache,
-    spec: &GatedProductExpertBankSpec,
+    cache: &AddressableParameterBank,
+    spec: &GroupedGatedProductSpec,
     layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
-    route_weights: &Array,
+    group_indices: &Array,
+    coefficients: &Array,
     pass: ExpertPass,
     partitions: usize,
     stream: &Stream,
-) -> Result<TensorParallelExpertOutput<Array>, Error> {
+) -> Result<TensorParallelGroupedOutput<Array>, Error> {
     let original_shape = hidden.shape().to_vec();
     let packed = execute_cached_gated_product_inner(
         cache,
         spec,
         layer,
         hidden,
-        expert_ids,
-        route_weights,
+        group_indices,
+        coefficients,
         pass,
         Some(partitions),
         stream,
     )?;
-    let output_dimensions = spec.output_dimensions;
+    let output_dimensions = spec.output_dimensions();
     let packed = packed.reshape(&[-1, 2 * output_dimensions], stream)?;
     let reducible = packed
         .try_index_device((.., ..output_dimensions), stream)?
         .reshape(&original_shape, stream)?;
-    Ok(TensorParallelExpertOutput {
+    Ok(TensorParallelGroupedOutput::new(
         reducible,
-        post_reduce: packed_gated_product_projections(spec)?
+        packed_gated_product_projections(spec)?
             .1
-            .bias
+            .bias()
             .is_some()
             .then(|| {
                 packed
@@ -796,23 +698,23 @@ pub fn execute_cached_gated_product_tensor_parallel(
                     .reshape(&original_shape, stream)
             })
             .transpose()?,
-    })
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_cached_gated_product_inner(
-    cache: &ExpertCache,
-    spec: &GatedProductExpertBankSpec,
+    cache: &AddressableParameterBank,
+    spec: &GroupedGatedProductSpec,
     layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
-    route_weights: &Array,
+    group_indices: &Array,
+    coefficients: &Array,
     pass: ExpertPass,
     partitions: Option<usize>,
     stream: &Stream,
 ) -> Result<Array, Error> {
     spec.validate()?;
-    if spec.input_dimensions != spec.output_dimensions {
+    if spec.input_dimensions() != spec.output_dimensions() {
         return Err(Error::ArchitectureModel(
             "MLX cached gated-product experts require equal input and output dimensions".into(),
         ));
@@ -824,26 +726,32 @@ fn execute_cached_gated_product_inner(
     // cached banks must do the same before entering the row-oriented cache.
     let original_shape = hidden.shape().to_vec();
     let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
-    let output = cache.execute_routes_bounded(
-        ExpertRouteBatch::new(layer, &flattened, expert_ids, route_weights, pass),
+    let output = cache.execute_selections_bounded(
+        ParameterBankSelection::new(
+            layer,
+            &flattened,
+            group_indices,
+            coefficients,
+            bank_access_class(pass),
+        ),
         stream,
         |hidden, acquired, weights, stream| {
             let started = Instant::now();
             let load_time = cache.weight_quantization();
-            let mut bank = PackedGatedProductExperts::new(
+            let mut bank = PackedGatedProductGroups::new(
                 acquired.identities().len() as i32,
-                spec.input_dimensions,
-                spec.intermediate_dimensions,
+                spec.input_dimensions(),
+                spec.intermediate_dimensions(),
                 gate_up
-                    .format
+                    .format()
                     .encoding()
                     .weight_quantization()
                     .or(load_time),
-                down.format.encoding().weight_quantization().or(load_time),
-                [gate_up.bias.is_some(), down.bias.is_some()],
+                down.format().encoding().weight_quantization().or(load_time),
+                [gate_up.bias().is_some(), down.bias().is_some()],
                 stream,
             )?
-            .with_policy(spec.policy)?;
+            .with_policy(spec.policy())?;
             bank.gate_up_proj =
                 PhysicalParam::new(acquired.compact_binding("gate_up_proj", stream)?);
             bank.gate_up_proj_bias =
@@ -870,22 +778,21 @@ fn execute_cached_gated_product_inner(
                 Some(partitions) => {
                     let output = bank.forward_tensor_parallel(
                         hidden,
-                        acquired.compact_routes(),
+                        acquired.compact_selections(),
                         weights,
                         partitions,
                         stream,
                     )?;
-                    let post_reduce = match output.post_reduce {
+                    let (reducible, post_reduce) = output.into_parts();
+                    let post_reduce = match post_reduce {
                         Some(bias) => bias,
-                        None => safemlx::ops::zeros_dtype(
-                            output.reducible.shape(),
-                            output.reducible.dtype(),
-                            stream,
-                        )?,
+                        None => {
+                            safemlx::ops::zeros_dtype(reducible.shape(), reducible.dtype(), stream)?
+                        }
                     };
-                    safemlx::ops::concatenate_axis(&[output.reducible, post_reduce], -1, stream)?
+                    safemlx::ops::concatenate_axis(&[reducible, post_reduce], -1, stream)?
                 }
-                None => bank.forward(hidden, acquired.compact_routes(), weights, stream)?,
+                None => bank.forward(hidden, acquired.compact_selections(), weights, stream)?,
             })
         },
     )?;
@@ -904,36 +811,42 @@ fn execute_cached_gated_product_inner(
 /// Executes one cached ReLU2 route batch with a compact acquired bank.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cached_relu2(
-    cache: &ExpertCache,
-    spec: &Relu2ExpertBankSpec,
+    cache: &AddressableParameterBank,
+    spec: &GroupedRelu2Spec,
     layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
-    route_weights: &Array,
+    group_indices: &Array,
+    coefficients: &Array,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
     spec.validate()?;
     let original_shape = hidden.shape().to_vec();
     let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
-    let output = cache.execute_routes_bounded(
-        ExpertRouteBatch::new(layer, &flattened, expert_ids, route_weights, pass),
+    let output = cache.execute_selections_bounded(
+        ParameterBankSelection::new(
+            layer,
+            &flattened,
+            group_indices,
+            coefficients,
+            bank_access_class(pass),
+        ),
         stream,
         |hidden, acquired, weights, stream| {
             let started = Instant::now();
             let load_time = cache.weight_quantization();
-            let mut bank = PackedRelu2Experts::new(
+            let mut bank = PackedRelu2Groups::new(
                 acquired.identities().len() as i32,
-                spec.hidden_dimensions,
-                spec.intermediate_dimensions,
+                spec.hidden_dimensions(),
+                spec.intermediate_dimensions(),
                 [
-                    spec.up
-                        .format
+                    spec.up()
+                        .format()
                         .encoding()
                         .weight_quantization()
                         .or(load_time),
-                    spec.down
-                        .format
+                    spec.down()
+                        .format()
                         .encoding()
                         .weight_quantization()
                         .or(load_time),
@@ -955,7 +868,7 @@ pub fn execute_cached_relu2(
                 acquired.scratch_bytes(),
                 started.elapsed(),
             )?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), weights, stream)?)
+            Ok(bank.forward(hidden, acquired.compact_selections(), weights, stream)?)
         },
     )?;
     Ok(output.reshape(&original_shape, stream)?)
@@ -963,22 +876,22 @@ pub fn execute_cached_relu2(
 
 /// Executes ReLU2 route rows already compacted by distributed ownership dispatch.
 pub fn execute_cached_relu2_dispatched(
-    cache: &ExpertCache,
-    spec: &Relu2ExpertBankSpec,
+    cache: &AddressableParameterBank,
+    spec: &GroupedRelu2Spec,
     layer: usize,
     hidden: &Array,
-    global_expert_ids: &Array,
+    global_group_indices: &Array,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let expert_ids = global_expert_ids.reshape(&[-1, 1], stream)?;
+    let group_indices = global_group_indices.reshape(&[-1, 1], stream)?;
     let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
     execute_cached_relu2(
         cache,
         spec,
         layer,
         hidden,
-        &expert_ids,
+        &group_indices,
         &weights,
         pass,
         stream,
@@ -991,22 +904,22 @@ pub fn execute_cached_relu2_dispatched(
 /// applies the original route weight while recombining rows, so this compact
 /// bank must use a unit weight and return one unweighted output row per input.
 pub fn execute_cached_gated_product_dispatched(
-    cache: &ExpertCache,
-    spec: &GatedProductExpertBankSpec,
+    cache: &AddressableParameterBank,
+    spec: &GroupedGatedProductSpec,
     layer: usize,
     hidden: &Array,
-    global_expert_ids: &Array,
+    global_group_indices: &Array,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let expert_ids = global_expert_ids.reshape(&[-1, 1], stream)?;
+    let group_indices = global_group_indices.reshape(&[-1, 1], stream)?;
     let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
     execute_cached_gated_product(
         cache,
         spec,
         layer,
         hidden,
-        &expert_ids,
+        &group_indices,
         &weights,
         pass,
         stream,
@@ -1014,18 +927,21 @@ pub fn execute_cached_gated_product_dispatched(
 }
 
 fn packed_gated_product_projections(
-    spec: &GatedProductExpertBankSpec,
+    spec: &GroupedGatedProductSpec,
 ) -> Result<
     (
-        &eredu_nn::ExpertProjectionSpec,
-        &eredu_nn::ExpertProjectionSpec,
+        &eredu_nn::GroupedProjectionSpec,
+        &eredu_nn::GroupedProjectionSpec,
     ),
     Error,
 > {
-    match &spec.layout {
-        GatedProductExpertLayout::Packed { gate_up, down } => Ok((gate_up, down)),
-        GatedProductExpertLayout::Independent(_) => Err(Error::ArchitectureModel(
+    match spec.layout() {
+        GatedProductGroupLayout::Packed { gate_up, down } => Ok((gate_up, down)),
+        GatedProductGroupLayout::Independent(_) => Err(Error::ArchitectureModel(
             "MLX compact cached banks require a packed architecture expert specification".into(),
+        )),
+        _ => Err(Error::ArchitectureModel(
+            "MLX does not implement this grouped parameter-bank layout".into(),
         )),
     }
 }

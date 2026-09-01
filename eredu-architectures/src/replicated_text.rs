@@ -7,13 +7,12 @@ use eredu_checkpoint::{
 };
 use eredu_core::{
     checkpoint::{TensorCatalog, TensorDtype},
-    ArtifactInspection, PreparationPolicy, QuantizationRequest,
+    ArtifactInspection,
 };
 use eredu_nn::{AttentionCache, NeuralBackend, NeuralOperatorCapabilities, Tensor};
 use eredu_runtime::{
-    LayerRuntimeState, ParameterTransformTarget, ReplicatedTextArchitecture,
-    ReplicatedTextParameterRequirement, ReplicatedTextRequirements, RuntimeState,
-    SelectedReplicatedTextRealization,
+    LayerRuntimeState, ReplicatedTextArchitecture, ReplicatedTextParameterRequirement,
+    ReplicatedTextRequirements, RuntimeState, SelectedReplicatedTextRealization,
 };
 
 use crate::{
@@ -24,6 +23,7 @@ use crate::{
 
 /// Architecture-owned reason that an admitted artifact cannot use replicated text composition.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReplicatedTextIneligibility {
     /// The architecture uses routed computation.
     #[error("architecture requires routed execution")]
@@ -37,9 +37,6 @@ pub enum ReplicatedTextIneligibility {
     /// The architecture owns embedded prediction groups.
     #[error("architecture requires embedded prediction execution")]
     EmbeddedPrediction,
-    /// The requested topology is not single-process replicated execution.
-    #[error("architecture preparation requests partitioned execution")]
-    Partitioned,
     /// The architecture uses a frame-oriented realtime lifecycle.
     #[error("architecture requires realtime execution")]
     Realtime,
@@ -59,25 +56,52 @@ pub struct PreparedReplicatedTextArchitecture<A> {
 }
 
 impl<A> PreparedReplicatedTextArchitecture<A> {
-    /// Consumes the checked handoff into its concrete parts.
-    pub fn into_parts(
-        self,
-    ) -> (
-        A,
-        Option<A>,
-        ReplicatedTextRequirements,
-        SelectedReplicatedTextRealization,
-        crate::capability::CapabilityEstimate,
-        String,
-    ) {
-        (
-            self.architecture,
-            self.source_architecture,
-            self.requirements,
-            self.selected,
-            self.capability_estimate,
-            self.effective_model_type,
-        )
+    /// Returns the exact architecture and artifact requirements.
+    pub const fn requirements(&self) -> &ReplicatedTextRequirements {
+        &self.requirements
+    }
+
+    /// Returns the authoritative selected realization.
+    pub const fn selected(&self) -> &SelectedReplicatedTextRealization {
+        &self.selected
+    }
+
+    /// Returns the architecture capability estimate presented by the session.
+    pub const fn capability_estimate(&self) -> &crate::capability::CapabilityEstimate {
+        &self.capability_estimate
+    }
+
+    /// Returns the normalized model-type label presented by the session.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
+    }
+
+    /// Consumes the handoff into opaque architecture module ownership.
+    pub fn into_modules(self) -> PreparedReplicatedTextModules<A> {
+        PreparedReplicatedTextModules {
+            architecture: Some(self.architecture),
+            source_architecture: self.source_architecture,
+        }
+    }
+}
+
+/// Opaque ownership of selected-format and optional source-format modules.
+pub struct PreparedReplicatedTextModules<A> {
+    architecture: Option<A>,
+    source_architecture: Option<A>,
+}
+
+impl<A> PreparedReplicatedTextModules<A> {
+    /// Takes the selected-format architecture exactly once.
+    pub fn take_architecture(&mut self) -> A {
+        self.architecture
+            .take()
+            .expect("prepared architecture was already taken")
+    }
+
+    /// Takes the source-format architecture used by a selected transform.
+    pub fn take_source_architecture(&mut self) -> Option<A> {
+        self.source_architecture.take()
     }
 }
 
@@ -104,6 +128,7 @@ where
 
 /// Failure before or during the checked architecture/backend handoff.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReplicatedTextDispatchError<E> {
     /// The normalized architecture belongs to a different execution class.
     #[error(transparent)]
@@ -184,9 +209,9 @@ where
 
 fn selected_uses_transform(selected: &SelectedReplicatedTextRealization) -> bool {
     selected
-        .parameters
+        .parameters()
         .iter()
-        .any(|parameter| parameter.lowering == eredu_runtime::WeightLoweringKind::Transform)
+        .any(|parameter| parameter.lowering() == eredu_runtime::WeightLoweringKind::Transform)
 }
 
 fn validate_selected_handoff(
@@ -194,53 +219,63 @@ fn validate_selected_handoff(
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<(), String> {
     let required = requirements
-        .parameters
+        .parameters()
         .iter()
-        .map(|parameter| parameter.name.as_str())
+        .map(|parameter| parameter.name())
         .collect::<BTreeSet<_>>();
     let realized = selected
-        .parameters
+        .parameters()
         .iter()
-        .map(|parameter| parameter.name.as_str())
+        .map(|parameter| parameter.name())
         .collect::<BTreeSet<_>>();
-    if required != realized || selected.parameters.len() != requirements.parameters.len() {
+    if required != realized || selected.parameters().len() != requirements.parameters().len() {
         return Err("selected parameter realization does not match exact requirements".into());
     }
-    for requirement in &requirements.parameters {
+    for requirement in requirements.parameters() {
         let realization = selected
-            .parameters
+            .parameters()
             .iter()
-            .find(|parameter| parameter.name == requirement.name)
+            .find(|parameter| parameter.name() == requirement.name())
             .expect("parameter identity sets were compared above");
-        if realization.sources != requirement.sources
-            || realization.source_encoding != requirement.source_encoding
+        if realization.sources() != requirement.sources()
+            || realization.source_encoding() != requirement.source_encoding()
         {
             return Err(format!(
                 "selected source facts for {:?} differ from exact artifact requirements",
-                requirement.name
+                requirement.name()
             ));
         }
-        let valid_format = match realization.lowering {
+        let valid_format = match realization.lowering() {
             eredu_runtime::WeightLoweringKind::Direct => {
-                realization.executable == requirement.native_executable
+                realization.executable() == requirement.native_executable()
             }
-            eredu_runtime::WeightLoweringKind::Transform => requirement
-                .transform_targets
-                .iter()
-                .any(|target| target.executable == realization.executable),
+            eredu_runtime::WeightLoweringKind::Transform => {
+                let request = match realization.executable() {
+                    LinearFormat::Affine(format) => Some(eredu_core::QuantizationRequest::Affine {
+                        group_size: u32::try_from(format.group_size)
+                            .map_err(|_| "negative selected affine group size".to_owned())?,
+                        bits: u8::try_from(format.bits)
+                            .map_err(|_| "invalid selected affine bit width".to_owned())?,
+                    }),
+                    LinearFormat::MxFp4 => Some(eredu_core::QuantizationRequest::MxFp4),
+                    _ => None,
+                };
+                match request {
+                    Some(request) => requirement
+                        .transform_target(request)
+                        .map_err(|error| error.to_string())?
+                        .is_some_and(|target| target.executable() == realization.executable()),
+                    None => false,
+                }
+            }
+            _ => false,
         };
         if !valid_format {
             return Err(format!(
                 "selected executable format for {:?} is not architecture-admitted",
-                requirement.name
+                requirement.name()
             ));
         }
-    }
-    if selected.session != requirements.session
-        || selected.prompt_cache != requirements.prompt_cache
-        || selected.exact_completion != requirements.exact_completion
-    {
-        return Err("selected lifecycle facilities differ from exact requirements".into());
     }
     Ok(())
 }
@@ -249,13 +284,13 @@ fn selected_formats(
     selected: &SelectedReplicatedTextRealization,
 ) -> HashMap<String, WeightQuantization> {
     selected
-        .parameters
+        .parameters()
         .iter()
         .filter_map(|parameter| {
             parameter
-                .executable
+                .executable()
                 .weight_quantization()
-                .map(|format| (parameter.name.clone(), format))
+                .map(|format| (parameter.name().to_owned(), format))
         })
         .collect()
 }
@@ -313,54 +348,25 @@ impl EligibleConfig<'_> {
         }
         .map_or(LinearFormat::Dense, LinearFormat::from)
     }
-
-    fn validate_transform(&self, quantization: WeightQuantization) -> Result<(), String> {
-        match self {
-            Self::Llama(args) => crate::llama::load_time_quantization(args, quantization).map(drop),
-            Self::Qwen(args) => crate::qwen::load_time_quantization(args, quantization).map(drop),
-        }
-    }
 }
 
 /// Derives exact replicated text requirements from an admitted artifact.
 pub fn replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
-    policy: PreparationPolicy,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    if policy
-        .topology
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(ReplicatedTextIneligibility::Partitioned.into());
-    }
     let plan = inspection.architecture_plan();
     let config = eligible_config(plan)?;
-    let transform = policy
-        .quantization
-        .map(requested_quantization)
-        .transpose()?;
-    if let Some(quantization) = transform {
-        config
-            .validate_transform(quantization)
-            .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
-    }
     let parameters = match (
         plan.safetensors_architecture(),
         plan.gguf_plan(),
         inspection.gguf_checkpoint(),
     ) {
-        (Some(architecture), None, None) => safetensors_parameters(
-            architecture,
-            inspection.tensors(),
-            &config,
-            policy.quantization.zip(transform),
-        )?,
-        (None, Some(architecture), Some(checkpoint)) => gguf_parameters(
-            architecture,
-            checkpoint,
-            &config,
-            policy.quantization.zip(transform),
-        )?,
+        (Some(architecture), None, None) => {
+            safetensors_parameters(architecture, inspection.tensors(), &config)?
+        }
+        (None, Some(architecture), Some(checkpoint)) => {
+            gguf_parameters(architecture, checkpoint, &config)?
+        }
         _ => {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(
                 "artifact container and admitted architecture plan disagree".into(),
@@ -376,19 +382,17 @@ pub fn replicated_text_requirements(
             .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?],
     )
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
-    Ok(ReplicatedTextRequirements {
-        operators: NeuralOperatorCapabilities::NONE,
+    ReplicatedTextRequirements::new(
+        NeuralOperatorCapabilities::NONE,
         execution_graph,
         execution_units,
-        group_transports: vec![crate::transport::decoder()],
-        state_layout: config
+        vec![crate::transport::decoder()],
+        config
             .state_layout()
             .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
         parameters,
-        session: policy.required_session_capabilities,
-        prompt_cache: true,
-        exact_completion: true,
-    })
+    )
+    .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
 }
 
 fn eligible_config(
@@ -481,7 +485,6 @@ fn safetensors_parameters(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
     catalog: &TensorCatalog,
     config: &EligibleConfig<'_>,
-    transform: Option<(QuantizationRequest, WeightQuantization)>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
     let selected = architecture.checkpoint_resolution().ok_or_else(|| {
         ReplicatedTextRequirementsError::InvalidArtifact(
@@ -528,8 +531,7 @@ fn safetensors_parameters(
             vec![source.clone()],
             SourceTensorEncoding::Safetensors(stored_dtype(&descriptor.dtype)?),
             config.native_format(&constraint.key),
-            transform,
-        ));
+        )?);
     }
     finish_parameters(parameters)
 }
@@ -538,7 +540,6 @@ fn gguf_parameters(
     architecture: &crate::configuration::GgufArchitecturePlan,
     checkpoint: &eredu_gguf::Checkpoint,
     config: &EligibleConfig<'_>,
-    transform: Option<(QuantizationRequest, WeightQuantization)>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
     let mut physical = BTreeMap::new();
     for shard in checkpoint.shards() {
@@ -598,8 +599,7 @@ fn gguf_parameters(
             vec![mapping.physical_name.clone(), mapping.original_name.clone()],
             source_encoding.clone(),
             native,
-            transform,
-        ));
+        )?);
     }
     let _ = config;
     finish_parameters(parameters)
@@ -610,35 +610,24 @@ fn parameter_requirement(
     sources: Vec<String>,
     source_encoding: SourceTensorEncoding,
     native_executable: LinearFormat,
-    transform: Option<(QuantizationRequest, WeightQuantization)>,
-) -> ReplicatedTextParameterRequirement {
-    ReplicatedTextParameterRequirement {
-        name,
-        sources,
-        source_encoding,
-        native_executable,
-        transform_targets: transform
-            .map(|(request, quantization)| ParameterTransformTarget {
-                request,
-                executable: LinearFormat::from(quantization),
-            })
-            .into_iter()
-            .collect(),
-    }
+) -> Result<ReplicatedTextParameterRequirement, ReplicatedTextRequirementsError> {
+    ReplicatedTextParameterRequirement::new(name, sources, source_encoding, native_executable)
+        .map(|requirement| requirement.with_affine_transforms().with_mxfp4_transform())
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
 }
 
 fn finish_parameters(
     mut parameters: Vec<ReplicatedTextParameterRequirement>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
-    parameters.sort_by(|left, right| left.name.cmp(&right.name));
+    parameters.sort_by(|left, right| left.name().cmp(right.name()));
     let mut names = BTreeSet::new();
     if let Some(duplicate) = parameters
         .iter()
-        .find(|parameter| !names.insert(parameter.name.as_str()))
+        .find(|parameter| !names.insert(parameter.name()))
     {
         return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
             "logical parameter {:?} is mapped more than once",
-            duplicate.name
+            duplicate.name()
         )));
     }
     if parameters.is_empty() {
@@ -647,24 +636,6 @@ fn finish_parameters(
         ));
     }
     Ok(parameters)
-}
-
-fn requested_quantization(
-    request: QuantizationRequest,
-) -> Result<WeightQuantization, ReplicatedTextRequirementsError> {
-    match request {
-        QuantizationRequest::Affine { group_size, bits } => {
-            Ok(WeightQuantization::Affine(AffineQuantization::new(
-                i32::try_from(group_size).map_err(|_| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(
-                        "affine group size exceeds i32".into(),
-                    )
-                })?,
-                i32::from(bits),
-            )?))
-        }
-        QuantizationRequest::MxFp4 => Ok(WeightQuantization::MxFp4),
-    }
 }
 
 fn stored_dtype(dtype: &TensorDtype) -> Result<StoredDtype, ReplicatedTextRequirementsError> {
@@ -695,6 +666,7 @@ fn stored_dtype(dtype: &TensorDtype) -> Result<StoredDtype, ReplicatedTextRequir
 
 /// Failure while deriving replicated text requirements from an admitted artifact.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReplicatedTextRequirementsError {
     /// The architecture belongs to a different execution class.
     #[error(transparent)]
@@ -716,7 +688,7 @@ impl From<eredu_checkpoint::Error> for ReplicatedTextRequirementsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_core::{ModelConfigurationResolver, SessionCapabilities};
+    use eredu_core::ModelConfigurationResolver;
     use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
 
     fn config(model_type: &str) -> serde_json::Value {
@@ -799,33 +771,65 @@ mod tests {
     }
 
     #[test]
-    fn exact_llama_and_dense_qwen_artifacts_derive_the_same_contract_shape() {
+    fn exact_llama_and_dense_qwen_artifacts_derive_policy_independent_requirements() {
         for model_type in ["llama", "mistral", "qwen2", "qwen3"] {
             let (_root, inspection) = inspected(model_type);
-            let requirements = replicated_text_requirements(
-                &inspection,
-                PreparationPolicy {
-                    quantization: Some(QuantizationRequest::Affine {
+            let requirements = replicated_text_requirements(&inspection).unwrap();
+            let requests = [
+                eredu_runtime::ReplicatedTextSelectionRequest::new(
+                    eredu_core::ResidencyRequest::FullyResident,
+                    eredu_runtime::CacheResidencyPolicy::Device,
+                ),
+                eredu_runtime::ReplicatedTextSelectionRequest::new(
+                    eredu_core::ResidencyRequest::LayerwiseHost,
+                    eredu_runtime::CacheResidencyPolicy::Device,
+                )
+                .with_quantization(eredu_core::QuantizationRequest::Affine {
+                    group_size: 16,
+                    bits: 4,
+                }),
+                eredu_runtime::ReplicatedTextSelectionRequest::new(
+                    eredu_core::ResidencyRequest::DenseDiskStream,
+                    eredu_runtime::CacheResidencyPolicy::Paged(
+                        eredu_runtime::PagedCacheOptions::new(4, 4096, 4096, 1).unwrap(),
+                    ),
+                )
+                .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap())
+                .with_quantization(eredu_core::QuantizationRequest::MxFp4)
+                .with_session(eredu_core::SessionCapabilities {
+                    persistent_cache: true,
+                    output_observation: true,
+                    activation_inspection: true,
+                })
+                .with_prompt_cache(true)
+                .with_exact_completion(true),
+            ];
+            for request in requests {
+                assert_eq!(
+                    requirements,
+                    replicated_text_requirements(&inspection).unwrap()
+                );
+                assert!(matches!(
+                    request.residency(),
+                    eredu_core::ResidencyRequest::FullyResident
+                        | eredu_core::ResidencyRequest::LayerwiseHost
+                        | eredu_core::ResidencyRequest::DenseDiskStream
+                ));
+            }
+            assert_eq!(requirements.execution_graph().groups().len(), 1);
+            assert_eq!(requirements.state_layout().len(), 1);
+            assert!(!requirements.parameters().is_empty());
+            assert!(requirements.parameters().iter().all(|parameter| {
+                matches!(
+                    parameter.source_encoding(),
+                    SourceTensorEncoding::Safetensors(StoredDtype::F32)
+                ) && parameter
+                    .transform_target(eredu_core::QuantizationRequest::Affine {
                         group_size: 16,
                         bits: 4,
-                    }),
-                    required_session_capabilities: SessionCapabilities {
-                        persistent_cache: true,
-                        output_observation: true,
-                        activation_inspection: true,
-                    },
-                    ..PreparationPolicy::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(requirements.execution_graph.groups().len(), 1);
-            assert_eq!(requirements.state_layout.len(), 1);
-            assert!(!requirements.parameters.is_empty());
-            assert!(requirements.parameters.iter().all(|parameter| {
-                matches!(
-                    parameter.source_encoding,
-                    SourceTensorEncoding::Safetensors(StoredDtype::F32)
-                ) && parameter.transform_targets.len() == 1
+                    })
+                    .unwrap()
+                    .is_some()
             }));
         }
     }
@@ -889,19 +893,18 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_policy_is_rejected_before_requirements_are_built() {
+    fn partitioned_topology_remains_a_caller_selection_choice() {
         let (_root, inspection) = inspected("llama");
-        let error = replicated_text_requirements(
-            &inspection,
-            PreparationPolicy {
-                topology: Some(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap()),
-                ..PreparationPolicy::default()
-            },
+        let requirements = replicated_text_requirements(&inspection).unwrap();
+        let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+            eredu_core::ResidencyRequest::FullyResident,
+            eredu_runtime::CacheResidencyPolicy::Device,
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ReplicatedTextRequirementsError::Ineligible(ReplicatedTextIneligibility::Partitioned)
-        ));
+        .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
+        assert!(!request.topology().unwrap().is_replicated());
+        assert_eq!(
+            requirements,
+            replicated_text_requirements(&inspection).unwrap()
+        );
     }
 }

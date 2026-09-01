@@ -46,13 +46,13 @@ pub use vision::{VisionLayer, VisionStatic, VisionTower};
 #[derive(Debug, Clone)]
 pub struct ExpertBankRealization {
     /// Selectable experts partitioned over the expert axis.
-    pub routed: eredu_nn::GatedProductExpertBankSpec,
+    pub routed: eredu_nn::GroupedGatedProductSpec,
     /// Always-on shared experts replicated over the expert axis.
-    pub shared: eredu_nn::GatedProductExpertBankSpec,
+    pub shared: eredu_nn::GroupedGatedProductSpec,
 }
 
 /// Derives complete routed-expert ownership and both rank-local bank geometries.
-pub fn expert_realization_plan<B: eredu_nn::RoutedNeuralBackend>(
+pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<ExpertBankRealization>>, eredu_nn::Error> {

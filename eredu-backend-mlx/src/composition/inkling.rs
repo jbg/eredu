@@ -57,7 +57,7 @@ use crate::backend::{
             layerwise::{quantize_module_store_with_bindings, shard_layer_bindings},
         },
         media::input,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport},
+        residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
     },
 };
 
@@ -375,7 +375,7 @@ pub struct InklingModel {
     args: ModelArgs,
     state_layouts: eredu_architectures::inkling::InklingStateLayouts,
     execution: Execution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
 }
 
@@ -608,10 +608,10 @@ impl InklingModel {
         }
     }
 
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Into::into)
     }
@@ -648,10 +648,10 @@ impl InklingModel {
         let mut final_text_hidden = None;
         let mut ordered_tokens = None;
         let output_group = self.execution.output_group()?;
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let mut provider =
-                crate::composition::inkling_expert::cached_provider(&expert_cache, &args);
+                crate::composition::inkling_expert::cached_provider(&parameter_bank, &args);
             let result = match &mut self.execution {
                 Execution::Resident(runtime) => runtime
                     .forward_with_unit_executor_and_activation_hook(
@@ -708,7 +708,7 @@ impl InklingModel {
                 Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
             };
             drop(provider);
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             let (logits, _) =
                 result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             return Ok(
@@ -815,14 +815,14 @@ impl InklingModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.clone();
                     let mut provider =
-                        crate::composition::inkling_expert::cached_provider(expert_cache, &args);
+                        crate::composition::inkling_expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
                             input,
@@ -869,7 +869,7 @@ impl InklingModel {
                 },
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         eredu_runtime::observe_model_logits(observer, logits.as_array())
             .map(crate::MlxTensor::from_array)
@@ -1141,14 +1141,14 @@ impl InklingModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            let output = match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.clone();
                     let mut provider =
-                        crate::composition::inkling_expert::cached_provider(expert_cache, &args);
+                        crate::composition::inkling_expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         Execution::ParallelResident(runtime) => runtime
                             .forward_parallel_with_provider_and_observer(
@@ -1202,7 +1202,7 @@ impl InklingModel {
             .map_err(|error| Error::Parallel(error.to_string()))?;
             eredu_runtime::observe_model_logits(&mut neutral, &output).map_err(Error::from)
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
@@ -2032,7 +2032,7 @@ fn load_store(
         state_layouts,
         args,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: None,
     })
 }
@@ -2205,7 +2205,7 @@ fn load_parallel_store(
         args,
         state_layouts,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: Some(parallel_info),
     })
 }
@@ -2243,7 +2243,7 @@ pub fn load_gguf_tensor_parallel(
     load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut InklingModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -2251,7 +2251,7 @@ fn attach_expert_cache(
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
     let entries = crate::composition::inkling_expert::expert_catalog(&model.args, store.as_ref())?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -2302,7 +2302,7 @@ pub fn load_safetensors(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -2327,7 +2327,7 @@ pub fn load_gguf(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }

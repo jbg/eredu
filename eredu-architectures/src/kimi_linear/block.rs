@@ -1,8 +1,8 @@
 //! Kimi Linear normalization, residual, and heterogeneous mixer assembly.
 
 use eredu_nn::{
-    BlockwiseAttentionBackend, CompressedAttentionCache, Error, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RoutedNeuralBackend, Tensor,
+    BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
 
@@ -13,7 +13,7 @@ use super::{AttentionKind, FeedForward, KimiDeltaAttention, KimiLatentAttention,
 #[parameterized(tensor = "B::Tensor")]
 pub enum TokenMixer<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Kimi Delta Attention.
     Kda(KimiDeltaAttention<B>),
@@ -26,7 +26,7 @@ where
 #[parameterized(tensor = "B::Tensor")]
 pub struct Block<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Scheduled heterogeneous token mixer.
     pub mixer: TokenMixer<B>,
@@ -68,7 +68,7 @@ impl BlockGeometry {
 
 impl<B> Block<B>
 where
-    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Builds one unloaded block from the validated physical schedule.
     pub fn new(

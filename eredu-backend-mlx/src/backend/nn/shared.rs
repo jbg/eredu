@@ -12,18 +12,18 @@ use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
     BlockwiseAttentionSpec, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
-    Error as ComputeError, GatedDeltaScanInput, GatedDeltaScanOutput,
-    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    GatedProductPolicy, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
-    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
-    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormatSpec, LinearOperator,
-    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
-    NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SegmentedAttentionInput,
+    Error as ComputeError, GatedDeltaScanInput, GatedDeltaScanOutput, GatedProductGroupLayout,
+    GatedProductPolicy, GroupScoring, GroupSelection, GroupSelectionOperator,
+    GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
+    GroupedRelu2Operator, GroupedRelu2Spec, HyperConnectionOperator, HyperConnectionSpec,
+    HyperConnectionState, HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend,
+    IndexedAttentionInput, JointGroupSelection, JointGroupSelectionInput, LinearFormatSpec,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
+    RelativeAttentionInput, RotaryOperator, RotaryPosition, RotarySpec, SegmentedAttentionInput,
     SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TensorParallelExpertOutput, TopKRouterSpec, VocabularyParallelRange,
+    TensorParallelGroupedOutput, TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use ref_cast::RefCast;
@@ -769,13 +769,13 @@ impl Parameterized<MlxTensor> for MlxHyperHead {
     }
 }
 
-/// MLX implementation of the backend-neutral learned top-k router.
+/// MLX implementation of the backend-neutral learned top-k selector.
 #[derive(Debug, Clone)]
-pub struct MlxTopKRouter {
-    module: MlxNamedModule<common::moe::TopKRouter>,
+pub struct MlxTopKGroupSelector {
+    module: MlxNamedModule<common::grouped::TopKGroupSelector>,
 }
 
-impl Parameterized<MlxTensor> for MlxTopKRouter {
+impl Parameterized<MlxTensor> for MlxTopKGroupSelector {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -793,51 +793,51 @@ impl Parameterized<MlxTensor> for MlxTopKRouter {
     }
 }
 
-impl RoutingOperator<MlxTensor> for MlxTopKRouter {
-    fn route(
+impl GroupSelectionOperator<MlxTensor> for MlxTopKGroupSelector {
+    fn select(
         &mut self,
         input: &MlxTensor,
         context: &Stream,
-    ) -> Result<RoutingResult<MlxTensor>, ComputeError> {
-        let output = compute(self.module.forward_routes_with_selection_bias(
+    ) -> Result<GroupSelection<MlxTensor>, ComputeError> {
+        let output = compute(self.module.select_with_selection_bias(
             input.as_array(),
             None,
             context,
         ))?;
-        Ok(RoutingResult {
-            expert_ids: MlxTensor::from_array(output.indices),
-            selected_scores: MlxTensor::from_array(output.scores),
-            route_weights: MlxTensor::from_array(output.weights),
-        })
+        Ok(GroupSelection::new(
+            MlxTensor::from_array(output.indices),
+            MlxTensor::from_array(output.scores),
+            MlxTensor::from_array(output.weights),
+        ))
     }
 
-    fn route_selected(
+    fn select_indices(
         &mut self,
         input: &MlxTensor,
-        expert_ids: &MlxTensor,
+        group_indices: &MlxTensor,
         context: &Stream,
-    ) -> Result<RoutingResult<MlxTensor>, ComputeError> {
-        let output = compute(self.module.forward_routes_with_routing_indices(
+    ) -> Result<GroupSelection<MlxTensor>, ComputeError> {
+        let output = compute(self.module.select_indices(
             input.as_array(),
-            expert_ids.as_array(),
+            group_indices.as_array(),
             context,
         ))?;
-        Ok(RoutingResult {
-            expert_ids: MlxTensor::from_array(output.indices),
-            selected_scores: MlxTensor::from_array(output.scores),
-            route_weights: MlxTensor::from_array(output.weights),
-        })
+        Ok(GroupSelection::new(
+            MlxTensor::from_array(output.indices),
+            MlxTensor::from_array(output.scores),
+            MlxTensor::from_array(output.weights),
+        ))
     }
 }
 
-/// MLX packed execution bank for backend-neutral routed gated-product experts.
+/// MLX packed execution bank for backend-neutral grouped gated-product groups.
 #[derive(Debug, Clone)]
-pub struct MlxGatedProductExpertBank {
-    spec: GatedProductExpertBankSpec,
-    module: MlxNamedModule<common::moe::PackedGatedProductExperts>,
+pub struct MlxGroupedGatedProduct {
+    spec: GroupedGatedProductSpec,
+    module: MlxNamedModule<common::grouped::PackedGatedProductGroups>,
 }
 
-impl Parameterized<MlxTensor> for MlxGatedProductExpertBank {
+impl Parameterized<MlxTensor> for MlxGroupedGatedProduct {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -855,69 +855,69 @@ impl Parameterized<MlxTensor> for MlxGatedProductExpertBank {
     }
 }
 
-impl GatedProductExpertBankOperator<MlxTensor> for MlxGatedProductExpertBank {
-    fn spec(&self) -> &GatedProductExpertBankSpec {
+impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
+    fn spec(&self) -> &GroupedGatedProductSpec {
         &self.spec
     }
 
-    fn forward_routed(
+    fn forward_grouped(
         &mut self,
         input: &MlxTensor,
-        routes: &RoutingResult<MlxTensor>,
+        selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward(
             &flattened,
-            routes.expert_ids.as_array(),
-            routes.route_weights.as_array(),
+            selections.group_indices().as_array(),
+            selections.coefficients().as_array(),
             context,
         ))?;
         compute_tensor(output.reshape(input.shape(), context))
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
         input: &MlxTensor,
-        routes: &RoutingResult<MlxTensor>,
+        selections: &GroupSelection<MlxTensor>,
         partitions: usize,
         context: &Stream,
-    ) -> Result<TensorParallelExpertOutput<MlxTensor>, ComputeError> {
+    ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward_tensor_parallel(
             &flattened,
-            routes.expert_ids.as_array(),
-            routes.route_weights.as_array(),
+            selections.group_indices().as_array(),
+            selections.coefficients().as_array(),
             partitions,
             context,
         ))?;
-        Ok(TensorParallelExpertOutput {
-            reducible: compute_tensor(output.reducible.reshape(input.shape(), context))?,
-            post_reduce: output
-                .post_reduce
+        let (reducible, post_reduce) = output.into_parts();
+        Ok(TensorParallelGroupedOutput::new(
+            compute_tensor(reducible.reshape(input.shape(), context))?,
+            post_reduce
                 .map(|bias| compute_tensor(bias.reshape(input.shape(), context)))
                 .transpose()?,
-        })
+        ))
     }
 }
 
-/// MLX packed execution bank for backend-neutral routed ReLU2 experts.
+/// MLX packed execution bank for backend-neutral grouped ReLU2 groups.
 #[derive(Debug, Clone)]
-pub struct MlxRelu2ExpertBank {
-    spec: Relu2ExpertBankSpec,
-    module: MlxNamedModule<common::moe::PackedRelu2Experts>,
+pub struct MlxGroupedRelu2 {
+    spec: GroupedRelu2Spec,
+    module: MlxNamedModule<common::grouped::PackedRelu2Groups>,
 }
 
-impl MlxRelu2ExpertBank {
+impl MlxGroupedRelu2 {
     /// Returns the architecture-owned specification used to realize this bank.
-    pub const fn spec(&self) -> &Relu2ExpertBankSpec {
+    pub const fn spec(&self) -> &GroupedRelu2Spec {
         &self.spec
     }
 }
 
-impl Parameterized<MlxTensor> for MlxRelu2ExpertBank {
+impl Parameterized<MlxTensor> for MlxGroupedRelu2 {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -937,11 +937,11 @@ impl Parameterized<MlxTensor> for MlxRelu2ExpertBank {
     }
 }
 
-impl Relu2ExpertBankOperator<MlxTensor> for MlxRelu2ExpertBank {
-    fn forward_routed(
+impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
+    fn forward_grouped(
         &mut self,
         input: &MlxTensor,
-        routes: &RoutingResult<MlxTensor>,
+        selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         let input = input.as_array();
@@ -949,71 +949,37 @@ impl Relu2ExpertBankOperator<MlxTensor> for MlxRelu2ExpertBank {
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward(
             &flattened,
-            routes.expert_ids.as_array(),
-            routes.route_weights.as_array(),
+            selections.group_indices().as_array(),
+            selections.coefficients().as_array(),
             context,
         ))?;
         compute_tensor(output.reshape(shape, context))
     }
 
-    fn forward_routed_tensor_parallel(
+    fn forward_grouped_tensor_parallel(
         &mut self,
         input: &MlxTensor,
-        routes: &RoutingResult<MlxTensor>,
+        selections: &GroupSelection<MlxTensor>,
         partitions: usize,
         context: &Stream,
-    ) -> Result<TensorParallelExpertOutput<MlxTensor>, ComputeError> {
+    ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
         let input = input.as_array();
         let shape = input.shape();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward_tensor_parallel(
             &flattened,
-            routes.expert_ids.as_array(),
-            routes.route_weights.as_array(),
+            selections.group_indices().as_array(),
+            selections.coefficients().as_array(),
             partitions,
             context,
         ))?;
-        Ok(TensorParallelExpertOutput {
-            reducible: compute_tensor(output.reducible.reshape(shape, context))?,
-            post_reduce: output
-                .post_reduce
+        let (reducible, post_reduce) = output.into_parts();
+        Ok(TensorParallelGroupedOutput::new(
+            compute_tensor(reducible.reshape(shape, context))?,
+            post_reduce
                 .map(|bias| compute_tensor(bias.reshape(shape, context)))
                 .transpose()?,
-        })
-    }
-}
-
-impl crate::backend::runtime::distributed::expert::LocalExpertBank for MlxRelu2ExpertBank {
-    fn execute_local_routes(
-        &mut self,
-        hidden: &Array,
-        local_expert_ids: &Array,
-        stream: &Stream,
-    ) -> Result<Array, crate::backend::error::Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = crate::backend::runtime::distributed::expert::unit_route_weights(
-            hidden.dim(0),
-            hidden.dtype(),
-            stream,
-        )?;
-        Ok(self.module.forward(hidden, &ids, &weights, stream)?)
-    }
-}
-
-impl crate::backend::runtime::distributed::expert::LocalExpertBank for MlxGatedProductExpertBank {
-    fn execute_local_routes(
-        &mut self,
-        hidden: &Array,
-        local_expert_ids: &Array,
-        stream: &Stream,
-    ) -> Result<Array, crate::backend::error::Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = crate::backend::runtime::distributed::expert::unit_route_weights(
-            hidden.dim(0),
-            hidden.dtype(),
-            stream,
-        )?;
-        Ok(self.module.forward(hidden, &ids, &weights, stream)?)
+        ))
     }
 }
 
@@ -1847,6 +1813,11 @@ impl NeuralBackend for MlxNeuralBackend {
             eredu_nn::GatedProductActivation::GeluApproximate => {
                 compute(nn::gelu_approximate(gate, context))?
             }
+            _ => {
+                return Err(ComputeError::backend(
+                    "unsupported grouped gated-product activation",
+                ))
+            }
         };
         compute_tensor(gate.multiply(up, context))
     }
@@ -1983,44 +1954,6 @@ impl NeuralBackend for MlxNeuralBackend {
         ))?;
         let probabilities = compute(softmax_axis(scores, -1, true, context))?;
         compute_tensor(matmul(probabilities, values, context))
-    }
-
-    fn joint_expert_routing(
-        input: JointExpertRoutingInput<'_, MlxTensor>,
-        context: &Stream,
-    ) -> Result<JointExpertRoutingResult<MlxTensor>, ComputeError> {
-        input.validate()?;
-        let hidden_width = input.hidden.as_array().dim(-1);
-        let flat = compute(
-            input
-                .hidden
-                .as_array()
-                .reshape(&[-1, hidden_width], context),
-        )?;
-        let logits = compute(matmul(
-            &flat,
-            &compute(input.weight.as_array().transpose(context))?,
-            context,
-        ))?;
-        let routed = compute(logits.try_index_device((.., ..input.routed_experts), context))?;
-        let shared = compute(logits.try_index_device((.., input.routed_experts..), context))?;
-        let choice = compute(sigmoid(&routed, context))?;
-        let choice = compute(choice.add(input.correction_bias.as_array(), context))?;
-        let routed_ids = compute(argpartition_axis(choice, -input.top_k, -1, context))?;
-        let routed_ids = compute(routed_ids.try_index_device((.., -input.top_k..), context))?;
-        let selected_logits = compute(take_along_axis(&routed, &routed_ids, -1, context))?;
-        let all_logits = compute(concatenate_axis(&[selected_logits, shared], -1, context))?;
-        let weights = compute(nn::log_sigmoid(all_logits, context))?;
-        let weights = compute(softmax_axis(weights, -1, true, context))?;
-        let weights = compute(weights.multiply(Array::from_f32(input.route_scale), context))?;
-        let weights = compute(weights.multiply(input.global_scale.as_array(), context))?;
-        let routed_weights = compute(weights.try_index_device((.., ..input.top_k), context))?;
-        let shared_weights = compute(weights.try_index_device((.., input.top_k..), context))?;
-        Ok(JointExpertRoutingResult {
-            routed_ids: MlxTensor::from_array(routed_ids),
-            routed_weights: MlxTensor::from_array(routed_weights),
-            shared_weights: MlxTensor::from_array(shared_weights),
-        })
     }
 
     fn indexed_attention(
@@ -2395,89 +2328,135 @@ impl HyperNeuralBackend for MlxNeuralBackend {
     }
 }
 
-impl RoutedNeuralBackend for MlxNeuralBackend {
-    type Router = MlxTopKRouter;
-    type GatedProductExpertBank = MlxGatedProductExpertBank;
-    type Relu2ExpertBank = MlxRelu2ExpertBank;
+impl GroupedNeuralBackend for MlxNeuralBackend {
+    type Selector = MlxTopKGroupSelector;
+    type GatedProductGroups = MlxGroupedGatedProduct;
+    type Relu2Groups = MlxGroupedRelu2;
 
-    fn top_k_router(spec: TopKRouterSpec, context: &Stream) -> Result<Self::Router, ComputeError> {
-        spec.validate()?;
-        let score_function = match spec.routing.scoring() {
-            RoutingScoring::Softmax => common::moe::TopKRouterScoreFunction::Softmax,
-            RoutingScoring::SelectedSoftmax => {
-                common::moe::TopKRouterScoreFunction::SelectedSoftmax
-            }
-            RoutingScoring::Sigmoid => common::moe::TopKRouterScoreFunction::Sigmoid,
-            RoutingScoring::SqrtSoftplus => common::moe::TopKRouterScoreFunction::SqrtSoftplus,
-        };
-        let module = compute(common::moe::TopKRouter::new_with_quantization(
-            common::moe::TopKRouterConfig {
-                top_k: spec.routing.top_k(),
-                num_experts: spec.routing.expert_count(),
-                hidden_size: spec.input_dimensions,
-                score_function,
-                norm_topk_prob: spec.routing.normalize_selected(),
-                normalization_epsilon: spec.routing.normalization_epsilon(),
-                routed_scaling_factor: spec.routing.routed_scaling(),
-                n_group: spec.routing.expert_groups(),
-                topk_group: spec.routing.selected_groups(),
-                projection_bias: spec.bias.is_some(),
-                score_correction_bias: spec.correction_bias.is_some(),
-                input_rms_epsilon: spec
-                    .input_transform
-                    .as_ref()
-                    .map(|transform| transform.epsilon),
-                input_inverse_sqrt_dimensions: spec
-                    .input_transform
-                    .as_ref()
-                    .is_some_and(|transform| transform.inverse_sqrt_dimensions),
-                route_scale: spec.route_scale.is_some(),
-            },
-            spec.format.encoding().weight_quantization(),
+    fn joint_group_selection(
+        input: JointGroupSelectionInput<'_, MlxTensor>,
+        context: &Stream,
+    ) -> Result<JointGroupSelection<MlxTensor>, ComputeError> {
+        input.validate()?;
+        let hidden_width = input.hidden().as_array().dim(-1);
+        let flat = compute(
+            input
+                .hidden()
+                .as_array()
+                .reshape(&[-1, hidden_width], context),
+        )?;
+        let logits = compute(matmul(
+            &flat,
+            &compute(input.weight().as_array().transpose(context))?,
             context,
         ))?;
-        let weight = spec.weight;
+        let primary = compute(logits.try_index_device((.., ..input.selectable_groups()), context))?;
+        let always_on =
+            compute(logits.try_index_device((.., input.selectable_groups()..), context))?;
+        let choice = compute(sigmoid(&primary, context))?;
+        let choice = compute(choice.add(input.correction_bias().as_array(), context))?;
+        let primary_indices = compute(argpartition_axis(choice, -input.top_k(), -1, context))?;
+        let primary_indices =
+            compute(primary_indices.try_index_device((.., -input.top_k()..), context))?;
+        let selected_logits = compute(take_along_axis(&primary, &primary_indices, -1, context))?;
+        let all_logits = compute(concatenate_axis(&[selected_logits, always_on], -1, context))?;
+        let coefficients = compute(nn::log_sigmoid(all_logits, context))?;
+        let coefficients = compute(softmax_axis(coefficients, -1, true, context))?;
+        let coefficients =
+            compute(coefficients.multiply(Array::from_f32(input.coefficient_scale()), context))?;
+        let coefficients =
+            compute(coefficients.multiply(input.global_scale().as_array(), context))?;
+        let primary_coefficients =
+            compute(coefficients.try_index_device((.., ..input.top_k()), context))?;
+        let always_on_coefficients =
+            compute(coefficients.try_index_device((.., input.top_k()..), context))?;
+        Ok(JointGroupSelection::new(
+            MlxTensor::from_array(primary_indices),
+            MlxTensor::from_array(primary_coefficients),
+            MlxTensor::from_array(always_on_coefficients),
+        ))
+    }
+
+    fn top_k_group_selector(
+        spec: TopKGroupSelectorSpec,
+        context: &Stream,
+    ) -> Result<Self::Selector, ComputeError> {
+        spec.validate()?;
+        let selection = spec.selection();
+        let score_function = match selection.scoring() {
+            GroupScoring::Softmax => common::grouped::TopKGroupScoring::Softmax,
+            GroupScoring::SelectedSoftmax => common::grouped::TopKGroupScoring::SelectedSoftmax,
+            GroupScoring::Sigmoid => common::grouped::TopKGroupScoring::Sigmoid,
+            GroupScoring::SqrtSoftplus => common::grouped::TopKGroupScoring::SqrtSoftplus,
+            _ => return Err(ComputeError::backend("unsupported group scoring policy")),
+        };
+        let module = compute(common::grouped::TopKGroupSelector::new_with_quantization(
+            common::grouped::TopKGroupSelectorConfig {
+                top_k: selection.top_k(),
+                group_count: selection.group_count(),
+                hidden_size: spec.input_dimensions(),
+                score_function,
+                norm_topk_prob: selection.normalize_selected(),
+                normalization_epsilon: selection.normalization_epsilon(),
+                coefficient_scale: selection.coefficient_scale(),
+                n_group: selection.selection_partitions(),
+                topk_group: selection.selected_groups(),
+                projection_bias: spec.bias().is_some(),
+                score_correction_bias: spec.correction_bias().is_some(),
+                input_rms_epsilon: spec.input_transform().map(|transform| transform.epsilon()),
+                input_inverse_sqrt_dimensions: spec
+                    .input_transform()
+                    .is_some_and(|transform| transform.inverse_sqrt_dimensions()),
+                learned_coefficient_scale: spec.coefficient_scale().is_some(),
+            },
+            spec.format().encoding().weight_quantization(),
+            context,
+        ))?;
+        let weight = spec.weight().clone();
         let mut topology = vec![("weight", weight.clone())];
-        if let Some(bias) = spec.bias {
-            topology.push(("bias", bias));
+        if let Some(bias) = spec.bias() {
+            topology.push(("bias", bias.clone()));
         }
-        if let Some(scale) = spec.format.scale() {
+        if let Some(scale) = spec.format().scale() {
             topology.push(("scales", bind_linear_companion(&weight, scale.clone())));
         }
-        if let Some(bias) = spec.format.affine_bias() {
+        if let Some(bias) = spec.format().affine_bias() {
             topology.push(("biases", bind_linear_companion(&weight, bias.clone())));
         }
-        if let Some(correction_bias) = spec.correction_bias {
-            topology.push(("e_score_correction_bias", correction_bias));
+        if let Some(correction_bias) = spec.correction_bias() {
+            topology.push(("e_score_correction_bias", correction_bias.clone()));
         }
-        if let Some(transform) = spec.input_transform {
-            topology.push(("input_scale", transform.scale));
+        if let Some(transform) = spec.input_transform() {
+            topology.push(("input_scale", transform.scale().clone()));
         }
-        if let Some(route_scale) = spec.route_scale {
-            topology.push(("route_scale", route_scale));
+        if let Some(learned_coefficient_scale) = spec.coefficient_scale() {
+            topology.push((
+                "learned_coefficient_scale",
+                learned_coefficient_scale.clone(),
+            ));
         }
-        Ok(MlxTopKRouter {
+        Ok(MlxTopKGroupSelector {
             module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }
 
-    fn gated_product_expert_bank(
-        spec: GatedProductExpertBankSpec,
+    fn grouped_gated_product(
+        spec: GroupedGatedProductSpec,
         context: &Stream,
-    ) -> Result<Self::GatedProductExpertBank, ComputeError> {
+    ) -> Result<Self::GatedProductGroups, ComputeError> {
         spec.validate()?;
-        if spec.input_dimensions != spec.output_dimensions {
+        if spec.input_dimensions() != spec.output_dimensions() {
             return Err(ComputeError::backend(
-                "MLX packed gated-product experts require equal input and output dimensions",
+                "MLX packed gated-product groups require equal input and output dimensions",
             ));
         }
-        let policy = spec.policy;
-        let GatedProductExpertLayout::Packed { gate_up, down } = &spec.layout else {
+        let policy = spec.policy();
+        let GatedProductGroupLayout::Packed { gate_up, down } = spec.layout() else {
             return Err(ComputeError::backend(
-                "independent expert units must be acquired through a runtime expert provider",
+                "independent group units must be acquired through a runtime group provider",
             ));
         };
-        let native_fp8 = match (gate_up.format.encoding(), down.format.encoding()) {
+        let native_fp8 = match (gate_up.format().encoding(), down.format().encoding()) {
             (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
                 if gate == down
                     && gate.scale_encoding == eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 =>
@@ -2486,23 +2465,23 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             }
             (LinearFormat::E4M3BlockFp8(_), LinearFormat::E4M3BlockFp8(_)) => {
                 return Err(ComputeError::backend(
-                    "MLX packed block-FP8 experts require matching UE8M0 formats",
+                    "MLX packed block-FP8 groups require matching UE8M0 formats",
                 ));
             }
             (LinearFormat::E4M3BlockFp8(_), _) | (_, LinearFormat::E4M3BlockFp8(_)) => {
                 return Err(ComputeError::backend(
-                    "packed expert projections must use one physical format",
+                    "packed group projections must use one physical format",
                 ));
             }
             _ => false,
         };
-        let mut module = compute(common::moe::PackedGatedProductExperts::new(
-            spec.expert_count,
-            spec.input_dimensions,
-            spec.intermediate_dimensions,
-            gate_up.format.encoding().weight_quantization(),
-            down.format.encoding().weight_quantization(),
-            [gate_up.bias.is_some(), down.bias.is_some()],
+        let mut module = compute(common::grouped::PackedGatedProductGroups::new(
+            spec.group_count(),
+            spec.input_dimensions(),
+            spec.intermediate_dimensions(),
+            gate_up.format().encoding().weight_quantization(),
+            down.format().encoding().weight_quantization(),
+            [gate_up.bias().is_some(), down.bias().is_some()],
             context,
         ))?;
         module = compute(module.with_policy(policy))?;
@@ -2510,94 +2489,94 @@ impl RoutedNeuralBackend for MlxNeuralBackend {
             module = compute(module.with_native_fp8_e8m0(context))?;
         }
         let mut topology = vec![
-            ("gate_up_proj", gate_up.weight.clone()),
-            ("down_proj", down.weight.clone()),
+            ("gate_up_proj", gate_up.weight().clone()),
+            ("down_proj", down.weight().clone()),
         ];
-        if let Some(bias) = &gate_up.bias {
+        if let Some(bias) = gate_up.bias() {
             topology.push(("gate_up_proj_bias", bias.clone()));
         }
-        if let Some(bias) = &down.bias {
+        if let Some(bias) = down.bias() {
             topology.push(("down_proj_bias", bias.clone()));
         }
-        if let Some(scale) = gate_up.format.scale() {
+        if let Some(scale) = gate_up.format().scale() {
             topology.push((
                 "gate_up_proj_scales",
-                bind_linear_companion(&gate_up.weight, scale.clone()),
+                bind_linear_companion(gate_up.weight(), scale.clone()),
             ));
         }
-        if let Some(bias) = gate_up.format.affine_bias() {
+        if let Some(bias) = gate_up.format().affine_bias() {
             topology.push((
                 "gate_up_proj_biases",
-                bind_linear_companion(&gate_up.weight, bias.clone()),
+                bind_linear_companion(gate_up.weight(), bias.clone()),
             ));
         }
-        if let Some(scale) = down.format.scale() {
+        if let Some(scale) = down.format().scale() {
             topology.push((
                 "down_proj_scales",
-                bind_linear_companion(&down.weight, scale.clone()),
+                bind_linear_companion(down.weight(), scale.clone()),
             ));
         }
-        if let Some(bias) = down.format.affine_bias() {
+        if let Some(bias) = down.format().affine_bias() {
             topology.push((
                 "down_proj_biases",
-                bind_linear_companion(&down.weight, bias.clone()),
+                bind_linear_companion(down.weight(), bias.clone()),
             ));
         }
-        Ok(MlxGatedProductExpertBank {
+        Ok(MlxGroupedGatedProduct {
             spec,
             module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }
 
-    fn relu2_expert_bank(
-        spec: Relu2ExpertBankSpec,
+    fn grouped_relu2(
+        spec: GroupedRelu2Spec,
         context: &Stream,
-    ) -> Result<Self::Relu2ExpertBank, ComputeError> {
+    ) -> Result<Self::Relu2Groups, ComputeError> {
         spec.validate()?;
-        if spec.up.bias.is_some() || spec.down.bias.is_some() {
+        if spec.up().bias().is_some() || spec.down().bias().is_some() {
             return Err(ComputeError::backend(
-                "MLX packed ReLU2 experts do not support ordinary projection biases",
+                "MLX packed ReLU2 groups do not support ordinary projection biases",
             ));
         }
-        let module = compute(common::moe::PackedRelu2Experts::new(
-            spec.expert_count,
-            spec.hidden_dimensions,
-            spec.intermediate_dimensions,
+        let module = compute(common::grouped::PackedRelu2Groups::new(
+            spec.group_count(),
+            spec.hidden_dimensions(),
+            spec.intermediate_dimensions(),
             [
-                spec.up.format.encoding().weight_quantization(),
-                spec.down.format.encoding().weight_quantization(),
+                spec.up().format().encoding().weight_quantization(),
+                spec.down().format().encoding().weight_quantization(),
             ],
             context,
         ))?;
         let mut topology = vec![
-            ("up_proj", spec.up.weight.clone()),
-            ("down_proj", spec.down.weight.clone()),
+            ("up_proj", spec.up().weight().clone()),
+            ("down_proj", spec.down().weight().clone()),
         ];
-        if let Some(scale) = spec.up.format.scale() {
+        if let Some(scale) = spec.up().format().scale() {
             topology.push((
                 "up_proj_scales",
-                bind_linear_companion(&spec.up.weight, scale.clone()),
+                bind_linear_companion(spec.up().weight(), scale.clone()),
             ));
         }
-        if let Some(bias) = spec.up.format.affine_bias() {
+        if let Some(bias) = spec.up().format().affine_bias() {
             topology.push((
                 "up_proj_biases",
-                bind_linear_companion(&spec.up.weight, bias.clone()),
+                bind_linear_companion(spec.up().weight(), bias.clone()),
             ));
         }
-        if let Some(scale) = spec.down.format.scale() {
+        if let Some(scale) = spec.down().format().scale() {
             topology.push((
                 "down_proj_scales",
-                bind_linear_companion(&spec.down.weight, scale.clone()),
+                bind_linear_companion(spec.down().weight(), scale.clone()),
             ));
         }
-        if let Some(bias) = spec.down.format.affine_bias() {
+        if let Some(bias) = spec.down().format().affine_bias() {
             topology.push((
                 "down_proj_biases",
-                bind_linear_companion(&spec.down.weight, bias.clone()),
+                bind_linear_companion(spec.down().weight(), bias.clone()),
             ));
         }
-        Ok(MlxRelu2ExpertBank {
+        Ok(MlxGroupedRelu2 {
             spec,
             module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
@@ -2682,11 +2661,12 @@ mod neutral_semantic_operator_tests {
     use eredu_checkpoint::{AffineQuantization, LinearFormat, WeightQuantization};
     use eredu_nn::{
         reference_expand_heads, reference_segmented_attention, EmbeddingLookupPolicy,
-        EmbeddingOperator, EmbeddingSpec, ExpertProjectionSpec, FusedProjectionLayout,
-        FusedProjectionSegment, GatedProductExpertBankSpec, GatedProductExpertLayout,
-        HeadExpansion, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
+        EmbeddingOperator, EmbeddingSpec, FusedProjectionLayout, FusedProjectionSegment,
+        GatedProductGroupLayout, GroupedGatedProductSpec, GroupedNeuralBackend,
+        GroupedProjectionSpec, GroupedRelu2Spec, HeadExpansion, JointGroupSelectionInput,
+        JointGroupSelectionSpec, LinearOperator, LinearSpec, NeuralBackend,
         NormalizationConstructionSpec, NormalizationScale, ParameterSpec, RelativeAttentionInput,
-        Relu2ExpertBankSpec, RoutedNeuralBackend, SegmentedAttentionInput, Tensor,
+        SegmentedAttentionInput, Tensor,
     };
     use safemlx::{
         ops::{quantize_with_mode, QuantizationMode},
@@ -2779,17 +2759,18 @@ mod neutral_semantic_operator_tests {
         }
     }
 
-    fn affine_expert_projection(weight: &str, scales: &str, biases: &str) -> ExpertProjectionSpec {
-        ExpertProjectionSpec {
-            weight: parameter(weight),
-            bias: None,
-            format: eredu_nn::LinearFormatSpec::affine(
+    fn affine_group_projection(weight: &str, scales: &str, biases: &str) -> GroupedProjectionSpec {
+        GroupedProjectionSpec::new(
+            parameter(weight),
+            None,
+            eredu_nn::LinearFormatSpec::affine(
                 LinearFormat::Affine(AffineQuantization::new(32, 4).unwrap()),
                 parameter(scales),
                 parameter(biases),
             )
             .unwrap(),
-        }
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2863,28 +2844,29 @@ mod neutral_semantic_operator_tests {
             .collect()
         );
 
-        let gate = affine_expert_projection(
+        let gate = affine_group_projection(
             "arbitrary.gated.matrix_a",
             "arbitrary.gated.scale_a",
             "arbitrary.gated.affine_a",
         );
-        let down = affine_expert_projection(
+        let down = affine_group_projection(
             "arbitrary.gated.matrix_b",
             "arbitrary.gated.scale_b",
             "arbitrary.gated.affine_b",
         );
-        let gated = <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(
-            GatedProductExpertBankSpec {
-                expert_count: 2,
-                input_dimensions: 32,
-                intermediate_dimensions: 32,
-                output_dimensions: 32,
-                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                layout: GatedProductExpertLayout::Packed {
+        let gated = <MlxNeuralBackend as GroupedNeuralBackend>::grouped_gated_product(
+            GroupedGatedProductSpec::new(
+                2,
+                32,
+                32,
+                32,
+                eredu_nn::GatedProductPolicy::ordinary_silu(),
+                GatedProductGroupLayout::Packed {
                     gate_up: gate,
                     down,
                 },
-            },
+            )
+            .unwrap(),
             stream,
         )
         .unwrap();
@@ -2908,22 +2890,23 @@ mod neutral_semantic_operator_tests {
             .collect()
         );
 
-        let relu = <MlxNeuralBackend as RoutedNeuralBackend>::relu2_expert_bank(
-            Relu2ExpertBankSpec {
-                expert_count: 2,
-                hidden_dimensions: 32,
-                intermediate_dimensions: 32,
-                up: affine_expert_projection(
+        let relu = <MlxNeuralBackend as GroupedNeuralBackend>::grouped_relu2(
+            GroupedRelu2Spec::new(
+                2,
+                32,
+                32,
+                affine_group_projection(
                     "arbitrary.relu.matrix_a",
                     "arbitrary.relu.scale_a",
                     "arbitrary.relu.affine_a",
                 ),
-                down: affine_expert_projection(
+                affine_group_projection(
                     "arbitrary.relu.matrix_b",
                     "arbitrary.relu.scale_b",
                     "arbitrary.relu.affine_b",
                 ),
-            },
+            )
+            .unwrap(),
             stream,
         )
         .unwrap();
@@ -3020,7 +3003,7 @@ mod neutral_semantic_operator_tests {
                 )
                 .unwrap();
                 embedding.inner.weight.value = arrays.weight;
-                embedding.scales.value = arrays.scales;
+                embedding.scales.value = Some(arrays.scales);
                 embedding.biases.value = arrays.biases;
             }
         }
@@ -3341,34 +3324,40 @@ mod neutral_semantic_operator_tests {
     }
 
     #[test]
-    fn joint_routing_selects_with_bias_but_weights_unbiased_logits() {
+    fn joint_group_selection_selects_with_bias_but_weights_unbiased_logits() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
         let hidden = MlxTensor::from_array(Array::from_slice(&[1.0_f32], &[1, 1]));
         let weight = MlxTensor::from_array(Array::from_slice(&[0.0_f32, 1.0, 2.0], &[3, 1]));
         let correction = MlxTensor::from_array(Array::from_slice(&[10.0_f32, 0.0], &[2]));
         let global = MlxTensor::from_array(Array::from_slice(&[0.5_f32], &[1]));
-        let routes = <MlxNeuralBackend as NeuralBackend>::joint_expert_routing(
-            JointExpertRoutingInput {
-                hidden: &hidden,
-                weight: &weight,
-                correction_bias: &correction,
-                global_scale: &global,
-                routed_experts: 2,
-                shared_experts: 1,
-                top_k: 1,
-                route_scale: 2.0,
-            },
+        let selections = <MlxNeuralBackend as GroupedNeuralBackend>::joint_group_selection(
+            JointGroupSelectionInput::new(
+                &hidden,
+                &weight,
+                &correction,
+                &global,
+                JointGroupSelectionSpec::new(2, 1, 1, 2.0).unwrap(),
+            )
+            .unwrap(),
             stream,
         )
         .unwrap();
-        let ids = routes.routed_ids.as_array().evaluated().unwrap();
-        let routed = routes.routed_weights.as_array().evaluated().unwrap();
-        let shared = routes.shared_weights.as_array().evaluated().unwrap();
+        let ids = selections.primary_indices().as_array().evaluated().unwrap();
+        let grouped = selections
+            .primary_coefficients()
+            .as_array()
+            .evaluated()
+            .unwrap();
+        let shared = selections
+            .always_on_coefficients()
+            .as_array()
+            .evaluated()
+            .unwrap();
         assert_eq!(ids.as_slice::<u32>(), &[0]);
         let expected = 0.5 / (0.5 + 1.0 / (1.0 + (-2.0_f32).exp()));
-        assert!((routed.as_slice::<f32>()[0] - expected).abs() < 1e-5);
-        assert!((routed.as_slice::<f32>()[0] + shared.as_slice::<f32>()[0] - 1.0).abs() < 1e-5);
+        assert!((grouped.as_slice::<f32>()[0] - expected).abs() < 1e-5);
+        assert!((grouped.as_slice::<f32>()[0] + shared.as_slice::<f32>()[0] - 1.0).abs() < 1e-5);
     }
 
     #[test]

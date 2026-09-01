@@ -1,11 +1,11 @@
-//! Reusable expert-parallel assignment, routing, and exchange infrastructure.
+//! Architecture-owned expert assignment and routing over generic MLX collectives.
 //!
 //! Pure expert parallelism keeps ordinary model state replicated and partitions
-//! only routed expert banks. [`crate::backend::runtime::distributed::expert::dispatch_replicated`]
+//! only routed expert banks. [`crate::composition::expert_dispatch::dispatch_replicated`]
 //! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
 //! the resulting token buffer. Sharded-token dispatch uses one reusable
-//! [`AllToAllVPlan`](crate::backend::runtime::distributed::expert::AllToAllVPlan)
+//! [`AllToAllVPlan`](crate::composition::expert_dispatch::AllToAllVPlan)
 //! and compact variable-count exchanges in both directions.
 
 use std::{
@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu_nn::TensorParallelExpertOutput;
+use eredu_nn::TensorParallelGroupedOutput;
 use safemlx::{
     ops::{concatenate_axis, indexing::TryIndexOp, r#where, zeros_dtype},
     transforms::{depends, eval},
@@ -23,10 +23,60 @@ use safemlx::{
 use crate::{
     backend::compaction::{compact_indices, count_nonzero},
     backend::error::Error,
-    backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
-    backend::nn::routing::segment_sum_by_index,
+    backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
+    backend::nn::grouping::segment_sum_by_index,
     backend::runtime::distributed::{self as distributed, Group},
 };
+
+impl LocalExpertBank for crate::backend::nn::shared::MlxGroupedRelu2 {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_group_indices: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let ids = local_group_indices.reshape(&[-1, 1], stream)?;
+        let weights = unit_coefficients(hidden.dim(0), hidden.dtype(), stream)?;
+        let routes = eredu_nn::GroupSelection::new(
+            crate::MlxTensor::from_array(ids),
+            crate::MlxTensor::from_array(weights.clone()),
+            crate::MlxTensor::from_array(weights),
+        );
+        eredu_nn::GroupedRelu2Operator::forward_grouped(
+            self,
+            &crate::MlxTensor::from_array(hidden.clone()),
+            &routes,
+            stream,
+        )
+        .map(|value| value.as_array().clone())
+        .map_err(Error::from)
+    }
+}
+
+impl LocalExpertBank for crate::backend::nn::shared::MlxGroupedGatedProduct {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_group_indices: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let ids = local_group_indices.reshape(&[-1, 1], stream)?;
+        let weights = unit_coefficients(hidden.dim(0), hidden.dtype(), stream)?;
+        let routes = eredu_nn::GroupSelection::new(
+            crate::MlxTensor::from_array(ids),
+            crate::MlxTensor::from_array(weights.clone()),
+            crate::MlxTensor::from_array(weights),
+        );
+        eredu_nn::GroupedGatedProductOperator::forward_grouped(
+            self,
+            &crate::MlxTensor::from_array(hidden.clone()),
+            &routes,
+            stream,
+        )
+        .map(|value| value.as_array().clone())
+        .map_err(Error::from)
+    }
+}
 
 thread_local! {
     static EAGER_TIMING_PROFILING: Cell<bool> = const { Cell::new(false) };
@@ -156,7 +206,7 @@ impl ExpertAssignment {
         self.rank
     }
     /// Global expert ids owned by this rank, in owner-local order.
-    pub fn local_global_expert_ids(&self) -> &[usize] {
+    pub fn local_global_group_indices(&self) -> &[usize] {
         &self.local_global
     }
     /// Number of experts owned by this rank.
@@ -330,9 +380,9 @@ pub struct DispatchedRoutes {
     /// Hidden rows in stable original route order.
     pub hidden: Array,
     /// Checkpoint-global expert ids.
-    pub global_expert_ids: Array,
+    pub global_group_indices: Array,
     /// Dense owner-local ids passed to grouped kernels.
-    pub local_expert_ids: Array,
+    pub local_group_indices: Array,
     /// Original flattened route positions.
     pub original_route_indices: Array,
     /// Source token indices.
@@ -360,7 +410,7 @@ pub trait LocalExpertBank {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
-        local_expert_ids: &Array,
+        local_group_indices: &Array,
         stream: &Stream,
     ) -> Result<Array, Error>;
 
@@ -368,61 +418,61 @@ pub trait LocalExpertBank {
     fn execute_local_routes_tensor_parallel(
         &mut self,
         hidden: &Array,
-        local_expert_ids: &Array,
+        local_group_indices: &Array,
         partitions: usize,
         stream: &Stream,
-    ) -> Result<TensorParallelExpertOutput<Array>, Error> {
+    ) -> Result<TensorParallelGroupedOutput<Array>, Error> {
         if partitions == 0 {
             return Err(Error::Parallel(
                 "tensor-parallel partition count must be positive".into(),
             ));
         }
-        Ok(TensorParallelExpertOutput {
-            reducible: self.execute_local_routes(hidden, local_expert_ids, stream)?,
-            post_reduce: None,
-        })
+        Ok(TensorParallelGroupedOutput::new(
+            self.execute_local_routes(hidden, local_group_indices, stream)?,
+            None,
+        ))
     }
 }
 
 /// Creates one unit weight for every routed token.
-pub fn unit_route_weights(routes: i32, dtype: Dtype, stream: &Stream) -> Result<Array, Error> {
+pub fn unit_coefficients(routes: i32, dtype: Dtype, stream: &Stream) -> Result<Array, Error> {
     Ok(safemlx::ops::ones_dtype(&[routes, 1], dtype, stream)?)
 }
 
-impl LocalExpertBank for PackedGatedProductExperts {
+impl LocalExpertBank for PackedGatedProductGroups {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
-        local_expert_ids: &Array,
+        local_group_indices: &Array,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+        let ids = local_group_indices.reshape(&[-1, 1], stream)?;
+        let weights = unit_coefficients(hidden.dim(0), hidden.dtype(), stream)?;
         Ok(self.forward(hidden, &ids, &weights, stream)?)
     }
 
     fn execute_local_routes_tensor_parallel(
         &mut self,
         hidden: &Array,
-        local_expert_ids: &Array,
+        local_group_indices: &Array,
         partitions: usize,
         stream: &Stream,
-    ) -> Result<TensorParallelExpertOutput<Array>, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    ) -> Result<TensorParallelGroupedOutput<Array>, Error> {
+        let ids = local_group_indices.reshape(&[-1, 1], stream)?;
+        let weights = unit_coefficients(hidden.dim(0), hidden.dtype(), stream)?;
         Ok(self.forward_tensor_parallel(hidden, &ids, &weights, partitions, stream)?)
     }
 }
 
-impl LocalExpertBank for PackedRelu2Experts {
+impl LocalExpertBank for PackedRelu2Groups {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
-        local_expert_ids: &Array,
+        local_group_indices: &Array,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+        let ids = local_group_indices.reshape(&[-1, 1], stream)?;
+        let weights = unit_coefficients(hidden.dim(0), hidden.dtype(), stream)?;
         Ok(self.forward(hidden, &ids, &weights, stream)?)
     }
 }
@@ -430,31 +480,31 @@ impl LocalExpertBank for PackedRelu2Experts {
 /// Compacts routes owned by this rank with exactly one scalar synchronization.
 pub fn compact_local_routes(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     stream: &Stream,
 ) -> Result<(DispatchedRoutes, RoutingStatistics), Error> {
-    if expert_ids.ndim() != 2 || weights.shape() != expert_ids.shape() {
+    if group_indices.ndim() != 2 || weights.shape() != group_indices.shape() {
         return Err(Error::Parallel(format!(
             "expert ids and weights must have matching [tokens, top_k] shapes, got {:?} and {:?}",
-            expert_ids.shape(),
+            group_indices.shape(),
             weights.shape()
         )));
     }
-    if hidden_states.ndim() != 2 || hidden_states.dim(0) != expert_ids.dim(0) {
+    if hidden_states.ndim() != 2 || hidden_states.dim(0) != group_indices.dim(0) {
         return Err(Error::Parallel(format!(
             "hidden states must be [tokens, hidden] matching route tokens, got {:?}",
             hidden_states.shape()
         )));
     }
     if !matches!(
-        expert_ids.dtype(),
+        group_indices.dtype(),
         Dtype::Int32 | Dtype::Uint32 | Dtype::Int64 | Dtype::Uint64
     ) {
         return Err(Error::Parallel(format!(
             "expert ids must use an integer dtype, got {:?}",
-            expert_ids.dtype()
+            group_indices.dtype()
         )));
     }
     if !weights.dtype().is_float() || !hidden_states.dtype().is_float() {
@@ -462,7 +512,7 @@ pub fn compact_local_routes(
             "route weights and hidden states must be floating point".into(),
         ));
     }
-    let flat_ids = expert_ids
+    let flat_ids = group_indices
         .reshape(&[-1], stream)?
         .as_dtype(Dtype::Int32, stream)?;
     let valid = flat_ids.ge(Array::from_int(0), stream)?.logical_and(
@@ -514,25 +564,25 @@ pub fn compact_local_routes(
     let positions = compact
         .indices
         .try_index_device(..local_routes as i32, stream)?;
-    let global_expert_ids = flat_ids.take(&positions, stream)?;
-    let local_expert_ids = owner_local.take(&global_expert_ids, stream)?;
-    let top_k = expert_ids.dim(1);
+    let global_group_indices = flat_ids.take(&positions, stream)?;
+    let local_group_indices = owner_local.take(&global_group_indices, stream)?;
+    let top_k = group_indices.dim(1);
     let token_indices = positions.floor_divide(Array::from_int(top_k), stream)?;
     let slot_indices = positions.remainder(Array::from_int(top_k), stream)?;
     let hidden = hidden_states.take_axis(&token_indices, 0, stream)?;
-    let route_weights = weights.reshape(&[-1], stream)?.take(&positions, stream)?;
+    let coefficients = weights.reshape(&[-1], stream)?.take(&positions, stream)?;
     Ok((
         DispatchedRoutes {
             hidden,
-            global_expert_ids,
-            local_expert_ids,
+            global_group_indices,
+            local_group_indices,
             original_route_indices: positions,
             token_indices,
             slot_indices,
-            weights: route_weights,
+            weights: coefficients,
         },
         RoutingStatistics {
-            total_routes: expert_ids.size(),
+            total_routes: group_indices.size(),
             local_routes,
             host_synchronization_count: 1,
             host_synchronization_time: synchronization_time,
@@ -544,7 +594,7 @@ pub fn compact_local_routes(
 /// Executes compact local routes and exactly recombines them across EP ranks.
 pub fn dispatch_replicated(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     bank: &mut impl LocalExpertBank,
@@ -553,13 +603,13 @@ pub fn dispatch_replicated(
 ) -> Result<ReturnedRoutes, Error> {
     dispatch_replicated_with(
         hidden_states,
-        expert_ids,
+        group_indices,
         weights,
         assignment,
         group,
         stream,
         |routes, stream| {
-            bank.execute_local_routes(&routes.hidden, &routes.local_expert_ids, stream)
+            bank.execute_local_routes(&routes.hidden, &routes.local_group_indices, stream)
         },
     )
 }
@@ -567,7 +617,7 @@ pub fn dispatch_replicated(
 /// EP-reduced rank-local TP contribution with replicated bias kept separate.
 pub struct TensorParallelReturnedRoutes {
     /// Tensor-parallel projection contribution and literal post-reduce bias.
-    pub output: TensorParallelExpertOutput<Array>,
+    pub output: TensorParallelGroupedOutput<Array>,
     /// Dispatch counters shared with ordinary expert execution.
     pub statistics: RoutingStatistics,
 }
@@ -576,7 +626,7 @@ pub struct TensorParallelReturnedRoutes {
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_replicated_tensor_parallel(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     bank: &mut impl LocalExpertBank,
@@ -587,7 +637,7 @@ pub fn dispatch_replicated_tensor_parallel(
     let hidden_dimensions = hidden_states.dim(-1);
     let returned = dispatch_replicated_with_output_dimensions(
         hidden_states,
-        expert_ids,
+        group_indices,
         weights,
         assignment,
         group,
@@ -596,19 +646,16 @@ pub fn dispatch_replicated_tensor_parallel(
         |routes, stream| {
             let output = bank.execute_local_routes_tensor_parallel(
                 &routes.hidden,
-                &routes.local_expert_ids,
+                &routes.local_group_indices,
                 partitions,
                 stream,
             )?;
-            let post_reduce = match output.post_reduce {
+            let (reducible, post_reduce) = output.into_parts();
+            let post_reduce = match post_reduce {
                 Some(bias) => bias,
-                None => zeros_dtype(output.reducible.shape(), output.reducible.dtype(), stream)?,
+                None => zeros_dtype(reducible.shape(), reducible.dtype(), stream)?,
             };
-            Ok(concatenate_axis(
-                &[output.reducible, post_reduce],
-                -1,
-                stream,
-            )?)
+            Ok(concatenate_axis(&[reducible, post_reduce], -1, stream)?)
         },
     )?;
     let reducible = returned
@@ -618,10 +665,7 @@ pub fn dispatch_replicated_tensor_parallel(
         .reduced_output
         .try_index_device((.., hidden_dimensions..), stream)?;
     Ok(TensorParallelReturnedRoutes {
-        output: TensorParallelExpertOutput {
-            reducible,
-            post_reduce: Some(post_reduce),
-        },
+        output: TensorParallelGroupedOutput::new(reducible, Some(post_reduce)),
         statistics: returned.statistics,
     })
 }
@@ -630,7 +674,7 @@ pub fn dispatch_replicated_tensor_parallel(
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_local_tensor_parallel(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     bank: &mut impl LocalExpertBank,
@@ -646,7 +690,7 @@ pub fn dispatch_local_tensor_parallel(
     let hidden_dimensions = hidden_states.dim(-1);
     let returned = dispatch_owned_with(
         hidden_states,
-        expert_ids,
+        group_indices,
         weights,
         assignment,
         None,
@@ -655,19 +699,16 @@ pub fn dispatch_local_tensor_parallel(
         |routes, stream| {
             let output = bank.execute_local_routes_tensor_parallel(
                 &routes.hidden,
-                &routes.local_expert_ids,
+                &routes.local_group_indices,
                 partitions,
                 stream,
             )?;
-            let post_reduce = match output.post_reduce {
+            let (reducible, post_reduce) = output.into_parts();
+            let post_reduce = match post_reduce {
                 Some(bias) => bias,
-                None => zeros_dtype(output.reducible.shape(), output.reducible.dtype(), stream)?,
+                None => zeros_dtype(reducible.shape(), reducible.dtype(), stream)?,
             };
-            Ok(concatenate_axis(
-                &[output.reducible, post_reduce],
-                -1,
-                stream,
-            )?)
+            Ok(concatenate_axis(&[reducible, post_reduce], -1, stream)?)
         },
     )?;
     let reducible = returned
@@ -677,10 +718,7 @@ pub fn dispatch_local_tensor_parallel(
         .reduced_output
         .try_index_device((.., hidden_dimensions..), stream)?;
     Ok(TensorParallelReturnedRoutes {
-        output: TensorParallelExpertOutput {
-            reducible,
-            post_reduce: Some(post_reduce),
-        },
+        output: TensorParallelGroupedOutput::new(reducible, Some(post_reduce)),
         statistics: returned.statistics,
     })
 }
@@ -692,7 +730,7 @@ pub fn dispatch_local_tensor_parallel(
 /// without duplicating transport or recombination.
 pub fn dispatch_replicated_with<F>(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     group: &Group,
@@ -704,7 +742,7 @@ where
 {
     dispatch_replicated_with_output_dimensions(
         hidden_states,
-        expert_ids,
+        group_indices,
         weights,
         assignment,
         group,
@@ -717,7 +755,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn dispatch_replicated_with_output_dimensions<F>(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     group: &Group,
@@ -735,7 +773,7 @@ where
     }
     dispatch_owned_with(
         hidden_states,
-        expert_ids,
+        group_indices,
         weights,
         assignment,
         Some(group),
@@ -753,7 +791,7 @@ where
 /// explicit.
 pub fn dispatch_local_with<F>(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     stream: &Stream,
@@ -769,7 +807,7 @@ where
     }
     dispatch_owned_with(
         hidden_states,
-        expert_ids,
+        group_indices,
         weights,
         assignment,
         None,
@@ -782,7 +820,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn dispatch_owned_with<F>(
     hidden_states: &Array,
-    expert_ids: &Array,
+    group_indices: &Array,
     weights: &Array,
     assignment: &ExpertAssignment,
     group: Option<&Group>,
@@ -796,11 +834,11 @@ where
     let total_started = Instant::now();
     let compaction_started = Instant::now();
     let (routes, mut statistics) =
-        compact_local_routes(hidden_states, expert_ids, weights, assignment, stream)?;
+        compact_local_routes(hidden_states, group_indices, weights, assignment, stream)?;
     materialize_timing_phase([
         &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.local_expert_ids,
+        &routes.global_group_indices,
+        &routes.local_group_indices,
         &routes.original_route_indices,
         &routes.token_indices,
         &routes.slot_indices,
@@ -1080,7 +1118,7 @@ pub struct ShardedRouteBlocks {
     /// Hidden activation rows addressed to each expert owner.
     pub hidden: Vec<Array>,
     /// Checkpoint-global expert ids for each row.
-    pub global_expert_ids: Vec<Array>,
+    pub global_group_indices: Vec<Array>,
     /// Original source-rank flattened route indices for each row.
     pub original_route_indices: Vec<Array>,
     /// Route weights for each row, applied exactly once by the owner.
@@ -1106,7 +1144,7 @@ fn validate_sharded_blocks(blocks: &ShardedRouteBlocks, world: usize) -> Result<
         ));
     }
     if blocks.hidden.len() != world
-        || blocks.global_expert_ids.len() != world
+        || blocks.global_group_indices.len() != world
         || blocks.original_route_indices.len() != world
         || blocks.weights.len() != world
     {
@@ -1117,7 +1155,7 @@ fn validate_sharded_blocks(blocks: &ShardedRouteBlocks, world: usize) -> Result<
     for destination in 0..world {
         let rows = blocks.hidden[destination].dim(0);
         if blocks.hidden[destination].ndim() != 2
-            || blocks.global_expert_ids[destination].shape() != [rows]
+            || blocks.global_group_indices[destination].shape() != [rows]
             || blocks.original_route_indices[destination].shape() != [rows]
             || blocks.weights[destination].shape() != [rows]
         {
@@ -1168,7 +1206,7 @@ pub fn dispatch_sharded(
     })?;
     let plan = AllToAllVPlan::new(&send_counts, group, stream)?;
     let hidden = plan.exchange(&compact_blocks(&blocks.hidden, stream)?, group, stream)?;
-    let compact_global_ids = compact_blocks(&blocks.global_expert_ids, stream)?;
+    let compact_global_ids = compact_blocks(&blocks.global_group_indices, stream)?;
     let compact_global_ids = depends([&compact_global_ids], [&hidden.received])?
         .pop()
         .ok_or_else(|| Error::Parallel("all-to-all-v dependency produced no payload".into()))?;
@@ -1332,7 +1370,7 @@ mod tests {
 
         let assignment = ExpertAssignment::from_realization(&plan).unwrap();
         assert_eq!(assignment.global_expert_count(), 5);
-        assert_eq!(assignment.local_global_expert_ids(), [3, 4]);
+        assert_eq!(assignment.local_global_group_indices(), [3, 4]);
         assert_eq!(
             (0..5)
                 .map(|expert| assignment.owner(expert).unwrap())

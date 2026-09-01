@@ -213,9 +213,9 @@ impl<'a> MlxDistributedSession<'a> {
         self.communicators.tensor_group()
     }
 
-    /// Returns the expert-parallel communicator when that axis is partitioned.
-    pub fn expert_group(&self) -> Option<&Group> {
-        self.communicators.expert_group()
+    /// Returns the communicator for an active typed topology axis.
+    pub fn axis_group(&self, axis: ParallelAxis) -> Option<&Group> {
+        self.communicators.group(axis)
     }
 
     /// Returns the pipeline-parallel communicator when that axis is partitioned.

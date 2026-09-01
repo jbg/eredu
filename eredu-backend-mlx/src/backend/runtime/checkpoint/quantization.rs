@@ -172,7 +172,7 @@ impl QuantizedTensor {
 /// Quantizes one floating-point weight using an explicit execution stream.
 ///
 /// The last dimension is grouped and packed. Leading dimensions, including an
-/// expert-bank dimension, are retained. Both on-the-fly model loading and
+/// leading bank dimensions are retained. Both on-the-fly model loading and
 /// checkpoint conversion call this function.
 pub fn quantize_tensor(
     weight: &Array,

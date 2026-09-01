@@ -2,7 +2,7 @@
 
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub mod cache;
-mod compaction;
+pub(crate) mod compaction;
 pub mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
@@ -184,7 +184,7 @@ fn infer_native_device_identity(device: &Device) -> Result<MlxDeviceIdentity, Er
 
 /// Opaque MLX executable selected for one complete model session.
 ///
-/// Replicated, tensor-, pipeline-, and expert-parallel materializations share
+/// Replicated and axis-partitioned materializations share
 /// this type. Architecture-specific rank-local executables are deliberately
 /// not exposed through the public loading API.
 pub struct MlxModel {
@@ -321,14 +321,16 @@ impl MlxModel {
         }
     }
 
-    /// Returns sparse routed-expert cache telemetry when enabled.
-    pub fn expert_cache_report(
+    /// Returns addressable parameter-bank residency telemetry when enabled.
+    pub fn parameter_bank_report(
         &self,
-    ) -> Result<Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>, Error>
-    {
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Error,
+    > {
         match &self.inner {
-            MlxModelKind::Complete(model) => model.expert_cache_report(),
-            MlxModelKind::Pipeline(model) => model.expert_cache_report(),
+            MlxModelKind::Complete(model) => model.parameter_bank_report(),
+            MlxModelKind::Pipeline(model) => model.parameter_bank_report(),
         }
     }
 }

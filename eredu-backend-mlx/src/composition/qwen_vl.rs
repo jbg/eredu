@@ -86,7 +86,7 @@ use crate::backend::{
             layerwise::quantize_parameterized_store,
         },
         media::input,
-        residency::expert_cache::ExpertCache,
+        residency::parameter_bank::AddressableParameterBank,
     },
 };
 
@@ -317,9 +317,9 @@ impl QwenVlPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error>
     {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
@@ -328,7 +328,7 @@ impl QwenVlPipelineBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(
                     plan,
                 )
                 .map(Some)
@@ -345,7 +345,7 @@ impl QwenVlPipelineBindings {
         global_layer: &MlxModule<Unit>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         match (&global_layer.inner, group_kind(architecture, group)) {
             (Unit::Vision(_), eredu_runtime::ArchitectureGroupKind::VisionEncoder) => {
@@ -389,7 +389,7 @@ impl QwenVlPipelineBindings {
                                 store,
                                 architecture.args(),
                                 unit_ordinal(architecture, group, index)?,
-                                assignment.local_global_expert_ids(),
+                                assignment.local_global_group_indices(),
                             )
                             .map_err(Error::ArchitectureModel)?,
                         )?
@@ -450,7 +450,7 @@ pub struct QwenVlModel {
     args: vl::ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
 }
 
 impl QwenVlModel {
@@ -559,16 +559,15 @@ impl QwenVlModel {
         }
     }
 
-    pub fn expert_cache_report(
+    pub fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        Ok(self
-            .expert_cache
+        Ok(self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()?)
     }
 
@@ -578,14 +577,14 @@ impl QwenVlModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.text.clone();
             let result = {
                 let mut provider =
-                    crate::composition::qwen::expert::cached_provider(&expert_cache, &args);
+                    crate::composition::qwen::expert::cached_provider(&parameter_bank, &args);
                 self.forward_with_provider(input, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         let parts = neutral_input_parts(input.parts);
@@ -671,14 +670,14 @@ impl QwenVlModel {
             pixels: crate::composition::tensor_opt(input.pixels),
             mask: crate::composition::tensor_opt(input.mask),
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.text.clone();
                     let mut provider =
-                        crate::composition::qwen::expert::cached_provider(expert_cache, &args);
+                        crate::composition::qwen::expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
                             input, cache, pass, &mut provider, stream, &mut neutral,
@@ -698,7 +697,7 @@ impl QwenVlModel {
                 },
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let logits = result
             .map(crate::MlxTensor::into_array)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -1049,7 +1048,7 @@ pub fn load_gguf(
         weights_stream,
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -1111,12 +1110,12 @@ pub fn load_safetensors_with_residency(
         weights_stream,
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut QwenVlModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -1130,7 +1129,7 @@ fn attach_expert_cache(
         &model.args.text,
         store.as_ref(),
     )?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -1214,6 +1213,6 @@ fn load_store(
         args,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }

@@ -54,7 +54,7 @@ use crate::backend::{
             },
         },
         media::input,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport},
+        residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
     },
 };
 
@@ -188,7 +188,7 @@ pub struct MuseGlimmerModel {
     args: DecoderConfig,
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
 }
 
@@ -452,7 +452,7 @@ impl MuseGlimmerPipelineBindings {
         global_layer: &MuseGlimmerPipelineUnit,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = if group == primary_execution_group(architecture)? {
             eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
@@ -704,10 +704,10 @@ impl MuseGlimmerModel {
         }
     }
 
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Into::into)
     }
@@ -746,10 +746,10 @@ impl MuseGlimmerModel {
             .transpose()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let output_group = self.execution.output_group()?;
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let mut provider =
-                crate::composition::muse_glimmer_expert::cached_provider(&expert_cache, &args);
+                crate::composition::muse_glimmer_expert::cached_provider(&parameter_bank, &args);
             let result = match &mut self.execution {
                 Execution::Resident(runtime) => runtime
                     .forward_with_unit_executor_and_activation_hook(
@@ -822,7 +822,7 @@ impl MuseGlimmerModel {
                 Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
             };
             drop(provider);
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             let (logits, _) =
                 result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let target_states = capture
@@ -930,14 +930,14 @@ impl MuseGlimmerModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.clone();
                     let mut provider = crate::composition::muse_glimmer_expert::cached_provider(
-                        expert_cache,
+                        parameter_bank,
                         &args,
                     );
                     match &mut self.execution {
@@ -980,7 +980,7 @@ impl MuseGlimmerModel {
                 },
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         let logits = result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         eredu_runtime::observe_model_logits(observer, logits.as_array())
             .map(crate::MlxTensor::from_array)
@@ -1250,14 +1250,14 @@ impl MuseGlimmerModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            let output = match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.clone();
                     let mut provider = crate::composition::muse_glimmer_expert::cached_provider(
-                        expert_cache,
+                        parameter_bank,
                         &args,
                     );
                     match &mut self.execution {
@@ -1313,7 +1313,7 @@ impl MuseGlimmerModel {
             .map_err(|error| Error::Parallel(error.to_string()))?;
             eredu_runtime::observe_model_logits(&mut neutral, &output).map_err(Error::from)
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
@@ -1329,10 +1329,10 @@ impl MuseGlimmerModel {
                 "Muse-Glimmer tensor-parallel cache layout mismatch".into(),
             ));
         }
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let mut provider =
-                crate::composition::muse_glimmer_expert::cached_provider(&expert_cache, &args);
+                crate::composition::muse_glimmer_expert::cached_provider(&parameter_bank, &args);
             let result = match &mut self.execution {
                 Execution::ParallelResident(runtime) => runtime
                     .forward_parallel_with_unit_executor(
@@ -1409,14 +1409,14 @@ impl MuseGlimmerModel {
                 ),
                 Execution::Resident(_) | Execution::Bounded(_) => {
                     drop(provider);
-                    self.expert_cache = Some(expert_cache);
+                    self.parameter_bank = Some(parameter_bank);
                     return Err(Error::Parallel(
                         "Muse-Glimmer model was not loaded for tensor parallelism".into(),
                     ));
                 }
             };
             drop(provider);
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result.map_err(|error| Error::Parallel(error.to_string()));
         }
         match &mut self.execution {
@@ -1674,7 +1674,7 @@ fn load_store(
         state_layout,
         args,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: None,
     })
 }
@@ -1846,7 +1846,7 @@ fn load_parallel_store(
         args,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: Some(parallel_info),
     })
 }
@@ -1882,7 +1882,7 @@ pub fn load_gguf_tensor_parallel(
     load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut MuseGlimmerModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -1891,7 +1891,7 @@ fn attach_expert_cache(
     let store = model.checkpoint_store_arc();
     let entries =
         crate::composition::muse_glimmer_expert::expert_catalog(&model.args, store.as_ref())?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -1943,7 +1943,7 @@ pub fn load_safetensors(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -1967,7 +1967,7 @@ pub fn load_gguf(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }

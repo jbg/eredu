@@ -136,6 +136,15 @@ pub enum Executable {
 }
 
 impl Executable {
+    pub(super) fn selected_session_binding(
+        &self,
+    ) -> Option<&super::replicated_text::SelectedSessionBinding> {
+        match self {
+            Self::ReplicatedText(_, executable) => Some(executable.selected_session_binding()),
+            _ => None,
+        }
+    }
+
     pub(super) fn deepseek(
         kind: ModelKind,
         model: Box<crate::composition::deepseek::DeepSeekModel>,
@@ -376,22 +385,26 @@ impl Executable {
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
-    pub fn expert_cache_report(
+    pub fn parameter_bank_report(
         &self,
-    ) -> Result<Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>, Error>
-    {
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Error,
+    > {
         match self {
-            Self::DeepSeek(_, model, _) => model.expert_cache_report(),
-            Self::Gemma4(_, model, _) => model.expert_cache_report(),
-            Self::KimiLinear(_, model, _) => model.expert_cache_report(),
-            Self::GptOss(_, model, _) => model.expert_cache_report(),
-            Self::Inkling(_, model, _) => model.expert_cache_report(),
-            Self::Lfm2(_, model, _) => model.expert_cache_report(),
-            Self::NemotronH(_, model, _) => model.expert_cache_report(),
-            Self::Qwen(_, model, _) => model.expert_cache_report(),
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => model.expert_cache_report(),
-            Self::Qwen3VlMoe(_, model, _) => model.expert_cache_report(),
-            Self::MuseGlimmer(_, model, _) => model.expert_cache_report(),
+            Self::DeepSeek(_, model, _) => model.parameter_bank_report(),
+            Self::Gemma4(_, model, _) => model.parameter_bank_report(),
+            Self::KimiLinear(_, model, _) => model.parameter_bank_report(),
+            Self::GptOss(_, model, _) => model.parameter_bank_report(),
+            Self::Inkling(_, model, _) => model.parameter_bank_report(),
+            Self::Lfm2(_, model, _) => model.parameter_bank_report(),
+            Self::NemotronH(_, model, _) => model.parameter_bank_report(),
+            Self::Qwen(_, model, _) => model.parameter_bank_report(),
+            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
+                model.parameter_bank_report()
+            }
+            Self::Qwen3VlMoe(_, model, _) => model.parameter_bank_report(),
+            Self::MuseGlimmer(_, model, _) => model.parameter_bank_report(),
             Self::PartitionedLlama(_, _, _)
             | Self::ReplicatedText(_, _)
             | Self::Qwen3Vl(_, _, _) => Ok(None),

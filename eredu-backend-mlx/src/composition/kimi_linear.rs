@@ -11,6 +11,8 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
+use crate::composition::grouped_provider::*;
+
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
@@ -40,9 +42,8 @@ use crate::backend::{
             layerwise::{quantize_parameterized_store, shard_layer_bindings},
         },
         media::input,
-        residency::expert_cache::ExpertCatalogEntry,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport},
-        residency::expert_provider::CachedGatedProductExpertProvider,
+        residency::parameter_bank::ParameterBankEntry,
+        residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
     },
 };
 use eredu_core::cache::{
@@ -177,9 +178,9 @@ impl KimiLinearBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
                 "Kimi Linear has no architecture expert realization".into(),
@@ -187,10 +188,8 @@ impl KimiLinearBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
-                    plan,
-                )
-                .map(Some)
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
+                    .map(Some)
             }
         }
     }
@@ -204,7 +203,7 @@ impl KimiLinearBindings {
         global_layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
@@ -278,17 +277,17 @@ fn unit_recipes(
 pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
+) -> Result<Vec<ParameterBankEntry>, Error> {
     let catalog = eredu_architectures::kimi_linear::expert_residency_catalog(store, args)
         .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 
 const fn cached_provider<'a>(
-    cache: &'a ExpertCache,
+    cache: &'a AddressableParameterBank,
     _args: &ModelArgs,
-) -> CachedGatedProductExpertProvider<'a> {
-    CachedGatedProductExpertProvider::new(cache)
+) -> CachedGatedProductGroupProvider<'a> {
+    CachedGatedProductGroupProvider::new(cache)
 }
 
 fn load_neutral(
@@ -356,7 +355,7 @@ fn load_neutral(
         args,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: None,
         parallel_rank: None,
     })
@@ -513,7 +512,7 @@ fn load_neutral_parallel(
         args,
         state_layout,
         execution,
-        expert_cache: None,
+        parameter_bank: None,
         parallel_info: Some(info),
         parallel_rank: rank,
     })
@@ -582,7 +581,7 @@ pub struct KimiLinearModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     execution: KimiLinearExecution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
 }
@@ -647,10 +646,10 @@ impl KimiLinearModel {
     }
 
     /// Returns independent expert-cache telemetry when enabled.
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Into::into)
     }
@@ -773,13 +772,13 @@ impl KimiLinearModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider = cached_provider(&expert_cache, &args);
+                let mut provider = cached_provider(&parameter_bank, &args);
                 self.forward_with_provider(tokens, None, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         let input = eredu_architectures::decoder::LayeredInput {
@@ -873,13 +872,13 @@ impl KimiLinearModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-            match expert_cache.as_ref() {
-                Some(expert_cache) => {
+            match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
                     let args = self.args.clone();
-                    let mut provider = cached_provider(expert_cache, &args);
+                    let mut provider = cached_provider(parameter_bank, &args);
                     self.forward_observed_with_provider(
                         tokens,
                         mask,
@@ -902,7 +901,7 @@ impl KimiLinearModel {
                 }
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
@@ -1089,7 +1088,7 @@ pub fn load_kimi_linear_model(
             expert_options.is_some(),
         )?;
         if let Some(expert_options) = expert_options {
-            attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+            attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
         }
         return Ok(model);
     }
@@ -1102,12 +1101,12 @@ pub fn load_kimi_linear_model(
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {
-        attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
     Ok(model)
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut KimiLinearModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -1115,7 +1114,7 @@ fn attach_expert_cache(
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
     let entries = expert_catalog(&model.args, store.as_ref())?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -1205,7 +1204,7 @@ pub(crate) fn load_kimi_linear_gguf_model(
         expert_options.is_some(),
     )?;
     if let Some(expert_options) = expert_options {
-        attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
     Ok(model)
 }

@@ -2,9 +2,9 @@
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
-    Error, GatedProductExpertBankSpec, GatedProductExpertLayout, GatedProductPolicy,
-    LinearOperator, LinearSpec, ParameterSpec, Parameterized, RoutedNeuralBackend, RoutingOperator,
-    RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, GatedProductGroupLayout, GatedProductPolicy, GroupScoring, GroupSelectionOperator,
+    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec, ParameterSpec,
+    Parameterized, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
@@ -23,7 +23,7 @@ pub struct MoePolicy {
     pub routes_per_token: i32,
     pub expert_width: i32,
     pub shared_width: i32,
-    pub scoring: RoutingScoring,
+    pub scoring: GroupScoring,
     pub normalize_routes: bool,
     pub normalization_epsilon: f32,
     pub routed_scaling: f32,
@@ -56,13 +56,13 @@ pub enum RouteSource<'a, T> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 #[allow(missing_docs)]
-pub struct RoutedPlusShared<B: RoutedNeuralBackend> {
+pub struct RoutedPlusShared<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     #[parameter(skip)]
     expert_count: i32,
-    pub router: B::Router,
-    pub experts: B::GatedProductExpertBank,
+    pub router: B::Selector,
+    pub experts: B::GatedProductGroups,
     shared_gate: B::Linear,
     shared_up: B::Linear,
     shared_down: B::Linear,
@@ -71,12 +71,12 @@ pub struct RoutedPlusShared<B: RoutedNeuralBackend> {
 }
 
 #[allow(missing_docs)]
-impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
+impl<B: GroupedNeuralBackend> RoutedPlusShared<B> {
     pub fn new(
         policy: &MoePolicy,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let routing = TopKRoutingSpec::new(
+        let routing = TopKGroupSelectionSpec::new(
             policy.expert_count,
             policy.routes_per_token,
             policy.scoring,
@@ -84,27 +84,25 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
         )?
         .with_groups(policy.expert_groups, policy.selected_groups)?
         .with_weight_policy(policy.normalization_epsilon, policy.routed_scaling)?;
-        let router = B::top_k_router(
-            TopKRouterSpec {
-                input_dimensions: policy.hidden,
-                weight: parameter(&policy.router_weight)?,
-                bias: None,
-                correction_bias: policy
-                    .correction_bias
-                    .as_deref()
-                    .map(parameter)
-                    .transpose()?,
-                input_transform: None,
-                route_scale: None,
-                format: crate::linear_format::standard_linear_format(
-                    &policy.router_weight,
-                    eredu_checkpoint::LinearFormat::Dense,
-                )?,
-                routing,
-            },
-            context,
+        let mut selector = TopKGroupSelectorSpec::new(
+            policy.hidden,
+            parameter(&policy.router_weight)?,
+            crate::linear_format::standard_linear_format(
+                &policy.router_weight,
+                eredu_checkpoint::LinearFormat::Dense,
+            )?,
+            routing,
         )?;
-        let experts = B::gated_product_expert_bank(expert_bank_spec(policy)?, context)?;
+        if let Some(correction_bias) = policy
+            .correction_bias
+            .as_deref()
+            .map(parameter)
+            .transpose()?
+        {
+            selector = selector.with_correction_bias(correction_bias)?;
+        }
+        let router = B::top_k_group_selector(selector, context)?;
+        let experts = B::grouped_gated_product(expert_bank_spec(policy)?, context)?;
         let shared = |weight: &str, input, output, format| {
             B::linear(
                 LinearSpec {
@@ -193,11 +191,11 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
         let routes = match source {
-            RouteSource::Learned => self.router.route(input, context)?,
-            RouteSource::Selected(ids) => self.router.route_selected(input, ids, context)?,
+            RouteSource::Learned => self.router.select(input, context)?,
+            RouteSource::Selected(ids) => self.router.select_indices(input, ids, context)?,
         };
         let routed = provider
-            .forward_routed_tensor_parallel(
+            .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -217,10 +215,10 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
             eredu_runtime::RoutedExpertTensorParallelOutput::Complete(routed) => {
                 routed.add(&reduce(shared, context)?, context)
             }
-            eredu_runtime::RoutedExpertTensorParallelOutput::Partial(mut routed) => {
-                routed.reducible = routed.reducible.add(&shared, context)?;
-                let reduced = reduce(routed.reducible, context)?;
-                match routed.post_reduce {
+            eredu_runtime::RoutedExpertTensorParallelOutput::Partial(routed) => {
+                let (reducible, post_reduce) = routed.into_parts();
+                let reduced = reduce(reducible.add(&shared, context)?, context)?;
+                match post_reduce {
                     Some(bias) => reduced.add(&bias, context),
                     None => Ok(reduced),
                 }
@@ -247,11 +245,11 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let routes = match source {
-            RouteSource::Learned => self.router.route(input, context)?,
-            RouteSource::Selected(ids) => self.router.route_selected(input, ids, context)?,
+            RouteSource::Learned => self.router.select(input, context)?,
+            RouteSource::Selected(ids) => self.router.select_indices(input, ids, context)?,
         };
         let routed = provider
-            .forward_routed(
+            .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -269,9 +267,9 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(RoutingObservation {
             path,
-            selected_experts: &routes.expert_ids,
-            selected_scores: &routes.selected_scores,
-            route_weights: &routes.route_weights,
+            selected_experts: routes.group_indices(),
+            selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(),
             routed_output: &routed,
             local_routed_output: None,
             reduced_routed_output: None,
@@ -284,14 +282,14 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
 }
 
 /// Returns the architecture-owned routed expert specification for one policy.
-pub fn expert_bank_spec(policy: &MoePolicy) -> Result<GatedProductExpertBankSpec, Error> {
-    Ok(GatedProductExpertBankSpec {
-        expert_count: policy.expert_count,
-        input_dimensions: policy.hidden,
-        intermediate_dimensions: policy.expert_width,
-        output_dimensions: policy.hidden,
-        policy: policy.limit.unwrap_or_default(),
-        layout: GatedProductExpertLayout::Packed {
+pub fn expert_bank_spec(policy: &MoePolicy) -> Result<GroupedGatedProductSpec, Error> {
+    GroupedGatedProductSpec::new(
+        policy.expert_count,
+        policy.hidden,
+        policy.expert_width,
+        policy.hidden,
+        policy.limit.unwrap_or_default(),
+        GatedProductGroupLayout::Packed {
             gate_up: standard_expert_projection(
                 &policy.expert_gate_up,
                 None,
@@ -299,7 +297,7 @@ pub fn expert_bank_spec(policy: &MoePolicy) -> Result<GatedProductExpertBankSpec
             )?,
             down: standard_expert_projection(&policy.expert_down, None, policy.expert_down_format)?,
         },
-    })
+    )
 }
 
 fn parameter(name: &str) -> Result<ParameterSpec, Error> {

@@ -18,7 +18,7 @@ pub struct ExpertRealizationPlan<S> {
     expert_parallel_size: usize,
     expert_parallel_rank: usize,
     owners: Vec<usize>,
-    local_global_expert_ids: Vec<usize>,
+    local_global_group_indices: Vec<usize>,
     unit_specs: BTreeMap<(ExecutionGroupId, usize), S>,
 }
 
@@ -58,7 +58,7 @@ impl<S> ExpertRealizationPlan<S> {
             expert_parallel_size: topology.expert_parallel_size,
             expert_parallel_rank: topology.expert_parallel_rank,
             owners,
-            local_global_expert_ids: local.collect(),
+            local_global_group_indices: local.collect(),
             unit_specs,
         })
     }
@@ -84,8 +84,8 @@ impl<S> ExpertRealizationPlan<S> {
     }
 
     /// Returns this rank's global expert identities in owner-local order.
-    pub fn local_global_expert_ids(&self) -> &[usize] {
-        &self.local_global_expert_ids
+    pub fn local_global_group_indices(&self) -> &[usize] {
+        &self.local_global_group_indices
     }
 
     /// Returns the exact rank-local bank specification for an execution unit.
@@ -142,14 +142,14 @@ pub(crate) fn select_rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     global_experts: usize,
     expert_axis: usize,
-    expert_ids: &[usize],
+    group_indices: &[usize],
     outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    if expert_ids.is_empty() {
+    if group_indices.is_empty() {
         return Err("rank-local expert recipes require at least one expert".into());
     }
     let mut unique = BTreeSet::new();
-    for &expert in expert_ids {
+    for &expert in group_indices {
         if expert >= global_experts {
             return Err(format!(
                 "rank-local expert {expert} is outside {global_experts} experts"
@@ -163,7 +163,7 @@ pub(crate) fn select_rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     }
     let selection = TensorSelection::Indices {
         axis: expert_axis,
-        indices: expert_ids.to_vec(),
+        indices: group_indices.to_vec(),
     };
     outputs
         .into_iter()
@@ -562,9 +562,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(plans[0].owners(), [0, 0, 0, 1, 1, 1, 2, 2]);
-        assert_eq!(plans[0].local_global_expert_ids(), [0, 1, 2]);
-        assert_eq!(plans[1].local_global_expert_ids(), [3, 4, 5]);
-        assert_eq!(plans[2].local_global_expert_ids(), [6, 7]);
+        assert_eq!(plans[0].local_global_group_indices(), [0, 1, 2]);
+        assert_eq!(plans[1].local_global_group_indices(), [3, 4, 5]);
+        assert_eq!(plans[2].local_global_group_indices(), [6, 7]);
         assert_eq!(
             plans[2].unit_spec("text_decoder", 4).map(String::as_str),
             Some("rank-2-bank")

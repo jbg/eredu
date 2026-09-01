@@ -2,10 +2,10 @@
 //! execution.
 
 use eredu_nn::{
-    BlockwiseAttentionBackend, CompressedAttentionCache, Error, HyperHead, HyperHeadSpec,
-    HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, PoolingAttentionCache,
-    RoutedNeuralBackend, Tensor,
+    BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend, HyperHead,
+    HyperHeadSpec, HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
+    PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider};
 
@@ -138,7 +138,7 @@ pub struct PredictionOutput<T> {
 /// One V3/R1 embedded prediction layer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct V3PredictionLayer<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
+pub struct V3PredictionLayer<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
     embedding_norm: B::Normalization,
     hidden_norm: B::Normalization,
     fusion: B::Linear,
@@ -147,7 +147,7 @@ pub struct V3PredictionLayer<B: RoutedNeuralBackend + BlockwiseAttentionBackend>
     output_head: B::Linear,
 }
 
-impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
+impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
     /// Builds one unloaded V3 prediction depth.
     pub fn new(
         args: &V3Args,
@@ -339,7 +339,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct V4PredictionLayer<B>
 where
-    B: HyperNeuralBackend + RoutedNeuralBackend,
+    B: HyperNeuralBackend + GroupedNeuralBackend,
 {
     embedding_projection: B::Linear,
     hidden_projection: B::Linear,
@@ -352,7 +352,7 @@ where
 
 impl<B> V4PredictionLayer<B>
 where
-    B: HyperNeuralBackend + RoutedNeuralBackend,
+    B: HyperNeuralBackend + GroupedNeuralBackend,
 {
     /// Builds one unloaded V4 prediction depth.
     pub fn new(

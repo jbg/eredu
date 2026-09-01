@@ -1,6 +1,6 @@
 //! Semantic tensor-parallel placement for Qwen decoder blocks.
 
-use eredu_nn::{NeuralBackend, RoutedNeuralBackend};
+use eredu_nn::{GroupedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
@@ -118,7 +118,7 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
 }
 
 /// Declares every rank-local placement group for a dynamically dense-or-routed Qwen block.
-pub fn routed_layer_parallel_parameter_groups<B: RoutedNeuralBackend>(
+pub fn routed_layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
     block: &RoutedTransformerBlock<B>,
     args: &ModelArgs,
     layer: usize,

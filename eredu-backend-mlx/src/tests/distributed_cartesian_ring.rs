@@ -7,11 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::backend::{
-    runtime::distributed::expert::{AllToAllVPlan, RoutedTransport},
-    DeviceAssignment, MlxParallelContext,
-};
 use crate::MlxTensor;
+use crate::{
+    backend::{DeviceAssignment, MlxParallelContext},
+    composition::expert_dispatch::{AllToAllVPlan, RoutedTransport},
+};
 use eredu_core::{CollectiveScope, DistributedSession};
 use safemlx::{
     distributed::{self, Backend},

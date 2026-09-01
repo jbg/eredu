@@ -156,7 +156,7 @@ impl CompleteTensorParallelBinding {
 
 /// Family binding consumed by independent expert-cache materialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExpertCacheBinding {
+pub(crate) enum AddressableParameterBankBinding {
     DeepSeek,
     Gemma4,
     GptOss,
@@ -171,7 +171,7 @@ pub(crate) enum ExpertCacheBinding {
     Qwen35,
 }
 
-impl ExpertCacheBinding {
+impl AddressableParameterBankBinding {
     pub(crate) const fn for_kind(kind: ModelKind) -> Option<Self> {
         Some(match kind {
             ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Self::DeepSeek,

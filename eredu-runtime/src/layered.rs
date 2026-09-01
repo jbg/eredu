@@ -910,7 +910,7 @@ where
 /// architecture retains attention, residual, routing, and unit semantics.
 pub trait RoutedLayeredArchitecture<B, S>: LayeredArchitecture<B, S>
 where
-    B: eredu_nn::RoutedNeuralBackend,
+    B: eredu_nn::GroupedNeuralBackend,
     S: RuntimeState<B>,
 {
     /// Returns the architecture-owned routing observation point for one unit.
@@ -949,7 +949,7 @@ where
 pub trait ParallelRoutedLayeredArchitecture<B, S>:
     RoutedLayeredArchitecture<B, S> + ParallelLayeredArchitecture<B, S>
 where
-    B: eredu_nn::RoutedNeuralBackend,
+    B: eredu_nn::GroupedNeuralBackend,
     S: RuntimeState<B>,
 {
     /// Executes one tensor-parallel unit through a runtime-supplied provider.
@@ -1574,7 +1574,7 @@ where
         observer: &mut Observer,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
     where
-        B: eredu_nn::RoutedNeuralBackend,
+        B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
         A::Error: std::fmt::Display,
         Provider: RoutedExpertProvider<B>,
@@ -2087,7 +2087,7 @@ where
         observer: &mut Observer,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
     where
-        B: eredu_nn::RoutedNeuralBackend,
+        B: eredu_nn::GroupedNeuralBackend,
         A: ParallelRoutedLayeredArchitecture<B, S>,
         Provider: RoutedExpertProvider<B>,
         Provider::Error: std::fmt::Display,

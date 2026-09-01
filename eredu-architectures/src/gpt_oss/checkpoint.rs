@@ -403,14 +403,18 @@ pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &ModelArgs,
     layer: usize,
-    expert_ids: &[usize],
+    group_indices: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
     let experts = dimension(args.num_local_experts, "expert count")?;
     let outputs = expert_recipes(catalog, args, layer)?
         .into_outputs()
         .into_outputs();
     crate::expert_residency::select_rank_local_expert_recipes(
-        catalog, experts, 0, expert_ids, outputs,
+        catalog,
+        experts,
+        0,
+        group_indices,
+        outputs,
     )
 }
 

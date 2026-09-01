@@ -9,7 +9,7 @@ use std::{
 use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_nn::{
-    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
+    GroupedNeuralBackend, ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
 };
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
@@ -46,8 +46,10 @@ use crate::backend::{
             layerwise::{quantize_parameterized_store, shard_layer_bindings},
         },
         media::input,
-        residency::expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry},
         residency::manager::ResidentUnitLease,
+        residency::parameter_bank::{
+            AddressableParameterBank, ParameterBankEntry, ParameterBankResidencyReport,
+        },
     },
 };
 use eredu_core::cache::{
@@ -317,7 +319,7 @@ pub fn load_neutral_with_store(
         planned_external_experts: None,
         prompt_cache_topology: PromptCacheTopology::default(),
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }
 
@@ -487,7 +489,7 @@ fn load_neutral_parallel_with_store(
         planned_external_experts,
         prompt_cache_topology: crate::backend::cache::prompt_cache_topology(build.topology()),
         execution,
-        expert_cache: None,
+        parameter_bank: None,
     })
 }
 
@@ -602,9 +604,9 @@ impl GptOssPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
                 "GPT-OSS has no architecture expert realization".into(),
@@ -612,10 +614,8 @@ impl GptOssPipelineBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::backend::runtime::distributed::expert::ExpertAssignment::from_realization(
-                    plan,
-                )
-                .map(Some)
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
+                    .map(Some)
             }
         }
     }
@@ -626,16 +626,16 @@ impl GptOssPipelineBindings {
         index: usize,
         layer: &mut MlxModule<NeutralBlock>,
         realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GatedProductExpertBankSpec>,
+            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<(), Error> {
         if let Some(assignment) = assignment {
             let plan = realization.ok_or_else(|| {
                 Error::Parallel("GPT-OSS expert assignment has no architecture realization".into())
             })?;
-            if assignment.local_global_expert_ids() != plan.local_global_expert_ids() {
+            if assignment.local_global_group_indices() != plan.local_global_group_indices() {
                 return Err(Error::Parallel(
                     "GPT-OSS native assignment disagrees with architecture realization".into(),
                 ));
@@ -649,7 +649,7 @@ impl GptOssPipelineBindings {
                     ))
                 })?;
             layer.inner.mlp.experts =
-                <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(spec, stream)
+                <MlxNeuralBackend as GroupedNeuralBackend>::grouped_gated_product(spec, stream)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
         }
         Ok(())
@@ -663,7 +663,7 @@ impl GptOssPipelineBindings {
         index: usize,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
@@ -702,7 +702,7 @@ impl GptOssPipelineBindings {
                     store,
                     architecture.args(),
                     index,
-                    assignment.local_global_expert_ids(),
+                    assignment.local_global_group_indices(),
                 )
                 .map_err(Error::ArchitectureModel)?,
             )?,
@@ -752,10 +752,10 @@ pub struct GptOssModel {
     state_layout: eredu_runtime::StateLayout,
     parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
-    planned_external_experts: Option<Vec<ExpertCatalogEntry>>,
+    planned_external_experts: Option<Vec<ParameterBankEntry>>,
     prompt_cache_topology: PromptCacheTopology,
     execution: GptOssExecution,
-    expert_cache: Option<ExpertCache>,
+    parameter_bank: Option<AddressableParameterBank>,
 }
 
 impl GptOssModel {
@@ -769,7 +769,7 @@ impl GptOssModel {
     }
 
     /// Builds expert-cache units with this rank's exact TP selections.
-    pub fn external_expert_catalog(&self) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    pub fn external_expert_catalog(&self) -> Result<Vec<ParameterBankEntry>, Error> {
         self.planned_external_experts.clone().map_or_else(
             || expert::expert_catalog(&self.args, self.checkpoint_store(), None),
             Ok,
@@ -803,10 +803,10 @@ impl GptOssModel {
     }
 
     /// Returns independent expert-cache telemetry when configured.
-    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.expert_cache
+    pub fn parameter_bank_report(&self) -> Result<Option<ParameterBankResidencyReport>, Error> {
+        self.parameter_bank
             .as_ref()
-            .map(ExpertCache::report)
+            .map(AddressableParameterBank::report)
             .transpose()
             .map_err(Error::from)
     }
@@ -928,13 +928,13 @@ impl GptOssModel {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider = expert::cached_provider(&expert_cache, &args);
-                self.forward_with_expert_provider(inputs, None, cache, &mut provider, stream)
+                let mut provider = expert::cached_provider(&parameter_bank, &args);
+                self.forward_with_grouped_provider(inputs, None, cache, &mut provider, stream)
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         self.validate_cache(cache)?;
@@ -958,7 +958,7 @@ impl GptOssModel {
     }
 
     /// Runs the neutral decoder with runtime-owned expert residency.
-    pub fn forward_with_expert_provider<P>(
+    pub fn forward_with_grouped_provider<P>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -1028,11 +1028,11 @@ impl GptOssModel {
         group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        if let Some(expert_cache) = self.expert_cache.take() {
+        if let Some(parameter_bank) = self.parameter_bank.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider = expert::cached_provider(&expert_cache, &args);
-                self.forward_tensor_expert_provider(
+                let mut provider = expert::cached_provider(&parameter_bank, &args);
+                self.forward_tensor_grouped_provider(
                     inputs,
                     None,
                     cache,
@@ -1041,7 +1041,7 @@ impl GptOssModel {
                     stream,
                 )
             };
-            self.expert_cache = Some(expert_cache);
+            self.parameter_bank = Some(parameter_bank);
             return result;
         }
         self.validate_cache(cache)?;
@@ -1073,7 +1073,7 @@ impl GptOssModel {
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
         let args = self.args.clone();
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let result = {
             let input = eredu_architectures::gpt_oss::LayeredInput {
                 tokens: crate::composition::tensor_ref(inputs),
@@ -1085,9 +1085,9 @@ impl GptOssModel {
                 eredu_runtime::ExpertPass::Decode
             };
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match expert_cache.as_ref() {
-                Some(expert_cache) => {
-                    let mut provider = expert::cached_provider(expert_cache, &args);
+            let output = match parameter_bank.as_ref() {
+                Some(parameter_bank) => {
+                    let mut provider = expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         GptOssExecution::TensorParallelResident(runtime) => runtime
                             .forward_parallel_with_provider_and_observer(
@@ -1152,12 +1152,12 @@ impl GptOssModel {
                 .map(crate::MlxTensor::into_array)
                 .map_err(Error::from)
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
     /// Runs tensor-parallel attention and provider-owned routed experts.
-    pub fn forward_tensor_expert_provider<P>(
+    pub fn forward_tensor_grouped_provider<P>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -1230,12 +1230,12 @@ impl GptOssModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
-        let expert_cache = self.expert_cache.take();
+        let parameter_bank = self.parameter_bank.take();
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-        let result = match expert_cache.as_ref() {
-            Some(expert_cache) => {
+        let result = match parameter_bank.as_ref() {
+            Some(parameter_bank) => {
                 let args = self.args.clone();
-                let mut provider = expert::cached_provider(expert_cache, &args);
+                let mut provider = expert::cached_provider(parameter_bank, &args);
                 self.forward_observed_with_provider(
                     inputs,
                     mask,
@@ -1257,7 +1257,7 @@ impl GptOssModel {
                 )
             }
         };
-        self.expert_cache = expert_cache;
+        self.parameter_bank = parameter_bank;
         result
     }
 
@@ -1391,7 +1391,7 @@ impl CausalModel<Cache> for GptOssModel {
     }
 }
 
-fn attach_expert_cache(
+fn attach_parameter_bank(
     model: &mut GptOssModel,
     options: eredu_runtime::ExpertCacheLoadOptions,
     stream: &Stream,
@@ -1399,7 +1399,7 @@ fn attach_expert_cache(
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
     let entries = model.external_expert_catalog()?;
-    model.expert_cache = Some(ExpertCache::new_shared(
+    model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
         options,
@@ -1450,7 +1450,7 @@ pub fn load_safetensors(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
@@ -1537,7 +1537,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
         expert_options.is_some(),
     )?;
     if let Some(options) = expert_options {
-        attach_expert_cache(&mut model, options, stream, weights_stream)?;
+        attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
     Ok(model)
 }
