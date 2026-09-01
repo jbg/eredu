@@ -2847,7 +2847,8 @@ impl NeuralOperatorCapabilities {
         self.0 & required.0 == required.0
     }
 
-    fn missing_names(self, required: Self) -> Vec<&'static str> {
+    /// Returns stable names for every required capability absent from this set.
+    pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
             (
                 NeuralOperatorCapabilities::GELU_APPROXIMATE,
@@ -2983,7 +2984,7 @@ mod neural_operator_capability_tests {
             (C::MASKED_OUTPUT_PROJECTION, "masked_output_projection"),
         ] {
             assert!(C::ALL.contains(capability));
-            assert_eq!(C::NONE.missing_names(capability), [name]);
+            assert_eq!(C::NONE.missing_capability_names(capability), [name]);
         }
     }
 }
@@ -3021,7 +3022,7 @@ pub trait NeuralBackend: Sized + 'static {
         }
         Err(Error::backend(format!(
             "{architecture} requires unsupported backend operators: {}",
-            available.missing_names(required).join(", ")
+            available.missing_capability_names(required).join(", ")
         )))
     }
 

@@ -98,7 +98,8 @@ impl Executable {
             Self::DeepSeek(_, _, _)
             | Self::GptOss(_, _, _)
             | Self::KimiLinear(_, _, _)
-            | Self::Llama(_, _, _)
+            | Self::PartitionedLlama(_, _, _)
+            | Self::ReplicatedText(_, _)
             | Self::Lfm2(_, _, _)
             | Self::NemotronH(_, _, _)
             | Self::Qwen(_, _, _) => media_plan::text_only_input_part(
@@ -122,7 +123,8 @@ impl Executable {
                     capability::deepseek_v4(model.v4_args().expect("DeepSeek family"))
                 }
             }
-            Self::Llama(_, model, _) => capability::llama(model.args()),
+            Self::PartitionedLlama(_, model, _) => capability::llama(model.args()),
+            Self::ReplicatedText(_, model) => Ok(model.capability_estimate().clone()),
             Self::Qwen(_, model, _) => capability::qwen(model.args()),
             Self::MuseGlimmer(_, model, _) => capability::muse_glimmer(model.args()),
             Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {

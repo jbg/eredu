@@ -1948,7 +1948,7 @@ pub fn static_parallel_parameter_groups<B: NeuralBackend>(
 }
 
 /// Pinned modules shared by resident and bounded-residency execution.
-#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[derive(Debug, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct StaticModules<B: NeuralBackend> {
     /// Token embedding table.
@@ -1957,6 +1957,16 @@ pub struct StaticModules<B: NeuralBackend> {
     pub norm: B::Normalization,
     /// Optional untied vocabulary projection.
     pub lm_head: Option<B::Linear>,
+}
+
+impl<B: NeuralBackend> Clone for StaticModules<B> {
+    fn clone(&self) -> Self {
+        Self {
+            embeddings: self.embeddings.clone(),
+            norm: self.norm.clone(),
+            lm_head: self.lm_head.clone(),
+        }
+    }
 }
 
 /// Architecture-supplied identities and geometry for the shared pinned text
@@ -3214,6 +3224,19 @@ where
         _index: usize,
     ) -> Self::RetainedContextValues<'a> {
         forward.mask.iter()
+    }
+}
+
+impl<B, C, P, S> eredu_runtime::ReplicatedTextArchitecture<B, S> for LayeredModel<B, C, P>
+where
+    B: NeuralBackend,
+    C: Config,
+    P: BlockFactory<B, C>,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
+        LayeredInput { tokens, mask }
     }
 }
 

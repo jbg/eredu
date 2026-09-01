@@ -162,9 +162,6 @@ fn qwen_unit_recipes(
     args: &ModelArgs,
     layer: usize,
 ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, Error> {
-    if !args.is_moe() {
-        return Ok(BTreeMap::new());
-    }
     let resolved = eredu_architectures::qwen::expert_recipes(store, args, layer)
         .map_err(Error::ArchitectureModel)?;
     Ok(BTreeMap::from([
@@ -972,6 +969,11 @@ pub fn load_safetensors(
         ));
     };
     let args = args.clone();
+    if !args.is_moe() {
+        return Err(Error::ArchitectureModel(
+            "ordinary replicated Qwen must use replicated text composition".into(),
+        ));
+    }
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen", args.weight_quantization(), requested)
@@ -1303,6 +1305,11 @@ pub(crate) fn load_qwen_gguf_model(
             residency.max_cached_shards(),
         )?);
     let args = prepared.args;
+    if !args.is_moe() {
+        return Err(Error::ArchitectureModel(
+            "ordinary replicated Qwen must use replicated text composition".into(),
+        ));
+    }
     let expert_options = residency.expert_cache();
     let execution_options = residency.layers();
     let model = if let Some(quantization) = quantization {

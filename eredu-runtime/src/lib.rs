@@ -37,6 +37,8 @@ pub mod partition;
 pub mod prefetch;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
 pub mod realtime;
+/// Selection contracts for replicated text architectures.
+pub mod replicated_text;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
 /// Backend-neutral speculative request lifecycle and fair scheduling.
@@ -135,6 +137,13 @@ pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{
     RealtimeCompletionAttachmentError, RealtimeGenerationBranch, RealtimeGenerationState,
     RealtimeGenerationTransactionError,
+};
+pub use replicated_text::{
+    select_replicated_text_realization, ParameterTransformTarget, ReplicatedTextArchitecture,
+    ReplicatedTextBackendCapabilities, ReplicatedTextParameterRequirement,
+    ReplicatedTextRequirements, ReplicatedTextResidency, ReplicatedTextSelectionError,
+    ReplicatedTextSelectionRequest, ReplicatedTextStateResidency, SelectedParameterRealization,
+    SelectedReplicatedTextRealization, WeightLoweringCapability, WeightLoweringKind,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,

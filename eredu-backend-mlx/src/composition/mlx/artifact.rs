@@ -1,12 +1,10 @@
 //! Prepared SafeTensors inputs for MLX materialization.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 use crate::backend::error::Error;
 use eredu_checkpoint::{
+    safetensors::SafetensorsShards,
     schema::SafetensorsCheckpointPlan,
     store::{
         CheckpointLease, CheckpointSource, EncodedTensorLease, SafetensorsWeightStore,
@@ -32,13 +30,13 @@ pub struct PreparedSafetensorsArtifact {
 
 impl PreparedSafetensorsArtifact {
     pub fn open(
-        path: PathBuf,
         configuration: ModelConfiguration,
         architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
         catalog: TensorCatalog,
+        shards: SafetensorsShards,
         max_cached_shards: usize,
     ) -> Result<Self, Error> {
-        let store = open_catalog_bound_store(&path, catalog, max_cached_shards)?;
+        let store = open_admitted_catalog_bound_store(catalog, shards, max_cached_shards)?;
         let resolution = architecture
             .checkpoint_resolution()
             .ok_or_else(|| {
@@ -107,6 +105,19 @@ fn open_catalog_bound_store(
     max_cached_shards: usize,
 ) -> Result<SharedCheckpointSource, Error> {
     let store = SafetensorsWeightStore::open_with_max_cached_shards(path, max_cached_shards)?;
+    validate_prepared_catalog(&catalog, &store)?;
+    Ok(Arc::new(PreparedCatalogSource {
+        catalog,
+        source: Arc::new(store),
+    }))
+}
+
+fn open_admitted_catalog_bound_store(
+    catalog: TensorCatalog,
+    shards: SafetensorsShards,
+    max_cached_shards: usize,
+) -> Result<SharedCheckpointSource, Error> {
+    let store = SafetensorsWeightStore::open_admitted(shards, max_cached_shards)?;
     validate_prepared_catalog(&catalog, &store)?;
     Ok(Arc::new(PreparedCatalogSource {
         catalog,
@@ -365,10 +376,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         write_tensor(directory.path(), &[0.0, 0.0]);
         let error = PreparedSafetensorsArtifact::open(
-            directory.path().to_owned(),
             configuration(serde_json::json!({"model_type": "llama"})),
             architecture(),
             catalog_for(directory.path(), vec![1], 4),
+            eredu_checkpoint::safetensors::SafetensorsShards::discover(directory.path()).unwrap(),
             1,
         )
         .err()

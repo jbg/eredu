@@ -43,6 +43,8 @@ pub mod operator_requirements;
 pub mod preparation;
 /// Backend-neutral family preprocessing and framing plans.
 pub mod processor_plan;
+/// Architecture-owned admission for replicated text execution.
+pub mod replicated_text;
 /// Architecture-owned external rotary configuration values.
 pub mod rotary;
 mod static_parameters;

@@ -912,10 +912,21 @@ impl SafetensorsWeightStore {
         path: impl AsRef<Path>,
         max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
+        let shards = SafetensorsShards::discover_catalog(path)?;
+        Self::open_admitted(shards, max_cached_shards)
+    }
+
+    /// Opens the exact shard set admitted by portable artifact inspection.
+    ///
+    /// This constructor performs no directory or index discovery. Indexed
+    /// shards remain selectively opened and governed by `max_cached_shards`.
+    pub fn open_admitted(
+        shards: SafetensorsShards,
+        max_cached_shards: usize,
+    ) -> Result<Self, StoreError> {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
         }
-        let shards = SafetensorsShards::discover_catalog(path)?;
         if let Some(locations) = shards.tensor_locations() {
             let mut indexed_shards = BTreeMap::<PathBuf, BTreeSet<String>>::new();
             for (key, shard) in locations {
@@ -1658,8 +1669,9 @@ mod tests {
         )
         .unwrap();
 
-        let store =
-            SafetensorsWeightStore::open_with_max_cached_shards(directory.path(), 1).unwrap();
+        let admitted = SafetensorsShards::discover(directory.path()).unwrap();
+        std::fs::remove_file(directory.path().join("model.safetensors.index.json")).unwrap();
+        let store = SafetensorsWeightStore::open_admitted(admitted, 1).unwrap();
         let first = first.canonicalize().unwrap();
         store.metadata("left").unwrap();
         let metadata_diagnostics = store.diagnostics().unwrap();

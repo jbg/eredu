@@ -13,6 +13,7 @@ mod prepared_speculative;
 mod processor;
 mod realization;
 pub mod realtime;
+mod replicated_text;
 mod session;
 pub mod speculative;
 pub mod structural;

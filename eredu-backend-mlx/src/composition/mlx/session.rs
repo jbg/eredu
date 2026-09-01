@@ -616,7 +616,8 @@ impl<'a> MlxModelSession<'a> {
                 | Executable::Inkling(_, _, _)
                 | Executable::KimiLinear(_, _, _)
                 | Executable::Lfm2(_, _, _)
-                | Executable::Llama(_, _, _)
+                | Executable::PartitionedLlama(_, _, _)
+                | Executable::ReplicatedText(_, _)
                 | Executable::MuseGlimmer(_, _, _)
                 | Executable::NemotronH(_, _, _)
                 | Executable::Qwen(_, _, _)
@@ -888,8 +889,11 @@ impl<'a> MlxModelSession<'a> {
             Executable::Lfm2(_, model, cache) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            Executable::Llama(_, model, cache) => {
+            Executable::PartitionedLlama(_, model, cache) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
+            }
+            Executable::ReplicatedText(_, model) => {
+                model.forward_with_observer(input_tokens, mask, stream, &mut observer)
             }
             Executable::MuseGlimmer(_, model, cache) => {
                 if mask.is_some() {
@@ -1047,12 +1051,21 @@ impl<'a> MlxModelSession<'a> {
                         &mut ArrayObserverAdapter { inner: observer },
                     )?
                 }
-                Executable::Llama(_, family, cache) => {
+                Executable::PartitionedLlama(_, family, cache) => {
                     let tokens = input::text_token_ids(input, stream)?;
                     family.forward_with_observer(
                         &tokens,
                         None,
                         cache,
+                        stream,
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?
+                }
+                Executable::ReplicatedText(_, family) => {
+                    let tokens = input::text_token_ids(input, stream)?;
+                    family.forward_with_observer(
+                        &tokens,
+                        None,
                         stream,
                         &mut ArrayObserverAdapter { inner: observer },
                     )?

@@ -231,6 +231,49 @@ plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
+Replicated text composition has one checked cross-crate construction flow.
+`eredu-architectures` derives `ReplicatedTextRequirements` from the normalized
+architecture and the exact admitted artifact. The requirements contain the
+execution graph and unit layout, group transport, complete state layout,
+canonical logical parameters, admitted source encodings, architecture-valid
+executable formats and transforms, and required session facilities. A concrete
+backend reports only mechanism support through
+`ReplicatedTextBackendCapabilities`. The neutral selector resolves those two
+values and the requested residency policy into one
+`SelectedReplicatedTextRealization` before architecture modules or weight
+payloads are constructed.
+
+Architecture-owned typed dispatch constructs Llama/Mistral and ordinary dense
+Qwen2/Qwen3 modules with the selected executable formats and hands the selected
+value, exact requirements, and concrete architecture to a generic backend
+visitor. MLX binds that opaque architecture through `ArchitectureParameters`
+and `Parameterized`, uses the existing resident or layerwise runtime traversal,
+constructs state from the architecture-owned layout, and erases the paired
+runtime and state only at the session boundary. The erased interface performs
+one dispatch per session operation; tensor operations and execution-unit
+traversal remain statically dispatched.
+
+Source storage, executable format, and native lowering are independent values.
+SafeTensors handoff carries the admitted `SafetensorsShards`, including index
+validation and canonical shard order, into the bounded store without directory
+rediscovery. GGUF handoff carries the admitted translated output map and exact
+physical encoding; backend lowering does not reconstruct canonical names from
+GGUF strings. A selected transform builds a source-format architecture and a
+target-format architecture from the same neutral topology, materializes the
+declared targets, and reports the resulting storage separately from residency
+telemetry.
+
+`ReplicatedTextArchitecture` adds only ordinary borrowed text-input formation
+to the layered lifecycle and remains generic over its runtime state. Hybrid
+component state uses a different `RuntimeState`; routed computation adds
+`RoutedLayeredArchitecture` and mechanism-oriented expert providers;
+partitioning adds `PartitionedLayeredArchitecture` and collective contexts;
+composite models use architecture-owned inputs and execution groups; embedded
+prediction uses separately identified prediction groups and transactional
+draft state; and realtime models use the frame-oriented realtime contracts.
+None of these execution classes adds routing, media, partition, prediction, or
+frame requirements to replicated text selection or to `NeuralBackend`.
+
 Execution-group transport is also architecture policy. The runtime defines the
 neutral placement, semantic-kind, merge-destination, parallel-subgroup, and
 request-optionality data types, but every `LayeredArchitecture` must declare the

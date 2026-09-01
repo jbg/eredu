@@ -55,7 +55,8 @@ pub(super) fn prefill_model(
         Executable::Inkling(_, model, cache) => prefill_pair(model, cache, input, stream),
         Executable::KimiLinear(_, model, cache) => prefill_pair(model, cache, input, stream),
         Executable::Lfm2(_, model, cache) => prefill_pair(model, cache, input, stream),
-        Executable::Llama(_, model, cache) => prefill_pair(model, cache, input, stream),
+        Executable::PartitionedLlama(_, model, cache) => prefill_pair(model, cache, input, stream),
+        Executable::ReplicatedText(_, model) => model.prefill(input, stream),
         Executable::MuseGlimmer(_, model, cache) => prefill_pair(model, cache, input, stream),
         Executable::NemotronH(_, model, cache) => prefill_pair(model, cache, input, stream),
         Executable::Qwen(_, model, cache) => prefill_pair(model, cache, input, stream),
@@ -80,7 +81,8 @@ pub(super) fn decode_model(
         Executable::Inkling(_, model, cache) => decode_pair(model, cache, input, stream),
         Executable::KimiLinear(_, model, cache) => decode_pair(model, cache, input, stream),
         Executable::Lfm2(_, model, cache) => decode_pair(model, cache, input, stream),
-        Executable::Llama(_, model, cache) => decode_pair(model, cache, input, stream),
+        Executable::PartitionedLlama(_, model, cache) => decode_pair(model, cache, input, stream),
+        Executable::ReplicatedText(_, model) => model.decode(input, stream),
         Executable::MuseGlimmer(_, model, cache) => decode_pair(model, cache, input, stream),
         Executable::NemotronH(_, model, cache) => decode_pair(model, cache, input, stream),
         Executable::Qwen(_, model, cache) => decode_pair(model, cache, input, stream),
@@ -122,7 +124,8 @@ pub(super) fn prefill_model_tensor_parallel(
         | Executable::GptOss(_, _, _)
         | Executable::KimiLinear(_, _, _)
         | Executable::Lfm2(_, _, _)
-        | Executable::Llama(_, _, _)
+        | Executable::PartitionedLlama(_, _, _)
+        | Executable::ReplicatedText(_, _)
         | Executable::NemotronH(_, _, _)
         | Executable::Qwen(_, _, _)
         | Executable::Qwen3Next(_, _, _)
@@ -171,7 +174,7 @@ fn forward_model_tensor_parallel(
         Executable::Lfm2(_, model, cache) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        Executable::Llama(_, model, cache) => {
+        Executable::PartitionedLlama(_, model, cache) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
         Executable::NemotronH(_, model, cache) => {
@@ -187,6 +190,7 @@ fn forward_model_tensor_parallel(
             .forward_tensor_parallel(&tensor_input, cache, group, stream)
             .map(MlxTensor::into_array),
         Executable::DeepSeek(_, _, _)
+        | Executable::ReplicatedText(_, _)
         | Executable::Qwen3Next(_, _, _)
         | Executable::Qwen3Vl(_, _, _)
         | Executable::Qwen3VlMoe(_, _, _)
@@ -239,7 +243,8 @@ pub(super) fn prefill_model_tensor_parallel_with_observer(
         | Executable::GptOss(_, _, _)
         | Executable::KimiLinear(_, _, _)
         | Executable::Lfm2(_, _, _)
-        | Executable::Llama(_, _, _)
+        | Executable::PartitionedLlama(_, _, _)
+        | Executable::ReplicatedText(_, _)
         | Executable::NemotronH(_, _, _)
         | Executable::Qwen(_, _, _)
         | Executable::Qwen3Next(_, _, _)
@@ -282,7 +287,7 @@ pub(super) fn forward_model_tensor_parallel_with_observer(
         Executable::Lfm2(_, model, cache) => {
             model.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
         }
-        Executable::Llama(_, model, cache) => {
+        Executable::PartitionedLlama(_, model, cache) => {
             model.forward_tensor_parallel_with_observer(input, cache, group, stream, &mut observer)
         }
         Executable::NemotronH(_, model, cache) => {
@@ -310,6 +315,7 @@ pub(super) fn forward_model_tensor_parallel_with_observer(
             )
             .map(MlxTensor::into_array),
         Executable::DeepSeek(_, _, _)
+        | Executable::ReplicatedText(_, _)
         | Executable::Qwen3Next(_, _, _)
         | Executable::Qwen3Vl(_, _, _)
         | Executable::Qwen3VlMoe(_, _, _)

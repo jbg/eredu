@@ -1,11 +1,16 @@
 //! MLX checkpoint materialization after backend-neutral planning.
 
+use std::sync::Arc;
+
 use eredu_checkpoint::WeightQuantization;
 
 use eredu_architectures::processor_plan::ArtifactArchitecturePlan;
 use eredu_architectures::ModelKind;
 use eredu_core::{ModelArtifact, ModelPreparationPlan};
 use eredu_gguf::MetadataValue as GgufMetadataValue;
+use eredu_runtime::{
+    select_replicated_text_realization, CacheResidencyPolicy, ReplicatedTextSelectionRequest,
+};
 use safemlx::Stream;
 
 #[cfg(any(feature = "image", feature = "audio"))]
@@ -123,14 +128,9 @@ fn materialize_gguf_model(
             Executable::gemma4(kind, loaded)?
         }
         GgufBinding::Quantized(QuantizedGgufBinding::Llama) => {
-            let loaded = crate::composition::llama::load_llama_gguf_model(
-                source,
-                options.weight_residency,
-                quantization,
-                stream,
-                weights_stream,
-            )?;
-            Executable::llama(kind, loaded)?
+            return Err(Error::ArchitectureModel(
+                "replicated Llama must use replicated text composition".into(),
+            ));
         }
         GgufBinding::Fixed(FixedGgufBinding::MuseGlimmer) => {
             let loaded = crate::composition::muse_glimmer::load_gguf(
@@ -163,6 +163,14 @@ fn materialize_gguf_model(
             Executable::nemotron_h(kind, loaded)?
         }
         GgufBinding::Quantized(QuantizedGgufBinding::Qwen) => {
+            if !matches!(
+                source.plan().model(),
+                eredu_architectures::configuration::GgufModelConfig::Qwen(args) if args.is_moe()
+            ) {
+                return Err(Error::ArchitectureModel(
+                    "ordinary replicated Qwen must use replicated text composition".into(),
+                ));
+            }
             let loaded = crate::composition::qwen::load_qwen_gguf_model(
                 source,
                 options.weight_residency,
@@ -219,6 +227,92 @@ pub fn materialize_model_plan(
 ) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
+    let replicated = match eredu_architectures::replicated_text::replicated_text_requirements(
+        plan.inspection(),
+        plan.policy(),
+    ) {
+        Ok(requirements) => {
+            let selected = select_replicated_text_realization(
+                &requirements,
+                &ReplicatedTextSelectionRequest {
+                    residency: plan.policy().residency,
+                    state: CacheResidencyPolicy::Device,
+                    quantization: plan.policy().quantization,
+                },
+                &super::replicated_text::capabilities(&requirements),
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            Some((requirements, selected))
+        }
+        Err(eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(
+            _,
+        )) => None,
+        Err(error) => return Err(Error::ArchitectureModel(error.to_string())),
+    };
+    if let Some((requirements, selected)) = replicated {
+        let (artifact, architecture_plan, _policy, _route) = plan.into_parts();
+        let kind = prepared_model_kind(&architecture_plan);
+        let executable = match artifact {
+            ModelArtifact::SafeTensors {
+                path: _,
+                configuration,
+                tensors,
+                shards,
+            } => {
+                let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+                    configuration,
+                    prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                    tensors,
+                    shards,
+                    options.weight_residency.max_cached_shards(),
+                )?;
+                bind_replicated_text(
+                    &architecture_plan,
+                    requirements,
+                    selected,
+                    prepared.store(),
+                    options,
+                    stream,
+                    weights_stream,
+                )?
+            }
+            ModelArtifact::Gguf { validated, .. } => {
+                let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+                let (source, projector) = structural::AdmittedGguf::from_admission(
+                    architecture,
+                    architecture_plan.gguf_media_projector().cloned(),
+                    validated,
+                )?;
+                if projector.is_some() {
+                    return Err(Error::ArchitectureModel(
+                        "replicated text composition cannot bind a media projector".into(),
+                    ));
+                }
+                let store = Arc::new(
+                    crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                        source.checkpoint().clone(),
+                        source.plan().checkpoint(),
+                        source.plan().tensor_mapping(),
+                        options.weight_residency.max_cached_shards(),
+                    )?,
+                );
+                bind_replicated_text(
+                    &architecture_plan,
+                    requirements,
+                    selected,
+                    store,
+                    options,
+                    stream,
+                    weights_stream,
+                )?
+            }
+        };
+        let model = MlxModel::complete(
+            Executable::replicated_text(kind, executable)?,
+            floating_state_dtype_bytes,
+        );
+        return attach_processor(model, &architecture_plan);
+    }
     if let Some(topology) = options
         .parallel_topology()
         .filter(|topology| !topology.is_replicated())
@@ -250,15 +344,16 @@ pub fn materialize_model_plan(
             )
             .map(|model| complete_gguf_model(model, floating_state_dtype_bytes)),
             ModelArtifact::SafeTensors {
-                path,
+                path: _,
                 configuration,
                 tensors,
+                shards,
             } => {
                 let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                    path,
                     configuration,
                     prepared_safetensors_architecture(&architecture_plan)?.clone(),
                     tensors,
+                    shards,
                     options.weight_residency.max_cached_shards(),
                 )?;
                 let model = materialize_tensor_parallel(&prepared, options, stream, weights_stream)
@@ -274,15 +369,16 @@ pub fn materialize_model_plan(
                 .map(|model| complete_gguf_model(model, floating_state_dtype_bytes))
         }
         ModelArtifact::SafeTensors {
-            path,
+            path: _,
             configuration,
             tensors,
+            shards,
         } => {
             let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                path,
                 configuration,
                 prepared_safetensors_architecture(&architecture_plan)?.clone(),
                 tensors,
+                shards,
                 options.weight_residency.max_cached_shards(),
             )?;
             let model = materialize_safetensors(&prepared, options, stream, weights_stream)
@@ -290,6 +386,30 @@ pub fn materialize_model_plan(
             attach_processor(model, &architecture_plan)
         }
     }
+}
+
+fn bind_replicated_text(
+    architecture_plan: &ArtifactArchitecturePlan,
+    requirements: eredu_runtime::ReplicatedTextRequirements,
+    selected: eredu_runtime::SelectedReplicatedTextRealization,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>, Error> {
+    eredu_architectures::replicated_text::visit_replicated_text_architecture(
+        architecture_plan,
+        requirements,
+        selected,
+        stream,
+        super::replicated_text::BindingVisitor {
+            store,
+            options: options.weight_residency.layers(),
+            stream,
+            weights_stream,
+        },
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 fn inspected_floating_state_dtype_bytes(
@@ -706,9 +826,9 @@ fn materialize_tensor_parallel(
                 weights_stream,
             )?,
         )?),
-        TensorParallelBinding::Llama => Ok(Executable::llama(
+        TensorParallelBinding::Llama => Ok(Executable::partitioned_llama(
             kind,
-            crate::composition::llama::load_llama_tensor_parallel_model(
+            crate::composition::llama::load_partitioned_llama_safetensors(
                 artifact,
                 execution,
                 build,
@@ -913,14 +1033,14 @@ fn materialize_gguf_tensor_parallel(
             Executable::gemma4(kind, model)
         }
         TensorParallelBinding::Llama => {
-            let model = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
+            let model = crate::composition::llama::load_partitioned_llama_gguf(
                 source,
                 residency,
                 build,
                 stream,
                 weights_stream,
             )?;
-            Executable::llama(kind, model)
+            Executable::partitioned_llama(kind, model)
         }
         TensorParallelBinding::MuseGlimmer => {
             let model = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
@@ -1211,16 +1331,9 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::Llama => Ok(Executable::llama(
-            kind,
-            crate::composition::llama::load_safetensors(
-                artifact,
-                eredu_runtime::WeightResidency::with_layers(execution),
-                quantization,
-                stream,
-                weights_stream,
-            )?,
-        )?),
+        FamilyBinding::Llama => Err(Error::ArchitectureModel(
+            "replicated Llama must use replicated text composition".into(),
+        )),
         FamilyBinding::MuseGlimmer => Ok(Executable::muse_glimmer(
             kind,
             crate::composition::muse_glimmer::load_safetensors(
@@ -1231,16 +1344,27 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::Qwen => Ok(Executable::qwen(
-            kind,
-            crate::composition::qwen::load_safetensors(
-                artifact,
-                eredu_runtime::WeightResidency::with_layers(execution),
-                quantization,
-                stream,
-                weights_stream,
-            )?,
-        )?),
+        FamilyBinding::Qwen => {
+            if !matches!(
+                artifact.model(),
+                eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args)
+                    if args.is_moe()
+            ) {
+                return Err(Error::ArchitectureModel(
+                    "ordinary replicated Qwen must use replicated text composition".into(),
+                ));
+            }
+            Ok(Executable::qwen(
+                kind,
+                crate::composition::qwen::load_safetensors(
+                    artifact,
+                    eredu_runtime::WeightResidency::with_layers(execution),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )?)
+        }
         FamilyBinding::GptOss => Ok(Executable::gpt_oss(
             kind,
             crate::composition::gpt_oss::load_safetensors(

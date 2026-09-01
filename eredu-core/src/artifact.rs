@@ -203,6 +203,7 @@ pub struct ArtifactInspection<P = ()> {
     format: ArtifactFormat,
     configuration: ModelConfiguration,
     tensors: TensorCatalog,
+    safetensors_shards: Option<SafetensorsShards>,
     validated_gguf: Option<ValidatedGguf>,
     architecture_plan: P,
 }
@@ -281,6 +282,10 @@ impl<P> ArtifactInspection<P> {
     /// Validated portable tensor catalog.
     pub fn tensors(&self) -> &TensorCatalog {
         &self.tensors
+    }
+    /// Exact canonical SafeTensors shard set admitted during inspection.
+    pub fn safetensors_shards(&self) -> Option<&SafetensorsShards> {
+        self.safetensors_shards.as_ref()
     }
     /// Validated portable GGUF result, when applicable.
     pub fn validated_gguf(&self) -> Option<&ValidatedGguf> {
@@ -404,6 +409,10 @@ impl<P> ModelPreparationPlan<P> {
                 path: self.inspection.path,
                 configuration: self.inspection.configuration,
                 tensors: self.inspection.tensors,
+                shards: self
+                    .inspection
+                    .safetensors_shards
+                    .expect("SafeTensors inspection retains its admitted shard set"),
             },
         };
         (
@@ -426,6 +435,8 @@ pub enum ModelArtifact {
         configuration: ModelConfiguration,
         /// Header-only tensor catalog.
         tensors: TensorCatalog,
+        /// Exact canonical shard set admitted during header inspection.
+        shards: SafetensorsShards,
     },
     /// Validated GGUF checkpoint handle and metadata-derived configuration.
     Gguf {
@@ -548,6 +559,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         format: ArtifactFormat::Gguf,
         configuration,
         tensors,
+        safetensors_shards: None,
         validated_gguf: Some(validated_gguf),
         architecture_plan,
     })
@@ -744,6 +756,7 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
         format: ArtifactFormat::SafeTensors,
         configuration,
         tensors,
+        safetensors_shards: Some(shards),
         validated_gguf: None,
         architecture_plan,
     })
@@ -1196,6 +1209,14 @@ mod tests {
         let inspection = inspect_artifact(root.path(), &FixtureResolver).unwrap();
         assert_eq!(inspection.configuration().family, "llama");
         assert_eq!(inspection.tensors().len(), 1);
+        assert_eq!(
+            inspection
+                .safetensors_shards()
+                .unwrap()
+                .payload_paths()
+                .len(),
+            1
+        );
         let plan = plan_model_preparation(
             inspection,
             PreparationPolicy::default(),
@@ -1204,7 +1225,10 @@ mod tests {
         .unwrap();
         assert_eq!(plan.route(), MaterializationRoute::Resident);
         let (artifact, architecture_plan, _, _) = plan.into_parts();
-        assert!(matches!(artifact, ModelArtifact::SafeTensors { .. }));
+        let ModelArtifact::SafeTensors { shards, .. } = artifact else {
+            panic!("expected SafeTensors artifact");
+        };
+        assert_eq!(shards.payload_paths().len(), 1);
         assert_eq!(architecture_plan.format, Some(ArtifactFormat::SafeTensors));
     }
 

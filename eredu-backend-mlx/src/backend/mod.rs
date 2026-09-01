@@ -313,6 +313,14 @@ impl MlxModel {
         }
     }
 
+    /// Returns load-time weight transformation telemetry when present.
+    pub fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.materialization_report(),
+            MlxModelKind::Pipeline(_) => None,
+        }
+    }
+
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,

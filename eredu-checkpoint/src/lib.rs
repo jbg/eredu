@@ -67,6 +67,23 @@ pub enum StoredDtype {
     Other(String),
 }
 
+/// Physical tensor encoding recorded by an admitted artifact catalog.
+///
+/// This remains distinct from [`LinearFormat`], which describes the format
+/// selected for an executable neural operator.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SourceTensorEncoding {
+    /// Scalar storage in a SafeTensors payload.
+    Safetensors(StoredDtype),
+    /// One physical GGML block encoding in a GGUF shard.
+    Gguf {
+        /// Exact GGML tensor encoding.
+        ggml_type: GgmlType,
+        /// Byte order declared by the containing shard.
+        endian: Endian,
+    },
+}
+
 /// Invalid backend-neutral checkpoint metadata.
 #[derive(Debug, Clone, thiserror::Error, Eq, PartialEq)]
 #[error("{0}")]

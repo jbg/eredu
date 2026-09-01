@@ -9285,17 +9285,18 @@ pub fn load_pipeline_model_with_options(
             };
         }
         ModelArtifact::SafeTensors {
-            path,
+            path: _,
             configuration,
             tensors,
+            shards,
         } => crate::composition::mlx::artifact::PreparedSafetensorsArtifact::open(
-            path,
             configuration,
             crate::composition::mlx::loading::prepared_safetensors_architecture(
                 &architecture_plan,
             )?
             .clone(),
             tensors,
+            shards,
             max_cached_shards,
         )?,
     };

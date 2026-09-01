@@ -74,11 +74,16 @@ pub enum Executable {
         crate::composition::inkling::InklingModel,
         crate::composition::inkling::InklingState,
     ),
-    /// Llama-compatible dense model.
-    Llama(
+    /// Tensor-parallel Llama model.
+    PartitionedLlama(
         AdmittedModelKind,
-        crate::composition::llama::LlamaModel,
+        crate::composition::llama::PartitionedLlamaModel,
         crate::backend::runtime::cache::state::MlxKeyValueState,
+    ),
+    /// Ordinary replicated text model bound through the family-neutral contract.
+    ReplicatedText(
+        AdmittedModelKind,
+        Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>,
     ),
     /// Meta Muse-Glimmer dense multimodal model.
     MuseGlimmer(
@@ -179,13 +184,24 @@ impl Executable {
         Ok(Self::Inkling(identity, model, cache))
     }
 
-    pub(super) fn llama(
+    pub(super) fn partitioned_llama(
         kind: ModelKind,
-        model: crate::composition::llama::LlamaModel,
+        model: crate::composition::llama::PartitionedLlamaModel,
     ) -> Result<Self, Error> {
         let identity = AdmittedModelKind::new(kind, &[ModelKind::Llama])?;
         let cache = model.new_cache();
-        Ok(Self::Llama(identity, model, cache))
+        Ok(Self::PartitionedLlama(identity, model, cache))
+    }
+
+    pub(super) fn replicated_text(
+        kind: ModelKind,
+        model: Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>,
+    ) -> Result<Self, Error> {
+        let identity = AdmittedModelKind::new(
+            kind,
+            &[ModelKind::Llama, ModelKind::Qwen2, ModelKind::Qwen3],
+        )?;
+        Ok(Self::ReplicatedText(identity, model))
     }
 
     pub(super) fn muse_glimmer(
@@ -267,7 +283,8 @@ impl Executable {
     ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
         match self {
             Self::DeepSeek(_, _, _) => None,
-            Self::Llama(_, model, _) => model.parallel_info(),
+            Self::PartitionedLlama(_, model, _) => model.parallel_info(),
+            Self::ReplicatedText(_, _) => None,
             Self::MuseGlimmer(_, model, _) => model.parallel_info(),
             Self::GptOss(_, model, _) => model.parallel_info(),
             Self::Qwen(_, model, _) => model.parallel_info(),
@@ -298,7 +315,8 @@ impl Executable {
             Self::Gemma4(_, model, _) => model.residency_report(),
             Self::Inkling(_, model, _) => model.residency_report(),
             Self::KimiLinear(_, model, _) => Ok(Some(model.residency_report()?)),
-            Self::Llama(_, model, _) => model.residency_report(),
+            Self::PartitionedLlama(_, model, _) => model.residency_report(),
+            Self::ReplicatedText(_, model) => model.residency_report(),
             Self::GptOss(_, model, _) => Ok(Some(model.residency_report()?)),
             Self::Lfm2(_, model, _) => Ok(Some(model.residency_report()?)),
             Self::NemotronH(_, model, _) => Ok(Some(model.residency_report()?)),
@@ -322,7 +340,8 @@ impl Executable {
             Self::Gemma4(_, model, _) => model.dense_stream_report(),
             Self::Inkling(_, model, _) => model.dense_stream_report(),
             Self::KimiLinear(_, model, _) => model.dense_stream_report(),
-            Self::Llama(_, model, _) => model.dense_stream_report(),
+            Self::PartitionedLlama(_, model, _) => model.dense_stream_report(),
+            Self::ReplicatedText(_, model) => model.dense_stream_report(),
             Self::GptOss(_, model, _) => model.dense_stream_report(),
             Self::Lfm2(_, model, _) => model.dense_stream_report(),
             Self::NemotronH(_, model, _) => model.dense_stream_report(),
@@ -332,6 +351,27 @@ impl Executable {
             Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
                 model.dense_stream_report()
             }
+        }
+    }
+
+    /// Returns load-time weight transformation telemetry when materialization transformed weights.
+    pub fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
+        match self {
+            Self::ReplicatedText(_, model) => model.materialization_report(),
+            Self::DeepSeek(_, _, _)
+            | Self::Gemma4(_, _, _)
+            | Self::GptOss(_, _, _)
+            | Self::KimiLinear(_, _, _)
+            | Self::Inkling(_, _, _)
+            | Self::PartitionedLlama(_, _, _)
+            | Self::MuseGlimmer(_, _, _)
+            | Self::Lfm2(_, _, _)
+            | Self::NemotronH(_, _, _)
+            | Self::Qwen(_, _, _)
+            | Self::Qwen3Next(_, _, _)
+            | Self::Qwen3Vl(_, _, _)
+            | Self::Qwen3VlMoe(_, _, _)
+            | Self::Qwen35(_, _, _) => None,
         }
     }
 
@@ -352,7 +392,9 @@ impl Executable {
             Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => model.expert_cache_report(),
             Self::Qwen3VlMoe(_, model, _) => model.expert_cache_report(),
             Self::MuseGlimmer(_, model, _) => model.expert_cache_report(),
-            Self::Llama(_, _, _) | Self::Qwen3Vl(_, _, _) => Ok(None),
+            Self::PartitionedLlama(_, _, _)
+            | Self::ReplicatedText(_, _)
+            | Self::Qwen3Vl(_, _, _) => Ok(None),
         }
     }
 
@@ -364,7 +406,7 @@ impl Executable {
             | Self::GptOss(kind, _, _)
             | Self::KimiLinear(kind, _, _)
             | Self::Inkling(kind, _, _)
-            | Self::Llama(kind, _, _)
+            | Self::PartitionedLlama(kind, _, _)
             | Self::MuseGlimmer(kind, _, _)
             | Self::Lfm2(kind, _, _)
             | Self::NemotronH(kind, _, _)
@@ -373,6 +415,7 @@ impl Executable {
             | Self::Qwen3Vl(kind, _, _)
             | Self::Qwen3VlMoe(kind, _, _)
             | Self::Qwen35(kind, _, _) => kind.get(),
+            Self::ReplicatedText(kind, _) => kind.get(),
         }
     }
 
@@ -384,7 +427,8 @@ impl Executable {
             Self::GptOss(_, model, _) => &model.args().model_type,
             Self::Inkling(_, model, _) => &model.args().model_type,
             Self::KimiLinear(_, model, _) => &model.args().model_type,
-            Self::Llama(_, model, _) => &model.args().model_type,
+            Self::PartitionedLlama(_, model, _) => &model.args().model_type,
+            Self::ReplicatedText(_, model) => model.effective_model_type(),
             Self::Lfm2(_, model, _) => &model.args().model_type,
             Self::NemotronH(_, model, _) => &model.args().model_type,
             Self::Qwen(_, model, _) => &model.args().model_type,
@@ -406,7 +450,8 @@ impl Executable {
             Self::GptOss(_, model, _) => model.prompt_cache_model_identity(),
             Self::Inkling(_, model, _) => model.prompt_identity(),
             Self::KimiLinear(_, model, _) => model.prompt_cache_model_identity(),
-            Self::Llama(_, model, _) => model.prompt_cache_model_identity(),
+            Self::PartitionedLlama(_, model, _) => model.prompt_cache_model_identity(),
+            Self::ReplicatedText(_, model) => Ok(model.prompt_cache_model_identity().clone()),
             Self::Lfm2(_, model, _) => model.prompt_cache_model_identity(),
             Self::NemotronH(_, model, _) => model.prompt_cache_model_identity(),
             Self::Qwen(_, model, _) => model.prompt_cache_model_identity(),
@@ -448,7 +493,10 @@ impl Executable {
                 Self::Inkling(_, model, cache) => reset_paged!(model, cache, options),
                 Self::KimiLinear(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Lfm2(_, model, cache) => reset_paged!(model, cache, options),
-                Self::Llama(_, model, cache) => reset_paged!(model, cache, options),
+                Self::PartitionedLlama(_, model, cache) => reset_paged!(model, cache, options),
+                Self::ReplicatedText(_, model) => model
+                    .reset_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map_err(|error| Exception::custom(error.to_string())),
                 Self::MuseGlimmer(_, model, cache) => reset_paged!(model, cache, options),
                 Self::NemotronH(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Qwen(_, model, cache) => reset_paged!(model, cache, options),
@@ -474,7 +522,8 @@ impl Executable {
             Self::Inkling(_, model, cache) => *cache = model.new_cache(),
             Self::KimiLinear(_, model, cache) => *cache = model.new_cache(),
             Self::Lfm2(_, model, cache) => *cache = model.new_cache(),
-            Self::Llama(_, model, cache) => *cache = model.new_cache(),
+            Self::PartitionedLlama(_, model, cache) => *cache = model.new_cache(),
+            Self::ReplicatedText(_, model) => return model.reset_cache(),
             Self::MuseGlimmer(_, model, cache) => *cache = model.new_cache(),
             Self::NemotronH(_, model, cache) => *cache = model.new_cache(),
             Self::Qwen(_, model, cache) => *cache = model.new_cache(),
@@ -512,7 +561,10 @@ impl Executable {
             Self::Inkling(_, model, cache) => load_into!(model, cache),
             Self::KimiLinear(_, model, cache) => load_into!(model, cache),
             Self::Lfm2(_, model, cache) => load_into!(model, cache),
-            Self::Llama(_, model, cache) => load_into!(model, cache),
+            Self::PartitionedLlama(_, model, cache) => load_into!(model, cache),
+            Self::ReplicatedText(_, model) => model
+                .load_prompt_cache(directory.as_ref(), expected, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::MuseGlimmer(_, model, cache) => load_into!(model, cache),
             Self::NemotronH(_, model, cache) => load_into!(model, cache),
             Self::Qwen(_, model, cache) => load_into!(model, cache),
@@ -556,7 +608,10 @@ impl Executable {
             Self::Inkling(_, model, cache) => save_from!(model, cache),
             Self::KimiLinear(_, model, cache) => save_from!(model, cache),
             Self::Lfm2(_, model, cache) => save_from!(model, cache),
-            Self::Llama(_, model, cache) => save_from!(model, cache),
+            Self::PartitionedLlama(_, model, cache) => save_from!(model, cache),
+            Self::ReplicatedText(_, model) => model
+                .save_prompt_cache(destination.as_ref(), descriptor, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::MuseGlimmer(_, model, cache) => save_from!(model, cache),
             Self::NemotronH(_, model, cache) => save_from!(model, cache),
             Self::Qwen(_, model, cache) => save_from!(model, cache),
@@ -574,9 +629,10 @@ impl Executable {
             Self::DeepSeek(_, _, cache) => cache.residency_report(),
             Self::GptOss(_, _, cache) => cache.residency_report(),
             Self::Inkling(_, _, cache) => cache.target().residency_report(),
-            Self::Llama(_, _, cache) | Self::MuseGlimmer(_, _, cache) | Self::Qwen(_, _, cache) => {
-                cache.residency_report()
-            }
+            Self::PartitionedLlama(_, _, cache)
+            | Self::MuseGlimmer(_, _, cache)
+            | Self::Qwen(_, _, cache) => cache.residency_report(),
+            Self::ReplicatedText(_, model) => model.cache_residency_report(),
             Self::Gemma4(_, _, cache)
             | Self::KimiLinear(_, _, cache)
             | Self::Lfm2(_, _, cache)
