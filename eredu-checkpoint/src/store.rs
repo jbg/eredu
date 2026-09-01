@@ -906,7 +906,7 @@ impl SafetensorsWeightStore {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
         }
-        let shards = SafetensorsShards::discover(path)?;
+        let shards = SafetensorsShards::discover_catalog(path)?;
         if let Some(locations) = shards.tensor_locations() {
             let catalog = locations
                 .iter()
@@ -1681,6 +1681,46 @@ mod tests {
                 policy: ReadPolicy::RequireBounded,
             })
             .is_ok());
+    }
+
+    #[test]
+    fn indexed_store_defers_validation_of_unrequested_shards() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.safetensors");
+        let remote = directory.path().join("remote.safetensors");
+        serialize_to_file(
+            [(
+                "local",
+                TensorView::new(Dtype::F32, vec![1], &f32_bytes(&[1.0])).unwrap(),
+            )],
+            None,
+            &local,
+        )
+        .unwrap();
+        std::fs::write(&remote, b"not safetensors").unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {
+                    "local": "local.safetensors",
+                    "remote": "remote.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = SafetensorsWeightStore::open(directory.path()).unwrap();
+        assert_eq!(store.keys(), ["local", "remote"]);
+        assert_eq!(store.metadata("local").unwrap().logical_shape, [1]);
+        assert_eq!(
+            store.diagnostics().unwrap().touched_shard_paths,
+            [local.canonicalize().unwrap()]
+        );
+        assert!(matches!(
+            store.metadata("remote"),
+            Err(StoreError::MalformedSafetensors { .. })
+        ));
     }
 
     #[cfg(unix)]

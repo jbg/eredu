@@ -172,9 +172,11 @@ examples; they do not live under the facade.
 Portable crates split tensor-independent ownership by responsibility:
 
 - `eredu-checkpoint` owns canonical SafeTensors index parsing, exact
-  index-to-shard-header validation, and shard-path admission; inspection,
-  neutral stores, and conversion tooling consume the same discovery result and
-  never reinterpret `weight_map`;
+  index-to-shard-header validation, and shard-path admission. Inspection and
+  conversion tooling consume strict discovery, while neutral stores consume
+  the same parsed and admitted catalog but validate payload headers lazily so
+  selective loads do not read remote-only shards. None reinterpret
+  `weight_map`;
 - artifact identity, header inspection, the model-configuration resolver
   contract, tensor catalogs, and preparation plans live in `eredu-core`;
 - validated attention schedules and parallel topologies;
@@ -367,13 +369,15 @@ execute those plans literally. They do not select tensors by suffix, rank,
 dtype, size, or substring; derive companion identities; canonicalize legacy
 names; or inject compatibility metadata into `config.json`. Conversion fails
 closed when a declared source is absent or any declared output collides with
-another checkpoint tensor. Conversion obtains payload paths from the canonical
-`eredu-checkpoint` SafeTensors shard facility used by inspection and neutral
-stores. Duplicate index keys, empty mappings, absolute or traversing shard
-names, missing payloads, and symlinks outside the admitted checkpoint access
-root therefore fail consistently before a concrete backend can read or publish
-any tensor. Hugging Face snapshot symlinks remain confined to their repository,
-including its sibling `blobs` directory.
+another checkpoint tensor. Conversion obtains payload paths from canonical
+`eredu-checkpoint` strict SafeTensors discovery. Duplicate index keys, empty
+mappings, absolute or traversing shard names, missing payloads, contradictory
+index mappings, and symlinks outside the admitted checkpoint access root
+therefore fail before a concrete backend can publish any tensor. Neutral stores
+share its index parser and path admission but defer payload-header validation
+until a tensor in that shard is requested, preserving remote-shard skipping.
+Hugging Face snapshot symlinks remain confined to their repository, including
+its sibling `blobs` directory.
 
 Portable SafeTensors schemas use released checkpoint names directly. A private
 module spelling that inserts `inner` into an architecture name, such as

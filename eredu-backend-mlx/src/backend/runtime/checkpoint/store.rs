@@ -1822,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_contradictory_index_mapping_when_opened() {
+    fn rejects_contradictory_index_mapping_when_accessed() {
         let dir = tempfile::tempdir().unwrap();
         write_i32(
             &dir.path().join("payload.safetensors"),
@@ -1831,11 +1831,10 @@ mod tests {
             vec![1],
         );
         write_index(dir.path(), &[("claimed", "payload.safetensors")]);
+        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
         assert!(matches!(
-            SafetensorsWeightStore::open(dir.path()),
-            Err(StoreError::SafetensorsShards(
-                eredu_checkpoint::safetensors::SafetensorsShardError::MalformedIndex { .. }
-            ))
+            store.source_metadata("claimed"),
+            Err(StoreError::ContradictoryIndexMapping { key, .. }) if key == "claimed"
         ));
     }
 

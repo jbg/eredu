@@ -23,8 +23,28 @@ pub struct SafetensorsShards {
 }
 
 impl SafetensorsShards {
-    /// Discovers and admits a SafeTensors file or checkpoint directory.
+    /// Discovers, admits, and validates a SafeTensors file or checkpoint directory.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
+        let path = path.as_ref();
+        let shards = Self::discover_catalog(path)?;
+        if let Some(locations) = shards.tensor_locations() {
+            let mut indexed_names = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+            for (tensor, payload) in locations {
+                indexed_names
+                    .entry(payload.clone())
+                    .or_default()
+                    .insert(tensor.clone());
+            }
+            validate_indexed_shards(&path.join("model.safetensors.index.json"), &indexed_names)?;
+        }
+        Ok(shards)
+    }
+
+    /// Builds an admitted tensor-to-shard catalog without reading payload headers.
+    ///
+    /// The neutral weight store uses this path so it can validate and buffer only
+    /// shards requested by the caller. Public discovery remains strict.
+    pub(crate) fn discover_catalog(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         if path.is_dir() {
             return Self::discover_directory(path);
@@ -61,7 +81,7 @@ impl SafetensorsShards {
             });
         }
 
-        let mut indexed_names = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+        let mut payload_paths = BTreeSet::new();
         let mut tensor_locations = BTreeMap::new();
         for (tensor, relative) in index.weight_map.0 {
             if tensor.is_empty() {
@@ -72,15 +92,11 @@ impl SafetensorsShards {
             }
             let relative = validate_relative_shard_path(Path::new(&relative))?;
             let payload = admit_payload(&root.join(relative), &access_root)?;
-            indexed_names
-                .entry(payload.clone())
-                .or_default()
-                .insert(tensor.clone());
+            payload_paths.insert(payload.clone());
             tensor_locations.insert(tensor, payload);
         }
-        validate_indexed_shards(&index_path, &indexed_names)?;
         Ok(Self {
-            payload_paths: indexed_names.into_keys().collect(),
+            payload_paths: payload_paths.into_iter().collect(),
             tensor_locations: Some(tensor_locations),
         })
     }
