@@ -1077,7 +1077,10 @@ mod tests {
             plan.insert("model.remote.weight", TensorPlacement::Omit);
             let partition = load_safetensors_partition(dir.path(), &plan, &stream).unwrap();
             assert_eq!(partition.len(), 1);
-            assert_eq!(partition.opened_shards(), &[local_shard.clone()]);
+            assert_eq!(
+                partition.opened_shards(),
+                std::slice::from_ref(&local_shard)
+            );
             assert!(partition.get("model.remote.weight").is_none());
             let local = partition
                 .get("model.projection.weight")
