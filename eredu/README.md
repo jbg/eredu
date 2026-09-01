@@ -33,7 +33,7 @@ crates; the facade does not duplicate those types at its root or under `api`.
 generation-default, and chat-template metadata. Its backend, session, prompts,
 token handles, drafting resources, and native errors remain private:
 
-```rust,ignore
+```rust,no_run
 use eredu::api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel};
 use eredu_core::ExecutionPlan;
 
