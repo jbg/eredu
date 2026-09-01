@@ -725,6 +725,14 @@ pub enum StoreError {
         /// Referenced payload shard.
         path: PathBuf,
     },
+    /// A payload shard contains a tensor absent from its index mappings.
+    #[error("shard {path} contains tensor {key:?}, but the index does not map it to that shard", path = .path.display())]
+    UnindexedShardTensor {
+        /// Tensor key found in the shard header.
+        key: String,
+        /// Payload shard containing the unexpected tensor.
+        path: PathBuf,
+    },
     /// A requested selection is invalid.
     #[error("invalid selection for tensor {key:?}: {message}")]
     InvalidSelection {
@@ -886,6 +894,7 @@ impl EncodedTensorLease for SafetensorsLease {
 #[derive(Debug)]
 pub struct SafetensorsWeightStore {
     catalog: BTreeMap<String, CatalogEntry>,
+    indexed_shards: BTreeMap<PathBuf, BTreeSet<String>>,
     metadata: Mutex<BTreeMap<String, TensorMetadata>>,
     cache: Mutex<CacheState>,
     read_telemetry: Arc<SafetensorsReadTelemetry>,
@@ -908,6 +917,13 @@ impl SafetensorsWeightStore {
         }
         let shards = SafetensorsShards::discover_catalog(path)?;
         if let Some(locations) = shards.tensor_locations() {
+            let mut indexed_shards = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+            for (key, shard) in locations {
+                indexed_shards
+                    .entry(shard.clone())
+                    .or_default()
+                    .insert(key.clone());
+            }
             let catalog = locations
                 .iter()
                 .map(|(key, shard)| {
@@ -921,6 +937,7 @@ impl SafetensorsWeightStore {
                 .collect();
             return Ok(Self {
                 catalog,
+                indexed_shards,
                 metadata: Mutex::new(BTreeMap::new()),
                 cache: Mutex::new(CacheState::default()),
                 read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
@@ -950,6 +967,7 @@ impl SafetensorsWeightStore {
             .collect();
         Ok(Self {
             catalog,
+            indexed_shards: BTreeMap::new(),
             metadata: Mutex::new(discovered),
             cache: Mutex::new(CacheState::default()),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
@@ -1020,6 +1038,40 @@ impl SafetensorsWeightStore {
             metadata,
             payload_offset,
         });
+        if let Some(expected) = self.indexed_shards.get(&shard.path) {
+            let actual = shard
+                .metadata
+                .offset_keys()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if let Some(key) = expected.difference(&actual).next() {
+                return Err(StoreError::ContradictoryIndexMapping {
+                    key: key.clone(),
+                    path: shard.path.clone(),
+                });
+            }
+            if let Some(key) = actual.difference(expected).next() {
+                return Err(StoreError::UnindexedShardTensor {
+                    key: key.clone(),
+                    path: shard.path.clone(),
+                });
+            }
+            let discovered = expected
+                .iter()
+                .map(|key| {
+                    let info = shard
+                        .metadata
+                        .info(key)
+                        .expect("exact shard validation established the tensor");
+                    metadata_for_info(key, &shard.path, info)
+                        .map(|metadata| (key.clone(), metadata))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            self.metadata
+                .lock()
+                .map_err(|_| StoreError::Internal("metadata cache is poisoned".into()))?
+                .extend(discovered);
+        }
         cache.touched.insert(entry.shard.clone());
         cache.entries.insert(
             canonical_path,
@@ -1031,48 +1083,17 @@ impl SafetensorsWeightStore {
         Ok(shard)
     }
 
-    fn metadata_from_shard(
-        &self,
-        key: &str,
-        entry: &CatalogEntry,
-        shard: &BufferedShard,
-    ) -> Result<TensorMetadata, StoreError> {
-        if let Some(metadata) = self
-            .metadata
-            .lock()
-            .map_err(|_| StoreError::Internal("metadata cache is poisoned".into()))?
-            .get(key)
-            .cloned()
-        {
-            return Ok(metadata);
-        }
-        shard
-            .metadata
-            .info(key)
-            .ok_or_else(|| StoreError::ContradictoryIndexMapping {
-                key: key.into(),
-                path: entry.shard.clone(),
-            })?;
-        let mut discovered = BTreeMap::new();
-        for name in shard.metadata.offset_keys() {
-            if self
-                .catalog
-                .get(&name)
-                .is_some_and(|candidate| candidate.shard == shard.path)
-            {
-                let info = shard.metadata.info(&name).expect("metadata key is present");
-                discovered.insert(name.clone(), metadata_for_info(&name, &shard.path, info)?);
-            }
-        }
-        let metadata = discovered
-            .get(key)
-            .cloned()
-            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+    fn cached_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.metadata
             .lock()
             .map_err(|_| StoreError::Internal("metadata cache is poisoned".into()))?
-            .extend(discovered);
-        Ok(metadata)
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "opened safetensors shard did not populate metadata for {key:?}"
+                ))
+            })
     }
 }
 
@@ -1098,7 +1119,8 @@ impl WeightStore for SafetensorsWeightStore {
             .get(key)
             .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
         let shard = self.acquire_shard(entry)?;
-        self.metadata_from_shard(key, entry, &shard)
+        drop(shard);
+        self.cached_metadata(key)
     }
 
     fn acquire(&self, request: TensorReadRequest) -> Result<Self::Lease, StoreError> {
@@ -1109,7 +1131,7 @@ impl WeightStore for SafetensorsWeightStore {
                 key: request.key.clone(),
             })?;
         let shard = self.acquire_shard(entry)?;
-        let metadata = self.metadata_from_shard(&request.key, entry, &shard)?;
+        let metadata = self.cached_metadata(&request.key)?;
         let info = shard.metadata.info(&request.key).ok_or_else(|| {
             io_error(
                 &entry.shard,
@@ -1720,6 +1742,73 @@ mod tests {
         assert!(matches!(
             store.metadata("remote"),
             Err(StoreError::MalformedSafetensors { .. })
+        ));
+    }
+
+    #[test]
+    fn indexed_store_exactly_validates_every_opened_shard() {
+        let missing = tempfile::tempdir().unwrap();
+        let missing_shard = missing.path().join("payload.safetensors");
+        serialize_to_file(
+            [(
+                "requested",
+                TensorView::new(Dtype::F32, vec![1], &f32_bytes(&[1.0])).unwrap(),
+            )],
+            None,
+            &missing_shard,
+        )
+        .unwrap();
+        std::fs::write(
+            missing.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {
+                    "requested": "payload.safetensors",
+                    "missing_sibling": "payload.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = SafetensorsWeightStore::open(missing.path()).unwrap();
+        assert!(matches!(
+            store.metadata("requested"),
+            Err(StoreError::ContradictoryIndexMapping { key, .. })
+                if key == "missing_sibling"
+        ));
+
+        let extra = tempfile::tempdir().unwrap();
+        let extra_shard = extra.path().join("payload.safetensors");
+        let requested = f32_bytes(&[1.0]);
+        let unindexed = f32_bytes(&[2.0]);
+        serialize_to_file(
+            [
+                (
+                    "requested",
+                    TensorView::new(Dtype::F32, vec![1], &requested).unwrap(),
+                ),
+                (
+                    "unindexed",
+                    TensorView::new(Dtype::F32, vec![1], &unindexed).unwrap(),
+                ),
+            ],
+            None,
+            &extra_shard,
+        )
+        .unwrap();
+        std::fs::write(
+            extra.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {"requested": "payload.safetensors"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = SafetensorsWeightStore::open(extra.path()).unwrap();
+        assert!(matches!(
+            store.metadata("requested"),
+            Err(StoreError::UnindexedShardTensor { key, .. }) if key == "unindexed"
         ));
     }
 

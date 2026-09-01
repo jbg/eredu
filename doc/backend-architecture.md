@@ -174,8 +174,9 @@ Portable crates split tensor-independent ownership by responsibility:
 - `eredu-checkpoint` owns canonical SafeTensors index parsing, exact
   index-to-shard-header validation, and shard-path admission. Inspection and
   conversion tooling consume strict discovery, while neutral stores consume
-  the same parsed and admitted catalog but validate payload headers lazily so
-  selective loads do not read remote-only shards. None reinterpret
+  the same parsed and admitted catalog but validate each opened payload header
+  exactly and lazily, so selective loads detect every mismatch in a local shard
+  without reading remote-only shards. None reinterpret
   `weight_map`;
 - artifact identity, header inspection, the model-configuration resolver
   contract, tensor catalogs, and preparation plans live in `eredu-core`;

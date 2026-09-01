@@ -730,7 +730,8 @@ impl PartitionReport {
 ///
 /// For indexed checkpoints, exact-name placement is resolved from the
 /// index before any payload shard is opened. A shard containing no local
-/// tensors is therefore skipped completely. Within an opened shard, omitted
+/// tensors is therefore skipped completely. Every opened shard header must
+/// exactly match all index entries assigned to that shard, while omitted
 /// tensors never become MLX arrays. Selected source views are sliced before
 /// their final stream copy, then explicitly evaluated while the mmap is alive.
 /// Peak temporary memory is bounded by the accumulated local partition plus at
@@ -1187,6 +1188,37 @@ mod tests {
         let partition = load_safetensors_partition(dir.path(), &plan, &stream()).unwrap();
         assert!(partition.is_empty());
         assert!(partition.opened_shards().is_empty());
+    }
+
+    #[test]
+    fn selective_loader_rejects_an_incomplete_opened_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_i32_tensor(
+            &dir.path().join("local.safetensors"),
+            "requested.weight",
+            &[1],
+            vec![1],
+        );
+        std::fs::write(dir.path().join("remote.safetensors"), b"not safetensors").unwrap();
+        write_index(
+            dir.path(),
+            &[
+                ("requested.weight", "local.safetensors"),
+                ("missing.weight", "local.safetensors"),
+                ("remote.weight", "remote.safetensors"),
+            ],
+        );
+        let mut plan = PlacementPlan::new(topology(0, 1, 1, 1));
+        plan.insert("requested.weight", TensorPlacement::Local);
+        plan.insert("missing.weight", TensorPlacement::Omit);
+        plan.insert("remote.weight", TensorPlacement::Omit);
+
+        assert!(matches!(
+            load_safetensors_partition(dir.path(), &plan, &stream()),
+            Err(Error::CheckpointStore(
+                eredu_checkpoint::store::StoreError::ContradictoryIndexMapping { key, .. }
+            )) if key == "missing.weight"
+        ));
     }
 
     #[test]
