@@ -34,6 +34,8 @@ generation-default, and chat-template metadata. Its backend, session, prompts,
 token handles, drafting resources, and native errors remain private:
 
 ```rust,no_run
+# #[cfg(feature = "mlx")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use eredu::api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel};
 use eredu_core::ExecutionPlan;
 
@@ -43,6 +45,9 @@ let factory = LocalBackendFactory::default();
 let planned = LocalModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
 let (mut model, drafting) = planned.into_parts();
 # Ok::<(), Box<dyn std::error::Error>>(())
+# }
+# #[cfg(not(feature = "mlx"))]
+# fn main() {}
 ```
 
 `default_local_device` selects accelerator zero in CUDA and Apple Metal builds,
