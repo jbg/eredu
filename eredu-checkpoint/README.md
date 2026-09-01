@@ -6,9 +6,10 @@ selection plans, and encoded tensor leases without allocating backend tensors
 or executing accelerator operations.
 
 The crate includes portable SafeTensors and GGUF validation and storage
-interfaces. Its canonical SafeTensors shard discovery rejects malformed index
-mappings and confines resolved payloads to the checkpoint access root; artifact
-inspection, stores, and conversion tooling share that facility. Architecture
+interfaces. Its canonical SafeTensors shard discovery requires every index
+mapping to exactly match the referenced shard headers and confines resolved
+payloads to the checkpoint access root; artifact inspection, stores, and
+conversion tooling share that facility. Architecture
 crates use these types to declare checkpoint intent; backend implementations
 decide how selected values are materialized and where they reside.
 

@@ -171,9 +171,10 @@ examples; they do not live under the facade.
 
 Portable crates split tensor-independent ownership by responsibility:
 
-- `eredu-checkpoint` owns canonical SafeTensors index parsing and shard-path
-  admission; inspection, neutral stores, and conversion tooling consume the
-  same discovery result and never reinterpret `weight_map`;
+- `eredu-checkpoint` owns canonical SafeTensors index parsing, exact
+  index-to-shard-header validation, and shard-path admission; inspection,
+  neutral stores, and conversion tooling consume the same discovery result and
+  never reinterpret `weight_map`;
 - artifact identity, header inspection, the model-configuration resolver
   contract, tensor catalogs, and preparation plans live in `eredu-core`;
 - validated attention schedules and parallel topologies;

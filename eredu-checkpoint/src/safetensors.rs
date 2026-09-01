@@ -1,7 +1,9 @@
-//! Canonical discovery and path admission for SafeTensors checkpoints.
+//! Canonical discovery and index validation for SafeTensors checkpoints.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 
@@ -9,10 +11,11 @@ use serde::{de::MapAccess, Deserialize, Deserializer};
 
 /// One canonically resolved SafeTensors checkpoint shard set.
 ///
-/// Discovery parses an optional Hugging Face index exactly once, rejects
-/// duplicate or empty tensor mappings, and resolves every payload beneath the
-/// checkpoint access root. Snapshot payload symlinks may target the sibling
-/// repository `blobs` directory, but no path may escape that repository.
+/// Discovery parses an optional Hugging Face index exactly once, requires its
+/// tensor map to exactly match the referenced shard headers, and resolves every
+/// payload beneath the checkpoint access root. Snapshot payload symlinks may
+/// target the sibling repository `blobs` directory, but no path may escape that
+/// repository.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SafetensorsShards {
     payload_paths: Vec<PathBuf>,
@@ -58,7 +61,7 @@ impl SafetensorsShards {
             });
         }
 
-        let mut payload_paths = BTreeSet::new();
+        let mut indexed_names = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         let mut tensor_locations = BTreeMap::new();
         for (tensor, relative) in index.weight_map.0 {
             if tensor.is_empty() {
@@ -69,11 +72,15 @@ impl SafetensorsShards {
             }
             let relative = validate_relative_shard_path(Path::new(&relative))?;
             let payload = admit_payload(&root.join(relative), &access_root)?;
-            payload_paths.insert(payload.clone());
+            indexed_names
+                .entry(payload.clone())
+                .or_default()
+                .insert(tensor.clone());
             tensor_locations.insert(tensor, payload);
         }
+        validate_indexed_shards(&index_path, &indexed_names)?;
         Ok(Self {
-            payload_paths: payload_paths.into_iter().collect(),
+            payload_paths: indexed_names.into_keys().collect(),
             tensor_locations: Some(tensor_locations),
         })
     }
@@ -109,6 +116,14 @@ pub enum SafetensorsShardError {
     #[error("malformed SafeTensors index {path}: {message}", path = .path.display())]
     MalformedIndex {
         /// Index path.
+        path: PathBuf,
+        /// Decoder or validation detail.
+        message: String,
+    },
+    /// A referenced payload header could not be decoded for index validation.
+    #[error("malformed SafeTensors shard {path}: {message}", path = .path.display())]
+    MalformedShard {
+        /// Invalid payload path.
         path: PathBuf,
         /// Decoder or validation detail.
         message: String,
@@ -166,6 +181,78 @@ impl<'de> Deserialize<'de> for UniqueWeightMap {
             }
         }
         deserializer.deserialize_map(Visitor)
+    }
+}
+
+fn validate_indexed_shards(
+    index_path: &Path,
+    indexed_names: &BTreeMap<PathBuf, BTreeSet<String>>,
+) -> Result<(), SafetensorsShardError> {
+    for (shard, expected) in indexed_names {
+        let actual = read_tensor_names(shard)?;
+        if let Some(tensor) = expected.difference(&actual).next() {
+            return Err(SafetensorsShardError::MalformedIndex {
+                path: index_path.to_path_buf(),
+                message: format!(
+                    "weight_map assigns tensor {tensor:?} to {}, but that shard does not contain it",
+                    shard.display()
+                ),
+            });
+        }
+        if let Some(tensor) = actual.difference(expected).next() {
+            return Err(SafetensorsShardError::MalformedIndex {
+                path: index_path.to_path_buf(),
+                message: format!(
+                    "shard {} contains tensor {tensor:?}, but weight_map does not assign it to that shard",
+                    shard.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_tensor_names(path: &Path) -> Result<BTreeSet<String>, SafetensorsShardError> {
+    const MAX_HEADER_BYTES: u64 = 100_000_000;
+
+    let mut file = File::open(path).map_err(|error| io_error(path, error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| io_error(path, error))?
+        .len();
+    let mut length = [0_u8; 8];
+    file.read_exact(&mut length)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    let header_len = u64::from_le_bytes(length);
+    if header_len > MAX_HEADER_BYTES {
+        return Err(malformed_shard(
+            path,
+            format!("header exceeds {MAX_HEADER_BYTES} bytes"),
+        ));
+    }
+    let payload_start = 8_u64
+        .checked_add(header_len)
+        .ok_or_else(|| malformed_shard(path, "header length overflow"))?;
+    if payload_start > file_len {
+        return Err(malformed_shard(path, "header exceeds shard length"));
+    }
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| malformed_shard(path, "header length overflows usize"))?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    let raw = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&header)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    Ok(raw
+        .into_keys()
+        .filter(|name| name != "__metadata__")
+        .collect())
+}
+
+fn malformed_shard(path: &Path, message: impl Into<String>) -> SafetensorsShardError {
+    SafetensorsShardError::MalformedShard {
+        path: path.to_path_buf(),
+        message: message.into(),
     }
 }
 
@@ -233,16 +320,26 @@ fn io_error(path: &Path, error: std::io::Error) -> SafetensorsShardError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
 
     fn write_index(root: &Path, contents: &str) {
         std::fs::write(root.join("model.safetensors.index.json"), contents).unwrap();
     }
 
+    fn write_shard(path: &Path, name: &str) {
+        serialize_to_file(
+            [(name, TensorView::new(Dtype::U8, vec![1], &[0]).unwrap())],
+            None,
+            path,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn indexed_discovery_is_unique_canonical_and_deterministic() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("z.safetensors"), []).unwrap();
-        std::fs::write(root.path().join("a.safetensors"), []).unwrap();
+        write_shard(&root.path().join("z.safetensors"), "z");
+        write_shard(&root.path().join("a.safetensors"), "a");
         write_index(
             root.path(),
             r#"{"weight_map":{"z":"z.safetensors","a":"a.safetensors"}}"#,
@@ -260,6 +357,59 @@ mod tests {
             shards.tensor_locations().unwrap()["a"],
             shards.payload_paths()[0]
         );
+    }
+
+    #[test]
+    fn indexed_discovery_rejects_missing_misassigned_and_unindexed_tensors() {
+        let missing = tempfile::tempdir().unwrap();
+        write_shard(&missing.path().join("payload.safetensors"), "actual");
+        write_index(
+            missing.path(),
+            r#"{"weight_map":{"claimed":"payload.safetensors"}}"#,
+        );
+        assert!(matches!(
+            SafetensorsShards::discover(missing.path()),
+            Err(SafetensorsShardError::MalformedIndex { .. })
+        ));
+
+        let swapped = tempfile::tempdir().unwrap();
+        write_shard(&swapped.path().join("a.safetensors"), "a");
+        write_shard(&swapped.path().join("b.safetensors"), "b");
+        write_index(
+            swapped.path(),
+            r#"{"weight_map":{"a":"b.safetensors","b":"a.safetensors"}}"#,
+        );
+        assert!(matches!(
+            SafetensorsShards::discover(swapped.path()),
+            Err(SafetensorsShardError::MalformedIndex { .. })
+        ));
+
+        let unindexed = tempfile::tempdir().unwrap();
+        let first = [0_u8];
+        let second = [1_u8];
+        serialize_to_file(
+            [
+                (
+                    "declared",
+                    TensorView::new(Dtype::U8, vec![1], &first).unwrap(),
+                ),
+                (
+                    "extra",
+                    TensorView::new(Dtype::U8, vec![1], &second).unwrap(),
+                ),
+            ],
+            None,
+            &unindexed.path().join("payload.safetensors"),
+        )
+        .unwrap();
+        write_index(
+            unindexed.path(),
+            r#"{"weight_map":{"declared":"payload.safetensors"}}"#,
+        );
+        assert!(matches!(
+            SafetensorsShards::discover(unindexed.path()),
+            Err(SafetensorsShardError::MalformedIndex { .. })
+        ));
     }
 
     #[test]

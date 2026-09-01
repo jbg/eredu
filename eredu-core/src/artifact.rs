@@ -1208,6 +1208,29 @@ mod tests {
         assert_eq!(architecture_plan.format, Some(ArtifactFormat::SafeTensors));
     }
 
+    #[test]
+    fn safetensors_inspection_rejects_index_entries_missing_from_their_shard() {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(root.path(), "llama");
+        std::fs::rename(
+            root.path().join("model.safetensors"),
+            root.path().join("model-00001.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"missing.weight":"model-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            inspect_artifact(root.path(), &FixtureResolver),
+            Err(ArtifactError::SafetensorsShards(
+                eredu_checkpoint::safetensors::SafetensorsShardError::MalformedIndex { .. }
+            ))
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn safetensors_inspection_rejects_indexed_symlinks_outside_the_access_root() {

@@ -94,7 +94,9 @@ before materialization. Tokenizer and chat-template selection use checkpoint
 sidecars. Multimodal models additionally require their processor configuration
 and media-tower weights. Indexed tensor mappings must have unique keys; every
 shard path must be relative and contained by the checkpoint's canonical access
-root. The same validation applies to checkpoint conversion and quantization.
+root, and the index must assign every tensor to the shard header that contains
+it without omitting physical shard tensors. The same validation applies to
+checkpoint conversion and quantization.
 
 Recognized stored formats include dense F32/F16/BF16, packed affine and MXFP4
 layouts, family-specific packed experts, and native dynamic E4M3 block-FP8 for
