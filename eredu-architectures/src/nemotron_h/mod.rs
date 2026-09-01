@@ -35,7 +35,9 @@ pub use parallel::{
 };
 
 /// Derives complete expert ownership and rank-local ReLU-squared bank geometry.
-pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
+pub fn expert_realization_plan<
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>, eredu_nn::Error> {
@@ -48,8 +50,8 @@ pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(eredu_nn::Error::backend)?
@@ -165,13 +167,14 @@ pub fn state_identity(
             "Nemotron-H owns state layers {global_layer_start}..{global_layer_end}, outside {total} layers"
         )));
     }
-    Ok(eredu_runtime::ModelStateIdentity {
-        model_family: "nemotron_h".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
-        layer_count: total,
+    eredu_runtime::ModelStateIdentity::new(
+        "nemotron_h",
+        args.model_type.clone(),
+        prompt_cache_architecture_fingerprint(args),
+        total,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(eredu_nn::Error::backend)
 }

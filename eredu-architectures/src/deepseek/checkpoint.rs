@@ -887,7 +887,7 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
         .collect::<Result<Vec<_>, _>>()?;
         units.push(
             crate::ExpertResidencyUnit::new(
-                eredu_runtime::ExpertIdentity::new(identity_layer, expert),
+                eredu_runtime::ParameterBankKey::new(identity_layer, expert),
                 owner_group.clone(),
                 owner_unit,
                 unit_path,
@@ -2024,7 +2024,10 @@ mod tests {
         let residency = v3_expert_residency_catalog(&catalog, &args, Some(16..48)).unwrap();
         assert_eq!(residency.units().len(), 8);
         let target = &residency.units()[0];
-        assert_eq!(target.identity(), eredu_runtime::ExpertIdentity::new(1, 0));
+        assert_eq!(
+            target.identity(),
+            eredu_runtime::ParameterBankKey::new(1, 0)
+        );
         assert_eq!(target.owner_group().as_str(), "target");
         assert_eq!(target.owner_unit(), 1);
         assert_eq!(target.unit_path(), "model.layers.1");
@@ -2047,21 +2050,21 @@ mod tests {
         let prediction = &residency.units()[4];
         assert_eq!(
             prediction.identity(),
-            eredu_runtime::ExpertIdentity::new(2, 0)
+            eredu_runtime::ParameterBankKey::new(2, 0)
         );
         assert_eq!(prediction.owner_group().as_str(), "mtp.0");
         assert_eq!(prediction.owner_unit(), 0);
         assert_eq!(prediction.unit_path(), "model.layers.2");
         assert_eq!(
             residency.units()[7].identity(),
-            eredu_runtime::ExpertIdentity::new(2, 3)
+            eredu_runtime::ParameterBankKey::new(2, 3)
         );
         let prediction = residency
             .into_units_selected_by_owner(|group, unit| group.as_str() == "mtp.0" && unit == 0)
             .collect::<Vec<_>>();
         assert_eq!(prediction.len(), 4);
         assert!(prediction.iter().all(|unit| {
-            unit.identity().layer == 2
+            unit.identity().unit() == 2
                 && unit.owner_group().as_str() == "mtp.0"
                 && unit.owner_unit() == 0
         }));

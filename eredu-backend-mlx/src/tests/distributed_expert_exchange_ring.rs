@@ -12,8 +12,8 @@ use crate::{
     backend::error::Error,
     backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
     backend::runtime::residency::parameter_bank::{
-        AddressableParameterBank, BankAccessClass, ParameterBankEntry, ParameterBankKey,
-        ParameterBankSelection,
+        AddressableParameterBank, BankAccessClass, ParameterBankEntry,
+        ParameterBankKey as BackendParameterBankKey, ParameterBankSelection,
     },
     composition::expert_dispatch::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
@@ -24,7 +24,7 @@ use crate::{
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
 use eredu_core::{residency::OffloadConfig, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,
+    ExpertPass, OffloadUnit, ParameterBankKey, ParameterBankLoadOptions, WeightBinding,
 };
 use safemlx::{
     distributed::{self, Backend},
@@ -160,6 +160,7 @@ fn execute_cached_qwen_routes(
     let access = match pass {
         ExpertPass::Prefill => BankAccessClass::Bulk,
         ExpertPass::Decode => BankAccessClass::Incremental,
+        _ => unreachable!("unsupported expert pass requires explicit test coverage"),
     };
     Ok(cache.execute_selections_bounded(
         ParameterBankSelection::new(
@@ -374,7 +375,7 @@ fn expert_exchange_ring_worker() {
         .iter()
         .copied()
         .map(|expert| {
-            let identity = ExpertIdentity::new(0, expert);
+            let identity = ParameterBankKey::new(0, expert);
             let bindings = [
                 WeightBinding::new(
                     "gate_up_proj",
@@ -399,7 +400,7 @@ fn expert_exchange_ring_worker() {
                 )
                 .unwrap(),
             ];
-            let key = ParameterBankKey::new(identity.layer, identity.global_expert);
+            let key = BackendParameterBankKey::new(identity.unit(), identity.member());
             let unit = OffloadUnit::new(key.unit_id(), bindings).unwrap();
             ParameterBankEntry::new(key, unit, 12).unwrap()
         })
@@ -407,7 +408,7 @@ fn expert_exchange_ring_worker() {
     let cache = AddressableParameterBank::new(
         store,
         entries,
-        ExpertCacheLoadOptions::new(OffloadConfig::new(Some(24), Some(24), 1).unwrap(), 24, 24)
+        ParameterBankLoadOptions::new(OffloadConfig::new(Some(24), Some(24), 1).unwrap(), 24, 24)
             .unwrap(),
         stream.clone(),
         stream.clone(),

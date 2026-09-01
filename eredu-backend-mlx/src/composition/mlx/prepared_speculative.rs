@@ -40,7 +40,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        let tokenizer_fingerprint = request.tokenizer_fingerprint;
+        let tokenizer_fingerprint = request.tokenizer_fingerprint();
         MlxSpeculativeSession::new(runtime, tokenizer_fingerprint).with_execution(request, visitor)
     }
 }
@@ -101,19 +101,21 @@ where
             config.temperature,
             streams,
         )?;
-        prepared.push(PreparedSpeculativeLane {
+        let sequence =
+            GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied());
+        prepared.push(PreparedSpeculativeLane::new(
             cache,
             input,
-            runtime: SpeculativeOutputRuntime::new(
+            config,
+            SpeculativeOutputRuntime::new(
                 sampling,
-                GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
+                sequence,
                 SpeculativeSemanticConstraint::semantic(semantic),
                 SpeculativeCallbackPublisher::semantic(on_event),
                 cancellation,
             ),
-            config,
             randomness,
-        });
+        ));
     }
     visitor
         .run(
@@ -177,16 +179,14 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
     {
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
-        for lane in lanes {
-            let SpeculativeGenerationLane {
-                prompt,
-                generation,
-                config,
-                constraint,
-                semantic,
-                cancellation,
-                on_event,
-            } = lane;
+        for mut lane in lanes {
+            let prompt = lane.take_prompt();
+            let generation = lane.take_generation();
+            let config = lane.take_config();
+            let constraint = lane.take_constraint();
+            let semantic = lane.take_semantic();
+            let cancellation = lane.take_cancellation();
+            let on_event = lane.take_on_event();
             let (prng_key, sampler) =
                 Self::prepare_mlx_speculative_sampling(generation, constraint)?;
             prepared_lanes.push(MlxSpeculativeLaneRuntime {
@@ -204,18 +204,15 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
 
     fn with_execution<C, V>(
         &mut self,
-        request: SpeculativeGenerationBatchRequest<'_, MlxBackend<'world>, MlxDrafter, C>,
+        mut request: SpeculativeGenerationBatchRequest<'_, MlxBackend<'world>, MlxDrafter, C>,
         visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
     where
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        let SpeculativeGenerationBatchRequest {
-            drafting,
-            lanes,
-            tokenizer_fingerprint: _,
-        } = request;
+        let drafting = request.take_drafting();
+        let lanes = request.take_lanes();
         match drafting {
             SpeculativeDraft::External(drafter) => {
                 self.generate_speculative_batch_with_external_draft(drafter, lanes, visitor)
@@ -223,6 +220,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             SpeculativeDraft::Embedded => {
                 self.generate_speculative_batch_with_embedded_draft(lanes, visitor)
             }
+            _ => Err(Error::ArchitectureModel(
+                "unsupported speculative draft source".to_string(),
+            )),
         }
     }
 
@@ -337,7 +337,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                                 "distributed embedded MTP requires selected topology".into(),
                             )
                         })?;
-                    if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
+                    if topology.pipeline_parallel_size() != 1
+                        || topology.expert_parallel_size() != 1
+                    {
                         return Err(Error::Speculative(
                             "complete-model embedded MTP requires pure tensor parallelism".into(),
                         ));
@@ -351,12 +353,12 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                         )
                     })?;
                     let sampling_rank = topology
-                        .global_rank_for(eredu_core::ParallelCoordinates {
-                            tensor: 0,
-                            pipeline: 0,
-                            expert: 0,
-                            data: topology.data_parallel_rank,
-                        })
+                        .global_rank_for(eredu_core::ParallelCoordinates::new(
+                            0,
+                            0,
+                            0,
+                            topology.data_parallel_rank(),
+                        ))
                         .map_err(|error| Error::Parallel(error.to_string()))?;
                     let world = execution.world();
                     let synchronized = |sampler| {
@@ -562,15 +564,15 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 let mut caches = (0..lane_count)
                     .map(|_| model.new_cache())
                     .collect::<Result<Vec<_>, _>>()?;
-                let topology = model.stage_info().topology;
+                let topology = model.stage_info().topology();
                 super::distributed::topology::validate_session(topology, execution)?;
                 let sampling_rank = topology
-                    .global_rank_for(eredu_core::ParallelCoordinates {
-                        tensor: 0,
-                        pipeline: topology.pipeline_parallel_size - 1,
-                        expert: 0,
-                        data: topology.data_parallel_rank,
-                    })
+                    .global_rank_for(eredu_core::ParallelCoordinates::new(
+                        0,
+                        topology.pipeline_parallel_size() - 1,
+                        0,
+                        topology.data_parallel_rank(),
+                    ))
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 let world = execution.world();
                 let mut target = PipelineEmbeddedMtpTarget::new(model, execution);

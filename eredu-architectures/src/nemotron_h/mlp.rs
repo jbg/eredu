@@ -17,14 +17,14 @@ use super::ModelArgs;
 /// Dense up/ReLU²/down projection pair.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseMlp<B: GroupedNeuralBackend> {
+pub struct DenseMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Up projection.
     pub up_proj: B::Linear,
     /// Down projection.
     pub down_proj: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend> DenseMlp<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
     /// Builds one unloaded dense MLP.
     pub fn new(
         args: &ModelArgs,
@@ -94,7 +94,7 @@ impl<B: GroupedNeuralBackend> DenseMlp<B> {
 /// Grouped sigmoid selection: routing, packed ReLU² experts, and one shared expert.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMoe<B: GroupedNeuralBackend> {
+pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Grouped correction-bias router.
@@ -105,7 +105,7 @@ pub struct SparseMoe<B: GroupedNeuralBackend> {
     pub shared_experts: DenseMlp<B>,
 }
 
-impl<B: GroupedNeuralBackend> SparseMoe<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> {
     /// Builds one unloaded sparse unit at placement-resolved widths.
     pub fn new(
         args: &ModelArgs,

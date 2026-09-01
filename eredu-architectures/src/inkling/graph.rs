@@ -395,8 +395,8 @@ mod tests {
         .unwrap()
         .prompt_cache_identity(&composite)
         .unwrap();
-        assert_eq!(identity.layer_count, 4);
-        assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
+        assert_eq!(identity.layer_count(), 4);
+        assert_eq!(identity.layer_prefix_offsets(), [0, 0, -1, -1]);
 
         let prediction_layout = composite.slice(target.len()..composite.len()).unwrap();
         let prediction_identity = super::super::state_identity(
@@ -408,7 +408,7 @@ mod tests {
         .unwrap()
         .prompt_cache_identity(&prediction_layout)
         .unwrap();
-        assert_eq!(prediction_identity.layer_count, 4);
-        assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);
+        assert_eq!(prediction_identity.layer_count(), 4);
+        assert_eq!(prediction_identity.layer_prefix_offsets(), [-1, -1]);
     }
 }

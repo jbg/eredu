@@ -48,28 +48,33 @@ pub fn state_identity(
             "V3 owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: "deepseek_v3".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: super::v3_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        "deepseek_v3",
+        args.model_type.clone(),
+        super::v3_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }
 
 /// One target or appended prediction execution unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
+pub enum Unit<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+> {
     /// Ordinary target decoder block.
     Target(V3Block<B>),
     /// One embedded prediction depth.
     Prediction(V3PredictionLayer<B>),
 }
 
-impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> Unit<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
+    Unit<B>
+{
     /// Returns the exact routed bank specification retained by this realized unit.
     pub fn expert_bank_spec(&self) -> Option<&eredu_nn::GroupedGatedProductSpec> {
         let feed_forward = match self {
@@ -85,7 +90,9 @@ impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> Unit<B> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -113,7 +120,9 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -277,7 +286,9 @@ pub enum TargetPartitionInput<'a, T> {
 
 /// Thin target-model architecture over the shared V3 block and generic
 /// resident/layerwise execution lifecycle.
-pub struct Model<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
+pub struct Model<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+> {
     args: V3Args,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
@@ -287,7 +298,7 @@ pub struct Model<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     type DefinitionError = Error;
 
@@ -340,7 +351,9 @@ where
     }
 }
 
-impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
+    Model<B>
+{
     /// Builds the unloaded pinned V3 modules.
     pub fn new(args: V3Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
@@ -1065,7 +1078,7 @@ fn prediction_groups(args: &V3Args) -> Result<SequentialPredictionGroups, Error>
 
 impl<B, S> LayeredArchitecture<B, S> for Model<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -1315,7 +1328,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -1465,7 +1478,9 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

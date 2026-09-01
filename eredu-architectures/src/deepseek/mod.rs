@@ -47,7 +47,9 @@ pub fn v3_expert_realization_plan<B>(
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::BlockwiseAttentionBackend,
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend,
 {
     let args = architecture.args();
     let global_experts =
@@ -55,8 +57,8 @@ where
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(eredu_nn::Error::backend)?
@@ -106,7 +108,9 @@ pub fn v4_expert_realization_plan<B>(
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error>
 where
-    B: eredu_nn::HyperNeuralBackend + eredu_nn::GroupedNeuralBackend,
+    B: eredu_nn::HyperNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend,
 {
     let args = architecture.args();
     let global_experts =
@@ -114,8 +118,8 @@ where
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(eredu_nn::Error::backend)?

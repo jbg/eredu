@@ -12,7 +12,7 @@ use super::{DecoderLayer, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, 
 /// One prediction depth's hidden/token fusion and ordinary decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct MtpDepth<B: GroupedNeuralBackend> {
+pub struct MtpDepth<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Target hidden-state normalization.
     pub hidden_norm: B::Normalization,
     /// Next-token embedding normalization.
@@ -35,7 +35,7 @@ pub struct MtpOutput<T> {
 /// Complete embedded multi-token prediction chain.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct MtpModel<B: GroupedNeuralBackend> {
+pub struct MtpModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Ordered prediction depths.
     pub layers: Vec<MtpDepth<B>>,
     /// Optional normalization between prediction depths.
@@ -44,7 +44,7 @@ pub struct MtpModel<B: GroupedNeuralBackend> {
     policies: Vec<AttentionPolicy>,
 }
 
-impl<B: GroupedNeuralBackend> MtpModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpModel<B> {
     /// Builds no predictor when the checkpoint declares zero depths.
     pub fn new(
         args: &ModelArgs,

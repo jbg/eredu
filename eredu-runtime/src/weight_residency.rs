@@ -140,6 +140,7 @@ impl<T> DenseTransferSchedule<T> {
 
 /// Invalid transition in a bounded dense transfer schedule.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DenseTransferScheduleError {
     /// A transfer window cannot have zero capacity.
     #[error("dense transfer window capacity must be nonzero")]
@@ -175,13 +176,13 @@ pub enum DenseTransferScheduleError {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LayerwiseLoadOptions {
     /// Residency budgets and maximum device-unit window.
-    pub offload: OffloadConfig,
+    offload: OffloadConfig,
     /// Maximum number of checkpoint payload shards or readers retained in cache.
-    pub max_cached_shards: usize,
+    max_cached_shards: usize,
     /// Sample backend allocator memory when a forward pass completes.
-    pub sample_backend_memory: bool,
+    sample_backend_memory: bool,
     /// Sample process memory metrics when a forward pass completes.
-    pub sample_process_memory: bool,
+    sample_process_memory: bool,
 }
 
 impl LayerwiseLoadOptions {
@@ -191,6 +192,34 @@ impl LayerwiseLoadOptions {
             offload,
             ..Self::default()
         }
+    }
+
+    /// Selects the checkpoint-reader cache bound.
+    pub const fn with_max_cached_shards(mut self, maximum: usize) -> Self {
+        self.max_cached_shards = maximum;
+        self
+    }
+    /// Selects allocator and process memory sampling.
+    pub const fn with_memory_sampling(mut self, backend: bool, process: bool) -> Self {
+        self.sample_backend_memory = backend;
+        self.sample_process_memory = process;
+        self
+    }
+    /// Returns the exact offload limits.
+    pub const fn offload(self) -> OffloadConfig {
+        self.offload
+    }
+    /// Returns the checkpoint-reader cache bound.
+    pub const fn max_cached_shards(self) -> usize {
+        self.max_cached_shards
+    }
+    /// Returns whether backend allocator sampling is enabled.
+    pub const fn samples_backend_memory(self) -> bool {
+        self.sample_backend_memory
+    }
+    /// Returns whether process memory sampling is enabled.
+    pub const fn samples_process_memory(self) -> bool {
+        self.sample_process_memory
     }
 }
 
@@ -209,21 +238,21 @@ impl Default for LayerwiseLoadOptions {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DenseDiskStreamLoadOptions {
     /// Finite logical device parameter budget, including pinned static weights.
-    pub device_budget_bytes: u64,
+    device_budget_bytes: u64,
     /// Finite charged host-allocation budget. Zero selects direct disk-to-device loading.
-    pub host_budget_bytes: u64,
+    host_budget_bytes: u64,
     /// Number of current and imminent unit host copies protected from eviction.
-    pub host_lookahead: usize,
+    host_lookahead: usize,
     /// Maximum number of pending background host materializations.
-    pub background_queue_capacity: usize,
+    background_queue_capacity: usize,
     /// Deterministic ordering used when unprotected cached copies must be evicted.
-    pub eviction_policy: CacheEvictionPolicy,
+    eviction_policy: CacheEvictionPolicy,
     /// Maximum number of checkpoint payload shards or readers retained in cache.
-    pub max_cached_shards: usize,
+    max_cached_shards: usize,
     /// Sample backend allocator memory after a forward pass.
-    pub sample_backend_memory: bool,
+    sample_backend_memory: bool,
     /// Sample process memory and page-fault counters after a forward pass.
-    pub sample_process_memory: bool,
+    sample_process_memory: bool,
 }
 
 impl DenseDiskStreamLoadOptions {
@@ -248,7 +277,7 @@ impl DenseDiskStreamLoadOptions {
         Ok(options)
     }
 
-    /// Revalidates public fields after caller customization.
+    /// Revalidates the complete bounded policy.
     pub fn validate(self) -> Result<(), WeightResidencyPolicyError> {
         if self.host_budget_bytes == 0 {
             if self.host_lookahead != 0 || self.background_queue_capacity != 0 {
@@ -270,6 +299,50 @@ impl DenseDiskStreamLoadOptions {
         self.eviction_policy = policy;
         self
     }
+
+    /// Selects the checkpoint-reader cache bound.
+    pub const fn with_max_cached_shards(mut self, maximum: usize) -> Self {
+        self.max_cached_shards = maximum;
+        self
+    }
+    /// Selects allocator and process memory sampling.
+    pub const fn with_memory_sampling(mut self, backend: bool, process: bool) -> Self {
+        self.sample_backend_memory = backend;
+        self.sample_process_memory = process;
+        self
+    }
+    /// Returns the finite logical device budget.
+    pub const fn device_budget_bytes(self) -> u64 {
+        self.device_budget_bytes
+    }
+    /// Returns the finite charged host budget.
+    pub const fn host_budget_bytes(self) -> u64 {
+        self.host_budget_bytes
+    }
+    /// Returns the protected host lookahead.
+    pub const fn host_lookahead(self) -> usize {
+        self.host_lookahead
+    }
+    /// Returns the background materialization queue bound.
+    pub const fn background_queue_capacity(self) -> usize {
+        self.background_queue_capacity
+    }
+    /// Returns deterministic eviction ordering.
+    pub const fn eviction_policy(self) -> CacheEvictionPolicy {
+        self.eviction_policy
+    }
+    /// Returns the checkpoint-reader cache bound.
+    pub const fn max_cached_shards(self) -> usize {
+        self.max_cached_shards
+    }
+    /// Returns whether backend allocator sampling is enabled.
+    pub const fn samples_backend_memory(self) -> bool {
+        self.sample_backend_memory
+    }
+    /// Returns whether process memory sampling is enabled.
+    pub const fn samples_process_memory(self) -> bool {
+        self.sample_process_memory
+    }
 }
 
 impl Default for DenseDiskStreamLoadOptions {
@@ -280,6 +353,7 @@ impl Default for DenseDiskStreamLoadOptions {
 
 /// Placement policy for ordinary architecture execution units.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[non_exhaustive]
 pub enum LayerWeightResidency {
     /// Construct every rank-local module once and retain it on the execution device.
     #[default]
@@ -290,36 +364,42 @@ pub enum LayerWeightResidency {
     DenseDiskStream(DenseDiskStreamLoadOptions),
 }
 
-/// Stable architecture-neutral identity for one layer-local routed expert.
+/// Stable mechanism identity for one member of an independently addressable bank.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExpertIdentity {
-    /// Zero-based execution-unit identity.
-    pub layer: usize,
-    /// Global expert identity emitted by the architecture router.
-    pub global_expert: usize,
+pub struct ParameterBankKey {
+    unit: usize,
+    member: usize,
 }
 
-impl ExpertIdentity {
-    /// Creates one logical expert identity.
-    pub const fn new(layer: usize, global_expert: usize) -> Self {
-        Self {
-            layer,
-            global_expert,
-        }
+impl ParameterBankKey {
+    /// Creates one generic bank member identity after semantic translation.
+    pub const fn new(unit: usize, member: usize) -> Self {
+        Self { unit, member }
+    }
+
+    /// Returns the owning execution-unit ordinal.
+    pub const fn unit(self) -> usize {
+        self.unit
+    }
+
+    /// Returns the member ordinal within the architecture's global bank namespace.
+    pub const fn member(self) -> usize {
+        self.member
     }
 
     /// Returns the deterministic residency unit identifier.
     pub fn unit_id(self) -> OffloadUnitId {
         OffloadUnitId::new(format!(
-            "expert.layer.{:05}.global.{:05}",
-            self.layer, self.global_expert
+            "bank.unit.{:05}.member.{:05}",
+            self.unit, self.member
         ))
-        .expect("expert unit identifier is non-empty")
+        .expect("parameter-bank unit identifier is non-empty")
     }
 }
 
 /// Execution-path classification for routed-expert telemetry and chunking.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum ExpertPass {
     /// Prompt processing with more than one input token.
     Prefill,
@@ -327,26 +407,26 @@ pub enum ExpertPass {
     Decode,
 }
 
-/// Backend-neutral controls for sparse routed-expert residency.
+/// Backend-neutral controls for independently addressable parameter-bank residency.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ExpertCacheLoadOptions {
-    /// Independent host/device budgets and eviction policy for expert units.
-    pub experts: OffloadConfig,
+pub struct ParameterBankLoadOptions {
+    /// Independent host/device budgets and eviction policy for bank members.
+    members: OffloadConfig,
     /// Hard maximum bytes for one materialized temporary compact bank.
-    pub compact_bank_scratch_bytes: u64,
+    compact_bank_scratch_bytes: u64,
     /// Soft compact-bank target used to split multi-token prefill routing.
-    pub prefill_compact_bank_target_bytes: u64,
+    prefill_compact_bank_target_bytes: u64,
 }
 
-impl ExpertCacheLoadOptions {
-    /// Creates strict sparse expert caching options.
+impl ParameterBankLoadOptions {
+    /// Creates strict independently addressable bank-caching options.
     pub fn new(
-        experts: OffloadConfig,
+        members: OffloadConfig,
         compact_bank_scratch_bytes: u64,
         prefill_compact_bank_target_bytes: u64,
     ) -> Result<Self, WeightResidencyPolicyError> {
         let options = Self {
-            experts,
+            members,
             compact_bank_scratch_bytes,
             prefill_compact_bank_target_bytes,
         };
@@ -354,17 +434,17 @@ impl ExpertCacheLoadOptions {
         Ok(options)
     }
 
-    /// Revalidates public fields after caller customization.
+    /// Revalidates the complete independently addressable residency policy.
     pub fn validate(self) -> Result<(), WeightResidencyPolicyError> {
         if self.compact_bank_scratch_bytes == 0 {
-            return Err(WeightResidencyPolicyError::ZeroExpertScratchLimit);
+            return Err(WeightResidencyPolicyError::ZeroParameterBankScratchLimit);
         }
         if self.prefill_compact_bank_target_bytes == 0 {
-            return Err(WeightResidencyPolicyError::ZeroExpertPrefillBankTarget);
+            return Err(WeightResidencyPolicyError::ZeroParameterBankPrefillTarget);
         }
         if self.prefill_compact_bank_target_bytes > self.compact_bank_scratch_bytes {
             return Err(
-                WeightResidencyPolicyError::ExpertPrefillBankTargetExceedsScratch {
+                WeightResidencyPolicyError::ParameterBankPrefillTargetExceedsScratch {
                     target_bytes: self.prefill_compact_bank_target_bytes,
                     scratch_bytes: self.compact_bank_scratch_bytes,
                 },
@@ -372,30 +452,44 @@ impl ExpertCacheLoadOptions {
         }
         Ok(())
     }
+
+    /// Returns the independent bank offload limits.
+    pub const fn offload(self) -> OffloadConfig {
+        self.members
+    }
+    /// Returns the hard compact-bank scratch bound.
+    pub const fn compact_bank_scratch_bytes(self) -> u64 {
+        self.compact_bank_scratch_bytes
+    }
+    /// Returns the prefill compact-bank target.
+    pub const fn prefill_compact_bank_target_bytes(self) -> u64 {
+        self.prefill_compact_bank_target_bytes
+    }
 }
 
-impl Default for ExpertCacheLoadOptions {
+impl Default for ParameterBankLoadOptions {
     fn default() -> Self {
         Self {
-            experts: OffloadConfig::default(),
+            members: OffloadConfig::default(),
             compact_bank_scratch_bytes: u64::MAX,
             prefill_compact_bank_target_bytes: 1 << 30,
         }
     }
 }
 
-/// Placement of non-expert parameters when routed experts are independent units.
+/// Placement of ordinary parameters beside independently addressable banks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum NonExpertWeightResidency {
-    /// Keep every non-expert parameter resident on the execution device.
+#[non_exhaustive]
+pub enum OrdinaryWeightResidency {
+    /// Keep every ordinary parameter resident on the execution device.
     FullyResident,
-    /// Eagerly materialize non-expert units on host behind a device window.
+    /// Eagerly materialize ordinary units on host behind a device window.
     LayerwiseHost(LayerwiseLoadOptions),
-    /// Leave non-expert units cold on disk behind finite tier caches.
+    /// Leave ordinary units cold on disk behind finite tier caches.
     DenseDiskStream(DenseDiskStreamLoadOptions),
 }
 
-impl NonExpertWeightResidency {
+impl OrdinaryWeightResidency {
     /// Returns the corresponding generalized layer policy.
     pub const fn layers(self) -> LayerWeightResidency {
         match self {
@@ -406,33 +500,36 @@ impl NonExpertWeightResidency {
     }
 }
 
-impl From<NonExpertWeightResidency> for LayerWeightResidency {
-    fn from(value: NonExpertWeightResidency) -> Self {
+impl From<OrdinaryWeightResidency> for LayerWeightResidency {
+    fn from(value: OrdinaryWeightResidency) -> Self {
         value.layers()
     }
 }
 
-/// Routed-expert placement relative to ordinary execution units.
+/// Independently addressable bank placement relative to ordinary execution units.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum ExpertWeightResidency {
-    /// Keep routed experts in the ordinary unit residency allocation.
+#[non_exhaustive]
+pub enum ParameterBankResidency {
+    /// Keep bank members in the ordinary unit residency allocation.
     #[default]
     WithLayer,
-    /// Catalog routed experts as independent atomic residency units.
-    IndependentCache(ExpertCacheLoadOptions),
+    /// Catalog bank members as independent atomic residency units.
+    IndependentCache(ParameterBankLoadOptions),
 }
 
-/// Composable ordinary-unit and routed-expert weight placement.
+/// Composable ordinary-unit and independently addressable bank placement.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum WeightResidency {
-    /// Routed experts share the ordinary unit residency allocation.
+    /// All parameters share the ordinary unit residency allocation.
     Layers(LayerWeightResidency),
-    /// Routed experts are independent units beside bounded ordinary units.
-    IndependentExperts {
+    /// Addressable bank members are independent units beside bounded ordinary units.
+    #[non_exhaustive]
+    IndependentParameterBanks {
         /// Bounded ordinary-unit policy.
-        non_experts: NonExpertWeightResidency,
-        /// Expert-granular cache controls.
-        cache: ExpertCacheLoadOptions,
+        ordinary: OrdinaryWeightResidency,
+        /// Bank-member-granular cache controls.
+        cache: ParameterBankLoadOptions,
     },
 }
 
@@ -457,55 +554,55 @@ impl WeightResidency {
         Self::Layers(layers)
     }
 
-    /// Gives routed experts an independent cache beside ordinary-unit placement.
-    pub const fn with_expert_cache(
-        non_experts: NonExpertWeightResidency,
-        cache: ExpertCacheLoadOptions,
+    /// Gives addressable parameter banks an independent cache beside ordinary units.
+    pub const fn with_independent_parameter_banks(
+        ordinary: OrdinaryWeightResidency,
+        cache: ParameterBankLoadOptions,
     ) -> Self {
-        Self::IndependentExperts { non_experts, cache }
+        Self::IndependentParameterBanks { ordinary, cache }
     }
 
     /// Returns ordinary-unit placement.
     pub const fn layers(self) -> LayerWeightResidency {
         match self {
             Self::Layers(layers) => layers,
-            Self::IndependentExperts { non_experts, .. } => non_experts.layers(),
+            Self::IndependentParameterBanks { ordinary, .. } => ordinary.layers(),
         }
     }
 
-    /// Returns routed-expert placement relative to ordinary units.
-    pub const fn experts(self) -> ExpertWeightResidency {
+    /// Returns independently addressable bank placement relative to ordinary units.
+    pub const fn parameter_banks(self) -> ParameterBankResidency {
         match self {
-            Self::Layers(_) => ExpertWeightResidency::WithLayer,
-            Self::IndependentExperts { cache, .. } => {
-                ExpertWeightResidency::IndependentCache(cache)
+            Self::Layers(_) => ParameterBankResidency::WithLayer,
+            Self::IndependentParameterBanks { cache, .. } => {
+                ParameterBankResidency::IndependentCache(cache)
             }
         }
     }
 
-    /// Returns independently cached expert controls, when selected.
-    pub const fn expert_cache(self) -> Option<ExpertCacheLoadOptions> {
+    /// Returns independently cached parameter-bank controls, when selected.
+    pub const fn parameter_bank_cache(self) -> Option<ParameterBankLoadOptions> {
         match self {
             Self::Layers(_) => None,
-            Self::IndependentExperts { cache, .. } => Some(cache),
+            Self::IndependentParameterBanks { cache, .. } => Some(cache),
         }
     }
 
-    /// Returns non-expert placement paired with an independent expert cache.
-    pub const fn non_experts(self) -> Option<NonExpertWeightResidency> {
+    /// Returns ordinary placement paired with an independent parameter-bank cache.
+    pub const fn ordinary_residency(self) -> Option<OrdinaryWeightResidency> {
         match self {
             Self::Layers(_) => None,
-            Self::IndependentExperts { non_experts, .. } => Some(non_experts),
+            Self::IndependentParameterBanks { ordinary, .. } => Some(ordinary),
         }
     }
 
-    /// Returns whether every non-expert parameter remains resident.
-    pub const fn non_experts_are_fully_resident(self) -> bool {
+    /// Returns whether every ordinary parameter remains resident.
+    pub const fn ordinary_is_fully_resident(self) -> bool {
         matches!(
             self,
             Self::Layers(LayerWeightResidency::FullyResident)
-                | Self::IndependentExperts {
-                    non_experts: NonExpertWeightResidency::FullyResident,
+                | Self::IndependentParameterBanks {
+                    ordinary: OrdinaryWeightResidency::FullyResident,
                     ..
                 }
         )
@@ -619,6 +716,7 @@ impl From<DenseDiskStreamLoadOptions> for LayerWeightResidency {
 
 /// Static-parameter placement used by the generalized execution engine.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ExecutionResidency {
     /// Every module is constructed once and all rank-local parameters remain on device.
     FullyResident,
@@ -742,6 +840,7 @@ impl LayerwiseModelMetadata {
 
 /// Invalid backend-neutral immutable-weight residency policy.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WeightResidencyPolicyError {
     /// Enabled host caching needs a protected current unit.
     #[error("dense disk streaming host lookahead must be nonzero when the host budget is enabled")]
@@ -752,15 +851,15 @@ pub enum WeightResidencyPolicyError {
     /// Direct-to-device mode cannot configure host-only controls.
     #[error("dense disk streaming with a zero host budget requires zero host lookahead and queue capacity")]
     HostDisabledControls,
-    /// Sparse expert scratch accounting was disabled with a zero limit.
-    #[error("sparse expert compact-bank scratch limit must be nonzero")]
-    ZeroExpertScratchLimit,
-    /// Sparse expert prefill chunking was disabled with a zero target.
-    #[error("sparse expert prefill compact-bank target must be nonzero")]
-    ZeroExpertPrefillBankTarget,
-    /// The sparse expert prefill target exceeded the hard scratch bound.
-    #[error("sparse expert prefill compact-bank target {target_bytes} exceeds scratch limit {scratch_bytes}")]
-    ExpertPrefillBankTargetExceedsScratch {
+    /// Parameter-bank scratch accounting was disabled with a zero limit.
+    #[error("parameter-bank compact scratch limit must be nonzero")]
+    ZeroParameterBankScratchLimit,
+    /// Parameter-bank prefill chunking was disabled with a zero target.
+    #[error("parameter-bank prefill target must be nonzero")]
+    ZeroParameterBankPrefillTarget,
+    /// The parameter-bank prefill target exceeded the hard scratch bound.
+    #[error("parameter-bank prefill target {target_bytes} exceeds scratch limit {scratch_bytes}")]
+    ParameterBankPrefillTargetExceedsScratch {
         /// Requested soft prefill target.
         target_bytes: u64,
         /// Configured hard scratch limit.
@@ -848,19 +947,21 @@ mod tests {
 
     #[test]
     fn expert_cache_controls_and_composite_placement_are_backend_neutral() {
-        let experts = ExpertCacheLoadOptions::new(OffloadConfig::default(), 64, 32).unwrap();
-        let placement =
-            WeightResidency::with_expert_cache(NonExpertWeightResidency::FullyResident, experts);
-        assert_eq!(placement.expert_cache(), Some(experts));
-        assert!(placement.non_experts_are_fully_resident());
+        let experts = ParameterBankLoadOptions::new(OffloadConfig::default(), 64, 32).unwrap();
+        let placement = WeightResidency::with_independent_parameter_banks(
+            OrdinaryWeightResidency::FullyResident,
+            experts,
+        );
+        assert_eq!(placement.parameter_bank_cache(), Some(experts));
+        assert!(placement.ordinary_is_fully_resident());
         assert!(!placement.is_fully_resident());
         assert!(matches!(
-            ExpertCacheLoadOptions::new(OffloadConfig::default(), 64, 0),
-            Err(WeightResidencyPolicyError::ZeroExpertPrefillBankTarget)
+            ParameterBankLoadOptions::new(OffloadConfig::default(), 64, 0),
+            Err(WeightResidencyPolicyError::ZeroParameterBankPrefillTarget)
         ));
         assert_eq!(
-            ExpertIdentity::new(3, 7).unit_id().as_str(),
-            "expert.layer.00003.global.00007"
+            ParameterBankKey::new(3, 7).unit_id().as_str(),
+            "bank.unit.00003.member.00007"
         );
     }
 

@@ -78,9 +78,9 @@ impl DenseStreamController {
         pinned_static_device_bytes: u64,
         groups: impl IntoIterator<Item = (String, Vec<OffloadUnitId>)>,
     ) -> Result<Self, Error> {
-        let background = (options.host_budget_bytes > 0)
+        let background = (options.host_budget_bytes() > 0)
             .then(|| {
-                BackgroundLayerPrefetch::new(manager.clone(), options.background_queue_capacity)
+                BackgroundLayerPrefetch::new(manager.clone(), options.background_queue_capacity())
             })
             .transpose()?;
         let transfer_stream_index = manager.device_stream_index()?;
@@ -173,10 +173,10 @@ impl DenseStreamController {
     }
 
     fn commit_forward(&self, manager: &ResidencyManager) -> Result<(), Error> {
-        if self.options.sample_backend_memory || self.options.sample_process_memory {
+        if self.options.samples_backend_memory() || self.options.samples_process_memory() {
             manager.sample_memory(
-                self.options.sample_backend_memory,
-                self.options.sample_process_memory,
+                self.options.samples_backend_memory(),
+                self.options.samples_process_memory(),
             )?;
         }
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
@@ -248,7 +248,7 @@ impl DenseTransferWindow {
         let device_indices = self.schedule.desired_indices(DENSE_TRANSFER_WINDOW);
         let host_indices = if self.controller.background.is_some() {
             self.schedule
-                .desired_indices(self.controller.options.host_lookahead)
+                .desired_indices(self.controller.options.host_lookahead())
         } else {
             Vec::new()
         };
@@ -1132,9 +1132,7 @@ fn stored_tensor_selection(
                 indices: indices.clone(),
             }
         }
-        TensorPlacement::Omit
-        | TensorPlacement::Rank { .. }
-        | TensorPlacement::PipelineStage { .. } => {
+        TensorPlacement::Omit | TensorPlacement::Rank { .. } => {
             return Err(Error::Parallel(format!(
                 "execution-group binding has non-TP placement {:?}",
                 tensor.placement()

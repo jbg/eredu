@@ -600,7 +600,7 @@ pub struct AssistantOutput<T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct MaskedHead<B: NeuralBackend> {
+struct MaskedHead<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     centroids: B::Linear,
     token_ordering: Parameter<B::Tensor>,
     output_weight: Parameter<B::Tensor>,
@@ -608,7 +608,7 @@ struct MaskedHead<B: NeuralBackend> {
     top_k: i32,
 }
 
-impl<B: NeuralBackend> MaskedHead<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MaskedHead<B> {
     fn new(
         config: &AssistantConfig,
         context: &<B::Tensor as Tensor>::Context,
@@ -667,7 +667,7 @@ impl<B: NeuralBackend> MaskedHead<B> {
 /// Neutral external Gemma assistant, built from ordinary shared-KV blocks.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Assistant<B: GroupedNeuralBackend> {
+pub struct Assistant<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     config: AssistantConfig,
     layers: Vec<DenseBlock<B>>,
@@ -679,7 +679,7 @@ pub struct Assistant<B: GroupedNeuralBackend> {
     masked_head: Option<MaskedHead<B>>,
 }
 
-impl<B: GroupedNeuralBackend> Assistant<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> {
     /// Builds an unloaded assistant under released SafeTensors identities.
     pub fn new(
         config: AssistantConfig,

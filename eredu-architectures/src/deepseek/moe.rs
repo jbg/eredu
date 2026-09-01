@@ -57,7 +57,7 @@ pub enum RouteSource<'a, T> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 #[allow(missing_docs)]
-pub struct RoutedPlusShared<B: GroupedNeuralBackend> {
+pub struct RoutedPlusShared<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     #[parameter(skip)]
@@ -72,7 +72,7 @@ pub struct RoutedPlusShared<B: GroupedNeuralBackend> {
 }
 
 #[allow(missing_docs)]
-impl<B: GroupedNeuralBackend> RoutedPlusShared<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusShared<B> {
     pub fn new(
         policy: &MoePolicy,
         context: &<B::Tensor as Tensor>::Context,

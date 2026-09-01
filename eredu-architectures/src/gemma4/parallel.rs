@@ -17,7 +17,7 @@ use super::{
 };
 
 /// Declares one replicated Gemma media execution unit.
-pub fn media_unit_parameter_groups<B: NeuralBackend>(
+pub fn media_unit_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     logical_name: impl Into<String>,
     unit: &impl eredu_nn::Parameterized<B::Tensor>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -30,21 +30,23 @@ pub fn media_unit_parameter_groups<B: NeuralBackend>(
 }
 
 /// Declares pinned Gemma vision modules as one atomic replicated group.
-pub fn vision_static_parameter_groups<B: NeuralBackend>(
+pub fn vision_static_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     modules: &VisionStatic<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     media_unit_parameter_groups::<B>("model.vision_tower.static", modules)
 }
 
 /// Declares pinned Gemma audio modules as one atomic replicated group.
-pub fn audio_static_parameter_groups<B: NeuralBackend>(
+pub fn audio_static_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     modules: &AudioStatic<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     media_unit_parameter_groups::<B>("model.audio_tower.static", modules)
 }
 
 /// Declares a Gemma modality projector as one atomic replicated group.
-pub fn modality_projection_parameter_groups<B: NeuralBackend>(
+pub fn modality_projection_parameter_groups<
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     logical_name: impl Into<String>,
     projector: &ModalityProjector<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -52,7 +54,7 @@ pub fn modality_projection_parameter_groups<B: NeuralBackend>(
 }
 
 /// Declares one replicated Gemma vision layer.
-pub fn vision_layer_parameter_groups<B: NeuralBackend>(
+pub fn vision_layer_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     layer: &VisionLayer<B>,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -60,7 +62,7 @@ pub fn vision_layer_parameter_groups<B: NeuralBackend>(
 }
 
 /// Declares one replicated Gemma audio layer.
-pub fn audio_layer_parameter_groups<B: NeuralBackend>(
+pub fn audio_layer_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     layer: &AudioLayer<B>,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {

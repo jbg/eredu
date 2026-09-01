@@ -1207,12 +1207,12 @@ mod tests {
         .prompt_cache_identity(&layout)
         .unwrap();
 
-        assert_eq!(identity.model_family, "muse_glimmer");
+        assert_eq!(identity.model_family(), "muse_glimmer");
         assert_eq!(
-            identity.architecture_fingerprint,
+            identity.architecture_fingerprint(),
             args.architecture_fingerprint()
         );
-        assert_eq!(identity.layer_prefix_offsets, vec![0; layout.len()]);
+        assert_eq!(identity.layer_prefix_offsets(), vec![0; layout.len()]);
     }
 
     #[test]

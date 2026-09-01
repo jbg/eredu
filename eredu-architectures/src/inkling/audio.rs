@@ -18,7 +18,7 @@ pub struct AudioInput<'a, T> {
 /// Codebook-offset embedding sum followed by learned RMS normalization.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct AudioTower<B: NeuralBackend> {
+pub struct AudioTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     embedding: B::Embedding,
     final_norm: B::Normalization,
     #[parameter(skip)]
@@ -27,7 +27,7 @@ pub struct AudioTower<B: NeuralBackend> {
     codebook_size: i32,
 }
 
-impl<B: NeuralBackend> AudioTower<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
     /// Builds the unloaded native dMel tower.
     pub fn new(
         config: &AudioConfig,

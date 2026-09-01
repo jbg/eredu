@@ -6,6 +6,7 @@ use std::ops::Range;
 /// Logical parallel axis.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ParallelAxis {
     /// Tensor parallelism.
     Tensor,
@@ -19,15 +20,64 @@ pub enum ParallelAxis {
 
 /// Coordinate of one rank in a four-dimensional topology.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ParallelCoordinates {
     /// Tensor coordinate.
-    pub tensor: usize,
+    tensor: usize,
     /// Pipeline coordinate.
-    pub pipeline: usize,
+    pipeline: usize,
     /// Expert coordinate.
-    pub expert: usize,
+    expert: usize,
     /// Data coordinate.
-    pub data: usize,
+    data: usize,
+}
+
+impl ParallelCoordinates {
+    /// Creates an explicit Cartesian rank coordinate.
+    pub const fn new(tensor: usize, pipeline: usize, expert: usize, data: usize) -> Self {
+        Self {
+            tensor,
+            pipeline,
+            expert,
+            data,
+        }
+    }
+    /// Tensor coordinate.
+    pub const fn tensor(self) -> usize {
+        self.tensor
+    }
+    /// Pipeline coordinate.
+    pub const fn pipeline(self) -> usize {
+        self.pipeline
+    }
+    /// Expert coordinate.
+    pub const fn expert(self) -> usize {
+        self.expert
+    }
+    /// Data coordinate.
+    pub const fn data(self) -> usize {
+        self.data
+    }
+    /// Returns coordinates with a replaced tensor coordinate.
+    pub const fn with_tensor(mut self, tensor: usize) -> Self {
+        self.tensor = tensor;
+        self
+    }
+    /// Returns coordinates with a replaced pipeline coordinate.
+    pub const fn with_pipeline(mut self, pipeline: usize) -> Self {
+        self.pipeline = pipeline;
+        self
+    }
+    /// Returns coordinates with a replaced expert coordinate.
+    pub const fn with_expert(mut self, expert: usize) -> Self {
+        self.expert = expert;
+        self
+    }
+    /// Returns coordinates with a replaced data coordinate.
+    pub const fn with_data(mut self, data: usize) -> Self {
+        self.data = data;
+        self
+    }
 }
 
 /// Validated sizes for every parallel axis.
@@ -35,13 +85,13 @@ pub struct ParallelCoordinates {
 #[non_exhaustive]
 pub struct ParallelTopology {
     /// Tensor-parallel size.
-    pub tensor: usize,
+    tensor: usize,
     /// Pipeline-parallel size.
-    pub pipeline: usize,
+    pipeline: usize,
     /// Expert-parallel size.
-    pub expert: usize,
+    expert: usize,
     /// Data-parallel size.
-    pub data: usize,
+    data: usize,
 }
 
 impl<'de> Deserialize<'de> for ParallelTopology {
@@ -84,6 +134,22 @@ impl ParallelTopology {
             expert,
             data,
         })
+    }
+    /// Tensor-parallel size.
+    pub const fn tensor(self) -> usize {
+        self.tensor
+    }
+    /// Pipeline-parallel size.
+    pub const fn pipeline(self) -> usize {
+        self.pipeline
+    }
+    /// Expert-parallel size.
+    pub const fn expert(self) -> usize {
+        self.expert
+    }
+    /// Data-parallel size.
+    pub const fn data(self) -> usize {
+        self.data
     }
     /// Total rank count.
     pub fn world_size(self) -> usize {
@@ -184,25 +250,25 @@ impl ParallelTopology {
 #[non_exhaustive]
 pub struct ParallelRankTopology {
     /// Number of ranks in the complete topology.
-    pub world_size: usize,
+    world_size: usize,
     /// Global rank represented by this value.
-    pub global_rank: usize,
+    global_rank: usize,
     /// Tensor-parallel rank count.
-    pub tensor_parallel_size: usize,
+    tensor_parallel_size: usize,
     /// Tensor-parallel coordinate.
-    pub tensor_parallel_rank: usize,
+    tensor_parallel_rank: usize,
     /// Pipeline-parallel rank count.
-    pub pipeline_parallel_size: usize,
+    pipeline_parallel_size: usize,
     /// Pipeline-parallel coordinate.
-    pub pipeline_parallel_rank: usize,
+    pipeline_parallel_rank: usize,
     /// Expert-parallel rank count.
-    pub expert_parallel_size: usize,
+    expert_parallel_size: usize,
     /// Expert-parallel coordinate.
-    pub expert_parallel_rank: usize,
+    expert_parallel_rank: usize,
     /// Data-parallel rank count.
-    pub data_parallel_size: usize,
+    data_parallel_size: usize,
     /// Data-parallel coordinate.
-    pub data_parallel_rank: usize,
+    data_parallel_rank: usize,
 }
 
 impl ParallelRankTopology {
@@ -227,6 +293,47 @@ impl ParallelRankTopology {
             data_parallel_size: topology.data,
             data_parallel_rank: coordinates.data,
         })
+    }
+
+    /// Number of ranks in the complete topology.
+    pub const fn world_size(self) -> usize {
+        self.world_size
+    }
+    /// Global rank represented by this value.
+    pub const fn global_rank(self) -> usize {
+        self.global_rank
+    }
+    /// Tensor-parallel rank count.
+    pub const fn tensor_parallel_size(self) -> usize {
+        self.tensor_parallel_size
+    }
+    /// Tensor-parallel coordinate.
+    pub const fn tensor_parallel_rank(self) -> usize {
+        self.tensor_parallel_rank
+    }
+    /// Pipeline-parallel rank count.
+    pub const fn pipeline_parallel_size(self) -> usize {
+        self.pipeline_parallel_size
+    }
+    /// Pipeline-parallel coordinate.
+    pub const fn pipeline_parallel_rank(self) -> usize {
+        self.pipeline_parallel_rank
+    }
+    /// Expert-parallel rank count.
+    pub const fn expert_parallel_size(self) -> usize {
+        self.expert_parallel_size
+    }
+    /// Expert-parallel coordinate.
+    pub const fn expert_parallel_rank(self) -> usize {
+        self.expert_parallel_rank
+    }
+    /// Data-parallel rank count.
+    pub const fn data_parallel_size(self) -> usize {
+        self.data_parallel_size
+    }
+    /// Data-parallel coordinate.
+    pub const fn data_parallel_rank(self) -> usize {
+        self.data_parallel_rank
     }
 
     /// Returns the complete topology shape.
@@ -442,40 +549,104 @@ impl<'de> Deserialize<'de> for ParallelRankTopology {
 
 /// Topology-derived membership of one rank in an axis subgroup.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SubgroupMembership {
     /// Axis represented by this subgroup.
-    pub axis: ParallelAxis,
+    axis: ParallelAxis,
     /// Deterministic subgroup color.
-    pub color: usize,
+    color: usize,
     /// Rank within the subgroup.
-    pub rank: usize,
+    rank: usize,
     /// Number of subgroup ranks.
-    pub size: usize,
+    size: usize,
     /// Ordered global ranks.
-    pub global_ranks: Vec<usize>,
+    global_ranks: Vec<usize>,
+}
+
+impl SubgroupMembership {
+    /// Axis represented by this subgroup.
+    pub const fn axis(&self) -> ParallelAxis {
+        self.axis
+    }
+    /// Deterministic subgroup color.
+    pub const fn color(&self) -> usize {
+        self.color
+    }
+    /// Rank within the subgroup.
+    pub const fn rank(&self) -> usize {
+        self.rank
+    }
+    /// Number of subgroup ranks.
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+    /// Ordered global ranks.
+    pub fn global_ranks(&self) -> &[usize] {
+        &self.global_ranks
+    }
 }
 
 /// Weight-independent ownership report for one parallel rank.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TopologyPreflightReport {
     /// Complete rank topology.
-    pub topology: ParallelRankTopology,
+    topology: ParallelRankTopology,
     /// Tensor subgroup.
-    pub tensor_subgroup: SubgroupMembership,
+    tensor_subgroup: SubgroupMembership,
     /// Pipeline subgroup.
-    pub pipeline_subgroup: SubgroupMembership,
+    pipeline_subgroup: SubgroupMembership,
     /// Expert subgroup.
-    pub expert_subgroup: SubgroupMembership,
+    expert_subgroup: SubgroupMembership,
     /// Data subgroup.
-    pub data_subgroup: SubgroupMembership,
+    data_subgroup: SubgroupMembership,
     /// Locally owned layer range.
-    pub local_layer_range: Option<Range<usize>>,
+    local_layer_range: Option<Range<usize>>,
     /// Locally owned expert range.
-    pub local_expert_range: Option<Range<usize>>,
+    local_expert_range: Option<Range<usize>>,
     /// Whether the embedding is local.
-    pub owns_embedding: bool,
+    owns_embedding: bool,
     /// Whether the output head is local.
-    pub owns_output_head: bool,
+    owns_output_head: bool,
+}
+
+impl TopologyPreflightReport {
+    /// Complete rank topology.
+    pub const fn topology(&self) -> ParallelRankTopology {
+        self.topology
+    }
+    /// Tensor subgroup.
+    pub const fn tensor_subgroup(&self) -> &SubgroupMembership {
+        &self.tensor_subgroup
+    }
+    /// Pipeline subgroup.
+    pub const fn pipeline_subgroup(&self) -> &SubgroupMembership {
+        &self.pipeline_subgroup
+    }
+    /// Expert subgroup.
+    pub const fn expert_subgroup(&self) -> &SubgroupMembership {
+        &self.expert_subgroup
+    }
+    /// Data subgroup.
+    pub const fn data_subgroup(&self) -> &SubgroupMembership {
+        &self.data_subgroup
+    }
+    /// Locally owned layer range.
+    pub const fn local_layer_range(&self) -> Option<&Range<usize>> {
+        self.local_layer_range.as_ref()
+    }
+    /// Locally owned expert range.
+    pub const fn local_expert_range(&self) -> Option<&Range<usize>> {
+        self.local_expert_range.as_ref()
+    }
+    /// Whether the embedding is local.
+    pub const fn owns_embedding(&self) -> bool {
+        self.owns_embedding
+    }
+    /// Whether the output head is local.
+    pub const fn owns_output_head(&self) -> bool {
+        self.owns_output_head
+    }
 }
 
 fn subgroup_color(
@@ -534,6 +705,7 @@ pub fn balanced_contiguous_range(
 
 /// Topology validation error.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TopologyError {
     /// An axis size was zero.
     #[error("parallel topology axis sizes must be positive")]

@@ -53,13 +53,15 @@ pub struct ForwardContext<T> {
 }
 
 /// Shared layered LFM2 lifecycle over a heterogeneous physical schedule.
-pub struct LayeredModel<B: GroupedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
     decoder: HybridDecoder<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
+{
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -113,7 +115,7 @@ impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layer
     }
 }
 
-impl<B: GroupedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
@@ -467,7 +469,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         self.decoder.unit_path(0, index)?;
         block.forward_parallel(
@@ -516,7 +518,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -644,7 +646,7 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -715,7 +717,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -800,7 +802,7 @@ where
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -846,7 +848,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -899,13 +901,14 @@ pub fn state_identity(
             "LFM2 owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: "lfm2".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        "lfm2",
+        args.model_type.clone(),
+        prompt_cache_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }

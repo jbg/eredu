@@ -18,7 +18,7 @@ use super::{FeedForward, ModelArgs, OperatorPolicy};
 /// Scheduled LFM2 token mixer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum TokenMixer<B: GroupedNeuralBackend> {
+pub enum TokenMixer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Grouped-query self attention.
     Attention(Attention<B>),
     /// Gated causal short convolution.
@@ -28,7 +28,7 @@ pub enum TokenMixer<B: GroupedNeuralBackend> {
 /// One exact LFM2 decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Block<B: GroupedNeuralBackend> {
+pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Scheduled token mixer.
     pub mixer: TokenMixer<B>,
     /// Scheduled dense or routed feed-forward operator.
@@ -67,7 +67,7 @@ impl BlockGeometry {
     }
 }
 
-impl<B: GroupedNeuralBackend> Block<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     /// Builds one unloaded block from the normalized physical schedule.
     pub fn new(
         args: &ModelArgs,
@@ -262,7 +262,7 @@ impl<B: GroupedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let normalized = self.operator_norm.forward(hidden, context)?;
         let mixed = match &mut self.mixer {

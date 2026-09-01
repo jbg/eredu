@@ -10,11 +10,9 @@ use std::{
 };
 
 use crate::{
-    backend::{
-        config::ModelLoadOptions,
-        topology::{DeviceAssignment, MlxParallelContext},
-    },
-    native::{MlxRealtimeBackend, MlxRealtimeInput},
+    backend::DeviceAssignment,
+    native::{MlxParallelPlan, MlxRealtimeBackend, MlxRealtimeInput},
+    MlxLoadRequest,
 };
 use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
@@ -176,9 +174,9 @@ fn run_forced_and_greedy_sequence(model: &mut RealtimeModel<MlxRealtimeBackend>)
             }
             thread::yield_now();
         };
-        push_tokens(&mut serialized, &output.text_token);
-        push_tokens(&mut serialized, &output.sampled_audio_tokens);
-        match &output.output_audio_tokens {
+        push_tokens(&mut serialized, output.text_token());
+        push_tokens(&mut serialized, output.sampled_audio_tokens());
+        match output.output_audio_tokens() {
             Some(tokens) => {
                 serialized.push(1);
                 push_tokens(&mut serialized, tokens);
@@ -242,13 +240,13 @@ fn moshi_ring_model_parity_worker() {
     let expected = run_forced_and_greedy_sequence(&mut replicated);
     drop(replicated);
 
-    let topology = MlxParallelContext::for_group(group.native_group(), 2, 1, 1, device).unwrap();
+    let topology = MlxParallelPlan::for_group(group.native_group(), 2, 1, 1, device).unwrap();
     let backend = MlxRealtimeBackend::new(&stream, &weights_stream)
         .with_tensor_parallel_group(Arc::clone(&group));
     let mut parallel = load_realtime_model_with_options(
         backend,
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
-        ModelLoadOptions::with_parallel(
+        MlxLoadRequest::with_parallel(
             topology,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,

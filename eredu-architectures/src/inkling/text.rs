@@ -102,7 +102,7 @@ where
 /// Inkling learned-relative grouped-query attention.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Attention<B: NeuralBackend> {
+pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     query_heads: i32,
     #[parameter(skip)]
@@ -141,7 +141,7 @@ pub struct Attention<B: NeuralBackend> {
     pub value_convolution: CausalDepthwiseConvolution<B>,
 }
 
-impl<B: NeuralBackend> Attention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     /// Builds one attention layer under the released parameter root.
     pub fn new(
         args: &TextArgs,
@@ -370,7 +370,7 @@ impl<B: NeuralBackend> Attention<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: GroupedNeuralBackend,
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let batch = hidden.dim(0);
         let sequence = hidden.dim(1);
@@ -467,7 +467,7 @@ impl<B: NeuralBackend> Attention<B> {
     }
 }
 
-fn residual_convolution<B: NeuralBackend>(
+fn residual_convolution<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     convolution: &CausalDepthwiseConvolution<B>,
     input: &B::Tensor,
     history: &mut Option<B::Tensor>,
@@ -481,7 +481,7 @@ fn residual_convolution<B: NeuralBackend>(
 /// Dense SwiGLU branch with its learned global scalar.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseMlp<B: NeuralBackend> {
+pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Gate projection.
     pub gate: B::Linear,
     /// Up projection.
@@ -492,7 +492,7 @@ pub struct DenseMlp<B: NeuralBackend> {
     pub global_scale: Parameter<B::Tensor>,
 }
 
-impl<B: NeuralBackend> DenseMlp<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
     fn new_at(
         args: &TextArgs,
         block_root: &str,
@@ -549,7 +549,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: GroupedNeuralBackend,
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
@@ -562,7 +562,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
 /// Sparse Inkling branch with jointly normalized routed and shared experts.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMlp<B: GroupedNeuralBackend> {
+pub struct SparseMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     routed_count: i32,
     #[parameter(skip)]
@@ -583,7 +583,7 @@ pub struct SparseMlp<B: GroupedNeuralBackend> {
     pub shared_experts: B::GatedProductGroups,
 }
 
-impl<B: GroupedNeuralBackend> SparseMlp<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> {
     fn new_at(
         args: &TextArgs,
         block_root: &str,
@@ -682,7 +682,7 @@ impl<B: GroupedNeuralBackend> SparseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let routes = B::joint_group_selection(
             JointGroupSelectionInput::new(
@@ -957,14 +957,14 @@ fn expert_bank_spec_at(
 /// Dense or sparse feed-forward branch selected by the normalized schedule.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: GroupedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Dense SwiGLU branch.
     Dense(DenseMlp<B>),
     /// Routed plus shared expert branch.
     Sparse(SparseMlp<B>),
 }
 
-impl<B: GroupedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
     fn forward(
         &mut self,
         hidden: &B::Tensor,
@@ -983,7 +983,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         match self {
             Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
@@ -1044,7 +1044,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
 /// One ordinary Inkling decoder layer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DecoderLayer<B: GroupedNeuralBackend> {
+pub struct DecoderLayer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     #[parameter(skip)]
@@ -1063,7 +1063,7 @@ pub struct DecoderLayer<B: GroupedNeuralBackend> {
     pub feed_forward_convolution: CausalDepthwiseConvolution<B>,
 }
 
-impl<B: GroupedNeuralBackend> DecoderLayer<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<B> {
     /// Builds one scheduled decoder layer.
     pub fn new(
         args: &TextArgs,
@@ -1211,7 +1211,7 @@ impl<B: GroupedNeuralBackend> DecoderLayer<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         match state {
             Some(state) => {
@@ -1468,7 +1468,7 @@ impl<T: Tensor> AuxiliaryConvolutionState<T> for NoCache {
 /// Inkling token embedding, ordinary decoder layers, and final norm.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct TextModel<B: GroupedNeuralBackend> {
+pub struct TextModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Token embedding table.
     pub embeddings: B::Embedding,
     /// Required post-embedding RMS normalization.
@@ -1485,7 +1485,7 @@ pub struct TextModel<B: GroupedNeuralBackend> {
     output_vocabulary: i32,
 }
 
-impl<B: GroupedNeuralBackend> TextModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> {
     /// Builds the complete neutral text model.
     pub fn new(args: &TextArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let norm = |name: &str| {

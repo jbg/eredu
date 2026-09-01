@@ -89,12 +89,12 @@ pub struct VisionOutput<T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub(super) struct LayerNorm<B: NeuralBackend> {
+pub(super) struct LayerNorm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     bias: Parameter<B::Tensor>,
 }
 
-impl<B: NeuralBackend> LayerNorm<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
     fn new(
         prefix: &str,
         width: i32,
@@ -129,14 +129,14 @@ impl<B: NeuralBackend> LayerNorm<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub(super) struct PatchEmbed<B: NeuralBackend> {
+pub(super) struct PatchEmbed<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     bias: Parameter<B::Tensor>,
     #[parameter(skip)]
     spec: FlattenedPatchSpec,
 }
 
-impl<B: NeuralBackend> PatchEmbed<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
     fn new(
         config: &VisionConfig,
         root: &str,
@@ -186,7 +186,7 @@ impl<B: NeuralBackend> PatchEmbed<B> {
     }
 }
 
-fn linear<B: NeuralBackend>(
+fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &VisionConfig,
     prefix: &str,
     input: i32,
@@ -211,7 +211,7 @@ fn linear<B: NeuralBackend>(
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub(super) struct Attention<B: NeuralBackend> {
+pub(super) struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) qkv: B::Linear,
     pub(super) output: B::Linear,
     #[parameter(skip)]
@@ -222,7 +222,7 @@ pub(super) struct Attention<B: NeuralBackend> {
     scale: f32,
 }
 
-impl<B: NeuralBackend> Attention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     fn new_with_heads(
         config: &VisionConfig,
         parameter_root: &str,
@@ -355,7 +355,7 @@ impl<B: NeuralBackend> Attention<B> {
 /// One shared, independently streamable vision transformer block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionBlock<B: NeuralBackend> {
+pub struct VisionBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) norm1: LayerNorm<B>,
     pub(super) attention: Attention<B>,
     pub(super) norm2: LayerNorm<B>,
@@ -365,7 +365,7 @@ pub struct VisionBlock<B: NeuralBackend> {
     activation: String,
 }
 
-impl<B: NeuralBackend> VisionBlock<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
     /// Builds one unloaded canonical block.
     pub fn new(
         config: &VisionConfig,
@@ -490,7 +490,7 @@ impl<B: NeuralBackend> VisionBlock<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub(super) struct Merger<B: NeuralBackend> {
+pub(super) struct Merger<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) norm: LayerNorm<B>,
     pub(super) fc1: B::Linear,
     pub(super) fc2: B::Linear,
@@ -504,7 +504,7 @@ pub(super) struct Merger<B: NeuralBackend> {
     approximate: bool,
 }
 
-impl<B: NeuralBackend> Merger<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
     fn new_with_intermediate(
         config: &VisionConfig,
         prefix: &str,
@@ -604,7 +604,7 @@ impl<B: NeuralBackend> Merger<B> {
 /// Pinned patch/position/merger modules used by resident and bounded execution.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionStatic<B: NeuralBackend> {
+pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) position: B::Embedding,
     pub(super) patch: PatchEmbed<B>,
     pub(super) merger: Merger<B>,
@@ -613,7 +613,7 @@ pub struct VisionStatic<B: NeuralBackend> {
     config: VisionConfig,
 }
 
-impl<B: NeuralBackend> VisionStatic<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
     /// Builds static modules for one explicit vision mode.
     pub fn new(
         config: VisionConfig,
@@ -866,14 +866,14 @@ impl<B: NeuralBackend> VisionStatic<B> {
 /// Resident tower executing the same streamable block lifecycle.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionTower<B: NeuralBackend> {
+pub struct VisionTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Pinned vision modules.
     pub static_modules: VisionStatic<B>,
     /// Independently streamable blocks.
     pub blocks: Vec<VisionBlock<B>>,
 }
 
-impl<B: NeuralBackend> VisionTower<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
     /// Builds one shared tower.
     pub fn new(
         config: VisionConfig,
@@ -932,7 +932,7 @@ fn relative_vision_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn gathered_positions<B: NeuralBackend>(
+fn gathered_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     embedding: &mut B::Embedding,
     grid: &[(i32, i32, i32)],
     count: i32,
@@ -961,7 +961,7 @@ fn gathered_positions<B: NeuralBackend>(
     )
 }
 
-fn interpolated_positions<B: NeuralBackend>(
+fn interpolated_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     embedding: &mut B::Embedding,
     grid: &[(i32, i32, i32)],
     count: i32,

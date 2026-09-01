@@ -23,7 +23,7 @@ use super::{
     inspection::{inspect_model, MlxInspectionOptions},
     realtime::MlxRealtimeBackend,
     speculative::MlxDrafter,
-    MlxBackend, ModelLoadOptions,
+    MlxBackend, MlxLoadRequest,
 };
 use crate::{
     backend::runtime::{
@@ -34,8 +34,8 @@ use crate::{
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
 use eredu_runtime::{
-    DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
-    NonExpertWeightResidency, ResidencyReport, WeightResidency,
+    DenseDiskStreamLoadOptions, LayerwiseLoadOptions, OrdinaryWeightResidency,
+    ParameterBankLoadOptions, ResidencyReport, WeightResidency,
 };
 
 /// MLX automatic-planning adapter and whole-session backend factory.
@@ -70,7 +70,7 @@ pub struct MlxRealtimeAdapter {
 
 impl RealtimeModelLoadingBackend for MlxRealtimeAdapter {
     type Preparation = eredu_architectures::moshi::RealtimePreparationPlan;
-    type LoadOptions = ModelLoadOptions;
+    type LoadOptions = MlxLoadRequest;
 
     fn materialize_realtime_model(
         &self,
@@ -290,16 +290,16 @@ pub fn discover_hardware() -> HardwareProfile {
 fn mlx_load_options(
     factory: &MlxBackendFactory,
     plan: &ExecutionPlan,
-) -> Result<ModelLoadOptions, Error> {
-    if plan.topology.world_size() != 1 {
+) -> Result<MlxLoadRequest, Error> {
+    if plan.topology().world_size() != 1 {
         return Err(Error::AutomaticPlanning(
             "single-device automatic plans require a 1x1x1 parallel topology".into(),
         ));
     }
-    let mut load = match plan.weight_transformation {
-        WeightTransformationPlan::PreserveCheckpoint => ModelLoadOptions::default(),
+    let mut load = match plan.weight_transformation() {
+        WeightTransformationPlan::PreserveCheckpoint => MlxLoadRequest::default(),
         WeightTransformationPlan::Affine { bits, group_size } => {
-            ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+            MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
                 group_size: u32::try_from(group_size).map_err(|_| {
                     Error::Quantization(format!(
                         "group_size must be non-negative, got {group_size}"
@@ -310,26 +310,30 @@ fn mlx_load_options(
             })
         }
         WeightTransformationPlan::MxFp4 => {
-            ModelLoadOptions::with_quantization(QuantizationRequest::MxFp4)
+            MlxLoadRequest::with_quantization(QuantizationRequest::MxFp4)
+        }
+        _ => {
+            return Err(Error::AutomaticPlanning(
+                "unsupported weight transformation".into(),
+            ))
         }
     };
-    load.required_session_capabilities = plan.required_session_capabilities;
-    let residency = match &plan.residency {
-        ResidencyPlan::FullyResident => NonExpertWeightResidency::FullyResident,
+    load.required_session_capabilities = *plan.required_session_capabilities();
+    let residency = match plan.residency() {
+        ResidencyPlan::FullyResident => OrdinaryWeightResidency::FullyResident,
         ResidencyPlan::LayerwiseHost {
             device_layer_window,
             device_budget_bytes,
             host_budget_bytes,
-        } => NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions {
-            offload: OffloadConfig::new(
+        } => OrdinaryWeightResidency::LayerwiseHost(
+            LayerwiseLoadOptions::new(OffloadConfig::new(
                 *device_budget_bytes,
                 *host_budget_bytes,
                 *device_layer_window,
-            )?,
-            max_cached_shards: plan.max_cached_shards,
-            sample_backend_memory: factory.sample_mlx_memory,
-            sample_process_memory: factory.sample_process_memory,
-        }),
+            )?)
+            .with_max_cached_shards(plan.max_cached_shards())
+            .with_memory_sampling(factory.sample_mlx_memory, factory.sample_process_memory),
+        ),
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes,
             host_budget_bytes,
@@ -342,30 +346,41 @@ fn mlx_load_options(
                 *host_lookahead,
                 *background_queue,
             )?;
-            options.max_cached_shards = plan.max_cached_shards;
-            options.sample_backend_memory = factory.sample_mlx_memory;
-            options.sample_process_memory = factory.sample_process_memory;
-            NonExpertWeightResidency::DenseDiskStream(options)
+            options = options
+                .with_max_cached_shards(plan.max_cached_shards())
+                .with_memory_sampling(factory.sample_mlx_memory, factory.sample_process_memory);
+            OrdinaryWeightResidency::DenseDiskStream(options)
+        }
+        _ => {
+            return Err(Error::AutomaticPlanning(
+                "unsupported residency plan".into(),
+            ))
         }
     };
-    let residency = if let Some(expert) = &plan.expert_cache {
-        WeightResidency::with_expert_cache(
+    let residency = if let Some(expert) = plan.expert_cache() {
+        WeightResidency::with_independent_parameter_banks(
             residency,
-            ExpertCacheLoadOptions::new(
-                OffloadConfig::new(expert.device_budget_bytes, expert.host_budget_bytes, 1)?
-                    .with_eviction_policy(expert.eviction_policy),
-                expert.scratch_bytes,
-                expert.prefill_bank_bytes,
+            ParameterBankLoadOptions::new(
+                OffloadConfig::new(expert.device_budget_bytes(), expert.host_budget_bytes(), 1)?
+                    .with_eviction_policy(expert.eviction_policy()),
+                expert.scratch_bytes(),
+                expert.prefill_bank_bytes(),
             )?,
         )
     } else {
         match residency {
-            NonExpertWeightResidency::FullyResident => WeightResidency::fully_resident(),
-            NonExpertWeightResidency::LayerwiseHost(options) => {
+            OrdinaryWeightResidency::FullyResident => WeightResidency::fully_resident(),
+            OrdinaryWeightResidency::LayerwiseHost(options) => {
                 WeightResidency::layerwise_host(options)
             }
-            NonExpertWeightResidency::DenseDiskStream(options) => {
+            OrdinaryWeightResidency::DenseDiskStream(options) => {
                 WeightResidency::dense_disk_stream(options)
+            }
+            _ => {
+                return Err(Error::Parallel(
+                    "automatic MLX planning selected an unsupported ordinary weight residency"
+                        .into(),
+                ));
             }
         }
     };
@@ -373,11 +388,11 @@ fn mlx_load_options(
     Ok(load)
 }
 
-fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Error> {
-    match plan.weight_transformation {
-        WeightTransformationPlan::PreserveCheckpoint => Ok(ModelLoadOptions::default()),
+fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<MlxLoadRequest, Error> {
+    match plan.weight_transformation() {
+        WeightTransformationPlan::PreserveCheckpoint => Ok(MlxLoadRequest::default()),
         WeightTransformationPlan::Affine { bits, group_size } => Ok(
-            ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+            MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
                 group_size: u32::try_from(group_size).map_err(|_| {
                     Error::Quantization(format!(
                         "group_size must be non-negative, got {group_size}"
@@ -387,8 +402,11 @@ fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Er
                     .map_err(|_| Error::Quantization(format!("bits must fit in u8, got {bits}")))?,
             }),
         ),
-        WeightTransformationPlan::MxFp4 => Ok(ModelLoadOptions::with_quantization(
+        WeightTransformationPlan::MxFp4 => Ok(MlxLoadRequest::with_quantization(
             QuantizationRequest::MxFp4,
+        )),
+        _ => Err(Error::AutomaticPlanning(
+            "unsupported weight transformation".into(),
         )),
     }
 }
@@ -418,7 +436,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
         let load = mlx_load_options(self, plan)
             .map_err(|error| planning_backend_error("realize_plan", error))?;
-        let report = inspect_model(model_path, MlxInspectionOptions { load })
+        let report = inspect_model(model_path, MlxInspectionOptions::new(load))
             .map_err(|error| planning_backend_error("admit_candidate", error))?;
         let supported = report.is_loadable();
         let rejection = (!supported).then(|| {
@@ -442,24 +460,41 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         model_path: &Path,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
-        let mut probe = plan.clone();
-        probe.expert_cache = None;
-        match &mut probe.residency {
+        let mut probe = plan.clone().with_expert_cache(None);
+        let residency = match probe.residency().clone() {
             ResidencyPlan::LayerwiseHost {
-                device_budget_bytes,
+                device_layer_window,
+                host_budget_bytes,
                 ..
-            } => *device_budget_bytes = Some(1),
+            } => ResidencyPlan::LayerwiseHost {
+                device_layer_window,
+                device_budget_bytes: Some(1),
+                host_budget_bytes,
+            },
             ResidencyPlan::DenseDiskStream {
-                device_budget_bytes,
+                host_budget_bytes,
+                host_lookahead,
+                background_queue,
                 ..
-            } => *device_budget_bytes = 1,
+            } => ResidencyPlan::DenseDiskStream {
+                device_budget_bytes: 1,
+                host_budget_bytes,
+                host_lookahead,
+                background_queue,
+            },
             ResidencyPlan::FullyResident => {
                 return Err(AutomaticPlanningError::Invalid(
                     "fully resident execution has no bounded device window".into(),
                 ));
             }
-        }
-        let realized = mlx_device(&probe.device)?;
+            _ => {
+                return Err(AutomaticPlanningError::Invalid(
+                    "unsupported residency plan".into(),
+                ))
+            }
+        };
+        probe = probe.with_residency(residency);
+        let realized = mlx_device(probe.device())?;
         let stream = Stream::new_with_device(&realized.device);
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let backend = MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity);
@@ -500,7 +535,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         &self,
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
-        let realized = mlx_device(&plan.device)?;
+        let realized = mlx_device(plan.device())?;
         let stream = Stream::new_with_device(&realized.device);
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let options = mlx_load_options(self, plan)
@@ -519,7 +554,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
     ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
         let capability =
             <MlxBackend<'static> as SpeculativeGenerationBackend>::speculative_capability(target);
-        match &plan.drafting {
+        match plan.drafting() {
             DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
             DraftingPlan::Embedded { .. } => {
                 if capability
@@ -554,6 +589,11 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         let realized = mlx_device(device)?;
                         Stream::new_with_device(&realized.device)
                     }
+                    _ => {
+                        return Err(AutomaticPlanningError::Invalid(
+                            "unsupported draft placement".into(),
+                        ))
+                    }
                 };
                 let options = mlx_drafter_load_options(plan)
                     .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
@@ -574,6 +614,9 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 })?;
                 Ok(RealizedDrafting::External(drafter))
             }
+            _ => Err(AutomaticPlanningError::Invalid(
+                "unsupported speculative drafting plan".into(),
+            )),
         }
     }
 }
@@ -625,20 +668,20 @@ pub fn parameter_bank_telemetry(report: &ParameterBankResidencyReport) -> Expert
 /// Converts neutral speculative statistics into the stable telemetry document.
 pub fn speculative_decoding_telemetry(stats: &SpeculativeStats) -> SpeculativeDecodingTelemetry {
     SpeculativeDecodingTelemetry {
-        execution_topology: stats.execution_topology.to_string(),
-        target_tokens: stats.target_tokens,
-        draft_tokens: stats.draft_tokens,
-        accepted_tokens: stats.accepted_tokens,
+        execution_topology: stats.execution_topology().to_string(),
+        target_tokens: stats.target_tokens(),
+        draft_tokens: stats.draft_tokens(),
+        accepted_tokens: stats.accepted_tokens(),
         accept_rate: stats.accept_rate(),
-        rounds: stats.rounds,
-        accept_lens: stats.accept_lens.clone(),
-        emitted_tokens: stats.emitted_tokens,
-        optimistic_draft_tokens: stats.optimistic_draft_tokens,
-        reused_optimistic_tokens: stats.reused_optimistic_tokens,
-        discarded_optimistic_tokens: stats.discarded_optimistic_tokens,
-        adaptive_lookahead_disabled: stats.adaptive_lookahead_disabled,
-        optimistic_draft_seconds: stats.optimistic_draft_time.as_secs_f64(),
-        verification_in_flight_seconds: stats.verification_in_flight_time.as_secs_f64(),
+        rounds: stats.rounds(),
+        accept_lens: stats.accept_lens().to_vec(),
+        emitted_tokens: stats.emitted_tokens(),
+        optimistic_draft_tokens: stats.optimistic_draft_tokens(),
+        reused_optimistic_tokens: stats.reused_optimistic_tokens(),
+        discarded_optimistic_tokens: stats.discarded_optimistic_tokens(),
+        adaptive_lookahead_disabled: stats.adaptive_lookahead_disabled(),
+        optimistic_draft_seconds: stats.optimistic_draft_time().as_secs_f64(),
+        verification_in_flight_seconds: stats.verification_in_flight_time().as_secs_f64(),
     }
 }
 
@@ -657,16 +700,16 @@ struct RealizedMlxDevice {
 }
 
 fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlanningError> {
-    if device.backend.as_str() != "mlx" {
+    if device.backend().as_str() != "mlx" {
         return Err(AutomaticPlanningError::Invalid(format!(
             "MLX cannot probe backend {}",
-            device.backend
+            device.backend()
         )));
     }
-    let (family, index) = device.device.split_once(':').ok_or_else(|| {
+    let (family, index) = device.device().split_once(':').ok_or_else(|| {
         AutomaticPlanningError::Invalid(format!(
             "MLX device identifier {:?} must be family:index",
-            device.device
+            device.device()
         ))
     })?;
     let index = i32::try_from(index.parse::<usize>().map_err(|error| {
@@ -684,10 +727,10 @@ fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlannin
         }
     };
     let canonical_id = format!("{family}:{index}");
-    if device.device != canonical_id {
+    if device.device() != canonical_id {
         return Err(AutomaticPlanningError::Invalid(format!(
             "MLX device identifier {:?} is not canonical; use {canonical_id:?}",
-            device.device
+            device.device()
         )));
     }
     if let Some(family) = accelerator_family {
@@ -756,8 +799,8 @@ mod tests {
 
     #[test]
     fn plan_realization_rejects_distributed_topology() {
-        let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
-        plan.topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+            .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
         assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
     }
 
@@ -769,8 +812,8 @@ mod tests {
         let backend = MlxBackend::for_execution_plan(&stream, &stream, realized.identity);
 
         let devices = backend.devices().unwrap();
-        assert_eq!(devices[0].0.id, "cpu:0");
-        assert_eq!(devices[0].0.family, "cpu");
+        assert_eq!(devices[0].0.id(), "cpu:0");
+        assert_eq!(devices[0].0.family(), "cpu");
     }
 
     #[test]
@@ -821,7 +864,7 @@ mod tests {
                 .unwrap();
         let devices = target.backend().devices().unwrap();
 
-        assert_eq!(devices[0].0.id, "metal:0");
-        assert_eq!(devices[0].0.family, "metal");
+        assert_eq!(devices[0].0.id(), "metal:0");
+        assert_eq!(devices[0].0.family(), "metal");
     }
 }

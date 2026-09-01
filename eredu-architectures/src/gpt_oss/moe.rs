@@ -48,7 +48,7 @@ fn inferred_pass<T: Tensor>(input: &T) -> ExpertPass {
 /// GPT-OSS SelectedSoftmax router and canonical biased MXFP4 expert bank.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct RoutedMlp<B: GroupedNeuralBackend> {
+pub struct RoutedMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Global layer identity used by runtime expert providers.
     #[parameter(skip)]
     pub layer: usize,
@@ -58,7 +58,9 @@ pub struct RoutedMlp<B: GroupedNeuralBackend> {
     pub experts: B::GatedProductGroups,
 }
 
-impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for RoutedMlp<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    crate::decoder::RoutedFeedForwardOperator<B> for RoutedMlp<B>
+{
     fn forward_with_provider<P>(
         &mut self,
         _layer: usize,
@@ -75,8 +77,8 @@ impl<B: GroupedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for R
     }
 }
 
-impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelRoutedFeedForwardOperator<B>
-    for RoutedMlp<B>
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    TensorParallelRoutedFeedForwardOperator<B> for RoutedMlp<B>
 {
     fn forward_parallel_with_provider<P>(
         &mut self,
@@ -95,7 +97,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelRoutedFeedFo
     }
 }
 
-impl<B: GroupedNeuralBackend> RoutedMlp<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> {
     /// Builds one unloaded GPT-OSS routed feed-forward operator.
     pub fn new(
         args: &ModelArgs,
@@ -232,7 +234,7 @@ pub(crate) fn localized_expert_bank_spec(
 }
 
 /// Derives complete expert ownership and rank-local bank geometry from GPT-OSS.
-pub fn expert_realization_plan<B: GroupedNeuralBackend>(
+pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     architecture: &super::LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
@@ -241,8 +243,8 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend>(
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(Error::backend)?
@@ -339,7 +341,9 @@ mod tests {
     }
 }
 
-impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedMlp<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOperator<B>
+    for RoutedMlp<B>
+{
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -354,8 +358,8 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for RoutedMlp<B> {
     }
 }
 
-impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
-    for RoutedMlp<B>
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    TensorParallelFeedForwardOperator<B> for RoutedMlp<B>
 {
     fn forward_feed_forward_parallel(
         &mut self,

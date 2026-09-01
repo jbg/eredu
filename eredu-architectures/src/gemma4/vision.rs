@@ -165,7 +165,7 @@ impl VisionConfig {
 /// Architecture-specific projection clipped by four learned scalar bounds.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct ClippedLinear<B: NeuralBackend> {
+pub struct ClippedLinear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Ordinary general linear operator.
     pub linear: B::Linear,
     /// Minimum input value.
@@ -178,7 +178,7 @@ pub struct ClippedLinear<B: NeuralBackend> {
     pub output_max: Parameter<B::Tensor>,
 }
 
-impl<B: NeuralBackend> ClippedLinear<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
     /// Builds one unloaded clipped projection under its checkpoint prefix.
     pub fn new(
         config: &VisionConfig,
@@ -264,14 +264,14 @@ pub struct VisionInput<'a, T> {
 /// Patch projection plus learned two-axis positions.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct PatchEmbedder<B: NeuralBackend> {
+pub struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Flattened patch projection.
     pub input_projection: B::Linear,
     /// Learned table shaped `[2, positions, hidden]`.
     pub position_table: Parameter<B::Tensor>,
 }
 
-impl<B: NeuralBackend> PatchEmbedder<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
     fn new(config: &VisionConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let weight = "model.vision_tower.patch_embedder.input_proj.weight";
         Ok(Self {
@@ -334,7 +334,7 @@ impl<B: NeuralBackend> PatchEmbedder<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct VisionAttention<B: NeuralBackend> {
+struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     query_heads: i32,
     #[parameter(skip)]
@@ -349,7 +349,7 @@ struct VisionAttention<B: NeuralBackend> {
     key_norm: B::Normalization,
 }
 
-impl<B: NeuralBackend> VisionAttention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
     fn new(
         config: &VisionConfig,
         layer: usize,
@@ -451,13 +451,13 @@ impl<B: NeuralBackend> VisionAttention<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct VisionMlp<B: NeuralBackend> {
+struct VisionMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     gate: ClippedLinear<B>,
     up: ClippedLinear<B>,
     down: ClippedLinear<B>,
 }
 
-impl<B: NeuralBackend> VisionMlp<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
     fn new(
         config: &VisionConfig,
         layer: usize,
@@ -503,7 +503,7 @@ impl<B: NeuralBackend> VisionMlp<B> {
 /// One vision encoder residual block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionLayer<B: NeuralBackend> {
+pub struct VisionLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     attention: VisionAttention<B>,
     mlp: VisionMlp<B>,
     input_norm: B::Normalization,
@@ -512,7 +512,7 @@ pub struct VisionLayer<B: NeuralBackend> {
     post_feed_forward_norm: B::Normalization,
 }
 
-impl<B: NeuralBackend> VisionLayer<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
     /// Builds one unloaded image encoder block.
     pub fn new(
         config: &VisionConfig,
@@ -595,7 +595,7 @@ impl<T> VisionState<T> {
 /// Pinned patch, position, pooling, and standardization modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionStatic<B: NeuralBackend> {
+pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     config: VisionConfig,
     patch_embedder: PatchEmbedder<B>,
@@ -603,7 +603,7 @@ pub struct VisionStatic<B: NeuralBackend> {
     standardization_scale: Option<Parameter<B::Tensor>>,
 }
 
-impl<B: NeuralBackend> VisionStatic<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
     /// Builds unloaded pinned image modules.
     pub fn new(
         config: VisionConfig,
@@ -755,14 +755,14 @@ impl<B: NeuralBackend> VisionStatic<B> {
 /// Resident Gemma 4 vision tower built from the same static phases and streamable blocks.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionTower<B: NeuralBackend> {
+pub struct VisionTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Pinned patch/pooling modules.
     pub static_modules: VisionStatic<B>,
     /// Independently streamable encoder blocks.
     pub layers: Vec<VisionLayer<B>>,
 }
 
-impl<B: NeuralBackend> VisionTower<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
     /// Builds the unloaded image tower.
     pub fn new(
         config: VisionConfig,

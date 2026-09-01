@@ -1,10 +1,10 @@
 //! Minimal MLX sparse-cache Ring expert-parallel generation probe.
 
 use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
-use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelContext};
+use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelPlan};
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
-use eredu_runtime::{ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency};
+use eredu_runtime::{OrdinaryWeightResidency, ParameterBankLoadOptions, WeightResidency};
 use safemlx::{
     distributed::{self, Backend},
     Array, DeviceType, Stream,
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = MlxParallelContext::for_group(
+    let topology = MlxParallelPlan::for_group(
         &group,
         1,
         1,
@@ -32,19 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         topology,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
     )
-    .with_weight_residency(WeightResidency::with_expert_cache(
-        NonExpertWeightResidency::LayerwiseHost(Default::default()),
-        ExpertCacheLoadOptions::default(),
+    .with_weight_residency(WeightResidency::with_independent_parameter_banks(
+        OrdinaryWeightResidency::LayerwiseHost(Default::default()),
+        ParameterBankLoadOptions::default(),
     ));
     let backend = eredu_backend_mlx::native::distributed_backend(&stream, &weights_stream, &group);
     let model = load_model(&backend, &model_dir, options)?;
     if group.rank() == 0 {
-        eprintln!(
-            "loaded {}/{} with EP={}",
-            model.model_family().canonical_name(),
-            model.effective_model_type(),
-            group.size()
-        );
+        eprintln!("loaded selected model with EP={}", group.size());
     }
 
     let mut session = backend.create_session(model)?;

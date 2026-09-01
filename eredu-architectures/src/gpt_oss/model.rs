@@ -8,7 +8,7 @@ use super::{block::GptOssBlockFactory, config::ModelArgs};
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, GptOssBlockFactory>;
 
 /// Builds one layered GPT-OSS model with pinned static modules.
-pub fn new_layered_model<B: GroupedNeuralBackend>(
+pub fn new_layered_model<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     args: ModelArgs,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<LayeredModel<B>, Error> {

@@ -10,7 +10,7 @@ use super::MoshiTransformerConfig;
 pub type Block<B> = TransformerBlock<B>;
 
 /// Builds one unloaded shared decoder block.
-pub fn build<B: NeuralBackend>(
+pub fn build<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &MoshiTransformerConfig,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
@@ -29,7 +29,7 @@ pub fn forward<B, S>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -59,7 +59,7 @@ pub fn forward_parallel<B, S>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {

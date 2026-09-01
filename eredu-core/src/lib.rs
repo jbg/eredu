@@ -95,7 +95,7 @@ pub use generation::{
     GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationSequence,
     OptimisticReuseDecision, ResolvedGenerationConfig, SemanticEvent,
     SpeculativeCancellationDisposition, SpeculativeCommitPlan, SpeculativeConfig,
-    SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestPhase, SpeculativeRound,
+    SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
     SpeculativeSchedulerOptions, SpeculativeTail, TokenCommit, TokenTerminalSignals,
 };
 pub use input::{

@@ -36,6 +36,8 @@ impl PreparedSafetensorsArtifact {
         shards: SafetensorsShards,
         max_cached_shards: usize,
     ) -> Result<Self, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::payload_open();
         let store = open_admitted_catalog_bound_store(catalog, shards, max_cached_shards)?;
         let resolution = architecture
             .checkpoint_resolution()
@@ -54,11 +56,11 @@ impl PreparedSafetensorsArtifact {
     }
 
     pub fn loading_protocol(&self) -> eredu_core::LoadingProtocol {
-        self.configuration.loading_protocol
+        self.configuration.loading_protocol()
     }
 
     pub fn effective_model_type(&self) -> &str {
-        &self.configuration.effective_model_type
+        self.configuration.effective_model_type()
     }
 
     pub fn architecture(&self) -> &eredu_architectures::configuration::SafetensorsArchitecturePlan {
@@ -287,13 +289,14 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     fn configuration(json: serde_json::Value) -> ModelConfiguration {
-        ModelConfiguration {
-            declared_model_type: "llama".into(),
-            effective_model_type: "llama".into(),
-            family: "llama".into(),
-            loading_protocol: LoadingProtocol::Model,
-            json: Some(json),
-        }
+        ModelConfiguration::new(
+            "llama",
+            "llama",
+            "llama",
+            LoadingProtocol::Model,
+            Some(json),
+        )
+        .unwrap()
     }
 
     fn architecture() -> eredu_architectures::configuration::SafetensorsArchitecturePlan {

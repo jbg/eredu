@@ -21,6 +21,7 @@ use std::{
 /// Core uses it to route preparation without knowing any concrete model family.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LoadingProtocol {
     /// Ordinary whole-model preparation followed by a model session.
     Model,
@@ -31,6 +32,7 @@ pub enum LoadingProtocol {
 /// Artifact container selected during inspection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ArtifactFormat {
     /// Hugging Face SafeTensors directory.
     SafeTensors,
@@ -42,25 +44,82 @@ pub enum ArtifactFormat {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfiguration {
     /// Submitted outer `model_type` or GGUF architecture.
-    pub declared_model_type: String,
+    declared_model_type: String,
     /// Nested text architecture selected for dispatch where applicable.
-    pub effective_model_type: String,
+    effective_model_type: String,
     /// Open canonical family name supplied by the architecture registry.
-    pub family: String,
+    family: String,
     /// Neutral loader contract selected by the architecture registry.
-    pub loading_protocol: LoadingProtocol,
+    loading_protocol: LoadingProtocol,
     /// Raw JSON configuration for SafeTensors artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub json: Option<Value>,
+    json: Option<Value>,
+}
+
+impl ModelConfiguration {
+    /// Creates validated portable model-configuration facts.
+    pub fn new(
+        declared_model_type: impl Into<String>,
+        effective_model_type: impl Into<String>,
+        family: impl Into<String>,
+        loading_protocol: LoadingProtocol,
+        json: Option<Value>,
+    ) -> Result<Self, ArtifactError> {
+        let configuration = Self {
+            declared_model_type: declared_model_type.into(),
+            effective_model_type: effective_model_type.into(),
+            family: family.into(),
+            loading_protocol,
+            json,
+        };
+        if [
+            &configuration.declared_model_type,
+            &configuration.effective_model_type,
+            &configuration.family,
+        ]
+        .into_iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(ArtifactError::InvalidArtifact(
+                "model configuration identities must be non-empty".into(),
+            ));
+        }
+        Ok(configuration)
+    }
+
+    /// Submitted outer model type or GGUF architecture.
+    pub fn declared_model_type(&self) -> &str {
+        &self.declared_model_type
+    }
+
+    /// Nested model type selected for architecture dispatch.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
+    }
+
+    /// Open canonical architecture-family name.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// Neutral loading protocol selected by the architecture registry.
+    pub const fn loading_protocol(&self) -> LoadingProtocol {
+        self.loading_protocol
+    }
+
+    /// Raw SafeTensors JSON configuration, when present.
+    pub const fn json(&self) -> Option<&Value> {
+        self.json.as_ref()
+    }
 }
 
 /// Portable configuration plus the architecture-owned plan produced while resolving it.
 #[derive(Debug, Clone)]
 pub struct ResolvedModelConfiguration<P> {
     /// Backend-neutral configuration facts used by core orchestration.
-    pub configuration: ModelConfiguration,
+    configuration: ModelConfiguration,
     /// Typed architecture state proven valid by the resolver.
-    pub architecture_plan: P,
+    architecture_plan: P,
 }
 
 impl<P> ResolvedModelConfiguration<P> {
@@ -70,6 +129,16 @@ impl<P> ResolvedModelConfiguration<P> {
             configuration,
             architecture_plan,
         }
+    }
+
+    /// Portable configuration facts used by neutral orchestration.
+    pub const fn configuration(&self) -> &ModelConfiguration {
+        &self.configuration
+    }
+
+    /// Architecture-owned plan derived from the exact configuration.
+    pub const fn architecture_plan(&self) -> &P {
+        &self.architecture_plan
     }
 
     /// Separates the portable facts from architecture-owned state.
@@ -123,6 +192,7 @@ pub trait ModelConfigurationResolver {
 
 /// Semantic identity of a separately stored GGUF companion.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum GgufCompanionRole {
     /// Media encoder and projection weights consumed with the decoder.
     MediaProjector,
@@ -132,6 +202,7 @@ pub enum GgufCompanionRole {
 
 /// Encoding policy used to select among matching GGUF companions.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum GgufCompanionEncoding {
     /// Require a checkpoint whose tensor catalog contains no quantized weights.
     DenseRequired,
@@ -308,6 +379,7 @@ impl<P> ArtifactInspection<P> {
 /// Requested load-time weight transformation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum QuantizationRequest {
     /// Per-group affine integer quantization.
     Affine {
@@ -323,6 +395,7 @@ pub enum QuantizationRequest {
 /// Coarse backend-neutral weight residency request.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResidencyRequest {
     /// Keep all owned weights resident.
     #[default]
@@ -331,24 +404,69 @@ pub enum ResidencyRequest {
     LayerwiseHost,
     /// Stream bounded layer units from disk.
     DenseDiskStream,
-    /// Manage routed experts independently of non-expert layers.
-    ExpertCache,
+    /// Manage independently addressable parameter banks beside ordinary units.
+    AddressableParameterBanks,
 }
 
 /// Backend-neutral inputs to materialization-route selection.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PreparationPolicy {
     /// Optional requested load-time transformation.
-    pub quantization: Option<QuantizationRequest>,
+    quantization: Option<QuantizationRequest>,
     /// Requested residency family.
-    pub residency: ResidencyRequest,
+    residency: ResidencyRequest,
     /// Exact parallel topology selected for materialization, when explicitly configured.
-    pub topology: Option<crate::topology::ParallelTopology>,
+    topology: Option<crate::topology::ParallelTopology>,
     /// Capabilities required from the exact prepared session.
-    pub required_session_capabilities: crate::backend::SessionCapabilities,
+    required_session_capabilities: crate::backend::SessionCapabilities,
 }
 
 impl PreparationPolicy {
+    /// Creates a portable preparation request with no optional session facilities.
+    pub const fn new(
+        quantization: Option<QuantizationRequest>,
+        residency: ResidencyRequest,
+    ) -> Self {
+        Self {
+            quantization,
+            residency,
+            topology: None,
+            required_session_capabilities: crate::backend::SessionCapabilities::new(
+                false, false, false,
+            ),
+        }
+    }
+
+    /// Returns the requested load-time transformation.
+    pub const fn quantization(self) -> Option<QuantizationRequest> {
+        self.quantization
+    }
+    /// Returns the requested residency family.
+    pub const fn residency(self) -> ResidencyRequest {
+        self.residency
+    }
+    /// Returns the requested semantic topology.
+    pub const fn topology(self) -> Option<crate::topology::ParallelTopology> {
+        self.topology
+    }
+    /// Returns the exact required session facilities.
+    pub const fn required_session_capabilities(self) -> crate::backend::SessionCapabilities {
+        self.required_session_capabilities
+    }
+    /// Returns a request with a selected semantic topology.
+    pub const fn with_topology(mut self, topology: crate::topology::ParallelTopology) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+    /// Returns a request with exact required session facilities.
+    pub const fn with_required_session_capabilities(
+        mut self,
+        capabilities: crate::backend::SessionCapabilities,
+    ) -> Self {
+        self.required_session_capabilities = capabilities;
+        self
+    }
+
     /// Validates exact session requirements independently from device requirements.
     pub fn validate_session_capabilities(
         &self,
@@ -361,13 +479,14 @@ impl PreparationPolicy {
 /// Canonical materialization recipe selected by the core planner.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MaterializationRoute {
     /// Resident materialization, optionally with a load-time transform.
     Resident,
-    /// Bounded non-expert layer materialization.
+    /// Bounded ordinary-unit materialization.
     Layerwise,
-    /// Independent routed-expert materialization.
-    ExpertCache,
+    /// Independent addressable parameter-bank materialization.
+    AddressableParameterBanks,
 }
 
 /// Fully inspected input supplied to one selected backend for materialization.
@@ -396,9 +515,14 @@ impl<P> ModelPreparationPlan<P> {
     pub const fn admitted_session_capabilities(&self) -> crate::backend::SessionCapabilities {
         self.admitted_session_capabilities
     }
-    /// Consume the plan into its portable artifact, architecture state, and policy.
-    pub fn into_parts(self) -> (ModelArtifact, P, PreparationPolicy, MaterializationRoute) {
-        let artifact = match self.inspection.validated_gguf {
+    /// Consumes the plan into the exact portable artifact admitted by inspection.
+    ///
+    /// Architecture state remains available through [`Self::inspection`] before
+    /// this consuming operation. Policy and route are intentionally not repeated
+    /// in a positional handoff: materializers must inspect those named properties
+    /// before consuming the plan.
+    pub fn into_artifact(self) -> ModelArtifact {
+        match self.inspection.validated_gguf {
             Some(validated) => ModelArtifact::Gguf {
                 path: self.inspection.path,
                 configuration: self.inspection.configuration,
@@ -414,18 +538,13 @@ impl<P> ModelPreparationPlan<P> {
                     .safetensors_shards
                     .expect("SafeTensors inspection retains its admitted shard set"),
             },
-        };
-        (
-            artifact,
-            self.inspection.architecture_plan,
-            self.policy,
-            self.route,
-        )
+        }
     }
 }
 
 /// Portable artifact payload consumed by a backend materializer.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ModelArtifact {
     /// SafeTensors directory and validated header catalog.
     SafeTensors {
@@ -496,7 +615,9 @@ pub fn validate_preparation_policy(
         ResidencyRequest::LayerwiseHost | ResidencyRequest::DenseDiskStream => {
             MaterializationRoute::Layerwise
         }
-        ResidencyRequest::ExpertCache => MaterializationRoute::ExpertCache,
+        ResidencyRequest::AddressableParameterBanks => {
+            MaterializationRoute::AddressableParameterBanks
+        }
     };
     Ok(route)
 }
@@ -887,6 +1008,7 @@ fn is_gguf(path: &Path) -> bool {
 
 /// Portable artifact inspection/planning failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArtifactError {
     /// Artifact path does not exist.
     #[error("model artifact does not exist: {0}")]
@@ -1224,7 +1346,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.route(), MaterializationRoute::Resident);
-        let (artifact, architecture_plan, _, _) = plan.into_parts();
+        let architecture_plan = plan.inspection().architecture_plan().clone();
+        let artifact = plan.into_artifact();
         let ModelArtifact::SafeTensors { shards, .. } = artifact else {
             panic!("expected SafeTensors artifact");
         };
@@ -1380,13 +1503,16 @@ mod tests {
         let plan = plan_model_preparation(
             inspect_artifact(root.path(), &FixtureResolver).unwrap(),
             PreparationPolicy {
-                residency: ResidencyRequest::ExpertCache,
+                residency: ResidencyRequest::AddressableParameterBanks,
                 ..PreparationPolicy::default()
             },
             crate::backend::SessionCapabilities::default(),
         )
         .unwrap();
-        assert_eq!(plan.route(), MaterializationRoute::ExpertCache);
+        assert_eq!(
+            plan.route(),
+            MaterializationRoute::AddressableParameterBanks
+        );
     }
 
     #[test]
@@ -1449,7 +1575,8 @@ mod tests {
             crate::backend::SessionCapabilities::default(),
         )
         .unwrap();
-        let (artifact, architecture_plan, _, _) = plan.into_parts();
+        let architecture_plan = plan.inspection().architecture_plan().clone();
+        let artifact = plan.into_artifact();
         let ModelArtifact::Gguf {
             configuration,
             validated,
@@ -1533,9 +1660,7 @@ mod tests {
             crate::backend::SessionCapabilities::default(),
         )
         .unwrap()
-        .into_parts()
-        .0
-        else {
+        .into_artifact() else {
             panic!("expected GGUF preparation artifact");
         };
         assert_eq!(

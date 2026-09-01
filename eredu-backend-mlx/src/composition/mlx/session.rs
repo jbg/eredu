@@ -34,7 +34,7 @@ use crate::{
 use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use eredu_core::SpeculativeCapability;
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::CacheResidencyPolicy;
 
 use super::{
     execution::{
@@ -432,6 +432,7 @@ pub struct MlxModelSession<'a> {
     floating_state_dtype_bytes: std::num::NonZeroU8,
     distributed: Option<MlxDistributedSession<'a>>,
     capabilities: eredu_core::SessionCapabilities,
+    state_residency: CacheResidencyPolicy,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
@@ -463,6 +464,7 @@ impl<'a> MlxModelSession<'a> {
         admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
         let floating_state_dtype_bytes = model.floating_state_dtype_bytes();
+        let state_residency = model.state_residency().clone();
         let topology = model.topology();
         match (topology, distributed.as_ref()) {
             (None, None) => {}
@@ -485,17 +487,18 @@ impl<'a> MlxModelSession<'a> {
         #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
         let inner = match model.into_kind() {
-            MlxModelKind::Complete(model) => MlxSessionKind::Complete(model),
+            MlxModelKind::Complete(mut model) => {
+                model
+                    .reset_cache_with_options(state_residency.clone())
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                MlxSessionKind::Complete(model)
+            }
             MlxModelKind::Pipeline(model) => {
-                let cache = model.new_cache()?;
+                let cache = model.new_cache_with_options(state_residency.clone())?;
                 MlxSessionKind::Pipeline(model, cache)
             }
         };
-        let realized_capabilities = eredu_core::SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        };
+        let realized_capabilities = eredu_core::SessionCapabilities::new(true, true, true);
         if admitted_capabilities != realized_capabilities {
             return Err(Error::ArchitectureModel(format!(
                 "realized MLX session capabilities {realized_capabilities:?} do not match pre-materialization admission {admitted_capabilities:?}"
@@ -513,6 +516,7 @@ impl<'a> MlxModelSession<'a> {
             floating_state_dtype_bytes,
             distributed,
             capabilities: realized_capabilities,
+            state_residency,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor,
         })
@@ -527,16 +531,15 @@ impl<'a> MlxModelSession<'a> {
         self.processor.as_ref()
     }
 
-    /// Returns the canonical architecture family of the session-owned model.
-    pub fn model_family(&self) -> eredu_architectures::ModelKind {
+    #[cfg(test)]
+    pub(crate) fn model_family(&self) -> eredu_architectures::ModelKind {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.model_family(),
             MlxSessionKind::Pipeline(model, _) => model.model_family(),
         }
     }
 
-    /// Returns the effective model type preserved from the parsed configuration.
-    pub fn effective_model_type(&self) -> &str {
+    pub(crate) fn effective_model_type(&self) -> &str {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.effective_model_type(),
             MlxSessionKind::Pipeline(model, _) => model.effective_model_type(),
@@ -688,11 +691,16 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    /// Clears all MLX cache state while preserving session topology.
+    /// Clears all MLX cache state under the authoritative selected policy.
     pub fn reset(&mut self) -> Result<(), Error> {
         match &mut self.inner {
-            MlxSessionKind::Complete(model) => model.reset_cache().map_err(Into::into),
-            MlxSessionKind::Pipeline(_, cache) => cache.reset(),
+            MlxSessionKind::Complete(model) => model
+                .reset_cache_with_options(self.state_residency.clone())
+                .map_err(Into::into),
+            MlxSessionKind::Pipeline(model, cache) => {
+                *cache = model.new_cache_with_options(self.state_residency.clone())?;
+                Ok(())
+            }
         }
     }
 
@@ -718,20 +726,6 @@ impl<'a> MlxModelSession<'a> {
                 .map_err(|error| Error::Parallel(error.to_string())),
             MlxSessionKind::Pipeline(model, cache) => model.cache_residency_report(cache),
         }
-    }
-
-    /// Replaces this session's cache with one allocated under `policy`.
-    ///
-    /// Cache representation remains an MLX backend detail for complete,
-    /// pipeline, and expert models alike.
-    pub fn configure_cache(&mut self, policy: CacheResidencyPolicy) -> Result<(), Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => model.reset_cache_with_options(policy)?,
-            MlxSessionKind::Pipeline(model, cache) => {
-                *cache = model.new_cache_with_options(policy)?;
-            }
-        }
-        Ok(())
     }
 
     /// Atomically persists the completed prefix owned by this session.
@@ -771,8 +765,13 @@ impl<'a> MlxModelSession<'a> {
         root: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        options: PagedCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
+            return Err(Error::ArchitectureModel(
+                "prompt-cache loading requires paged state selected during preparation".into(),
+            ));
+        };
+        let options = options.clone();
         let manifest = match &mut self.inner {
             MlxSessionKind::Complete(model) => model.load_prompt_cache(
                 root,
@@ -835,12 +834,13 @@ impl<'a> MlxModelSession<'a> {
                             "distributed complete-model sampling requires selected topology".into(),
                         )
                     })?;
-                let sampling_rank = topology.global_rank_for(eredu_core::ParallelCoordinates {
-                    tensor: 0,
-                    pipeline: topology.pipeline_parallel_size - 1,
-                    expert: 0,
-                    data: topology.data_parallel_rank,
-                })?;
+                let sampling_rank =
+                    topology.global_rank_for(eredu_core::ParallelCoordinates::new(
+                        0,
+                        topology.pipeline_parallel_size() - 1,
+                        0,
+                        topology.data_parallel_rank(),
+                    ))?;
                 distributed.sample_and_synchronize_on_rank(
                     logits,
                     batch_size,
@@ -1240,7 +1240,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     if multimodal {
                         let step = model.prepared_input_step(borrowed)?;
                         model.prefill_distributed(
-                            model.stage_info().owns_input.then_some(borrowed),
+                            model.stage_info().owns_input().then_some(borrowed),
                             step,
                             None,
                             cache,
@@ -1250,7 +1250,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         let tokens = input::text_token_ids(borrowed, backend.stream())?;
                         let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
                         model.forward_distributed(
-                            model.stage_info().owns_input.then_some(&tokens),
+                            model.stage_info().owns_input().then_some(&tokens),
                             step,
                             None,
                             cache,
@@ -1285,7 +1285,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 })?;
                 let step = PipelineStep::new(input.dim(0), input.dim(1))?;
                 let completion = model.forward_distributed(
-                    model.stage_info().owns_input.then_some(&input),
+                    model.stage_info().owns_input().then_some(&input),
                     step,
                     None,
                     cache,
@@ -1352,7 +1352,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     if multimodal {
                         let step = model.prepared_input_step(borrowed)?;
                         model.prefill_distributed_with_observer(
-                            model.stage_info().owns_input.then_some(borrowed),
+                            model.stage_info().owns_input().then_some(borrowed),
                             step,
                             None,
                             cache,
@@ -1363,7 +1363,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                         let tokens = input::text_token_ids(borrowed, backend.stream())?;
                         let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
                         model.forward_distributed_with_observer(
-                            model.stage_info().owns_input.then_some(&tokens),
+                            model.stage_info().owns_input().then_some(&tokens),
                             step,
                             None,
                             cache,
@@ -1406,7 +1406,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     inner: &mut collector,
                 };
                 let completion = model.forward_distributed_with_observer(
-                    model.stage_info().owns_input.then_some(&input),
+                    model.stage_info().owns_input().then_some(&input),
                     step,
                     None,
                     cache,

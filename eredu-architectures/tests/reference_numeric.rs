@@ -7,11 +7,14 @@ use std::{
 };
 
 use eredu_architectures::{
-    decoder, deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, moshi, muse_glimmer,
-    nemotron_h, qwen,
+    decoder, deepseek, execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2,
+    llama, moshi, muse_glimmer, nemotron_h, qwen,
 };
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
-use eredu_core::{Completion, LayerSchedule, ParallelRankTopology, ParallelTopology, TokenFilter};
+use eredu_core::{
+    CollectiveGroupId, Completion, LayerSchedule, ParallelRankTopology, ParallelTopology,
+    TokenFilter,
+};
 use eredu_nn::{
     reference_gated_delta_scan, reference_selective_state_space_scan, validate_parameter_topology,
     AttentionCache, AttentionMask, AttentionRequest, BlockwiseAttentionBackend,
@@ -36,10 +39,11 @@ use eredu_nn::{
     TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    ArchitectureParameters, CollectiveBackend, CompositeLayeredTraversalHook, DeviceState,
-    ExecutionUnitAddress, ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook,
-    LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
-    MemberSharding, ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
+    AddressableGatedProductBank, ArchitectureParameters, CollectiveBackend,
+    CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress, ExpertPass,
+    LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook, LayerwiseAcquireError,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    ParameterBankKey, ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
     ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
     RoutedExpertRequest, RoutedExpertTensorParallelOutput, RuntimeLayerState,
     RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
@@ -1377,9 +1381,7 @@ fn select_parameter(
             }
             Ok(output)
         }
-        TensorPlacement::Omit
-        | TensorPlacement::Rank { .. }
-        | TensorPlacement::PipelineStage { .. } => Err(Error::backend(
+        TensorPlacement::Omit | TensorPlacement::Rank { .. } => Err(Error::backend(
             "numeric parameter layout does not materialize this tensor",
         )),
     }
@@ -2766,80 +2768,6 @@ impl NeuralBackend for NumericBackend {
         })
     }
 
-    fn vocabulary_parallel_embedding(
-        spec: EmbeddingSpec,
-        range: VocabularyParallelRange,
-        _context: &NumericContext,
-    ) -> Result<Self::Embedding, Error> {
-        range.validate_global_rows(spec.vocabulary)?;
-        let global = parameter(&spec.weight, vec![spec.vocabulary, spec.dimensions], false);
-        Ok(NumericEmbedding {
-            weight: global.axis_slice(0, range.local.start, range.local.end),
-            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
-            vocabulary_range: Some(range),
-        })
-    }
-
-    fn vocabulary_parallel_linear(
-        spec: LinearSpec,
-        range: VocabularyParallelRange,
-        _context: &NumericContext,
-    ) -> Result<Self::Linear, Error> {
-        range.validate_global_rows(spec.output)?;
-        let global = parameter(&spec.weight, vec![spec.output, spec.input], false);
-        let weight = global.axis_slice(0, range.local.start, range.local.end);
-        let bias = spec.bias.map(|bias| {
-            let value = parameter(&bias, vec![spec.output], false).axis_slice(
-                0,
-                range.local.start,
-                range.local.end,
-            );
-            let metadata = ParameterMetadata::from_spec(&bias, bias.trainable);
-            (value, metadata)
-        });
-        Ok(NumericLinear {
-            weight,
-            weight_metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
-            bias,
-        })
-    }
-
-    fn vocabulary_parallel_lookup(
-        embedding: &mut Self::Embedding,
-        input: &Self::Tensor,
-        _policy: EmbeddingLookupPolicy,
-        parallel: &Self::ParallelContext,
-        context: &NumericContext,
-    ) -> Result<Self::Tensor, Error> {
-        let local = embedding.lookup(input, _policy, context)?;
-        parallel.collective(NumericCollectiveKind::Sum, local)
-    }
-
-    fn vocabulary_parallel_project(
-        linear: &mut Self::Linear,
-        input: &Self::Tensor,
-        parallel: &Self::ParallelContext,
-        context: &NumericContext,
-    ) -> Result<Self::Tensor, Error> {
-        let local = linear.forward(input, context)?;
-        parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
-    }
-
-    fn vocabulary_parallel_embedding_project(
-        embedding: &mut Self::Embedding,
-        input: &Self::Tensor,
-        parallel: &Self::ParallelContext,
-        context: &NumericContext,
-    ) -> Result<Self::Tensor, Error> {
-        let mut linear = NumericLinear {
-            weight: embedding.weight.clone(),
-            weight_metadata: embedding.metadata.clone(),
-            bias: None,
-        };
-        let local = linear.forward(input, context)?;
-        parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
-    }
-
     fn normalization(
         spec: NormalizationConstructionSpec,
         context: &NumericContext,
@@ -3336,50 +3264,6 @@ impl NeuralBackend for NumericBackend {
         Ok(output)
     }
 
-    fn grouped_linear(
-        linear: &mut NumericLinear,
-        input: &NumericTensor,
-        groups: i32,
-        output_per_group: i32,
-        _: &NumericContext,
-    ) -> Result<NumericTensor, Error> {
-        if input.shape.len() != 4
-            || input.shape[1] != groups
-            || linear.weight.shape != [groups * output_per_group, input.shape[3]]
-        {
-            return Err(Error::backend("numeric grouped-linear geometry mismatch"));
-        }
-        let batch = input.shape[0] as usize;
-        let groups = groups as usize;
-        let tokens = input.shape[2] as usize;
-        let width = input.shape[3] as usize;
-        let output_width = output_per_group as usize;
-        let mut output = NumericTensor::zeros(vec![
-            batch as i32,
-            groups as i32,
-            tokens as i32,
-            output_per_group,
-        ]);
-        for b in 0..batch {
-            for group in 0..groups {
-                for token in 0..tokens {
-                    let input_base = ((b * groups + group) * tokens + token) * width;
-                    for out in 0..output_width {
-                        let weight_base = (group * output_width + out) * width;
-                        output.data[((b * groups + group) * tokens + token) * output_width + out] =
-                            (0..width)
-                                .map(|inner| {
-                                    input.data[input_base + inner]
-                                        * linear.weight.data[weight_base + inner]
-                                })
-                                .sum();
-                    }
-                }
-            }
-        }
-        Ok(output)
-    }
-
     fn sliding_window_attention(
         queries: Self::Tensor,
         keys: Self::Tensor,
@@ -3476,16 +3360,92 @@ impl NeuralBackend for NumericBackend {
         Ok(output)
     }
 
+    fn parallel_size(parallel: &Self::ParallelContext) -> usize {
+        parallel.group.size
+    }
+}
+
+impl eredu_nn::DistributedNeuralBackend for NumericBackend {
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        _context: &NumericContext,
+    ) -> Result<Self::Embedding, Error> {
+        range.validate_global_rows(spec.vocabulary)?;
+        let global = parameter(&spec.weight, vec![spec.vocabulary, spec.dimensions], false);
+        Ok(NumericEmbedding {
+            weight: global.axis_slice(0, range.local.start, range.local.end),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            vocabulary_range: Some(range),
+        })
+    }
+
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        _context: &NumericContext,
+    ) -> Result<Self::Linear, Error> {
+        range.validate_global_rows(spec.output)?;
+        let global = parameter(&spec.weight, vec![spec.output, spec.input], false);
+        let weight = global.axis_slice(0, range.local.start, range.local.end);
+        let bias = spec.bias.map(|bias| {
+            let value = parameter(&bias, vec![spec.output], false).axis_slice(
+                0,
+                range.local.start,
+                range.local.end,
+            );
+            let metadata = ParameterMetadata::from_spec(&bias, bias.trainable);
+            (value, metadata)
+        });
+        Ok(NumericLinear {
+            weight,
+            weight_metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            bias,
+        })
+    }
+
+    fn vocabulary_parallel_lookup(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        _policy: EmbeddingLookupPolicy,
+        parallel: &Self::ParallelContext,
+        context: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let local = embedding.lookup(input, _policy, context)?;
+        parallel.collective(NumericCollectiveKind::Sum, local)
+    }
+
+    fn vocabulary_parallel_project(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let local = linear.forward(input, context)?;
+        parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
+    }
+
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let mut linear = NumericLinear {
+            weight: embedding.weight.clone(),
+            weight_metadata: embedding.metadata.clone(),
+            bias: None,
+        };
+        let local = linear.forward(input, context)?;
+        parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
+    }
+
     fn sum_parallel(
         value: Self::Tensor,
         parallel: &Self::ParallelContext,
         _: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
         parallel.collective(NumericCollectiveKind::Sum, value)
-    }
-
-    fn parallel_size(parallel: &Self::ParallelContext) -> usize {
-        parallel.group.size
     }
 }
 
@@ -4752,6 +4712,50 @@ impl GroupedNeuralBackend for NumericBackend {
     type Selector = NumericRouter;
     type GatedProductGroups = NumericExpertBank;
     type Relu2Groups = NumericRelu2Groups;
+
+    fn grouped_linear(
+        linear: &mut NumericLinear,
+        input: &NumericTensor,
+        groups: i32,
+        output_per_group: i32,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        if input.shape.len() != 4
+            || input.shape[1] != groups
+            || linear.weight.shape != [groups * output_per_group, input.shape[3]]
+        {
+            return Err(Error::backend("numeric grouped-linear geometry mismatch"));
+        }
+        let batch = input.shape[0] as usize;
+        let groups = groups as usize;
+        let tokens = input.shape[2] as usize;
+        let width = input.shape[3] as usize;
+        let output_width = output_per_group as usize;
+        let mut output = NumericTensor::zeros(vec![
+            batch as i32,
+            groups as i32,
+            tokens as i32,
+            output_per_group,
+        ]);
+        for b in 0..batch {
+            for group in 0..groups {
+                for token in 0..tokens {
+                    let input_base = ((b * groups + group) * tokens + token) * width;
+                    for out in 0..output_width {
+                        let weight_base = (group * output_width + out) * width;
+                        output.data[((b * groups + group) * tokens + token) * output_width + out] =
+                            (0..width)
+                                .map(|inner| {
+                                    input.data[input_base + inner]
+                                        * linear.weight.data[weight_base + inner]
+                                })
+                                .sum();
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
 
     fn joint_group_selection(
         input: JointGroupSelectionInput<'_, NumericTensor>,
@@ -6721,6 +6725,28 @@ fn dense_qwen_construction_rejects_moe_configuration() {
     }
 }
 
+struct NumericAddressableBank {
+    banks: BTreeMap<ParameterBankKey, NumericExpertBank>,
+    trace: NumericContext,
+}
+
+impl AddressableGatedProductBank<NumericBackend> for NumericAddressableBank {
+    type Error = Error;
+
+    fn acquire(
+        &mut self,
+        key: ParameterBankKey,
+        _: &GroupedGatedProductSpec,
+        _: &NumericContext,
+    ) -> Result<&mut NumericExpertBank, Self::Error> {
+        self.trace
+            .record_bank_lookup(format!("bank:{}:{}", key.unit(), key.member()));
+        self.banks
+            .get_mut(&key)
+            .ok_or_else(|| Error::backend("numeric addressable bank omitted selected key"))
+    }
+}
+
 #[test]
 fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
     let mut value = config("qwen3_moe", false);
@@ -6759,13 +6785,15 @@ fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
     assert_eq!(bank.intermediate_dimensions(), 3);
 
     let grouped_context = NumericContext::default();
-    let bank_key = u64::try_from(plan.local_global_group_indices()[0]).unwrap();
-    let mut addressable_banks = BTreeMap::from([(
-        bank_key,
-        NumericBackend::grouped_gated_product(bank.clone(), &grouped_context).unwrap(),
-    )]);
-    grouped_context.record_bank_lookup(format!("bank:{bank_key}"));
-    let grouped = addressable_banks.get_mut(&bank_key).unwrap();
+    let bank_key = ParameterBankKey::new(0, plan.local_global_group_indices()[0]);
+    let mut addressable_banks = NumericAddressableBank {
+        banks: BTreeMap::from([(
+            bank_key,
+            NumericBackend::grouped_gated_product(bank.clone(), &grouped_context).unwrap(),
+        )]),
+        trace: grouped_context.clone(),
+    };
+    let grouped = addressable_banks.banks.get_mut(&bank_key).unwrap();
     let expert = &mut grouped.experts[0];
     expert.gate = NumericTensor::new(
         vec![bank.intermediate_dimensions(), bank.input_dimensions()],
@@ -6785,16 +6813,30 @@ fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
         NumericTensor::new(vec![1, 1], vec![0.75]),
         NumericTensor::new(vec![1, 1], vec![0.5]),
     );
-    let gathered = grouped
-        .forward_grouped(&hidden, &selection, &grouped_context)
-        .unwrap();
-    assert!(gathered.data.iter().all(|value| *value > 90.0));
-    let exchanged = NumericBackend::all_to_all(gathered, &41, &grouped_context).unwrap();
+    let collective = plan.collective_group(CollectiveGroupId::new(41)).unwrap();
+    assert_eq!(collective.members(), [2, 3]);
+    assert_eq!(collective.local_rank(), 1);
+    let group = u64::from(collective.id().value());
+    let exchanged = execute_routed_gated_product::<NumericBackend, _>(
+        &plan,
+        "text_decoder",
+        0,
+        0,
+        &hidden,
+        &selection,
+        &mut addressable_banks,
+        &collective,
+        &group,
+        &grouped_context,
+        &grouped_context,
+    )
+    .unwrap();
+    assert!(exchanged.data.iter().all(|value| *value > 90.0));
     assert_eq!(exchanged.shape, [1, bank.output_dimensions()]);
     assert_eq!(
         grouped_context.mechanism_trace(),
         [
-            NumericMechanismTrace::BankLookup("bank:2".into()),
+            NumericMechanismTrace::BankLookup("bank:0:2".into()),
             NumericMechanismTrace::AllToAll(41),
         ]
     );
@@ -6924,23 +6966,27 @@ fn qwen_prompt_snapshot_reopens_with_global_identity_and_continues_exactly() {
         LayerSchedule::new(1, vec![layout.layers().get(1).unwrap().clone()]).unwrap(),
     )
     .unwrap();
-    let topology = PromptCacheTopology {
-        pipeline: Some((2, 1)),
-        tensor_parallel: Some((2, 0)),
-        ..PromptCacheTopology::default()
-    };
+    let topology = PromptCacheTopology::new(Some((2, 1)), Some((2, 0)), None, true).unwrap();
     let model_identity = qwen::state_identity(&args, &local_layout, 1, topology.clone()).unwrap();
     let prompt_identity = model_identity.prompt_cache_identity(&local_layout).unwrap();
-    assert_eq!(prompt_identity.global_layer_start, 1);
-    assert_eq!(prompt_identity.global_layer_end, 2);
-    assert_eq!(prompt_identity.topology, topology);
-    assert_eq!(prompt_identity.layer_layout.len(), 1);
+    assert_eq!(prompt_identity.global_layer_start(), 1);
+    assert_eq!(prompt_identity.global_layer_end(), 2);
+    assert_eq!(prompt_identity.topology(), &topology);
+    assert_eq!(prompt_identity.layer_layout().len(), 1);
 
     // Identity and input failures are rejected before mutating the restored
     // state. This is the portable failure-atomicity boundary used before any
     // persistent tensors are materialized.
-    let mut malformed_identity = model_identity;
-    malformed_identity.global_layer_start = 2;
+    let malformed_identity = eredu_runtime::ModelStateIdentity::new(
+        "malformed-fixture",
+        "malformed-fixture",
+        "malformed-fixture",
+        1,
+        1,
+        0,
+        eredu_core::cache::PromptCacheTopology::default(),
+    )
+    .unwrap();
     assert!(malformed_identity
         .prompt_cache_identity(&local_layout)
         .is_err());

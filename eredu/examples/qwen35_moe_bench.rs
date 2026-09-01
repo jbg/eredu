@@ -43,10 +43,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     if quantize_on_load {
-        plan.weight_transformation = WeightTransformationPlan::Affine {
+        plan = plan.with_weight_transformation(WeightTransformationPlan::Affine {
             bits: 4,
             group_size: 64,
-        };
+        });
     }
     reset_local_allocator_peak()?;
     let load_start = Instant::now();

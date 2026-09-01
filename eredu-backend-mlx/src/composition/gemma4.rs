@@ -280,7 +280,8 @@ pub struct Gemma4Model {
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
 }
 
 /// Fully resident external assistant built from the neutral Gemma equations.
@@ -321,7 +322,7 @@ impl Gemma4AssistantModel {
 pub fn load_assistant_safetensors(
     store: SharedCheckpointSource,
     source_config: eredu_architectures::gemma4::AssistantConfig,
-    options: crate::backend::ModelLoadOptions,
+    options: crate::MlxLoadRequest,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
@@ -378,7 +379,7 @@ pub fn load_assistant_gguf(
     resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     source_config: eredu_architectures::gemma4::AssistantConfig,
-    options: crate::backend::ModelLoadOptions,
+    options: crate::MlxLoadRequest,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
@@ -450,7 +451,10 @@ impl Gemma4Model {
         &self.args
     }
 
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -467,8 +471,10 @@ impl Gemma4Model {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
                 let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::backend::cache::prompt_cache_topology(info.topology())
-                        .cache_rank_identity()
+                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                        info.topology(),
+                    )
+                    .cache_rank_identity()
                 });
                 MlxHybridState::paged(
                     self.state_layout.clone(),
@@ -484,12 +490,14 @@ impl Gemma4Model {
     pub(crate) fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        let topology = self
-            .parallel_info
-            .as_ref()
-            .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
-                crate::backend::cache::prompt_cache_topology(info.topology())
-            });
+        let topology = self.parallel_info.as_ref().map_or_else(
+            eredu_core::cache::PromptCacheTopology::default,
+            |info| {
+                crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                    info.topology(),
+                )
+            },
+        );
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
             topology,
@@ -505,7 +513,7 @@ impl Gemma4Model {
         stream: &Stream,
     ) -> Result<(MlxHybridState, eredu_core::cache::PromptCacheManifest), Error> {
         let identity = self.prompt_cache_model_identity()?;
-        let rank = identity.topology.cache_rank_identity();
+        let rank = identity.topology().cache_rank_identity();
         let (manager, manifest) = open_prompt_cache(
             directory.as_ref(),
             expected,
@@ -519,7 +527,7 @@ impl Gemma4Model {
         let mut state = MlxHybridState::paged(self.state_layout.clone(), manager, rank)?;
         let processed = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("prompt-cache prefix length exceeds i32".into()))?;
-        state.restore_prompt_cache_state(tensors, processed, &identity.layer_prefix_offsets)?;
+        state.restore_prompt_cache_state(tensors, processed, identity.layer_prefix_offsets())?;
         Ok((state, manifest))
     }
 
@@ -1570,6 +1578,7 @@ impl PreparedParts {
                         InputModality::Image => DecoderInputPart::Image(tokens),
                         InputModality::Video => DecoderInputPart::Video(tokens),
                         InputModality::Audio => DecoderInputPart::Audio(tokens),
+                        _ => unreachable!("validated Gemma input modality"),
                     }
                 }
             })
@@ -1829,7 +1838,7 @@ fn load_parallel_store(
     store: SharedCheckpointSource,
     args: FamilyConfig,
     residency: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
@@ -1989,7 +1998,7 @@ fn load_parallel_store(
 pub fn load_safetensors_tensor_parallel(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
@@ -2008,7 +2017,7 @@ pub fn load_gguf_tensor_parallel(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
@@ -2018,7 +2027,7 @@ pub fn load_gguf_tensor_parallel(
 
 fn attach_parameter_bank(
     model: &mut Gemma4Model,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
@@ -2043,7 +2052,7 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let eredu_architectures::configuration::SafetensorsModelConfig::Gemma4(args) = artifact.model()
     else {
         return Err(Error::ArchitectureModel(
@@ -2089,7 +2098,7 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let (store, args) = open_pipeline_gguf_store(source, projector, residency.max_cached_shards())?;
     let mut model = load_store(
         store,

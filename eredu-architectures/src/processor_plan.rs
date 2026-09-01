@@ -622,6 +622,27 @@ impl ArtifactArchitecturePlan {
         }
     }
 
+    /// Exact grouped mechanisms required by this architecture under `topology`.
+    pub fn grouped_operation_requirements(
+        &self,
+        topology: Option<eredu_core::ParallelTopology>,
+    ) -> Vec<eredu_runtime::GroupedOperationRequirement> {
+        let routed = match &self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => plan.model().uses_grouped_routed_experts(),
+            ArtifactFamilyPlan::Gguf(plan) => plan.model().uses_grouped_routed_experts(),
+        };
+        if !routed {
+            return Vec::new();
+        }
+        let mut required = vec![eredu_runtime::GroupedOperationRequirement::GatedProduct];
+        if topology.is_some_and(|topology| topology.tensor() > 1) {
+            required.push(
+                eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
+            );
+        }
+        required
+    }
+
     /// Returns the exact normalized GGUF architecture, when applicable.
     pub const fn gguf_architecture(&self) -> Option<GgufArchitecture> {
         match &self.family {

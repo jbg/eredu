@@ -9,8 +9,9 @@ use std::{
 
 use crate::MlxTensor;
 use crate::{
-    backend::{DeviceAssignment, MlxParallelContext},
+    backend::DeviceAssignment,
     composition::expert_dispatch::{AllToAllVPlan, RoutedTransport},
+    native::MlxParallelPlan,
 };
 use eredu_core::{CollectiveScope, DistributedSession};
 use safemlx::{
@@ -21,9 +22,8 @@ use safemlx::{
 const WORKER_ENV: &str = "EREDU_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "EREDU_CARTESIAN_TRIPLE_RING_WORKER";
 
-fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxParallelContext {
-    MlxParallelContext::for_rank(rank, tp, pp, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
-        .unwrap()
+fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxParallelPlan {
+    MlxParallelPlan::for_rank(rank, tp, pp, ep, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap()
 }
 
 fn scalar(value: i32) -> Array {
@@ -283,7 +283,7 @@ fn cartesian_triple_ring_worker() {
         &distributed::init(true, Backend::Ring).unwrap(),
     );
     assert_eq!((world.rank(), world.size()), (expected_rank, 8));
-    let topology = MlxParallelContext::for_rank(
+    let topology = MlxParallelPlan::for_rank(
         expected_rank,
         2,
         2,
@@ -308,7 +308,7 @@ fn cartesian_triple_ring_worker() {
     let expected_tp = topology
         .subgroup(eredu_core::ParallelAxis::Tensor)
         .unwrap()
-        .global_ranks
+        .global_ranks()
         .iter()
         .map(|rank| *rank as i32 + 1)
         .sum::<i32>();
@@ -325,13 +325,13 @@ fn cartesian_triple_ring_worker() {
     let expected_ep = topology
         .subgroup(eredu_core::ParallelAxis::Expert)
         .unwrap()
-        .global_ranks
+        .global_ranks()
         .iter()
         .map(|rank| *rank as i32 + 1)
         .sum::<i32>();
     assert_eq!(values(ep.as_array()), vec![expected_ep]);
 
-    if topology.pipeline_parallel_rank == 0 {
+    if topology.pipeline_parallel_rank() == 0 {
         let value = MlxTensor::from_array(scalar(expected_rank as i32 + 100));
         execution
             .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)

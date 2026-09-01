@@ -291,7 +291,9 @@ pub fn local_geometry(
 }
 
 /// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn static_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = vec![
@@ -336,7 +338,9 @@ pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend>(
 }
 
 /// Declares semantic groups for one scheduled LFM2 block.
-pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn layer_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     block: &Block<B>,
     args: &ModelArgs,
     layer: usize,

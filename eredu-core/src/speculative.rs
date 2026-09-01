@@ -8,7 +8,7 @@ use crate::{
     generation::{
         FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
         SemanticEvent, SpeculativeCancellationDisposition, SpeculativeConfig, SpeculativeRequestId,
-        SpeculativeRequestLifecycle, SpeculativeRequestPhase, SpeculativeRound,
+        SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
         SpeculativeSchedulerOptions, TokenTerminalSignals,
     },
 };
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 /// Draft-model source selected for one speculative-generation request.
+#[non_exhaustive]
 pub enum SpeculativeDraft<'a, D> {
     /// Separately prepared assistant owned by the selected backend.
     External(&'a mut D),
@@ -26,19 +27,76 @@ pub enum SpeculativeDraft<'a, D> {
 /// One backend-independent speculative-generation result.
 pub struct SpeculativeGenerationOutput {
     /// Canonical emitted token ids, including terminal EOS when emitted.
-    pub token_ids: Vec<u32>,
+    token_ids: Vec<u32>,
     /// Portable terminal reason selected by the generation lifecycle.
-    pub finish_reason: FinishReason,
+    finish_reason: FinishReason,
     /// Portable speculative execution telemetry.
-    pub stats: SpeculativeStats,
+    stats: SpeculativeStats,
+}
+
+impl SpeculativeGenerationOutput {
+    /// Creates one completed portable result.
+    pub fn new(token_ids: Vec<u32>, finish_reason: FinishReason, stats: SpeculativeStats) -> Self {
+        Self {
+            token_ids,
+            finish_reason,
+            stats,
+        }
+    }
+
+    /// Canonical emitted token ids.
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+    /// Terminal generation reason.
+    pub const fn finish_reason(&self) -> FinishReason {
+        self.finish_reason
+    }
+    /// Portable speculative telemetry.
+    pub const fn stats(&self) -> &SpeculativeStats {
+        &self.stats
+    }
 }
 
 /// Completed speculative requests plus aggregate fair-scheduler telemetry.
 pub struct SpeculativeGenerationBatchOutput {
     /// Per-request results in submission order.
-    pub requests: Vec<SpeculativeGenerationOutput>,
+    requests: Vec<SpeculativeGenerationOutput>,
     /// Aggregate scheduler telemetry.
-    pub scheduler: SpeculativeSchedulerStats,
+    scheduler: SpeculativeSchedulerStats,
+}
+
+impl SpeculativeGenerationBatchOutput {
+    /// Creates a completed batch in stable submission order.
+    pub fn new(
+        requests: Vec<SpeculativeGenerationOutput>,
+        scheduler: SpeculativeSchedulerStats,
+    ) -> Self {
+        Self {
+            requests,
+            scheduler,
+        }
+    }
+    /// Per-request results in submission order.
+    pub fn requests(&self) -> &[SpeculativeGenerationOutput] {
+        &self.requests
+    }
+    /// Consumes the batch and returns its request results.
+    pub fn into_requests(self) -> Vec<SpeculativeGenerationOutput> {
+        self.requests
+    }
+    /// Aggregate scheduler telemetry.
+    pub const fn scheduler(&self) -> &SpeculativeSchedulerStats {
+        &self.scheduler
+    }
+    /// Appends a result while adapting another backend-neutral execution path.
+    pub fn push_request(&mut self, request: SpeculativeGenerationOutput) {
+        self.requests.push(request);
+    }
+    /// Clears adapted request results while retaining scheduler telemetry.
+    pub fn clear_requests(&mut self) {
+        self.requests.clear();
+    }
 }
 
 /// One independently executable lane in a speculative batch.
@@ -48,19 +106,99 @@ where
     C: SpeculativeTokenFilterController,
 {
     /// Backend-owned prompt prepared by the selected session backend.
-    pub prompt: B::Prompt,
+    prompt: Option<B::Prompt>,
     /// Fully resolved portable sampling configuration and random seed.
-    pub generation: TextGenerationConfig,
+    generation: Option<TextGenerationConfig>,
     /// Resolved token budget, proposal width, temperature, and EOS ids.
-    pub config: SpeculativeConfig,
+    config: Option<SpeculativeConfig>,
     /// Portable canonical grammar state.
-    pub constraint: C,
+    constraint: Option<C>,
     /// Transactional decoded semantic parser state.
-    pub semantic: Box<dyn SpeculativeSemanticState>,
+    semantic: Option<Box<dyn SpeculativeSemanticState>>,
     /// Cooperative cancellation owned by this lane.
-    pub cancellation: GenerationCancellationToken,
+    cancellation: Option<GenerationCancellationToken>,
     /// Called synchronously for canonical events from this lane.
-    pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
+    on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
+}
+
+impl<'a, B, C> SpeculativeGenerationLane<'a, B, C>
+where
+    B: TextGenerationBackend,
+    C: SpeculativeTokenFilterController,
+{
+    /// Creates one independently executable speculative lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        prompt: B::Prompt,
+        generation: TextGenerationConfig,
+        config: SpeculativeConfig,
+        constraint: C,
+        semantic: Box<dyn SpeculativeSemanticState>,
+        cancellation: GenerationCancellationToken,
+        on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
+    ) -> Self {
+        Self {
+            prompt: Some(prompt),
+            generation: Some(generation),
+            config: Some(config),
+            constraint: Some(constraint),
+            semantic: Some(semantic),
+            cancellation: Some(cancellation),
+            on_event: Some(on_event),
+        }
+    }
+    /// Takes the backend-owned prompt exactly once.
+    pub fn take_prompt(&mut self) -> B::Prompt {
+        self.prompt.take().expect("lane prompt already taken")
+    }
+    /// Borrows the backend-owned prompt before preparation consumes it.
+    pub fn prompt(&self) -> &B::Prompt {
+        self.prompt.as_ref().expect("lane prompt already taken")
+    }
+    /// Takes the resolved generation controls exactly once.
+    pub fn take_generation(&mut self) -> TextGenerationConfig {
+        self.generation
+            .take()
+            .expect("lane generation already taken")
+    }
+    /// Borrows resolved generation controls.
+    pub fn generation(&self) -> &TextGenerationConfig {
+        self.generation
+            .as_ref()
+            .expect("lane generation already taken")
+    }
+    /// Takes the speculative controls exactly once.
+    pub fn take_config(&mut self) -> SpeculativeConfig {
+        self.config.take().expect("lane config already taken")
+    }
+    /// Borrows speculative controls.
+    pub fn config(&self) -> &SpeculativeConfig {
+        self.config.as_ref().expect("lane config already taken")
+    }
+    /// Takes the grammar controller exactly once.
+    pub fn take_constraint(&mut self) -> C {
+        self.constraint
+            .take()
+            .expect("lane constraint already taken")
+    }
+    /// Takes semantic state exactly once.
+    pub fn take_semantic(&mut self) -> Box<dyn SpeculativeSemanticState> {
+        self.semantic
+            .take()
+            .expect("lane semantic state already taken")
+    }
+    /// Takes cancellation state exactly once.
+    pub fn take_cancellation(&mut self) -> GenerationCancellationToken {
+        self.cancellation
+            .take()
+            .expect("lane cancellation already taken")
+    }
+    /// Takes the event callback exactly once.
+    pub fn take_on_event(&mut self) -> Box<dyn FnMut(SemanticEvent) + 'a> {
+        self.on_event
+            .take()
+            .expect("lane event callback already taken")
+    }
 }
 
 /// Backend-preparation input for one or more speculative lanes.
@@ -70,11 +208,42 @@ where
     C: SpeculativeTokenFilterController,
 {
     /// Embedded or separately prepared draft-model selection.
-    pub drafting: SpeculativeDraft<'a, D>,
+    drafting: Option<SpeculativeDraft<'a, D>>,
     /// Independently prepared speculative lanes.
-    pub lanes: Vec<SpeculativeGenerationLane<'a, B, C>>,
+    lanes: Option<Vec<SpeculativeGenerationLane<'a, B, C>>>,
     /// Target tokenizer vocabulary identity used for drafter compatibility.
-    pub tokenizer_fingerprint: [u8; 32],
+    tokenizer_fingerprint: [u8; 32],
+}
+
+impl<'a, B, D, C> SpeculativeGenerationBatchRequest<'a, B, D, C>
+where
+    B: TextGenerationBackend,
+    C: SpeculativeTokenFilterController,
+{
+    /// Creates one validated backend-preparation request.
+    pub fn new(
+        drafting: SpeculativeDraft<'a, D>,
+        lanes: Vec<SpeculativeGenerationLane<'a, B, C>>,
+        tokenizer_fingerprint: [u8; 32],
+    ) -> Self {
+        Self {
+            drafting: Some(drafting),
+            lanes: Some(lanes),
+            tokenizer_fingerprint,
+        }
+    }
+    /// Target tokenizer vocabulary identity.
+    pub const fn tokenizer_fingerprint(&self) -> [u8; 32] {
+        self.tokenizer_fingerprint
+    }
+    /// Takes draft selection exactly once.
+    pub fn take_drafting(&mut self) -> SpeculativeDraft<'a, D> {
+        self.drafting.take().expect("draft selection already taken")
+    }
+    /// Takes prepared lanes exactly once.
+    pub fn take_lanes(&mut self) -> Vec<SpeculativeGenerationLane<'a, B, C>> {
+        self.lanes.take().expect("speculative lanes already taken")
+    }
 }
 
 /// Optional speculative model-session capability.
@@ -105,6 +274,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
 /// Relationship between target and assistant execution placements.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SpeculativeExecutionTopology {
     /// Target and assistant operations share one ordered execution queue.
     #[default]
@@ -128,6 +298,7 @@ impl std::fmt::Display for SpeculativeExecutionTopology {
 /// How a model exposes speculative draft-token weights.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SpeculativeDraftSource {
     /// Drafting weights live in a separately prepared model.
     Separate,
@@ -138,6 +309,7 @@ pub enum SpeculativeDraftSource {
 /// Fail-closed speculative-decoding capability of a prepared model session.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SpeculativeCapability {
     /// The model does not advertise executable draft weights.
     Unavailable,
@@ -159,64 +331,214 @@ pub enum SpeculativeCapability {
 #[derive(Debug, Clone, Default)]
 pub struct SpeculativeStats {
     /// Relationship between the request's target and draft execution placements.
-    pub execution_topology: SpeculativeExecutionTopology,
+    execution_topology: SpeculativeExecutionTopology,
     /// Target tokens evaluated during prefill and verification.
-    pub target_tokens: usize,
+    target_tokens: usize,
     /// Assistant tokens proposed.
-    pub draft_tokens: usize,
+    draft_tokens: usize,
     /// Assistant tokens accepted by target verification.
-    pub accepted_tokens: usize,
+    accepted_tokens: usize,
     /// Number of target verification rounds.
-    pub rounds: usize,
+    rounds: usize,
     /// Accepted proposal count for each round.
-    pub accept_lens: Vec<usize>,
+    accept_lens: Vec<usize>,
     /// Tokens emitted, including a terminal EOS token when one is produced.
-    pub emitted_tokens: usize,
+    emitted_tokens: usize,
     /// Tokens drafted on an optimistic continuation.
-    pub optimistic_draft_tokens: usize,
+    optimistic_draft_tokens: usize,
     /// Optimistic continuation blocks drafted.
-    pub optimistic_draft_blocks: usize,
+    optimistic_draft_blocks: usize,
     /// Optimistically drafted tokens promoted after full acceptance.
-    pub reused_optimistic_tokens: usize,
+    reused_optimistic_tokens: usize,
     /// Optimistic continuation blocks promoted after full acceptance.
-    pub reused_optimistic_blocks: usize,
+    reused_optimistic_blocks: usize,
     /// First optimistic tokens consumed by matching target bonuses.
-    pub consumed_optimistic_tokens: usize,
+    consumed_optimistic_tokens: usize,
     /// Optimistically drafted tokens discarded.
-    pub discarded_optimistic_tokens: usize,
+    discarded_optimistic_tokens: usize,
     /// Optimistic continuation blocks discarded.
-    pub discarded_optimistic_blocks: usize,
+    discarded_optimistic_blocks: usize,
     /// Target bonus tokens emitted while an optimistic branch existed.
-    pub optimistic_target_bonus_tokens: usize,
+    optimistic_target_bonus_tokens: usize,
     /// Non-terminal target bonuses matching the first optimistic token.
-    pub optimistic_bonus_matches: usize,
+    optimistic_bonus_matches: usize,
     /// Non-terminal target bonuses differing from the first optimistic token.
-    pub optimistic_bonus_mismatches: usize,
+    optimistic_bonus_mismatches: usize,
     /// Whether deterministic cost accounting disabled further optimistic branches.
-    pub adaptive_lookahead_disabled: bool,
+    adaptive_lookahead_disabled: bool,
     /// Host wall time spent producing optional same-request branches.
-    pub optimistic_draft_time: Duration,
+    optimistic_draft_time: Duration,
     /// Host wall time retained target verification remained in flight.
-    pub verification_in_flight_time: Duration,
+    verification_in_flight_time: Duration,
     /// Whether architecture component timings were collected.
-    pub component_timings_collected: bool,
+    component_timings_collected: bool,
     /// Device execution time spent encoding committed target context.
-    pub draft_context_time: Duration,
+    draft_context_time: Duration,
     /// Device execution time spent executing assistant proposal blocks.
-    pub draft_assistant_time: Duration,
+    draft_assistant_time: Duration,
     /// Device execution time spent projecting proposal states to logits.
-    pub draft_head_time: Duration,
+    draft_head_time: Duration,
     /// Device execution time spent executing target verification passes.
-    pub target_verification_time: Duration,
+    target_verification_time: Duration,
     /// Scheduler operations performed for this request.
-    pub scheduler_turns: usize,
+    scheduler_turns: usize,
     /// Draft turns performed while another request had target work in flight.
-    pub cross_request_draft_opportunities: usize,
+    cross_request_draft_opportunities: usize,
     /// Wall-clock generation duration.
-    pub elapsed: Duration,
+    elapsed: Duration,
 }
 
 impl SpeculativeStats {
+    /// Selected target/draft placement relationship.
+    pub const fn execution_topology(&self) -> SpeculativeExecutionTopology {
+        self.execution_topology
+    }
+    /// Target tokens evaluated.
+    pub const fn target_tokens(&self) -> usize {
+        self.target_tokens
+    }
+    /// Assistant tokens proposed.
+    pub const fn draft_tokens(&self) -> usize {
+        self.draft_tokens
+    }
+    /// Assistant tokens accepted.
+    pub const fn accepted_tokens(&self) -> usize {
+        self.accepted_tokens
+    }
+    /// Target verification rounds.
+    pub const fn rounds(&self) -> usize {
+        self.rounds
+    }
+    /// Accepted proposal count per round.
+    pub fn accept_lens(&self) -> &[usize] {
+        &self.accept_lens
+    }
+    /// Emitted token count.
+    pub const fn emitted_tokens(&self) -> usize {
+        self.emitted_tokens
+    }
+    /// Optimistically drafted token count.
+    pub const fn optimistic_draft_tokens(&self) -> usize {
+        self.optimistic_draft_tokens
+    }
+    /// Optimistic block count.
+    pub const fn optimistic_draft_blocks(&self) -> usize {
+        self.optimistic_draft_blocks
+    }
+    /// Reused optimistic token count.
+    pub const fn reused_optimistic_tokens(&self) -> usize {
+        self.reused_optimistic_tokens
+    }
+    /// Reused optimistic block count.
+    pub const fn reused_optimistic_blocks(&self) -> usize {
+        self.reused_optimistic_blocks
+    }
+    /// Optimistic tokens consumed by target bonuses.
+    pub const fn consumed_optimistic_tokens(&self) -> usize {
+        self.consumed_optimistic_tokens
+    }
+    /// Discarded optimistic token count.
+    pub const fn discarded_optimistic_tokens(&self) -> usize {
+        self.discarded_optimistic_tokens
+    }
+    /// Discarded optimistic block count.
+    pub const fn discarded_optimistic_blocks(&self) -> usize {
+        self.discarded_optimistic_blocks
+    }
+    /// Target bonuses emitted while an optimistic branch existed.
+    pub const fn optimistic_target_bonus_tokens(&self) -> usize {
+        self.optimistic_target_bonus_tokens
+    }
+    /// Matching optimistic bonus count.
+    pub const fn optimistic_bonus_matches(&self) -> usize {
+        self.optimistic_bonus_matches
+    }
+    /// Mismatching optimistic bonus count.
+    pub const fn optimistic_bonus_mismatches(&self) -> usize {
+        self.optimistic_bonus_mismatches
+    }
+    /// Whether adaptive lookahead is disabled.
+    pub const fn adaptive_lookahead_disabled(&self) -> bool {
+        self.adaptive_lookahead_disabled
+    }
+    /// Time spent drafting optimistic branches.
+    pub const fn optimistic_draft_time(&self) -> Duration {
+        self.optimistic_draft_time
+    }
+    /// Time retained verification remained in flight.
+    pub const fn verification_in_flight_time(&self) -> Duration {
+        self.verification_in_flight_time
+    }
+    /// Whether component timings were collected.
+    pub const fn component_timings_collected(&self) -> bool {
+        self.component_timings_collected
+    }
+    /// Draft-context device time.
+    pub const fn draft_context_time(&self) -> Duration {
+        self.draft_context_time
+    }
+    /// Draft-assistant device time.
+    pub const fn draft_assistant_time(&self) -> Duration {
+        self.draft_assistant_time
+    }
+    /// Draft-head device time.
+    pub const fn draft_head_time(&self) -> Duration {
+        self.draft_head_time
+    }
+    /// Target-verification device time.
+    pub const fn target_verification_time(&self) -> Duration {
+        self.target_verification_time
+    }
+    /// Scheduler turns for this request.
+    pub const fn scheduler_turns(&self) -> usize {
+        self.scheduler_turns
+    }
+    /// Draft turns performed beside other in-flight target work.
+    pub const fn cross_request_draft_opportunities(&self) -> usize {
+        self.cross_request_draft_opportunities
+    }
+    /// Wall-clock generation duration.
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// Adds backend-measured component timings without exposing mutable fields.
+    pub fn add_component_timings(
+        &mut self,
+        draft_context: Duration,
+        draft_assistant: Duration,
+        draft_head: Duration,
+        target_verification: Duration,
+    ) {
+        self.draft_context_time += draft_context;
+        self.draft_assistant_time += draft_assistant;
+        self.draft_head_time += draft_head;
+        self.target_verification_time += target_verification;
+        self.component_timings_collected = true;
+    }
+
+    /// Adds completed scheduler rounds to portable telemetry.
+    pub fn add_scheduler_rounds(&mut self, rounds: usize) {
+        self.rounds += rounds;
+    }
+
+    /// Records aggregate optimistic work used by adaptive-lookahead policy.
+    pub fn record_optimistic_accounting(
+        &mut self,
+        drafted_blocks: usize,
+        reused_tokens: usize,
+        discarded_tokens: usize,
+    ) {
+        self.optimistic_draft_blocks += drafted_blocks;
+        self.reused_optimistic_tokens += reused_tokens;
+        self.discarded_optimistic_tokens += discarded_tokens;
+    }
+
+    /// Clears the cached adaptive-lookahead decision before policy re-evaluation.
+    pub fn reset_adaptive_lookahead_decision(&mut self) {
+        self.adaptive_lookahead_disabled = false;
+    }
+
     /// Fraction of proposed tokens accepted by the target.
     pub fn accept_rate(&self) -> f64 {
         if self.draft_tokens == 0 {
@@ -243,15 +565,38 @@ impl SpeculativeStats {
 #[derive(Debug, Clone, Default)]
 pub struct SpeculativeSchedulerStats {
     /// Relationship between scheduler target and draft placements.
-    pub execution_topology: SpeculativeExecutionTopology,
+    execution_topology: SpeculativeExecutionTopology,
     /// Total scheduler operations.
-    pub turns: usize,
+    turns: usize,
     /// Draft turns performed while another request was being verified.
-    pub cross_request_draft_opportunities: usize,
+    cross_request_draft_opportunities: usize,
     /// Maximum simultaneously retained target verification transactions.
-    pub peak_in_flight_verifications: usize,
+    peak_in_flight_verifications: usize,
     /// Maximum simultaneously retained optimistic draft branches.
-    pub peak_optimistic_branches: usize,
+    peak_optimistic_branches: usize,
+}
+
+impl SpeculativeSchedulerStats {
+    /// Selected target/draft placement relationship.
+    pub const fn execution_topology(&self) -> SpeculativeExecutionTopology {
+        self.execution_topology
+    }
+    /// Scheduler turn count.
+    pub const fn turns(&self) -> usize {
+        self.turns
+    }
+    /// Draft turns performed beside other in-flight target work.
+    pub const fn cross_request_draft_opportunities(&self) -> usize {
+        self.cross_request_draft_opportunities
+    }
+    /// Peak retained target verifications.
+    pub const fn peak_in_flight_verifications(&self) -> usize {
+        self.peak_in_flight_verifications
+    }
+    /// Peak retained optimistic branches.
+    pub const fn peak_optimistic_branches(&self) -> usize {
+        self.peak_optimistic_branches
+    }
 }
 
 /// Backend telemetry that can contribute to portable speculative statistics.
@@ -271,20 +616,41 @@ impl SpeculativeTelemetry for () {
 #[derive(Debug)]
 pub struct SpeculativePrefill<State, Logits> {
     /// Opaque logits used by the selected backend sampler.
-    pub logits: Logits,
+    logits: Logits,
     /// Backend state from which the first proposal round begins.
-    pub state: State,
+    state: State,
     /// Number of prompt tokens evaluated by the target.
-    pub evaluated_tokens: usize,
+    evaluated_tokens: usize,
+}
+
+impl<State, Logits> SpeculativePrefill<State, Logits> {
+    /// Creates a backend-owned prefill result.
+    pub const fn new(logits: Logits, state: State, evaluated_tokens: usize) -> Self {
+        Self {
+            logits,
+            state,
+            evaluated_tokens,
+        }
+    }
 }
 
 /// Result of committing one exact target verification transaction.
 #[derive(Debug)]
 pub struct SpeculativeCommit<State> {
     /// Assistant seed state matching the committed target cache.
-    pub state: State,
+    state: State,
     /// Target tokens replayed while restoring the exact retained prefix.
-    pub replayed_tokens: usize,
+    replayed_tokens: usize,
+}
+
+impl<State> SpeculativeCommit<State> {
+    /// Creates an exact target-commit result.
+    pub const fn new(state: State, replayed_tokens: usize) -> Self {
+        Self {
+            state,
+            replayed_tokens,
+        }
+    }
 }
 
 /// Whole-session speculative execution contract.
@@ -414,6 +780,7 @@ pub trait SpeculativeExecutor {
 
 /// Target decision for one assistant proposal.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ProposalDecision {
     /// Retain the assistant proposal.
     Accept,
@@ -423,6 +790,7 @@ pub enum ProposalDecision {
 
 /// Logical model side on which an opaque sampling operation executes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SamplingPlacement {
     /// Canonical target-model execution.
     Target,
@@ -434,9 +802,16 @@ pub enum SamplingPlacement {
 #[derive(Debug, Clone)]
 pub struct SpeculativeRandomness<R, D> {
     /// Sequential target randomness.
-    pub target: Option<R>,
+    target: Option<R>,
     /// Position-addressable assistant randomness.
-    pub draft: Option<D>,
+    draft: Option<D>,
+}
+
+impl<R, D> SpeculativeRandomness<R, D> {
+    /// Creates independent target and draft random streams.
+    pub const fn new(target: Option<R>, draft: Option<D>) -> Self {
+        Self { target, draft }
+    }
 }
 
 /// One backend-prepared lane lent to neutral speculative orchestration.
@@ -451,15 +826,62 @@ where
     P: SpeculativePublisher<C>,
 {
     /// Backend-owned request cache.
-    pub cache: &'a mut E::Cache,
+    cache: Option<&'a mut E::Cache>,
     /// Backend-owned prepared model input.
-    pub input: E::Input,
+    input: Option<E::Input>,
     /// Validated speculative generation controls.
-    pub config: SpeculativeConfig,
+    config: Option<SpeculativeConfig>,
     /// Canonical sampling, constraint, publication, and cancellation state.
-    pub runtime: SpeculativeOutputRuntime<S, C, P>,
+    runtime: Option<SpeculativeOutputRuntime<S, C, P>>,
     /// Independent target and draft random streams.
-    pub randomness: SpeculativeRandomness<S::RandomState, S::DraftRandomness>,
+    randomness: Option<SpeculativeRandomness<S::RandomState, S::DraftRandomness>>,
+}
+
+impl<'a, E, S, C, P> PreparedSpeculativeLane<'a, E, S, C, P>
+where
+    E: SpeculativeExecutor,
+    S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
+{
+    /// Creates one backend-prepared lane for neutral orchestration.
+    pub fn new(
+        cache: &'a mut E::Cache,
+        input: E::Input,
+        config: SpeculativeConfig,
+        runtime: SpeculativeOutputRuntime<S, C, P>,
+        randomness: SpeculativeRandomness<S::RandomState, S::DraftRandomness>,
+    ) -> Self {
+        Self {
+            cache: Some(cache),
+            input: Some(input),
+            config: Some(config),
+            runtime: Some(runtime),
+            randomness: Some(randomness),
+        }
+    }
+    /// Takes the backend cache borrow exactly once.
+    pub fn take_cache(&mut self) -> &'a mut E::Cache {
+        self.cache.take().expect("prepared cache already taken")
+    }
+    /// Takes model input exactly once.
+    pub fn take_input(&mut self) -> E::Input {
+        self.input.take().expect("prepared input already taken")
+    }
+    /// Takes speculative controls exactly once.
+    pub fn take_config(&mut self) -> SpeculativeConfig {
+        self.config.take().expect("prepared config already taken")
+    }
+    /// Takes portable output state exactly once.
+    pub fn take_runtime(&mut self) -> SpeculativeOutputRuntime<S, C, P> {
+        self.runtime.take().expect("prepared runtime already taken")
+    }
+    /// Takes target/draft randomness exactly once.
+    pub fn take_randomness(&mut self) -> SpeculativeRandomness<S::RandomState, S::DraftRandomness> {
+        self.randomness
+            .take()
+            .expect("prepared randomness already taken")
+    }
 }
 
 /// Facade/runtime-owned driver for backend-prepared speculative execution.
@@ -610,28 +1032,72 @@ pub trait SpeculativeSampling: Clone {
 #[derive(Debug)]
 pub struct SpeculativeProposal<D> {
     /// Proposed token id.
-    pub token: u32,
+    token: u32,
     /// Backend-owned processed assistant distribution.
-    pub distribution: D,
+    distribution: D,
+}
+
+impl<D> SpeculativeProposal<D> {
+    /// Creates one retained assistant proposal.
+    pub const fn new(token: u32, distribution: D) -> Self {
+        Self {
+            token,
+            distribution,
+        }
+    }
+    /// Proposed token id.
+    pub const fn token(&self) -> u32 {
+        self.token
+    }
+    /// Retained assistant distribution.
+    pub const fn distribution(&self) -> &D {
+        &self.distribution
+    }
 }
 
 /// Backend-owned assistant state paired with a portable proposal sequence.
 pub struct SpeculativeDraftBlock<S, D> {
     /// Assistant state after producing every proposal.
-    pub state: S,
+    state: S,
     /// Ordered proposed tokens and opaque distributions.
-    pub proposals: Vec<SpeculativeProposal<D>>,
+    proposals: Vec<SpeculativeProposal<D>>,
+}
+
+impl<S, D> SpeculativeDraftBlock<S, D> {
+    /// Creates one ordered assistant proposal block.
+    pub fn new(state: S, proposals: Vec<SpeculativeProposal<D>>) -> Self {
+        Self { state, proposals }
+    }
+    /// Assistant state after every proposal.
+    pub const fn state(&self) -> &S {
+        &self.state
+    }
+    /// Ordered proposals retained by this block.
+    pub fn proposals(&self) -> &[SpeculativeProposal<D>] {
+        &self.proposals
+    }
 }
 
 /// Tentative continuation drafted against an assumed canonical prefix.
 pub struct SpeculativeOptimisticBranch<S, D> {
     /// Backend-owned tentative draft block.
-    pub block: SpeculativeDraftBlock<S, D>,
+    block: SpeculativeDraftBlock<S, D>,
     /// Prefix against which the block was produced.
-    pub assumed_prefix: Vec<u32>,
+    assumed_prefix: Vec<u32>,
+}
+
+impl<S, D> SpeculativeOptimisticBranch<S, D> {
+    /// Creates one tentative continuation tied to an assumed prefix.
+    pub fn new(block: SpeculativeDraftBlock<S, D>, assumed_prefix: Vec<u32>) -> Self {
+        Self {
+            block,
+            assumed_prefix,
+        }
+    }
 }
 
 /// Optimistic state retained after a committed target transaction.
+#[non_exhaustive]
 pub enum SpeculativeContinuation<S, D> {
     /// No reusable proposal block remains.
     None,
@@ -706,6 +1172,7 @@ where
 
 /// Structured failure in backend-independent speculative output handling.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SpeculativeOutputError {
     /// Transactional semantic parsing, decoding, or stop matching failed.
     #[error("speculative semantic state failed during {operation}: {message}")]
@@ -996,13 +1463,14 @@ where
     }
 
     /// Consumes the runtime into its backend-owned parts.
-    pub fn into_parts(self) -> (S, GenerationSequence, C, P) {
+    pub(crate) fn into_parts(self) -> (S, GenerationSequence, C, P) {
         (self.sampler, self.sequence, self.constraint, self.publisher)
     }
 }
 
 /// Error returned by portable proposal and verification drivers.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SpeculativeDriverError<E: std::error::Error + 'static> {
     /// Backend execution or sampling failed.
     #[error(transparent)]
@@ -1018,23 +1486,23 @@ pub enum SpeculativeDriverError<E: std::error::Error + 'static> {
 /// Resolved speculative transaction ready for backend cache commit.
 pub struct ResolvedSpeculativeRound<S, C, R> {
     /// Tentatively advanced sampler state.
-    pub sampler: S,
+    sampler: S,
     /// Tentatively advanced semantic state.
-    pub constraint: C,
+    constraint: C,
     /// Tentatively advanced canonical sequence.
-    pub sequence: GenerationSequence,
+    sequence: GenerationSequence,
     /// Tentatively advanced target randomness.
-    pub target_randomness: Option<R>,
+    target_randomness: Option<R>,
     /// Number of accepted proposals.
-    pub accepted_proposals: usize,
+    accepted_proposals: usize,
     /// Tokens visible after cache commit.
-    pub committed_tokens: Vec<u32>,
+    committed_tokens: Vec<u32>,
     /// Exact verification inputs retained by cache commit.
-    pub verified_inputs: usize,
+    verified_inputs: usize,
     /// Target bonus token, when full acceptance produced one.
-    pub bonus_token: Option<u32>,
+    bonus_token: Option<u32>,
     /// Terminal reason after this round.
-    pub finish_reason: Option<FinishReason>,
+    finish_reason: Option<FinishReason>,
 }
 
 /// Generates one assistant proposal block through opaque backend operations.
@@ -1253,6 +1721,7 @@ where
 }
 
 /// Request state selected after committed output publication.
+#[non_exhaustive]
 pub enum SpeculativePublicationStatus<S, D> {
     /// Continue from canonical target state and an optional promoted block.
     Continue(SpeculativeContinuation<S, D>),
@@ -1265,15 +1734,15 @@ pub enum SpeculativePublicationStatus<S, D> {
 /// Backend and portable state after exact commit and legal publication.
 pub struct PublishedSpeculativeVerification<TargetState, DraftState, Distribution, RandomState, T> {
     /// Target state matching the committed backend cache.
-    pub target_state: TargetState,
+    target_state: TargetState,
     /// Canonical target randomness after resolution.
-    pub target_randomness: Option<RandomState>,
+    target_randomness: Option<RandomState>,
     /// Updated portable request telemetry.
-    pub stats: SpeculativeStats,
+    stats: SpeculativeStats,
     /// Backend component telemetry observed at exact completion.
-    pub telemetry: T,
+    telemetry: T,
     /// Request continuation selected after publication.
-    pub status: SpeculativePublicationStatus<DraftState, Distribution>,
+    status: SpeculativePublicationStatus<DraftState, Distribution>,
 }
 
 /// Publication result produced after a speculative verification commits.
@@ -1588,9 +2057,9 @@ where
         self.id
     }
 
-    /// Current validated lifecycle phase.
-    pub const fn phase(&self) -> SpeculativeRequestPhase {
-        self.lifecycle.phase()
+    /// Current validated lifecycle status.
+    pub const fn status(&self) -> SpeculativeRequestStatus {
+        self.lifecycle.status()
     }
 
     /// Portable request statistics.
@@ -1620,7 +2089,7 @@ where
 
     fn transition(
         &mut self,
-        next: SpeculativeRequestPhase,
+        next: SpeculativeRequestStatus,
     ) -> Result<(), SpeculativeDriverError<E::Error>> {
         self.lifecycle
             .transition(next)
@@ -1659,8 +2128,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let optimistic_eligible = if self.lifecycle.phase()
-            != SpeculativeRequestPhase::TargetVerificationInFlight
+        let optimistic_eligible = if self.lifecycle.status()
+            != SpeculativeRequestStatus::TargetVerificationInFlight
             || !optimistic_execution_available
         {
             false
@@ -1686,7 +2155,7 @@ where
                 && self.config.max_tokens.saturating_sub(assumed_len) > 1
         };
         Ok(SpeculativeCandidate {
-            phase: self.lifecycle.phase(),
+            status: self.lifecycle.status(),
             optimistic_eligible,
         })
     }
@@ -1714,7 +2183,7 @@ where
                     .saturating_sub(self.runtime.sequence().tokens().len()),
             );
         if target_count == 0 {
-            self.transition(SpeculativeRequestPhase::Completed)?;
+            self.transition(SpeculativeRequestStatus::Completed)?;
             self.stats.elapsed = self.started.elapsed();
             return Ok(false);
         }
@@ -1787,7 +2256,7 @@ where
         }
         executor.take_telemetry()?.record(&mut self.stats);
         self.block = Some(block);
-        self.transition(SpeculativeRequestPhase::ReadyToSubmitVerification)?;
+        self.transition(SpeculativeRequestStatus::ReadyToSubmitVerification)?;
         Ok(additional > 0)
     }
 
@@ -1817,7 +2286,7 @@ where
         let pending = submit_verification_transaction(executor, self.cache, last, block, context)?;
         self.stats.target_tokens += pending.submitted_tokens();
         self.pending = Some(pending);
-        self.transition(SpeculativeRequestPhase::TargetVerificationInFlight)
+        self.transition(SpeculativeRequestStatus::TargetVerificationInFlight)
     }
 
     fn draft_optimistic<'context>(
@@ -1834,7 +2303,7 @@ where
             > + 'context,
     {
         let started = Instant::now();
-        self.transition(SpeculativeRequestPhase::OptimisticDraftInProgress)?;
+        self.transition(SpeculativeRequestStatus::OptimisticDraftRunning)?;
         let pending = self
             .pending
             .as_mut()
@@ -1876,7 +2345,7 @@ where
                 assumed_prefix: history,
             })
             .map_err(SpeculativeDriverError::Generation)?;
-        self.transition(SpeculativeRequestPhase::OptimisticDraftReady)
+        self.transition(SpeculativeRequestStatus::OptimisticDraftReady)
     }
 
     fn resolve_verification<'context>(
@@ -1893,7 +2362,7 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        self.transition(SpeculativeRequestPhase::VerificationResolution)?;
+        self.transition(SpeculativeRequestStatus::VerificationResolution)?;
         let pending = self
             .pending
             .take()
@@ -1909,7 +2378,7 @@ where
             )?;
             telemetry.record(&mut stats);
             self.stats = stats;
-            self.transition(SpeculativeRequestPhase::Cancelled)?;
+            self.transition(SpeculativeRequestStatus::Cancelled)?;
             self.stats.elapsed = self.started.elapsed();
             return Ok(());
         }
@@ -1931,14 +2400,14 @@ where
         match published.status {
             SpeculativePublicationStatus::Continue(continuation) => {
                 self.block = continuation.into_block();
-                self.transition(SpeculativeRequestPhase::ReadyToDraft)?;
+                self.transition(SpeculativeRequestStatus::ReadyToDraft)?;
             }
             SpeculativePublicationStatus::Completed => {
-                self.transition(SpeculativeRequestPhase::Completed)?;
+                self.transition(SpeculativeRequestStatus::Completed)?;
                 self.stats.elapsed = self.started.elapsed();
             }
             SpeculativePublicationStatus::Cancelled => {
-                self.transition(SpeculativeRequestPhase::Cancelled)?;
+                self.transition(SpeculativeRequestStatus::Cancelled)?;
                 self.stats.elapsed = self.started.elapsed();
             }
         }
@@ -1949,25 +2418,119 @@ where
 /// One completed request returned in stable submission order.
 pub struct CompletedSpeculativeRequest<S> {
     /// Stable request identity.
-    pub id: SpeculativeRequestId,
+    id: SpeculativeRequestId,
     /// Canonical generated token sequence.
-    pub token_ids: Vec<u32>,
+    token_ids: Vec<u32>,
     /// Portable request telemetry.
-    pub stats: SpeculativeStats,
+    stats: SpeculativeStats,
     /// Final backend sampling state.
-    pub sampler: S,
+    sampler: S,
     /// Terminal reason selected by the canonical sequence.
-    pub finish_reason: Option<FinishReason>,
-    /// Terminal lifecycle phase.
-    pub phase: SpeculativeRequestPhase,
+    finish_reason: Option<FinishReason>,
+    /// Terminal lifecycle status.
+    status: SpeculativeRequestStatus,
+}
+
+impl<S> CompletedSpeculativeRequest<S> {
+    /// Stable request identity.
+    pub const fn id(&self) -> SpeculativeRequestId {
+        self.id
+    }
+    /// Canonical emitted token ids.
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+    /// Portable request telemetry.
+    pub const fn stats(&self) -> &SpeculativeStats {
+        &self.stats
+    }
+    /// Final sampling state.
+    pub const fn sampler(&self) -> &S {
+        &self.sampler
+    }
+    /// Terminal reason, when completed normally.
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+    /// Terminal request status.
+    pub const fn status(&self) -> SpeculativeRequestStatus {
+        self.status
+    }
+    /// Consumes the request into a named handoff artifact.
+    pub fn into_artifact(self) -> CompletedSpeculativeRequestArtifact<S> {
+        CompletedSpeculativeRequestArtifact {
+            id: self.id,
+            token_ids: self.token_ids,
+            stats: self.stats,
+            sampler: self.sampler,
+            finish_reason: self.finish_reason,
+            status: self.status,
+        }
+    }
+}
+
+/// Named consuming artifact for adapting one completed speculative request.
+pub struct CompletedSpeculativeRequestArtifact<S> {
+    id: SpeculativeRequestId,
+    token_ids: Vec<u32>,
+    stats: SpeculativeStats,
+    sampler: S,
+    finish_reason: Option<FinishReason>,
+    status: SpeculativeRequestStatus,
+}
+
+impl<S> CompletedSpeculativeRequestArtifact<S> {
+    /// Stable request identity.
+    pub const fn id(&self) -> SpeculativeRequestId {
+        self.id
+    }
+    /// Takes canonical token ids.
+    pub fn take_token_ids(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.token_ids)
+    }
+    /// Takes request telemetry.
+    pub fn take_stats(&mut self) -> SpeculativeStats {
+        std::mem::take(&mut self.stats)
+    }
+    /// Consumes the artifact into its final sampler.
+    pub fn into_sampler(self) -> S {
+        self.sampler
+    }
+    /// Terminal finish reason.
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+    /// Terminal lifecycle status.
+    pub const fn status(&self) -> SpeculativeRequestStatus {
+        self.status
+    }
 }
 
 /// Completed request table and aggregate fair-scheduler telemetry.
 pub struct CompletedSpeculativeSchedule<S> {
     /// Requests in stable submission order.
-    pub requests: Vec<CompletedSpeculativeRequest<S>>,
+    requests: Vec<CompletedSpeculativeRequest<S>>,
     /// Aggregate scheduler telemetry.
-    pub scheduler: SpeculativeSchedulerStats,
+    scheduler: SpeculativeSchedulerStats,
+}
+
+impl<S> CompletedSpeculativeSchedule<S> {
+    /// Consumes the schedule into request results.
+    pub fn into_requests(self) -> Vec<CompletedSpeculativeRequest<S>> {
+        self.requests
+    }
+    /// Takes completed requests while retaining access to scheduler telemetry.
+    pub fn take_requests(&mut self) -> Vec<CompletedSpeculativeRequest<S>> {
+        std::mem::take(&mut self.requests)
+    }
+    /// Takes aggregate scheduler telemetry.
+    pub fn take_scheduler(&mut self) -> SpeculativeSchedulerStats {
+        std::mem::take(&mut self.scheduler)
+    }
+    /// Aggregate scheduler telemetry.
+    pub const fn scheduler(&self) -> &SpeculativeSchedulerStats {
+        &self.scheduler
+    }
 }
 
 /// Canonical table and action coordinator for speculative requests.
@@ -2013,9 +2576,9 @@ where
         self.requests.get(id.index())
     }
 
-    /// Returns one request's current phase.
-    pub fn phase(&self, id: SpeculativeRequestId) -> Option<SpeculativeRequestPhase> {
-        self.request(id).map(SpeculativeRequest::phase)
+    /// Returns one request's current status.
+    pub fn status(&self, id: SpeculativeRequestId) -> Option<SpeculativeRequestStatus> {
+        self.request(id).map(SpeculativeRequest::status)
     }
 
     /// Whether every request is terminal.
@@ -2116,7 +2679,7 @@ where
             } else {
                 let mut lifecycle = SpeculativeRequestLifecycle::new();
                 lifecycle
-                    .transition(SpeculativeRequestPhase::ReadyToDraft)
+                    .transition(SpeculativeRequestStatus::ReadyToDraft)
                     .map_err(SpeculativeDriverError::Generation)?;
                 lifecycle
             };
@@ -2304,7 +2867,7 @@ where
                         token_ids: sequence.into_tokens(),
                         stats: request.stats,
                         sampler,
-                        phase: request.lifecycle.phase(),
+                        status: request.lifecycle.status(),
                     }
                 })
                 .collect(),
@@ -2316,14 +2879,15 @@ where
 /// Portable candidate snapshot used by fair speculative action selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SpeculativeCandidate {
-    /// Current validated request phase.
-    pub phase: SpeculativeRequestPhase,
+    /// Current validated request status.
+    status: SpeculativeRequestStatus,
     /// Whether this request may start exact optimistic work now.
-    pub optimistic_eligible: bool,
+    optimistic_eligible: bool,
 }
 
 /// One backend action selected by the portable fair scheduler.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SpeculativeAction {
     /// Submit a prepared proposal block.
     SubmitVerification(usize),
@@ -2367,8 +2931,8 @@ impl SpeculativeSchedule {
     ) -> Result<Option<SpeculativeAction>, GenerationError> {
         if candidates.iter().all(|candidate| {
             matches!(
-                candidate.phase,
-                SpeculativeRequestPhase::Completed | SpeculativeRequestPhase::Cancelled
+                candidate.status,
+                SpeculativeRequestStatus::Completed | SpeculativeRequestStatus::Cancelled
             )
         }) {
             return Ok(None);
@@ -2377,22 +2941,22 @@ impl SpeculativeSchedule {
             .iter()
             .filter(|candidate| {
                 matches!(
-                    candidate.phase,
-                    SpeculativeRequestPhase::TargetVerificationInFlight
-                        | SpeculativeRequestPhase::OptimisticDraftInProgress
-                        | SpeculativeRequestPhase::OptimisticDraftReady
-                        | SpeculativeRequestPhase::VerificationResolution
+                    candidate.status,
+                    SpeculativeRequestStatus::TargetVerificationInFlight
+                        | SpeculativeRequestStatus::OptimisticDraftRunning
+                        | SpeculativeRequestStatus::OptimisticDraftReady
+                        | SpeculativeRequestStatus::VerificationResolution
                 )
             })
             .count();
         let optimistic = candidates
             .iter()
-            .filter(|candidate| candidate.phase == SpeculativeRequestPhase::OptimisticDraftReady)
+            .filter(|candidate| candidate.status == SpeculativeRequestStatus::OptimisticDraftReady)
             .count();
 
         if in_flight < self.options.max_in_flight_verifications {
             if let Some(index) = self.select(candidates, |candidate| {
-                candidate.phase == SpeculativeRequestPhase::ReadyToSubmitVerification
+                candidate.status == SpeculativeRequestStatus::ReadyToSubmitVerification
             }) {
                 return Ok(Some(SpeculativeAction::SubmitVerification(index)));
             }
@@ -2402,14 +2966,14 @@ impl SpeculativeSchedule {
                 && self.options.lookahead_blocks > 0
             {
                 if let Some(index) = self.select(candidates, |candidate| {
-                    candidate.phase == SpeculativeRequestPhase::TargetVerificationInFlight
+                    candidate.status == SpeculativeRequestStatus::TargetVerificationInFlight
                         && candidate.optimistic_eligible
                 }) {
                     return Ok(Some(SpeculativeAction::DraftOptimistic(index)));
                 }
             }
             if let Some(index) = self.select(candidates, |candidate| {
-                candidate.phase == SpeculativeRequestPhase::ReadyToDraft
+                candidate.status == SpeculativeRequestStatus::ReadyToDraft
             }) {
                 return Ok(Some(SpeculativeAction::DraftCommitted {
                     index,
@@ -2418,15 +2982,15 @@ impl SpeculativeSchedule {
             }
             if let Some(index) = self.select(candidates, |candidate| {
                 matches!(
-                    candidate.phase,
-                    SpeculativeRequestPhase::TargetVerificationInFlight
-                        | SpeculativeRequestPhase::OptimisticDraftReady
+                    candidate.status,
+                    SpeculativeRequestStatus::TargetVerificationInFlight
+                        | SpeculativeRequestStatus::OptimisticDraftReady
                 )
             }) {
                 return Ok(Some(SpeculativeAction::ResolveVerification(index)));
             }
         } else if let Some(index) = self.select(candidates, |candidate| {
-            candidate.phase == SpeculativeRequestPhase::ReadyToDraft
+            candidate.status == SpeculativeRequestStatus::ReadyToDraft
         }) {
             return Ok(Some(SpeculativeAction::DraftCommitted {
                 index,
@@ -3014,7 +3578,7 @@ mod tests {
         let mut schedule =
             SpeculativeSchedule::new(SpeculativeSchedulerOptions::default()).unwrap();
         let ready = SpeculativeCandidate {
-            phase: SpeculativeRequestPhase::ReadyToSubmitVerification,
+            status: SpeculativeRequestStatus::ReadyToSubmitVerification,
             optimistic_eligible: false,
         };
         assert_eq!(
@@ -3027,11 +3591,11 @@ mod tests {
         );
 
         let in_flight = SpeculativeCandidate {
-            phase: SpeculativeRequestPhase::TargetVerificationInFlight,
+            status: SpeculativeRequestStatus::TargetVerificationInFlight,
             optimistic_eligible: false,
         };
         let draft = SpeculativeCandidate {
-            phase: SpeculativeRequestPhase::ReadyToDraft,
+            status: SpeculativeRequestStatus::ReadyToDraft,
             optimistic_eligible: false,
         };
         assert_eq!(
@@ -3090,12 +3654,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            table.phase(first),
-            Some(SpeculativeRequestPhase::ReadyToDraft)
+            table.status(first),
+            Some(SpeculativeRequestStatus::ReadyToDraft)
         );
         assert_eq!(
-            table.phase(second),
-            Some(SpeculativeRequestPhase::ReadyToDraft)
+            table.status(second),
+            Some(SpeculativeRequestStatus::ReadyToDraft)
         );
         table.step(&mut executor, false, ()).unwrap();
         table.step(&mut executor, false, ()).unwrap();
@@ -3106,10 +3670,16 @@ mod tests {
         let output = table.finish().unwrap();
         assert_eq!(output.requests.len(), 2);
         assert_eq!(output.requests[0].id, first);
-        assert_eq!(output.requests[0].phase, SpeculativeRequestPhase::Cancelled);
+        assert_eq!(
+            output.requests[0].status,
+            SpeculativeRequestStatus::Cancelled
+        );
         assert_eq!(output.requests[0].token_ids, [1]);
         assert_eq!(output.requests[1].id, second);
-        assert_eq!(output.requests[1].phase, SpeculativeRequestPhase::Completed);
+        assert_eq!(
+            output.requests[1].status,
+            SpeculativeRequestStatus::Completed
+        );
         assert_eq!(output.requests[1].token_ids, [1, 1, 0]);
         assert!(output.scheduler.cross_request_draft_opportunities > 0);
         assert_eq!(first_cache, [4, 1]);
@@ -3151,12 +3721,15 @@ mod tests {
         table.step(&mut executor, true, ()).unwrap();
         table.step(&mut executor, true, ()).unwrap();
         assert_eq!(
-            table.phase(id),
-            Some(SpeculativeRequestPhase::OptimisticDraftReady)
+            table.status(id),
+            Some(SpeculativeRequestStatus::OptimisticDraftReady)
         );
         table.run(&mut executor, true, ()).unwrap();
         let output = table.finish().unwrap();
-        assert_eq!(output.requests[0].phase, SpeculativeRequestPhase::Completed);
+        assert_eq!(
+            output.requests[0].status,
+            SpeculativeRequestStatus::Completed
+        );
         assert!(output.requests[0].stats.optimistic_draft_blocks > 0);
         assert!(output.requests[0].stats.discarded_optimistic_blocks > 0);
         assert_eq!(output.scheduler.peak_optimistic_branches, 1);

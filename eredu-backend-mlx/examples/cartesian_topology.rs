@@ -1,6 +1,6 @@
 //! Inspect MLX Cartesian rank topology construction.
 
-use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelContext};
+use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelPlan};
 use safemlx::{
     distributed::{self, Backend},
     DeviceType,
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = MlxParallelContext::for_group(
+    let topology = MlxParallelPlan::for_group(
         &world,
         tp,
         pp,
@@ -34,16 +34,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = topology.preflight((pp > 1).then_some(layers), (ep > 1).then_some(experts))?;
     eprintln!(
         "global={}/{} coordinates={:?} layers={:?} experts={:?} embedding={} head={} TP={:?} PP={:?} EP={:?}",
-        topology.global_rank,
-        topology.world_size,
+        topology.global_rank(),
+        topology.world_size(),
         topology.coordinates(),
-        report.local_layer_range,
-        report.local_expert_range,
-        report.owns_embedding,
-        report.owns_output_head,
-        report.tensor_subgroup.global_ranks,
-        report.pipeline_subgroup.global_ranks,
-        report.expert_subgroup.global_ranks,
+        report.local_layer_range(),
+        report.local_expert_range(),
+        report.owns_embedding(),
+        report.owns_output_head(),
+        report.tensor_subgroup().global_ranks(),
+        report.pipeline_subgroup().global_ranks(),
+        report.expert_subgroup().global_ranks(),
     );
     Ok(())
 }

@@ -1112,7 +1112,7 @@ mod tests {
         .unwrap()
         .prompt_cache_identity(&layout)
         .unwrap();
-        assert_eq!(identity.layer_prefix_offsets, [0, 0, 0, 0, -1, -1]);
+        assert_eq!(identity.layer_prefix_offsets(), [0, 0, 0, 0, -1, -1]);
     }
 
     #[test]

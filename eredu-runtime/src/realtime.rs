@@ -10,7 +10,7 @@ use crate::{
 };
 use eredu_core::{
     scheduler::SemanticStateTransaction, Completion, RealtimeFrameScheduleState,
-    RealtimeScheduleError, RealtimeSpeechConfig,
+    RealtimeInputFrame, RealtimeScheduleError, RealtimeSpeechConfig,
 };
 use std::marker::PhantomData;
 
@@ -38,8 +38,43 @@ pub struct RealtimeGenerationBranch<MB, S, R, C> {
     completion: Option<C>,
 }
 
+/// Additive execution contract for architectures that consume realtime frames.
+///
+/// The causal-text base model contract remains unchanged. Realtime composition
+/// implements this extension only when frame ingress is part of execution.
+pub trait RealtimeFrameTransition<MB, S, R, C> {
+    /// Output causally produced by one frame transition.
+    type Output;
+    /// Architecture or mechanism failure before publication.
+    type Error;
+
+    /// Consumes the portable ingress frame, mutates the unpublished branch,
+    /// and returns the exact completion associated with the submitted work.
+    fn execute(
+        &mut self,
+        frame: &RealtimeInputFrame,
+        branch: &mut RealtimeGenerationBranch<MB, S, R, C>,
+    ) -> Result<(Self::Output, C), Self::Error>;
+}
+
+/// Failure while executing or atomically publishing one realtime frame.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RealtimeFrameExecutionError<TransitionError, TransactionError> {
+    /// Frame ingress or architecture execution failed before publication.
+    #[error("realtime frame transition failed")]
+    Transition(#[source] TransitionError),
+    /// The returned completion could not be attached to the exact branch.
+    #[error(transparent)]
+    CompletionAttachment(#[from] RealtimeCompletionAttachmentError),
+    /// Exact completion or atomic state publication failed.
+    #[error("realtime frame publication failed")]
+    Publication(#[source] TransactionError),
+}
+
 /// Failure to attach exact backend completion evidence to a branch.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RealtimeCompletionAttachmentError {
     /// A transition represents one exact submission and already has evidence.
     #[error("realtime generation branch already has an exact submission completion")]
@@ -48,6 +83,7 @@ pub enum RealtimeCompletionAttachmentError {
 
 /// Invalid composite branch construction or publication.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RealtimeGenerationTransactionError<ModelError, CompletionError> {
     /// The model/cache transaction could not branch or publish.
     #[error("realtime model-state transaction failed: {0}")]
@@ -151,6 +187,39 @@ where
         validate_sampler_cardinality(self.schedule_state.schedule(), samplers.len())?;
         self.samplers = samplers;
         Ok(())
+    }
+
+    /// Executes one ingress-dependent transition and publishes every mutable
+    /// component only after its exact completion succeeds.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the signature preserves the exact transition, model, and completion error types"
+    )]
+    pub fn execute_frame_transition<T>(
+        &mut self,
+        frame: &RealtimeInputFrame,
+        transition: &mut T,
+    ) -> Result<
+        T::Output,
+        RealtimeFrameExecutionError<
+            T::Error,
+            RealtimeGenerationTransactionError<M::Error, C::Error>,
+        >,
+    >
+    where
+        S: Clone,
+        R: Clone,
+        T: RealtimeFrameTransition<M::Branch, S, R, C>,
+    {
+        let mut branch = SemanticStateTransaction::branch(self)
+            .map_err(RealtimeFrameExecutionError::Publication)?;
+        let (output, completion) = transition
+            .execute(frame, &mut branch)
+            .map_err(RealtimeFrameExecutionError::Transition)?;
+        branch.attach_submission_completion(completion)?;
+        SemanticStateTransaction::commit_branch(self, branch)
+            .map_err(RealtimeFrameExecutionError::Publication)?;
+        Ok(output)
     }
 
     /// Publishes a branch only after the concrete backend's exact completion
@@ -352,9 +421,9 @@ mod tests {
     use crate::{PenaltyConfig, PredictionDirective};
     use eredu_core::{
         scheduler::SemanticStateTransaction, RealtimeFrameConvention, RealtimeFrameForcing,
-        TokenFilter,
+        RealtimeInputFrame, TokenFilter,
     };
-    use std::{cell::Cell, fmt, rc::Rc};
+    use std::{cell::Cell, convert::Infallible, fmt, rc::Rc};
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct ModelState {
@@ -602,10 +671,11 @@ mod tests {
     }
 
     fn mutate_every_component(
+        frame: &RealtimeInputFrame,
         branch: &mut RealtimeGenerationBranch<ModelState, StatefulSampler, i32, MockCompletion>,
     ) {
-        branch.model_state_mut().model_step = 9;
-        branch.model_state_mut().cache_offset = 10;
+        branch.model_state_mut().model_step = frame.input_audio_tokens()[0];
+        branch.model_state_mut().cache_offset = frame.forced_text_tokens().unwrap()[0];
         branch
             .schedule_state_mut()
             .advance(&schedule(), &RealtimeFrameForcing::none(&schedule()))
@@ -634,16 +704,49 @@ mod tests {
         branch.adopt_decision_driver(driver).unwrap();
     }
 
+    struct FrameTransition {
+        outcome: CompletionOutcome,
+        waits: Rc<Cell<usize>>,
+    }
+
+    impl RealtimeFrameTransition<ModelState, StatefulSampler, i32, MockCompletion> for FrameTransition {
+        type Output = i32;
+        type Error = Infallible;
+
+        fn execute(
+            &mut self,
+            frame: &RealtimeInputFrame,
+            branch: &mut RealtimeGenerationBranch<ModelState, StatefulSampler, i32, MockCompletion>,
+        ) -> Result<(Self::Output, MockCompletion), Self::Error> {
+            mutate_every_component(frame, branch);
+            let output = branch.model_state.model_step + branch.model_state.cache_offset;
+            Ok((
+                output,
+                MockCompletion {
+                    outcome: self.outcome,
+                    waits: Rc::clone(&self.waits),
+                },
+            ))
+        }
+    }
+
     #[test]
     fn realtime_frame_extension_publishes_ingress_and_state_atomically() {
         let mut state = state();
-        let mut branch = state.branch().unwrap();
-        mutate_every_component(&mut branch);
-        let (completion, waits) = MockCompletion::new(CompletionOutcome::Success);
-        branch.attach_submission_completion(completion).unwrap();
-        state.commit_branch(branch).unwrap();
+        let waits = Rc::new(Cell::new(0));
+        let mut transition = FrameTransition {
+            outcome: CompletionOutcome::Success,
+            waits: Rc::clone(&waits),
+        };
+        let output = state
+            .execute_frame_transition(
+                &RealtimeInputFrame::new(1, vec![9]).with_forced_text(vec![10]),
+                &mut transition,
+            )
+            .unwrap();
 
         assert_eq!(waits.get(), 1);
+        assert_eq!(output, 19);
         assert_eq!(
             state.model_state(),
             &ModelState {
@@ -659,13 +762,19 @@ mod tests {
     #[test]
     fn failed_completion_rolls_back_every_component() {
         let mut state = state();
-        let mut branch = state.branch().unwrap();
-        mutate_every_component(&mut branch);
-        let (completion, waits) = MockCompletion::new(CompletionOutcome::Failure);
-        branch.attach_submission_completion(completion).unwrap();
+        let waits = Rc::new(Cell::new(0));
+        let mut transition = FrameTransition {
+            outcome: CompletionOutcome::Failure,
+            waits: Rc::clone(&waits),
+        };
         assert!(matches!(
-            state.commit_branch(branch),
-            Err(RealtimeGenerationTransactionError::Completion(_))
+            state.execute_frame_transition(
+                &RealtimeInputFrame::new(1, vec![40]).with_forced_text(vec![50]),
+                &mut transition,
+            ),
+            Err(RealtimeFrameExecutionError::Publication(
+                RealtimeGenerationTransactionError::Completion(_)
+            ))
         ));
 
         assert_eq!(waits.get(), 1);
@@ -685,7 +794,10 @@ mod tests {
     fn pending_completion_is_not_waited_or_published() {
         let mut state = state();
         let mut branch = state.branch().unwrap();
-        mutate_every_component(&mut branch);
+        mutate_every_component(
+            &RealtimeInputFrame::new(1, vec![9]).with_forced_text(vec![10]),
+            &mut branch,
+        );
         let (completion, waits) = MockCompletion::new(CompletionOutcome::Pending);
         branch.attach_submission_completion(completion).unwrap();
         assert!(matches!(
@@ -708,7 +820,10 @@ mod tests {
     fn discard_leaves_canonical_state_unchanged() {
         let state = state();
         let mut branch = state.branch().unwrap();
-        mutate_every_component(&mut branch);
+        mutate_every_component(
+            &RealtimeInputFrame::new(1, vec![9]).with_forced_text(vec![10]),
+            &mut branch,
+        );
         State::discard_branch(branch).unwrap();
         assert_eq!(
             state.model_state(),
@@ -772,7 +887,10 @@ mod tests {
     fn missing_completion_cannot_publish() {
         let mut state = state();
         let mut branch = state.branch().unwrap();
-        mutate_every_component(&mut branch);
+        mutate_every_component(
+            &RealtimeInputFrame::new(1, vec![9]).with_forced_text(vec![10]),
+            &mut branch,
+        );
         assert!(matches!(
             state.commit_branch(branch),
             Err(RealtimeGenerationTransactionError::MissingCompletion)

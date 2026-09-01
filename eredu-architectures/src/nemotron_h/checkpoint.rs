@@ -526,7 +526,7 @@ fn add_expert_residency_units(
             .collect::<Result<Vec<_>, _>>()?;
         units.push(
             crate::ExpertResidencyUnit::new(
-                eredu_runtime::ExpertIdentity::new(topology.identity_layer, expert),
+                eredu_runtime::ParameterBankKey::new(topology.identity_layer, expert),
                 owner_group.clone(),
                 topology.owner_unit,
                 &topology.unit_path,
@@ -1636,7 +1636,10 @@ mod tests {
         let catalog = expert_residency_catalog(&store, &args).unwrap();
         assert_eq!(catalog.units().len(), 8);
         let target = &catalog.units()[0];
-        assert_eq!(target.identity(), eredu_runtime::ExpertIdentity::new(3, 0));
+        assert_eq!(
+            target.identity(),
+            eredu_runtime::ParameterBankKey::new(3, 0)
+        );
         assert_eq!(target.owner_group().as_str(), "target");
         assert_eq!(target.owner_unit(), 3);
         assert_eq!(target.unit_path(), "model.layers.3");
@@ -1665,7 +1668,7 @@ mod tests {
         let prediction = &catalog.units()[4];
         assert_eq!(
             prediction.identity(),
-            eredu_runtime::ExpertIdentity::new(5, 0)
+            eredu_runtime::ParameterBankKey::new(5, 0)
         );
         assert_eq!(prediction.owner_group().as_str(), "mtp.0");
         assert_eq!(prediction.owner_unit(), 1);
@@ -1679,7 +1682,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(selected.len(), 4);
         assert!(selected.iter().all(|unit| {
-            unit.identity().layer == 5
+            unit.identity().unit() == 5
                 && unit.owner_group().as_str() == "mtp.0"
                 && unit.owner_unit() == 1
         }));

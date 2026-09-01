@@ -82,9 +82,11 @@ for the corresponding processor support and `codec` for the MLX Mimi binding.
 
 Application clients should use portable `ExecutionPlan`, `LocalLoadOptions`,
 and `LocalInspectionOptions` values through `eredu::api`. Backend tooling may
-instead bind a `ParallelRankTopology` to a process-local MLX device with
-`backend::topology::MlxParallelContext` and pass it through
-`backend::config::ModelLoadOptions::with_parallel`.
+instead bind a `ParallelRankTopology` to a process-local MLX device with the
+composition-owned `native::MlxParallelPlan` and pass it through the root
+`MlxLoadRequest` adapter. Selection consumes that request before payload access;
+materialization receives only the opaque selected preparation and resolved
+composition-owned construction values.
 
 Use `safemlx::distributed::device_for_local_rank` for the process-local device.
 A global rank is not a local GPU index: launchers commonly restrict each

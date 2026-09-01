@@ -621,11 +621,11 @@ mod tests {
         .unwrap()
         .prompt_cache_identity(&state_layout)
         .unwrap();
-        assert_eq!(identity.layer_count, state_layout.len());
-        assert_eq!(identity.global_layer_start, 0);
-        assert_eq!(identity.layer_prefix_offsets.len(), state_layout.len());
+        assert_eq!(identity.layer_count(), state_layout.len());
+        assert_eq!(identity.global_layer_start(), 0);
+        assert_eq!(identity.layer_prefix_offsets().len(), state_layout.len());
         assert_eq!(
-            identity.architecture_fingerprint,
+            identity.architecture_fingerprint(),
             gpt_oss::prompt_cache_architecture_fingerprint(&args)
         );
         let (capabilities, estimate) = architecture_capability::gpt_oss(&args)

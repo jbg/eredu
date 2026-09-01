@@ -1,12 +1,29 @@
 //! Runtime ownership boundary for routed expert acquisition and residency.
 
 use eredu_nn::{
-    GroupSelection, GroupedGatedProductOperator, GroupedNeuralBackend, GroupedRelu2Operator,
-    Tensor, TensorParallelGroupedOutput,
+    DistributedNeuralBackend, GroupSelection, GroupedGatedProductOperator, GroupedNeuralBackend,
+    GroupedRelu2Operator, Tensor, TensorParallelGroupedOutput,
 };
 
 use crate::ExpertPass;
-use crate::{ActivationObserver, RoutingObservation};
+use crate::{ActivationObserver, ParameterBankKey, RoutingObservation};
+
+/// Mechanism-only lookup of one grouped operator in an addressable parameter bank.
+pub trait AddressableGatedProductBank<B>
+where
+    B: GroupedNeuralBackend,
+{
+    /// Bank lookup or construction failure.
+    type Error;
+
+    /// Resolves one generic bank key and exact grouped construction specification.
+    fn acquire(
+        &mut self,
+        key: ParameterBankKey,
+        spec: &eredu_nn::GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<&mut B::GatedProductGroups, Self::Error>;
+}
 
 /// One architecture route batch submitted to a runtime expert provider.
 pub struct RoutedExpertRequest<'a, T> {
@@ -35,7 +52,7 @@ pub fn reduce_tensor_parallel_expert_output<B>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, eredu_nn::Error>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
 {
     let reduced = B::sum_parallel(output.reducible().clone(), parallel, context)?;
     match output.post_reduce().cloned() {
@@ -98,7 +115,7 @@ pub fn reduce_routed_expert_tensor_parallel<B>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, eredu_nn::Error>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
 {
     match output {
         RoutedExpertTensorParallelOutput::Complete(output) => Ok(output),

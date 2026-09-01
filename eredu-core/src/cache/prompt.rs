@@ -57,36 +57,172 @@ impl PromptCacheStateSegment {
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct PromptCacheDescriptor {
     /// Stable architecture family.
-    pub model_family: String,
+    model_family: String,
     /// Effective normalized model type.
-    pub effective_model_type: String,
+    effective_model_type: String,
     /// Caller-verified checkpoint identity.
-    pub checkpoint_fingerprint: String,
+    checkpoint_fingerprint: String,
     /// Identity of all content that produced the cached activations.
-    pub prefix_content_fingerprint: String,
+    prefix_content_fingerprint: String,
     /// Cache-relevant architecture identity.
-    pub architecture_fingerprint: String,
+    architecture_fingerprint: String,
     /// Total model layer count.
-    pub layer_count: usize,
+    layer_count: usize,
     /// Inclusive first global layer stored by this rank.
-    pub global_layer_start: usize,
+    global_layer_start: usize,
     /// Exclusive global layer boundary stored by this rank.
-    pub global_layer_end: usize,
+    global_layer_end: usize,
     /// Prefix batch size.
-    pub batch_size: usize,
+    batch_size: usize,
     /// Ordered cache layout for the owned layer range.
-    pub layer_layout: LayerSchedule<LayerCachePolicy>,
+    layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Per-layer processed-token delta relative to the persisted prefix.
-    pub layer_prefix_offsets: Vec<i32>,
+    layer_prefix_offsets: Vec<i32>,
     /// Architecture-declared named ranges in the ordered state layout.
-    pub state_segments: Vec<PromptCacheStateSegment>,
+    state_segments: Vec<PromptCacheStateSegment>,
     /// Attention sink or pinned-prefix token count.
-    pub sink_tokens: usize,
+    sink_tokens: usize,
     /// Distributed rank-local layout.
-    pub topology: PromptCacheTopology,
+    topology: PromptCacheTopology,
 }
 
 impl PromptCacheDescriptor {
+    /// Creates and validates a complete reusable prefix-cache descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        model_family: impl Into<String>,
+        effective_model_type: impl Into<String>,
+        checkpoint_fingerprint: impl Into<String>,
+        prefix_content_fingerprint: impl Into<String>,
+        architecture_fingerprint: impl Into<String>,
+        layer_count: usize,
+        global_layer_start: usize,
+        global_layer_end: usize,
+        batch_size: usize,
+        layer_layout: LayerSchedule<LayerCachePolicy>,
+        layer_prefix_offsets: Vec<i32>,
+        state_segments: Vec<PromptCacheStateSegment>,
+        sink_tokens: usize,
+        topology: PromptCacheTopology,
+    ) -> Result<Self, PromptCacheError> {
+        let descriptor = Self {
+            model_family: model_family.into(),
+            effective_model_type: effective_model_type.into(),
+            checkpoint_fingerprint: checkpoint_fingerprint.into(),
+            prefix_content_fingerprint: prefix_content_fingerprint.into(),
+            architecture_fingerprint: architecture_fingerprint.into(),
+            layer_count,
+            global_layer_start,
+            global_layer_end,
+            batch_size,
+            layer_layout,
+            layer_prefix_offsets,
+            state_segments,
+            sink_tokens,
+            topology,
+        };
+        for value in [
+            &descriptor.model_family,
+            &descriptor.effective_model_type,
+            &descriptor.checkpoint_fingerprint,
+            &descriptor.prefix_content_fingerprint,
+            &descriptor.architecture_fingerprint,
+        ] {
+            if value.trim().is_empty() {
+                return Err(PromptCacheError::Malformed(
+                    "prompt-cache identity strings must be non-empty".into(),
+                ));
+            }
+        }
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    /// Stable architecture family.
+    pub fn model_family(&self) -> &str {
+        &self.model_family
+    }
+    /// Effective normalized model type.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
+    }
+    /// Caller-verified checkpoint identity.
+    pub fn checkpoint_fingerprint(&self) -> &str {
+        &self.checkpoint_fingerprint
+    }
+    /// Prefix-content identity.
+    pub fn prefix_content_fingerprint(&self) -> &str {
+        &self.prefix_content_fingerprint
+    }
+    /// Cache-relevant architecture identity.
+    pub fn architecture_fingerprint(&self) -> &str {
+        &self.architecture_fingerprint
+    }
+    /// Total model layer count.
+    pub const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+    /// Inclusive first global layer stored by this rank.
+    pub const fn global_layer_start(&self) -> usize {
+        self.global_layer_start
+    }
+    /// Exclusive global layer boundary stored by this rank.
+    pub const fn global_layer_end(&self) -> usize {
+        self.global_layer_end
+    }
+    /// Prefix batch size.
+    pub const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+    /// Ordered cache layout.
+    pub const fn layer_layout(&self) -> &LayerSchedule<LayerCachePolicy> {
+        &self.layer_layout
+    }
+    /// Per-layer processed-token deltas.
+    pub fn layer_prefix_offsets(&self) -> &[i32] {
+        &self.layer_prefix_offsets
+    }
+    /// Named state-layout ranges.
+    pub fn state_segments(&self) -> &[PromptCacheStateSegment] {
+        &self.state_segments
+    }
+    /// Attention sink token count.
+    pub const fn sink_tokens(&self) -> usize {
+        self.sink_tokens
+    }
+    /// Distributed rank-local layout.
+    pub const fn topology(&self) -> &PromptCacheTopology {
+        &self.topology
+    }
+    /// Replaces the distributed topology and revalidates the descriptor.
+    pub fn with_topology(
+        mut self,
+        topology: PromptCacheTopology,
+    ) -> Result<Self, PromptCacheError> {
+        self.topology = topology;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Replaces the cache-relevant architecture fingerprint.
+    pub fn with_architecture_fingerprint(
+        mut self,
+        architecture_fingerprint: impl Into<String>,
+    ) -> Result<Self, PromptCacheError> {
+        self.architecture_fingerprint = architecture_fingerprint.into();
+        if self.architecture_fingerprint.trim().is_empty() {
+            return Err(PromptCacheError::Malformed(
+                "prompt-cache architecture fingerprint must be non-empty".into(),
+            ));
+        }
+        self.validate()?;
+        Ok(self)
+    }
+    /// Replaces the total model layer count while preserving the owned range.
+    pub fn with_layer_count(mut self, layer_count: usize) -> Result<Self, PromptCacheError> {
+        self.layer_count = layer_count;
+        self.validate()?;
+        Ok(self)
+    }
     /// Derives every model-owned field from a prepared model identity.
     ///
     /// The checkpoint and prefix-content fingerprints remain caller-owned
@@ -138,30 +274,117 @@ impl PromptCacheDescriptor {
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct PromptCacheModelIdentity {
     /// Stable architecture family.
-    pub model_family: String,
+    model_family: String,
     /// Effective normalized model type.
-    pub effective_model_type: String,
+    effective_model_type: String,
     /// Cache-relevant architecture identity.
-    pub architecture_fingerprint: String,
+    architecture_fingerprint: String,
     /// Total model layer count.
-    pub layer_count: usize,
+    layer_count: usize,
     /// Inclusive first global layer owned by this model instance.
-    pub global_layer_start: usize,
+    global_layer_start: usize,
     /// Exclusive global layer boundary owned by this model instance.
-    pub global_layer_end: usize,
+    global_layer_end: usize,
     /// Attention sink or pinned-prefix token count.
-    pub sink_tokens: usize,
+    sink_tokens: usize,
     /// Distributed rank-local layout.
-    pub topology: PromptCacheTopology,
+    topology: PromptCacheTopology,
     /// Ordered cache layout for the owned layer range.
-    pub layer_layout: LayerSchedule<LayerCachePolicy>,
+    layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Per-layer processed-token delta relative to the persisted prefix.
-    pub layer_prefix_offsets: Vec<i32>,
+    layer_prefix_offsets: Vec<i32>,
     /// Architecture-declared named ranges in the ordered state layout.
-    pub state_segments: Vec<PromptCacheStateSegment>,
+    state_segments: Vec<PromptCacheStateSegment>,
 }
 
 impl PromptCacheModelIdentity {
+    /// Creates and validates cache-relevant prepared-model identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        model_family: impl Into<String>,
+        effective_model_type: impl Into<String>,
+        architecture_fingerprint: impl Into<String>,
+        layer_count: usize,
+        global_layer_start: usize,
+        global_layer_end: usize,
+        sink_tokens: usize,
+        topology: PromptCacheTopology,
+        layer_layout: LayerSchedule<LayerCachePolicy>,
+        layer_prefix_offsets: Vec<i32>,
+        state_segments: Vec<PromptCacheStateSegment>,
+    ) -> Result<Self, PromptCacheError> {
+        let identity = Self {
+            model_family: model_family.into(),
+            effective_model_type: effective_model_type.into(),
+            architecture_fingerprint: architecture_fingerprint.into(),
+            layer_count,
+            global_layer_start,
+            global_layer_end,
+            sink_tokens,
+            topology,
+            layer_layout,
+            layer_prefix_offsets,
+            state_segments,
+        };
+        for value in [
+            &identity.model_family,
+            &identity.effective_model_type,
+            &identity.architecture_fingerprint,
+        ] {
+            if value.trim().is_empty() {
+                return Err(PromptCacheError::Malformed(
+                    "prompt-cache model identity strings must be non-empty".into(),
+                ));
+            }
+        }
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Stable architecture family.
+    pub fn model_family(&self) -> &str {
+        &self.model_family
+    }
+    /// Effective normalized model type.
+    pub fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
+    }
+    /// Cache-relevant architecture identity.
+    pub fn architecture_fingerprint(&self) -> &str {
+        &self.architecture_fingerprint
+    }
+    /// Total model layer count.
+    pub const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+    /// Inclusive first global layer owned locally.
+    pub const fn global_layer_start(&self) -> usize {
+        self.global_layer_start
+    }
+    /// Exclusive global layer boundary owned locally.
+    pub const fn global_layer_end(&self) -> usize {
+        self.global_layer_end
+    }
+    /// Attention sink token count.
+    pub const fn sink_tokens(&self) -> usize {
+        self.sink_tokens
+    }
+    /// Distributed rank-local layout.
+    pub const fn topology(&self) -> &PromptCacheTopology {
+        &self.topology
+    }
+    /// Ordered cache layout.
+    pub const fn layer_layout(&self) -> &LayerSchedule<LayerCachePolicy> {
+        &self.layer_layout
+    }
+    /// Per-layer processed-token deltas.
+    pub fn layer_prefix_offsets(&self) -> &[i32] {
+        &self.layer_prefix_offsets
+    }
+    /// Named state-layout ranges.
+    pub fn state_segments(&self) -> &[PromptCacheStateSegment] {
+        &self.state_segments
+    }
     /// Builds an ordered ordinary key/value layout from runtime window values.
     pub fn key_value_layouts(
         sliding_windows: impl IntoIterator<Item = Option<i32>>,
@@ -389,34 +612,71 @@ fn validate_state_segments(
 /// Rank-local topology recorded in a prompt-cache manifest.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PromptCacheTopology {
-    /// Pipeline world size and rank.
-    pub pipeline: Option<(usize, usize)>,
-    /// Tensor-parallel world size and rank.
-    pub tensor_parallel: Option<(usize, usize)>,
-    /// Expert-parallel world size and rank.
-    pub expert_parallel: Option<(usize, usize)>,
-    /// Whether attention state is replicated on the expert-parallel axis.
-    pub expert_parallel_cache_replicated: bool,
+    /// Ordered-stage partition size and rank.
+    stage: Option<(usize, usize)>,
+    /// State-shard partition size and rank.
+    shard: Option<(usize, usize)>,
+    /// Addressable-group size and rank.
+    addressable: Option<(usize, usize)>,
+    /// Whether cache state is replicated on the addressable axis.
+    addressable_state_replicated: bool,
 }
 
 impl Default for PromptCacheTopology {
     fn default() -> Self {
         Self {
-            pipeline: None,
-            tensor_parallel: None,
-            expert_parallel: None,
-            expert_parallel_cache_replicated: true,
+            stage: None,
+            shard: None,
+            addressable: None,
+            addressable_state_replicated: true,
         }
     }
 }
 
 impl PromptCacheTopology {
+    /// Creates and validates an exact cache-placement topology.
+    pub fn new(
+        stage: Option<(usize, usize)>,
+        shard: Option<(usize, usize)>,
+        addressable: Option<(usize, usize)>,
+        addressable_state_replicated: bool,
+    ) -> Result<Self, PromptCacheError> {
+        let topology = Self {
+            stage,
+            shard,
+            addressable,
+            addressable_state_replicated,
+        };
+        topology.validate()?;
+        Ok(topology)
+    }
+
+    /// Returns ordered-stage size and rank when partitioned.
+    pub const fn stage(&self) -> Option<(usize, usize)> {
+        self.stage
+    }
+
+    /// Returns state-shard size and rank when partitioned.
+    pub const fn shard(&self) -> Option<(usize, usize)> {
+        self.shard
+    }
+
+    /// Returns addressable-group size and rank when partitioned.
+    pub const fn addressable(&self) -> Option<(usize, usize)> {
+        self.addressable
+    }
+
+    /// Returns whether cache state is replicated on the addressable axis.
+    pub const fn addressable_state_replicated(&self) -> bool {
+        self.addressable_state_replicated
+    }
+
     /// Validates every optional world-size/rank pair.
     pub fn validate(&self) -> Result<(), PromptCacheError> {
         for (name, axis) in [
-            ("pipeline", self.pipeline),
-            ("tensor parallel", self.tensor_parallel),
-            ("expert parallel", self.expert_parallel),
+            ("stage", self.stage),
+            ("state shard", self.shard),
+            ("addressable group", self.addressable),
         ] {
             if axis.is_some_and(|(size, rank)| size == 0 || rank >= size) {
                 return Err(PromptCacheError::Malformed(format!(
@@ -429,13 +689,12 @@ impl PromptCacheTopology {
 
     /// Returns the rank identity stored on cache blocks, if distributed.
     pub fn cache_rank_identity(&self) -> Option<CacheRankIdentity> {
-        (self.pipeline.is_some()
-            || self.tensor_parallel.is_some()
-            || self.expert_parallel.is_some())
-        .then(|| CacheRankIdentity {
-            pipeline_rank: self.pipeline.map(|(_, rank)| rank),
-            tensor_parallel_rank: self.tensor_parallel.map(|(_, rank)| rank),
-            expert_parallel_rank: self.expert_parallel.map(|(_, rank)| rank),
+        (self.stage.is_some() || self.shard.is_some() || self.addressable.is_some()).then(|| {
+            CacheRankIdentity::new(
+                self.stage.map(|(_, rank)| rank),
+                self.shard.map(|(_, rank)| rank),
+                self.addressable.map(|(_, rank)| rank),
+            )
         })
     }
 }
@@ -444,9 +703,40 @@ impl PromptCacheTopology {
 #[derive(Debug, Clone, Default)]
 pub struct PromptCacheOptions {
     /// Optional application grouping label; never used for compatibility.
-    pub application_namespace: Option<String>,
+    application_namespace: Option<String>,
     /// Allows atomically replacing an existing destination.
-    pub replace_existing: bool,
+    replace_existing: bool,
+}
+
+impl PromptCacheOptions {
+    /// Creates validated prompt-cache publication options.
+    pub fn new(
+        application_namespace: Option<String>,
+        replace_existing: bool,
+    ) -> Result<Self, PromptCacheError> {
+        if application_namespace
+            .as_deref()
+            .is_some_and(|namespace| namespace.trim().is_empty())
+        {
+            return Err(PromptCacheError::Malformed(
+                "prompt-cache application namespace must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            application_namespace,
+            replace_existing,
+        })
+    }
+
+    /// Returns the optional application grouping label.
+    pub fn application_namespace(&self) -> Option<&str> {
+        self.application_namespace.as_deref()
+    }
+
+    /// Returns whether an existing destination may be replaced atomically.
+    pub const fn replace_existing(&self) -> bool {
+        self.replace_existing
+    }
 }
 
 /// Versioned metadata inspectable without loading backend arrays.
@@ -1141,7 +1431,7 @@ mod tests {
     #[test]
     fn rejects_bad_topology_geometry_coverage_and_paths() {
         let mut value = manifest();
-        value.topology.tensor_parallel = Some((1, 1));
+        value.topology.shard = Some((1, 1));
         assert!(value.validate().is_err());
         let mut value = manifest();
         value.blocks[0].first_shape[2] = 1;

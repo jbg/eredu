@@ -9,13 +9,16 @@ use eredu_core::cache::{
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
     BackendMechanismCapabilities, CacheResidencyPolicy, CacheResidencyReport,
-    DenseDiskStreamReport, GroupedOperationRequirement, LayerwiseRuntime, PagedCacheOptions,
+    DenseDiskStreamReport, GroupedOperationRequirement, LayerwiseRuntime,
     ReplicatedTextArchitecture, ReplicatedTextRequirements, ReplicatedTextSelectionRequest,
     ResidencyReport, RuntimeState, SelectedReplicatedTextRealization, StateResidencyMechanism,
     WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
     WeightResidencyMechanism,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+
+#[cfg(test)]
+use eredu_runtime::PagedCacheOptions;
 
 use crate::{
     backend::{
@@ -47,6 +50,13 @@ use eredu_architectures::replicated_text::{
 ///
 /// The report is derived only from source encodings, executable formats, and
 /// implemented backend facilities. It does not receive architecture identity.
+pub(crate) const GROUPED_OPERATION_CAPABILITIES: [GroupedOperationRequirement; 4] = [
+    GroupedOperationRequirement::GatedProduct,
+    GroupedOperationRequirement::GatedProductTensorParallelPartial,
+    GroupedOperationRequirement::Relu2,
+    GroupedOperationRequirement::Relu2TensorParallelPartial,
+];
+
 pub(crate) fn capabilities(
     requirements: &ReplicatedTextRequirements,
     request: &ReplicatedTextSelectionRequest,
@@ -93,17 +103,8 @@ pub(crate) fn capabilities(
             StateResidencyMechanism::Paged,
         ],
     )
-    .with_session(eredu_core::SessionCapabilities {
-        persistent_cache: true,
-        output_observation: true,
-        activation_inspection: true,
-    })
-    .with_grouped_operations([
-        GroupedOperationRequirement::GatedProduct,
-        GroupedOperationRequirement::GatedProductTensorParallelPartial,
-        GroupedOperationRequirement::Relu2,
-        GroupedOperationRequirement::Relu2TensorParallelPartial,
-    ])
+    .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+    .with_grouped_operations(GROUPED_OPERATION_CAPABILITIES)
     .with_prompt_cache(true)
     .with_exact_completion(true)
 }
@@ -120,13 +121,11 @@ pub trait ErasedReplicatedTextExecutable {
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport>;
     fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity;
     fn reset_cache(&mut self) -> Result<(), Exception>;
-    fn reset_cache_with_options(&mut self, policy: CacheResidencyPolicy) -> Result<(), Error>;
     fn load_prompt_cache(
         &mut self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        options: PagedCacheOptions,
     ) -> Result<PromptCacheManifest, Error>;
     fn save_prompt_cache(
         &mut self,
@@ -225,6 +224,7 @@ where
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
     selected_session: SelectedSessionBinding,
+    state_residency: CacheResidencyPolicy,
 }
 
 impl<A> BoundReplicatedText<A>
@@ -242,6 +242,7 @@ where
         let requirements = prepared.requirements().clone();
         let selected = prepared.selected().clone();
         let selected_session = SelectedSessionBinding::from_selected(&selected);
+        let state_residency = selected.state().clone();
         let capability_estimate = prepared.capability_estimate().clone();
         let effective_model_type = prepared.effective_model_type().to_owned();
         let residency = selected.residency();
@@ -338,6 +339,7 @@ where
             #[cfg(test)]
             selected_residency: residency,
             selected_session,
+            state_residency,
         })
     }
 
@@ -475,12 +477,9 @@ where
     }
 
     fn reset_cache(&mut self) -> Result<(), Exception> {
-        self.state = MlxKeyValueState::device(self.state_layout.clone())?;
-        Ok(())
-    }
-
-    fn reset_cache_with_options(&mut self, policy: CacheResidencyPolicy) -> Result<(), Error> {
-        self.state = self.new_state(policy)?;
+        self.state = self
+            .new_state(self.state_residency.clone())
+            .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(())
     }
 
@@ -489,8 +488,12 @@ where
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        options: PagedCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
+            return Err(Error::Parallel(
+                "prompt-cache loading requires paged state selected during preparation".into(),
+            ));
+        };
         eredu_core::cache::validate_prompt_cache_model_identity(
             expected,
             &self.prompt_cache_identity,
@@ -501,7 +504,7 @@ where
             expected,
             &self.prompt_cache_identity,
             prefix_token_ids,
-            options,
+            options.clone(),
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         self.state = MlxKeyValueState::paged(self.state_layout.clone(), manager, None)?;
@@ -537,6 +540,8 @@ where
     }
 
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
         self.forward(tokens, None, stream)?
             .try_index_device((.., -1, ..), stream)
             .map_err(Into::into)
@@ -610,6 +615,11 @@ pub(crate) struct BindingVisitor<'a> {
 impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for BindingVisitor<'_> {
     type Output = Box<dyn ErasedReplicatedTextExecutable>;
     type Error = Error;
+
+    fn construction_started(&mut self) {
+        #[cfg(test)]
+        super::path_instrumentation::architecture_construction();
+    }
 
     fn visit<A>(
         self,
@@ -793,6 +803,19 @@ mod tests {
         WeightLoweringDescriptor,
     };
 
+    fn materialize_model_plan(
+        plan: eredu_core::ModelPreparationPlan<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        options: crate::MlxLoadRequest,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<crate::backend::MlxModel, crate::backend::error::Error> {
+        let selected =
+            super::super::loading::select_preparation(plan.inspection(), options, plan.policy())?;
+        super::super::loading::materialize_model_plan(plan, selected, stream, weights_stream)
+    }
+
     #[test]
     fn exact_lowering_rejects_unsupported_encodings_and_incoherent_physical_geometry() {
         let affine =
@@ -844,6 +867,12 @@ mod tests {
         let parameter = ReplicatedTextParameterRequirement::new(
             "projection.weight",
             vec!["projection.weight".into()],
+            vec![eredu_runtime::ReplicatedTextPhysicalSource::new(
+                "projection.weight",
+                "/checkpoint/model.safetensors",
+                "projection.weight",
+            )
+            .unwrap()],
             Vec::new(),
             Some(SourceTensorEncoding::Safetensors(StoredDtype::F16)),
             Some(vec![64, 64]),
@@ -919,9 +948,10 @@ mod tests {
             "mistral" => "MistralForCausalLM",
             "qwen2" => "Qwen2ForCausalLM",
             "qwen3" => "Qwen3ForCausalLM",
+            "qwen3_moe" => "Qwen3MoeForCausalLM",
             _ => unreachable!(),
         };
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "model_type": model_type,
             "architectures": [architecture],
             "hidden_size": 32,
@@ -936,6 +966,11 @@ mod tests {
             "rope_theta": 10000.0,
             "tie_word_embeddings": tied
         });
+        if model_type == "qwen3_moe" {
+            config["num_experts"] = 2.into();
+            config["num_experts_per_tok"] = 1.into();
+            config["moe_intermediate_size"] = 16.into();
+        }
         std::fs::write(
             root.path().join("config.json"),
             serde_json::to_vec(&config).unwrap(),
@@ -945,7 +980,7 @@ mod tests {
             .resolve_safetensors(&config)
             .unwrap();
         let plan = resolved
-            .architecture_plan
+            .architecture_plan()
             .safetensors_architecture()
             .unwrap()
             .checkpoint();
@@ -1144,7 +1179,51 @@ mod tests {
     }
 
     #[test]
+    fn gguf_requirements_retain_shard_and_multi_output_provenance() {
+        let (stream, _) = execution_streams();
+        let gguf = tiny_llama_gguf("llama", Some(eredu_gguf::GgmlType::MxFp4), &stream);
+        let inspection = eredu_architectures::configuration::inspect_artifact(gguf.path()).unwrap();
+        let shard = inspection.gguf_checkpoint().unwrap().shards()[0]
+            .path()
+            .to_path_buf();
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        let derived = requirements
+            .parameters()
+            .iter()
+            .find(|parameter| {
+                matches!(
+                    parameter.presence(),
+                    eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+                ) && parameter
+                    .physical_sources()
+                    .iter()
+                    .any(|source| source.output().ends_with(".scales"))
+            })
+            .expect("MXFP4 requirements include a derived scales output");
+        let source = &derived.physical_sources()[0];
+        assert_eq!(source.shard(), shard);
+        assert!(source.tensor().ends_with(".weight"));
+        assert!(source.output().ends_with(".scales"));
+        let direct = requirements
+            .parameters()
+            .iter()
+            .find(|parameter| {
+                parameter
+                    .physical_sources()
+                    .iter()
+                    .any(|candidate| candidate.tensor() == source.tensor())
+                    && parameter.presence().has_physical_source()
+            })
+            .expect("the same MXFP4 tensor includes its direct weight output");
+        assert_eq!(direct.physical_sources()[0].shard(), source.shard());
+        assert_ne!(direct.physical_sources()[0].output(), source.output());
+    }
+
+    #[test]
     fn public_handoff_executes_llama_and_dense_qwen_with_repeated_decode() {
+        super::super::path_instrumentation::reset();
         let (stream, weights_stream) = execution_streams();
         for (model_type, tied) in [
             ("llama", true),
@@ -1162,9 +1241,9 @@ mod tests {
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
-            let model = super::super::loading::materialize_model_plan(
+            let model = materialize_model_plan(
                 plan,
-                crate::backend::ModelLoadOptions::default(),
+                crate::MlxLoadRequest::default(),
                 &stream,
                 &weights_stream,
             )
@@ -1181,6 +1260,14 @@ mod tests {
                 logits.evaluated().unwrap();
             }
         }
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts {
+                architecture_constructions: 4,
+                payload_opens: 4,
+                forwards: 8,
+            }
+        );
     }
 
     #[test]
@@ -1190,11 +1277,9 @@ mod tests {
             let root = tiny_sharded_artifact(model_type, false);
             let inspection =
                 eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-            let streaming = eredu_runtime::DenseDiskStreamLoadOptions {
-                max_cached_shards: 1,
-                ..Default::default()
-            };
-            let options = crate::backend::ModelLoadOptions::default().with_weight_residency(
+            let streaming =
+                eredu_runtime::DenseDiskStreamLoadOptions::default().with_max_cached_shards(1);
+            let options = crate::MlxLoadRequest::default().with_weight_residency(
                 eredu_runtime::WeightResidency::dense_disk_stream(streaming),
             );
             let plan = eredu_core::plan_model_preparation(
@@ -1205,13 +1290,8 @@ mod tests {
             .unwrap();
             std::fs::remove_file(root.path().join("model.safetensors.index.json")).unwrap();
 
-            let model = super::super::loading::materialize_model_plan(
-                plan,
-                options,
-                &stream,
-                &weights_stream,
-            )
-            .unwrap_or_else(|error| panic!("{model_type}: {error}"));
+            let model = materialize_model_plan(plan, options, &stream, &weights_stream)
+                .unwrap_or_else(|error| panic!("{model_type}: {error}"));
             let mut executable = model.into_complete().unwrap();
             let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
                 panic!("ordinary sharded text must use the generic executable")
@@ -1233,9 +1313,10 @@ mod tests {
 
     #[test]
     fn unsupported_topology_fails_before_checkpoint_payload_or_module_construction() {
+        super::super::path_instrumentation::reset();
         let root = tiny_artifact("llama", false);
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let topology = crate::backend::MlxParallelContext::for_rank(
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
             0,
             2,
             1,
@@ -1265,6 +1346,217 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("No such file"), "{message}");
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
+    }
+
+    #[test]
+    fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
+        super::super::path_instrumentation::reset();
+        let root = tiny_artifact("llama", false);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+            eredu_runtime::LayerWeightResidency::FullyResident,
+            CacheResidencyPolicy::Device,
+        );
+
+        let first = &requirements.parameters()[0];
+        let invalid = ReplicatedTextParameterRequirement::new(
+            first.name(),
+            first.sources().to_vec(),
+            first.physical_sources().to_vec(),
+            first.aliases().to_vec(),
+            Some(SourceTensorEncoding::Safetensors(StoredDtype::U8)),
+            first.physical_shape().map(<[usize]>::to_vec),
+            first.logical_shape().to_vec(),
+            first.native_executable(),
+            first.role(),
+            first.owner().clone(),
+            first.presence().clone(),
+            first.transform_constraint(),
+        )
+        .unwrap();
+        let mut parameters = requirements.parameters().to_vec();
+        parameters[0] = invalid;
+        let invalid_requirements = ReplicatedTextRequirements::new(
+            requirements.operators(),
+            requirements.execution_graph().clone(),
+            requirements.execution_units().clone(),
+            requirements.group_transports().to_vec(),
+            requirements.state_layout().clone(),
+            parameters,
+        )
+        .unwrap();
+        let error = eredu_runtime::select_replicated_text_realization(
+            &invalid_requirements,
+            &request,
+            &capabilities(&invalid_requirements, &request),
+        )
+        .unwrap_err();
+        assert!(error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("weight lowering")));
+
+        let routed_root = tiny_artifact("qwen3_moe", false);
+        let routed =
+            eredu_architectures::configuration::inspect_artifact(routed_root.path()).unwrap();
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
+            0,
+            2,
+            1,
+            1,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+        let routed_options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+        );
+        let routed_policy = routed_options.preparation_policy().unwrap();
+        let error = super::super::loading::select_preparation_with_grouped_capabilities(
+            &routed,
+            routed_options,
+            routed_policy,
+            &[GroupedOperationRequirement::GatedProduct],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("GatedProductTensorParallelPartial"));
+
+        let affine_error = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &request
+                .clone()
+                .with_quantization(eredu_core::QuantizationRequest::Affine {
+                    group_size: 128,
+                    bits: 4,
+                }),
+            &capabilities(&requirements, &request),
+        )
+        .unwrap_err();
+        assert!(affine_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("affine group size")));
+
+        let linear_index = requirements
+            .parameters()
+            .iter()
+            .position(|parameter| {
+                matches!(
+                    parameter.transform_constraint(),
+                    ParameterTransformConstraint::Linear { .. }
+                )
+            })
+            .unwrap();
+        let linear = &requirements.parameters()[linear_index];
+        let ParameterTransformConstraint::Linear { packed_axis } = linear.transform_constraint()
+        else {
+            unreachable!()
+        };
+        let mut logical_shape = linear.logical_shape().to_vec();
+        logical_shape[packed_axis] = 48;
+        let invalid_mxfp4 = ReplicatedTextParameterRequirement::new(
+            linear.name(),
+            linear.sources().to_vec(),
+            linear.physical_sources().to_vec(),
+            linear.aliases().to_vec(),
+            linear.source_encoding().cloned(),
+            Some(logical_shape.clone()),
+            logical_shape,
+            linear.native_executable(),
+            linear.role(),
+            linear.owner().clone(),
+            linear.presence().clone(),
+            linear.transform_constraint(),
+        )
+        .unwrap();
+        let mut parameters = requirements.parameters().to_vec();
+        parameters[linear_index] = invalid_mxfp4;
+        let invalid_mxfp4_requirements = ReplicatedTextRequirements::new(
+            requirements.operators(),
+            requirements.execution_graph().clone(),
+            requirements.execution_units().clone(),
+            requirements.group_transports().to_vec(),
+            requirements.state_layout().clone(),
+            parameters,
+        )
+        .unwrap();
+        let mxfp4_request = request
+            .clone()
+            .with_quantization(eredu_core::QuantizationRequest::MxFp4);
+        let mxfp4_error = eredu_runtime::select_replicated_text_realization(
+            &invalid_mxfp4_requirements,
+            &mxfp4_request,
+            &capabilities(&invalid_mxfp4_requirements, &mxfp4_request),
+        )
+        .unwrap_err();
+        assert!(mxfp4_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("MXFP4 packed extent 48")));
+
+        let full = capabilities(&requirements, &request);
+        let only_basic = BackendMechanismCapabilities::new(
+            full.operators(),
+            full.weight_lowerings().to_vec(),
+            vec![WeightResidencyMechanism::Resident],
+            vec![StateResidencyMechanism::Device],
+        );
+        let paged = CacheResidencyPolicy::Paged(PagedCacheOptions::new(4, 4096, 4096, 1).unwrap());
+        let state_error = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &eredu_runtime::ReplicatedTextSelectionRequest::new(
+                eredu_runtime::LayerWeightResidency::FullyResident,
+                paged,
+            ),
+            &only_basic,
+        )
+        .unwrap_err();
+        assert!(state_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("state residency")));
+        let session_error = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &request
+                .clone()
+                .with_session(eredu_core::SessionCapabilities::new(true, false, false)),
+            &only_basic,
+        )
+        .unwrap_err();
+        assert!(session_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("session capability")));
+        let residency_error = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &eredu_runtime::ReplicatedTextSelectionRequest::new(
+                eredu_runtime::LayerWeightResidency::DenseDiskStream(
+                    eredu_runtime::DenseDiskStreamLoadOptions::default(),
+                ),
+                CacheResidencyPolicy::Device,
+            ),
+            &only_basic,
+        )
+        .unwrap_err();
+        assert!(residency_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("weight residency")));
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
     }
 
     #[test]
@@ -1300,7 +1592,8 @@ mod tests {
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
-            let (artifact, architecture_plan, _, _) = plan.into_parts();
+            let architecture_plan = plan.inspection().architecture_plan().clone();
+            let artifact = plan.into_artifact();
             let eredu_core::ModelArtifact::SafeTensors {
                 configuration,
                 tensors,
@@ -1361,20 +1654,14 @@ mod tests {
             let root = tiny_artifact(model_type, false);
             let inspection =
                 eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-            let options = crate::backend::ModelLoadOptions::with_quantization(request);
+            let options = crate::MlxLoadRequest::with_quantization(request);
             let plan = eredu_core::plan_model_preparation(
                 inspection,
                 options.preparation_policy().unwrap(),
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
-            let model = super::super::loading::materialize_model_plan(
-                plan,
-                options,
-                &stream,
-                &weights_stream,
-            )
-            .unwrap();
+            let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
             assert!(model.materialization_report().is_some());
             let mut executable = model.into_complete().unwrap();
             let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
@@ -1406,9 +1693,9 @@ mod tests {
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
-            let model = super::super::loading::materialize_model_plan(
+            let model = materialize_model_plan(
                 plan,
-                crate::backend::ModelLoadOptions::default(),
+                crate::MlxLoadRequest::default(),
                 &stream,
                 &weights_stream,
             )
@@ -1488,9 +1775,9 @@ mod tests {
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
-            let model = super::super::loading::materialize_model_plan(
+            let model = materialize_model_plan(
                 plan,
-                crate::backend::ModelLoadOptions::default(),
+                crate::MlxLoadRequest::default(),
                 &stream,
                 &weights_stream,
             )
@@ -1529,7 +1816,7 @@ mod tests {
         let mut host = eredu_runtime::LayerwiseLoadOptions::new(
             eredu_core::residency::OffloadConfig::new(Some(u64::MAX), Some(u64::MAX), 7).unwrap(),
         );
-        host.max_cached_shards = 3;
+        host = host.with_max_cached_shards(3);
         let disk = eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 30, 2 << 30, 5, 4).unwrap();
         for (model_type, residency) in ["llama", "qwen2"].into_iter().flat_map(|family| {
             [
@@ -1541,8 +1828,12 @@ mod tests {
             .map(move |residency| (family, residency))
         }) {
             let root = tiny_artifact(model_type, false);
-            let options =
-                crate::backend::ModelLoadOptions::default().with_weight_residency(residency);
+            let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true);
+            let options = crate::MlxLoadRequest::default()
+                .with_weight_residency(residency)
+                .with_state_residency(CacheResidencyPolicy::Paged(paged.clone()));
             let inspection =
                 eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
             let plan = eredu_core::plan_model_preparation(
@@ -1551,13 +1842,7 @@ mod tests {
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
-            let model = super::super::loading::materialize_model_plan(
-                plan,
-                options,
-                &stream,
-                &weights_stream,
-            )
-            .unwrap();
+            let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
             assert!(model.residency_report().unwrap().is_some());
             assert_eq!(
                 model.dense_stream_report().unwrap().is_some(),
@@ -1607,12 +1892,7 @@ mod tests {
             let cache_root = tempfile::tempdir().unwrap();
             let destination = cache_root.path().join("cache");
             let prefix = [1_u32, 2, 3];
-            let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
-                .unwrap()
-                .with_full_attention(true);
-            generic
-                .reset_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
-                .unwrap();
+            generic.reset_cache().unwrap();
             generic
                 .decode(&Array::from_slice(&prefix, &[1, 3]), &stream)
                 .unwrap()
@@ -1627,13 +1907,18 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(manifest.block_size_tokens, paged.block_size_tokens());
-            let mut incompatible = descriptor.clone();
-            incompatible.architecture_fingerprint.push_str("-different");
+            let incompatible = descriptor
+                .clone()
+                .with_architecture_fingerprint(format!(
+                    "{}-different",
+                    descriptor.architecture_fingerprint()
+                ))
+                .unwrap();
             assert!(generic
-                .load_prompt_cache(&destination, &incompatible, &prefix, paged.clone())
+                .load_prompt_cache(&destination, &incompatible, &prefix)
                 .is_err());
             generic
-                .load_prompt_cache(&destination, &descriptor, &prefix, paged)
+                .load_prompt_cache(&destination, &descriptor, &prefix)
                 .unwrap();
             assert!(generic.cache_residency_report().unwrap().is_some());
             generic

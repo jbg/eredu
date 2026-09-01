@@ -67,7 +67,7 @@ use crate::{
     },
     backend::runtime::checkpoint::store::open_gguf_checkpoint_source,
     backend::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
-    backend::runtime::distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
+    backend::runtime::distributed::parallel::ParallelExecutionContext,
     backend::runtime::execution::layerwise::{
         packed_weight_companions, quantize_pipeline_stage_store_with, shard_layer_bindings,
         DenseStreamController, DenseTransferWindow, PackedWeightCompanions,
@@ -80,13 +80,12 @@ use crate::{
     backend::runtime::residency::parameter_bank::{
         AddressableParameterBank, ParameterBankEntry, ParameterBankResidencyReport,
     },
-    backend::MlxParallelContext,
-    backend::ModelLoadOptions,
     composition::expert_dispatch::{
         dispatch_replicated, dispatch_replicated_tensor_parallel, ExpertAssignment,
         RoutingStatistics,
     },
     composition::llama::checkpoint as llama_checkpoint,
+    composition::mlx::distributed::topology::{MlxParallelPlan, ParallelBuildContext},
     composition::mlx::speculative::embedded::{EmbeddedMtpOutput, EmbeddedMtpTarget},
     composition::{
         gemma4::{Gemma4Bindings, Gemma4PipelineUnit},
@@ -117,8 +116,8 @@ use eredu_core::{
 use eredu_runtime::DenseDiskStreamReport;
 use eredu_runtime::ResidentLayerGroup;
 use eredu_runtime::{
-    CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
-    PagedCacheOptions,
+    CacheResidencyPolicy, CacheResidencyReport, ExpertPass, PagedCacheOptions,
+    ParameterBankLoadOptions,
 };
 
 use safemlx::ops::indexing::TryIndexOp;
@@ -453,7 +452,7 @@ fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
 fn build_pipeline_parameter_bank(
     store: SharedCheckpointSource,
     entries: Vec<ParameterBankEntry>,
-    options: Option<ExpertCacheLoadOptions>,
+    options: Option<ParameterBankLoadOptions>,
     quantization: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
@@ -492,115 +491,176 @@ fn build_pipeline_parameter_bank(
 
 /// Immutable, inspectable description of the local pipeline stage.
 #[derive(Debug, Clone)]
-pub struct PipelineStageInfo {
+pub(crate) struct PipelineStageInfo {
     /// Authoritative global placement of decoder and multimodal execution groups.
-    pub placement: Arc<PlacedExecutionDag>,
+    placement: Arc<PlacedExecutionDag>,
     /// Stable architecture-owned identity of the primary pipeline group.
-    pub primary_execution_group: String,
+    primary_execution_group: String,
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
-    pub topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     /// Zero-based pipeline coordinate.
-    pub pipeline_stage: usize,
+    pipeline_stage: usize,
     /// Number of pipeline stages.
-    pub pipeline_stages: usize,
+    pipeline_stages: usize,
     /// Whether the realized partition owns model input preparation.
-    pub owns_input: bool,
+    owns_input: bool,
     /// Whether the realized partition owns final output production.
-    pub owns_output: bool,
+    owns_output: bool,
     /// Whether this rank owns the checkpoint-embedded prediction module.
-    pub owns_embedded_mtp: bool,
+    owns_embedded_mtp: bool,
     /// Number of predictor layers owned by this rank.
-    pub embedded_mtp_layers: usize,
+    embedded_mtp_layers: usize,
     /// Number of checkpoint-embedded predictor layers in the complete pipeline.
-    pub global_embedded_mtp_layers: usize,
+    global_embedded_mtp_layers: usize,
     /// Global decoder-layer indices owned by this stage.
-    pub global_layer_range: Range<usize>,
+    global_layer_range: Range<usize>,
     /// Complete encoder/projector/merge/finalization unit geometry.
-    pub global_encoder_units: usize,
+    global_encoder_units: usize,
     /// Encoder/projector/merge/finalization units owned by this PP coordinate.
-    pub local_encoder_units: usize,
+    local_encoder_units: usize,
     /// Exact group/unit intervals and static roles owned by this PP coordinate.
-    pub local_execution_groups: Vec<LocalPlacedGroupOwnership>,
+    local_execution_groups: Vec<LocalPlacedGroupOwnership>,
     /// Explicit encoder and merge routes touching this PP coordinate.
-    pub encoder_routes: Vec<PlacementRoute>,
+    encoder_routes: Vec<PlacementRoute>,
     /// Root group pairs eligible to overlap under this rank's runtime policy.
-    pub overlap_eligible_groups: Vec<[String; 2]>,
+    overlap_eligible_groups: Vec<[String; 2]>,
     /// Root group pairs forced into deterministic serial fallback at preflight.
-    pub planned_serial_fallbacks: Vec<PlacedSerialFallbackReport>,
+    planned_serial_fallbacks: Vec<PlacedSerialFallbackReport>,
     /// Conservative concurrent rank-local parameter residency peak.
-    pub concurrent_residency_peak_bytes: u64,
+    concurrent_residency_peak_bytes: u64,
     /// Peak concurrent rank-local residency observed by placed-DAG execution.
-    pub observed_concurrent_residency_peak_bytes: u64,
+    observed_concurrent_residency_peak_bytes: u64,
     /// Total routed experts in global model geometry, when applicable.
-    pub global_expert_count: Option<usize>,
+    global_expert_count: Option<usize>,
     /// Checkpoint-global expert ids owned by this stage rank.
-    pub local_group_indices: Vec<usize>,
+    local_group_indices: Vec<usize>,
     /// Previous stage's global rank, if any.
-    pub predecessor_rank: Option<usize>,
+    predecessor_rank: Option<usize>,
     /// Next stage's global rank, if any.
-    pub successor_rank: Option<usize>,
+    successor_rank: Option<usize>,
     /// Architecture adapter used by the stage.
-    pub model_kind: ModelKind,
+    model_kind: ModelKind,
     /// Backend-neutral contract used for transferred hidden activations.
-    pub wire_contract: eredu_runtime::PipelineWireContract,
+    wire_contract: eredu_runtime::PipelineWireContract,
     /// Checkpoint tensors selected for this rank.
-    pub owned_tensors: Vec<String>,
+    owned_tensors: Vec<String>,
     /// Parameter bytes materialized while loading this stage.
     ///
     /// For host-layerwise or dense-disk execution this contains only pinned
     /// static weights; non-resident layer bytes are included in
     /// `planned_owned_parameter_bytes`.
-    pub local_parameter_bytes: usize,
+    local_parameter_bytes: usize,
     /// Total logical bytes owned by this stage, including non-resident layers.
-    pub planned_owned_parameter_bytes: u64,
+    planned_owned_parameter_bytes: u64,
     /// Payload shards actually opened for this rank.
-    pub opened_checkpoint_shards: Vec<PathBuf>,
+    opened_checkpoint_shards: Vec<PathBuf>,
     /// Checkpoint backend reads observed after rank-local materialization.
-    pub checkpoint_diagnostics: Option<WeightStoreDiagnostics>,
+    checkpoint_diagnostics: Option<WeightStoreDiagnostics>,
     /// Bounded stage-local load-time materialization telemetry, when dense
     /// semantic weights were converted into a packed overlay.
-    pub materialization: Option<WeightMaterializationReport>,
+    materialization: Option<WeightMaterializationReport>,
 }
 
 impl PipelineStageInfo {
+    /// Complete selected Cartesian topology.
+    pub const fn topology(&self) -> MlxParallelPlan {
+        self.topology
+    }
+    /// Whether this rank owns input preparation.
+    pub const fn owns_input(&self) -> bool {
+        self.owns_input
+    }
+
     fn activation_dtype(&self) -> Dtype {
         mlx_pipeline_activation_dtype(self.wire_contract.activation_dtype())
     }
 }
 
+#[cfg(test)]
+impl PipelineStageInfo {
+    /// Whether this rank owns final output production.
+    pub const fn owns_output(&self) -> bool {
+        self.owns_output
+    }
+    /// Whether this rank owns embedded prediction.
+    pub const fn owns_embedded_mtp(&self) -> bool {
+        self.owns_embedded_mtp
+    }
+    /// Locally owned embedded-prediction layers.
+    pub const fn embedded_mtp_layers(&self) -> usize {
+        self.embedded_mtp_layers
+    }
+    /// Complete embedded-prediction layer count.
+    pub const fn global_embedded_mtp_layers(&self) -> usize {
+        self.global_embedded_mtp_layers
+    }
+    /// Global decoder-layer interval owned locally.
+    pub fn global_layer_range(&self) -> Range<usize> {
+        self.global_layer_range.clone()
+    }
+    /// Locally owned encoder-unit count.
+    pub const fn local_encoder_units(&self) -> usize {
+        self.local_encoder_units
+    }
+    /// Global expert indices owned locally.
+    pub fn local_group_indices(&self) -> &[usize] {
+        &self.local_group_indices
+    }
+    /// Hidden-activation transport contract.
+    pub const fn wire_contract(&self) -> eredu_runtime::PipelineWireContract {
+        self.wire_contract
+    }
+    /// Checkpoint tensors selected for this rank.
+    pub fn owned_tensors(&self) -> &[String] {
+        &self.owned_tensors
+    }
+    /// Parameter bytes materialized while loading.
+    pub const fn local_parameter_bytes(&self) -> usize {
+        self.local_parameter_bytes
+    }
+    /// Payload shards opened while loading.
+    pub fn opened_checkpoint_shards(&self) -> &[PathBuf] {
+        &self.opened_checkpoint_shards
+    }
+    /// Load-time materialization report.
+    pub const fn materialization(&self) -> Option<&WeightMaterializationReport> {
+        self.materialization.as_ref()
+    }
+}
+
 /// Rank-local ownership projected from the authoritative placed DAG.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LocalPlacedGroupOwnership {
+pub(crate) struct LocalPlacedGroupOwnership {
     /// Stable execution-group identity.
-    pub group: String,
+    group: String,
     /// Group-global repeated units owned locally, or `0..0` for static-only roles.
-    pub global_units: Range<usize>,
+    global_units: Range<usize>,
     /// Static tensor roles uniquely owned by this PP coordinate.
-    pub static_roles: Vec<String>,
+    static_roles: Vec<String>,
 }
 
 /// One deterministic reason a pair of ready groups used serial fallback.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct PlacedSerialFallbackReport {
+pub(crate) struct PlacedSerialFallbackReport {
     /// Earlier group in stable architecture order.
-    pub left: String,
+    left: String,
     /// Later group in stable architecture order.
-    pub right: String,
+    right: String,
     /// Resource or collective constraint which prevented overlap.
-    pub reason: PlacedGroupSerialReason,
+    reason: PlacedGroupSerialReason,
 }
 
 /// Instrumentation from the most recent placed-ingress DAG execution.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct PlacedIngressScheduleReport {
+pub(crate) struct PlacedIngressScheduleReport {
     /// Ready groups admitted together, in stable declaration order.
-    pub ready_batches: Vec<Vec<String>>,
+    ready_batches: Vec<Vec<String>>,
     /// Largest number of active groups simultaneously submitted.
-    pub maximum_in_flight_groups: usize,
+    maximum_in_flight_groups: usize,
     /// Per-route transfers observed on this PP coordinate.
-    pub routed_transfers: Vec<PlacementRoute>,
+    routed_transfers: Vec<PlacementRoute>,
     /// Ready pairs forced into deterministic serial fallback.
-    pub serial_fallbacks: Vec<PlacedSerialFallbackReport>,
+    serial_fallbacks: Vec<PlacedSerialFallbackReport>,
 }
 
 /// Shape metadata shared by every rank for one pipeline operation.
@@ -632,6 +692,7 @@ const fn mlx_boundary_dtype(kind: eredu_runtime::BoundaryTensorDtype, activation
         eredu_runtime::BoundaryTensorDtype::Activation => activation,
         eredu_runtime::BoundaryTensorDtype::Uint32 => Dtype::Uint32,
         eredu_runtime::BoundaryTensorDtype::Int32 => Dtype::Int32,
+        _ => panic!("unsupported boundary tensor dtype requires an explicit MLX lowering"),
     }
 }
 
@@ -640,6 +701,7 @@ const fn mlx_pipeline_activation_dtype(dtype: eredu_runtime::PipelineActivationD
         eredu_runtime::PipelineActivationDtype::Float16 => Dtype::Float16,
         eredu_runtime::PipelineActivationDtype::Bfloat16 => Dtype::Bfloat16,
         eredu_runtime::PipelineActivationDtype::Float32 => Dtype::Float32,
+        _ => panic!("unsupported pipeline activation dtype requires an explicit MLX lowering"),
     }
 }
 
@@ -2127,14 +2189,14 @@ trait RealizedPipelinePartition {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
     ) -> Result<PromptCacheModelIdentity, Error>;
 }
 
 fn neutral_partition_cache_identity<A, G, B>(
     architecture: &A,
     partition: &eredu_runtime::ArchitecturePartition<G, B>,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
 ) -> Result<PromptCacheModelIdentity, Error>
 where
     A: ArchitectureParameters<MlxNeuralBackend>,
@@ -2143,7 +2205,7 @@ where
     partition
         .prompt_cache_identity::<MlxNeuralBackend, _>(
             architecture,
-            crate::backend::cache::prompt_cache_topology(topology),
+            crate::composition::mlx::distributed::topology::prompt_cache_topology(topology),
         )
         .map_err(|error| Error::Parallel(error.to_string()))
 }
@@ -2159,7 +2221,7 @@ where
 
     fn prompt_cache_model_identity(
         &self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
     ) -> Result<PromptCacheModelIdentity, Error> {
         neutral_partition_cache_identity(&self.architecture, &self.partition, topology)
     }
@@ -2176,7 +2238,7 @@ where
 
     fn prompt_cache_model_identity(
         &self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
     ) -> Result<PromptCacheModelIdentity, Error> {
         neutral_partition_cache_identity(&self.architecture, &self.partition, topology)
     }
@@ -2193,7 +2255,7 @@ where
 
     fn prompt_cache_model_identity(
         &self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
     ) -> Result<PromptCacheModelIdentity, Error> {
         neutral_partition_cache_identity(&self.architecture, &self.partition, topology)
     }
@@ -2210,7 +2272,7 @@ where
 
     fn prompt_cache_model_identity(
         &self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
     ) -> Result<PromptCacheModelIdentity, Error> {
         neutral_partition_cache_identity(&self.architecture, &self.partition, topology)
     }
@@ -2227,7 +2289,7 @@ where
 
     fn prompt_cache_model_identity(
         &self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
     ) -> Result<PromptCacheModelIdentity, Error> {
         neutral_partition_cache_identity(&self.architecture, &self.partition, topology)
     }
@@ -4496,12 +4558,12 @@ fn materialize_pipeline_cache_layers(
     paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
 ) -> Result<Vec<PipelineLayerCache>, Error> {
     identity
-        .layer_layout
+        .layer_layout()
         .iter()
         .enumerate()
         .map(|(local_layer, policy)| {
             let global_layer = identity
-                .global_layer_start
+                .global_layer_start()
                 .checked_add(local_layer)
                 .ok_or_else(|| Error::Parallel("pipeline cache layer index overflowed".into()))?;
             match policy {
@@ -4671,7 +4733,7 @@ fn pipeline_key_value_validation_consumes_partition_state_layout() {
 }
 
 pub struct PipelineModel {
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     info: PipelineStageInfo,
     stage: Box<dyn PipelineArchitecture>,
     cache_identity: PromptCacheModelIdentity,
@@ -4965,7 +5027,7 @@ fn pipeline_encoder_telemetry_excludes_prediction_units() {
 
 impl PipelineModel {
     fn from_adapter(
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
         mut info: PipelineStageInfo,
         stage: impl PipelineArchitecture + 'static,
     ) -> Result<Self, Error> {
@@ -5022,8 +5084,8 @@ impl PipelineModel {
         let concurrency_policy = PlacedGroupConcurrencyPolicy {
             rank_local_streams: true,
             shared_residency_window: stage.placed_ingress_shared_residency_window(),
-            tensor_parallel_size: topology.tensor_parallel_size,
-            expert_parallel_size: topology.expert_parallel_size,
+            tensor_parallel_size: topology.tensor_parallel_size(),
+            expert_parallel_size: topology.expert_parallel_size(),
         };
         let roots = info
             .placement
@@ -5059,18 +5121,18 @@ impl PipelineModel {
         info.observed_concurrent_residency_peak_bytes = info.local_parameter_bytes as u64;
         let cache_identity = stage.prompt_cache_model_identity(topology)?;
         let cache_identity = stage.persisted_prompt_cache_identity(cache_identity)?;
-        if cache_identity.global_layer_start != info.global_layer_range.start
-            || cache_identity.global_layer_end < info.global_layer_range.end
-            || cache_identity.layer_layout.len()
-                != cache_identity.global_layer_end - cache_identity.global_layer_start
-            || cache_identity.global_layer_end > cache_identity.layer_count
+        if cache_identity.global_layer_start() != info.global_layer_range.start
+            || cache_identity.global_layer_end() < info.global_layer_range.end
+            || cache_identity.layer_layout().len()
+                != cache_identity.global_layer_end() - cache_identity.global_layer_start()
+            || cache_identity.global_layer_end() > cache_identity.layer_count()
         {
             return Err(Error::Parallel(format!(
                 "pipeline adapter cache range {}..{} ({} entries of {} total layers) does not match stage range {:?}",
-                cache_identity.global_layer_start,
-                cache_identity.global_layer_end,
-                cache_identity.layer_layout.len(),
-                cache_identity.layer_count,
+                cache_identity.global_layer_start(),
+                cache_identity.global_layer_end(),
+                cache_identity.layer_layout().len(),
+                cache_identity.layer_count(),
                 info.global_layer_range
             )));
         }
@@ -5099,14 +5161,14 @@ impl PipelineModel {
         &self.info
     }
 
-    /// Returns the canonical architecture family selected for this stage.
-    pub const fn model_family(&self) -> ModelKind {
+    #[cfg(test)]
+    pub(crate) const fn model_family(&self) -> ModelKind {
         self.info.model_kind
     }
 
     /// Returns the effective model type preserved from the parsed configuration.
     pub fn effective_model_type(&self) -> &str {
-        &self.cache_identity.effective_model_type
+        self.cache_identity.effective_model_type()
     }
 
     pub(in crate::composition::mlx) fn capability_estimate(
@@ -5139,6 +5201,7 @@ impl PipelineModel {
                 let value = match part.payload() {
                     InputPayload::TokenIds(value) | InputPayload::Embeddings(value) => value,
                     InputPayload::Tensor(_) => unreachable!("validated text payload"),
+                    _ => unreachable!("validated prepared-input payload"),
                 };
                 let part_batch = value.shape()[0];
                 if let Some(expected) = batch {
@@ -5224,7 +5287,7 @@ impl PipelineModel {
             CacheResidencyPolicy::Paged(options) => {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
-                let rank = self.cache_identity.topology.cache_rank_identity();
+                let rank = self.cache_identity.topology().cache_rank_identity();
                 let layers = self
                     .stage
                     .new_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
@@ -5409,7 +5472,7 @@ impl PipelineModel {
                 .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment)
                 .filter(|segment| {
                     identity
-                        .state_segments
+                        .state_segments()
                         .iter()
                         .any(|owned| owned.id() == *segment)
                 }),
@@ -5418,7 +5481,7 @@ impl PipelineModel {
                 .state_segment(segment)
                 .map_err(|error| Error::Parallel(error.to_string()))?;
             let offsets = identity
-                .layer_prefix_offsets
+                .layer_prefix_offsets()
                 .get(prediction.layers())
                 .ok_or_else(|| Error::Parallel("pipeline MTP prompt offsets are missing".into()))?;
             let range = mtp
@@ -5478,7 +5541,7 @@ impl PipelineModel {
         .into_iter()
         .map(|state| ((state.owner, state.role), state.array))
         .collect::<BTreeMap<_, _>>();
-        let rank = identity.topology.cache_rank_identity();
+        let rank = identity.topology().cache_rank_identity();
         let mut layers = self
             .stage
             .new_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
@@ -5543,7 +5606,7 @@ impl PipelineModel {
                     .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment)
                     .filter(|segment| {
                         identity
-                            .state_segments
+                            .state_segments()
                             .iter()
                             .any(|owned| owned.id() == *segment)
                     }),
@@ -5552,7 +5615,7 @@ impl PipelineModel {
                     .state_segment(segment)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 let offsets = identity
-                    .layer_prefix_offsets
+                    .layer_prefix_offsets()
                     .get(prediction.layers())
                     .ok_or_else(|| {
                         Error::Parallel("pipeline MTP prompt offsets are missing".into())
@@ -5578,7 +5641,7 @@ impl PipelineModel {
     }
 
     fn prompt_cache_rank_directory(&self, root: &Path) -> PathBuf {
-        root.join(format!("rank-{:05}", self.topology.global_rank))
+        root.join(format!("rank-{:05}", self.topology.global_rank()))
     }
 
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
@@ -5613,14 +5676,14 @@ impl PipelineModel {
         super::topology::validate_session(self.topology, execution)?;
         let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
-            None if self.topology.pipeline_parallel_size == 1 => execution.world(),
+            None if self.topology.pipeline_parallel_size() == 1 => execution.world(),
             None => {
                 return Err(Error::Parallel(
                     "distributed pipeline execution requires a PP lane group".into(),
                 ))
             }
         };
-        let tensor = (self.topology.tensor_parallel_size > 1)
+        let tensor = (self.topology.tensor_parallel_size() > 1)
             .then(|| execution.partitioned_context(crate::backend::distributed::SHARD_GROUP_ID))
             .transpose()?;
         let stream = execution.stream();
@@ -5633,10 +5696,10 @@ impl PipelineModel {
             pipeline,
             self.info
                 .predecessor_rank
-                .map(|_| self.topology.pipeline_parallel_rank - 1),
+                .map(|_| self.topology.pipeline_parallel_rank() - 1),
             self.info
                 .successor_rank
-                .map(|_| self.topology.pipeline_parallel_rank + 1),
+                .map(|_| self.topology.pipeline_parallel_rank() + 1),
             tensor.as_ref(),
             execution.selected_group(crate::backend::distributed::ADDRESSABLE_GROUP_ID),
             false,
@@ -5683,14 +5746,14 @@ impl PipelineModel {
         super::topology::validate_session(self.topology, execution)?;
         let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
-            None if self.topology.pipeline_parallel_size == 1 => execution.world(),
+            None if self.topology.pipeline_parallel_size() == 1 => execution.world(),
             None => {
                 return Err(Error::Parallel(
                     "distributed pipeline execution requires a PP lane group".into(),
                 ))
             }
         };
-        let tensor = (self.topology.tensor_parallel_size > 1)
+        let tensor = (self.topology.tensor_parallel_size() > 1)
             .then(|| execution.partitioned_context(crate::backend::distributed::SHARD_GROUP_ID))
             .transpose()?;
         let stream = execution.stream();
@@ -5703,10 +5766,10 @@ impl PipelineModel {
             pipeline,
             self.info
                 .predecessor_rank
-                .map(|_| self.topology.pipeline_parallel_rank - 1),
+                .map(|_| self.topology.pipeline_parallel_rank() - 1),
             self.info
                 .successor_rank
-                .map(|_| self.topology.pipeline_parallel_rank + 1),
+                .map(|_| self.topology.pipeline_parallel_rank() + 1),
             tensor.as_ref(),
             execution.selected_group(crate::backend::distributed::ADDRESSABLE_GROUP_ID),
             true,
@@ -5752,7 +5815,7 @@ impl PipelineModel {
                 > 0
             && matches!(cache.mtp, PipelineMtpCache::None)
         {
-            let rank = self.cache_identity.topology.cache_rank_identity();
+            let rank = self.cache_identity.topology().cache_rank_identity();
             let paged = cache
                 .residency_manager
                 .as_ref()
@@ -5777,7 +5840,7 @@ impl PipelineModel {
     ) -> Result<EmbeddedMtpOutput, Exception> {
         let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
-            None if self.topology.pipeline_parallel_size == 1 => execution.world(),
+            None if self.topology.pipeline_parallel_size() == 1 => execution.world(),
             None => {
                 return Err(Exception::custom(
                     "pipeline embedded MTP requires a pipeline communicator",
@@ -5848,7 +5911,7 @@ impl PipelineModel {
     ) -> Result<bool, Exception> {
         let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
-            None if self.topology.pipeline_parallel_size == 1 => execution.world(),
+            None if self.topology.pipeline_parallel_size() == 1 => execution.world(),
             None => {
                 return Err(Exception::custom(
                     "pipeline embedded MTP requires a pipeline communicator",
@@ -5931,8 +5994,8 @@ impl PipelineModel {
         let policy = PlacedGroupConcurrencyPolicy {
             rank_local_streams: true,
             shared_residency_window: self.stage.placed_ingress_shared_residency_window(),
-            tensor_parallel_size: self.topology.tensor_parallel_size,
-            expert_parallel_size: self.topology.expert_parallel_size,
+            tensor_parallel_size: self.topology.tensor_parallel_size(),
+            expert_parallel_size: self.topology.expert_parallel_size(),
         };
         let device = stream.get_device()?;
         let streams = placement
@@ -6308,7 +6371,7 @@ impl PipelineModel {
         }
         let pipeline = match execution.selected_group(crate::backend::distributed::STAGE_GROUP_ID) {
             Some(group) => group,
-            None if self.topology.pipeline_parallel_size == 1 => execution.world(),
+            None if self.topology.pipeline_parallel_size() == 1 => execution.world(),
             None => {
                 return Err(Error::Parallel(
                     "pipeline sampling requires a pipeline communicator".into(),
@@ -7004,7 +7067,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
             .selected_group(crate::backend::distributed::STAGE_GROUP_ID)
         {
             Some(group) => group,
-            None if self.model.topology.pipeline_parallel_size == 1 => self.execution.world(),
+            None if self.model.topology.pipeline_parallel_size() == 1 => self.execution.world(),
             None => {
                 return Err(Exception::custom(
                     "pipeline embedded MTP requires a pipeline communicator",
@@ -7085,7 +7148,7 @@ impl PipelineEmbeddedMtpTarget<'_, '_> {
     }
 }
 
-fn validate_distributed_stage_topology(topology: MlxParallelContext) -> Result<(), Error> {
+fn validate_distributed_stage_topology(topology: MlxParallelPlan) -> Result<(), Error> {
     if topology.is_replicated() {
         return Err(Error::Parallel(
             "distributed stage loading requires an active parallel axis".into(),
@@ -7116,7 +7179,7 @@ fn validate_admitted_pipeline_kind(
 #[cfg(test)]
 #[test]
 fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
-    let tensor_parallel = MlxParallelContext::for_rank(
+    let tensor_parallel = MlxParallelPlan::for_rank(
         0,
         2,
         1,
@@ -7126,7 +7189,7 @@ fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
     .unwrap();
     validate_distributed_stage_topology(tensor_parallel).unwrap();
 
-    let replicated = MlxParallelContext::for_rank(
+    let replicated = MlxParallelPlan::for_rank(
         0,
         1,
         1,
@@ -7155,20 +7218,20 @@ fn pipeline_kind_validation_trusts_admission_and_checks_the_adapter() {
 }
 
 fn base_info(
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     range: Range<usize>,
     placement: Arc<PlacedExecutionDag>,
     primary_execution_group: impl Into<String>,
     model_kind: ModelKind,
 ) -> PipelineStageInfo {
-    let stage = topology.pipeline_parallel_rank;
+    let stage = topology.pipeline_parallel_rank();
     PipelineStageInfo {
         placement,
         primary_execution_group: primary_execution_group.into(),
         topology,
         pipeline_stage: stage,
-        pipeline_stages: topology.pipeline_parallel_size,
+        pipeline_stages: topology.pipeline_parallel_size(),
         owns_input: false,
         owns_output: false,
         owns_embedded_mtp: false,
@@ -7713,6 +7776,7 @@ impl StaticParameterVisitorMut<MlxNeuralBackend> for ArchitectureStaticLoader<'_
                     .first()
                     .is_some_and(|candidate| candidate == role),
                 eredu_runtime::ParameterGroupOwner::ExecutionUnit { .. } => false,
+                _ => false,
             })
             .flat_map(|group| group.members())
             .any(|member| !matches!(member.sharding(), eredu_runtime::MemberSharding::Replicated));
@@ -7807,10 +7871,10 @@ mod state_partition_conformance_tests {
                 .prompt_cache_identity::<MlxNeuralBackend, _>(architecture, Default::default())
                 .unwrap();
             assert_eq!(
-                identity.global_layer_start..identity.global_layer_end,
+                identity.global_layer_start()..identity.global_layer_end(),
                 expected
             );
-            assert_eq!(identity.layer_layout, *local.layers());
+            assert_eq!(identity.layer_layout(), local.layers());
         }
     }
 
@@ -7987,9 +8051,11 @@ fn owner_parameter_targets(
                 roles.first().is_some_and(|candidate| candidate == role)
             }
             eredu_runtime::ParameterGroupOwner::ExecutionUnit { .. } => false,
+            _ => false,
         },
         eredu_runtime::ParameterGroupOwner::StaticAnyOf(_) => candidate == owner,
         eredu_runtime::ParameterGroupOwner::ExecutionUnit { .. } => candidate == owner,
+        _ => false,
     };
     let exact = authority
         .iter()
@@ -8656,7 +8722,7 @@ where
 {
     let layer_count = range.len();
     let device_depth = match options {
-        PipelineLayerLoadOptions::LayerwiseHost(options) => options.offload.prefetch_depth(),
+        PipelineLayerLoadOptions::LayerwiseHost(options) => options.offload().prefetch_depth(),
         PipelineLayerLoadOptions::DenseDiskStream(options) => {
             options.validate()?;
             layer_count.min(DENSE_TRANSFER_WINDOW)
@@ -8669,12 +8735,12 @@ where
         )));
     }
     if let PipelineLayerLoadOptions::DenseDiskStream(options) = options {
-        if options.host_budget_bytes > 0
-            && (options.host_lookahead == 0 || options.host_lookahead > layer_count)
+        if options.host_budget_bytes() > 0
+            && (options.host_lookahead() == 0 || options.host_lookahead() > layer_count)
         {
             return Err(Error::Parallel(format!(
                 "pipeline host lookahead {} cannot fit the {layer_count} local layers",
-                options.host_lookahead
+                options.host_lookahead()
             )));
         }
     }
@@ -8742,14 +8808,14 @@ where
         .ok_or_else(|| Error::Parallel("pipeline device parameter total overflowed".into()))?;
     let config = match options {
         PipelineLayerLoadOptions::LayerwiseHost(options) => {
-            if let Some(budget) = options.offload.device_budget_bytes() {
+            if let Some(budget) = options.offload().device_budget_bytes() {
                 if required_device > budget {
                     return Err(Error::Parallel(format!(
                         "pipeline device budget {budget} cannot hold {static_device_bytes} pinned static bytes plus the largest local layer window ({device_window_bytes} bytes, {required_device} total)"
                     )));
                 }
             }
-            if let Some(budget) = options.offload.host_budget_bytes() {
+            if let Some(budget) = options.offload().host_budget_bytes() {
                 if planned_host_bytes > budget {
                     return Err(Error::Parallel(format!(
                         "pipeline host budget {budget} cannot eagerly hold all {planned_host_bytes} rank-local host allocation bytes"
@@ -8757,39 +8823,39 @@ where
                 }
             }
             let device_layer_budget = options
-                .offload
+                .offload()
                 .device_budget_bytes()
                 .map(|budget| budget - static_device_bytes);
             OffloadConfig::new(
                 device_layer_budget,
-                options.offload.host_budget_bytes(),
+                options.offload().host_budget_bytes(),
                 device_depth,
             )?
-            .with_eviction_policy(options.offload.eviction_policy())
+            .with_eviction_policy(options.offload().eviction_policy())
         }
         PipelineLayerLoadOptions::DenseDiskStream(options) => {
-            if required_device > options.device_budget_bytes {
+            if required_device > options.device_budget_bytes() {
                 return Err(Error::Parallel(format!(
                     "pipeline device budget {} cannot hold {static_device_bytes} pinned static bytes plus the largest local layer window ({device_window_bytes} bytes, {required_device} total)",
-                    options.device_budget_bytes
+                    options.device_budget_bytes()
                 )));
             }
-            let device_layer_budget = options.device_budget_bytes - static_device_bytes;
-            if options.host_budget_bytes > 0 {
-                let host_window_bytes = largest(&host_bytes, options.host_lookahead)?;
-                if host_window_bytes > options.host_budget_bytes {
+            let device_layer_budget = options.device_budget_bytes() - static_device_bytes;
+            if options.host_budget_bytes() > 0 {
+                let host_window_bytes = largest(&host_bytes, options.host_lookahead())?;
+                if host_window_bytes > options.host_budget_bytes() {
                     return Err(Error::Parallel(format!(
                         "pipeline host budget {} cannot hold the largest protected local layer window ({host_window_bytes} bytes)",
-                        options.host_budget_bytes
+                        options.host_budget_bytes()
                     )));
                 }
             }
             OffloadConfig::new(
                 Some(device_layer_budget),
-                Some(options.host_budget_bytes),
-                options.host_lookahead.max(DENSE_TRANSFER_WINDOW),
+                Some(options.host_budget_bytes()),
+                options.host_lookahead().max(DENSE_TRANSFER_WINDOW),
             )?
-            .with_eviction_policy(options.eviction_policy)
+            .with_eviction_policy(options.eviction_policy())
         }
     };
     let plan = OffloadPlan::new(config, specs)?;
@@ -8807,12 +8873,14 @@ where
     )?;
     residency.initialize()?;
     let (sample_mlx_memory, sample_process_memory) = match options {
-        PipelineLayerLoadOptions::LayerwiseHost(options) => {
-            (options.sample_backend_memory, options.sample_process_memory)
-        }
-        PipelineLayerLoadOptions::DenseDiskStream(options) => {
-            (options.sample_backend_memory, options.sample_process_memory)
-        }
+        PipelineLayerLoadOptions::LayerwiseHost(options) => (
+            options.samples_backend_memory(),
+            options.samples_process_memory(),
+        ),
+        PipelineLayerLoadOptions::DenseDiskStream(options) => (
+            options.samples_backend_memory(),
+            options.samples_process_memory(),
+        ),
     };
     let controller = match options {
         PipelineLayerLoadOptions::LayerwiseHost(_) => PipelineLayerController::LayerwiseHost(
@@ -8844,7 +8912,7 @@ where
 
 fn validate_distributed_stage_capabilities(
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     parameter_bank: bool,
     artifact: &str,
     architecture: &str,
@@ -8888,47 +8956,59 @@ fn validate_distributed_stage_capabilities(
 /// Load-time conversion from a dense checkpoint always constructs the same
 /// stage-local bounded packed overlay before parameter residency is selected;
 /// fully resident stages never fall back to eager complete-matrix conversion.
-pub fn load_pipeline_model_with_options(
+pub(crate) fn load_pipeline_model_with_options(
     plan: ModelPreparationPlan<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
-    options: ModelLoadOptions,
+    options: crate::composition::mlx::loading::SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    crate::composition::mlx::loading::validate_plan_options(&plan, options)?;
-    let quantization = options.weight_quantization()?;
+    let quantization = options.weight_quantization();
     let (topology, wire_contract) = options.parallel_execution().ok_or_else(|| {
-        Error::Parallel("distributed stage loading requires ModelLoadOptions::parallel".into())
+        Error::Parallel("distributed stage loading requires a selected parallel plan".into())
     })?;
     validate_distributed_stage_topology(topology)?;
     topology.validate_execution_stream(stream)?;
     let layer_residency = || match options.weight_residency.layers() {
-        LayerWeightResidency::FullyResident => None,
+        LayerWeightResidency::FullyResident => Ok(None),
         LayerWeightResidency::LayerwiseHost(options) => {
-            Some(PipelineLayerLoadOptions::LayerwiseHost(options))
+            Ok(Some(PipelineLayerLoadOptions::LayerwiseHost(options)))
         }
         LayerWeightResidency::DenseDiskStream(options) => {
-            Some(PipelineLayerLoadOptions::DenseDiskStream(options))
+            Ok(Some(PipelineLayerLoadOptions::DenseDiskStream(options)))
         }
+        _ => Err(Error::ArchitectureModel(
+            "unsupported selected layer-residency mechanism".into(),
+        )),
     };
-    let (artifact, architecture_plan, _policy, route) = plan.into_parts();
+    let route = plan.route();
+    let architecture_plan = plan.inspection().architecture_plan().clone();
+    let artifact = plan.into_artifact();
     let model_kind = architecture_plan.model_kind();
     let (parameter_bank, dense_stream) = match route {
         MaterializationRoute::Resident => (None, None),
         MaterializationRoute::Layerwise => {
-            let layers = layer_residency().ok_or_else(|| {
+            let layers = layer_residency()?.ok_or_else(|| {
                 Error::ArchitectureModel(
                     "layerwise preparation plan requires non-resident layer options".into(),
                 )
             })?;
             (None, Some(layers))
         }
-        MaterializationRoute::ExpertCache => {
-            let experts = options.weight_residency.expert_cache().ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "expert-cache preparation plan requires expert-cache options".into(),
-                )
-            })?;
-            (Some(experts), layer_residency())
+        MaterializationRoute::AddressableParameterBanks => {
+            let experts = options
+                .weight_residency
+                .parameter_bank_cache()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "expert-cache preparation plan requires expert-cache options".into(),
+                    )
+                })?;
+            (Some(experts), layer_residency()?)
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported materialization route selected by the portable planner".into(),
+            ));
         }
     };
     let max_cached_shards = options.weight_residency.max_cached_shards();
@@ -9288,6 +9368,11 @@ pub fn load_pipeline_model_with_options(
             shards,
             max_cached_shards,
         )?,
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact route for distributed pipeline composition".into(),
+            ));
+        }
     };
 
     if artifact.loading_protocol() == eredu_core::LoadingProtocol::Realtime {
@@ -9568,7 +9653,7 @@ fn validate_pipeline_expert_dispatch(
 #[allow(clippy::too_many_arguments)]
 fn architecture_parallel_layout(
     description: &eredu_runtime::ArchitectureParameterDescription,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
 ) -> Result<eredu_runtime::LocalModelLayout, Error> {
     crate::composition::parallel_layout_from_description(
         ParallelBuildContext::new(topology, ShardingPolicy::Require),
@@ -9577,7 +9662,7 @@ fn architecture_parallel_layout(
 }
 
 fn preflight_pipeline_realization<S>(
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     target_units: usize,
     expert_realization: Option<&eredu_architectures::ExpertRealizationPlan<S>>,
     require_experts: bool,
@@ -9589,8 +9674,8 @@ fn preflight_pipeline_realization<S>(
         )));
     }
     if let Some(realization) = expert_realization {
-        if realization.expert_parallel_size() != topology.expert_parallel_size
-            || realization.expert_parallel_rank() != topology.expert_parallel_rank
+        if realization.expert_parallel_size() != topology.expert_parallel_size()
+            || realization.expert_parallel_rank() != topology.expert_parallel_rank()
         {
             return Err(Error::Parallel(format!(
                 "{family} expert realization topology does not match pipeline topology"
@@ -9644,7 +9729,7 @@ fn localized_gated_expert_width(
 #[test]
 fn pipeline_preflight_requires_and_validates_the_expert_realization() {
     let device = crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
-    let topology = MlxParallelContext::for_rank(0, 1, 1, 2, device).unwrap();
+    let topology = MlxParallelPlan::for_rank(0, 1, 1, 2, device).unwrap();
     let mut unit_specs = std::collections::BTreeMap::new();
     unit_specs.insert(
         (eredu_runtime::ExecutionGroupId::new("decoder").unwrap(), 0),
@@ -9660,7 +9745,7 @@ fn pipeline_preflight_requires_and_validates_the_expert_realization() {
 
     assert!(preflight_pipeline_realization::<()>(topology, 2, None, true, "test").is_err());
 
-    let replicated = MlxParallelContext::for_rank(0, 1, 1, 1, device).unwrap();
+    let replicated = MlxParallelPlan::for_rank(0, 1, 1, 1, device).unwrap();
     let mismatched = eredu_architectures::ExpertRealizationPlan::balanced(
         4,
         replicated.rank_topology(),

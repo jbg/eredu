@@ -20,7 +20,7 @@ use crate::{
         self as distributed, completion::synchronize_outputs, topology::PlacementPlan, Group,
     },
     backend::runtime::generation::MlxSamplingBackend,
-    backend::MlxParallelContext,
+    backend::MlxRankContext,
     MlxTensor,
 };
 use eredu_core::balanced_contiguous_range;
@@ -111,31 +111,33 @@ pub fn sample_and_synchronize<S: Sampler<MlxSamplingBackend>>(
 }
 
 /// Builds checkpoint placement and local model geometry from typed roles.
-pub struct ParallelPlanBuilder {
-    topology: MlxParallelContext,
+pub(crate) struct ParallelPlanBuilder {
+    partition_rank: usize,
+    partition_size: usize,
     policy: ShardingPolicy,
     placement: PlacementPlan,
     local: LocalModelLayout<TensorPlacement>,
 }
 
 impl ParallelPlanBuilder {
-    /// Creates an empty strict planner for one rank.
-    pub fn new(topology: MlxParallelContext) -> Self {
-        Self::with_policy(topology, ShardingPolicy::Require)
-    }
-
     /// Creates an empty planner with an explicit fallback policy.
-    pub fn with_policy(topology: MlxParallelContext, policy: ShardingPolicy) -> Self {
+    pub(crate) fn with_policy(
+        rank: MlxRankContext,
+        partition_rank: usize,
+        partition_size: usize,
+        policy: ShardingPolicy,
+    ) -> Self {
         Self {
-            topology,
+            partition_rank,
+            partition_size,
             policy,
-            placement: PlacementPlan::new(topology),
+            placement: PlacementPlan::new(rank),
             local: LocalModelLayout::default(),
         }
     }
 
     /// Registers one atomic logical parameter group.
-    pub fn register(&mut self, group: ParameterGroupSpec) -> Result<(), Error> {
+    pub(crate) fn register(&mut self, group: ParameterGroupSpec) -> Result<(), Error> {
         if let Some(member) = group
             .members()
             .iter()
@@ -170,13 +172,8 @@ impl ParallelPlanBuilder {
         };
         let logical_range = match (group.partition_units(), fell_back) {
             (Some(units), false) => Some(
-                balanced_contiguous_range(
-                    units,
-                    self.topology.tensor_parallel_size,
-                    self.topology.tensor_parallel_rank,
-                    false,
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))?,
+                balanced_contiguous_range(units, self.partition_size, self.partition_rank, false)
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
             ),
             (Some(units), true) => Some(0..units),
             (None, _) => None,
@@ -206,7 +203,9 @@ impl ParallelPlanBuilder {
     }
 
     /// Completes planning and validates every generated placement.
-    pub fn finish(self) -> Result<(PlacementPlan, LocalModelLayout<TensorPlacement>), Error> {
+    pub(crate) fn finish(
+        self,
+    ) -> Result<(PlacementPlan, LocalModelLayout<TensorPlacement>), Error> {
         self.placement.validate()?;
         Ok((self.placement, self.local))
     }
@@ -216,8 +215,8 @@ impl ParallelPlanBuilder {
         member: &ParameterMemberSpec,
         partition_units: Option<usize>,
     ) -> Result<(TensorPlacement, Vec<usize>), String> {
-        let rank = self.topology.tensor_parallel_rank;
-        let parts = self.topology.tensor_parallel_size;
+        let rank = self.partition_rank;
+        let parts = self.partition_size;
         if parts == 0 || rank >= parts {
             return Err(format!("invalid TP coordinate {rank}/{parts}"));
         }
@@ -448,35 +447,6 @@ fn checked_axis(member: &ParameterMemberSpec, axis: usize) -> Result<usize, Stri
     })
 }
 
-/// Construction-time topology and fallback policy supplied to model builders.
-#[derive(Debug, Clone, Copy)]
-pub struct ParallelBuildContext {
-    topology: MlxParallelContext,
-    policy: ShardingPolicy,
-}
-
-impl ParallelBuildContext {
-    /// Creates a construction context for a validated topology.
-    pub const fn new(topology: MlxParallelContext, policy: ShardingPolicy) -> Self {
-        Self { topology, policy }
-    }
-
-    /// Returns the complete process topology.
-    pub const fn topology(self) -> MlxParallelContext {
-        self.topology
-    }
-
-    /// Returns the configured unsupported-shard behavior.
-    pub const fn policy(self) -> ShardingPolicy {
-        self.policy
-    }
-
-    /// Creates a typed parameter planner for this rank.
-    pub fn planner(self) -> ParallelPlanBuilder {
-        ParallelPlanBuilder::with_policy(self.topology, self.policy)
-    }
-}
-
 /// Borrowed execution resources for replicated or tensor-parallel primitives.
 ///
 /// The group is never retained by model state. In hybrid topologies callers
@@ -550,16 +520,26 @@ impl<'a> ParallelExecutionContext<'a> {
 mod tests {
     use super::*;
     use crate::backend::DeviceAssignment;
+    use crate::composition::mlx::distributed::topology::MlxParallelPlan;
     use safemlx::DeviceType;
 
-    fn topology(rank: usize, parts: usize) -> MlxParallelContext {
-        MlxParallelContext::for_rank(rank, parts, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+    fn topology(rank: usize, parts: usize) -> MlxParallelPlan {
+        MlxParallelPlan::for_rank(rank, parts, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap()
+    }
+
+    fn planner(topology: MlxParallelPlan) -> ParallelPlanBuilder {
+        ParallelPlanBuilder::with_policy(
+            topology.rank_context(),
+            topology.tensor_parallel_rank(),
+            topology.tensor_parallel_size(),
+            ShardingPolicy::Require,
+        )
     }
 
     #[test]
     fn plans_atomic_quantized_row_projection() {
-        let mut planner = ParallelPlanBuilder::new(topology(1, 2));
+        let mut planner = planner(topology(1, 2));
         planner
             .register(
                 ParameterGroupSpec::new(
@@ -594,7 +574,7 @@ mod tests {
 
     #[test]
     fn segmented_qkv_preserves_segment_order() {
-        let mut planner = ParallelPlanBuilder::new(topology(1, 2));
+        let mut planner = planner(topology(1, 2));
         planner
             .register(
                 ParameterGroupSpec::new(
@@ -627,7 +607,7 @@ mod tests {
     #[test]
     fn segmented_weight_and_quantization_companions_share_exact_indices() {
         let segments = vec![0..4, 4..8, 8..12];
-        let mut planner = ParallelPlanBuilder::new(topology(1, 2));
+        let mut planner = planner(topology(1, 2));
         planner
             .register(
                 ParameterGroupSpec::partitioned(
@@ -673,8 +653,13 @@ mod tests {
 
     #[test]
     fn permissive_policy_replicates_the_complete_group() {
-        let mut planner =
-            ParallelPlanBuilder::with_policy(topology(0, 3), ShardingPolicy::ReplicateUnsupported);
+        let topology = topology(0, 3);
+        let mut planner = ParallelPlanBuilder::with_policy(
+            topology.rank_context(),
+            topology.tensor_parallel_rank(),
+            topology.tensor_parallel_size(),
+            ShardingPolicy::ReplicateUnsupported,
+        );
         planner
             .register(
                 ParameterGroupSpec::new(
@@ -701,7 +686,7 @@ mod tests {
 
     #[test]
     fn strict_policy_rejects_indivisible_groups() {
-        let mut planner = ParallelPlanBuilder::new(topology(0, 3));
+        let mut planner = planner(topology(0, 3));
         let error = planner
             .register(
                 ParameterGroupSpec::new(
@@ -723,7 +708,7 @@ mod tests {
     fn aligned_members_share_an_uneven_logical_range() {
         let expected = [(0..8, 0..4), (8..16, 4..8), (16..20, 8..10)];
         for (rank, (weight_range, scale_range)) in expected.into_iter().enumerate() {
-            let mut planner = ParallelPlanBuilder::new(topology(rank, 3));
+            let mut planner = planner(topology(rank, 3));
             planner
                 .register(
                     ParameterGroupSpec::partitioned(
@@ -779,7 +764,7 @@ mod tests {
             (vec![8, 9, 18, 19], 12..15),
         ];
         for (rank, (gate_up_indices, down_range)) in expected.into_iter().enumerate() {
-            let mut planner = ParallelPlanBuilder::new(topology(rank, 3));
+            let mut planner = planner(topology(rank, 3));
             planner
                 .register(
                     ParameterGroupSpec::partitioned(
@@ -841,7 +826,7 @@ mod tests {
 
     #[test]
     fn aligned_groups_reject_more_ranks_than_units() {
-        let mut planner = ParallelPlanBuilder::new(topology(0, 3));
+        let mut planner = planner(topology(0, 3));
         let error = planner
             .register(
                 ParameterGroupSpec::partitioned(
@@ -864,7 +849,7 @@ mod tests {
     fn logical_unit_channel_range_preserves_uneven_balanced_slice() {
         let expected = [0..3, 3..5];
         for (rank, expected) in expected.into_iter().enumerate() {
-            let mut planner = ParallelPlanBuilder::new(topology(rank, 2));
+            let mut planner = planner(topology(rank, 2));
             planner
                 .register(
                     ParameterGroupSpec::partitioned(

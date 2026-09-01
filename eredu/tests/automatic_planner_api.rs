@@ -12,5 +12,5 @@ fn portable_planner_inputs_round_trip_and_build_inspection_options() {
     let plan = ExecutionPlan::fully_resident(device);
     let options =
         LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), &plan).unwrap();
-    assert_eq!(options.load, Default::default());
+    assert_eq!(options.load(), Default::default());
 }

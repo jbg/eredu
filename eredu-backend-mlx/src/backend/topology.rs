@@ -1,18 +1,13 @@
-//! MLX device assignment attached to backend-neutral rank topology.
+//! MLX device assignment attached to a mechanism-only world rank.
 
-use std::ops::Deref;
-
-use eredu_core::{BackendError, ParallelRankTopology, ParallelTopology};
-use safemlx::{distributed::Group, Device, DeviceType, Stream};
+use safemlx::{Device, DeviceType, Stream};
 
 use crate::backend::error::Error;
 
 /// Explicit process-local MLX execution-device assignment.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DeviceAssignment {
-    /// MLX device family used by this process.
     device_type: DeviceType,
-    /// Index within this process's visible devices.
     local_index: usize,
 }
 
@@ -43,26 +38,25 @@ impl DeviceAssignment {
     }
 }
 
-/// Canonical backend-neutral rank topology bound to one process-local MLX device.
+/// Mechanism-only world rank bound to one process-local MLX device.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct MlxParallelContext {
-    rank: ParallelRankTopology,
-    /// Explicit process-local MLX device assignment.
+pub struct MlxRankContext {
+    world_size: usize,
+    global_rank: usize,
     device: DeviceAssignment,
 }
 
-impl MlxParallelContext {
-    /// Binds one validated rank topology to an MLX device.
+impl MlxRankContext {
+    /// Binds a validated mechanism-only world rank to one MLX device.
     pub fn new(
-        topology: ParallelTopology,
+        world_size: usize,
         global_rank: usize,
         device: DeviceAssignment,
     ) -> Result<Self, Error> {
-        if topology.data != 1 {
-            return Err(Error::Backend(BackendError::Unsupported {
-                backend: "mlx".into(),
-                capability: "data-parallel model sessions".into(),
-            }));
+        if world_size == 0 || global_rank >= world_size {
+            return Err(Error::Parallel(format!(
+                "world rank {global_rank} is outside world size {world_size}"
+            )));
         }
         if i32::try_from(device.local_index).is_err() {
             return Err(Error::Parallel(format!(
@@ -71,74 +65,34 @@ impl MlxParallelContext {
             )));
         }
         Ok(Self {
-            rank: ParallelRankTopology::new(topology, global_rank)?,
+            world_size,
+            global_rank,
             device,
         })
     }
 
-    /// Constructs and binds a tensor/pipeline/expert topology for one rank.
-    pub fn for_rank(
-        global_rank: usize,
-        tensor_parallel_size: usize,
-        pipeline_parallel_size: usize,
-        expert_parallel_size: usize,
-        device: DeviceAssignment,
-    ) -> Result<Self, Error> {
-        let topology = ParallelTopology::new(
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            expert_parallel_size,
-            1,
-        )?;
-        Self::new(topology, global_rank, device)
+    /// Returns the selected process count.
+    pub const fn world_size(self) -> usize {
+        self.world_size
     }
 
-    /// Constructs a topology and snapshots its rank from an MLX world group.
-    pub fn for_group(
-        group: &Group,
-        tensor_parallel_size: usize,
-        pipeline_parallel_size: usize,
-        expert_parallel_size: usize,
-        device: DeviceAssignment,
-    ) -> Result<Self, Error> {
-        let topology = ParallelTopology::new(
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            expert_parallel_size,
-            1,
-        )?;
-        if group.size() != topology.world_size() {
-            return Err(Error::Parallel(format!(
-                "parallel topology expects world size {} but received {}",
-                topology.world_size(),
-                group.size()
-            )));
-        }
-        Self::new(topology, group.rank(), device)
+    /// Returns this process's world rank.
+    pub const fn global_rank(self) -> usize {
+        self.global_rank
     }
 
-    /// Returns the canonical topology shape.
-    pub fn topology(self) -> ParallelTopology {
-        self.rank.topology()
-    }
-
-    /// Returns the canonical backend-neutral rank snapshot.
-    pub const fn rank_topology(self) -> ParallelRankTopology {
-        self.rank
-    }
-
-    /// Resolves the process-local execution device selected by composition.
+    /// Resolves the process-local execution device.
     pub fn device(self) -> Result<Device, Error> {
         self.device.device()
     }
 
-    /// Verifies that an execution stream uses the assigned MLX device.
+    /// Verifies that an execution stream uses the selected process-local device.
     pub fn validate_execution_stream(self, stream: &Stream) -> Result<(), Error> {
         let actual = stream.get_device()?;
         let actual_type = actual.get_type()?;
         let actual_index = actual.get_index()?;
         let expected_index = i32::try_from(self.device.local_index)
-            .expect("MLX parallel context validated the local device index");
+            .expect("MLX rank context validated the local device index");
         if actual_type == self.device.device_type && actual_index == expected_index {
             Ok(())
         } else {
@@ -150,43 +104,20 @@ impl MlxParallelContext {
     }
 }
 
-impl Deref for MlxParallelContext {
-    type Target = ParallelRankTopology;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rank
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mlx_binding_adds_only_local_device_identity() {
-        let context = MlxParallelContext::new(
-            ParallelTopology::new(2, 2, 1, 1).unwrap(),
-            3,
-            DeviceAssignment::new(DeviceType::Gpu, 0),
-        )
-        .unwrap();
-        assert_eq!(context.rank_topology().global_rank, 3);
-        assert_eq!(context.coordinates().pipeline, 1);
-        assert_eq!(context.coordinates().tensor, 1);
+    fn mlx_binding_adds_only_world_rank_and_local_device_identity() {
+        let context = MlxRankContext::new(4, 3, DeviceAssignment::new(DeviceType::Gpu, 0)).unwrap();
+        assert_eq!(context.global_rank(), 3);
+        assert_eq!(context.world_size(), 4);
         assert_eq!(context.device.local_index(), 0);
     }
 
     #[test]
-    fn mlx_fails_closed_for_unimplemented_data_parallel_sessions() {
-        let error = MlxParallelContext::new(
-            ParallelTopology::new(1, 1, 1, 2).unwrap(),
-            0,
-            DeviceAssignment::new(DeviceType::Gpu, 0),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Backend(BackendError::Unsupported { .. })
-        ));
+    fn mlx_rank_context_rejects_out_of_range_rank() {
+        assert!(MlxRankContext::new(1, 1, DeviceAssignment::new(DeviceType::Gpu, 0)).is_err());
     }
 }

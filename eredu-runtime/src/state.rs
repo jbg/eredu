@@ -17,6 +17,7 @@ use eredu_nn::NeuralBackend;
 
 /// Architecture-declared placement of one contiguous mutable-state range.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ArchitectureStatePlacement {
     /// Partition the state range in lockstep with one execution group's units.
     GroupUnits {
@@ -87,6 +88,7 @@ impl ArchitectureStatePartitionPlan {
 
 /// Invalid architecture-authored mutable-state partition policy.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArchitectureStatePartitionError {
     /// The plan contains no placement rules.
     #[error("architecture state partition plan must contain at least one rule")]
@@ -192,6 +194,7 @@ impl std::fmt::Display for StateSegmentId {
 
 /// Lifetime policy attached to a named mutable-state segment.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[non_exhaustive]
 pub enum StateSegmentLifetime {
     /// State survives from one model input or frame to the next.
     Persistent,
@@ -511,6 +514,59 @@ pub trait RuntimeState<B: NeuralBackend> {
     ) -> Result<Self::RetainedValues<'_>, StateError>;
 }
 
+/// Additive backend mechanism for realizing an architecture-declared state layout.
+///
+/// Ordinary key/value architectures need not implement this extension: it is
+/// selected only by composition that requires a distinct concrete state
+/// representation, such as a layout combining attention and fixed components.
+pub trait ArchitectureStateFactory<B: NeuralBackend> {
+    /// Concrete state returned by this realization mechanism.
+    type State: RuntimeState<B>;
+    /// Backend-specific construction failure.
+    type Error;
+
+    /// Allocates native state for the exact selected architecture layout.
+    fn realize(&mut self, layout: &StateLayout) -> Result<Self::State, Self::Error>;
+}
+
+/// Failure while selecting and realizing architecture-authored mutable state.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ArchitectureStateRealizationError<ArchitectureError, FactoryError> {
+    /// The architecture could not derive its authoritative state layout.
+    #[error("architecture state layout selection failed")]
+    Architecture(#[source] ArchitectureError),
+    /// The selected backend mechanism could not realize the layout.
+    #[error("backend state realization failed")]
+    Factory(#[source] FactoryError),
+    /// The backend returned state whose layout differs from the selected value.
+    #[error("backend state realization changed the selected architecture layout")]
+    LayoutMismatch,
+}
+
+/// Selects the architecture's exact state layout and realizes it through an
+/// explicitly supplied additive mechanism.
+pub fn realize_architecture_state<B, M, F>(
+    architecture: &M,
+    factory: &mut F,
+) -> Result<F::State, ArchitectureStateRealizationError<M::DefinitionError, F::Error>>
+where
+    B: NeuralBackend,
+    M: crate::ArchitectureParameters<B>,
+    F: ArchitectureStateFactory<B>,
+{
+    let layout = architecture
+        .state_layout()
+        .map_err(ArchitectureStateRealizationError::Architecture)?;
+    let state = factory
+        .realize(&layout)
+        .map_err(ArchitectureStateRealizationError::Factory)?;
+    if state.layout() != &layout {
+        return Err(ArchitectureStateRealizationError::LayoutMismatch);
+    }
+    Ok(state)
+}
+
 /// Named-segment reset supported by a concrete runtime-state realization.
 pub trait ResettableRuntimeState<B: NeuralBackend>: RuntimeState<B> {
     /// Resets every layer in exactly one declared state segment.
@@ -651,22 +707,71 @@ impl<B: NeuralBackend, L> AsMut<[L]> for DeviceState<B, L> {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ModelStateIdentity {
     /// Stable architecture family.
-    pub model_family: String,
+    model_family: String,
     /// Effective normalized model type.
-    pub effective_model_type: String,
+    effective_model_type: String,
     /// Cache-relevant architecture fingerprint.
-    pub architecture_fingerprint: String,
+    architecture_fingerprint: String,
     /// Total architecture layer count.
-    pub layer_count: usize,
+    layer_count: usize,
     /// Inclusive first global layer owned by this runtime instance.
-    pub global_layer_start: usize,
+    global_layer_start: usize,
     /// Attention sink or pinned-prefix token count.
-    pub sink_tokens: usize,
+    sink_tokens: usize,
     /// Rank-local distributed placement.
-    pub topology: PromptCacheTopology,
+    topology: PromptCacheTopology,
 }
 
 impl ModelStateIdentity {
+    /// Creates a validated architecture and placement identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        model_family: impl Into<String>,
+        effective_model_type: impl Into<String>,
+        architecture_fingerprint: impl Into<String>,
+        layer_count: usize,
+        global_layer_start: usize,
+        sink_tokens: usize,
+        topology: PromptCacheTopology,
+    ) -> Result<Self, PromptCacheError> {
+        let model_family = model_family.into();
+        let effective_model_type = effective_model_type.into();
+        let architecture_fingerprint = architecture_fingerprint.into();
+        if model_family.trim().is_empty()
+            || effective_model_type.trim().is_empty()
+            || architecture_fingerprint.trim().is_empty()
+        {
+            return Err(PromptCacheError::Malformed(
+                "model-state identity strings must be non-empty".into(),
+            ));
+        }
+        if layer_count == 0 || global_layer_start > layer_count {
+            return Err(PromptCacheError::Malformed(format!(
+                "model-state layer start {global_layer_start} is invalid for {layer_count} layers"
+            )));
+        }
+        topology.validate()?;
+        Ok(Self {
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
+            layer_count,
+            global_layer_start,
+            sink_tokens,
+            topology,
+        })
+    }
+
+    /// Total architecture layer count.
+    pub const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    /// Inclusive first global layer owned by this runtime instance.
+    pub const fn global_layer_start(&self) -> usize {
+        self.global_layer_start
+    }
+
     /// Combines architecture identity, placement, and exact state geometry.
     pub fn prompt_cache_identity(
         &self,
@@ -676,32 +781,31 @@ impl ModelStateIdentity {
             .global_layer_start
             .checked_add(layout.len())
             .ok_or_else(|| PromptCacheError::Malformed("owned layer range overflowed".into()))?;
-        let identity = PromptCacheModelIdentity {
-            model_family: self.model_family.clone(),
-            effective_model_type: self.effective_model_type.clone(),
-            architecture_fingerprint: self.architecture_fingerprint.clone(),
-            layer_count: self.layer_count,
-            global_layer_start: self.global_layer_start,
+        PromptCacheModelIdentity::new(
+            self.model_family.clone(),
+            self.effective_model_type.clone(),
+            self.architecture_fingerprint.clone(),
+            self.layer_count,
+            self.global_layer_start,
             global_layer_end,
-            sink_tokens: self.sink_tokens,
-            topology: self.topology.clone(),
-            layer_layout: layout.layers().clone(),
-            layer_prefix_offsets: layout.layer_prefix_offsets(),
-            state_segments: layout
+            self.sink_tokens,
+            self.topology.clone(),
+            layout.layers().clone(),
+            layout.layer_prefix_offsets(),
+            layout
                 .segments()
                 .iter()
                 .map(|segment| {
                     PromptCacheStateSegment::new(segment.id().as_str(), segment.layers())
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-        };
-        identity.validate()?;
-        Ok(identity)
+        )
     }
 }
 
 /// Invalid architecture state geometry or runtime access.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StateError {
     /// A model declared no state-bearing layer slots.
     #[error("runtime state layout must contain at least one layer")]
@@ -855,9 +959,9 @@ mod tests {
         }
         .prompt_cache_identity(&layout)
         .unwrap();
-        assert_eq!(identity.global_layer_start, 1);
-        assert_eq!(identity.global_layer_end, 3);
-        assert_eq!(identity.layer_layout, *layout.layers());
+        assert_eq!(identity.global_layer_start(), 1);
+        assert_eq!(identity.global_layer_end(), 3);
+        assert_eq!(identity.layer_layout(), layout.layers());
     }
 
     #[test]
@@ -883,19 +987,19 @@ mod tests {
         }
         .prompt_cache_identity(&layout)
         .unwrap();
-        assert_eq!(identity.layer_prefix_offsets, [0, -1]);
-        assert_eq!(identity.state_segments.len(), 2);
-        assert_eq!(identity.state_segments[0].id(), "target");
-        assert_eq!(identity.state_segments[0].layers(), 0..1);
-        assert_eq!(identity.state_segments[1].id(), "prediction");
-        assert_eq!(identity.state_segments[1].layers(), 1..2);
+        assert_eq!(identity.layer_prefix_offsets(), [0, -1]);
+        assert_eq!(identity.state_segments().len(), 2);
+        assert_eq!(identity.state_segments()[0].id(), "target");
+        assert_eq!(identity.state_segments()[0].layers(), 0..1);
+        assert_eq!(identity.state_segments()[1].id(), "prediction");
+        assert_eq!(identity.state_segments()[1].layers(), 1..2);
 
         let prediction = identity.select_state_segment("prediction").unwrap();
-        assert_eq!(prediction.global_layer_start, 1);
-        assert_eq!(prediction.global_layer_end, 2);
-        assert_eq!(prediction.layer_prefix_offsets, [-1]);
-        assert_eq!(prediction.state_segments[0].id(), "prediction");
-        assert_eq!(prediction.state_segments[0].layers(), 0..1);
+        assert_eq!(prediction.global_layer_start(), 1);
+        assert_eq!(prediction.global_layer_end(), 2);
+        assert_eq!(prediction.layer_prefix_offsets(), [-1]);
+        assert_eq!(prediction.state_segments()[0].id(), "prediction");
+        assert_eq!(prediction.state_segments()[0].layers(), 0..1);
     }
 
     #[test]
@@ -915,7 +1019,7 @@ mod tests {
             .components(0)
             .unwrap()
             .iter()
-            .map(|component| component.role.stable_name())
+            .map(|component| component.role().stable_name())
             .collect::<Vec<_>>();
         assert_eq!(
             names,

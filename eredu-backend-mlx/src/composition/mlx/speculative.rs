@@ -26,12 +26,11 @@ use crate::{
     backend::error::Error,
     backend::random::RandomState,
     backend::runtime::generation::MlxSamplingBackend,
-    backend::ModelLoadOptions,
     composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
     composition::muse_glimmer::{
         load_dflash_gguf, load_dflash_safetensors, MuseGlimmerDFlashModel,
     },
-    MlxTensor,
+    MlxLoadRequest, MlxTensor,
 };
 
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
@@ -48,7 +47,7 @@ enum MlxDrafterModel {
 
 /// Stable architecture identity for an independently loaded MLX draft model.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MlxDrafterKind {
+pub(crate) enum MlxDrafterKind {
     /// Gemma 4 external assistant.
     Gemma4Assistant,
     /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
@@ -60,7 +59,7 @@ impl MlxDrafter {
     pub(crate) fn materialize_with_compatibility(
         preparation: eredu_architectures::ExternalAssistantPreparationPlan,
         tokenizer_compatibility: TokenizerCompatibilityProof,
-        options: ModelLoadOptions,
+        options: MlxLoadRequest,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
@@ -394,10 +393,7 @@ where
         Self: 'a,
     {
         if temperature == 0.0 {
-            return Ok(SpeculativeRandomness {
-                target: None,
-                draft: None,
-            });
+            return Ok(SpeculativeRandomness::new(None, None));
         }
         let mut root =
             RandomState::from_key(seed.ok_or_else(|| {
@@ -418,10 +414,10 @@ where
         } else {
             draft_key
         };
-        Ok(SpeculativeRandomness {
-            target: Some(RandomState::from_key(target_key)),
-            draft: Some(draft_key),
-        })
+        Ok(SpeculativeRandomness::new(
+            Some(RandomState::from_key(target_key)),
+            Some(draft_key),
+        ))
     }
 
     fn draft_randomness_at<'a>(
@@ -455,7 +451,7 @@ where
             &MlxTensor::from_array(logits.clone()),
             temperature,
             history,
-            sampling_stream(placement, context),
+            sampling_stream(placement, context)?,
         )
         .map(MlxTensor::into_array)
     }
@@ -471,7 +467,7 @@ where
     where
         Self: 'a,
     {
-        let stream = sampling_stream(placement, context);
+        let stream = sampling_stream(placement, context)?;
         let token = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
             &self.inner,
             &MlxTensor::from_array(distribution.clone()),
@@ -563,7 +559,7 @@ where
             &mut self.inner,
             &MlxTensor::from_array(distribution.clone()),
             token,
-            sampling_stream(placement, context),
+            sampling_stream(placement, context)?,
         )
     }
 
@@ -596,10 +592,13 @@ where
 fn sampling_stream<'a>(
     placement: SamplingPlacement,
     context: SpeculativeExecutionStreams<'a>,
-) -> &'a Stream {
+) -> Result<&'a Stream, Exception> {
     match placement {
-        SamplingPlacement::Target => context.target(),
-        SamplingPlacement::Draft => context.draft(),
+        SamplingPlacement::Target => Ok(context.target()),
+        SamplingPlacement::Draft => Ok(context.draft()),
+        _ => Err(Exception::custom(
+            "unsupported speculative sampling placement requires an explicit stream",
+        )),
     }
 }
 

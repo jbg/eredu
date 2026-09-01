@@ -741,15 +741,16 @@ mod tests {
             state: &eredu_runtime::PartitionState,
             topology: eredu_core::cache::PromptCacheTopology,
         ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-            Ok(eredu_runtime::ModelStateIdentity {
-                model_family: "placement_fixture".into(),
-                effective_model_type: "placement_fixture".into(),
-                architecture_fingerprint: "placement_fixture".into(),
-                layer_count: self.unit_counts.iter().sum(),
-                global_layer_start: state.global_layer_offset(),
-                sink_tokens: 0,
+            eredu_runtime::ModelStateIdentity::new(
+                "placement_fixture",
+                "placement_fixture",
+                "placement_fixture",
+                self.unit_counts.iter().sum(),
+                state.global_layer_offset(),
+                0,
                 topology,
-            })
+            )
+            .map_err(|error| error.to_string())
         }
 
         fn parameter_description(

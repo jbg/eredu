@@ -236,7 +236,7 @@ impl LocalGeometry {
 
     /// Builds one rank-local execution unit using the canonical Moshi unit
     /// types and shared decoder block implementation.
-    pub fn build_unit<B: NeuralBackend>(
+    pub fn build_unit<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
         &self,
         config: &MoshiConfig,
         group: usize,
@@ -287,7 +287,7 @@ pub fn forward_temporal_block_parallel<B, S>(
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
 ) -> Result<B::Tensor, eredu_nn::Error>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
 {
@@ -304,7 +304,7 @@ where
 }
 
 /// Declares pinned embedding, normalization, and text-output parameter groups.
-pub fn static_parameter_groups<B: NeuralBackend>(
+pub fn static_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = Vec::with_capacity(modules.embeddings.tables.len() + 2);
@@ -353,7 +353,7 @@ pub fn static_parameter_groups<B: NeuralBackend>(
 }
 
 /// Declares all semantic parameter groups for one temporal block or depth slice.
-pub fn unit_parameter_groups<B: NeuralBackend>(
+pub fn unit_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     unit: &Unit<B>,
     config: &MoshiConfig,
     group: usize,
@@ -419,7 +419,7 @@ pub fn unit_parameter_groups<B: NeuralBackend>(
     }
 }
 
-impl<B: NeuralBackend> LayeredModel<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Declares pinned parameter groups for semantic tensor-parallel planning.
     pub fn static_parameter_groups(&self) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
         static_parameter_groups(self.static_modules())

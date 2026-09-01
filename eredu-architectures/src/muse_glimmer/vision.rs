@@ -64,14 +64,14 @@ impl<T> VisionState<T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct CenteredLayerNorm<B: NeuralBackend> {
+struct CenteredLayerNorm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     bias: Parameter<B::Tensor>,
     #[parameter(skip)]
     epsilon: f32,
 }
 
-impl<B: NeuralBackend> CenteredLayerNorm<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredLayerNorm<B> {
     fn new(
         prefix: &str,
         dimensions: i32,
@@ -109,14 +109,14 @@ impl<B: NeuralBackend> CenteredLayerNorm<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct PatchEmbedder<B: NeuralBackend> {
+struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     projection: B::Linear,
     position_table: B::Embedding,
     #[parameter(skip)]
     input_width: i32,
 }
 
-impl<B: NeuralBackend> PatchEmbedder<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
     fn new(config: &VisionConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let input_width = config.temporal_patch_size * 3 * config.patch_size * config.patch_size;
         let weight = "model.vision_tower.patch_embedder.patch_embedding.weight";
@@ -181,7 +181,7 @@ impl<B: NeuralBackend> PatchEmbedder<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct VisionAttention<B: NeuralBackend> {
+struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     query: B::Linear,
     key: B::Linear,
     value: B::Linear,
@@ -194,7 +194,7 @@ struct VisionAttention<B: NeuralBackend> {
     scale: f32,
 }
 
-impl<B: NeuralBackend> VisionAttention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
     fn new(
         config: &VisionConfig,
         layer: usize,
@@ -300,7 +300,7 @@ impl<B: NeuralBackend> VisionAttention<B> {
 /// One exact Muse-Glimmer vision transformer block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionBlock<B: NeuralBackend> {
+pub struct VisionBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     norm1: CenteredLayerNorm<B>,
     attention: VisionAttention<B>,
     norm2: CenteredLayerNorm<B>,
@@ -308,7 +308,7 @@ pub struct VisionBlock<B: NeuralBackend> {
     fc2: B::Linear,
 }
 
-impl<B: NeuralBackend> VisionBlock<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
     /// Builds one unloaded vision block.
     pub fn new(
         config: &VisionConfig,
@@ -396,7 +396,7 @@ impl<B: NeuralBackend> VisionBlock<B> {
 /// Pinned patch, position, normalization, merge-adapter, and projection modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionStatic<B: NeuralBackend> {
+pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     patch_embedder: PatchEmbedder<B>,
     pre_norm: CenteredLayerNorm<B>,
     post_norm: CenteredLayerNorm<B>,
@@ -407,7 +407,7 @@ pub struct VisionStatic<B: NeuralBackend> {
     config: VisionConfig,
 }
 
-impl<B: NeuralBackend> VisionStatic<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
     /// Builds unloaded pinned vision modules.
     pub fn new(
         config: VisionConfig,
@@ -528,7 +528,7 @@ impl<B: NeuralBackend> VisionStatic<B> {
 /// Resident neutral vision tower; streamed runtimes reuse its static phases and block units.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionTower<B: NeuralBackend> {
+pub struct VisionTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Pinned media modules.
     pub static_modules: VisionStatic<B>,
     /// Independently streamable encoder blocks.
@@ -537,7 +537,7 @@ pub struct VisionTower<B: NeuralBackend> {
     schedule: Vec<VisionAttentionPolicy>,
 }
 
-impl<B: NeuralBackend> VisionTower<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
     /// Builds the complete unloaded native vision tower and language adapter.
     pub fn new(
         config: VisionConfig,
@@ -573,7 +573,7 @@ impl<B: NeuralBackend> VisionTower<B> {
     }
 }
 
-fn interpolated_positions<B: NeuralBackend>(
+fn interpolated_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     embedding: &mut B::Embedding,
     grid: &[(i32, i32, i32)],
     height: i32,

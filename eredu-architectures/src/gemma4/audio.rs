@@ -175,14 +175,14 @@ pub struct AudioInput<'a, T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct SubsampleLayer<B: NeuralBackend> {
+struct SubsampleLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     norm_weight: Parameter<B::Tensor>,
     #[parameter(skip)]
     epsilon: f32,
 }
 
-impl<B: NeuralBackend> SubsampleLayer<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleLayer<B> {
     fn new(
         prefix: &str,
         input: i32,
@@ -228,7 +228,7 @@ impl<B: NeuralBackend> SubsampleLayer<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct SubsampleProjection<B: NeuralBackend> {
+struct SubsampleProjection<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     layer0: SubsampleLayer<B>,
     layer1: SubsampleLayer<B>,
     input_projection: B::Linear,
@@ -236,7 +236,7 @@ struct SubsampleProjection<B: NeuralBackend> {
     second_channels: i32,
 }
 
-impl<B: NeuralBackend> SubsampleProjection<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleProjection<B> {
     fn new(config: &AudioConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let root = "model.audio_tower.subsample_conv_projection";
         let first = config.subsampling_conv_channels[0];
@@ -298,7 +298,7 @@ impl<B: NeuralBackend> SubsampleProjection<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct AudioFeedForward<B: NeuralBackend> {
+struct AudioFeedForward<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pre_norm: B::Normalization,
     first: ClippedLinear<B>,
     second: ClippedLinear<B>,
@@ -307,7 +307,7 @@ struct AudioFeedForward<B: NeuralBackend> {
     residual_weight: f32,
 }
 
-impl<B: NeuralBackend> AudioFeedForward<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioFeedForward<B> {
     fn new(
         config: &AudioConfig,
         prefix: &str,
@@ -354,7 +354,7 @@ impl<B: NeuralBackend> AudioFeedForward<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct LightConv1d<B: NeuralBackend> {
+struct LightConv1d<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pre_norm: B::Normalization,
     linear_start: ClippedLinear<B>,
     depthwise_weight: Parameter<B::Tensor>,
@@ -366,7 +366,7 @@ struct LightConv1d<B: NeuralBackend> {
     hidden_size: i32,
 }
 
-impl<B: NeuralBackend> LightConv1d<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LightConv1d<B> {
     fn new(
         config: &AudioConfig,
         prefix: &str,
@@ -442,7 +442,7 @@ impl<B: NeuralBackend> LightConv1d<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct AudioAttention<B: NeuralBackend> {
+struct AudioAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     query: ClippedLinear<B>,
     key: ClippedLinear<B>,
     value: ClippedLinear<B>,
@@ -465,7 +465,7 @@ struct AudioAttention<B: NeuralBackend> {
     invalid_logits: f32,
 }
 
-impl<B: NeuralBackend> AudioAttention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
     fn new(
         config: &AudioConfig,
         prefix: &str,
@@ -674,7 +674,7 @@ impl<B: NeuralBackend> AudioAttention<B> {
 /// One Gemma 4 audio encoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct AudioLayer<B: NeuralBackend> {
+pub struct AudioLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     feed_forward1: AudioFeedForward<B>,
     pre_attention_norm: B::Normalization,
     attention: AudioAttention<B>,
@@ -684,7 +684,7 @@ pub struct AudioLayer<B: NeuralBackend> {
     output_norm: B::Normalization,
 }
 
-impl<B: NeuralBackend> AudioLayer<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioLayer<B> {
     /// Builds one unloaded encoder layer with released checkpoint identities.
     pub fn new(
         config: &AudioConfig,
@@ -745,14 +745,14 @@ impl<B: NeuralBackend> AudioLayer<B> {
 /// Pinned subsampling and media-to-decoder output projection.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct AudioStatic<B: NeuralBackend> {
+pub struct AudioStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     config: AudioConfig,
     subsampling: SubsampleProjection<B>,
     output_projection: B::Linear,
 }
 
-impl<B: NeuralBackend> AudioStatic<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
     /// Builds unloaded pinned audio modules.
     pub fn new(
         config: AudioConfig,
@@ -830,14 +830,14 @@ impl<B: NeuralBackend> AudioStatic<B> {
 /// Resident Gemma 4 audio tower built from pinned phases and streamable encoder blocks.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct AudioTower<B: NeuralBackend> {
+pub struct AudioTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Pinned subsampling and output projection.
     pub static_modules: AudioStatic<B>,
     /// Independently streamable encoder blocks.
     pub layers: Vec<AudioLayer<B>>,
 }
 
-impl<B: NeuralBackend> AudioTower<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
     /// Builds the unloaded audio tower.
     pub fn new(
         config: AudioConfig,
@@ -902,7 +902,7 @@ fn parameter<T: Tensor>(
     )
 }
 
-fn rms_norm<B: NeuralBackend>(
+fn rms_norm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &AudioConfig,
     weight: &str,
     context: &<B::Tensor as Tensor>::Context,
@@ -917,7 +917,7 @@ fn rms_norm<B: NeuralBackend>(
     )
 }
 
-fn clipped<B: NeuralBackend>(
+fn clipped<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &AudioConfig,
     prefix: &str,
     input: i32,

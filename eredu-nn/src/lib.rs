@@ -2277,7 +2277,20 @@ impl GroupedProjectionSpec {
         &self.format
     }
     fn validate(&self) -> Result<(), Error> {
-        self.format.validate_for_weight(&self.weight)
+        self.format.validate_for_weight(&self.weight)?;
+        let parameters = self.parameters();
+        for (index, parameter) in parameters.iter().enumerate() {
+            if parameters[index + 1..]
+                .iter()
+                .any(|candidate| candidate.id == parameter.id)
+            {
+                return Err(Error::backend(format!(
+                    "grouped projection reuses parameter identity {:?}",
+                    parameter.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn parameters(&self) -> Vec<&ParameterSpec> {
@@ -2599,6 +2612,16 @@ pub trait GroupedNeuralBackend: NeuralBackend {
     type GatedProductGroups: GroupedGatedProductOperator<Self::Tensor>;
     /// Concrete packed or independently materialized ReLU-squared bank.
     type Relu2Groups: GroupedRelu2Operator<Self::Tensor>;
+
+    /// Applies one packed block-diagonal projection independently across an
+    /// explicit group axis.
+    fn grouped_linear(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        groups: i32,
+        output_per_group: i32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
 
     /// Builds a selector with architecture-selected top-k semantics.
     fn top_k_group_selector(
@@ -3500,66 +3523,6 @@ pub trait NeuralBackend: Sized + 'static {
         spec: EmbeddingSpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Embedding, Error>;
-    /// Builds one rank-local vocabulary embedding under validated ownership.
-    fn vocabulary_parallel_embedding(
-        spec: EmbeddingSpec,
-        range: VocabularyParallelRange,
-        context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Embedding, Error> {
-        let _ = (spec, range, context);
-        Err(Error::backend(
-            "backend does not implement vocabulary-parallel embeddings",
-        ))
-    }
-    /// Builds one rank-local vocabulary output projection.
-    fn vocabulary_parallel_linear(
-        spec: LinearSpec,
-        range: VocabularyParallelRange,
-        context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Linear, Error> {
-        let _ = (spec, range, context);
-        Err(Error::backend(
-            "backend does not implement vocabulary-parallel projections",
-        ))
-    }
-    /// Looks up global token IDs and sums this rank's local contribution.
-    fn vocabulary_parallel_lookup(
-        _embedding: &mut Self::Embedding,
-        _input: &Self::Tensor,
-        _policy: EmbeddingLookupPolicy,
-        _parallel: &Self::ParallelContext,
-        _context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error> {
-        Err(Error::backend(
-            "backend does not implement vocabulary-parallel lookup",
-        ))
-    }
-    /// Projects to local vocabulary rows and gathers complete logits.
-    fn vocabulary_parallel_project(
-        _linear: &mut Self::Linear,
-        _input: &Self::Tensor,
-        _parallel: &Self::ParallelContext,
-        _context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error> {
-        Err(Error::backend(
-            "backend does not implement vocabulary-parallel projection",
-        ))
-    }
-    /// Projects through a rank-local vocabulary embedding and gathers complete logits.
-    ///
-    /// This is the tied-output counterpart of [`Self::vocabulary_parallel_project`]:
-    /// it preserves the embedding operator and its physical parameter storage while
-    /// using the same vocabulary ownership established at construction time.
-    fn vocabulary_parallel_embedding_project(
-        _embedding: &mut Self::Embedding,
-        _input: &Self::Tensor,
-        _parallel: &Self::ParallelContext,
-        _context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error> {
-        Err(Error::backend(
-            "backend does not implement tied vocabulary-parallel projection",
-        ))
-    }
     /// Builds an RMS normalization with an explicit scale policy.
     fn normalization(
         spec: NormalizationConstructionSpec,
@@ -3839,20 +3802,6 @@ pub trait NeuralBackend: Sized + 'static {
     ) -> Result<Self::Tensor, Error> {
         Self::rms_norm_without_weight(input, epsilon, context)?.multiply(weight, context)
     }
-    /// Applies one packed block-diagonal projection independently across an
-    /// explicit group axis.
-    fn grouped_linear(
-        linear: &mut Self::Linear,
-        input: &Self::Tensor,
-        groups: i32,
-        output_per_group: i32,
-        context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error> {
-        let _ = (linear, input, groups, output_per_group, context);
-        Err(Error::backend(
-            "grouped linear projection is not implemented by this backend",
-        ))
-    }
     /// Applies a validated gated-product equation.
     fn gated_product(
         gate: Self::Tensor,
@@ -3897,22 +3846,58 @@ pub trait NeuralBackend: Sized + 'static {
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Number of participants in a tensor-parallel collective context.
+    fn parallel_size(_parallel: &Self::ParallelContext) -> usize {
+        1
+    }
+}
+
+/// Additive mechanisms required only by distributed vocabulary and reduction paths.
+///
+/// Ordinary replicated backends implement [`NeuralBackend`] without this trait.
+/// Every operation here is required, so an admitted distributed architecture cannot
+/// encounter an inherited forward-time “unsupported” implementation.
+pub trait DistributedNeuralBackend: NeuralBackend {
+    /// Builds one rank-local vocabulary embedding under validated ownership.
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Embedding, Error>;
+    /// Builds one rank-local vocabulary output projection.
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Linear, Error>;
+    /// Looks up global token IDs and sums this rank's local contribution.
+    fn vocabulary_parallel_lookup(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        policy: EmbeddingLookupPolicy,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+    /// Projects to local vocabulary rows and gathers complete logits.
+    fn vocabulary_parallel_project(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+    /// Projects through a rank-local vocabulary embedding and gathers complete logits.
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
     /// Sums a rank-local tensor contribution across the tensor-parallel group.
     fn sum_parallel(
         value: Self::Tensor,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error> {
-        let _ = (value, parallel, context);
-        Err(Error::backend(
-            "tensor-parallel sum is not implemented by this backend",
-        ))
-    }
-
-    /// Number of participants in a tensor-parallel collective context.
-    fn parallel_size(_parallel: &Self::ParallelContext) -> usize {
-        1
-    }
+    ) -> Result<Self::Tensor, Error>;
 }
 
 /// Projected inputs to one gated-delta recurrent scan.

@@ -18,7 +18,7 @@ pub struct GptOssBlockFactory;
 
 impl<B> BlockFactory<B, ModelArgs> for GptOssBlockFactory
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
     type FeedForward = RoutedMlp<B>;
 
@@ -62,7 +62,7 @@ where
 }
 
 /// Builds one unloaded global GPT-OSS decoder layer.
-pub fn new_block<B: GroupedNeuralBackend>(
+pub fn new_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
@@ -79,7 +79,7 @@ pub fn forward_with_provider<B, C, P>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: AttentionCache<B::Tensor>,
     P: RoutedExpertProvider<B>,
     P::Error: std::fmt::Display,
@@ -99,7 +99,7 @@ pub fn forward_parallel_with_provider<B, C, P>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: AttentionCache<B::Tensor>,
     P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     P::Error: std::fmt::Display,

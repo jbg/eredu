@@ -20,7 +20,7 @@ use super::{FeedForwardPolicy, ModelArgs};
 /// Checkpoint-compatible dense SwiGLU used by dense and shared paths.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseSwiGlu<B: GroupedNeuralBackend> {
+pub struct DenseSwiGlu<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Gate projection.
     pub gate: B::Linear,
     /// Down projection.
@@ -29,7 +29,7 @@ pub struct DenseSwiGlu<B: GroupedNeuralBackend> {
     pub up: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend> DenseSwiGlu<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B> {
     fn new(
         args: &ModelArgs,
         prefix: &str,
@@ -82,7 +82,7 @@ impl<B: GroupedNeuralBackend> DenseSwiGlu<B> {
 /// Grouped sigmoid router, routed bank, and one shared expert.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMoe<B: GroupedNeuralBackend> {
+pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Grouped sigmoid router with selection correction bias.
@@ -93,7 +93,7 @@ pub struct SparseMoe<B: GroupedNeuralBackend> {
     pub shared: DenseSwiGlu<B>,
 }
 
-impl<B: GroupedNeuralBackend> SparseMoe<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> {
     fn new(
         args: &ModelArgs,
         layer: usize,
@@ -185,7 +185,9 @@ pub fn expert_realization_plan<B>(
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error>
 where
-    B: GroupedNeuralBackend + eredu_nn::BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend,
 {
     let args = architecture.args();
     if !args.has_sparse_moe_layers() {
@@ -195,8 +197,8 @@ where
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(Error::backend)?
@@ -230,14 +232,14 @@ where
 /// Per-layer dense-prefix or sparse Kimi feed-forward policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: GroupedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Dense prefix SwiGLU.
     Dense(DenseSwiGlu<B>),
     /// Routed plus shared experts.
     Sparse(SparseMoe<B>),
 }
 
-impl<B: GroupedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
     /// Builds one scheduled feed-forward operator at replicated geometry.
     pub fn new(
         args: &ModelArgs,
@@ -364,7 +366,9 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
     }
 }
 
-impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOperator<B>
+    for FeedForward<B>
+{
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -384,8 +388,8 @@ impl<B: GroupedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
     }
 }
 
-impl<B: eredu_nn::TensorParallelGroupedNeuralBackend> TensorParallelFeedForwardOperator<B>
-    for FeedForward<B>
+impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    TensorParallelFeedForwardOperator<B> for FeedForward<B>
 {
     fn forward_feed_forward_parallel(
         &mut self,

@@ -2,10 +2,10 @@
 
 use std::{path::PathBuf, time::Instant};
 
-use eredu_backend_mlx::backend::config::ModelLoadOptions;
 use eredu_backend_mlx::native::{
     personaplex_sine_frame, ExecutionContext, MlxRealtimeBackend, MlxRealtimeInput,
 };
+use eredu_backend_mlx::MlxLoadRequest;
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
 use eredu_core::QuantizationRequest;
 use eredu_core::{
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = load_realtime_model_with_options(
             MlxRealtimeBackend::new(stream, weights_stream),
             eredu_architectures::moshi::prepare_realtime_model(&model_dir)?,
-            ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+            MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
                 group_size: 64,
                 bits: 4,
             }),
@@ -127,17 +127,17 @@ fn run_steps(
             }
             std::thread::yield_now();
         };
-        if let Some(tokens) = &output.output_audio_tokens {
-            eval([&output.text_token, &output.sampled_audio_tokens, tokens])?;
+        if let Some(tokens) = output.output_audio_tokens() {
+            eval([output.text_token(), output.sampled_audio_tokens(), tokens])?;
             emitted_frames += 1;
         } else {
-            eval([&output.text_token, &output.sampled_audio_tokens])?;
+            eval([output.text_token(), output.sampled_audio_tokens()])?;
         }
         stream.synchronize()?;
         latencies_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
-        hash_token_array(&mut token_hash, &output.text_token)?;
-        hash_token_array(&mut token_hash, &output.sampled_audio_tokens)?;
-        if let Some(tokens) = &output.output_audio_tokens {
+        hash_token_array(&mut token_hash, output.text_token())?;
+        hash_token_array(&mut token_hash, output.sampled_audio_tokens())?;
+        if let Some(tokens) = output.output_audio_tokens() {
             hash_token_array(&mut token_hash, tokens)?;
         } else {
             hash_value(&mut token_hash, u64::MAX);

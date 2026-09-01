@@ -4,8 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::recipe::DerivedWeightRecipe;
 use eredu_checkpoint::{recipe::RecipeCatalog, store::TensorSelection};
-use eredu_core::{balanced_contiguous_range, ParallelRankTopology};
-use eredu_runtime::{ExecutionGroupId, ExpertIdentity};
+use eredu_core::{
+    balanced_contiguous_range, CollectiveGroupDescriptor, CollectiveGroupId, ParallelAxis,
+    ParallelRankTopology,
+};
+use eredu_runtime::{
+    AddressableGatedProductBank, CollectiveBackend, ExecutionGroupId, ParameterBankKey,
+};
 
 /// Complete architecture-derived ownership and rank-local bank construction plan.
 ///
@@ -19,6 +24,8 @@ pub struct ExpertRealizationPlan<S> {
     expert_parallel_rank: usize,
     owners: Vec<usize>,
     local_global_group_indices: Vec<usize>,
+    collective_members: Vec<usize>,
+    collective_local_rank: usize,
     unit_specs: BTreeMap<(ExecutionGroupId, usize), S>,
 }
 
@@ -36,10 +43,10 @@ impl<S> ExpertRealizationPlan<S> {
             return Err(ExpertRealizationPlanError::EmptyUnitSchedule);
         }
         let mut owners = vec![0; global_expert_count];
-        for owner in 0..topology.expert_parallel_size {
+        for owner in 0..topology.expert_parallel_size() {
             let range = balanced_contiguous_range(
                 global_expert_count,
-                topology.expert_parallel_size,
+                topology.expert_parallel_size(),
                 owner,
                 false,
             )
@@ -48,17 +55,22 @@ impl<S> ExpertRealizationPlan<S> {
         }
         let local = balanced_contiguous_range(
             global_expert_count,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
+        let collective = topology
+            .subgroup(ParallelAxis::Expert)
+            .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
         Ok(Self {
             global_expert_count,
-            expert_parallel_size: topology.expert_parallel_size,
-            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size(),
+            expert_parallel_rank: topology.expert_parallel_rank(),
             owners,
             local_global_group_indices: local.collect(),
+            collective_members: collective.global_ranks().to_vec(),
+            collective_local_rank: collective.rank(),
             unit_specs,
         })
     }
@@ -107,10 +119,94 @@ impl<S> ExpertRealizationPlan<S> {
     pub fn unit_specs(&self) -> &BTreeMap<(ExecutionGroupId, usize), S> {
         &self.unit_specs
     }
+
+    /// Translates the architecture's semantic route axis to an opaque generic group.
+    pub fn collective_group(
+        &self,
+        id: CollectiveGroupId,
+    ) -> Result<CollectiveGroupDescriptor, ExpertRealizationPlanError> {
+        CollectiveGroupDescriptor::new(
+            id,
+            self.collective_members.clone(),
+            self.collective_local_rank,
+        )
+        .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))
+    }
+}
+
+/// Failure while translating and executing one routed plan through generic mechanisms.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RoutedMechanismExecutionError {
+    /// The architecture plan did not contain the requested local bank member or unit.
+    #[error("invalid routed mechanism plan: {0}")]
+    InvalidPlan(String),
+    /// A mechanism-only bank or collective operation failed.
+    #[error("routed mechanism execution failed: {0}")]
+    Mechanism(String),
+}
+
+/// Executes an architecture-owned route through generic bank, grouped, and collective mechanisms.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_routed_gated_product<B, P>(
+    plan: &ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+    owner_group: &str,
+    owner_unit: usize,
+    local_bank_member: usize,
+    input: &B::Tensor,
+    routes: &eredu_nn::GroupSelection<B::Tensor>,
+    bank: &mut P,
+    collective: &CollectiveGroupDescriptor,
+    group: &B::Group,
+    executor: &B::Executor,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+) -> Result<B::Tensor, RoutedMechanismExecutionError>
+where
+    B: eredu_nn::GroupedNeuralBackend + CollectiveBackend,
+    P: AddressableGatedProductBank<B>,
+    P::Error: std::fmt::Display,
+    B::CollectiveError: std::fmt::Display,
+{
+    let expected = plan
+        .collective_group(collective.id())
+        .map_err(|error| RoutedMechanismExecutionError::InvalidPlan(error.to_string()))?;
+    if &expected != collective {
+        return Err(RoutedMechanismExecutionError::InvalidPlan(
+            "collective membership does not match the architecture route plan".into(),
+        ));
+    }
+    let global_member = plan
+        .local_global_group_indices()
+        .get(local_bank_member)
+        .copied()
+        .ok_or_else(|| {
+            RoutedMechanismExecutionError::InvalidPlan(format!(
+                "local bank member {local_bank_member} is outside the selected bank"
+            ))
+        })?;
+    let spec = plan.unit_spec(owner_group, owner_unit).ok_or_else(|| {
+        RoutedMechanismExecutionError::InvalidPlan(format!(
+            "execution unit {owner_group:?}/{owner_unit} has no grouped bank"
+        ))
+    })?;
+    let key = ParameterBankKey::new(owner_unit, global_member);
+    let groups = bank
+        .acquire(key, spec, context)
+        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+    let output =
+        eredu_nn::GroupedGatedProductOperator::forward_grouped(groups, input, routes, context)
+            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+    if collective.members().len() > 1 {
+        B::all_to_all(output, group, executor)
+            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))
+    } else {
+        Ok(output)
+    }
 }
 
 /// Invalid architecture-derived expert realization.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExpertRealizationPlanError {
     /// The architecture declared no routed experts.
     #[error("expert realization requires at least one routed expert")]
@@ -125,6 +221,7 @@ pub enum ExpertRealizationPlanError {
 
 /// Placement of one expert relative to an expert-parallel axis.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ExpertResidencyDistribution {
     /// Assign the expert by its global router identity across expert ranks.
     ExpertParallel,
@@ -292,21 +389,54 @@ impl ExpertParameterRecipe {
         &self.role
     }
 
-    /// Consumes the declaration into its local name, logical target, recipe, and role.
-    pub fn into_parts(self) -> (String, String, DerivedWeightRecipe, ExpertParameterRole) {
-        (
-            self.binding_name,
-            self.logical_target,
-            self.recipe,
-            self.role,
-        )
+    /// Consumes the declaration into a named handoff artifact.
+    pub fn into_artifact(self) -> ExpertParameterArtifact {
+        ExpertParameterArtifact {
+            binding_name: Some(self.binding_name),
+            logical_target: Some(self.logical_target),
+            recipe: Some(self.recipe),
+            role: Some(self.role),
+        }
+    }
+}
+
+/// Named consuming artifact for one expert-local parameter declaration.
+pub struct ExpertParameterArtifact {
+    binding_name: Option<String>,
+    logical_target: Option<String>,
+    recipe: Option<DerivedWeightRecipe>,
+    role: Option<ExpertParameterRole>,
+}
+
+impl ExpertParameterArtifact {
+    /// Takes the local binding name exactly once.
+    pub fn take_binding_name(&mut self) -> String {
+        self.binding_name
+            .take()
+            .expect("binding name already taken")
+    }
+    /// Takes the architecture-logical destination exactly once.
+    pub fn take_logical_target(&mut self) -> String {
+        self.logical_target
+            .take()
+            .expect("logical target already taken")
+    }
+    /// Takes the checkpoint-derived recipe exactly once.
+    pub fn take_recipe(&mut self) -> DerivedWeightRecipe {
+        self.recipe.take().expect("expert recipe already taken")
+    }
+    /// Takes parameter-role semantics exactly once.
+    pub fn take_role(&mut self) -> ExpertParameterRole {
+        self.role
+            .take()
+            .expect("expert parameter role already taken")
     }
 }
 
 /// One independently addressable expert and its owning execution unit.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExpertResidencyUnit {
-    identity: ExpertIdentity,
+    identity: ParameterBankKey,
     owner_group: ExecutionGroupId,
     owner_unit: usize,
     unit_path: String,
@@ -317,7 +447,7 @@ pub struct ExpertResidencyUnit {
 impl ExpertResidencyUnit {
     /// Creates one complete atomic expert unit.
     pub fn new(
-        identity: ExpertIdentity,
+        identity: ParameterBankKey,
         owner_group: ExecutionGroupId,
         owner_unit: usize,
         unit_path: impl Into<String>,
@@ -378,7 +508,7 @@ impl ExpertResidencyUnit {
     }
 
     /// Returns the global cache identity selected by architecture routing.
-    pub const fn identity(&self) -> ExpertIdentity {
+    pub const fn identity(&self) -> ParameterBankKey {
         self.identity
     }
 
@@ -509,19 +639,19 @@ pub enum ExpertResidencyCatalogError {
     #[error("expert {identity:?} has an empty architecture unit path")]
     EmptyUnitPath {
         /// Invalid expert identity.
-        identity: ExpertIdentity,
+        identity: ParameterBankKey,
     },
     /// An expert has no checkpoint-backed parameters.
     #[error("expert {identity:?} has no residency parameters")]
     EmptyUnit {
         /// Invalid expert identity.
-        identity: ExpertIdentity,
+        identity: ParameterBankKey,
     },
     /// One acquired bank name is repeated inside an expert.
     #[error("expert {identity:?} repeats local binding {binding:?}")]
     DuplicateBinding {
         /// Invalid expert identity.
-        identity: ExpertIdentity,
+        identity: ParameterBankKey,
         /// Repeated local binding.
         binding: String,
     },
@@ -529,7 +659,7 @@ pub enum ExpertResidencyCatalogError {
     #[error("expert {identity:?} repeats logical target {target:?}")]
     DuplicateLogicalTarget {
         /// Invalid expert identity.
-        identity: ExpertIdentity,
+        identity: ParameterBankKey,
         /// Repeated logical destination.
         target: String,
     },
@@ -538,7 +668,7 @@ pub enum ExpertResidencyCatalogError {
     EmptyCatalog,
     /// Two units use the same router/cache identity.
     #[error("architecture repeats expert residency identity {0:?}")]
-    DuplicateIdentity(ExpertIdentity),
+    DuplicateIdentity(ParameterBankKey),
 }
 
 #[cfg(test)]

@@ -1080,7 +1080,7 @@ mod tests {
             .prompt_cache_identity(&layout)
             .unwrap();
 
-            assert_eq!(identity.model_family, family);
+            assert_eq!(identity.model_family(), family);
         }
     }
 

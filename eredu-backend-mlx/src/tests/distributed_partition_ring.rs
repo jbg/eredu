@@ -10,7 +10,8 @@ use std::{
 
 use crate::{
     backend::runtime::distributed::topology::{load_safetensors_partition, PlacementPlan},
-    backend::{DeviceAssignment, MlxParallelContext},
+    backend::DeviceAssignment,
+    native::MlxParallelPlan,
 };
 use eredu_runtime::TensorPlacement;
 use safemlx::{
@@ -32,7 +33,7 @@ fn partition_ring_worker() {
     let group = crate::backend::runtime::distributed::Group::native(
         &distributed::init(true, Backend::Ring).unwrap(),
     );
-    let topology = MlxParallelContext::for_group(
+    let topology = MlxParallelPlan::for_group(
         group.native_group(),
         2,
         1,
@@ -40,17 +41,17 @@ fn partition_ring_worker() {
         DeviceAssignment::new(DeviceType::Cpu, 0),
     )
     .unwrap();
-    assert_eq!(topology.global_rank, expected_rank);
+    assert_eq!(topology.global_rank(), expected_rank);
 
     let stream = Stream::new_with_device(&topology.device().unwrap());
-    let mut plan = PlacementPlan::new(topology);
+    let mut plan = PlacementPlan::new(topology.rank_context());
     plan.insert_expected(
         "model.projection.weight",
         vec![2, 4],
         TensorPlacement::Shard {
             axis: 1,
-            index: topology.tensor_parallel_rank,
-            parts: topology.tensor_parallel_size,
+            index: topology.tensor_parallel_rank(),
+            parts: topology.tensor_parallel_size(),
         },
     )
     .unwrap();

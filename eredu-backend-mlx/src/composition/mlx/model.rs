@@ -14,6 +14,7 @@ use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 /// Admitted architecture identity checked against the concrete model variant.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct AdmittedModelKind(ModelKind);
 
 impl AdmittedModelKind {
@@ -32,6 +33,7 @@ impl AdmittedModelKind {
         Ok(Self(artifact_kind))
     }
 
+    #[cfg(test)]
     const fn get(self) -> ModelKind {
         self.0
     }
@@ -43,6 +45,7 @@ impl AdmittedModelKind {
 /// reporting, input dispatch, and mutable state cannot disagree. Each variant
 /// owns the concrete model and its correctly typed cache together; there is no
 /// independently extensible erased cache type to re-pair at operation sites.
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum Executable {
     /// Neutral DeepSeek-V3/V4 architecture with policy-selected residency.
     DeepSeek(
@@ -289,7 +292,11 @@ impl Executable {
     /// model was loaded through generalized parallel execution groups.
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    ) -> Option<
+        &eredu_runtime::ParallelModelInfo<
+            crate::composition::mlx::distributed::topology::MlxParallelPlan,
+        >,
+    > {
         match self {
             Self::DeepSeek(_, _, _) => None,
             Self::PartitionedLlama(_, model, _) => model.parallel_info(),
@@ -411,8 +418,8 @@ impl Executable {
         }
     }
 
-    /// Returns the canonical architecture family for this loaded model.
-    pub const fn model_family(&self) -> ModelKind {
+    #[cfg(test)]
+    pub(crate) const fn model_family(&self) -> ModelKind {
         match self {
             Self::DeepSeek(kind, _, _)
             | Self::Gemma4(kind, _, _)
@@ -507,9 +514,7 @@ impl Executable {
                 Self::KimiLinear(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Lfm2(_, model, cache) => reset_paged!(model, cache, options),
                 Self::PartitionedLlama(_, model, cache) => reset_paged!(model, cache, options),
-                Self::ReplicatedText(_, model) => model
-                    .reset_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::ReplicatedText(_, model) => model.reset_cache(),
                 Self::MuseGlimmer(_, model, cache) => reset_paged!(model, cache, options),
                 Self::NemotronH(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Qwen(_, model, cache) => reset_paged!(model, cache, options),
@@ -576,7 +581,7 @@ impl Executable {
             Self::Lfm2(_, model, cache) => load_into!(model, cache),
             Self::PartitionedLlama(_, model, cache) => load_into!(model, cache),
             Self::ReplicatedText(_, model) => model
-                .load_prompt_cache(directory.as_ref(), expected, prefix_token_ids, options)
+                .load_prompt_cache(directory.as_ref(), expected, prefix_token_ids)
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::MuseGlimmer(_, model, cache) => load_into!(model, cache),
             Self::NemotronH(_, model, cache) => load_into!(model, cache),

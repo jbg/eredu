@@ -1479,9 +1479,9 @@ mod tests {
         for (layer, (logical_name, owner, members)) in norms.into_iter().enumerate() {
             assert_eq!(logical_name, format!("model.layers.{layer}.norms"));
             let (group, global_unit) = match owner {
-                ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                    (group.as_str(), *global_unit)
-                }
+                ParameterGroupOwner::ExecutionUnit {
+                    group, global_unit, ..
+                } => (group.as_str(), *global_unit),
                 owner => panic!("unexpected V3 norm owner {owner:?}"),
             };
             if layer < 2 {
@@ -1517,9 +1517,9 @@ mod tests {
                 format!("model.layers.{layer}.mlp.router")
             );
             let (group, global_unit) = match owned.owner() {
-                ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                    (group.as_str(), *global_unit)
-                }
+                ParameterGroupOwner::ExecutionUnit {
+                    group, global_unit, ..
+                } => (group.as_str(), *global_unit),
                 owner => panic!("unexpected V3 router owner {owner:?}"),
             };
             assert_eq!((group, global_unit), (expected_group, expected_unit));
@@ -1553,6 +1553,7 @@ mod tests {
                     roles.first().expect("shared static owner").as_str(),
                 )),
                 ParameterGroupOwner::ExecutionUnit { .. } => None,
+                _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(

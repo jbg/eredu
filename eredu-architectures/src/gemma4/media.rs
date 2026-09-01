@@ -9,13 +9,13 @@ use super::ModelArgs;
 /// Weightless RMS normalization followed by a learned media-to-text projection.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct ModalityProjector<B: NeuralBackend> {
+pub struct ModalityProjector<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     projection: B::Linear,
     #[parameter(skip)]
     epsilon: f32,
 }
 
-impl<B: NeuralBackend> ModalityProjector<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B> {
     /// Builds an unloaded image or audio projector under `model.<component>`.
     pub fn new(
         args: &ModelArgs,

@@ -132,7 +132,7 @@ pub struct RoutedQwenBlockFactory;
 
 impl<B> crate::decoder::BlockFactory<B, ModelArgs> for RoutedQwenBlockFactory
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
     type FeedForward = FeedForward<B>;
 
@@ -159,7 +159,7 @@ where
 }
 
 /// Builds a Qwen block for a backend adapter that dynamically admits dense or MoE configuration.
-pub fn new_routed_block<B: GroupedNeuralBackend>(
+pub fn new_routed_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,

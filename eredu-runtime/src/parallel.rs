@@ -887,11 +887,6 @@ pub enum TensorPlacement {
         /// Owning global rank.
         rank: usize,
     },
-    /// Materialize the complete tensor only on one pipeline stage.
-    PipelineStage {
-        /// Owning pipeline-stage coordinate.
-        stage: usize,
-    },
     /// Materialize an equal contiguous source-tensor slice.
     Shard {
         /// Source tensor axis being sharded.

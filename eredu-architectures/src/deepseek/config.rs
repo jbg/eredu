@@ -1482,10 +1482,10 @@ mod tests {
         .unwrap()
         .prompt_cache_identity(&v3_layout)
         .unwrap();
-        assert_eq!(v3_identity.model_family, "deepseek_v3");
-        assert_eq!(v3_identity.layer_prefix_offsets, [0, 0, 0, 0, -1, -1]);
+        assert_eq!(v3_identity.model_family(), "deepseek_v3");
+        assert_eq!(v3_identity.layer_prefix_offsets(), [0, 0, 0, 0, -1, -1]);
         assert_eq!(
-            v3_layout.components(0).unwrap()[0].role.stable_name(),
+            v3_layout.components(0).unwrap()[0].role().stable_name(),
             "attention.compressed_latent"
         );
         let v3_moe = crate::deepseek::v3::moe_policy(&v3, 2).unwrap();
@@ -1511,8 +1511,8 @@ mod tests {
         let compressed = v4_layout.components(1).unwrap();
         assert_eq!(compressed.len(), 11);
         assert!(compressed.iter().any(|component| {
-            component.role.stable_name() == "state.pooling.1.pooled"
-                && component.residency == eredu_core::cache::StateResidencyClass::SealablePaged
+            component.role().stable_name() == "state.pooling.1.pooled"
+                && component.residency() == eredu_core::cache::StateResidencyClass::SealablePaged
         }));
         assert!(crate::deepseek::v4::moe_policy(&v4, 0)
             .unwrap()
@@ -1544,8 +1544,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(layout.segments()[1].processed_token_offset(), 0);
-        assert_eq!(identity.layer_prefix_offsets, [0, 0, 0, 0]);
-        assert_eq!(identity.model_family, "deepseek_v4");
+        assert_eq!(identity.layer_prefix_offsets(), [0, 0, 0, 0]);
+        assert_eq!(identity.model_family(), "deepseek_v4");
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
         json: &Value,
     ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
         let resolved = resolve_model_config(json)?;
-        let configuration = portable_model_configuration(json, &resolved);
+        let configuration = portable_model_configuration(json, &resolved)?;
         Ok(ResolvedModelConfiguration::new(
             configuration,
             crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
@@ -79,7 +79,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
             ArtifactFormat::SafeTensors => {
                 let resolved_plan = resolved_plan.admit_safetensors_catalog(tensors)?;
                 let kind = resolved_plan.model_kind();
-                let model = serde_json::to_vec(configuration.json.as_ref().ok_or_else(|| {
+                let model = serde_json::to_vec(configuration.json().ok_or_else(|| {
                     ArtifactError::InvalidArtifact(
                         "SafeTensors inspection omitted normalized JSON configuration".into(),
                     )
@@ -149,6 +149,11 @@ impl ModelConfigurationResolver for ModelConfigurations {
                         validated.checkpoint().metadata(),
                         projector.map(GgufCheckpoint::metadata),
                     )
+            }
+            _ => {
+                return Err(ArtifactError::InvalidArtifact(
+                    "unsupported artifact format selected during architecture admission".into(),
+                ));
             }
         };
         plan.map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))
@@ -476,13 +481,13 @@ fn resolve_gguf_configuration(
     let architecture = GgufArchitecture::resolve(name)?;
     let plan = resolve_gguf_architecture(architecture, checkpoint)?;
     Ok((
-        ModelConfiguration {
-            declared_model_type: name.into(),
-            effective_model_type: name.into(),
-            family: architecture.model_kind().canonical_name().into(),
-            loading_protocol: architecture.model_kind().loading_protocol(),
-            json: None,
-        },
+        ModelConfiguration::new(
+            name,
+            name,
+            architecture.model_kind().canonical_name(),
+            architecture.model_kind().loading_protocol(),
+            None,
+        )?,
         plan,
     ))
 }
@@ -587,14 +592,14 @@ pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, Art
 fn portable_model_configuration(
     json: &Value,
     resolved: &ResolvedModelConfig,
-) -> ModelConfiguration {
-    ModelConfiguration {
-        declared_model_type: resolved.model_type.clone(),
-        effective_model_type: resolved.effective_model_type.clone(),
-        family: resolved.kind.canonical_name().into(),
-        loading_protocol: resolved.kind.loading_protocol(),
-        json: Some(json.clone()),
-    }
+) -> Result<ModelConfiguration, ArtifactError> {
+    ModelConfiguration::new(
+        resolved.model_type.clone(),
+        resolved.effective_model_type.clone(),
+        resolved.kind.canonical_name(),
+        resolved.kind.loading_protocol(),
+        Some(json.clone()),
+    )
 }
 
 fn invalid_configuration(kind: ModelKind, error: impl std::fmt::Display) -> ArtifactError {
@@ -674,6 +679,47 @@ pub enum GgufModelConfig {
     Qwen(crate::qwen::ModelArgs),
     /// Qwen hybrid-family geometry.
     QwenHybrid(crate::qwen::hybrid::ParsedHybridConfig),
+}
+
+impl SafetensorsModelConfig {
+    /// Whether this exact normalized configuration constructs grouped routed experts.
+    pub const fn uses_grouped_routed_experts(&self) -> bool {
+        match self {
+            Self::DeepSeekV3(args) => args.n_routed_experts > 0,
+            Self::DeepSeekV4(args) => args.n_routed_experts > 0,
+            Self::Gemma4(args) => matches!(args.text.num_experts, Some(count) if count > 0),
+            Self::GptOss(args) => args.num_local_experts > 0,
+            Self::Inkling(args) => args.text_config.n_routed_experts > 0,
+            Self::KimiLinear(args) => args.num_experts > 0,
+            Self::Llama(_) | Self::Moshi(_) => false,
+            Self::MuseGlimmer(args) => args.num_experts > 0,
+            Self::Lfm2(args) => args.num_experts > 0,
+            Self::NemotronH(args) => args.n_routed_experts > 0,
+            Self::Qwen(args) => args.num_experts > 0,
+            Self::QwenHybrid(args) => args.text.num_experts > 0,
+            Self::QwenVl(args) => args.text.num_experts > 0,
+        }
+    }
+}
+
+impl GgufModelConfig {
+    /// Whether this exact normalized configuration constructs grouped routed experts.
+    pub const fn uses_grouped_routed_experts(&self) -> bool {
+        match self {
+            Self::DeepSeekV3(args) => args.n_routed_experts > 0,
+            Self::DeepSeekV4(args) => args.n_routed_experts > 0,
+            Self::Gemma4(args) => matches!(args.text.num_experts, Some(count) if count > 0),
+            Self::GptOss(args) => args.num_local_experts > 0,
+            Self::Inkling(args) => args.text_config.n_routed_experts > 0,
+            Self::KimiLinear(args) => args.num_experts > 0,
+            Self::Lfm2(args) => args.num_experts > 0,
+            Self::Llama(_) => false,
+            Self::MuseGlimmer(args) => args.num_experts > 0,
+            Self::NemotronH(args) => args.n_routed_experts > 0,
+            Self::Qwen(args) => args.num_experts > 0,
+            Self::QwenHybrid(args) => args.text.num_experts > 0,
+        }
+    }
 }
 
 /// GGUF architecture geometry and checkpoint schema proven valid at admission.

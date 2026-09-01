@@ -414,7 +414,7 @@ fn local_config_at(
     Ok(local)
 }
 
-fn norm_groups<B: GroupedNeuralBackend>(
+fn norm_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     block: &Block<B>,
     root: &str,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -434,7 +434,7 @@ fn norm_groups<B: GroupedNeuralBackend>(
     ])
 }
 
-fn block_groups<B: GroupedNeuralBackend>(
+fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     block: &Block<B>,
     config: &HybridConfig,
     root: &str,
@@ -597,7 +597,9 @@ fn block_groups<B: GroupedNeuralBackend>(
 }
 
 /// Declares semantic placement for a target or configured prediction unit.
-pub fn unit_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn unit_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     unit: &Unit<B>,
     config: &HybridConfig,
     group: usize,

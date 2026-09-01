@@ -18,6 +18,7 @@ fn format_keys(keys: &[String]) -> String {
 
 #[derive(Debug, thiserror::Error)]
 /// Error type used by MLX model loading and execution.
+#[non_exhaustive]
 pub enum Error {
     /// Backend capability discovery, preparation, execution, or completion failed.
     #[error(transparent)]

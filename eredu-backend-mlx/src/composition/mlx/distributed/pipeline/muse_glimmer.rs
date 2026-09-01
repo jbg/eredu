@@ -6,8 +6,8 @@ use crate::backend::runtime::distributed::Group;
 use eredu_architectures::{muse_glimmer as muse_glimmer_arch, ModelKind};
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
-    LayeredArchitecture, ParallelLayeredArchitecture,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, LayeredArchitecture,
+    ParallelLayeredArchitecture, ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -24,7 +24,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -44,6 +43,7 @@ use crate::{
         PipelineLoadAccumulator, PipelineModel, PipelinePartitionMetadata, PipelinePayload,
         PipelineStageInput, PipelineStageOutput, PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
     composition::muse_glimmer::{MuseGlimmerPipelineBindings, MuseGlimmerPlacedState},
 };
 
@@ -310,16 +310,16 @@ pub(super) fn load_muse_glimmer_pipeline(
     source_args: muse_glimmer_arch::DecoderConfig,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::MuseGlimmer], "Muse-Glimmer")?;
-    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
+    let external_experts = topology.expert_parallel_size() > 1 || parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         MuseGlimmerPipelineBindings::new_external_experts()
     } else {
@@ -358,7 +358,7 @@ pub(super) fn load_muse_glimmer_pipeline(
         binding_decoder_group,
         "Muse-Glimmer decoder",
     )?;
-    let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
+    let (architecture, parallel_layout) = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = muse_glimmer_arch::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -387,7 +387,7 @@ pub(super) fn load_muse_glimmer_pipeline(
     let range = topology.layer_range(target_units)?;
     let placement = Arc::new(media_architecture_transport::<_, MlxKeyValueState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -680,7 +680,7 @@ pub(super) fn load_muse_glimmer_pipeline(
         let units = crate::composition::select_architecture_expert_units(
             catalog,
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
-            |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
+            |identity| assignment.owner(identity.member()) == Some(assignment.rank()),
         );
         let entries = crate::composition::architecture_expert_units(
             units,

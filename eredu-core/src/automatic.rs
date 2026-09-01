@@ -767,10 +767,11 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
 
     let realization = factory.realize_target(plan)?;
     let descriptor = realization.backend().descriptor();
-    if descriptor.name != expected_backend.as_str() {
+    if descriptor.name() != expected_backend.as_str() {
         return Err(AutomaticPlanningError::Invalid(format!(
             "factory identity {} does not match realized backend {}",
-            expected_backend, descriptor.name
+            expected_backend,
+            descriptor.name()
         )));
     }
     let devices =
@@ -784,7 +785,7 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
     let capabilities = devices
         .iter()
         .find_map(|(device, capabilities)| {
-            (device.id == plan.device.device).then_some(capabilities)
+            (device.id() == plan.device.device).then_some(capabilities)
         })
         .ok_or_else(|| {
             AutomaticPlanningError::Invalid(format!(

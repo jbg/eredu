@@ -500,7 +500,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 .collect::<Result<Vec<_>, _>>()?;
             units.push(
                 crate::ExpertResidencyUnit::new(
-                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    eredu_runtime::ParameterBankKey::new(layer, expert),
                     owner_group.clone(),
                     owner_unit,
                     &unit_path,
@@ -1922,7 +1922,10 @@ mod tests {
         let catalog = expert_residency_catalog(&Catalog(tensors), &config).unwrap();
         assert_eq!(catalog.units().len(), 12);
         let target = &catalog.units()[0];
-        assert_eq!(target.identity(), eredu_runtime::ExpertIdentity::new(0, 0));
+        assert_eq!(
+            target.identity(),
+            eredu_runtime::ParameterBankKey::new(0, 0)
+        );
         assert_eq!(target.owner_group().as_str(), "target");
         assert_eq!(target.owner_unit(), 0);
         assert_eq!(target.unit_path(), "model.layers.0");
@@ -1940,7 +1943,7 @@ mod tests {
         let prediction = &catalog.units()[8];
         assert_eq!(
             prediction.identity(),
-            eredu_runtime::ExpertIdentity::new(2, 0)
+            eredu_runtime::ParameterBankKey::new(2, 0)
         );
         assert_eq!(prediction.owner_group().as_str(), "mtp.0");
         assert_eq!(prediction.owner_unit(), 0);
@@ -1956,6 +1959,6 @@ mod tests {
         assert_eq!(prediction_units.len(), 4);
         assert!(prediction_units
             .iter()
-            .all(|unit| unit.identity().layer == 2));
+            .all(|unit| unit.identity().unit() == 2));
     }
 }

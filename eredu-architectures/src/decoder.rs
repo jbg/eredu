@@ -215,15 +215,16 @@ pub fn state_identity<C: Config>(
             args.model_family()
         )));
     }
-    Ok(eredu_runtime::ModelStateIdentity {
-        model_family: args.model_family().into(),
-        effective_model_type: args.model_identity().into(),
-        architecture_fingerprint: args.architecture_fingerprint(),
+    eredu_runtime::ModelStateIdentity::new(
+        args.model_family(),
+        args.model_identity(),
+        args.architecture_fingerprint(),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }
 
 /// Semantic attention projection selected by architecture policy.
@@ -346,7 +347,10 @@ impl<B: NeuralBackend> MultiTableEmbedding<B> {
         specs: impl IntoIterator<Item = NamedEmbeddingSpec>,
         ranges: impl IntoIterator<Item = eredu_nn::VocabularyParallelRange>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         let specs = specs.into_iter().collect::<Vec<_>>();
         let ranges = ranges.into_iter().collect::<Vec<_>>();
         if specs.is_empty() || specs.len() != ranges.len() {
@@ -385,7 +389,10 @@ impl<B: NeuralBackend> MultiTableEmbedding<B> {
         inputs: &[&B::Tensor],
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         if inputs.len() != self.tables.len() {
             return Err(Error::backend("parallel embedding input count drifted"));
         }
@@ -2069,7 +2076,10 @@ impl<B: NeuralBackend> StaticModules<B> {
         embedding_range: VocabularyParallelRange,
         output_range: Option<VocabularyParallelRange>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         embedding_range.validate_global_rows(spec.vocabulary)?;
         let embeddings = B::vocabulary_parallel_embedding(
             EmbeddingSpec {
@@ -2168,7 +2178,10 @@ impl<B: NeuralBackend> StaticModules<B> {
         config: &C,
         geometry: &LocalGeometry<C>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
         let norm_name = format!("{}.norm.weight", config.parameter_root());
         Self::from_parallel_spec(
@@ -2543,7 +2556,10 @@ where
         args: C,
         geometry: LocalGeometry<C>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         args.validate_config()?;
         P::validate(&args)?;
         if args.learned_attention_sinks() {
@@ -2709,6 +2725,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
+        B: eredu_nn::DistributedNeuralBackend,
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
@@ -2968,7 +2985,10 @@ where
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         let hidden = self.static_modules.norm.forward(hidden, context)?;
         match &mut self.static_modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
@@ -3256,7 +3276,7 @@ where
 
 impl<B, C, P, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B, C, P>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: TensorParallelFeedForwardOperator<B>,
@@ -3314,7 +3334,7 @@ where
 
 impl<B, C, P, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: TensorParallelFeedForwardOperator<B>,
@@ -3450,7 +3470,7 @@ where
 
 impl<B, C, P, S> eredu_runtime::ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: TensorParallelRoutedFeedForwardOperator<B>,

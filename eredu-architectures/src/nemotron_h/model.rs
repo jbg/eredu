@@ -21,7 +21,7 @@ use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules
 /// One target or appended prediction physical unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: GroupedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Ordinary target-model unit.
     Target(Block<B>),
     /// One physical unit in an MTP prediction group.
@@ -30,7 +30,7 @@ pub enum Unit<B: GroupedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -58,7 +58,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -219,7 +219,7 @@ impl<T> ForwardContext<T> {
 }
 
 /// Shared layered Nemotron-H model including graph-visible MTP groups.
-pub struct LayeredModel<B: GroupedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
@@ -230,7 +230,9 @@ pub struct LayeredModel<B: GroupedNeuralBackend> {
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>,
 }
 
-impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
+{
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -292,7 +294,7 @@ impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layer
     }
 }
 
-impl<B: GroupedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded static modules and validates target plus MTP schedules.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
@@ -1028,7 +1030,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1299,7 +1301,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1403,7 +1405,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {

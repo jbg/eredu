@@ -46,7 +46,19 @@ fn inspected_stored_dtype(dtype: &TensorDtype) -> eredu_checkpoint::StoredDtype 
 #[derive(Debug, Clone, Default)]
 pub struct MlxInspectionOptions {
     /// The exact loading policy that admission should validate.
-    pub load: ModelLoadOptions,
+    load: MlxLoadRequest,
+}
+
+impl MlxInspectionOptions {
+    /// Creates inspection options for an exact load request.
+    pub const fn new(load: MlxLoadRequest) -> Self {
+        Self { load }
+    }
+
+    /// Returns the load request whose feasibility is being inspected.
+    pub fn load(&self) -> MlxLoadRequest {
+        self.load.clone()
+    }
 }
 
 /// Inspects a local SafeTensors model directory or GGUF checkpoint without
@@ -119,8 +131,8 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     let architecture_plan = portable.architecture_plan();
     let catalog = portable.tensors();
     report.container = InspectionReadiness::Ready;
-    report.model_family = Some(configuration.family.clone());
-    report.architecture = Some(configuration.effective_model_type.clone());
+    report.model_family = Some(configuration.family().to_owned());
+    report.architecture = Some(configuration.effective_model_type().to_owned());
     report.architecture_support = InspectionReadiness::Ready;
     report.structural_binding = InspectionReadiness::Ready;
     report.model_loadability = InspectionReadiness::Ready;
@@ -174,7 +186,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             record_embedded_drafting(&mut report, capabilities);
             report.expected_modalities = artifact_modalities(capabilities.input_modalities());
             match options
-                .load
+                .load()
                 .preparation_policy()
                 .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
             {
@@ -362,13 +374,16 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     );
     record_embedded_drafting(&mut report, capabilities);
     match options
-        .load
+        .load()
         .preparation_policy()
         .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
     {
-        Ok(()) => match options.load.weight_quantization().and_then(|quantization| {
-            validate_gguf_quantization_source(&checkpoint, &metadata, quantization)
-        }) {
+        Ok(()) => match options
+            .load()
+            .weight_quantization()
+            .and_then(|quantization| {
+                validate_gguf_quantization_source(&checkpoint, &metadata, quantization)
+            }) {
             Ok(()) => report.requested_load = InspectionReadiness::Ready,
             Err(error) => reject_load_policy(&mut report, &error),
         },
@@ -803,7 +818,8 @@ mod tests {
             }),
         )
         .unwrap()
-        .architecture_plan;
+        .architecture_plan()
+        .clone();
 
         inspect_safetensors_media(&mut report, &plan);
 
@@ -1039,7 +1055,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.gguf");
         write_minimal_llama_gguf(&path, true, None);
-        let topology = crate::backend::MlxParallelContext::for_rank(
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
             0,
             2,
             1,
@@ -1047,15 +1063,15 @@ mod tests {
             crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
         )
         .unwrap();
-        let options = MlxInspectionOptions {
-            load: ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+        let options = MlxInspectionOptions::new(
+            MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
                 .with_parallel_topology(
                     topology,
                     eredu_runtime::PipelineWireContract::new(
                         eredu_runtime::PipelineActivationDtype::Float32,
                     ),
                 ),
-        };
+        );
 
         let report = inspect_model(&path, options).unwrap();
 

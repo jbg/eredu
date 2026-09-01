@@ -16,7 +16,7 @@ use super::{
 /// One scheduled physical operator.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Operator<B: GroupedNeuralBackend> {
+pub enum Operator<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Mamba2 state-space operator.
     Mamba(Mamba2<B>),
     /// No-positional grouped-query attention.
@@ -30,7 +30,7 @@ pub enum Operator<B: GroupedNeuralBackend> {
 /// One pre-normalized residual Nemotron-H physical unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Block<B: GroupedNeuralBackend> {
+pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Scheduled operator.
     pub operator: Operator<B>,
     /// Unit pre-normalization.
@@ -39,7 +39,7 @@ pub struct Block<B: GroupedNeuralBackend> {
     residual_in_fp32: bool,
 }
 
-impl<B: GroupedNeuralBackend> Block<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     /// Builds one global-geometry physical unit.
     pub fn new(
         args: &ModelArgs,

@@ -9,8 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::{ExecutionContext, MlxModelSession};
-use crate::MlxTensor;
+use crate::native::{ExecutionContext, MlxModelSession, MlxParallelPlan};
 use crate::{
     backend::runtime::{
         execution::layerwise::open_safetensors_weight_store,
@@ -21,13 +20,15 @@ use crate::{
         nn::shared::{
             neutral_parameter_refs, neutral_parameter_refs_mut, MlxModule, MlxNeuralBackend,
         },
-        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
+        DeviceAssignment, MlxBackend, MlxDistributedSession,
     },
     composition::mlx::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineModel, PipelineStep,
     },
+    composition::mlx::loading::SelectedMlxConstruction,
     composition::{kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h},
 };
+use crate::{MlxLoadRequest, MlxTensor};
 use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
 use eredu_architectures::ModelKind;
@@ -47,8 +48,8 @@ use eredu_gguf::{
 };
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use eredu_runtime::{
-    CacheResidencyPolicy, DefaultSampler, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions,
-    LayerwiseLoadOptions, NonExpertWeightResidency, PagedCacheOptions, WeightResidency,
+    CacheResidencyPolicy, DefaultSampler, DenseDiskStreamLoadOptions, LayerwiseLoadOptions,
+    OrdinaryWeightResidency, PagedCacheOptions, ParameterBankLoadOptions, WeightResidency,
 };
 use safemlx::{
     distributed::{self, Backend},
@@ -174,42 +175,43 @@ fn run_neutral_embedded_mtp<'world>(
     .unwrap();
     let output = <MlxBackend<'world> as SpeculativeGenerationBackend>::with_speculative_execution(
         runtime,
-        SpeculativeGenerationBatchRequest {
-            drafting: SpeculativeDraft::Embedded,
-            lanes: vec![SpeculativeGenerationLane {
+        SpeculativeGenerationBatchRequest::new(
+            SpeculativeDraft::Embedded,
+            vec![SpeculativeGenerationLane::new(
                 prompt,
-                generation: TextGenerationConfig::new(sampling),
+                TextGenerationConfig::new(sampling),
                 config,
-                constraint: AllowAllTokens,
-                semantic: Box::<TokenOnlySemanticState>::default(),
-                cancellation: GenerationCancellationToken::new(),
-                on_event: Box::new(|_| {}),
-            }],
-            tokenizer_fingerprint: [0; 32],
-        },
+                AllowAllTokens,
+                Box::<TokenOnlySemanticState>::default(),
+                GenerationCancellationToken::new(),
+                Box::new(|_| {}),
+            )],
+            [0; 32],
+        ),
         eredu_runtime::RunSpeculativeGeneration::default(),
     )
     .unwrap();
-    output.requests.into_iter().next().unwrap()
+    output.into_requests().into_iter().next().unwrap()
 }
 
 fn load_prepared_pipeline_model(
     checkpoint: &Path,
-    options: ModelLoadOptions,
+    options: MlxLoadRequest,
     stream: &Stream,
 ) -> PipelineModel {
     let inspection = eredu_architectures::configuration::inspect_artifact(checkpoint).unwrap();
     let plan = eredu_core::plan_model_preparation(
         inspection,
         options.preparation_policy().unwrap(),
-        eredu_core::SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        },
+        eredu_core::SessionCapabilities::new(true, true, true),
     )
     .unwrap();
-    load_pipeline_model_with_options(plan, options, stream, stream).unwrap()
+    let selected = SelectedMlxConstruction::from_request(
+        options,
+        eredu_core::SessionCapabilities::new(true, true, true),
+    )
+    .unwrap();
+    load_pipeline_model_with_options(plan, selected, stream, stream).unwrap()
 }
 
 #[test]
@@ -217,10 +219,9 @@ fn distributed_materialization_uses_the_planned_configuration() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_deepseek_fixture(checkpoint.path(), 2);
     let topology =
-        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap();
+        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
     let layerwise = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-    let options = ModelLoadOptions::with_parallel(
+    let options = MlxLoadRequest::with_parallel(
         topology,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
     )
@@ -230,20 +231,21 @@ fn distributed_materialization_uses_the_planned_configuration() {
     let plan = eredu_core::plan_model_preparation(
         inspection,
         options.preparation_policy().unwrap(),
-        eredu_core::SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        },
+        eredu_core::SessionCapabilities::new(true, true, true),
     )
     .unwrap();
 
     std::fs::remove_file(checkpoint.path().join("config.json")).unwrap();
 
     let stream = Stream::new_with_device(&topology.device().unwrap());
-    let error = match load_pipeline_model_with_options(plan, options, &stream, &stream) {
+    let selected = SelectedMlxConstruction::from_request(
+        options,
+        eredu_core::SessionCapabilities::new(true, true, true),
+    )
+    .unwrap();
+    let error = match load_pipeline_model_with_options(plan, selected, &stream, &stream) {
         Ok(model) => {
-            assert_eq!(model.stage_info().global_layer_range, 0..1);
+            assert_eq!(model.stage_info().global_layer_range(), 0..1);
             return;
         }
         Err(error) => error,
@@ -263,12 +265,11 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_qwen_fixture(checkpoint.path(), "qwen3_moe");
     let topology =
-        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap();
+        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
     let stream = Stream::new_with_device(&topology.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
-        ModelLoadOptions::with_parallel(
+        MlxLoadRequest::with_parallel(
             topology,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
@@ -283,12 +284,11 @@ fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_qwen35_multimodal_fixture(checkpoint.path(), true);
     let topology =
-        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap();
+        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
     let stream = Stream::new_with_device(&topology.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
-        ModelLoadOptions::with_parallel(
+        MlxLoadRequest::with_parallel(
             topology,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
@@ -308,12 +308,12 @@ fn inkling_pipeline_reports_static_embedded_mtp_ownership() {
 
     for rank in 0..2 {
         let topology =
-            MlxParallelContext::for_rank(rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelPlan::for_rank(rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         let stream = Stream::new_with_device(&topology.device().unwrap());
         let model = load_prepared_pipeline_model(
             checkpoint.path(),
-            ModelLoadOptions::with_parallel(
+            MlxLoadRequest::with_parallel(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
@@ -328,10 +328,10 @@ fn inkling_pipeline_reports_static_embedded_mtp_ownership() {
                 draft_source: SpeculativeDraftSource::Embedded,
             }
         );
-        assert_eq!(model.stage_info().global_embedded_mtp_layers, 2);
-        assert_eq!(model.stage_info().owns_embedded_mtp, rank == 1);
+        assert_eq!(model.stage_info().global_embedded_mtp_layers(), 2);
+        assert_eq!(model.stage_info().owns_embedded_mtp(), rank == 1);
         assert_eq!(
-            model.stage_info().embedded_mtp_layers,
+            model.stage_info().embedded_mtp_layers(),
             if rank == 1 { 2 } else { 0 }
         );
     }
@@ -342,18 +342,17 @@ fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_fixture(checkpoint.path());
     let topology =
-        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap();
+        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
     let wire_contract =
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Bfloat16);
     let stream = Stream::new_with_device(&topology.device().unwrap());
     let model = load_prepared_pipeline_model(
         checkpoint.path(),
-        ModelLoadOptions::with_parallel(topology, wire_contract),
+        MlxLoadRequest::with_parallel(topology, wire_contract),
         &stream,
     );
 
-    assert_eq!(model.stage_info().wire_contract, wire_contract);
+    assert_eq!(model.stage_info().wire_contract(), wire_contract);
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -695,7 +694,7 @@ fn pipeline_ring_worker() {
             Some("tp-pp-ep") => (2, 2, 2),
             Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
         };
-    let topology = MlxParallelContext::for_group(
+    let topology = MlxParallelPlan::for_group(
         &native_group,
         tensor_parallel_size,
         pipeline_parallel_size,
@@ -703,30 +702,34 @@ fn pipeline_ring_worker() {
         DeviceAssignment::new(DeviceType::Cpu, 0),
     )
     .unwrap();
-    assert_eq!(topology.global_rank, expected_rank);
-    let pipeline_rank = topology.pipeline_parallel_rank;
+    assert_eq!(topology.global_rank(), expected_rank);
+    let pipeline_rank = topology.pipeline_parallel_rank();
     let stream = Stream::new_with_device(&topology.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
         let backend = crate::native::distributed_backend(&stream, &stream, &native_group);
+        let selected_paged = PagedCacheOptions::new(1, 32768, 32768, 1)
+            .unwrap()
+            .with_full_attention(true);
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
-            ModelLoadOptions::with_parallel(
+            MlxLoadRequest::with_parallel(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
             )
-            .with_weight_residency(WeightResidency::with_expert_cache(
-                NonExpertWeightResidency::FullyResident,
-                ExpertCacheLoadOptions::default(),
+            .with_weight_residency(WeightResidency::with_independent_parameter_banks(
+                OrdinaryWeightResidency::FullyResident,
+                ParameterBankLoadOptions::default(),
             ))
         } else {
-            ModelLoadOptions::with_parallel(
+            MlxLoadRequest::with_parallel(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
             )
-        };
+        }
+        .with_state_residency(CacheResidencyPolicy::Paged(selected_paged));
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
         let expected_effective_model_type = family.effective_model_type();
         let expected_model_family =
@@ -807,13 +810,6 @@ fn pipeline_ring_worker() {
             eredu_core::AdmissionResult::Admitted(_)
         ));
         <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::static_memory(&runtime).unwrap();
-        let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
-            .unwrap()
-            .with_full_attention(true);
-        runtime
-            .session_mut()
-            .configure_cache(CacheResidencyPolicy::Paged(paged))
-            .unwrap();
         let image_mode = std::env::var_os(OPAQUE_MUSE_IMAGE).is_some();
         let inkling_media_mode = std::env::var_os(OPAQUE_INKLING_MEDIA).is_some();
         let inkling_mtp_mode = std::env::var_os(OPAQUE_INKLING_MTP).is_some();
@@ -912,7 +908,7 @@ fn pipeline_ring_worker() {
             } else {
                 "model.layers"
             };
-            let expected = format!("{layer_root}.{}.output", identity.global_layer_start);
+            let expected = format!("{layer_root}.{}.output", identity.global_layer_start());
             let inspected = runtime
                 .inspect_prefill(ModelInput::new(&parts).into(), &ObservationRequest::all())
                 .unwrap();
@@ -941,7 +937,7 @@ fn pipeline_ring_worker() {
         if inkling_mtp_mode {
             let identity = runtime.session().prompt_cache_model_identity().unwrap();
             assert_eq!(
-                identity.layer_prefix_offsets.contains(&-1),
+                identity.layer_prefix_offsets().contains(&-1),
                 pipeline_rank + 1 == pipeline_parallel_size
             );
             let max_tokens = 3;
@@ -955,9 +951,9 @@ fn pipeline_ring_worker() {
                     eos_token_ids: Vec::new(),
                 },
             );
-            assert_eq!(output.token_ids.len(), max_tokens);
-            assert_eq!(output.stats.emitted_tokens, max_tokens);
-            assert!(output.stats.draft_tokens > 0);
+            assert_eq!(output.token_ids().len(), max_tokens);
+            assert_eq!(output.stats().emitted_tokens(), max_tokens);
+            assert!(output.stats().draft_tokens() > 0);
             return;
         }
         let (backend, session) = runtime.parts_mut();
@@ -1011,15 +1007,7 @@ fn pipeline_ring_worker() {
                 .to_vec()
         });
         session
-            .load_prompt_cache(
-                backend,
-                &rank_prompt_cache,
-                &descriptor,
-                &prefix_tokens,
-                PagedCacheOptions::new(1, 32768, 32768, 1)
-                    .unwrap()
-                    .with_full_attention(true),
-            )
+            .load_prompt_cache(backend, &rank_prompt_cache, &descriptor, &prefix_tokens)
             .unwrap();
         output = session
             .decode(backend, continuity_token)
@@ -1089,14 +1077,14 @@ fn pipeline_ring_worker() {
         };
     let base_options = || {
         if requantize {
-            ModelLoadOptions::with_quantization(requested_quantization).with_parallel_topology(
+            MlxLoadRequest::with_quantization(requested_quantization).with_parallel_topology(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
             )
         } else {
-            ModelLoadOptions::with_parallel(
+            MlxLoadRequest::with_parallel(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
@@ -1108,20 +1096,22 @@ fn pipeline_ring_worker() {
         || LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
     let mut model = if parameter_bank {
         let non_experts = if dense_stream {
-            NonExpertWeightResidency::DenseDiskStream(
+            OrdinaryWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
             )
         } else if layerwise_host {
-            NonExpertWeightResidency::LayerwiseHost(layerwise_options())
+            OrdinaryWeightResidency::LayerwiseHost(layerwise_options())
         } else {
-            NonExpertWeightResidency::FullyResident
+            OrdinaryWeightResidency::FullyResident
         };
         load_prepared_pipeline_model(
             &checkpoint,
-            base_options().with_weight_residency(WeightResidency::with_expert_cache(
-                non_experts,
-                ExpertCacheLoadOptions::default(),
-            )),
+            base_options().with_weight_residency(
+                WeightResidency::with_independent_parameter_banks(
+                    non_experts,
+                    ParameterBankLoadOptions::default(),
+                ),
+            ),
             &stream,
         )
     } else if layerwise_host {
@@ -1149,26 +1139,26 @@ fn pipeline_ring_worker() {
     assert_eq!(model.effective_model_type(), expected_effective_model_type);
     let info = model.stage_info();
     let expected_range = family.stage_range(pipeline_rank);
-    assert_eq!(info.global_layer_range, expected_range);
+    assert_eq!(info.global_layer_range(), expected_range);
     if !family.has_gguf_source() {
         let prefix = family.layer_prefix();
         assert_eq!(
-            info.owned_tensors.iter().any(|name| expected_range
+            info.owned_tensors().iter().any(|name| expected_range
                 .clone()
                 .any(|layer| name.starts_with(&format!("{prefix}{layer}.")))),
             !dense_stream && !layerwise_host
         );
-        assert!(!info.owned_tensors.iter().any(|name| {
+        assert!(!info.owned_tensors().iter().any(|name| {
             (0..family.layer_count()).any(|layer| {
                 !expected_range.contains(&layer) && name.starts_with(&format!("{prefix}{layer}."))
             })
         }));
     }
     if family == FixtureFamily::Llama {
-        assert!(info.local_parameter_bytes < 1_616);
+        assert!(info.local_parameter_bytes() < 1_616);
     }
     let opened = info
-        .opened_checkpoint_shards
+        .opened_checkpoint_shards()
         .iter()
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -1185,7 +1175,7 @@ fn pipeline_ring_worker() {
     }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
-        let expected_units = expected_range.len() + info.local_encoder_units;
+        let expected_units = expected_range.len() + info.local_encoder_units();
         assert_eq!(report.planned_layer_count(), expected_units);
         assert!(report
             .residency()
@@ -1196,7 +1186,7 @@ fn pipeline_ring_worker() {
             let materialization = report.residency().materialization().unwrap();
             assert!(materialization.transformed_weights > 0);
             assert!(materialization.output_bytes < materialization.source_bytes_read);
-            assert!(info.materialization.is_some());
+            assert!(info.materialization().is_some());
         }
         if family.has_gguf_source() {
             let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
@@ -1213,7 +1203,7 @@ fn pipeline_ring_worker() {
         assert!(model.dense_stream_report().unwrap().is_none());
         let report = model.parameter_residency_report().unwrap().unwrap();
         assert!(report.initialized());
-        let expected_units = expected_range.len() + info.local_encoder_units;
+        let expected_units = expected_range.len() + info.local_encoder_units();
         assert_eq!(report.units().len(), expected_units);
         assert!(report
             .units()
@@ -1223,7 +1213,7 @@ fn pipeline_ring_worker() {
             let materialization = report.materialization().unwrap();
             assert!(materialization.transformed_weights > 0);
             assert!(materialization.output_bytes < materialization.source_bytes_read);
-            assert!(info.materialization.is_some());
+            assert!(info.materialization().is_some());
         }
         if family.has_gguf_source() {
             let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
@@ -1238,8 +1228,7 @@ fn pipeline_ring_worker() {
     }
     if requantize && !dense_stream && !layerwise_host && !parameter_bank {
         let materialization = info
-            .materialization
-            .as_ref()
+            .materialization()
             .expect("fully resident requantization must report its packed overlay");
         assert!(materialization.transformed_weights > 0);
         assert!(materialization.source_tiles > 0);
@@ -1260,7 +1249,7 @@ fn pipeline_ring_worker() {
     if parameter_bank {
         let report = model.parameter_bank_report().unwrap();
         let predictor_expert_layers = usize::from(
-            info.owns_output
+            info.owns_output()
                 && matches!(
                     family,
                     FixtureFamily::DeepSeekV4
@@ -1268,14 +1257,14 @@ fn pipeline_ring_worker() {
                         | FixtureFamily::Qwen35Moe
                         | FixtureFamily::Qwen35MoeMultimodal
                 ),
-        ) * info.embedded_mtp_layers;
+        ) * info.embedded_mtp_layers();
         let expert_layers = family.expert_layer_count(expected_range.clone());
         let shared_inkling_experts = usize::from(matches!(
             family,
             FixtureFamily::Inkling | FixtureFamily::InklingMultimodal | FixtureFamily::InklingGguf
         )) * expert_layers;
         let expected_experts = (expert_layers + predictor_expert_layers)
-            * info.local_group_indices.len()
+            * info.local_group_indices().len()
             + shared_inkling_experts;
         assert_eq!(report.is_some(), expected_experts > 0);
         if let Some(report) = report {
@@ -1381,7 +1370,7 @@ fn pipeline_ring_worker() {
                     model.prefill_distributed_with_embedded_mtp(input, &mut cache, &execution, None)
                 } else {
                     model.prefill_distributed(
-                        model.stage_info().owns_input.then_some(input),
+                        model.stage_info().owns_input().then_some(input),
                         PipelineStep::new(1, prompt_length).unwrap(),
                         None,
                         &mut cache,
@@ -1424,20 +1413,26 @@ fn pipeline_ring_worker() {
     let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
     let identity = model.prompt_cache_model_identity().unwrap();
     assert_eq!(
-        identity.topology,
-        crate::backend::cache::prompt_cache_topology(topology),
+        identity.topology(),
+        &crate::composition::mlx::distributed::topology::prompt_cache_topology(topology),
         "rank {expected_rank} cache identity lost its distributed topology"
     );
     if qwen_hybrid_prompt_cache {
         if pipeline_rank == 0 {
-            assert_eq!(identity.global_layer_start..identity.global_layer_end, 0..1);
-            assert_eq!(identity.state_segments.len(), 1);
+            assert_eq!(
+                identity.global_layer_start()..identity.global_layer_end(),
+                0..1
+            );
+            assert_eq!(identity.state_segments().len(), 1);
         } else {
-            assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..3);
-            assert_eq!(identity.layer_prefix_offsets, [0, -1]);
-            assert_eq!(identity.state_segments.len(), 2);
-            assert_eq!(identity.state_segments[1].id(), "prediction");
-            assert_eq!(identity.state_segments[1].layers(), 1..2);
+            assert_eq!(
+                identity.global_layer_start()..identity.global_layer_end(),
+                1..3
+            );
+            assert_eq!(identity.layer_prefix_offsets(), [0, -1]);
+            assert_eq!(identity.state_segments().len(), 2);
+            assert_eq!(identity.state_segments()[1].id(), "prediction");
+            assert_eq!(identity.state_segments()[1].layers(), 1..2);
         }
     }
     let descriptor = PromptCacheDescriptor::from_model_identity(
@@ -1475,7 +1470,7 @@ fn pipeline_ring_worker() {
     let (mut cache, manifest) = model
         .load_prompt_cache(&prompt_cache_root, &descriptor, &prefix_ids, paged, &stream)
         .unwrap();
-    assert_eq!(manifest.topology, descriptor.topology);
+    assert_eq!(&manifest.topology, descriptor.topology());
     if qwen_hybrid_prompt_cache && pipeline_rank == 1 {
         assert!(manifest.blocks.iter().any(|block| block.global_layer == 2));
     }
@@ -1609,12 +1604,12 @@ fn pipeline_ring_worker() {
                 draft_source: SpeculativeDraftSource::Embedded
             }
         );
-        assert_eq!(model.stage_info().owns_embedded_mtp, pipeline_rank == 1);
+        assert_eq!(model.stage_info().owns_embedded_mtp(), pipeline_rank == 1);
         assert_eq!(
-            model.stage_info().embedded_mtp_layers,
+            model.stage_info().embedded_mtp_layers(),
             usize::from(pipeline_rank == 1)
         );
-        assert_eq!(model.stage_info().global_embedded_mtp_layers, 1);
+        assert_eq!(model.stage_info().global_embedded_mtp_layers(), 1);
     } else if matches!(family, FixtureFamily::Gemma | FixtureFamily::MuseGlimmer) {
         assert_eq!(
             model.speculative_capability(),
@@ -1636,9 +1631,14 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
         let checkpoint = tempfile::tempdir().unwrap();
         write_qwen3_vl_fixture(checkpoint.path(), moe);
         let backend = crate::native::backend(&stream, &stream);
-        let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
+        let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let request =
+            MlxLoadRequest::default().with_state_residency(CacheResidencyPolicy::Paged(paged));
+        let model = load_model(&backend, checkpoint.path(), request).unwrap();
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
-        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
         assert_eq!(runtime.session().model_family(), expected_family);
         assert_eq!(
             runtime.session().effective_model_type(),
@@ -1651,13 +1651,6 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
             expected_effective_model_type
         );
 
-        let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
-            .unwrap()
-            .with_full_attention(true);
-        runtime
-            .session_mut()
-            .configure_cache(CacheResidencyPolicy::Paged(paged))
-            .unwrap();
         assert!(runtime
             .session()
             .cache_residency_report()
@@ -1672,7 +1665,7 @@ fn complete_gemma4_preserves_nested_effective_model_type() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_gemma_fixture(checkpoint.path());
     let backend = crate::native::backend(&stream, &stream);
-    let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
+    let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default()).unwrap();
     assert_eq!(model.model_family(), ModelKind::Gemma4);
     assert_eq!(model.effective_model_type(), "gemma4_text");
     let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
@@ -1737,17 +1730,13 @@ fn complete_family_adapters_return_final_output_interventions() {
         let checkpoint = tempfile::tempdir().unwrap();
         write_fixture(checkpoint.path());
         let backend = crate::native::backend(&stream, &stream);
-        let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default())
+        let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default())
             .unwrap()
             .into_inner();
         let mut session = MlxModelSession::from_model(
             model,
             None,
-            eredu_core::SessionCapabilities {
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: true,
-            },
+            eredu_core::SessionCapabilities::new(true, true, true),
         )
         .unwrap();
         let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
@@ -1786,13 +1775,13 @@ fn resident_reference_quantized(
     let options = quantization
         .map(|quantization| match quantization {
             WeightQuantization::Affine(config) => {
-                ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::Affine {
+                MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
                     group_size: u32::try_from(config.group_size).unwrap(),
                     bits: u8::try_from(config.bits).unwrap(),
                 })
             }
             WeightQuantization::MxFp4 => {
-                ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+                MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
             }
             WeightQuantization::GgufIQuant { .. } => {
                 panic!("checkpoint-native GGUF quantization is not a load-time transform")
@@ -1806,11 +1795,7 @@ fn resident_reference_quantized(
     let mut session = MlxModelSession::from_model(
         model,
         None,
-        eredu_core::SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        },
+        eredu_core::SessionCapabilities::new(true, true, true),
     )
     .unwrap();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
@@ -1852,17 +1837,13 @@ fn resident_reference_for_prepared(
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
     let backend = crate::native::backend(stream, stream);
-    let model = eredu_core::load_model(&backend, checkpoint, ModelLoadOptions::default())
+    let model = eredu_core::load_model(&backend, checkpoint, MlxLoadRequest::default())
         .unwrap()
         .into_inner();
     let mut session = MlxModelSession::from_model(
         model,
         None,
-        eredu_core::SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        },
+        eredu_core::SessionCapabilities::new(true, true, true),
     )
     .unwrap();
     let parts = prepared.input_parts();
@@ -1975,17 +1956,13 @@ fn multimodal_resident_reference(
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
     let backend = crate::native::backend(stream, stream);
-    let model = eredu_core::load_model(&backend, checkpoint, ModelLoadOptions::default())
+    let model = eredu_core::load_model(&backend, checkpoint, MlxLoadRequest::default())
         .unwrap()
         .into_inner();
     let mut session = MlxModelSession::from_model(
         model,
         None,
-        eredu_core::SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        },
+        eredu_core::SessionCapabilities::new(true, true, true),
     )
     .unwrap();
     let prepared = multimodal_prepared_input(family);
@@ -2915,7 +2892,7 @@ fn write_gpt_oss_fixture(directory: &Path) {
 fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
     fn inspect(
         write_fixture: impl FnOnce(&Path) -> PathBuf,
-        options: ModelLoadOptions,
+        options: MlxLoadRequest,
         expected_observation: &str,
     ) {
         let checkpoint = tempfile::tempdir().unwrap();
@@ -2945,10 +2922,12 @@ fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
             write_gpt_oss_fixture(directory);
             directory.to_path_buf()
         },
-        ModelLoadOptions::default().with_weight_residency(WeightResidency::with_expert_cache(
-            NonExpertWeightResidency::FullyResident,
-            ExpertCacheLoadOptions::default(),
-        )),
+        MlxLoadRequest::default().with_weight_residency(
+            WeightResidency::with_independent_parameter_banks(
+                OrdinaryWeightResidency::FullyResident,
+                ParameterBankLoadOptions::default(),
+            ),
+        ),
         "model.layers.0.output",
     );
     inspect(
@@ -2956,7 +2935,7 @@ fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
             write_nemotron_fixture(directory);
             directory.to_path_buf()
         },
-        ModelLoadOptions::default(),
+        MlxLoadRequest::default(),
         "model.layers.0.output",
     );
 }

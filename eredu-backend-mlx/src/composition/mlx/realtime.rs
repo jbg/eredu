@@ -43,13 +43,12 @@ use crate::{
         checkpoint::artifact::LoadedArtifactIdentity,
         generation::MlxSamplingBackend,
     },
-    backend::ModelLoadOptions,
     backend::{
         error::Error,
         nn::tensor::{validate_token_domain, TokenValidationBatch, TokenValidationScope},
     },
     composition::moshi::{self as neutral_moshi, MoshiModel as NeutralMoshiModel},
-    MlxTensor,
+    MlxLoadRequest, MlxTensor,
 };
 
 /// Loaded MLX realtime speech-to-speech token model.
@@ -112,15 +111,15 @@ impl MlxRealtimeModel {
 #[derive(Debug, Clone)]
 pub struct MlxRealtimeInput {
     /// Encoded input-side audio tokens shaped `[batch, input_audio_codebooks]`.
-    pub input_audio_tokens: Array,
+    input_audio_tokens: Array,
     /// Optional generated-side codec tokens forced by a prompt frame.
-    pub forced_generated_audio_tokens: Option<Array>,
+    forced_generated_audio_tokens: Option<Array>,
     /// Optional per-generated-codebook forcing mask.
-    pub forced_generated_audio_codebooks: Option<Vec<bool>>,
+    forced_generated_audio_codebooks: Option<Vec<bool>>,
     /// Optional text token forced by a prompt frame.
-    pub forced_text_token: Option<Array>,
+    forced_text_token: Option<Array>,
     /// Whether complete decision logits are retained for host observation.
-    pub retain_diagnostics: bool,
+    retain_diagnostics: bool,
 }
 
 impl MlxRealtimeInput {
@@ -191,15 +190,42 @@ impl WorkDescriptor for MlxRealtimeInput {
 /// MLX output from one encoded-audio realtime generation step.
 pub struct MlxRealtimeOutput {
     /// Text token sampled at this model step, shaped `[batch, 1]`.
-    pub text_token: Array,
+    text_token: Array,
     /// Audio tokens resolved at every depth decision, shaped `[batch, depth]`.
-    pub decision_audio_tokens: Array,
+    decision_audio_tokens: Array,
     /// Newly sampled generated-codebook tokens before delay alignment.
-    pub sampled_audio_tokens: Array,
+    sampled_audio_tokens: Array,
     /// Delay-aligned codec frame ready for decoding.
-    pub output_audio_tokens: Option<Array>,
+    output_audio_tokens: Option<Array>,
     /// Complete text-then-depth decision logits when requested by the input.
-    pub diagnostics: Vec<Array>,
+    diagnostics: Vec<Array>,
+}
+
+impl MlxRealtimeOutput {
+    /// Text token sampled at this model step.
+    pub fn text_token(&self) -> &Array {
+        &self.text_token
+    }
+
+    /// Audio tokens resolved at every depth decision.
+    pub fn decision_audio_tokens(&self) -> &Array {
+        &self.decision_audio_tokens
+    }
+
+    /// Newly sampled generated-codebook tokens before delay alignment.
+    pub fn sampled_audio_tokens(&self) -> &Array {
+        &self.sampled_audio_tokens
+    }
+
+    /// Delay-aligned codec frame ready for decoding, when one is available.
+    pub fn output_audio_tokens(&self) -> Option<&Array> {
+        self.output_audio_tokens.as_ref()
+    }
+
+    /// Complete text-then-depth decision logits retained by the request.
+    pub fn diagnostics(&self) -> &[Array] {
+        &self.diagnostics
+    }
 }
 
 fn encode_array_descriptor(array: &Array, output: &mut Vec<u32>) -> Result<(), Error> {
@@ -324,7 +350,7 @@ impl MlxRealtimeBackend {
 
 impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
     type Preparation = RealtimePreparationPlan;
-    type LoadOptions = ModelLoadOptions;
+    type LoadOptions = MlxLoadRequest;
 
     fn materialize_realtime_model(
         &self,
@@ -340,15 +366,15 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
                     "tensor-parallel realtime loading requires a TP collective group".into(),
                 )
             })?;
-            if group.rank() != topology.tensor_parallel_rank
-                || group.size() != topology.tensor_parallel_size
+            if group.rank() != topology.tensor_parallel_rank()
+                || group.size() != topology.tensor_parallel_size()
             {
                 return Err(Error::Parallel(format!(
                     "realtime TP group rank/size {}/{} does not match model topology {}/{}",
                     group.rank(),
                     group.size(),
-                    topology.tensor_parallel_rank,
-                    topology.tensor_parallel_size
+                    topology.tensor_parallel_rank(),
+                    topology.tensor_parallel_size()
                 )));
             }
         }
@@ -357,14 +383,10 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
 }
 
 const fn realtime_session_capabilities() -> eredu_core::SessionCapabilities {
-    eredu_core::SessionCapabilities {
-        persistent_cache: true,
-        output_observation: true,
-        activation_inspection: false,
-    }
+    eredu_core::SessionCapabilities::new(true, true, false)
 }
 
-fn validate_realtime_session_requirements(options: &ModelLoadOptions) -> Result<(), Error> {
+fn validate_realtime_session_requirements(options: &MlxLoadRequest) -> Result<(), Error> {
     options
         .required_session_capabilities
         .validate(&realtime_session_capabilities())?;
@@ -394,11 +416,11 @@ fn realtime_samplers(
 
 fn materialize_realtime_model(
     preparation: RealtimePreparationPlan,
-    options: ModelLoadOptions,
+    options: MlxLoadRequest,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxRealtimeModel, Error> {
-    if options.weight_residency.expert_cache().is_some() {
+    if options.weight_residency.parameter_bank_cache().is_some() {
         return Err(Error::ArchitectureModel(
             "Moshi does not contain routed experts".into(),
         ));
@@ -687,6 +709,11 @@ fn padding_token(
     let token = match slot {
         RealtimeFrameSlot::Text => config.frame_schedule().text_padding_token(),
         RealtimeFrameSlot::Audio(_) => config.frame_schedule().audio_padding_token(),
+        _ => {
+            return Err(Error::Parallel(
+                "unsupported realtime frame slot requested for padding".into(),
+            ));
+        }
     };
     Array::full::<i32>(&[batch, 1], Array::from_int(token), stream).map_err(Into::into)
 }
@@ -709,6 +736,9 @@ fn forced_token(
             codebook,
             stream,
         ),
+        _ => Err(Error::Parallel(
+            "unsupported realtime frame slot requested for forcing".into(),
+        )),
     }
 }
 
@@ -833,6 +863,9 @@ fn submit_neutral_step(
                         ))
                     })
                 }
+                _ => Err(Error::Parallel(
+                    "unsupported realtime temporal source".into(),
+                )),
             })
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -863,6 +896,7 @@ fn submit_neutral_step(
                             target.coordinate()
                         ))
                     }),
+                _ => Err(Error::Parallel("unsupported realtime target source".into())),
             })
             .collect::<Result<Vec<_>, Error>>()?
     };
@@ -1256,15 +1290,12 @@ mod tests {
     #[test]
     fn realtime_session_capabilities_fail_closed_for_activation_inspection() {
         let available = realtime_session_capabilities();
-        assert!(available.persistent_cache);
-        assert!(available.output_observation);
-        assert!(!available.activation_inspection);
+        assert!(available.persistent_cache());
+        assert!(available.output_observation());
+        assert!(!available.activation_inspection());
 
-        let options = ModelLoadOptions::default().with_required_session_capabilities(
-            eredu_core::SessionCapabilities {
-                activation_inspection: true,
-                ..eredu_core::SessionCapabilities::default()
-            },
+        let options = MlxLoadRequest::default().with_required_session_capabilities(
+            eredu_core::SessionCapabilities::default().with_activation_inspection(true),
         );
         let error = validate_realtime_session_requirements(&options).unwrap_err();
         match error {
@@ -1606,7 +1637,7 @@ mod tests {
             let mut model = load_realtime_model_with_options(
                 backend,
                 prepare(directory.path()),
-                ModelLoadOptions::default().with_weight_residency(residency),
+                MlxLoadRequest::default().with_weight_residency(residency),
             )
             .unwrap_or_else(|error| panic!("load tiny {execution:?} model: {error}"));
             assert_eq!(model.model().metadata().residency(), execution);
@@ -1646,7 +1677,7 @@ mod tests {
             let mut model = load_realtime_model_with_options(
                 backend,
                 prepare(directory.path()),
-                ModelLoadOptions::with_quantization(request),
+                MlxLoadRequest::with_quantization(request),
             )
             .unwrap_or_else(|error| panic!("load-time {quantization:?} tiny model: {error}"));
             let metadata = model.model().metadata();
@@ -1677,7 +1708,7 @@ mod tests {
             let mut model = load_realtime_model_with_options(
                 backend,
                 prepare(packed_directory.path()),
-                ModelLoadOptions::default(),
+                MlxLoadRequest::default(),
             )
             .unwrap_or_else(|error| panic!("load checkpoint-native {quantization:?}: {error}"));
             let metadata = model.model().metadata();
@@ -1703,7 +1734,7 @@ mod tests {
         let mut model = load_realtime_model_with_options(
             backend,
             prepare(directory.path()),
-            ModelLoadOptions::default(),
+            MlxLoadRequest::default(),
         )
         .expect("load tiny scheduler model");
         let request = RequestId::new(81);
@@ -2082,10 +2113,7 @@ mod tests {
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let backend = MlxRealtimeBackend::new(execution.stream(), &weights);
         let mut model = backend
-            .materialize_realtime_model(
-                prepare(Path::new(&model_path)),
-                ModelLoadOptions::default(),
-            )
+            .materialize_realtime_model(prepare(Path::new(&model_path)), MlxLoadRequest::default())
             .unwrap_or_else(|error| panic!("load {model_env}: {error}"));
         assert_eq!(model.effective_model_type(), expected_model_type);
         run_teacher_forced_fixture(&mut model, Path::new(&reference_path), execution.stream());
@@ -2332,7 +2360,7 @@ mod tests {
             let mut model = load_realtime_model_with_options(
                 backend,
                 prepare(Path::new(&model_path)),
-                ModelLoadOptions::default().with_weight_residency(residency),
+                MlxLoadRequest::default().with_weight_residency(residency),
             )
             .expect("load PersonaPlex residency mode");
             assert_eq!(
@@ -2361,7 +2389,7 @@ mod tests {
         let mut model = load_realtime_model_with_options(
             backend,
             prepare(Path::new(&model_path)),
-            ModelLoadOptions::default(),
+            MlxLoadRequest::default(),
         )
         .expect("load native seeded fixture model");
         let fixture = Array::load_safetensors(Path::new(&fixture_path), execution.stream())
@@ -2384,7 +2412,7 @@ mod tests {
         let stream = Stream::new_with_device(&device);
         let backend = MlxRealtimeBackend::new(&stream, &stream);
         let model = backend
-            .materialize_realtime_model(prepare(Path::new(&fixture)), ModelLoadOptions::default())
+            .materialize_realtime_model(prepare(Path::new(&fixture)), MlxLoadRequest::default())
             .unwrap();
         let session = backend
             .create_session(&model, RealtimeSampling::greedy())
@@ -2407,7 +2435,7 @@ mod tests {
         let stream = Stream::new_with_device(&device);
         let backend = MlxRealtimeBackend::new(&stream, &stream);
         let model = backend
-            .materialize_realtime_model(prepare(Path::new(&fixture)), ModelLoadOptions::default())
+            .materialize_realtime_model(prepare(Path::new(&fixture)), MlxLoadRequest::default())
             .unwrap();
         assert_eq!(
             model.effective_model_type(),

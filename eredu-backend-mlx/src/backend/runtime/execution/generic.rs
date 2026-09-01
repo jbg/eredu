@@ -771,8 +771,8 @@ where
         .max()
         .unwrap_or(0);
     let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes > 0 => maximum_host_bytes
-            .checked_mul(dense.host_lookahead as u64)
+        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
+            .checked_mul(dense.host_lookahead() as u64)
             .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
         Some(_) => 0,
         None if fully_resident => 0,

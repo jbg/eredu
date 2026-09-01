@@ -1,5 +1,33 @@
 //! Transactional ownership for embedded draft mutable state.
 
+/// Failure while executing one architecture-identified target or draft group.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DraftGroupExecutionError<E> {
+    /// The selected architecture graph has no such group.
+    #[error("execution graph has no target or draft group {0:?}")]
+    UnknownGroup(String),
+    /// The architecture-owned group executor failed.
+    #[error("target or draft group execution failed")]
+    Execution(#[source] E),
+}
+
+/// Executes one exact graph identity against the state owned by a target or
+/// draft transaction.
+pub fn execute_draft_group<S, I, O, E>(
+    graph: &crate::ExecutionGraph,
+    group: &str,
+    input: I,
+    state: &mut S,
+    execute: impl FnOnce(usize, &str, I, &mut S) -> Result<O, E>,
+) -> Result<O, DraftGroupExecutionError<E>> {
+    let index = graph
+        .group_index(group)
+        .ok_or_else(|| DraftGroupExecutionError::UnknownGroup(group.to_owned()))?;
+    execute(index, graph.groups()[index].id(), input, state)
+        .map_err(DraftGroupExecutionError::Execution)
+}
+
 /// An exact speculative fork retaining both the pre-verification checkpoint
 /// and an independently advanceable draft state.
 ///
@@ -92,18 +120,24 @@ mod tests {
         .unwrap();
         let mut trace = Vec::new();
         let execute = |group: &str, input: u32, state: &mut Vec<u32>, trace: &mut Vec<String>| {
-            let group_index = graph
-                .group_index(group)
-                .unwrap_or_else(|| panic!("unknown prediction fixture group {group}"));
-            let output = match group_index {
-                0 => input + 1,
-                1 => input + 3,
-                2 => input + 2,
-                _ => unreachable!("fixture graph has exactly three groups"),
-            };
-            state.push(output);
-            trace.push(graph.groups()[group_index].id().to_owned());
-            output
+            execute_draft_group(
+                &graph,
+                group,
+                input,
+                state,
+                |group_index, id, input, state| {
+                    let output = match group_index {
+                        0 => input + 1,
+                        1 => input + 3,
+                        2 => input + 2,
+                        _ => unreachable!("fixture graph has exactly three groups"),
+                    };
+                    state.push(output);
+                    trace.push(id.to_owned());
+                    Ok::<_, std::convert::Infallible>(output)
+                },
+            )
+            .unwrap()
         };
 
         let mut canonical = vec![10];

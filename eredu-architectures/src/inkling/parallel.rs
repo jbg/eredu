@@ -361,7 +361,7 @@ pub fn static_parameter_groups(
 }
 
 /// Declares one replicated Inkling vision execution unit.
-pub fn vision_layer_parameter_groups<B: NeuralBackend>(
+pub fn vision_layer_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     layer: &impl eredu_nn::Parameterized<B::Tensor>,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -924,8 +924,8 @@ mod tests {
             eredu_core::cache::PromptCacheTopology::default(),
         )
         .unwrap();
-        assert_eq!(identity.global_layer_start, 0);
-        assert_eq!(identity.layer_count, 2);
+        assert_eq!(identity.global_layer_start(), 0);
+        assert_eq!(identity.layer_count(), 2);
         assert!(super::super::state_identity(
             &args,
             geometry.state_layout(),

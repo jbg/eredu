@@ -380,13 +380,13 @@ mod tests {
         .prompt_cache_identity(&layout)
         .unwrap();
 
-        assert_eq!(identity.model_family, "gemma4");
-        assert_eq!(identity.effective_model_type, "gemma4_text");
+        assert_eq!(identity.model_family(), "gemma4");
+        assert_eq!(identity.effective_model_type(), "gemma4_text");
         assert_eq!(
-            identity.architecture_fingerprint,
+            identity.architecture_fingerprint(),
             parsed.architecture_fingerprint()
         );
-        assert_eq!(identity.layer_prefix_offsets, vec![0; layout.len()]);
+        assert_eq!(identity.layer_prefix_offsets(), vec![0; layout.len()]);
     }
 
     #[test]

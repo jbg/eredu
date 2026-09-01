@@ -130,6 +130,11 @@ pub fn validate(input: ModelInput<'_>) -> Result<(), Exception> {
                     part.modality().as_str()
                 )));
             }
+            _ => {
+                return Err(Exception::custom(
+                    "model input uses an unsupported modality or payload",
+                ));
+            }
         }
     }
     Ok(())

@@ -3,7 +3,7 @@
 use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
 #[cfg(test)]
-use eredu_core::generation::SpeculativeRequestPhase;
+use eredu_core::generation::SpeculativeRequestStatus;
 #[cfg(test)]
 use eredu_core::{
     resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
@@ -94,10 +94,12 @@ pub(crate) fn component_timing_enabled() -> bool {
 
 impl SpeculativeComponentTimings {
     fn add_to(self, stats: &mut SpeculativeStats) {
-        stats.draft_context_time += self.draft_context;
-        stats.draft_assistant_time += self.draft_assistant;
-        stats.draft_head_time += self.draft_head;
-        stats.target_verification_time += self.target_verification;
+        stats.add_component_timings(
+            self.draft_context,
+            self.draft_assistant,
+            self.draft_head,
+            self.target_verification,
+        );
     }
 }
 
@@ -350,10 +352,10 @@ where
             .map_err(speculative_driver_error)
     }
 
-    /// Returns the current phase for a submitted request.
+    /// Returns the current status for a submitted request.
     #[cfg(test)]
-    pub fn phase(&self, id: SpeculativeRequestId) -> Option<SpeculativeRequestPhase> {
-        self.requests.phase(id)
+    pub fn status(&self, id: SpeculativeRequestId) -> Option<SpeculativeRequestStatus> {
+        self.requests.status(id)
     }
 
     /// Requests independent cancellation.
@@ -388,21 +390,30 @@ where
 
     /// Consumes a finished scheduler and returns results in submission order.
     pub fn finish(self) -> Result<SpeculativeScheduleOutput<S>, Exception> {
-        let output = self.requests.finish().map_err(speculative_driver_error)?;
+        let mut output = self.requests.finish().map_err(speculative_driver_error)?;
         Ok(SpeculativeScheduleOutput {
             requests: output
-                .requests
+                .take_requests()
                 .into_iter()
-                .map(|request| SpeculativeRequestOutput {
-                    token_ids: request.token_ids,
-                    stats: request.stats,
-                    sampler: request.sampler.into_inner(),
-                    finish_reason: request.finish_reason,
+                .map(|request| {
+                    let mut request = request.into_artifact();
+                    let token_ids = request.take_token_ids();
+                    let stats = request.take_stats();
+                    let finish_reason = request.finish_reason();
                     #[cfg(test)]
-                    cancelled: request.phase == SpeculativeRequestPhase::Cancelled,
+                    let cancelled = request.status() == SpeculativeRequestStatus::Cancelled;
+                    let sampler = request.into_sampler().into_inner();
+                    SpeculativeRequestOutput {
+                        token_ids,
+                        stats,
+                        sampler,
+                        finish_reason,
+                        #[cfg(test)]
+                        cancelled,
+                    }
                 })
                 .collect(),
-            scheduler: output.scheduler,
+            scheduler: output.take_scheduler(),
         })
     }
 }
@@ -501,22 +512,25 @@ where
     )
     .map_err(speculative_driver_error)?;
     scheduler
-        .submit(eredu_core::PreparedSpeculativeLane {
+        .submit(eredu_core::PreparedSpeculativeLane::new(
             cache,
-            input: MlxModelInput::from(input),
-            config: config.clone(),
-            runtime: plain_runtime(sampler.clone(), config, on_token),
+            MlxModelInput::from(input),
+            config.clone(),
+            plain_runtime(sampler.clone(), config, on_token),
             randomness,
-        })
+        ))
         .map_err(speculative_driver_error)?;
     scheduler.run().map_err(speculative_driver_error)?;
-    let mut output = scheduler
-        .finish()
-        .map_err(speculative_driver_error)?
-        .requests;
-    let request = output.pop().expect("one request was submitted");
-    *sampler = request.sampler.into_inner();
-    Ok((request.token_ids, request.stats))
+    let mut output = scheduler.finish().map_err(speculative_driver_error)?;
+    let mut request = output
+        .take_requests()
+        .pop()
+        .expect("one request was submitted")
+        .into_artifact();
+    let token_ids = request.take_token_ids();
+    let stats = request.take_stats();
+    *sampler = request.into_sampler().into_inner();
+    Ok((token_ids, stats))
 }
 
 #[cfg(test)]
@@ -788,11 +802,11 @@ mod tests {
             *cache = 1;
             let mut first = [0.0f32; 3];
             first[self.first_token as usize] = 10.0;
-            Ok(SpeculativePrefill {
-                logits: Array::from_slice(&first, &[1, 3]),
-                state: (),
-                evaluated_tokens: 1,
-            })
+            Ok(SpeculativePrefill::new(
+                Array::from_slice(&first, &[1, 3]),
+                (),
+                1,
+            ))
         }
 
         fn begin_proposal(
@@ -904,10 +918,7 @@ mod tests {
             self.record("commit_target", streams.target())?;
             self.record("commit_draft", streams.draft())?;
             *cache = checkpoint + verified_inputs;
-            Ok(SpeculativeCommit {
-                state: (),
-                replayed_tokens: 0,
-            })
+            Ok(SpeculativeCommit::new((), 0))
         }
     }
 
@@ -1155,10 +1166,10 @@ mod tests {
 
         assert_eq!(request.token_ids, vec![1, 2]);
         assert_eq!(request.finish_reason, Some(FinishReason::StopSequence));
-        assert_eq!(request.stats.accept_lens, vec![1]);
+        assert_eq!(request.stats.accept_lens(), vec![1]);
         assert_eq!(request.sampler.process_calls, 2);
-        assert_eq!(request.stats.optimistic_draft_blocks, 1);
-        assert_eq!(request.stats.discarded_optimistic_blocks, 1);
+        assert_eq!(request.stats.optimistic_draft_blocks(), 1);
+        assert_eq!(request.stats.discarded_optimistic_blocks(), 1);
         assert_eq!(cache, 2);
         assert_eq!(
             events.borrow().as_slice(),
@@ -1219,7 +1230,7 @@ mod tests {
         assert_eq!(request.finish_reason, Some(FinishReason::GrammarComplete));
         assert_eq!(request.sampler.inner.process_calls, 2);
         assert_eq!(request.sampler.inner.committed, request.token_ids);
-        assert_eq!(request.stats.draft_tokens, 1);
+        assert_eq!(request.stats.draft_tokens(), 1);
         assert_eq!(
             backend.draft_storage.len(),
             1,
@@ -1292,10 +1303,10 @@ mod tests {
 
         assert_eq!(request.token_ids, vec![1, 2, 0, 0]);
         assert_eq!(request.finish_reason, Some(FinishReason::GrammarComplete));
-        assert_eq!(request.stats.optimistic_target_bonus_tokens, 1);
-        assert_eq!(request.stats.discarded_optimistic_tokens, 1);
-        assert_eq!(request.stats.reused_optimistic_tokens, 0);
-        assert_eq!(request.stats.consumed_optimistic_tokens, 0);
+        assert_eq!(request.stats.optimistic_target_bonus_tokens(), 1);
+        assert_eq!(request.stats.discarded_optimistic_tokens(), 1);
+        assert_eq!(request.stats.reused_optimistic_tokens(), 0);
+        assert_eq!(request.stats.consumed_optimistic_tokens(), 0);
         assert_eq!(request.sampler.inner.committed, request.token_ids);
     }
 
@@ -1517,20 +1528,20 @@ mod tests {
         let eos = run(6, vec![2]);
         assert_eq!(eos.0, vec![1, 2]);
         assert_eq!(eos.1, FinishReason::Eos);
-        assert_eq!(eos.2.accept_lens, vec![1]);
+        assert_eq!(eos.2.accept_lens(), vec![1]);
         assert_eq!(eos.3, 2);
 
         let max = run(2, Vec::new());
         assert_eq!(max.0, vec![1, 2]);
         assert_eq!(max.1, FinishReason::MaxTokens);
-        assert_eq!(max.2.accept_lens, vec![1]);
+        assert_eq!(max.2.accept_lens(), vec![1]);
         assert_eq!(max.3, 2);
 
         let bonus = run(4, Vec::new());
         assert_eq!(bonus.0, vec![1, 2, 0, 1]);
         assert_eq!(bonus.1, FinishReason::MaxTokens);
-        assert_eq!(bonus.2.accept_lens, vec![2]);
-        assert_eq!(bonus.2.accepted_tokens, 2);
+        assert_eq!(bonus.2.accept_lens(), vec![2]);
+        assert_eq!(bonus.2.accepted_tokens(), 2);
         assert_eq!(bonus.3, 4);
     }
 
@@ -1570,7 +1581,7 @@ mod tests {
 
         assert_eq!(request.token_ids, vec![1, 1]);
         assert_eq!(request.finish_reason, Some(FinishReason::MaxTokens));
-        assert_eq!(request.stats.accept_lens, vec![0]);
+        assert_eq!(request.stats.accept_lens(), vec![0]);
         assert_eq!(request.sampler.committed, request.token_ids);
         assert_eq!(cache, 2);
     }
@@ -1661,8 +1672,8 @@ mod tests {
 
         assert_eq!(tokens, vec![1, 2, 1]);
         assert_eq!(emitted, tokens);
-        assert_eq!(stats.accept_lens, vec![1]);
-        assert_eq!(stats.accepted_tokens, 1);
+        assert_eq!(stats.accept_lens(), vec![1]);
+        assert_eq!(stats.accepted_tokens(), 1);
         assert_eq!(cache, 3);
     }
 
@@ -1757,7 +1768,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(tokens, vec![1, 2, 0, 0]);
-        assert_eq!(stats.accepted_tokens, 2);
+        assert_eq!(stats.accepted_tokens(), 2);
         assert_eq!(sampler.generated_tokens(), tokens);
     }
 
@@ -1799,8 +1810,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(tokens, vec![1, 2, 0, 0]);
-        assert_eq!(stats.draft_tokens, 2);
-        assert_eq!(stats.accepted_tokens, 2);
+        assert_eq!(stats.draft_tokens(), 2);
+        assert_eq!(stats.accepted_tokens(), 2);
         assert_eq!(sampler.generated_tokens(), tokens);
         assert!((sampler.mu() - 12.0).abs() < 1e-4);
     }
@@ -1843,8 +1854,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(tokens, vec![1, 1]);
-        assert_eq!(stats.draft_tokens, 1);
-        assert_eq!(stats.accepted_tokens, 0);
+        assert_eq!(stats.draft_tokens(), 1);
+        assert_eq!(stats.accepted_tokens(), 0);
         assert_eq!(sampler.generated_tokens(), tokens);
         assert!((sampler.mu() - 11.0).abs() < 1e-4);
     }
@@ -1990,18 +2001,18 @@ mod tests {
         let stats = &output.requests[0].stats;
 
         assert_eq!(
-            output.scheduler.execution_topology,
+            output.scheduler.execution_topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(
-            stats.execution_topology,
+            stats.execution_topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
         );
-        assert!(stats.optimistic_draft_blocks > 0);
-        assert!(stats.optimistic_target_bonus_tokens > 0);
+        assert!(stats.optimistic_draft_blocks() > 0);
+        assert!(stats.optimistic_target_bonus_tokens() > 0);
         assert_eq!(
-            stats.optimistic_bonus_matches + stats.optimistic_bonus_mismatches,
-            stats.optimistic_target_bonus_tokens
+            stats.optimistic_bonus_matches() + stats.optimistic_bonus_mismatches(),
+            stats.optimistic_target_bonus_tokens()
         );
         assert!(backend
             .routes
@@ -2101,14 +2112,14 @@ mod tests {
         let canonical = run(false);
 
         assert_eq!(
-            request.stats.execution_topology,
+            request.stats.execution_topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(request.token_ids, canonical.token_ids);
         assert_eq!(request.token_ids.len(), 8);
-        assert_eq!(request.stats.emitted_tokens, 8);
-        assert!(request.stats.optimistic_draft_blocks > 0);
-        assert_eq!(canonical.stats.optimistic_draft_blocks, 0);
+        assert_eq!(request.stats.emitted_tokens(), 8);
+        assert!(request.stats.optimistic_draft_blocks() > 0);
+        assert_eq!(canonical.stats.optimistic_draft_blocks(), 0);
     }
 
     #[test]
@@ -2153,13 +2164,13 @@ mod tests {
         let output = scheduler.finish().unwrap();
         let stats = &output.requests[0].stats;
 
-        assert_eq!(stats.optimistic_draft_blocks, 1);
-        assert_eq!(stats.reused_optimistic_blocks, 1);
-        assert_eq!(stats.reused_optimistic_tokens, 1);
-        assert_eq!(stats.consumed_optimistic_tokens, 1);
-        assert_eq!(stats.optimistic_target_bonus_tokens, 1);
-        assert_eq!(stats.optimistic_bonus_matches, 1);
-        assert_eq!(output.scheduler.peak_optimistic_branches, 1);
+        assert_eq!(stats.optimistic_draft_blocks(), 1);
+        assert_eq!(stats.reused_optimistic_blocks(), 1);
+        assert_eq!(stats.reused_optimistic_tokens(), 1);
+        assert_eq!(stats.consumed_optimistic_tokens(), 1);
+        assert_eq!(stats.optimistic_target_bonus_tokens(), 1);
+        assert_eq!(stats.optimistic_bonus_matches(), 1);
+        assert_eq!(output.scheduler.peak_optimistic_branches(), 1);
         assert_eq!(backend.draft_storage[0], backend.draft_storage[2]);
         let first_commit = backend
             .routes
@@ -2219,22 +2230,22 @@ mod tests {
 
         let request = scheduler.requests.request(id).unwrap();
         assert_eq!(request.sequence().tokens(), &[1, 2, 0, 0]);
-        assert_eq!(request.phase(), SpeculativeRequestPhase::ReadyToDraft);
+        assert_eq!(request.status(), SpeculativeRequestStatus::ReadyToDraft);
         let retained = request.block().unwrap();
-        assert_eq!(retained.proposals.len(), 1);
-        assert_eq!(retained.proposals[0].token, 1);
-        assert_eq!(retained.state.step, 4);
+        assert_eq!(retained.proposals().len(), 1);
+        assert_eq!(retained.proposals()[0].token(), 1);
+        assert_eq!(retained.state().step, 4);
         assert_eq!(
-            retained.proposals[0]
-                .distribution
+            retained.proposals()[0]
+                .distribution()
                 .try_index_device((0, 0, 1), draft.stream())
                 .unwrap()
                 .item::<f32>(draft.stream()),
             10.0
         );
-        assert_eq!(request.stats().consumed_optimistic_tokens, 1);
-        assert_eq!(request.stats().reused_optimistic_tokens, 1);
-        assert_eq!(request.stats().optimistic_bonus_matches, 1);
+        assert_eq!(request.stats().consumed_optimistic_tokens(), 1);
+        assert_eq!(request.stats().reused_optimistic_tokens(), 1);
+        assert_eq!(request.stats().optimistic_bonus_matches(), 1);
         scheduler.step().unwrap();
         assert_eq!(
             scheduler
@@ -2243,7 +2254,7 @@ mod tests {
                 .unwrap()
                 .block()
                 .unwrap()
-                .proposals
+                .proposals()
                 .len(),
             2,
             "the consumed optimistic token must be topped back up before submission"
@@ -2337,17 +2348,17 @@ mod tests {
         assert_eq!(with.0, without.0);
         assert_eq!(with.1, without.1);
         assert_eq!(with.2, without.2);
-        assert_eq!(with.3.target_tokens, without.3.target_tokens);
-        assert_eq!(with.3.draft_tokens, without.3.draft_tokens);
-        assert_eq!(with.3.accepted_tokens, without.3.accepted_tokens);
-        assert_eq!(with.3.accept_lens, without.3.accept_lens);
-        assert_eq!(with.3.emitted_tokens, without.3.emitted_tokens);
+        assert_eq!(with.3.target_tokens(), without.3.target_tokens());
+        assert_eq!(with.3.draft_tokens(), without.3.draft_tokens());
+        assert_eq!(with.3.accepted_tokens(), without.3.accepted_tokens());
+        assert_eq!(with.3.accept_lens(), without.3.accept_lens());
+        assert_eq!(with.3.emitted_tokens(), without.3.emitted_tokens());
         assert_eq!(with.4.process_calls, without.4.process_calls);
         assert_eq!(with.4.histories, without.4.histories);
         assert_eq!(with.4.committed, without.4.committed);
-        assert!(with.3.optimistic_bonus_mismatches > 0);
-        assert!(with.3.discarded_optimistic_tokens > 0);
-        assert_eq!(with.3.consumed_optimistic_tokens, 0);
+        assert!(with.3.optimistic_bonus_mismatches() > 0);
+        assert!(with.3.discarded_optimistic_tokens() > 0);
+        assert_eq!(with.3.consumed_optimistic_tokens(), 0);
     }
 
     #[test]
@@ -2396,7 +2407,7 @@ mod tests {
                 .unwrap();
             scheduler.run().unwrap();
             let request = scheduler.finish().unwrap().requests.pop().unwrap();
-            (request.token_ids, request.stats.accept_lens)
+            (request.token_ids, request.stats.accept_lens().to_vec())
         }
 
         let without = run(SpeculativeSchedulerOptions {
@@ -2472,7 +2483,7 @@ mod tests {
             let request = scheduler.finish().unwrap().requests.remove(0);
             (
                 request.token_ids,
-                request.stats.accept_lens.clone(),
+                request.stats.accept_lens().to_vec(),
                 request.stats,
             )
         }
@@ -2487,15 +2498,15 @@ mod tests {
         let mut saw_mismatch = false;
         for seed in 0..64 {
             let with = run(seed, SpeculativeSchedulerOptions::default(), false);
-            if with.2.optimistic_bonus_matches == 0 && with.2.optimistic_bonus_mismatches == 0 {
+            if with.2.optimistic_bonus_matches() == 0 && with.2.optimistic_bonus_mismatches() == 0 {
                 continue;
             }
             let without = run(seed, no_lookahead, false);
             let interleaved = run(seed, SpeculativeSchedulerOptions::default(), true);
             assert_eq!((&with.0, &with.1), (&without.0, &without.1));
             assert_eq!((&with.0, &with.1), (&interleaved.0, &interleaved.1));
-            saw_match |= with.2.optimistic_bonus_matches > 0;
-            saw_mismatch |= with.2.optimistic_bonus_mismatches > 0;
+            saw_match |= with.2.optimistic_bonus_matches() > 0;
+            saw_mismatch |= with.2.optimistic_bonus_mismatches() > 0;
             if saw_match && saw_mismatch {
                 break;
             }
@@ -2551,8 +2562,8 @@ mod tests {
         scheduler.step().unwrap();
         scheduler.step().unwrap();
         assert_eq!(
-            scheduler.phase(id),
-            Some(SpeculativeRequestPhase::ReadyToDraft)
+            scheduler.status(id),
+            Some(SpeculativeRequestStatus::ReadyToDraft)
         );
         scheduler.cancel(id).unwrap();
         let output = scheduler.finish().unwrap();
@@ -2606,8 +2617,8 @@ mod tests {
         scheduler.step().unwrap();
         scheduler.step().unwrap();
         assert_eq!(
-            scheduler.phase(id),
-            Some(SpeculativeRequestPhase::OptimisticDraftReady)
+            scheduler.status(id),
+            Some(SpeculativeRequestStatus::OptimisticDraftReady)
         );
         scheduler.step().unwrap();
         scheduler.cancel(id).unwrap();
@@ -2616,8 +2627,8 @@ mod tests {
 
         assert_eq!(request.token_ids, vec![1, 1]);
         assert_eq!(request.sampler.process_calls, 2);
-        assert_eq!(request.stats.discarded_optimistic_blocks, 1);
-        assert_eq!(request.stats.discarded_optimistic_tokens, 2);
+        assert_eq!(request.stats.discarded_optimistic_blocks(), 1);
+        assert_eq!(request.stats.discarded_optimistic_tokens(), 2);
         assert_eq!(cache, 2);
         assert_eq!(backend.draft_storage[0], backend.draft_storage[2]);
     }
@@ -2676,9 +2687,9 @@ mod tests {
         let with = run(SpeculativeSchedulerOptions::default());
         assert_eq!(with.0, without.0);
         assert_eq!(with.1, without.1);
-        assert_eq!(with.2.accept_lens, without.2.accept_lens);
-        assert!(with.2.discarded_optimistic_tokens > 0);
-        assert_eq!(without.2.optimistic_draft_tokens, 0);
+        assert_eq!(with.2.accept_lens(), without.2.accept_lens());
+        assert!(with.2.discarded_optimistic_tokens() > 0);
+        assert_eq!(without.2.optimistic_draft_tokens(), 0);
     }
 
     #[test]
@@ -2722,9 +2733,9 @@ mod tests {
         scheduler.run().unwrap();
         let request = scheduler.finish().unwrap().requests.pop().unwrap();
         assert_eq!(request.token_ids, vec![1, 0]);
-        assert_eq!(request.stats.optimistic_draft_tokens, 1);
-        assert_eq!(request.stats.discarded_optimistic_tokens, 1);
-        assert_eq!(request.stats.reused_optimistic_tokens, 0);
+        assert_eq!(request.stats.optimistic_draft_tokens(), 1);
+        assert_eq!(request.stats.discarded_optimistic_tokens(), 1);
+        assert_eq!(request.stats.reused_optimistic_tokens(), 0);
     }
 
     #[test]
@@ -2799,13 +2810,13 @@ mod tests {
 
         assert_eq!(output.requests[0].token_ids, vec![1, 2, 0]);
         assert_eq!(callback_a, output.requests[0].token_ids);
-        assert_eq!(output.requests[0].stats.optimistic_target_bonus_tokens, 1);
-        assert_eq!(output.requests[0].stats.optimistic_bonus_matches, 0);
-        assert_eq!(output.requests[0].stats.discarded_optimistic_tokens, 1);
+        assert_eq!(output.requests[0].stats.optimistic_target_bonus_tokens(), 1);
+        assert_eq!(output.requests[0].stats.optimistic_bonus_matches(), 0);
+        assert_eq!(output.requests[0].stats.discarded_optimistic_tokens(), 1);
         assert_eq!(output.requests[1].token_ids.len(), 5);
         assert_eq!(callback_b, output.requests[1].token_ids);
-        assert!(output.requests[1].stats.rounds > output.requests[0].stats.rounds);
-        assert!(output.scheduler.cross_request_draft_opportunities > 0);
+        assert!(output.requests[1].stats.rounds() > output.requests[0].stats.rounds());
+        assert!(output.scheduler.cross_request_draft_opportunities() > 0);
     }
 
     #[test]
@@ -2850,9 +2861,9 @@ mod tests {
         let request = scheduler.finish().unwrap().requests.pop().unwrap();
 
         assert_eq!(request.token_ids, vec![1, 2, 0, 2, 0]);
-        assert_eq!(request.stats.consumed_optimistic_tokens, 1);
-        assert_eq!(request.stats.reused_optimistic_tokens, 0);
-        assert_eq!(request.stats.reused_optimistic_blocks, 0);
+        assert_eq!(request.stats.consumed_optimistic_tokens(), 1);
+        assert_eq!(request.stats.reused_optimistic_tokens(), 0);
+        assert_eq!(request.stats.reused_optimistic_blocks(), 0);
         assert_eq!(
             backend
                 .routes
@@ -2905,8 +2916,8 @@ mod tests {
         let request = scheduler.finish().unwrap().requests.pop().unwrap();
 
         assert_eq!(request.token_ids, vec![1, 2, 0]);
-        assert_eq!(request.stats.optimistic_draft_tokens, 0);
-        assert_eq!(request.stats.optimistic_draft_blocks, 0);
+        assert_eq!(request.stats.optimistic_draft_tokens(), 0);
+        assert_eq!(request.stats.optimistic_draft_blocks(), 0);
         assert_eq!(backend.draft_storage.len(), 1);
     }
 
@@ -2926,19 +2937,19 @@ mod tests {
 
     #[test]
     fn stale_optimistic_prefix_is_an_error_not_a_fallback() {
-        let branch = SpeculativeOptimisticBranch {
-            block: SpeculativeDraftBlock {
-                state: ScriptedDraftState {
+        let branch = SpeculativeOptimisticBranch::new(
+            SpeculativeDraftBlock::new(
+                ScriptedDraftState {
                     step: 1,
                     storage: Arc::new(()),
                 },
-                proposals: vec![SpeculativeProposal {
-                    token: 0,
-                    distribution: Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 1, 3]),
-                }],
-            },
-            assumed_prefix: vec![1, 2],
-        };
+                vec![SpeculativeProposal::new(
+                    0,
+                    Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 1, 3]),
+                )],
+            ),
+            vec![1, 2],
+        );
         let mut stats = SpeculativeStats::default();
         let error = resolve_optimistic_branch(Some(branch), &[1, 0], Some(0), false, &mut stats)
             .err()
@@ -2947,11 +2958,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("diverged from the canonical committed prefix"));
-        assert_eq!(stats.optimistic_target_bonus_tokens, 0);
-        assert_eq!(stats.optimistic_bonus_matches, 0);
-        assert_eq!(stats.optimistic_bonus_mismatches, 0);
-        assert_eq!(stats.consumed_optimistic_tokens, 0);
-        assert_eq!(stats.discarded_optimistic_tokens, 0);
+        assert_eq!(stats.optimistic_target_bonus_tokens(), 0);
+        assert_eq!(stats.optimistic_bonus_matches(), 0);
+        assert_eq!(stats.optimistic_bonus_mismatches(), 0);
+        assert_eq!(stats.consumed_optimistic_tokens(), 0);
+        assert_eq!(stats.discarded_optimistic_tokens(), 0);
     }
 
     #[test]
@@ -3015,7 +3026,7 @@ mod tests {
 
         assert_eq!(output.requests[0].token_ids, vec![1, 2, 0]);
         assert_eq!(output.requests[1].token_ids, vec![1, 2]);
-        assert!(output.scheduler.cross_request_draft_opportunities > 0);
+        assert!(output.scheduler.cross_request_draft_opportunities() > 0);
         let verify = backend
             .routes
             .iter()
@@ -3084,9 +3095,9 @@ mod tests {
         }
         scheduler.run().unwrap();
         let stats = scheduler.finish().unwrap().scheduler;
-        assert!(stats.peak_in_flight_verifications <= 2);
-        assert!(stats.peak_optimistic_branches <= 1);
-        assert_eq!(stats.peak_optimistic_branches, 1);
+        assert!(stats.peak_in_flight_verifications() <= 2);
+        assert!(stats.peak_optimistic_branches() <= 1);
+        assert_eq!(stats.peak_optimistic_branches(), 1);
     }
 
     #[test]
@@ -3159,7 +3170,7 @@ mod tests {
             let events = events.borrow().clone();
             (
                 output.requests[0].token_ids.clone(),
-                output.requests[0].stats.accept_lens.clone(),
+                output.requests[0].stats.accept_lens().to_vec(),
                 events,
                 output.requests[0].finish_reason,
             )
@@ -3220,10 +3231,10 @@ mod tests {
 
         assert_eq!(adaptive.0, disabled.0);
         assert_eq!(adaptive.1, disabled.1);
-        assert_eq!(adaptive.2.accept_lens, disabled.2.accept_lens);
-        assert_eq!(adaptive.2.optimistic_draft_blocks, 2);
-        assert!(adaptive.2.adaptive_lookahead_disabled);
-        assert_eq!(disabled.2.optimistic_draft_blocks, 0);
+        assert_eq!(adaptive.2.accept_lens(), disabled.2.accept_lens());
+        assert_eq!(adaptive.2.optimistic_draft_blocks(), 2);
+        assert!(adaptive.2.adaptive_lookahead_disabled());
+        assert_eq!(disabled.2.optimistic_draft_blocks(), 0);
     }
 
     #[test]
@@ -3233,11 +3244,14 @@ mod tests {
 
     #[test]
     fn component_timings_accumulate_without_overwriting_scheduler_stats() {
-        let mut stats = SpeculativeStats {
-            rounds: 7,
-            draft_context_time: Duration::from_millis(2),
-            ..SpeculativeStats::default()
-        };
+        let mut stats = SpeculativeStats::default();
+        stats.add_scheduler_rounds(7);
+        stats.add_component_timings(
+            Duration::from_millis(2),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         SpeculativeComponentTimings {
             draft_context: Duration::from_millis(3),
             draft_assistant: Duration::from_millis(5),
@@ -3246,11 +3260,11 @@ mod tests {
         }
         .add_to(&mut stats);
 
-        assert_eq!(stats.rounds, 7);
-        assert_eq!(stats.draft_context_time, Duration::from_millis(5));
-        assert_eq!(stats.draft_assistant_time, Duration::from_millis(5));
-        assert_eq!(stats.draft_head_time, Duration::from_millis(7));
-        assert_eq!(stats.target_verification_time, Duration::from_millis(11));
+        assert_eq!(stats.rounds(), 7);
+        assert_eq!(stats.draft_context_time(), Duration::from_millis(5));
+        assert_eq!(stats.draft_assistant_time(), Duration::from_millis(5));
+        assert_eq!(stats.draft_head_time(), Duration::from_millis(7));
+        assert_eq!(stats.target_verification_time(), Duration::from_millis(11));
     }
 
     #[test]
@@ -3274,37 +3288,27 @@ mod tests {
             adaptive_lookahead_min_blocks: 4,
             ..SpeculativeSchedulerOptions::default()
         };
-        let mut profitable = SpeculativeStats {
-            optimistic_draft_blocks: 4,
-            reused_optimistic_tokens: 3,
-            discarded_optimistic_tokens: 2,
-            ..SpeculativeStats::default()
-        };
+        let mut profitable = SpeculativeStats::default();
+        profitable.record_optimistic_accounting(4, 3, 2);
         profitable.update_adaptive_lookahead(options);
-        assert!(!profitable.adaptive_lookahead_disabled);
+        assert!(!profitable.adaptive_lookahead_disabled());
 
-        let mut unprofitable = SpeculativeStats {
-            optimistic_draft_blocks: 4,
-            reused_optimistic_tokens: 1,
-            discarded_optimistic_tokens: 2,
-            ..SpeculativeStats::default()
-        };
+        let mut unprofitable = SpeculativeStats::default();
+        unprofitable.record_optimistic_accounting(4, 1, 2);
         unprofitable.update_adaptive_lookahead(options);
-        assert!(unprofitable.adaptive_lookahead_disabled);
+        assert!(unprofitable.adaptive_lookahead_disabled());
 
-        let mut no_reuse = SpeculativeStats {
-            optimistic_draft_blocks: 4,
-            ..SpeculativeStats::default()
-        };
+        let mut no_reuse = SpeculativeStats::default();
+        no_reuse.record_optimistic_accounting(4, 0, 0);
         no_reuse.update_adaptive_lookahead(options);
-        assert!(no_reuse.adaptive_lookahead_disabled);
+        assert!(no_reuse.adaptive_lookahead_disabled());
 
         let mut disabled_policy = unprofitable.clone();
-        disabled_policy.adaptive_lookahead_disabled = false;
+        disabled_policy.reset_adaptive_lookahead_decision();
         disabled_policy.update_adaptive_lookahead(SpeculativeSchedulerOptions {
             adaptive_lookahead: false,
             ..options
         });
-        assert!(!disabled_policy.adaptive_lookahead_disabled);
+        assert!(!disabled_policy.adaptive_lookahead_disabled());
     }
 }

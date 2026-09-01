@@ -113,7 +113,7 @@ impl<T: Tensor> V4Rotary<T> {
 /// index streams.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Compressor<B: NeuralBackend> {
+pub struct Compressor<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     ratio: i32,
     #[parameter(skip)]
@@ -128,7 +128,7 @@ pub struct Compressor<B: NeuralBackend> {
     rope: V4Rotary<B::Tensor>,
 }
 
-impl<B: NeuralBackend> Compressor<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Compressor<B> {
     fn new(
         args: &V4Args,
         ratio: i32,
@@ -265,7 +265,7 @@ fn overlap_pool<B, C>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: PoolingAttentionCache<B::Tensor>,
 {
     let batch = values.dim(0);
@@ -339,7 +339,7 @@ where
 /// Sparse indexer selecting pooled positions for ratio-four layers.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Indexer<B: NeuralBackend> {
+pub struct Indexer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     heads: i32,
     #[parameter(skip)]
@@ -351,7 +351,7 @@ pub struct Indexer<B: NeuralBackend> {
     compressor: Compressor<B>,
 }
 
-impl<B: NeuralBackend> Indexer<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Indexer<B> {
     fn new(
         args: &V4Args,
         ratio: i32,
@@ -431,7 +431,7 @@ impl<B: NeuralBackend> Indexer<B> {
 /// without changing the surrounding block implementation.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Attention<B: NeuralBackend> {
+pub struct Attention<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     heads: i32,
     #[parameter(skip)]
@@ -458,7 +458,7 @@ pub struct Attention<B: NeuralBackend> {
     rope: V4Rotary<B::Tensor>,
 }
 
-impl<B: NeuralBackend> Attention<B> {
+impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     /// Builds one unloaded V4 attention layer from its scheduled policy.
     pub fn new(
         args: &V4Args,
@@ -815,7 +815,7 @@ fn slice_last<T: Tensor>(
     slice_axis(value, value.shape().len() - 1, start, end, context)
 }
 
-fn linear<B: NeuralBackend>(
+fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     name: impl Into<String>,
     input: i32,
     output: i32,

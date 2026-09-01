@@ -21,6 +21,7 @@ pub mod codec;
 mod composition;
 
 pub use adapter::*;
+pub use composition::mlx::{MlxLoadRequest, MlxModelConfig, MlxSelectedPreparation};
 
 pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn};
 pub(crate) use safemlx::{ops, Array, Dtype, Stream};
@@ -62,8 +63,9 @@ pub(crate) mod array {
 pub mod native {
     use safemlx::Stream;
 
-    pub use crate::backend::topology::{DeviceAssignment, MlxParallelContext};
+    pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
+    pub use crate::composition::mlx::distributed::topology::MlxParallelPlan;
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
         MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
@@ -109,10 +111,10 @@ pub mod native {
 
     /// Binds composition-owned semantic topology to otherwise ordinary model options.
     pub fn parallel_load_options(
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
         pipeline_wire: eredu_runtime::PipelineWireContract,
-    ) -> crate::backend::config::ModelLoadOptions {
-        crate::backend::config::ModelLoadOptions::with_parallel(topology, pipeline_wire)
+    ) -> crate::MlxLoadRequest {
+        crate::MlxLoadRequest::with_parallel(topology, pipeline_wire)
     }
 }
 

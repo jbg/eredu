@@ -2108,10 +2108,10 @@ impl MlxHybridState {
     ) -> Result<PromptCacheManifest, Exception> {
         let expected = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("prompt-cache prefix length exceeds i32"))?;
-        if descriptor.layer_prefix_offsets.len() != self.layers.len() {
+        if descriptor.layer_prefix_offsets().len() != self.layers.len() {
             return Err(Exception::custom(format!(
                 "prompt-cache descriptor supplied {} layer frontiers for {} hybrid state layers",
-                descriptor.layer_prefix_offsets.len(),
+                descriptor.layer_prefix_offsets().len(),
                 self.layers.len()
             )));
         }
@@ -2119,7 +2119,7 @@ impl MlxHybridState {
         for (layer, (state, delta)) in self
             .layers
             .iter_mut()
-            .zip(&descriptor.layer_prefix_offsets)
+            .zip(descriptor.layer_prefix_offsets())
             .enumerate()
         {
             let layer_expected = expected.checked_add(*delta).ok_or_else(|| {

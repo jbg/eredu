@@ -427,7 +427,9 @@ pub fn local_geometry(
 }
 
 /// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn static_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = vec![
@@ -471,7 +473,7 @@ pub fn static_parallel_parameter_groups<B: GroupedNeuralBackend>(
     Ok(groups)
 }
 
-fn dense_groups<B: GroupedNeuralBackend>(
+fn dense_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     root: &str,
     mlp: &DenseMlp<B>,
     width: i32,
@@ -498,7 +500,9 @@ fn dense_groups<B: GroupedNeuralBackend>(
 }
 
 /// Declares semantic groups for one target physical block.
-pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn layer_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     block: &Block<B>,
     args: &ModelArgs,
     layer: usize,
@@ -507,7 +511,7 @@ pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
     block_parallel_parameter_groups(block, args, &root)
 }
 
-fn block_parallel_parameter_groups<B: GroupedNeuralBackend>(
+fn block_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     block: &Block<B>,
     args: &ModelArgs,
     root: &str,
@@ -643,7 +647,9 @@ fn block_parallel_parameter_groups<B: GroupedNeuralBackend>(
 }
 
 /// Declares semantic placement for one target or appended prediction unit.
-pub fn unit_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn unit_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     unit: &Unit<B>,
     args: &ModelArgs,
     flat: usize,
@@ -661,7 +667,9 @@ pub fn unit_parallel_parameter_groups<B: GroupedNeuralBackend>(
     }
 }
 
-fn prediction_parallel_parameter_groups<B: GroupedNeuralBackend>(
+fn prediction_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     unit: &PredictionUnit<B>,
     args: &ModelArgs,
     physical: usize,

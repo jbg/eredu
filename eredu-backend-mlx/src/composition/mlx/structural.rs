@@ -13,7 +13,7 @@ use super::realization::{
     requires_distributed_stage, AddressableParameterBankBinding, FamilyBinding, GgufBinding,
 };
 #[cfg(test)]
-use super::ModelLoadOptions;
+use super::MlxLoadRequest;
 use crate::backend::error::Error;
 
 /// Native view of the GGUF source admitted by portable inspection.
@@ -134,10 +134,13 @@ fn validate_quantization_capability(
     policy: eredu_core::PreparationPolicy,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
-    if policy.quantization.is_none() {
+    if policy.quantization().is_none() {
         return Ok(());
     }
-    if let Some(topology) = policy.topology.filter(|topology| !topology.is_replicated()) {
+    if let Some(topology) = policy
+        .topology()
+        .filter(|topology| !topology.is_replicated())
+    {
         if requires_distributed_stage(kind, topology) {
             return Ok(());
         }
@@ -152,7 +155,7 @@ fn validate_quantization_capability(
         return validate_complete_gguf_quantization(kind, true);
     }
     let supported = FamilyBinding::for_kind(kind).is_some()
-        && (policy.residency == eredu_core::ResidencyRequest::FullyResident
+        && (policy.residency() == eredu_core::ResidencyRequest::FullyResident
             || capabilities.nonresident_safetensors_quantization());
     if supported {
         return Ok(());
@@ -161,7 +164,7 @@ fn validate_quantization_capability(
         eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
             "load-time quantization is unavailable for the normalized {} architecture from SafeTensors with {:?} weights on MLX",
             kind.canonical_name(),
-            policy.residency,
+            policy.residency(),
         )),
     ))
 }
@@ -189,19 +192,20 @@ fn validate_preparation_capability_intersection(
     policy: eredu_core::PreparationPolicy,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
-    if let Some(topology) = policy.topology {
-        validate_parallel_capabilities(
-            capabilities,
-            topology,
-            match format {
-                eredu_core::ArtifactFormat::SafeTensors => "SafeTensors",
-                eredu_core::ArtifactFormat::Gguf => "GGUF",
-            },
-            kind.canonical_name(),
-        )?;
+    if let Some(topology) = policy.topology() {
+        let format_name = match format {
+            eredu_core::ArtifactFormat::SafeTensors => "SafeTensors",
+            eredu_core::ArtifactFormat::Gguf => "GGUF",
+            _ => {
+                return Err(Error::ArchitectureModel(
+                    "unsupported artifact format selected for parallel validation".into(),
+                ));
+            }
+        };
+        validate_parallel_capabilities(capabilities, topology, format_name, kind.canonical_name())?;
     }
     validate_quantization_capability(kind, format, policy, capabilities)?;
-    if policy.residency == eredu_core::ResidencyRequest::ExpertCache {
+    if policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks {
         validate_parameter_bank_capability(kind, capabilities)?;
     }
     Ok(())
@@ -209,10 +213,10 @@ fn validate_preparation_capability_intersection(
 
 fn requires_architecture_capabilities(policy: eredu_core::PreparationPolicy) -> bool {
     policy
-        .topology
+        .topology()
         .is_some_and(|topology| !topology.is_replicated())
-        || policy.residency == eredu_core::ResidencyRequest::ExpertCache
-        || policy.quantization.is_some()
+        || policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks
+        || policy.quantization().is_some()
 }
 
 pub(crate) fn validate_parallel_capabilities(
@@ -243,7 +247,7 @@ pub(crate) fn validate_parallel_capabilities(
 fn validate_safetensors_preparation_for_test(
     kind: ModelKind,
     config: &Value,
-    options: ModelLoadOptions,
+    options: MlxLoadRequest,
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
     eredu_core::validate_preparation_policy(kind.loading_protocol(), policy)?;
@@ -274,7 +278,7 @@ pub(crate) fn validate_inspected_preparation(
     >,
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
-    eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol, policy)?;
+    eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol(), policy)?;
     if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
@@ -302,6 +306,11 @@ pub(crate) fn validate_inspected_preparation(
                 })?,
             ),
         ),
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact format selected during structural validation".into(),
+            ));
+        }
     }
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_preparation_capability_intersection(kind, inspection.format(), policy, capabilities)
@@ -315,22 +324,18 @@ pub(crate) fn inspected_session_capabilities(
     policy: eredu_core::PreparationPolicy,
 ) -> Result<eredu_core::SessionCapabilities, Error> {
     validate_inspected_preparation(inspection, policy)?;
-    Ok(eredu_core::SessionCapabilities {
-        persistent_cache: true,
-        output_observation: true,
-        activation_inspection: true,
-    })
+    Ok(eredu_core::SessionCapabilities::new(true, true, true))
 }
 
 #[cfg(test)]
 mod admission_policy_tests {
     use super::*;
 
-    fn parameter_bank_options() -> ModelLoadOptions {
-        ModelLoadOptions::default().with_weight_residency(
-            eredu_runtime::WeightResidency::with_expert_cache(
-                eredu_runtime::NonExpertWeightResidency::FullyResident,
-                eredu_runtime::ExpertCacheLoadOptions::default(),
+    fn parameter_bank_options() -> MlxLoadRequest {
+        MlxLoadRequest::default().with_weight_residency(
+            eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                eredu_runtime::ParameterBankLoadOptions::default(),
             ),
         )
     }
@@ -451,8 +456,12 @@ mod admission_policy_tests {
     #[test]
     fn parameter_bank_admits_normalized_gemma4_and_muse_glimmer_moe() {
         let options = parameter_bank_options();
-        validate_safetensors_preparation_for_test(ModelKind::Gemma4, &gemma4_config(true), options)
-            .unwrap();
+        validate_safetensors_preparation_for_test(
+            ModelKind::Gemma4,
+            &gemma4_config(true),
+            options.clone(),
+        )
+        .unwrap();
         validate_safetensors_preparation_for_test(
             ModelKind::MuseGlimmer,
             &muse_glimmer_config(true),
@@ -463,7 +472,7 @@ mod admission_policy_tests {
 
     #[test]
     fn nonresident_quantization_admits_kimi_linear_capability_intersection() {
-        let options = ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+        let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
             .with_weight_residency(eredu_runtime::WeightResidency::layerwise_host(
                 eredu_runtime::LayerwiseLoadOptions::default(),
             ));
@@ -477,7 +486,7 @@ mod admission_policy_tests {
 
     #[test]
     fn complete_tensor_parallel_quantization_is_rejected_during_preflight() {
-        let topology = crate::backend::MlxParallelContext::for_rank(
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
             0,
             2,
             1,
@@ -485,7 +494,7 @@ mod admission_policy_tests {
             crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
         )
         .unwrap();
-        let options = ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+        let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
             .with_parallel_topology(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
@@ -510,7 +519,7 @@ mod admission_policy_tests {
 
     #[test]
     fn distributed_stage_quantization_is_admitted_during_preflight() {
-        let topology = crate::backend::MlxParallelContext::for_rank(
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
             0,
             1,
             2,
@@ -518,7 +527,7 @@ mod admission_policy_tests {
             crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
         )
         .unwrap();
-        let options = ModelLoadOptions::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+        let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
             .with_parallel_topology(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
@@ -532,10 +541,10 @@ mod admission_policy_tests {
 
     #[test]
     fn replicated_gguf_quantization_requires_a_bound_complete_loader() {
-        let policy = eredu_core::PreparationPolicy {
-            quantization: Some(eredu_core::QuantizationRequest::MxFp4),
-            ..eredu_core::PreparationPolicy::default()
-        };
+        let policy = eredu_core::PreparationPolicy::new(
+            Some(eredu_core::QuantizationRequest::MxFp4),
+            eredu_core::ResidencyRequest::FullyResident,
+        );
         let capabilities = eredu_architectures::preparation::ArchitectureCapabilities::default();
 
         validate_quantization_capability(
@@ -571,7 +580,7 @@ mod admission_policy_tests {
             (ModelKind::Qwen3, dense_qwen3_config()),
         ] {
             assert!(matches!(
-                validate_safetensors_preparation_for_test(kind, &config, options),
+                validate_safetensors_preparation_for_test(kind, &config, options.clone()),
                 Err(Error::Artifact(
                     eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(_)
                 ))
@@ -581,7 +590,7 @@ mod admission_policy_tests {
 
     #[test]
     fn preparation_rejects_an_unsupported_exact_parallel_axis() {
-        let topology = crate::backend::MlxParallelContext::for_rank(
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
             0,
             1,
             1,
@@ -592,7 +601,7 @@ mod admission_policy_tests {
         let error = validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
             &dense_qwen3_config(),
-            ModelLoadOptions::with_parallel(
+            MlxLoadRequest::with_parallel(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
@@ -606,7 +615,7 @@ mod admission_policy_tests {
 
     #[test]
     fn preparation_accepts_supported_exact_parallel_axes() {
-        let topology = crate::backend::MlxParallelContext::for_rank(
+        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
             0,
             2,
             3,
@@ -618,7 +627,7 @@ mod admission_policy_tests {
         validate_safetensors_preparation_for_test(
             ModelKind::Qwen3,
             &dense_qwen3_config(),
-            ModelLoadOptions::with_parallel(
+            MlxLoadRequest::with_parallel(
                 topology,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,

@@ -13,10 +13,11 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use eredu_backend_mlx::backend::{
-    config::ModelLoadOptions, runtime::media::input::ModelInput, MlxBackend,
-};
 use eredu_backend_mlx::native::{ExecutionContext, MlxModelInput, MlxModelSession};
+use eredu_backend_mlx::{
+    backend::{runtime::media::input::ModelInput, MlxBackend},
+    MlxLoadRequest,
+};
 use eredu_core::{
     load_model, BackendProvider as _, BackendSession as _, ObservationValue, TensorObservationData,
 };
@@ -229,10 +230,10 @@ fn main() -> Result<()> {
 
     memory::reset_peak_memory()?;
     let load_started = Instant::now();
-    let model = load_model(&backend, &args.model, ModelLoadOptions::default())
+    let model = load_model(&backend, &args.model, MlxLoadRequest::default())
         .with_context(|| format!("failed to load checkpoint {}", args.model.display()))?;
-    let model_family = model.model_family().canonical_name().to_owned();
-    let effective_model_type = model.effective_model_type().to_owned();
+    let model_family = "selected-by-architecture-plan".to_owned();
+    let effective_model_type = "selected-by-architecture-plan".to_owned();
     let mut session = backend.create_session(model)?;
     backend.synchronize()?;
     weights_stream.synchronize()?;

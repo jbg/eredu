@@ -55,23 +55,53 @@ impl RealtimePreparationPlan {
         &self.recipes
     }
 
-    /// Consumes the preparation into materialization inputs.
-    pub fn into_parts(
-        self,
-    ) -> (
-        PathBuf,
-        PathBuf,
-        MoshiConfig,
-        SafetensorsCheckpointPlan,
-        AtomicRecipeSet,
-    ) {
-        (
-            self.artifact_root,
-            self.checkpoint_source,
-            self.config,
-            self.checkpoint_plan,
-            self.recipes,
-        )
+    /// Consumes the preparation into a named materialization artifact.
+    pub fn into_artifact(self) -> RealtimePreparationArtifact {
+        RealtimePreparationArtifact {
+            artifact_root: Some(self.artifact_root),
+            checkpoint_source: Some(self.checkpoint_source),
+            config: Some(self.config),
+            checkpoint_plan: Some(self.checkpoint_plan),
+            recipes: Some(self.recipes),
+        }
+    }
+}
+
+/// Named consuming artifact for realtime materialization inputs.
+pub struct RealtimePreparationArtifact {
+    artifact_root: Option<PathBuf>,
+    checkpoint_source: Option<PathBuf>,
+    config: Option<MoshiConfig>,
+    checkpoint_plan: Option<SafetensorsCheckpointPlan>,
+    recipes: Option<AtomicRecipeSet>,
+}
+
+impl RealtimePreparationArtifact {
+    /// Takes the submitted artifact root exactly once.
+    pub fn take_artifact_root(&mut self) -> PathBuf {
+        self.artifact_root
+            .take()
+            .expect("artifact root already taken")
+    }
+    /// Takes the physical checkpoint source exactly once.
+    pub fn take_checkpoint_source(&mut self) -> PathBuf {
+        self.checkpoint_source
+            .take()
+            .expect("checkpoint source already taken")
+    }
+    /// Takes normalized architecture configuration exactly once.
+    pub fn take_config(&mut self) -> MoshiConfig {
+        self.config.take().expect("realtime config already taken")
+    }
+    /// Takes the strict checkpoint plan exactly once.
+    pub fn take_checkpoint_plan(&mut self) -> SafetensorsCheckpointPlan {
+        self.checkpoint_plan
+            .take()
+            .expect("checkpoint plan already taken")
+    }
+    /// Takes canonical binding recipes exactly once.
+    pub fn take_recipes(&mut self) -> AtomicRecipeSet {
+        self.recipes.take().expect("realtime recipes already taken")
     }
 }
 

@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     if let Some(path) = &drafter_path {
-        plan.drafting = DraftingPlan::External {
+        plan = plan.with_drafting(DraftingPlan::External {
             model: path.clone(),
             placement: DraftPlacementPlan::Device {
                 device: local_device_plan(LocalDevice::Cpu)?,
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_draft_tokens: 3,
             lookahead: true,
             adaptive_lookahead: false,
-        };
+        });
     }
     let planned =
         LocalModel::load_execution_plan(&LocalBackendFactory::default(), &target_path, &plan)?;
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cancellation: GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
-            .finish_reason
+            .finish_reason()
     } else {
         model
             .generate_prepared_chat(LocalPreparedChatGenerationRequest {

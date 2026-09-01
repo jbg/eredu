@@ -584,7 +584,7 @@ impl<T> DFlashContext<T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct DFlashAttention<B: NeuralBackend> {
+struct DFlashAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     query: B::Linear,
     key: B::Linear,
     value: B::Linear,
@@ -602,7 +602,7 @@ struct DFlashAttention<B: NeuralBackend> {
     scale: f32,
 }
 
-impl<B: NeuralBackend> DFlashAttention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
     fn new(
         config: &DFlashConfig,
         layer: usize,
@@ -749,7 +749,7 @@ impl<B: NeuralBackend> DFlashAttention<B> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct DFlashBlock<B: NeuralBackend> {
+struct DFlashBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     input_norm: B::Normalization,
     attention: DFlashAttention<B>,
     post_attention_norm: B::Normalization,
@@ -758,7 +758,7 @@ struct DFlashBlock<B: NeuralBackend> {
     down: B::Linear,
 }
 
-impl<B: NeuralBackend> DFlashBlock<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
     fn new(
         config: &DFlashConfig,
         layer: usize,
@@ -835,7 +835,7 @@ impl<B: NeuralBackend> DFlashBlock<B> {
 /// Neutral DFlash assistant body. The target embedding and output head remain target-owned.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DFlash<B: NeuralBackend> {
+pub struct DFlash<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     encoder: B::Linear,
     encoder_norm: B::Normalization,
     layers: Vec<DFlashBlock<B>>,
@@ -844,7 +844,7 @@ pub struct DFlash<B: NeuralBackend> {
     config: DFlashConfig,
 }
 
-impl<B: NeuralBackend> DFlash<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
     /// Builds the unloaded released assistant body.
     pub fn new(
         config: DFlashConfig,

@@ -7,8 +7,8 @@ use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
-    LayeredArchitecture, ParallelLayeredArchitecture,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, LayeredArchitecture,
+    ParallelLayeredArchitecture, ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -25,7 +25,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -45,6 +44,7 @@ use crate::{
         PipelineLoadAccumulator, PipelineModel, PipelineMtpCache, PipelinePartitionMetadata,
         PipelinePayload, PipelineStageInput, PipelineStageOutput, PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
     composition::{
         inkling::{InklingBindings, InklingPipelineUnit, PreparedInklingInput},
         mlx::speculative::embedded::EmbeddedMtpOutput,
@@ -105,6 +105,7 @@ impl InklingPipelinePartition {
                         eredu_architectures::inkling::DecoderInputPart::Audio(tokens)
                     }
                     eredu_core::InputModality::Video => unreachable!(),
+                    _ => unreachable!("validated Inkling input modality"),
                 },
             })
             .collect::<Vec<_>>();
@@ -846,16 +847,16 @@ pub(super) fn load_neutral_inkling_pipeline(
     source_args: eredu_architectures::inkling::ModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Inkling], "Inkling")?;
-    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
+    let external_experts = topology.expert_parallel_size() > 1 || parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         InklingBindings::new_external_experts()
     } else {
@@ -952,7 +953,7 @@ pub(super) fn load_neutral_inkling_pipeline(
     let range = topology.layer_range(target_units)?;
     let neutral_placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -968,7 +969,7 @@ pub(super) fn load_neutral_inkling_pipeline(
     let partition = neutral_placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
-            topology.pipeline_parallel_rank,
+            topology.pipeline_parallel_rank(),
             Arc::clone(&geometry),
             &parameter_description,
         )?;
@@ -985,7 +986,7 @@ pub(super) fn load_neutral_inkling_pipeline(
         stage.expert_assignment = Some(assignment);
         stage.expert_storage = PipelineExpertStorage::ExternalEmpty;
     }
-    let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
+    let parallel_layout = (topology.tensor_parallel_size() > 1).then_some(planned_layout.clone());
     let vision_group = architecture_group_by_id::<_, MlxHybridState>(
         &stage.architecture,
         eredu_architectures::inkling::VISION_EXECUTION_GROUP,
@@ -1205,7 +1206,7 @@ pub(super) fn load_neutral_inkling_pipeline(
         let units = crate::composition::select_architecture_expert_units(
             catalog,
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
-            |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
+            |identity| assignment.owner(identity.member()) == Some(assignment.rank()),
         );
         let entries = crate::composition::architecture_expert_units(
             units,

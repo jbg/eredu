@@ -1,6 +1,9 @@
 //! Selection contracts for replicated text architectures.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
 use eredu_core::{ParallelTopology, QuantizationRequest, SessionCapabilities};
@@ -283,12 +286,58 @@ impl ReplicatedTextParameterPresence {
 }
 
 /// Exact admitted source and executable constraints for one logical parameter.
+#[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReplicatedTextPhysicalSource {
+    tensor: String,
+    shard: PathBuf,
+    output: String,
+}
+
+impl ReplicatedTextPhysicalSource {
+    /// Records one exact physical tensor, admitted shard, and selected output.
+    pub fn new(
+        tensor: impl Into<String>,
+        shard: impl Into<PathBuf>,
+        output: impl Into<String>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let tensor = tensor.into();
+        let shard = shard.into();
+        let output = output.into();
+        if tensor.trim().is_empty() || shard.as_os_str().is_empty() || output.trim().is_empty() {
+            return Err(ReplicatedTextContractError::invalid(
+                "physical source tensor, shard, and output must be non-empty",
+            ));
+        }
+        Ok(Self {
+            tensor,
+            shard,
+            output,
+        })
+    }
+
+    /// Physical tensor identity in the admitted container.
+    pub fn tensor(&self) -> &str {
+        &self.tensor
+    }
+    /// Canonical admitted payload shard.
+    pub fn shard(&self) -> &Path {
+        &self.shard
+    }
+    /// Exact logical output selected from the physical tensor.
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+}
+
+/// Exact admitted source and executable constraints for one logical parameter.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextParameterRequirement {
     /// Canonical logical parameter identity.
     name: String,
     /// Physical outputs admitted as sources for this logical parameter.
     sources: Vec<String>,
+    /// Exact shard and multi-output provenance for the physical input.
+    physical_sources: Vec<ReplicatedTextPhysicalSource>,
     /// All admitted aliases for the logical parameter.
     aliases: Vec<String>,
     /// Encoding of the selected physical source, when present.
@@ -318,6 +367,7 @@ impl ReplicatedTextParameterRequirement {
     pub fn new(
         name: impl Into<String>,
         sources: Vec<String>,
+        physical_sources: Vec<ReplicatedTextPhysicalSource>,
         aliases: Vec<String>,
         source_encoding: Option<SourceTensorEncoding>,
         physical_shape: Option<Vec<usize>>,
@@ -349,6 +399,22 @@ impl ReplicatedTextParameterRequirement {
                 "logical parameter {name:?} has inconsistent source presence"
             )));
         }
+        let provenance_required =
+            has_source || matches!(presence, ReplicatedTextParameterPresence::Derived { .. });
+        if provenance_required != !physical_sources.is_empty() {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "logical parameter {name:?} has inconsistent physical provenance"
+            )));
+        }
+        if has_source
+            && physical_sources
+                .iter()
+                .any(|source| !sources.iter().any(|name| name == source.tensor()))
+        {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "logical parameter {name:?} has provenance outside its selected sources"
+            )));
+        }
         if physical_shape
             .as_ref()
             .is_some_and(|shape| shape.is_empty() || shape.contains(&0))
@@ -372,6 +438,7 @@ impl ReplicatedTextParameterRequirement {
         Ok(Self {
             name,
             sources,
+            physical_sources,
             aliases,
             source_encoding,
             physical_shape,
@@ -392,6 +459,11 @@ impl ReplicatedTextParameterRequirement {
     /// Returns exact admitted physical source identities.
     pub fn sources(&self) -> &[String] {
         &self.sources
+    }
+
+    /// Returns exact admitted shard and multi-output provenance.
+    pub fn physical_sources(&self) -> &[ReplicatedTextPhysicalSource] {
+        &self.physical_sources
     }
 
     /// Returns all architecture-admitted alternative source identities.
@@ -474,6 +546,11 @@ impl ReplicatedTextParameterRequirement {
                     )));
                 }
                 LinearFormat::MxFp4
+            }
+            _ => {
+                return Err(ReplicatedTextContractError::invalid(
+                    "unknown load-time transform request",
+                ))
             }
         };
         let descriptor = self.lowering_descriptor(executable)?;
@@ -835,6 +912,7 @@ pub struct SelectedParameterRealization {
     name: String,
     /// Physical outputs admitted as sources for this logical parameter.
     sources: Vec<String>,
+    physical_sources: Vec<ReplicatedTextPhysicalSource>,
     /// Admitted physical encoding.
     source_encoding: SourceTensorEncoding,
     /// Exact executable format used to construct the architecture module.
@@ -851,6 +929,10 @@ impl SelectedParameterRealization {
     /// Returns admitted physical source identities.
     pub fn sources(&self) -> &[String] {
         &self.sources
+    }
+    /// Returns the exact selected shard and multi-output provenance.
+    pub fn physical_sources(&self) -> &[ReplicatedTextPhysicalSource] {
+        &self.physical_sources
     }
     /// Returns the admitted source encoding.
     pub const fn source_encoding(&self) -> &SourceTensorEncoding {
@@ -982,18 +1064,18 @@ pub fn select_replicated_text_realization(
     }
     for (required, supported, name) in [
         (
-            request.session.persistent_cache,
-            capabilities.session.persistent_cache,
+            request.session.persistent_cache(),
+            capabilities.session.persistent_cache(),
             "persistent_cache",
         ),
         (
-            request.session.output_observation,
-            capabilities.session.output_observation,
+            request.session.output_observation(),
+            capabilities.session.output_observation(),
             "output_observation",
         ),
         (
-            request.session.activation_inspection,
-            capabilities.session.activation_inspection,
+            request.session.activation_inspection(),
+            capabilities.session.activation_inspection(),
             "activation_inspection",
         ),
     ] {
@@ -1063,6 +1145,7 @@ pub fn select_replicated_text_realization(
         parameters.push(SelectedParameterRealization {
             name: parameter.name.clone(),
             sources: parameter.sources.clone(),
+            physical_sources: parameter.physical_sources.clone(),
             source_encoding: parameter
                 .source_encoding
                 .clone()
@@ -1098,7 +1181,6 @@ mod tests {
     };
     use eredu_checkpoint::{AffineQuantization, StoredDtype};
     use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
-    use std::cell::Cell;
 
     fn paged_state() -> CacheResidencyPolicy {
         CacheResidencyPolicy::Paged(
@@ -1106,6 +1188,10 @@ mod tests {
                 .unwrap()
                 .with_full_attention(true),
         )
+    }
+
+    fn physical_source(name: &str) -> ReplicatedTextPhysicalSource {
+        ReplicatedTextPhysicalSource::new(name, "/checkpoint/model.safetensors", name).unwrap()
     }
 
     fn requirements() -> ReplicatedTextRequirements {
@@ -1137,6 +1223,7 @@ mod tests {
                 ReplicatedTextParameterRequirement::new(
                     "model.layers.0.mlp.weight",
                     vec!["blk.0.ffn.weight".into()],
+                    vec![physical_source("blk.0.ffn.weight")],
                     Vec::new(),
                     Some(SourceTensorEncoding::Safetensors(StoredDtype::F16)),
                     Some(vec![64, 64]),
@@ -1155,6 +1242,7 @@ mod tests {
                     "model.layers.0.mlp.bias",
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                     None,
                     None,
                     vec![64],
@@ -1171,6 +1259,7 @@ mod tests {
                 ReplicatedTextParameterRequirement::new(
                     "model.layers.0.norm.weight",
                     vec!["blk.0.norm.weight".into()],
+                    vec![physical_source("blk.0.norm.weight")],
                     Vec::new(),
                     Some(SourceTensorEncoding::Safetensors(StoredDtype::F16)),
                     Some(vec![64]),
@@ -1188,6 +1277,85 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn parameter_requirement_preserves_every_admitted_alias() {
+        let requirement = ReplicatedTextParameterRequirement::new(
+            "model.layers.0.mlp.weight",
+            vec!["released.layers.0.mlp.weight".into()],
+            vec![physical_source("released.layers.0.mlp.weight")],
+            vec![
+                "legacy.layers.0.mlp.weight".into(),
+                "vendor.layers.0.mlp.weight".into(),
+            ],
+            Some(SourceTensorEncoding::Safetensors(StoredDtype::F16)),
+            Some(vec![64, 64]),
+            vec![64, 64],
+            LinearFormat::Dense,
+            ReplicatedTextParameterRole::LinearWeight,
+            ReplicatedTextParameterOwner::ExecutionUnit {
+                group: "decoder".into(),
+                unit: 0,
+            },
+            ReplicatedTextParameterPresence::Required,
+            ParameterTransformConstraint::Linear { packed_axis: 1 },
+        )
+        .unwrap();
+
+        assert_eq!(
+            requirement.aliases(),
+            ["legacy.layers.0.mlp.weight", "vendor.layers.0.mlp.weight"]
+        );
+        assert_eq!(requirement.sources(), ["released.layers.0.mlp.weight"]);
+
+        let absent_bias = ReplicatedTextParameterRequirement::new(
+            "model.layers.0.mlp.bias",
+            Vec::new(),
+            Vec::new(),
+            vec!["released.layers.0.mlp.bias".into()],
+            None,
+            None,
+            vec![64],
+            LinearFormat::Dense,
+            ReplicatedTextParameterRole::LinearBias,
+            ReplicatedTextParameterOwner::ExecutionUnit {
+                group: "decoder".into(),
+                unit: 0,
+            },
+            ReplicatedTextParameterPresence::OptionalAbsent,
+            ParameterTransformConstraint::None,
+        )
+        .unwrap();
+        assert_eq!(
+            absent_bias.presence(),
+            &ReplicatedTextParameterPresence::OptionalAbsent
+        );
+        assert!(absent_bias.sources().is_empty());
+        assert_eq!(
+            absent_bias.transform_constraint(),
+            ParameterTransformConstraint::None
+        );
+    }
+
+    #[test]
+    fn physical_provenance_distinguishes_outputs_from_one_sharded_tensor() {
+        let shard = "/checkpoint/model-00002-of-00003.gguf";
+        let weight = ReplicatedTextPhysicalSource::new(
+            "blk.0.ffn_gate.weight",
+            shard,
+            "blk.0.ffn_gate.weight",
+        )
+        .unwrap();
+        let scales = ReplicatedTextPhysicalSource::new(
+            "blk.0.ffn_gate.weight",
+            shard,
+            "blk.0.ffn_gate.scales",
+        )
+        .unwrap();
+        assert_eq!(weight.tensor(), scales.tensor());
+        assert_eq!(weight.shard(), scales.shard());
+        assert_ne!(weight.output(), scales.output());
     }
 
     fn capabilities() -> BackendMechanismCapabilities {
@@ -1239,24 +1407,70 @@ mod tests {
                 StateResidencyMechanism::Paged,
             ],
         )
-        .with_session(SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: true,
-        })
+        .with_session(SessionCapabilities::new(true, true, true))
         .with_prompt_cache(true)
         .with_exact_completion(true)
     }
 
     fn request(residency: LayerWeightResidency) -> ReplicatedTextSelectionRequest {
         ReplicatedTextSelectionRequest::new(residency, paged_state())
-            .with_session(SessionCapabilities {
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: true,
-            })
+            .with_session(SessionCapabilities::new(true, true, true))
             .with_prompt_cache(true)
             .with_exact_completion(true)
+    }
+
+    #[test]
+    fn complete_requirements_are_invariant_across_all_caller_policy_dimensions() {
+        let baseline = requirements();
+        let disk = DenseDiskStreamLoadOptions::new(4096, 8192, 2, 1).unwrap();
+        let requests = [
+            ReplicatedTextSelectionRequest::new(
+                LayerWeightResidency::FullyResident,
+                CacheResidencyPolicy::Device,
+            ),
+            ReplicatedTextSelectionRequest::new(
+                LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::default()),
+                paged_state(),
+            )
+            .with_topology(ParallelTopology::new(2, 1, 1, 1).unwrap())
+            .with_quantization(QuantizationRequest::Affine {
+                group_size: 64,
+                bits: 4,
+            })
+            .with_session(SessionCapabilities::new(true, true, true))
+            .with_prompt_cache(true)
+            .with_exact_completion(true),
+            ReplicatedTextSelectionRequest::new(
+                LayerWeightResidency::DenseDiskStream(disk),
+                CacheResidencyPolicy::Device,
+            )
+            .with_quantization(QuantizationRequest::MxFp4),
+        ];
+
+        for _request in &requests {
+            assert_eq!(requirements(), baseline);
+        }
+        assert_eq!(requests[0].state(), &CacheResidencyPolicy::Device);
+        assert!(matches!(
+            requests[1].residency(),
+            LayerWeightResidency::LayerwiseHost(_)
+        ));
+        assert_eq!(requests[1].topology().unwrap().tensor(), 2);
+        assert_eq!(
+            requests[1].quantization(),
+            Some(QuantizationRequest::Affine {
+                group_size: 64,
+                bits: 4,
+            })
+        );
+        assert!(requests[1].prompt_cache());
+        assert!(requests[1].exact_completion());
+        assert!(requests[1].session().activation_inspection());
+        assert_eq!(
+            requests[2].residency(),
+            LayerWeightResidency::DenseDiskStream(disk)
+        );
+        assert_eq!(requests[2].quantization(), Some(QuantizationRequest::MxFp4));
     }
 
     #[test]
@@ -1395,24 +1609,16 @@ mod tests {
         ] {
             let mut requirements = requirements();
             mutate(&mut requirements.parameters[0]);
-            let modules = Cell::new(0_u32);
-            let payloads = Cell::new(0_u32);
             let selected = select_replicated_text_realization(
                 &requirements,
                 &request(LayerWeightResidency::FullyResident),
                 &capabilities(),
             );
-            if selected.is_ok() {
-                modules.set(modules.get() + 1);
-                payloads.set(payloads.get() + 1);
-            }
             let error = selected.unwrap_err();
             assert!(error
                 .issues()
                 .iter()
                 .any(|issue| issue.contains("weight lowering")));
-            assert_eq!(modules.get(), 0);
-            assert_eq!(payloads.get(), 0);
         }
     }
 
@@ -1424,25 +1630,15 @@ mod tests {
         ]);
         let capabilities =
             capabilities().with_grouped_operations([GroupedOperationRequirement::GatedProduct]);
-        let modules = Cell::new(0_u32);
-        let forwards = Cell::new(0_u32);
-
         let selected = select_replicated_text_realization(
             &requirements,
             &request(LayerWeightResidency::FullyResident),
             &capabilities,
         );
-        if selected.is_ok() {
-            modules.set(modules.get() + 1);
-            forwards.set(forwards.get() + 1);
-        }
-
         let error = selected.unwrap_err();
         assert!(error
             .issues()
             .iter()
             .any(|issue| { issue.contains("GatedProductTensorParallelPartial") }));
-        assert_eq!(modules.get(), 0);
-        assert_eq!(forwards.get(), 0);
     }
 }

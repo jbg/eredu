@@ -26,7 +26,7 @@ use super::{
 /// One target or configured prediction execution unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: GroupedNeuralBackend> {
+pub enum Unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Ordinary hybrid decoder block.
     Target(Block<B>),
     /// One embedded prediction depth.
@@ -35,7 +35,7 @@ pub enum Unit<B: GroupedNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -63,7 +63,7 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -119,7 +119,7 @@ impl<T> ForwardContext<T> {
     }
 }
 
-impl<B: GroupedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Resumes an already embedded target partition in the canonical layered context.
     pub fn resume_target_partition(
         &self,
@@ -168,7 +168,7 @@ impl<B: GroupedNeuralBackend> LayeredModel<B> {
 }
 
 /// One neutral layered model for Qwen3-Next and every Qwen3.5 text policy.
-pub struct LayeredModel<B: GroupedNeuralBackend> {
+pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: HybridConfig,
     decoder: HybridDecoder<B>,
     target_layers: usize,
@@ -176,7 +176,9 @@ pub struct LayeredModel<B: GroupedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
-impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
+{
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -241,7 +243,7 @@ impl<B: GroupedNeuralBackend> eredu_runtime::ArchitectureParameters<B> for Layer
     }
 }
 
-impl<B: GroupedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules and the exact configured graph.
     pub fn new(
         config: HybridConfig,
@@ -681,7 +683,7 @@ fn static_spec(config: &HybridConfig) -> Result<StaticModuleSpec, Error> {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -922,7 +924,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1056,7 +1058,7 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
@@ -1206,15 +1208,16 @@ pub fn state_identity(
             "Qwen hybrid owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: config.variant.model_kind().canonical_name().into(),
-        effective_model_type: config.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(config),
+    eredu_runtime::ModelStateIdentity::new(
+        config.variant.model_kind().canonical_name(),
+        config.model_type.clone(),
+        prompt_cache_architecture_fingerprint(config),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }
 
 #[cfg(test)]
@@ -1254,8 +1257,8 @@ mod state_identity_tests {
         .prompt_cache_identity(&layout)
         .unwrap();
 
-        assert_eq!(identity.model_family, "qwen3_5");
-        assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
+        assert_eq!(identity.model_family(), "qwen3_5");
+        assert_eq!(identity.layer_prefix_offsets(), [0, 0, -1, -1]);
 
         let prediction_layout = layout.slice(2..4).unwrap();
         let prediction_identity = state_identity(
@@ -1267,7 +1270,7 @@ mod state_identity_tests {
         .unwrap()
         .prompt_cache_identity(&prediction_layout)
         .unwrap();
-        assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);
+        assert_eq!(prediction_identity.layer_prefix_offsets(), [-1, -1]);
     }
 
     #[test]
@@ -1285,6 +1288,6 @@ mod state_identity_tests {
         .prompt_cache_identity(&layout)
         .unwrap();
 
-        assert_eq!(identity.model_family, "qwen3_next");
+        assert_eq!(identity.model_family(), "qwen3_next");
     }
 }

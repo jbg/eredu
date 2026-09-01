@@ -1292,7 +1292,7 @@ impl DeepSeekModel {
 
     fn attach_parameter_bank(
         &mut self,
-        options: eredu_runtime::ExpertCacheLoadOptions,
+        options: eredu_runtime::ParameterBankLoadOptions,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<(), Error> {
@@ -1450,7 +1450,7 @@ impl DeepSeekModel {
                 .collect::<BTreeMap<_, _>>();
             for (layer, cache) in state.as_mut().iter_mut().enumerate() {
                 let processed = prefix
-                    .checked_add(identity.layer_prefix_offsets[layer])
+                    .checked_add(identity.layer_prefix_offsets()[layer])
                     .ok_or_else(|| unsupported("prompt layer offset overflow"))?;
                 cache
                     .restore_prompt_cache_state(layer, &mut fixed, processed)
@@ -1781,7 +1781,7 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let store = artifact.store();
     match artifact.model() {
         eredu_architectures::configuration::SafetensorsModelConfig::DeepSeekV3(args) => {
@@ -1850,7 +1850,7 @@ pub fn load_gguf(
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
     let checkpoint = source.checkpoint();
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
     let model = match source.model() {
         eredu_architectures::configuration::GgufModelConfig::DeepSeekV4(args) => {

@@ -56,9 +56,9 @@ impl<'de> Deserialize<'de> for BackendId {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct DevicePlan {
     /// Backend adapter identity.
-    pub backend: BackendId,
+    pub(crate) backend: BackendId,
     /// Backend-stable device identifier.
-    pub device: String,
+    pub(crate) device: String,
 }
 
 impl<'de> Deserialize<'de> for DevicePlan {
@@ -92,11 +92,21 @@ impl DevicePlan {
             device,
         })
     }
+
+    /// Selected backend identity.
+    pub const fn backend(&self) -> &BackendId {
+        &self.backend
+    }
+    /// Backend-stable device identifier.
+    pub fn device(&self) -> &str {
+        &self.device
+    }
 }
 
 /// Static weight placement selected by an execution plan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResidencyPlan {
     /// Retain all selected weights on the execution device.
     FullyResident,
@@ -129,21 +139,61 @@ pub enum ResidencyPlan {
 pub struct ExpertCachePlan {
     /// Logical device expert-cache budget.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_budget_bytes: Option<u64>,
+    pub(crate) device_budget_bytes: Option<u64>,
     /// Charged host expert-cache budget.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_budget_bytes: Option<u64>,
+    pub(crate) host_budget_bytes: Option<u64>,
     /// Hard compact-bank scratch bound.
-    pub scratch_bytes: u64,
+    pub(crate) scratch_bytes: u64,
     /// Soft prefill compact-bank target.
-    pub prefill_bank_bytes: u64,
+    pub(crate) prefill_bank_bytes: u64,
     /// Deterministic eviction ordering for independently cached experts.
-    pub eviction_policy: CacheEvictionPolicy,
+    pub(crate) eviction_policy: CacheEvictionPolicy,
+}
+
+impl ExpertCachePlan {
+    /// Creates one independent routed-parameter cache plan.
+    pub const fn new(
+        device_budget_bytes: Option<u64>,
+        host_budget_bytes: Option<u64>,
+        scratch_bytes: u64,
+        prefill_bank_bytes: u64,
+        eviction_policy: CacheEvictionPolicy,
+    ) -> Self {
+        Self {
+            device_budget_bytes,
+            host_budget_bytes,
+            scratch_bytes,
+            prefill_bank_bytes,
+            eviction_policy,
+        }
+    }
+    /// Logical device cache budget.
+    pub const fn device_budget_bytes(&self) -> Option<u64> {
+        self.device_budget_bytes
+    }
+    /// Charged host cache budget.
+    pub const fn host_budget_bytes(&self) -> Option<u64> {
+        self.host_budget_bytes
+    }
+    /// Hard compact-bank scratch bound.
+    pub const fn scratch_bytes(&self) -> u64 {
+        self.scratch_bytes
+    }
+    /// Soft prefill compact-bank target.
+    pub const fn prefill_bank_bytes(&self) -> u64 {
+        self.prefill_bank_bytes
+    }
+    /// Deterministic eviction ordering.
+    pub const fn eviction_policy(&self) -> CacheEvictionPolicy {
+        self.eviction_policy
+    }
 }
 
 /// Speculative decoding selected by an execution plan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DraftingPlan {
     /// Ordinary target-only decoding.
     Disabled,
@@ -174,6 +224,7 @@ pub enum DraftingPlan {
 /// External assistant placement selected by an execution plan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DraftPlacementPlan {
     /// Reuse the target execution context.
     Target,
@@ -187,6 +238,7 @@ pub enum DraftPlacementPlan {
 /// Optional load-time transformation applied to checkpoint weights.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WeightTransformationPlan {
     /// Preserve checkpoint-native weight encodings.
     PreserveCheckpoint,
@@ -205,26 +257,26 @@ pub enum WeightTransformationPlan {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     /// Version of this serialized plan schema.
-    pub schema_version: u32,
+    pub(crate) schema_version: u32,
     /// Backend and process-local device selected for the whole session.
-    pub device: DevicePlan,
+    pub(crate) device: DevicePlan,
     /// Distributed Cartesian topology.
-    pub topology: ParallelTopology,
+    pub(crate) topology: ParallelTopology,
     /// Ordinary static-weight placement.
-    pub residency: ResidencyPlan,
+    pub(crate) residency: ResidencyPlan,
     /// Optional transformation applied while checkpoint weights are loaded.
-    pub weight_transformation: WeightTransformationPlan,
+    pub(crate) weight_transformation: WeightTransformationPlan,
     /// Maximum number of checkpoint shards or readers retained simultaneously.
-    pub max_cached_shards: usize,
+    pub(crate) max_cached_shards: usize,
     /// Independent routed-expert cache, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expert_cache: Option<ExpertCachePlan>,
+    pub(crate) expert_cache: Option<ExpertCachePlan>,
     /// Speculative decoding configuration.
-    pub drafting: DraftingPlan,
+    pub(crate) drafting: DraftingPlan,
     /// Capabilities which the selected device must provide.
-    pub required_device_capabilities: DeviceCapabilities,
+    pub(crate) required_device_capabilities: DeviceCapabilities,
     /// Capabilities which the exact prepared session must provide.
-    pub required_session_capabilities: SessionCapabilities,
+    pub(crate) required_session_capabilities: SessionCapabilities,
 }
 
 impl ExecutionPlan {
@@ -239,12 +291,96 @@ impl ExecutionPlan {
             max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             expert_cache: None,
             drafting: DraftingPlan::Disabled,
-            required_device_capabilities: DeviceCapabilities {
-                exact_completion: true,
-                ..DeviceCapabilities::default()
-            },
+            required_device_capabilities: DeviceCapabilities::new(true, false, false),
             required_session_capabilities: SessionCapabilities::default(),
         }
+    }
+
+    /// Serialized schema version.
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    /// Selected backend and device.
+    pub const fn device(&self) -> &DevicePlan {
+        &self.device
+    }
+    /// Distributed topology.
+    pub const fn topology(&self) -> &ParallelTopology {
+        &self.topology
+    }
+    /// Static weight placement.
+    pub const fn residency(&self) -> &ResidencyPlan {
+        &self.residency
+    }
+    /// Load-time weight transformation.
+    pub const fn weight_transformation(&self) -> WeightTransformationPlan {
+        self.weight_transformation
+    }
+    /// Maximum simultaneously retained checkpoint readers.
+    pub const fn max_cached_shards(&self) -> usize {
+        self.max_cached_shards
+    }
+    /// Optional independent routed-parameter cache.
+    pub const fn expert_cache(&self) -> Option<&ExpertCachePlan> {
+        self.expert_cache.as_ref()
+    }
+    /// Speculative drafting selection.
+    pub const fn drafting(&self) -> &DraftingPlan {
+        &self.drafting
+    }
+    /// Required device capabilities.
+    pub const fn required_device_capabilities(&self) -> &DeviceCapabilities {
+        &self.required_device_capabilities
+    }
+    /// Required prepared-session capabilities.
+    pub const fn required_session_capabilities(&self) -> &SessionCapabilities {
+        &self.required_session_capabilities
+    }
+
+    /// Replaces the distributed topology.
+    pub fn with_topology(mut self, topology: ParallelTopology) -> Self {
+        self.topology = topology;
+        self
+    }
+    /// Replaces the selected backend and device.
+    pub fn with_device(mut self, device: DevicePlan) -> Self {
+        self.device = device;
+        self
+    }
+    /// Replaces static weight placement.
+    pub fn with_residency(mut self, residency: ResidencyPlan) -> Self {
+        self.residency = residency;
+        self
+    }
+    /// Replaces load-time weight transformation.
+    pub fn with_weight_transformation(mut self, transformation: WeightTransformationPlan) -> Self {
+        self.weight_transformation = transformation;
+        self
+    }
+    /// Replaces the checkpoint reader bound.
+    pub fn with_max_cached_shards(mut self, maximum: usize) -> Self {
+        self.max_cached_shards = maximum;
+        self
+    }
+    /// Replaces the independent routed-parameter cache plan.
+    pub fn with_expert_cache(mut self, expert_cache: Option<ExpertCachePlan>) -> Self {
+        self.expert_cache = expert_cache;
+        self
+    }
+    /// Replaces speculative drafting selection.
+    pub fn with_drafting(mut self, drafting: DraftingPlan) -> Self {
+        self.drafting = drafting;
+        self
+    }
+    /// Replaces required device capabilities.
+    pub fn with_required_device_capabilities(mut self, capabilities: DeviceCapabilities) -> Self {
+        self.required_device_capabilities = capabilities;
+        self
+    }
+    /// Replaces required prepared-session capabilities.
+    pub fn with_required_session_capabilities(mut self, capabilities: SessionCapabilities) -> Self {
+        self.required_session_capabilities = capabilities;
+        self
     }
 
     /// Validates portable plan invariants and fail-closed capabilities.
@@ -255,18 +391,18 @@ impl ExecutionPlan {
         self.validate_structure()?;
         for (required, supported, name) in [
             (
-                self.required_device_capabilities.exact_completion,
-                available.exact_completion,
+                self.required_device_capabilities.exact_completion(),
+                available.exact_completion(),
                 "exact_completion",
             ),
             (
-                self.required_device_capabilities.transfers,
-                available.transfers,
+                self.required_device_capabilities.transfers(),
+                available.transfers(),
                 "transfers",
             ),
             (
-                self.required_device_capabilities.collectives,
-                available.collectives,
+                self.required_device_capabilities.collectives(),
+                available.collectives(),
                 "collectives",
             ),
         ] {
@@ -319,10 +455,10 @@ impl ExecutionPlan {
             }
         }
         ParallelTopology::new(
-            self.topology.tensor,
-            self.topology.pipeline,
-            self.topology.expert,
-            self.topology.data,
+            self.topology.tensor(),
+            self.topology.pipeline(),
+            self.topology.expert(),
+            self.topology.data(),
         )
         .map_err(|error| ExecutionPlanError::Topology(error.to_string()))?;
         Ok(())
@@ -331,6 +467,7 @@ impl ExecutionPlan {
 
 /// Execution plan validation error.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExecutionPlanError {
     /// Backend identifier is empty.
     #[error("execution-plan backend identifier must not be empty")]
@@ -384,23 +521,20 @@ mod tests {
             Err(ExecutionPlanError::Capability("exact_completion"))
         );
 
-        plan.required_session_capabilities.activation_inspection = true;
+        plan.required_session_capabilities = plan
+            .required_session_capabilities
+            .with_activation_inspection(true);
         assert_eq!(
             plan.validate_session_capabilities(&SessionCapabilities::default()),
             Err(ExecutionPlanError::Capability("activation_inspection"))
         );
         assert!(plan
-            .validate_device_capabilities(&DeviceCapabilities {
-                exact_completion: true,
-                transfers: false,
-                collectives: false,
-            })
+            .validate_device_capabilities(&DeviceCapabilities::new(true, false, false))
             .is_ok());
         assert!(plan
-            .validate_session_capabilities(&SessionCapabilities {
-                activation_inspection: true,
-                ..SessionCapabilities::default()
-            })
+            .validate_session_capabilities(
+                &SessionCapabilities::default().with_activation_inspection(true),
+            )
             .is_ok());
     }
 

@@ -141,25 +141,18 @@ impl BackendProvider for MockBackend {
     type Error = MockError;
 
     fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor {
-            name: "mock".into(),
-            version: "test".into(),
-        }
+        BackendDescriptor::new("mock", "test")
     }
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
         Ok(vec![(
-            DeviceDescriptor {
-                id: "gpu:0".into(),
-                name: "mock accelerator".into(),
-                family: "mock-accelerator".into(),
-                memory_bytes: Some(8 * 1024),
-            },
-            DeviceCapabilities {
-                exact_completion: true,
-                transfers: true,
-                collectives: true,
-            },
+            DeviceDescriptor::new(
+                "gpu:0",
+                "mock accelerator",
+                "mock-accelerator",
+                Some(8 * 1024),
+            ),
+            DeviceCapabilities::new(true, true, true),
         )])
     }
 
@@ -169,11 +162,7 @@ impl BackendProvider for MockBackend {
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
         Ok(PreparedModel::new(
             (),
-            SessionCapabilities {
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: false,
-            },
+            SessionCapabilities::new(true, true, false),
         ))
     }
 
@@ -201,11 +190,7 @@ impl BackendSession<MockBackend> for MockSession {
     type Completion = Done;
 
     fn capabilities(&self) -> SessionCapabilities {
-        SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: false,
-        }
+        SessionCapabilities::new(true, true, false)
     }
 
     fn prefill(
@@ -497,6 +482,7 @@ impl ModelCapabilityBackend for MockBackend {
 
 impl ModelLoadingBackend for MockBackend {
     type LoadOptions = ();
+    type SelectedPreparation = ();
     type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
 
     fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
@@ -510,13 +496,14 @@ impl ModelLoadingBackend for MockBackend {
         Ok(eredu_core::PreparationPolicy::default())
     }
 
-    fn validate_preparation(
+    fn select_preparation(
         &self,
         _: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
+        _: &Self::LoadOptions,
         _: eredu_core::PreparationPolicy,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<Self::SelectedPreparation, Self::Error> {
         Ok(())
     }
 
@@ -527,11 +514,7 @@ impl ModelLoadingBackend for MockBackend {
         >,
         _: eredu_core::PreparationPolicy,
     ) -> Result<SessionCapabilities, Self::Error> {
-        Ok(SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: false,
-        })
+        Ok(SessionCapabilities::new(true, true, false))
     }
 
     fn model_config(
@@ -539,9 +522,9 @@ impl ModelLoadingBackend for MockBackend {
         plan: eredu_core::ModelPreparationPlan<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
-        _: Self::LoadOptions,
+        _: Self::SelectedPreparation,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        assert_eq!(plan.inspection().configuration().family, "llama");
+        assert_eq!(plan.inspection().configuration().family(), "llama");
         Ok(())
     }
 }
@@ -598,8 +581,8 @@ impl AutomaticPlanningBackend for MockBackend {
         _: &Path,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
-        assert_eq!(plan.device.backend, self.backend_id());
-        let supported = plan.expert_cache.is_none();
+        assert_eq!(plan.device().backend(), &self.backend_id());
+        let supported = plan.expert_cache().is_none();
         Ok(CandidateAdmission {
             supported,
             rejection: (!supported).then(|| "mock model has no routed experts".into()),
@@ -612,7 +595,7 @@ impl AutomaticPlanningBackend for MockBackend {
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
         assert!(matches!(
-            plan.residency,
+            plan.residency(),
             ResidencyPlan::LayerwiseHost { .. } | ResidencyPlan::DenseDiskStream { .. }
         ));
         Ok(BoundedResidencyRequirement {
@@ -642,7 +625,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
         _: &ModelRuntime<Self::Backend>,
         external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
     ) -> Result<RealizedDrafting<MockDrafter>, AutomaticPlanningError> {
-        Ok(match plan.drafting {
+        Ok(match plan.drafting() {
             DraftingPlan::Disabled => {
                 assert!(external_artifact.is_none());
                 RealizedDrafting::Disabled
@@ -655,6 +638,11 @@ impl ExecutionPlanBackendFactory for MockBackend {
                 let artifact = external_artifact.expect("external drafting carries identities");
                 let _shared_tokenizer_fingerprint = artifact.tokenizer_compatibility.fingerprint();
                 RealizedDrafting::External(MockDrafter)
+            }
+            _ => {
+                return Err(AutomaticPlanningError::Invalid(
+                    "unsupported drafting plan".into(),
+                ))
             }
         })
     }
@@ -691,11 +679,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         Self: 'a,
     {
         *cache = input.len();
-        Ok(SpeculativePrefill {
-            state: (),
-            logits: 7,
-            evaluated_tokens: input.len(),
-        })
+        Ok(SpeculativePrefill::new(7, (), input.len()))
     }
 
     fn begin_proposal<'a>(
@@ -755,10 +739,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         _: Self::Context<'a>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
         *cache = checkpoint + verified_inputs;
-        Ok(SpeculativeCommit {
-            state: (),
-            replayed_tokens: 0,
-        })
+        Ok(SpeculativeCommit::new((), 0))
     }
 }
 
@@ -782,10 +763,7 @@ impl SpeculativeSampling for MockSpeculativeSampling {
     where
         Self: 'a,
     {
-        Ok(SpeculativeRandomness {
-            target: None,
-            draft: None,
-        })
+        Ok(SpeculativeRandomness::new(None, None))
     }
 
     fn draft_randomness_at<'a>(
@@ -867,44 +845,47 @@ impl SpeculativeGenerationBackend for MockBackend {
 
     fn with_speculative_execution<C, V>(
         _: &mut ModelRuntime<Self>,
-        request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+        mut request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
         visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, MockError>
     where
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        assert!(matches!(request.drafting, SpeculativeDraft::Embedded));
-        let result_cardinality = request
-            .lanes
+        assert!(matches!(
+            request.take_drafting(),
+            SpeculativeDraft::Embedded
+        ));
+        let mut lanes = request.take_lanes();
+        let result_cardinality = lanes
             .first()
-            .and_then(|lane| lane.prompt.first())
+            .and_then(|lane| lane.prompt().first())
             .copied();
-        let mut caches = vec![0; request.lanes.len()];
-        let mut prepared = Vec::with_capacity(request.lanes.len());
-        for (lane, cache) in request.lanes.into_iter().zip(caches.iter_mut()) {
-            assert!(!lane.prompt.is_empty());
-            assert_eq!(lane.generation.seed(), 0);
-            lane.constraint.filter_at(&[]).unwrap();
-            prepared.push(PreparedSpeculativeLane {
+        let mut caches = vec![0; lanes.len()];
+        let mut prepared = Vec::with_capacity(lanes.len());
+        for (mut lane, cache) in lanes.drain(..).zip(caches.iter_mut()) {
+            assert!(!lane.prompt().is_empty());
+            assert_eq!(lane.generation().seed(), 0);
+            let constraint = lane.take_constraint();
+            constraint.filter_at(&[]).unwrap();
+            let config = lane.take_config();
+            let sequence = eredu_core::generation::GenerationSequence::new(
+                config.max_tokens,
+                config.eos_token_ids.iter().copied(),
+            );
+            prepared.push(PreparedSpeculativeLane::new(
                 cache,
-                input: lane.prompt,
-                config: lane.config.clone(),
-                runtime: SpeculativeOutputRuntime::new(
+                lane.take_prompt(),
+                config,
+                SpeculativeOutputRuntime::new(
                     MockSpeculativeSampling,
-                    eredu_core::generation::GenerationSequence::new(
-                        lane.config.max_tokens,
-                        lane.config.eos_token_ids.iter().copied(),
-                    ),
-                    SpeculativeSemanticConstraint::semantic(lane.semantic),
-                    SpeculativeCallbackPublisher::semantic(lane.on_event),
-                    lane.cancellation,
+                    sequence,
+                    SpeculativeSemanticConstraint::semantic(lane.take_semantic()),
+                    SpeculativeCallbackPublisher::semantic(lane.take_on_event()),
+                    lane.take_cancellation(),
                 ),
-                randomness: SpeculativeRandomness {
-                    target: None,
-                    draft: None,
-                },
-            });
+                SpeculativeRandomness::new(None, None),
+            ));
         }
         let mut output = visitor
             .run(
@@ -917,13 +898,13 @@ impl SpeculativeGenerationBackend for MockBackend {
             )
             .map_err(|error| MockError::Speculative(error.to_string()))?;
         match result_cardinality {
-            Some(NO_SPECULATIVE_RESULTS_PROMPT_TOKEN) => output.requests.clear(),
+            Some(NO_SPECULATIVE_RESULTS_PROMPT_TOKEN) => output.clear_requests(),
             Some(MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN) => {
-                output.requests.push(SpeculativeGenerationOutput {
-                    token_ids: Vec::new(),
-                    finish_reason: FinishReason::MaxTokens,
-                    stats: Default::default(),
-                });
+                output.push_request(SpeculativeGenerationOutput::new(
+                    Vec::new(),
+                    FinishReason::MaxTokens,
+                    Default::default(),
+                ));
             }
             _ => {}
         }
@@ -1291,8 +1272,8 @@ fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
         DevicePlan::new(backend.backend_id().as_str(), device).unwrap(),
     );
     let report = AutomaticPlanner::default().plan(backend, &request).unwrap();
-    assert_eq!(report.plan.device.backend, backend.backend_id());
-    assert_eq!(report.plan.device.device, device);
+    assert_eq!(report.plan.device().backend(), &backend.backend_id());
+    assert_eq!(report.plan.device().device(), device);
     report
 }
 
@@ -1372,7 +1353,7 @@ fn assert_automatic_planning_conformance() {
     let backend = MockBackend;
     let report = automatic_planning_client_code(&backend, artifact.path(), "gpu:0");
     assert!(matches!(
-        &report.plan.residency,
+        report.plan.residency(),
         ResidencyPlan::LayerwiseHost { .. }
     ));
     assert_eq!(report.resources.pinned_parameter_bytes.value(), Some(&1024));
@@ -1394,19 +1375,23 @@ fn assert_automatic_planning_conformance() {
         planned_loading_client_code(&backend, artifact.path(), "gpu:0");
     assert_eq!(realized_report.plan, report.plan);
     let model = planned.model_mut();
-    assert_eq!(model.backend_descriptor().name, "mock");
+    assert_eq!(model.backend_descriptor().name(), "mock");
     assert_eq!(client_code(model), vec![1, 2, 3]);
 
-    let mut wrong_backend = report.plan.clone();
-    wrong_backend.device = DevicePlan::new("other", "gpu:0").unwrap();
+    let wrong_backend = report
+        .plan
+        .clone()
+        .with_device(DevicePlan::new("other", "gpu:0").unwrap());
     assert!(matches!(
         eredu_core::realize_execution_plan_target(&backend, &wrong_backend),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("factory owns mock")
     ));
 
-    let mut missing_device = report.plan.clone();
-    missing_device.device = DevicePlan::new("mock", "gpu:1").unwrap();
+    let missing_device = report
+        .plan
+        .clone()
+        .with_device(DevicePlan::new("mock", "gpu:1").unwrap());
     assert!(matches!(
         eredu_core::realize_execution_plan_target(&backend, &missing_device),
         Err(AutomaticPlanningError::Invalid(message))
@@ -1416,13 +1401,13 @@ fn assert_automatic_planning_conformance() {
     let mut external = report.plan.clone();
     let assistant = TestDirectory::new();
     write_loadable_assistant_artifact(assistant.path());
-    external.drafting = DraftingPlan::External {
+    external = external.with_drafting(DraftingPlan::External {
         model: assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 4,
         lookahead: true,
         adaptive_lookahead: true,
-    };
+    });
     let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
         .expect("generic plan loading realizes the external assistant");
     assert!(planned.drafting().is_external());
@@ -1435,13 +1420,13 @@ fn assert_automatic_planning_conformance() {
     let incompatible_assistant = TestDirectory::new();
     write_loadable_assistant_artifact(incompatible_assistant.path());
     replace_with_incompatible_tokenizer(incompatible_assistant.path());
-    external.drafting = DraftingPlan::External {
+    external = external.with_drafting(DraftingPlan::External {
         model: incompatible_assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 4,
         lookahead: true,
         adaptive_lookahead: true,
-    };
+    });
     assert!(matches!(
         LoadedModel::load_execution_plan(&backend, artifact.path(), &external),
         Err(eredu::api::PlannedModelLoadError::Planning(
@@ -1673,8 +1658,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
     ));
 
     let (speculative, speculative_events) = speculative_client_code(&mut model, &prepared);
-    assert_eq!(speculative.token_ids, vec![7, 11]);
-    assert_eq!(speculative.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(speculative.token_ids(), vec![7, 11]);
+    assert_eq!(speculative.finish_reason(), FinishReason::MaxTokens);
     assert_eq!(
         speculative_events,
         vec![
@@ -1689,8 +1674,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
     assert_single_lane_speculative_cardinality_is_validated(&mut model, &prepared);
 
     let (batch, batch_events) = speculative_batch_client_code(&mut model, &prepared);
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].token_ids, vec![7, 11]);
+    assert_eq!(batch.requests().len(), 1);
+    assert_eq!(batch.requests()[0].token_ids(), vec![7, 11]);
     assert_eq!(
         batch_events,
         vec![
@@ -1802,11 +1787,7 @@ impl RealtimeBackend for MockRealtimeBackend {
     }
 
     fn session_capabilities(&self, _: &Self::Model) -> SessionCapabilities {
-        SessionCapabilities {
-            persistent_cache: true,
-            output_observation: true,
-            activation_inspection: false,
-        }
+        SessionCapabilities::new(true, true, false)
     }
 
     fn speech_config(&self, _: &Self::Model) -> RealtimeSpeechConfig {
@@ -1916,9 +1897,9 @@ fn assert_realtime_conformance() {
         load_realtime_model_with_options(MockRealtimeBackend::default(), 23, 0).unwrap();
     assert_eq!(model.backend().name(), "portable-mock-realtime");
     assert_eq!(*model.model(), 23);
-    assert!(model.session_capabilities().persistent_cache);
-    assert!(model.session_capabilities().output_observation);
-    assert!(!model.session_capabilities().activation_inspection);
+    assert!(model.session_capabilities().persistent_cache());
+    assert!(model.session_capabilities().output_observation());
+    assert!(!model.session_capabilities().activation_inspection());
     assert_eq!(model.speech_config().generated_audio_codebooks(), 1);
 
     let limits = SchedulerLimits::with_execution_bounds(1, 2, 1, 1, 1, usize::MAX).unwrap();

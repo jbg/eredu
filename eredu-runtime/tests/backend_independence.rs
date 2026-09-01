@@ -17,27 +17,29 @@ use eredu_core::{
     AttentionPolicy, Completion, InputModality, InputTensorIdentity, LayerSchedule, TokenFilter,
 };
 use eredu_nn::{
-    AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy, Index,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, PadMode, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
+    GatedProductPolicy, Index, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, PadMode, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, ArchitectureGroupKind,
-    ArchitectureGroupPlacement, ArchitectureGroupTransport, ArchitectureMergeDestination,
-    ArchitectureParameterDescription, ArchitectureParameters, ArchitecturePartition,
-    CollectiveBackend, CompositeLayeredTraversalHook, DeviceState, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredForwardState, LayeredPartitionDriver, LayeredPartitionInput, LayeredTraversalHook,
+    bind_materialized_unit, materialize_bindings, realize_architecture_state,
+    ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
+    ArchitecturePartition, ArchitectureStateFactory, CollectiveBackend,
+    CompositeLayeredTraversalHook, DeviceState, ExecutionGraph, ExecutionGroupSpec,
+    ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture, LayeredForwardState,
+    LayeredPartitionDriver, LayeredPartitionInput, LayeredPartitionOutput, LayeredTraversalHook,
     LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime,
-    NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParameterBackend, PartitionOwnership,
-    PenaltyConfig, PredictionDirective, PreparedInputPart, PreparedInputPayload,
-    PreparedModelInput, ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime,
-    RuntimeLayerState, RuntimeStateComponents, Sampler, SamplingBackend,
-    SequentialDecisionBoundary, SequentialDecisionDriver, SequentialDecisionError,
-    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
-    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor,
-    StaticParameterVisitorMut, SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
+    NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture, ParameterBackend,
+    PartitionOwnership, PartitionedLayeredArchitecture, PenaltyConfig, PredictionDirective,
+    PreparedInputPart, PreparedInputPayload, PreparedModelInput, ResettableRuntimeLayerState,
+    ResettableRuntimeState, ResidentRuntime, RuntimeLayerState, RuntimeState,
+    RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionBoundary,
+    SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
+    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId,
+    StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut,
+    SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -727,11 +729,23 @@ impl TransferBackend for FakeBackend {
 
 #[test]
 fn minimal_text_backend_compiles_without_optional_execution_extensions() {
-    let host = FakeTensor(vec![2, 3]);
-    let (mut parameter, transfer) = FakeBackend::promote(&(), &host).unwrap();
-    assert_eq!(parameter, host);
-    FakeBackend::bind(&mut parameter, FakeTensor(vec![3, 2])).unwrap();
-    FakeBackend::retain_until_complete(&(), &transfer, parameter).unwrap();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let layout = architecture.state_layout().unwrap();
+    let mut state =
+        DeviceState::create(layout, |_, _| Ok::<_, Infallible>(FakeLayerState(0))).unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &()).unwrap();
+    let tokens = FakeTensor(vec![9]);
+    let input = <OrdinaryTextFixture as eredu_runtime::ReplicatedTextArchitecture<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+    >>::text_input(&tokens, None);
+    let output = runtime.forward(input, &mut state, &()).unwrap();
+    assert_eq!(output, FakeTensor(vec![9, 5]));
+    assert_eq!(state.as_ref()[0].0, 1);
+    assert_eq!(runtime.architecture().trace, ["input", "unit", "output"]);
 }
 
 #[test]
@@ -864,9 +878,205 @@ impl ResettableRuntimeLayerState<FakeBackend> for FakeLayerState {
     }
 }
 
+struct OrdinaryTextFixture {
+    static_modules: FakeOperator,
+    trace: Vec<&'static str>,
+}
+
+impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap()],
+            )
+            .unwrap(),
+        )
+        .map_err(Error::backend)
+    }
+
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        eredu_runtime::ModelStateIdentity::new(
+            "ordinary-text-fixture",
+            "ordinary-text-fixture",
+            "ordinary-text-fixture",
+            1,
+            state.global_layer_offset(),
+            0,
+            topology,
+        )
+        .map_err(Error::backend)
+    }
+
+    fn parameter_description(
+        &self,
+        _: &(),
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        let graph = self.execution_graph()?;
+        let layout = ExecutionUnitLayout::new(&graph, [1]).map_err(Error::backend)?;
+        ArchitectureParameterDescription::new(&graph, &layout, [], []).map_err(Error::backend)
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitor<FakeBackend>,
+    {
+        visitor.visit("embedding", &self.static_modules)
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitorMut<FakeBackend>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules)
+    }
+}
+
+impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for OrdinaryTextFixture
+{
+    type Input<'a> = &'a FakeTensor;
+    type StaticModules = FakeOperator;
+    type Unit = FakeUnit;
+    type ForwardContext = ();
+    type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
+    type Error = Error;
+
+    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
+        ArchitectureGroupTransport {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: ArchitectureGroupKind::Decoder,
+            first_owner_static_roles: vec!["embedding".into()],
+            last_owner_static_roles: Vec::new(),
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: None,
+            request_optional: false,
+        }
+    }
+
+    fn primary_execution_group(&self) -> &str {
+        "decoder"
+    }
+
+    fn state_partition_plan(
+        &self,
+        _: &StateLayout,
+    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
+        eredu_runtime::ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..1),
+        ])
+    }
+
+    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
+        ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder")
+            .map_err(Error::backend)
+    }
+
+    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+        (group == 0)
+            .then_some(1)
+            .ok_or_else(|| Error::backend("unknown ordinary text group"))
+    }
+
+    fn unit_path(&self, _: usize, _: usize) -> Result<String, Self::Error> {
+        Ok("decoder.unit.0".into())
+    }
+
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+
+    fn build_unit(&self, _: usize, _: usize, _: &()) -> Result<Self::Unit, Self::Error> {
+        Ok(FakeUnit { marker: 5 })
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        self.trace.push("input");
+        Ok(LayeredForwardState {
+            hidden: input.clone(),
+            context: (),
+        })
+    }
+
+    fn begin_execution_group(
+        &mut self,
+        _: usize,
+        initial: &FakeTensor,
+        _: &[&FakeTensor],
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        Ok(initial.clone())
+    }
+
+    fn forward_unit(
+        &mut self,
+        _: usize,
+        _: usize,
+        unit: &mut Self::Unit,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        state.as_mut()[0].0 += 1;
+        self.trace.push("unit");
+        let mut output = hidden.clone();
+        output.0.push(unit.marker);
+        Ok(output)
+    }
+
+    fn finish_forward(
+        &mut self,
+        hidden: &FakeTensor,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.trace.push("output");
+        Ok(hidden.clone())
+    }
+
+    fn retained_context_values<'a>(
+        &'a self,
+        _: &'a Self::ForwardContext,
+        _: usize,
+        _: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+
+impl
+    eredu_runtime::ReplicatedTextArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for OrdinaryTextFixture
+{
+    fn text_input<'a>(tokens: &'a FakeTensor, _: Option<&'a FakeTensor>) -> Self::Input<'a> {
+        tokens
+    }
+}
+
 #[derive(Clone)]
 struct HybridLayerState {
     position: i32,
+    attention_keys: Option<FakeTensor>,
+    attention_values: Option<FakeTensor>,
     recurrent: Option<FakeTensor>,
     convolution: Option<FakeTensor>,
 }
@@ -878,8 +1088,48 @@ impl RuntimeLayerState<FakeBackend> for HybridLayerState {
         self.recurrent
             .iter()
             .chain(self.convolution.iter())
+            .chain(self.attention_keys.iter())
+            .chain(self.attention_values.iter())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+}
+
+impl AttentionCache<FakeTensor> for HybridLayerState {
+    fn offset(&self) -> i32 {
+        self.position
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: FakeTensor,
+        values: FakeTensor,
+        _: &(),
+    ) -> Result<(FakeTensor, FakeTensor), Error> {
+        let cached_keys = self
+            .attention_keys
+            .as_mut()
+            .ok_or_else(|| Error::backend("hybrid fixture omitted key state"))?;
+        let cached_values = self
+            .attention_values
+            .as_mut()
+            .ok_or_else(|| Error::backend("hybrid fixture omitted value state"))?;
+        cached_keys.0.extend(keys.0);
+        cached_values.0.extend(values.0);
+        Ok((cached_keys.clone(), cached_values.clone()))
+    }
+
+    fn attention(
+        &mut self,
+        request: AttentionRequest<'_, FakeTensor>,
+        _: &(),
+    ) -> Result<FakeTensor, Error> {
+        let _ = self.update_for_attention(request.keys, request.values, &())?;
+        Ok(request.queries)
     }
 }
 
@@ -944,6 +1194,30 @@ struct HybridFixture {
     trace: Vec<&'static str>,
 }
 
+struct HybridStateFactory {
+    calls: Rc<Cell<usize>>,
+}
+
+impl ArchitectureStateFactory<FakeBackend> for HybridStateFactory {
+    type State = DeviceState<FakeBackend, HybridLayerState>;
+    type Error = Infallible;
+
+    fn realize(&mut self, layout: &StateLayout) -> Result<Self::State, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        DeviceState::create(layout.clone(), |_, policy| {
+            assert_eq!(policy.fixed_state().len(), 2);
+            assert_eq!(policy.components().len(), 4);
+            Ok::<_, Infallible>(HybridLayerState {
+                position: 0,
+                attention_keys: Some(FakeTensor(vec![0])),
+                attention_values: Some(FakeTensor(vec![0])),
+                recurrent: Some(FakeTensor(vec![1, 4])),
+                convolution: Some(FakeTensor(vec![1, 4])),
+            })
+        })
+    }
+}
+
 impl ArchitectureParameters<FakeBackend> for HybridFixture {
     type DefinitionError = Error;
 
@@ -957,15 +1231,16 @@ impl ArchitectureParameters<FakeBackend> for HybridFixture {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        Ok(eredu_runtime::ModelStateIdentity {
-            model_family: "hybrid-fixture".into(),
-            effective_model_type: "hybrid-fixture".into(),
-            architecture_fingerprint: "hybrid-fixture".into(),
-            layer_count: 1,
-            global_layer_start: state.global_layer_offset(),
-            sink_tokens: 0,
+        eredu_runtime::ModelStateIdentity::new(
+            "hybrid-fixture",
+            "hybrid-fixture",
+            "hybrid-fixture",
+            1,
+            state.global_layer_offset(),
+            0,
             topology,
-        })
+        )
+        .map_err(Error::backend)
     }
 
     fn parameter_description(
@@ -1091,6 +1366,12 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, HybridLayerState>
     ) -> Result<FakeTensor, Self::Error> {
         let layer = eredu_runtime::LayerRuntimeState::layer(state, 0).map_err(Error::backend)?;
         let input = hidden.0[0];
+        let (keys, values) = AttentionCache::update_for_attention(
+            layer,
+            FakeTensor(vec![1, input]),
+            FakeTensor(vec![1, unit.marker]),
+            &(),
+        )?;
         RuntimeStateComponents::<FakeBackend>::fixed_component(layer, StateTensorRole::Recurrent)
             .map_err(|error| Error::backend(error.to_string()))?
             .as_mut()
@@ -1109,7 +1390,12 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, HybridLayerState>
         RuntimeStateComponents::<FakeBackend>::advance_fixed(layer, 2)
             .map_err(|error| Error::backend(error.to_string()))?;
         self.trace.push("unit");
-        Ok(FakeTensor(vec![input, layer.position, 3, 3]))
+        Ok(FakeTensor(vec![
+            input,
+            layer.position,
+            i32::try_from(keys.0.len()).unwrap(),
+            i32::try_from(values.0.len()).unwrap(),
+        ]))
     }
 
     fn finish_forward(
@@ -1139,16 +1425,14 @@ fn heterogeneous_state_uses_the_component_extension_contract() {
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
-    let layout = architecture.state_layout().unwrap();
-    assert_eq!(layout.layer(0).unwrap().fixed_state().len(), 2);
-    let mut state = DeviceState::<FakeBackend, HybridLayerState>::create(layout, |_, _| {
-        Ok::<_, Infallible>(HybridLayerState {
-            position: 0,
-            recurrent: Some(FakeTensor(vec![1, 4])),
-            convolution: Some(FakeTensor(vec![1, 4])),
-        })
-    })
-    .unwrap();
+    let calls = Rc::new(Cell::new(0));
+    let mut factory = HybridStateFactory {
+        calls: Rc::clone(&calls),
+    };
+    let mut state = realize_architecture_state::<FakeBackend, _, _>(&architecture, &mut factory)
+        .expect("architecture-selected heterogeneous state realization");
+    assert_eq!(state.layout().layer(0).unwrap().fixed_state().len(), 2);
+    assert_eq!(calls.get(), 1);
     let mut runtime = ResidentRuntime::new(architecture, &()).unwrap();
     let output = runtime.forward(11, &mut state, &()).unwrap();
     let layer = eredu_runtime::LayerRuntimeState::layer(&mut state, 0).unwrap();
@@ -1164,6 +1448,8 @@ fn heterogeneous_state_uses_the_component_extension_contract() {
         &FakeTensor(vec![1, 4, 7])
     );
     assert_eq!(layer.recurrent, Some(FakeTensor(vec![1, 4, 11])));
+    assert_eq!(layer.attention_keys, Some(FakeTensor(vec![0, 1, 11])));
+    assert_eq!(layer.attention_values, Some(FakeTensor(vec![0, 1, 7])));
     assert_eq!(output, FakeTensor(vec![11, 2, 3, 3]));
     assert_eq!(runtime.architecture().trace, ["input", "unit", "output"]);
 }
@@ -1363,15 +1649,16 @@ impl ArchitectureParameters<FakeBackend> for GroupedFixture {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        Ok(eredu_runtime::ModelStateIdentity {
-            model_family: "fixture".into(),
-            effective_model_type: "fixture".into(),
-            architecture_fingerprint: "fixture".into(),
-            layer_count: 4,
-            global_layer_start: state.global_layer_offset(),
-            sink_tokens: 0,
+        eredu_runtime::ModelStateIdentity::new(
+            "fixture",
+            "fixture",
+            "fixture",
+            4,
+            state.global_layer_offset(),
+            0,
             topology,
-        })
+        )
+        .map_err(Error::backend)
     }
 
     fn parameter_description(
@@ -1609,11 +1896,128 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
     }
 }
 
+impl ParallelLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for GroupedFixture
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &(),
+        context: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        self.begin_forward(input, state, context)
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &mut Self::ForwardContext,
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.forward_unit(group, index, unit, hidden, state, forward, context)
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &Self::ForwardContext,
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.finish_forward(hidden, state, forward, context)
+    }
+}
+
+impl PartitionedLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for GroupedFixture
+{
+    type Boundary = NoAuxiliaryBoundarySchema;
+
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(NoAuxiliaryBoundarySchema::new(8))
+    }
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, FakeTensor, NoAuxiliaryBoundary>,
+        _: Option<&FakeTensor>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        _: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        assert!(!expected.is_empty());
+        let hidden = match input {
+            LayeredPartitionInput::Tokens(tokens) => tokens.clone(),
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: vec![(usize::MAX, first_state_ordinal)],
+        })
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, FakeTensor, NoAuxiliaryBoundary>,
+        mask: Option<&FakeTensor>,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        _: &(),
+        context: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
+    }
+
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &FakeTensor,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &mut Self::ForwardContext,
+        _: Option<&()>,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        forward.push((group, usize::MAX));
+        Ok(initial.clone())
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &FakeTensor,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &Self::ForwardContext,
+        owns_output: bool,
+        _: Option<&()>,
+        _: &(),
+    ) -> Result<LayeredPartitionOutput<FakeTensor, NoAuxiliaryBoundary>, Self::Error> {
+        Ok(if owns_output {
+            LayeredPartitionOutput::Final {
+                output: hidden.clone(),
+                retained: None,
+            }
+        } else {
+            LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: NoAuxiliaryBoundary,
+            }
+        })
+    }
+}
+
 #[test]
 fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     type FixtureState = DeviceState<FakeBackend, FakeLayerState>;
 
-    let architecture = GroupedFixture {
+    let mut architecture = GroupedFixture {
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -1670,51 +2074,120 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
         eredu_runtime::BoundaryTensorDtype::Activation
     );
 
+    let mut states = drivers.each_ref().map(|driver| {
+        DeviceState::<FakeBackend, FakeLayerState>::create(
+            driver.state_layout().clone(),
+            |layer, _| Ok::<_, Infallible>(FakeLayerState(layer as i32)),
+        )
+        .unwrap()
+    });
     let token = FakeTensor(vec![7]);
-    let LayeredPartitionInput::Tokens(token) = drivers[0]
+    let first_input = drivers[0]
         .input(LayeredPartitionInput::<FakeTensor, NoAuxiliaryBoundary>::Tokens(&token))
+        .unwrap();
+    let mut first = drivers[0]
+        .begin::<FakeBackend, _, _>(
+            &mut architecture,
+            first_input,
+            None,
+            &mut states[0],
+            None,
+            &(),
+        )
+        .unwrap();
+    for index in drivers[0].range() {
+        let mut unit = architecture.build_unit(2, index, &()).unwrap();
+        first.hidden = architecture
+            .forward_unit(
+                2,
+                index,
+                &mut unit,
+                &first.hidden,
+                &mut states[0],
+                &mut first.context,
+                &(),
+            )
+            .unwrap();
+    }
+    let LayeredPartitionOutput::Boundary {
+        hidden: first_boundary,
+        auxiliary,
+    } = drivers[0]
+        .finish::<FakeBackend, _, _>(
+            &mut architecture,
+            &first.hidden,
+            &mut states[0],
+            &mut first.context,
+            None,
+            &(),
+        )
         .unwrap()
     else {
-        panic!("input owner must retain tokens")
+        panic!("non-output partition must produce a boundary")
     };
-    let mut first_boundary = token.clone();
-    first_boundary.0.push(drivers[0].range().start as i32);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let groups = [0, 1].map(|local_rank| PartitionCollectiveGroup {
         members: vec![0, 1],
         local_rank,
         trace: Rc::clone(&trace),
     });
-    let first_exchange =
-        PartitionCollectiveBackend::all_to_all(first_boundary, &groups[0], &()).unwrap();
-    let LayeredPartitionInput::Hidden { mut hidden, .. } = drivers[1]
+    let first_exchange = drivers[0]
+        .exchange_boundary::<PartitionCollectiveBackend>(first_boundary, &groups[0], &())
+        .unwrap();
+    let second_input = drivers[1]
         .input(LayeredPartitionInput::Hidden {
             hidden: first_exchange,
-            auxiliary: NoAuxiliaryBoundary,
+            auxiliary,
         })
+        .unwrap();
+    let mut second = drivers[1]
+        .begin::<FakeBackend, _, _>(
+            &mut architecture,
+            second_input,
+            None,
+            &mut states[1],
+            None,
+            &(),
+        )
+        .unwrap();
+    for index in drivers[1].range() {
+        let mut unit = architecture.build_unit(2, index, &()).unwrap();
+        second.hidden = architecture
+            .forward_unit(
+                2,
+                index,
+                &mut unit,
+                &second.hidden,
+                &mut states[1],
+                &mut second.context,
+                &(),
+            )
+            .unwrap();
+    }
+    let LayeredPartitionOutput::Final { output: merged, .. } = drivers[1]
+        .finish::<FakeBackend, _, _>(
+            &mut architecture,
+            &second.hidden,
+            &mut states[1],
+            &mut second.context,
+            None,
+            &(),
+        )
         .unwrap()
     else {
-        panic!("downstream owner must retain transported hidden state")
+        panic!("output partition must produce logits")
     };
-    hidden.0.push(drivers[1].range().start as i32);
-    let merged = PartitionCollectiveBackend::all_to_all(hidden, &groups[1], &()).unwrap();
 
-    assert_eq!(merged, FakeTensor(vec![7, 0, 1]));
+    assert_eq!(merged, FakeTensor(vec![7, 20, 21]));
     assert_eq!(
         *trace.borrow(),
-        [
-            PartitionCollectiveCall {
-                local_rank: 0,
-                members: vec![0, 1],
-                value: vec![7, 0],
-            },
-            PartitionCollectiveCall {
-                local_rank: 1,
-                members: vec![0, 1],
-                value: vec![7, 0, 1],
-            },
-        ]
+        [PartitionCollectiveCall {
+            local_rank: 0,
+            members: vec![0, 1],
+            value: vec![7, 20],
+        },]
     );
+    assert_eq!(architecture.trace, [(2, 0), (2, 1)]);
     assert!(partitions[0].ownership().owns_input());
     assert!(partitions[1].ownership().owns_output());
 }
@@ -1736,10 +2209,10 @@ fn complete_state_partition_derives_identity_through_architecture_contract() {
         .prompt_cache_identity::<FakeBackend, _>(&architecture, topology.clone())
         .expect("architecture derives prompt-cache identity");
 
-    assert_eq!(identity.architecture_fingerprint, "fixture");
-    assert_eq!(identity.global_layer_start, 0);
-    assert_eq!(identity.layer_count, 4);
-    assert_eq!(identity.topology, topology);
+    assert_eq!(identity.architecture_fingerprint(), "fixture");
+    assert_eq!(identity.global_layer_start(), 0);
+    assert_eq!(identity.layer_count(), 4);
+    assert_eq!(identity.topology(), &topology);
 }
 
 #[test]

@@ -3,11 +3,11 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use eredu_backend_mlx::backend::{
-    config::ModelLoadOptions,
-    runtime::{generation::MlxSamplingBackend, media::input::ModelInput},
-};
 use eredu_backend_mlx::native::ExecutionContext;
+use eredu_backend_mlx::{
+    backend::runtime::{generation::MlxSamplingBackend, media::input::ModelInput},
+    MlxLoadRequest,
+};
 use eredu_core::{
     load_model,
     residency::{MemoryTier, OffloadConfig, TransferDirection},
@@ -87,9 +87,9 @@ fn main() -> anyhow::Result<()> {
             args.stream_host_lookahead,
             args.stream_queue_capacity,
         )?;
-        dense.max_cached_shards = args.cached_shards;
-        dense.sample_backend_memory = true;
-        dense.sample_process_memory = true;
+        dense = dense
+            .with_max_cached_shards(args.cached_shards)
+            .with_memory_sampling(true, true);
         WeightResidency::dense_disk_stream(dense)
     } else {
         let config = OffloadConfig::new(
@@ -97,26 +97,17 @@ fn main() -> anyhow::Result<()> {
             args.host_budget_bytes,
             args.device_layer_window,
         )?;
-        let layerwise = LayerwiseLoadOptions {
-            offload: config,
-            max_cached_shards: args.cached_shards,
-            sample_backend_memory: true,
-            sample_process_memory: true,
-        };
+        let layerwise = LayerwiseLoadOptions::new(config)
+            .with_max_cached_shards(args.cached_shards)
+            .with_memory_sampling(true, true);
         WeightResidency::layerwise_host(layerwise)
     };
     let backend = eredu_backend_mlx::native::backend(stream, weights.stream());
     let model = load_model(
         &backend,
         &args.model_dir,
-        ModelLoadOptions::default().with_weight_residency(weight_residency),
+        MlxLoadRequest::default().with_weight_residency(weight_residency),
     )?;
-    anyhow::ensure!(
-        model.model_family() == eredu_architectures::ModelKind::Llama,
-        "the Llama residency benchmark requires a Llama-compatible checkpoint, got {} ({})",
-        model.model_family().canonical_name(),
-        model.effective_model_type()
-    );
     let mut session = backend.create_session(model)?;
 
     if let Some(report) = session.dense_stream_report()? {
@@ -186,11 +177,6 @@ fn main() -> anyhow::Result<()> {
         .filter(|unit| unit.id().as_str().starts_with("model.unit.") && unit.device_resident())
         .count();
 
-    println!(
-        "model family/type: {}/{}",
-        session.model_family().canonical_name(),
-        session.effective_model_type()
-    );
     println!(
         "residency policy: {}",
         if args.fully_resident {

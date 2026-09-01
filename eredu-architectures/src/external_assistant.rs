@@ -97,8 +97,8 @@ pub fn prepare_external_assistant(
     source: impl AsRef<std::path::Path>,
 ) -> Result<ExternalAssistantPreparationPlan, ArtifactError> {
     let inspection = eredu_core::inspect_artifact(source, &AssistantConfigurations)?;
-    let family = inspection.configuration().family.as_str();
-    let config_json = inspection.configuration().json.as_ref();
+    let family = inspection.configuration().family();
+    let config_json = inspection.configuration().json();
     let metadata = inspection.gguf_checkpoint().map(gguf_metadata);
 
     match family {
@@ -115,6 +115,11 @@ pub fn prepare_external_assistant(
                     metadata.as_ref().expect("GGUF inspection has metadata"),
                 )
                 .map_err(invalid_assistant)?,
+                _ => {
+                    return Err(ArtifactError::InvalidArtifact(
+                        "unsupported Gemma assistant artifact format".into(),
+                    ));
+                }
             };
             let checkpoint = prepared_checkpoint(
                 &inspection,
@@ -136,6 +141,11 @@ pub fn prepare_external_assistant(
                     metadata.as_ref().expect("GGUF inspection has metadata"),
                 )
                 .map_err(invalid_assistant)?,
+                _ => {
+                    return Err(ArtifactError::InvalidArtifact(
+                        "unsupported Muse/Glimmer assistant artifact format".into(),
+                    ));
+                }
             };
             let checkpoint = prepared_checkpoint(
                 &inspection,
@@ -195,6 +205,9 @@ fn prepared_checkpoint(
                 tensor_mapping,
             })
         }
+        _ => Err(ArtifactError::InvalidArtifact(
+            "unsupported external-assistant artifact format".into(),
+        )),
     }
 }
 
@@ -238,13 +251,13 @@ impl ModelConfigurationResolver for AssistantConfigurations {
             other => return Err(ArtifactError::UnsupportedModelType(other.into())),
         };
         Ok(ResolvedModelConfiguration::new(
-            ModelConfiguration {
-                declared_model_type: model_type.into(),
-                effective_model_type: model_type.into(),
-                family: family.into(),
-                loading_protocol: LoadingProtocol::Model,
-                json: Some(json.clone()),
-            },
+            ModelConfiguration::new(
+                model_type,
+                model_type,
+                family,
+                LoadingProtocol::Model,
+                Some(json.clone()),
+            )?,
             (),
         ))
     }
@@ -269,13 +282,7 @@ impl ModelConfigurationResolver for AssistantConfigurations {
             other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
         };
         Ok(ResolvedModelConfiguration::new(
-            ModelConfiguration {
-                declared_model_type: architecture.into(),
-                effective_model_type: family.into(),
-                family: family.into(),
-                loading_protocol: LoadingProtocol::Model,
-                json: None,
-            },
+            ModelConfiguration::new(architecture, family, family, LoadingProtocol::Model, None)?,
             (),
         ))
     }

@@ -56,7 +56,7 @@ pub enum ForwardMode {
 /// One physical operator inside an appended MTP prediction group.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct PredictionUnit<B: GroupedNeuralBackend> {
+pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// First-unit normalization of the current token embedding.
     pub embedding_norm: Option<B::Normalization>,
     /// First-unit normalization of the prior hidden state.
@@ -69,7 +69,7 @@ pub struct PredictionUnit<B: GroupedNeuralBackend> {
     pub final_norm: Option<B::Normalization>,
 }
 
-impl<B: GroupedNeuralBackend> PredictionUnit<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUnit<B> {
     /// Builds one physical unit at a prediction-depth-relative position.
     pub fn new(
         args: &ModelArgs,

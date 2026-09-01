@@ -1037,12 +1037,12 @@ fn automatic_cache_key(
         .hardware
         .backends
         .iter()
-        .find(|backend| backend.backend == report.plan.device.backend)
+        .find(|backend| &backend.backend == report.plan.device().backend())
         .and_then(|backend| {
             backend
                 .devices
                 .iter()
-                .find(|device| device.id == report.plan.device.device)
+                .find(|device| device.id == report.plan.device().device())
         })
         .and_then(|device| observed_u64(&device.total_memory_bytes));
     Ok(AutoPlanCacheKey {
@@ -1057,7 +1057,7 @@ fn automatic_cache_key(
         architecture: report.hardware.architecture.clone(),
         memory_semantics: format!("{:?}", report.hardware.physical_memory_semantics),
         physical_memory_bytes: observed_u64(&report.hardware.physical_memory_bytes),
-        device: report.plan.device.clone(),
+        device: report.plan.device().clone(),
         device_total_memory_bytes,
     })
 }
@@ -1148,12 +1148,12 @@ fn selected_device_available_memory(
     hardware
         .backends
         .iter()
-        .find(|backend| backend.backend == device.backend && backend.available)
+        .find(|backend| &backend.backend == device.backend() && backend.available)
         .and_then(|backend| {
             backend
                 .devices
                 .iter()
-                .find(|candidate| candidate.id == device.device)
+                .find(|candidate| candidate.id == device.device())
         })
         .and_then(|device| observed_u64(&device.available_memory_bytes))
 }
@@ -1162,29 +1162,29 @@ fn validate_automatic_device(hardware: &HardwareProfile, device: &DevicePlan) ->
     let backend = hardware
         .backends
         .iter()
-        .find(|backend| backend.backend == device.backend)
+        .find(|backend| &backend.backend == device.backend())
         .with_context(|| {
             format!(
                 "automatic planning did not discover the {} backend selected by --device",
-                device.backend
+                device.backend()
             )
         })?;
     if !backend.available {
         bail!(
             "automatic planning cannot use unavailable {} backend: {}",
-            device.backend,
+            device.backend(),
             backend.detail.as_deref().unwrap_or("no detail reported")
         );
     }
     if !backend
         .devices
         .iter()
-        .any(|candidate| candidate.id == device.device)
+        .any(|candidate| candidate.id == device.device())
     {
         bail!(
             "automatic planning did not discover {} device {}",
-            device.backend,
-            device.device
+            device.backend(),
+            device.device()
         );
     }
     Ok(())
@@ -1200,18 +1200,18 @@ fn automatic_model_bytes(resources: &ModelResourceProfile) -> Option<(u64, &'sta
 }
 
 fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &ExecutionPlan) -> bool {
-    let available_device = selected_device_available_memory(&observations.hardware, &plan.device)
+    let available_device = selected_device_available_memory(&observations.hardware, plan.device())
         .map(|bytes| automatic_budget(Some(bytes), 1));
     let available_host = observed_u64(&observations.hardware.available_memory_bytes)
         .map(|bytes| automatic_budget(Some(bytes), 1));
     let fits = |required: u64, available: Option<u64>| {
         available.is_none_or(|available| required <= available)
     };
-    if matches!(&plan.residency, ResidencyPlan::FullyResident) {
+    if matches!(plan.residency(), ResidencyPlan::FullyResident) {
         return automatic_model_bytes(&observations.resources)
             .is_some_and(|(bytes, _)| fits(bytes, available_device));
     }
-    let (mut device_required, mut host_required) = match &plan.residency {
+    let (mut device_required, mut host_required) = match plan.residency() {
         ResidencyPlan::LayerwiseHost {
             device_budget_bytes: Some(device),
             host_budget_bytes: Some(host),
@@ -1223,9 +1223,10 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
             ..
         } => (*device_budget_bytes, *host_budget_bytes),
         ResidencyPlan::LayerwiseHost { .. } | ResidencyPlan::FullyResident => return false,
+        _ => return false,
     };
-    if let Some(expert) = &plan.expert_cache {
-        let (Some(device), Some(host)) = (expert.device_budget_bytes, expert.host_budget_bytes)
+    if let Some(expert) = plan.expert_cache() {
+        let (Some(device), Some(host)) = (expert.device_budget_bytes(), expert.host_budget_bytes())
         else {
             return false;
         };
@@ -1243,15 +1244,13 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
 }
 
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<eredu::api::LocalLoadOptions> {
-    Ok(LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), plan)?.load)
+    Ok(LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), plan)?.load())
 }
 
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
     let report = inspect_local_model(
         model_path,
-        LocalInspectionOptions {
-            load: candidate_load_options(plan)?,
-        },
+        LocalInspectionOptions::new(candidate_load_options(plan)?),
     )?;
     Ok(AutoCandidate {
         supported: report.is_loadable(),
@@ -1264,19 +1263,20 @@ fn base_automatic_candidates(
     host_budget: u64,
 ) -> [ExecutionPlan; 3] {
     let resident = ExecutionPlan::fully_resident(device.clone());
-    let mut layerwise = ExecutionPlan::fully_resident(device.clone());
-    layerwise.residency = ResidencyPlan::LayerwiseHost {
-        device_layer_window: 1,
-        device_budget_bytes: Some(device_budget),
-        host_budget_bytes: Some(host_budget),
-    };
-    let mut disk = ExecutionPlan::fully_resident(device);
-    disk.residency = ResidencyPlan::DenseDiskStream {
-        device_budget_bytes: device_budget,
-        host_budget_bytes: host_budget,
-        host_lookahead: usize::from(host_budget > 0) * 2,
-        background_queue: usize::from(host_budget > 0) * 2,
-    };
+    let layerwise = ExecutionPlan::fully_resident(device.clone()).with_residency(
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window: 1,
+            device_budget_bytes: Some(device_budget),
+            host_budget_bytes: Some(host_budget),
+        },
+    );
+    let disk =
+        ExecutionPlan::fully_resident(device).with_residency(ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: device_budget,
+            host_budget_bytes: host_budget,
+            host_lookahead: usize::from(host_budget > 0) * 2,
+            background_queue: usize::from(host_budget > 0) * 2,
+        });
     [resident, layerwise, disk]
 }
 
@@ -1306,40 +1306,58 @@ fn model_advertises_embedded_mtp(model_path: &Path) -> bool {
 
 fn with_expert_cache(mut plan: ExecutionPlan) -> ExecutionPlan {
     let split = |bytes: u64, percent: u64| bytes.saturating_mul(percent) / 100;
-    let (device_budget, host_budget) = match &mut plan.residency {
-        ResidencyPlan::FullyResident => (AUTO_DEVICE_FALLBACK_BYTES, AUTO_HOST_FALLBACK_BYTES),
+    let (residency, device_budget, host_budget) = match plan.residency().clone() {
+        ResidencyPlan::FullyResident => (
+            ResidencyPlan::FullyResident,
+            AUTO_DEVICE_FALLBACK_BYTES,
+            AUTO_HOST_FALLBACK_BYTES,
+        ),
         ResidencyPlan::LayerwiseHost {
+            device_layer_window,
             device_budget_bytes,
             host_budget_bytes,
-            ..
         } => {
             let device = device_budget_bytes.unwrap_or(AUTO_DEVICE_FALLBACK_BYTES);
             let host = host_budget_bytes.unwrap_or(AUTO_HOST_FALLBACK_BYTES);
-            *device_budget_bytes = Some(split(device, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1));
-            *host_budget_bytes = Some(split(host, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1));
-            (device, host)
+            (
+                ResidencyPlan::LayerwiseHost {
+                    device_layer_window,
+                    device_budget_bytes: Some(
+                        split(device, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1),
+                    ),
+                    host_budget_bytes: Some(split(host, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1)),
+                },
+                device,
+                host,
+            )
         }
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes,
             host_budget_bytes,
-            ..
-        } => {
-            let device = *device_budget_bytes;
-            let host = *host_budget_bytes;
-            *device_budget_bytes = split(device, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1);
-            *host_budget_bytes = split(host, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1);
-            (device, host)
-        }
+            host_lookahead,
+            background_queue,
+        } => (
+            ResidencyPlan::DenseDiskStream {
+                device_budget_bytes: split(device_budget_bytes, 100 - AUTO_EXPERT_SHARE_PERCENT)
+                    .max(1),
+                host_budget_bytes: split(host_budget_bytes, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1),
+                host_lookahead,
+                background_queue,
+            },
+            device_budget_bytes,
+            host_budget_bytes,
+        ),
+        _ => return plan,
     };
+    plan = plan.with_residency(residency);
     let scratch = (1_u64 << 30).min(device_budget.max(1));
-    plan.expert_cache = Some(ExpertCachePlan {
-        device_budget_bytes: Some(split(device_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
-        host_budget_bytes: Some(split(host_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
-        scratch_bytes: scratch,
-        prefill_bank_bytes: scratch,
-        eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
-    });
-    plan
+    plan.with_expert_cache(Some(ExpertCachePlan::new(
+        Some(split(device_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
+        Some(split(host_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
+        scratch,
+        scratch,
+        CacheEvictionPolicy::LeastRecentlyUsed,
+    )))
 }
 
 #[cfg(test)]
@@ -1437,7 +1455,7 @@ fn automatic_benchmark_candidates(
     heuristic: &ExecutionPlanReport,
 ) -> Result<Vec<ExecutionPlan>> {
     let device_available =
-        selected_device_available_memory(&heuristic.hardware, &heuristic.plan.device);
+        selected_device_available_memory(&heuristic.hardware, heuristic.plan.device());
     let host_available = observed_u64(&heuristic.hardware.available_memory_bytes);
     let device_budget = automatic_budget(device_available, AUTO_DEVICE_FALLBACK_BYTES);
     let host_budget = automatic_budget(host_available, AUTO_HOST_FALLBACK_BYTES);
@@ -1450,11 +1468,11 @@ fn automatic_benchmark_candidates(
             bytes <= host_budget
         }
     });
-    let embedded = matches!(heuristic.plan.drafting, DraftingPlan::Embedded { .. });
+    let embedded = matches!(heuristic.plan.drafting(), DraftingPlan::Embedded { .. });
     let mut plans = Vec::new();
     let mut seen = HashSet::new();
     for (index, plan) in
-        base_automatic_candidates(heuristic.plan.device.clone(), device_budget, host_budget)
+        base_automatic_candidates(heuristic.plan.device().clone(), device_budget, host_budget)
             .into_iter()
             .enumerate()
     {
@@ -1471,15 +1489,15 @@ fn automatic_benchmark_candidates(
                 residency_plans.push(expert);
             }
         }
-        for mut variant in residency_plans {
-            variant.drafting = DraftingPlan::Disabled;
+        for variant in residency_plans {
+            let mut variant = variant.with_drafting(DraftingPlan::Disabled);
             push_unique_plan(&mut plans, &mut seen, variant.clone());
             if embedded {
-                variant.drafting = DraftingPlan::Embedded {
+                variant = variant.with_drafting(DraftingPlan::Embedded {
                     max_draft_tokens: 3,
                     lookahead: true,
                     adaptive_lookahead: true,
-                };
+                });
                 push_unique_plan(&mut plans, &mut seen, variant);
             }
         }
@@ -1489,11 +1507,11 @@ fn automatic_benchmark_candidates(
 }
 
 fn cli_device_for_plan(device: &DevicePlan) -> Result<CliDevice> {
-    if device.backend.as_str() != "mlx" {
-        bail!("the Eredu CLI cannot execute backend {}", device.backend);
+    if device.backend().as_str() != "mlx" {
+        bail!("the Eredu CLI cannot execute backend {}", device.backend());
     }
     let (family, index) = device
-        .device
+        .device()
         .split_once(':')
         .context("planned MLX device must use family:index syntax")?;
     let index = index
@@ -1546,7 +1564,7 @@ fn isolated_benchmark_trial(
             .arg("--model")
             .arg(model_path)
             .arg("--device")
-            .arg(cli_device_for_plan(&plan.device)?.to_string())
+            .arg(cli_device_for_plan(plan.device())?.to_string())
             .arg("--auto-trial-plan")
             .arg(&plan_path)
             .arg("--telemetry-json")
@@ -1655,8 +1673,8 @@ fn benchmark_automatic_plans(
             "automatic benchmark: candidate {}/{} ({:?}, {:?})",
             candidate + 1,
             candidate_count,
-            plan.residency,
-            plan.drafting
+            plan.residency(),
+            plan.drafting()
         );
         let trials = (0..runs)
             .map(|run| {
@@ -1743,20 +1761,18 @@ fn benchmark_automatic_plans(
 }
 
 fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<ExecutionPlanReport> {
-    if plan.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
+    if plan.schema_version() != EXECUTION_PLAN_SCHEMA_VERSION {
         bail!(
             "exact automatic plan schema {} does not match supported schema {}",
-            plan.schema_version,
+            plan.schema_version(),
             EXECUTION_PLAN_SCHEMA_VERSION
         );
     }
     let hardware = discover_local_hardware();
-    validate_automatic_device(&hardware, &plan.device)?;
+    validate_automatic_device(&hardware, plan.device())?;
     let inspection = inspect_local_model(
         model_path,
-        LocalInspectionOptions {
-            load: candidate_load_options(&plan)?,
-        },
+        LocalInspectionOptions::new(candidate_load_options(&plan)?),
     )?;
     if !inspection.is_loadable() {
         let detail = inspection
@@ -1785,7 +1801,7 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
 }
 
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
-    match plan.weight_transformation {
+    match plan.weight_transformation() {
         WeightTransformationPlan::PreserveCheckpoint => {
             args.quantize = None;
             args.quantization_mode = LoadQuantizationMode::Affine;
@@ -1799,11 +1815,12 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             args.quantize = Some(4);
             args.quantization_mode = LoadQuantizationMode::Mxfp4;
         }
+        _ => bail!("unsupported weight transformation plan"),
     }
-    args.cached_shards = plan.max_cached_shards;
+    args.cached_shards = plan.max_cached_shards();
     args.layerwise_host = false;
     args.dense_disk_stream = false;
-    match &plan.residency {
+    match plan.residency() {
         ResidencyPlan::FullyResident => {}
         ResidencyPlan::LayerwiseHost {
             device_layer_window,
@@ -1827,29 +1844,31 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             args.dense_host_lookahead = *host_lookahead;
             args.dense_background_queue = *background_queue;
         }
+        _ => bail!("unsupported residency plan"),
     }
-    args.expert_cache = plan.expert_cache.is_some();
-    if let Some(expert) = &plan.expert_cache {
-        args.expert_cache_device_budget_bytes = expert.device_budget_bytes;
-        args.expert_cache_host_budget_bytes = expert.host_budget_bytes;
-        args.expert_cache_scratch_bytes = expert.scratch_bytes;
-        args.expert_cache_prefill_bank_bytes = expert.prefill_bank_bytes;
-        args.expert_cache_eviction = expert.eviction_policy.into();
+    args.expert_cache = plan.expert_cache().is_some();
+    if let Some(expert) = plan.expert_cache() {
+        args.expert_cache_device_budget_bytes = expert.device_budget_bytes();
+        args.expert_cache_host_budget_bytes = expert.host_budget_bytes();
+        args.expert_cache_scratch_bytes = expert.scratch_bytes();
+        args.expert_cache_prefill_bank_bytes = expert.prefill_bank_bytes();
+        args.expert_cache_eviction = expert.eviction_policy().into();
     }
-    match plan.drafting {
+    match plan.drafting() {
         DraftingPlan::Disabled => args.speculative_draft_tokens = 0,
         DraftingPlan::Embedded {
             max_draft_tokens,
             lookahead,
             adaptive_lookahead,
         } => {
-            args.speculative_draft_tokens = max_draft_tokens;
+            args.speculative_draft_tokens = *max_draft_tokens;
             args.disable_speculative_lookahead = !lookahead;
             args.disable_speculative_adaptive_lookahead = !adaptive_lookahead;
         }
         DraftingPlan::External { .. } => {
             bail!("single-device automatic planning cannot apply an external drafting plan")
         }
+        _ => bail!("unsupported speculative drafting plan"),
     }
     Ok(())
 }
@@ -1957,11 +1976,11 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
             let plan: ExecutionPlan = serde_json::from_slice(&bytes)
                 .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
-            if plan.device != device_plan(args.device)? {
+            if plan.device() != &device_plan(args.device)? {
                 bail!(
                     "exact trial plan device {}:{} does not match --device {}",
-                    plan.device.backend,
-                    plan.device.device,
+                    plan.device().backend(),
+                    plan.device().device(),
                     args.device
                 );
             }
@@ -2111,9 +2130,7 @@ fn main() -> Result<()> {
         Some(
             inspect_local_model(
                 &model_path,
-                LocalInspectionOptions {
-                    load: candidate_load_options(&execution_plan)?,
-                },
+                LocalInspectionOptions::new(candidate_load_options(&execution_plan)?),
             )?
             .resources,
         )
@@ -2337,9 +2354,9 @@ fn main() -> Result<()> {
                     },
                 },
             )?;
-            output_ids = output.token_ids;
-            speculative_stats = Some(output.stats);
-            prepared_finish_reason = Some(output.finish_reason);
+            output_ids = output.token_ids().to_vec();
+            speculative_stats = Some(output.stats().clone());
+            prepared_finish_reason = Some(output.finish_reason());
         } else {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
@@ -2445,7 +2462,7 @@ fn main() -> Result<()> {
             .expect("verbose execution collected allocator telemetry");
         eprintln!(
             "model_family: {}, effective_model_type: {}, prompt_tokens: {}, generated_tokens: {}",
-            model.model_family().canonical_name(),
+            model.effective_model_type(),
             model.effective_model_type(),
             prompt_token_ids.len(),
             output_ids.len(),
@@ -2461,41 +2478,41 @@ fn main() -> Result<()> {
         if let Some(stats) = &speculative_stats {
             eprintln!(
                 "speculative_execution_topology: {}",
-                stats.execution_topology
+                stats.execution_topology()
             );
             eprintln!(
                 "speculative_rounds: {}, speculative_draft_tokens: {}, speculative_accepted_tokens: {}, speculative_accept_rate: {:.3}, speculative_optimistic_blocks: {}, speculative_optimistic_bonus_tokens: {}, speculative_optimistic_bonus_matches: {}, speculative_optimistic_bonus_mismatches: {}, speculative_consumed_optimistic_tokens: {}, speculative_reused_optimistic_blocks: {}, speculative_reused_optimistic_tokens: {}, speculative_discarded_optimistic_blocks: {}, speculative_discarded_optimistic_tokens: {}, speculative_adaptive_lookahead_disabled: {}, speculative_cross_request_draft_opportunities: {}",
-                stats.rounds,
-                stats.draft_tokens,
-                stats.accepted_tokens,
+                stats.rounds(),
+                stats.draft_tokens(),
+                stats.accepted_tokens(),
                 stats.accept_rate(),
-                stats.optimistic_draft_blocks,
-                stats.optimistic_target_bonus_tokens,
-                stats.optimistic_bonus_matches,
-                stats.optimistic_bonus_mismatches,
-                stats.consumed_optimistic_tokens,
-                stats.reused_optimistic_blocks,
-                stats.reused_optimistic_tokens,
-                stats.discarded_optimistic_blocks,
-                stats.discarded_optimistic_tokens,
-                stats.adaptive_lookahead_disabled,
-                stats.cross_request_draft_opportunities,
+                stats.optimistic_draft_blocks(),
+                stats.optimistic_target_bonus_tokens(),
+                stats.optimistic_bonus_matches(),
+                stats.optimistic_bonus_mismatches(),
+                stats.consumed_optimistic_tokens(),
+                stats.reused_optimistic_blocks(),
+                stats.reused_optimistic_tokens(),
+                stats.discarded_optimistic_blocks(),
+                stats.discarded_optimistic_tokens(),
+                stats.adaptive_lookahead_disabled(),
+                stats.cross_request_draft_opportunities(),
             );
             eprintln!(
                 "speculative_optimistic_draft_time: {:.3} s, speculative_verification_in_flight_time: {:.3} s",
-                stats.optimistic_draft_time.as_secs_f64(),
-                stats.verification_in_flight_time.as_secs_f64(),
+                stats.optimistic_draft_time().as_secs_f64(),
+                stats.verification_in_flight_time().as_secs_f64(),
             );
-            if stats.component_timings_collected {
+            if stats.component_timings_collected() {
                 eprintln!(
                     "speculative_draft_context_time: {:.3} s, speculative_draft_assistant_time: {:.3} s, speculative_draft_head_time: {:.3} s, speculative_target_verification_time: {:.3} s",
-                    stats.draft_context_time.as_secs_f64(),
-                    stats.draft_assistant_time.as_secs_f64(),
-                    stats.draft_head_time.as_secs_f64(),
-                    stats.target_verification_time.as_secs_f64(),
+                    stats.draft_context_time().as_secs_f64(),
+                    stats.draft_assistant_time().as_secs_f64(),
+                    stats.draft_head_time().as_secs_f64(),
+                    stats.target_verification_time().as_secs_f64(),
                 );
             }
-            eprintln!("speculative_accept_lens: {:?}", stats.accept_lens);
+            eprintln!("speculative_accept_lens: {:?}", stats.accept_lens());
         }
         eprintln!(
             "mlx_peak_memory: {}",
@@ -2631,8 +2648,10 @@ fn cli_execution_plan(
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes: args
                 .device_budget_bytes
-                .unwrap_or(defaults.device_budget_bytes),
-            host_budget_bytes: args.host_budget_bytes.unwrap_or(defaults.host_budget_bytes),
+                .unwrap_or(defaults.device_budget_bytes()),
+            host_budget_bytes: args
+                .host_budget_bytes
+                .unwrap_or(defaults.host_budget_bytes()),
             host_lookahead: args.dense_host_lookahead,
             background_queue: args.dense_background_queue,
         }
@@ -2668,35 +2687,38 @@ fn cli_execution_plan(
     } else {
         DraftingPlan::Disabled
     };
-    Ok(ExecutionPlan {
-        schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
-        device: device_plan(args.device)?,
-        topology: eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
-            .expect("the singleton topology is valid"),
-        residency,
-        weight_transformation: match (args.quantize, args.quantization_mode) {
-            (Some(bits), LoadQuantizationMode::Affine) => WeightTransformationPlan::Affine {
-                bits,
-                group_size: args.quantization_group_size,
-            },
-            (Some(4), LoadQuantizationMode::Mxfp4) => WeightTransformationPlan::MxFp4,
-            _ => WeightTransformationPlan::PreserveCheckpoint,
+    let transformation = match (args.quantize, args.quantization_mode) {
+        (None, _) => WeightTransformationPlan::PreserveCheckpoint,
+        (Some(bits), LoadQuantizationMode::Affine) => WeightTransformationPlan::Affine {
+            bits,
+            group_size: args.quantization_group_size,
         },
-        max_cached_shards: args.cached_shards,
-        expert_cache: args.expert_cache.then_some(ExpertCachePlan {
-            device_budget_bytes: args.expert_cache_device_budget_bytes,
-            host_budget_bytes: args.expert_cache_host_budget_bytes,
-            scratch_bytes: args.expert_cache_scratch_bytes,
-            prefill_bank_bytes: args.expert_cache_prefill_bank_bytes,
-            eviction_policy: args.expert_cache_eviction.into(),
-        }),
-        drafting,
-        required_device_capabilities: DeviceCapabilities {
-            exact_completion: true,
-            ..DeviceCapabilities::default()
-        },
-        required_session_capabilities: SessionCapabilities::default(),
-    })
+        (Some(4), LoadQuantizationMode::Mxfp4) => WeightTransformationPlan::MxFp4,
+        (Some(bits), LoadQuantizationMode::Mxfp4) => {
+            return Err(anyhow::anyhow!(
+                "MXFP4 transformation requires exactly 4 bits, got {bits}"
+            ));
+        }
+    };
+    let expert_cache = args.expert_cache.then_some(ExpertCachePlan::new(
+        args.expert_cache_device_budget_bytes,
+        args.expert_cache_host_budget_bytes,
+        args.expert_cache_scratch_bytes,
+        args.expert_cache_prefill_bank_bytes,
+        args.expert_cache_eviction.into(),
+    ));
+    Ok(ExecutionPlan::fully_resident(device_plan(args.device)?)
+        .with_topology(
+            eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
+                .expect("the singleton topology is valid"),
+        )
+        .with_residency(residency)
+        .with_weight_transformation(transformation)
+        .with_max_cached_shards(args.cached_shards)
+        .with_expert_cache(expert_cache)
+        .with_drafting(drafting)
+        .with_required_device_capabilities(DeviceCapabilities::new(true, false, false))
+        .with_required_session_capabilities(SessionCapabilities::default()))
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -3590,19 +3612,20 @@ mod tests {
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
         let device = device_plan(CliDevice::Cpu).unwrap();
-        let mut plan = base_automatic_candidates(device, 1 << 30, 2 << 30)[1].clone();
-        plan.expert_cache = Some(super::ExpertCachePlan {
-            device_budget_bytes: Some(256 << 20),
-            host_budget_bytes: Some(512 << 20),
-            scratch_bytes: 128 << 20,
-            prefill_bank_bytes: 64 << 20,
-            eviction_policy: super::CacheEvictionPolicy::LeastRecentlyUsed,
-        });
-        plan.drafting = DraftingPlan::Embedded {
-            max_draft_tokens: 3,
-            lookahead: true,
-            adaptive_lookahead: true,
-        };
+        let plan = base_automatic_candidates(device, 1 << 30, 2 << 30)[1]
+            .clone()
+            .with_expert_cache(Some(super::ExpertCachePlan::new(
+                Some(256 << 20),
+                Some(512 << 20),
+                128 << 20,
+                64 << 20,
+                super::CacheEvictionPolicy::LeastRecentlyUsed,
+            )))
+            .with_drafting(DraftingPlan::Embedded {
+                max_draft_tokens: 3,
+                lookahead: true,
+                adaptive_lookahead: true,
+            });
 
         apply_automatic_plan(&mut args, &plan).unwrap();
         assert!(args.layerwise_host);
@@ -3613,7 +3636,7 @@ mod tests {
         assert_eq!(args.speculative_draft_tokens, 3);
         assert!(!args.disable_speculative_lookahead);
         assert!(matches!(
-            plan.residency,
+            plan.residency(),
             ResidencyPlan::LayerwiseHost { .. }
         ));
     }
@@ -3623,16 +3646,16 @@ mod tests {
         let mut args =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
-        let mut plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap());
-        plan.weight_transformation = WeightTransformationPlan::Affine {
-            bits: 4,
-            group_size: 128,
-        };
+        let mut plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
+            .with_weight_transformation(WeightTransformationPlan::Affine {
+                bits: 4,
+                group_size: 128,
+            });
         apply_automatic_plan(&mut args, &plan).unwrap();
         assert_eq!(args.quantize, Some(4));
         assert_eq!(args.quantization_group_size, 128);
 
-        plan.weight_transformation = WeightTransformationPlan::MxFp4;
+        plan = plan.with_weight_transformation(WeightTransformationPlan::MxFp4);
         apply_automatic_plan(&mut args, &plan).unwrap();
         assert_eq!(args.quantize, Some(4));
         assert_eq!(args.quantization_mode, super::LoadQuantizationMode::Mxfp4);
@@ -3704,16 +3727,16 @@ mod tests {
         assert_eq!(args.telemetry_json.as_deref(), Some(Path::new("run.json")));
 
         let plan = cli_execution_plan(&args, None, false).unwrap();
-        assert_eq!(plan.device.backend.as_str(), "mlx");
-        assert_eq!(plan.device.device, "cpu:0");
+        assert_eq!(plan.device().backend().as_str(), "mlx");
+        assert_eq!(plan.device().device(), "cpu:0");
         assert!(matches!(
-            plan.residency,
+            plan.residency(),
             ResidencyPlan::LayerwiseHost {
                 device_layer_window: 2,
                 ..
             }
         ));
-        assert_eq!(plan.drafting, DraftingPlan::Disabled);
+        assert_eq!(plan.drafting(), &DraftingPlan::Disabled);
     }
 
     #[test]

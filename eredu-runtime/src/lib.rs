@@ -79,7 +79,7 @@ pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
     DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
 };
-pub use draft::DraftStateTransaction;
+pub use draft::{execute_draft_group, DraftGroupExecutionError, DraftStateTransaction};
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupSchedule,
     ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress, ExecutionUnitLayout,
@@ -88,9 +88,9 @@ pub use execution::{
 pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     reduce_routed_expert_tensor_parallel, reduce_tensor_parallel_expert_output,
-    ObservedExpertProvider, ObservedExpertProviderError, ResidentExpertProvider,
-    RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RoutedObservationPoint, TensorParallelRoutedExpertProvider,
+    AddressableGatedProductBank, ObservedExpertProvider, ObservedExpertProviderError,
+    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput, RoutedObservationPoint, TensorParallelRoutedExpertProvider,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
@@ -135,17 +135,18 @@ pub use partition::{
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{
-    RealtimeCompletionAttachmentError, RealtimeGenerationBranch, RealtimeGenerationState,
-    RealtimeGenerationTransactionError,
+    RealtimeCompletionAttachmentError, RealtimeFrameExecutionError, RealtimeFrameTransition,
+    RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
 };
 pub use replicated_text::{
     select_replicated_text_realization, BackendMechanismCapabilities, GroupedOperationRequirement,
     ParameterTransformConstraint, ParameterTransformTarget, ReplicatedTextArchitecture,
     ReplicatedTextContractError, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextRequirements,
-    ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, SelectedParameterRealization,
-    SelectedReplicatedTextRealization, StateResidencyMechanism, WeightLoweringCapability,
-    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
+    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
+    SelectedParameterRealization, SelectedReplicatedTextRealization, StateResidencyMechanism,
+    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
+    WeightResidencyMechanism,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,
@@ -156,15 +157,17 @@ pub use residency::{
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use state::{
-    ArchitectureStatePartitionError, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ArchitectureStatePlacement, DeviceState, LayerRuntimeState,
-    ModelStateIdentity, ResettableRuntimeLayerState, ResettableRuntimeState, RuntimeLayerState,
-    RuntimeState, RuntimeStateComponents, StateError, StateLayout, StateSegmentId,
-    StateSegmentLifetime, StateSegmentSpec, DEFAULT_STATE_SEGMENT_ID,
+    realize_architecture_state, ArchitectureStateFactory, ArchitectureStatePartitionError,
+    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ArchitectureStatePlacement,
+    ArchitectureStateRealizationError, DeviceState, LayerRuntimeState, ModelStateIdentity,
+    ResettableRuntimeLayerState, ResettableRuntimeState, RuntimeLayerState, RuntimeState,
+    RuntimeStateComponents, StateError, StateLayout, StateSegmentId, StateSegmentLifetime,
+    StateSegmentSpec, DEFAULT_STATE_SEGMENT_ID,
 };
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,
-    ExecutionResidency, ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, ExpertWeightResidency,
-    LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, NonExpertWeightResidency,
-    StaticUnitBindings, WeightResidency, WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
+    ExecutionResidency, ExpertPass, LayerWeightResidency, LayerwiseLoadOptions,
+    LayerwiseModelMetadata, OrdinaryWeightResidency, ParameterBankKey, ParameterBankLoadOptions,
+    ParameterBankResidency, StaticUnitBindings, WeightResidency, WeightResidencyPolicyError,
+    DENSE_TRANSFER_WINDOW,
 };

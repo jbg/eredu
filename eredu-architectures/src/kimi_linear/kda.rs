@@ -13,7 +13,7 @@ use super::ModelArgs;
 /// Backend-neutral Kimi Delta Attention operator.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct KimiDeltaAttention<B: NeuralBackend> {
+pub struct KimiDeltaAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     num_heads: i32,
     #[parameter(skip)]
@@ -37,7 +37,7 @@ pub struct KimiDeltaAttention<B: NeuralBackend> {
     o_proj: B::Linear,
 }
 
-impl<B: NeuralBackend> KimiDeltaAttention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> KimiDeltaAttention<B> {
     /// Creates unloaded KDA parameters for one physical layer.
     pub fn new(
         args: &ModelArgs,

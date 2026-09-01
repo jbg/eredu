@@ -42,7 +42,9 @@ fn expert_member_sharding(
 }
 
 /// Declares attention, sinks, router, biased expert bank, and norms for a layer.
-pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn layer_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     block: &TransformerBlock<B>,
     args: &ModelArgs,
     layer: usize,
@@ -71,7 +73,7 @@ pub fn layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
 }
 
 /// Declares pinned embedding, final norm, and separate head placement.
-pub fn static_parameter_groups<B: GroupedNeuralBackend>(
+pub fn static_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     modules: &crate::decoder::StaticModules<B>,
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {

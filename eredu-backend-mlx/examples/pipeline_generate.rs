@@ -1,7 +1,7 @@
 //! Minimal MLX two-or-more-process microbatched pipeline generation probe.
 
 use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
-use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelContext};
+use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelPlan};
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 use safemlx::{
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = MlxParallelContext::for_group(
+    let topology = MlxParallelPlan::for_group(
         &group,
         1,
         group.size(),

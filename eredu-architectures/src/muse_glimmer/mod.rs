@@ -39,7 +39,9 @@ pub use text::{
 pub use vision::{VisionBlock, VisionInput, VisionState, VisionStatic, VisionTower};
 
 /// Derives complete expert ownership and rank-local bank geometry from Muse-Glimmer.
-pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
+pub fn expert_realization_plan<
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
@@ -52,8 +54,8 @@ pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(eredu_nn::Error::backend)?
@@ -105,13 +107,14 @@ pub fn state_identity(
             "Muse-Glimmer owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(eredu_runtime::ModelStateIdentity {
-        model_family: "muse_glimmer".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: args.architecture_fingerprint(),
+    eredu_runtime::ModelStateIdentity::new(
+        "muse_glimmer",
+        args.model_type.clone(),
+        args.architecture_fingerprint(),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(|error| ConfigError::Invalid(error.to_string()))
 }

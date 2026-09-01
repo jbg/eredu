@@ -51,10 +51,7 @@ impl BackendProvider for MockBackend {
     type Error = MockError;
 
     fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor {
-            name: "portable-mock".into(),
-            version: "1".into(),
-        }
+        BackendDescriptor::new("portable-mock", "1")
     }
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {

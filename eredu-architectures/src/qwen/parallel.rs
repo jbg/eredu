@@ -118,7 +118,9 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
 }
 
 /// Declares every rank-local placement group for a dynamically dense-or-routed Qwen block.
-pub fn routed_layer_parallel_parameter_groups<B: GroupedNeuralBackend>(
+pub fn routed_layer_parallel_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     block: &RoutedTransformerBlock<B>,
     args: &ModelArgs,
     layer: usize,

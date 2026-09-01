@@ -237,14 +237,14 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
             if sequence <= 0 {
                 return Err(Exception::custom("Muse-Glimmer DFlash input is empty"));
             }
-            Ok(SpeculativePrefill {
-                logits: output
+            Ok(SpeculativePrefill::new(
+                output
                     .logits
                     .as_array()
                     .try_index_device((.., sequence - 1, ..), streams.target())?,
-                state: self.target_state(&output, None, cache.offset(), streams.target())?,
-                evaluated_tokens: sequence as usize,
-            })
+                self.target_state(&output, None, cache.offset(), streams.target())?,
+                sequence as usize,
+            ))
         })
     }
 
@@ -389,14 +389,14 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         }
         if verified_inputs == 0 {
             cache.restore_checkpoint(&checkpoint, streams.target())?;
-            return Ok(SpeculativeCommit {
-                state: MuseTargetState {
+            return Ok(SpeculativeCommit::new(
+                MuseTargetState {
                     pending_context: None,
                     draft_context: Some(draft_state.draft_context),
                     cache_len: checkpoint.offset(),
                 },
-                replayed_tokens: 0,
-            });
+                0,
+            ));
         }
         let (retained, replayed_tokens) = if verified_inputs == input_len {
             (output.output, 0)
@@ -417,15 +417,15 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
                 .map_err(|error| Exception::custom(error.to_string()))?;
             (replayed, verified_inputs)
         };
-        Ok(SpeculativeCommit {
-            state: self.target_state(
+        Ok(SpeculativeCommit::new(
+            self.target_state(
                 &retained,
                 Some(draft_state.draft_context),
                 cache.offset(),
                 streams.target(),
             )?,
             replayed_tokens,
-        })
+        ))
     }
 }
 
@@ -595,14 +595,14 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
                     "Gemma 4 speculative input must contain at least one token",
                 ));
             }
-            Ok(SpeculativePrefill {
-                logits: output
+            Ok(SpeculativePrefill::new(
+                output
                     .logits
                     .as_array()
                     .try_index_device((.., sequence - 1, ..), streams.target())?,
-                state: Self::state_at(&output, sequence - 1, cache.offset(), streams.target())?,
-                evaluated_tokens: sequence as usize,
-            })
+                Self::state_at(&output, sequence - 1, cache.offset(), streams.target())?,
+                sequence as usize,
+            ))
         })
     }
 
@@ -709,15 +709,15 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
             )));
         }
         if verified_inputs == input_len {
-            return Ok(SpeculativeCommit {
-                state: Self::state_at(
+            return Ok(SpeculativeCommit::new(
+                Self::state_at(
                     &output.output,
                     verified_inputs as i32 - 1,
                     cache.offset(),
                     streams.target(),
                 )?,
-                replayed_tokens: 0,
-            });
+                0,
+            ));
         }
 
         cache.restore_checkpoint(&checkpoint, streams.target())?;
@@ -728,15 +728,15 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
             .target
             .verify_speculative(&MlxTensor::from_array(retained), cache, streams.target())
             .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(SpeculativeCommit {
-            state: Self::state_at(
+        Ok(SpeculativeCommit::new(
+            Self::state_at(
                 &replayed,
                 verified_inputs as i32 - 1,
                 cache.offset(),
                 streams.target(),
             )?,
-            replayed_tokens: verified_inputs,
-        })
+            verified_inputs,
+        ))
     }
 }
 

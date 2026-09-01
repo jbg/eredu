@@ -19,7 +19,7 @@ use super::{DecoderConfig, LocalGeometry, WeightConvention};
 /// RMS normalization whose checkpoint scale may store `(scale - 1)`.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct CenteredRmsNorm<B: GroupedNeuralBackend> {
+pub struct CenteredRmsNorm<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Stored scale parameter.
     pub weight: Parameter<B::Tensor>,
     #[parameter(skip)]
@@ -30,7 +30,7 @@ pub struct CenteredRmsNorm<B: GroupedNeuralBackend> {
     effective_scale: Option<B::Tensor>,
 }
 
-impl<B: GroupedNeuralBackend> CenteredRmsNorm<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredRmsNorm<B> {
     fn new(
         dimensions: i32,
         epsilon: f32,
@@ -75,7 +75,7 @@ impl<B: GroupedNeuralBackend> CenteredRmsNorm<B> {
 /// Gated grouped-query attention with per-layer RoPE/NoPE policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Attention<B: GroupedNeuralBackend> {
+pub struct Attention<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     query_heads: i32,
     #[parameter(skip)]
@@ -110,7 +110,7 @@ pub struct Attention<B: GroupedNeuralBackend> {
     pub rotary: B::Rotary,
 }
 
-impl<B: GroupedNeuralBackend> Attention<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     /// Builds one unloaded scheduled attention unit.
     pub fn new(
         args: &DecoderConfig,
@@ -321,7 +321,7 @@ impl<B: GroupedNeuralBackend> Attention<B> {
 /// Dense SwiGLU branch.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Mlp<B: GroupedNeuralBackend> {
+pub struct Mlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Gate projection.
     pub gate: B::Linear,
     /// Up projection.
@@ -330,7 +330,7 @@ pub struct Mlp<B: GroupedNeuralBackend> {
     pub down: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend> Mlp<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Mlp<B> {
     fn new(
         args: &DecoderConfig,
         layer: usize,
@@ -387,7 +387,7 @@ impl<B: GroupedNeuralBackend> Mlp<B> {
 /// Softmax top-k routed gated-product branch used by Muse-Glimmer MoE checkpoints.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SparseMoe<B: GroupedNeuralBackend> {
+pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Learned softmax router.
     pub router: B::Selector,
     /// Packed routed expert bank.
@@ -396,7 +396,7 @@ pub struct SparseMoe<B: GroupedNeuralBackend> {
     hidden_size: i32,
 }
 
-impl<B: GroupedNeuralBackend> SparseMoe<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> {
     fn new(
         args: &DecoderConfig,
         layer: usize,
@@ -450,7 +450,7 @@ impl<B: GroupedNeuralBackend> SparseMoe<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
             return Err(Error::backend("invalid Muse-Glimmer MoE hidden geometry"));
@@ -577,14 +577,14 @@ pub(crate) fn localized_expert_bank_spec(
 /// Dense or routed feed-forward branch selected by normalized checkpoint geometry.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: GroupedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Dense SwiGLU branch.
     Dense(Mlp<B>),
     /// Softmax top-k routed gated-product branch.
     Sparse(SparseMoe<B>),
 }
 
-impl<B: GroupedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
     fn new(
         args: &DecoderConfig,
         layer: usize,
@@ -615,7 +615,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         match self {
             Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
@@ -667,7 +667,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
 /// One post-normalized decoder block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct TransformerBlock<B: GroupedNeuralBackend> {
+pub struct TransformerBlock<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Gated self-attention.
@@ -684,7 +684,7 @@ pub struct TransformerBlock<B: GroupedNeuralBackend> {
     pub post_feed_forward_norm: CenteredRmsNorm<B>,
 }
 
-impl<B: GroupedNeuralBackend> TransformerBlock<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBlock<B> {
     /// Builds one unloaded block.
     pub fn new(
         args: &DecoderConfig,
@@ -776,7 +776,7 @@ impl<B: GroupedNeuralBackend> TransformerBlock<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let normalized = self.input_norm.forward(hidden, context)?;
         let attention =
@@ -836,7 +836,7 @@ impl<B: GroupedNeuralBackend> TransformerBlock<B> {
 /// Pinned token embedding, final norm, and tied/untied vocabulary head.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: GroupedNeuralBackend> {
+pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Token table.
     pub embeddings: B::Embedding,
     /// Final learned RMS norm.
@@ -851,7 +851,7 @@ pub struct StaticModules<B: GroupedNeuralBackend> {
     logit_cap: f32,
 }
 
-impl<B: GroupedNeuralBackend> StaticModules<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
     /// Builds pinned modules.
     pub fn new(
         args: &DecoderConfig,

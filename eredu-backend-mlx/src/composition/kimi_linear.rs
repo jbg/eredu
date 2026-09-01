@@ -365,7 +365,7 @@ fn load_neutral_parallel(
     store: Arc<dyn CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
     external_experts: bool,
@@ -492,7 +492,9 @@ fn load_neutral_parallel(
         },
         maximum_device_parameter_bytes,
     );
-    let rank = crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+    let rank =
+        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
+            .cache_rank_identity();
     let execution = if options.is_fully_resident() {
         KimiLinearExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -582,7 +584,8 @@ pub struct KimiLinearModel {
     state_layout: eredu_runtime::StateLayout,
     execution: KimiLinearExecution,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
 }
 
@@ -593,7 +596,10 @@ impl KimiLinearModel {
     }
 
     /// Returns parallel metadata when a distributed binder supplied it.
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -674,7 +680,9 @@ impl KimiLinearModel {
             self.parallel_info
                 .as_ref()
                 .map_or_else(PromptCacheTopology::default, |info| {
-                    crate::backend::cache::prompt_cache_topology(info.topology())
+                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                        info.topology(),
+                    )
                 }),
         )
     }
@@ -760,7 +768,7 @@ impl KimiLinearModel {
             tensors,
             i32::try_from(prefix_token_ids.len())
                 .map_err(|_| Exception::custom("prompt-cache prefix exceeds i32"))?,
-            &identity.layer_prefix_offsets,
+            identity.layer_prefix_offsets(),
         )?;
         Ok((cache, manifest))
     }
@@ -1059,7 +1067,7 @@ pub fn load_kimi_linear_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
     let eredu_architectures::configuration::SafetensorsModelConfig::KimiLinear(args) =
         artifact.model()
@@ -1108,7 +1116,7 @@ pub fn load_kimi_linear_model(
 
 fn attach_parameter_bank(
     model: &mut KimiLinearModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
@@ -1128,7 +1136,7 @@ fn attach_parameter_bank(
 pub fn load_kimi_linear_tensor_parallel_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearModel, Error> {
@@ -1181,7 +1189,7 @@ pub(crate) fn load_kimi_linear_gguf_model(
 ) -> Result<KimiLinearModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         source.plan().checkpoint(),
@@ -1213,7 +1221,7 @@ pub(crate) fn load_kimi_linear_gguf_model(
 pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearModel, Error> {

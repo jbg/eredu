@@ -18,8 +18,9 @@ use crate::composition::mlx::ModelProcessor;
 
 use crate::{
     backend::error::Error,
-    backend::{MlxModel, ModelLoadOptions},
+    backend::MlxModel,
     composition::mlx::{structural, Executable},
+    MlxLoadRequest,
 };
 
 use super::realization::{
@@ -27,6 +28,106 @@ use super::realization::{
     CompleteTensorParallelBinding as TensorParallelBinding, FamilyBinding, FixedGgufBinding,
     GgufBinding, QuantizedGgufBinding,
 };
+
+/// Opaque MLX model configuration selected before payloads are opened.
+#[derive(Debug, Clone)]
+pub struct MlxModelConfig {
+    pub(crate) plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    pub(crate) selected: MlxSelectedPreparation,
+}
+
+impl MlxModelConfig {
+    pub(crate) const fn new(
+        plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+        selected: MlxSelectedPreparation,
+    ) -> Self {
+        Self { plan, selected }
+    }
+}
+
+/// Opaque, authoritative MLX construction policy selected before payloads are opened.
+#[derive(Debug, Clone)]
+pub struct MlxSelectedPreparation {
+    route: MlxSelectedPreparationRoute,
+}
+
+#[derive(Debug, Clone)]
+enum MlxSelectedPreparationRoute {
+    ReplicatedText {
+        requirements: eredu_runtime::ReplicatedTextRequirements,
+        realization: eredu_runtime::SelectedReplicatedTextRealization,
+    },
+    Other(SelectedMlxConstruction),
+}
+
+impl MlxSelectedPreparation {
+    const fn new(route: MlxSelectedPreparationRoute) -> Self {
+        Self { route }
+    }
+
+    fn into_route(self) -> MlxSelectedPreparationRoute {
+        self.route
+    }
+
+    pub(crate) const fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        match &self.route {
+            MlxSelectedPreparationRoute::ReplicatedText { realization, .. } => {
+                realization.session()
+            }
+            MlxSelectedPreparationRoute::Other(selected) => selected.session,
+        }
+    }
+}
+
+/// Fully resolved construction inputs for non-replicated-text MLX composition.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SelectedMlxConstruction {
+    quantization: Option<WeightQuantization>,
+    pub(crate) parallel: Option<(
+        super::distributed::topology::MlxParallelPlan,
+        eredu_runtime::PipelineWireContract,
+    )>,
+    pub(crate) weight_residency: eredu_runtime::WeightResidency,
+    pub(crate) state_residency: CacheResidencyPolicy,
+    session: eredu_core::SessionCapabilities,
+}
+
+impl SelectedMlxConstruction {
+    pub(crate) fn from_request(
+        request: MlxLoadRequest,
+        session: eredu_core::SessionCapabilities,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            quantization: request.weight_quantization()?,
+            parallel: request.parallel_execution(),
+            weight_residency: request.weight_residency(),
+            state_residency: request.state_residency().clone(),
+            session,
+        })
+    }
+
+    pub(crate) const fn parallel_topology(
+        &self,
+    ) -> Option<super::distributed::topology::MlxParallelPlan> {
+        match self.parallel {
+            Some((topology, _)) => Some(topology),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn parallel_execution(
+        &self,
+    ) -> Option<(
+        super::distributed::topology::MlxParallelPlan,
+        eredu_runtime::PipelineWireContract,
+    )> {
+        self.parallel
+    }
+
+    pub(crate) const fn weight_quantization(&self) -> Option<WeightQuantization> {
+        self.quantization
+    }
+}
 
 /// MLX arrays, modules, and media preprocessing from one GGUF artifact.
 struct MaterializedGgufModel {
@@ -55,12 +156,12 @@ pub(crate) fn validate_gguf_projector_requirement(
 fn materialize_gguf_model(
     source: &structural::AdmittedGguf,
     projector: Option<&structural::AdmittedGgufProjector>,
-    options: ModelLoadOptions,
+    options: SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = source.architecture().model_kind();
-    let quantization = options.weight_quantization()?;
+    let quantization = options.weight_quantization();
     let binding = GgufBinding::for_kind(kind).ok_or_else(|| {
         Error::ArchitectureModel(format!(
             "MLX has no GGUF realization for {}",
@@ -220,117 +321,188 @@ fn materialize_gguf_model(
     Ok(model)
 }
 
+pub(crate) fn select_preparation(
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    options: MlxLoadRequest,
+    policy: eredu_core::PreparationPolicy,
+) -> Result<MlxSelectedPreparation, Error> {
+    select_preparation_with_grouped_capabilities(
+        inspection,
+        options,
+        policy,
+        &super::replicated_text::GROUPED_OPERATION_CAPABILITIES,
+    )
+}
+
+pub(crate) fn select_preparation_with_grouped_capabilities(
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    options: MlxLoadRequest,
+    policy: eredu_core::PreparationPolicy,
+    grouped_capabilities: &[eredu_runtime::GroupedOperationRequirement],
+) -> Result<MlxSelectedPreparation, Error> {
+    if let Some(kind) = inspection
+        .architecture_plan()
+        .required_gguf_special_tokens()
+    {
+        return Err(Error::ArchitectureModel(format!(
+            "GGUF {kind:?} media token IDs must be resolved by the facade before MLX preparation"
+        )));
+    }
+    if policy != options.preparation_policy()? {
+        return Err(Error::ArchitectureModel(
+            "MLX preparation policy does not match the caller request".into(),
+        ));
+    }
+    structural::validate_inspected_preparation(inspection, policy)?;
+    let admitted_session = structural::inspected_session_capabilities(inspection, policy)?;
+    let grouped_requirements = inspection
+        .architecture_plan()
+        .grouped_operation_requirements(policy.topology());
+    let missing_grouped = grouped_requirements
+        .iter()
+        .filter(|required| !grouped_capabilities.contains(required))
+        .collect::<Vec<_>>();
+    if !missing_grouped.is_empty() {
+        return Err(Error::ArchitectureModel(format!(
+            "backend is missing architecture-required grouped mechanisms: {missing_grouped:?}"
+        )));
+    }
+    if policy
+        .topology()
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        return Ok(MlxSelectedPreparation::new(
+            MlxSelectedPreparationRoute::Other(SelectedMlxConstruction::from_request(
+                options,
+                admitted_session,
+            )?),
+        ));
+    }
+    match eredu_architectures::replicated_text::replicated_text_requirements(inspection) {
+        Ok(requirements) => {
+            let mut request = ReplicatedTextSelectionRequest::new(
+                options.weight_residency.layers(),
+                options.state_residency().clone(),
+            )
+            .with_session(admitted_session)
+            .with_prompt_cache(true)
+            .with_exact_completion(true);
+            if let Some(topology) = policy.topology() {
+                request = request.with_topology(topology);
+            }
+            if let Some(quantization) = policy.quantization() {
+                request = request.with_quantization(quantization);
+            }
+            let realization = select_replicated_text_realization(
+                &requirements,
+                &request,
+                &super::replicated_text::capabilities(&requirements, &request),
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            Ok(MlxSelectedPreparation::new(
+                MlxSelectedPreparationRoute::ReplicatedText {
+                    requirements,
+                    realization,
+                },
+            ))
+        }
+        Err(eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(
+            _,
+        )) => Ok(MlxSelectedPreparation::new(
+            MlxSelectedPreparationRoute::Other(SelectedMlxConstruction::from_request(
+                options,
+                admitted_session,
+            )?),
+        )),
+        Err(error) => Err(Error::ArchitectureModel(error.to_string())),
+    }
+}
+
 pub fn materialize_model_plan(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
-    options: ModelLoadOptions,
+    selected: MlxSelectedPreparation,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
-    validate_plan_options(&plan, options)?;
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
-    let replicated = if plan
-        .policy()
-        .topology
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        None
-    } else {
-        match eredu_architectures::replicated_text::replicated_text_requirements(plan.inspection())
-        {
-            Ok(requirements) => {
-                let policy = plan.policy();
-                let mut request = ReplicatedTextSelectionRequest::new(
-                    options.weight_residency.layers(),
-                    CacheResidencyPolicy::Device,
-                )
-                .with_session(policy.required_session_capabilities)
-                .with_prompt_cache(true)
-                .with_exact_completion(true);
-                if let Some(topology) = policy.topology {
-                    request = request.with_topology(topology);
-                }
-                if let Some(quantization) = policy.quantization {
-                    request = request.with_quantization(quantization);
-                }
-                let selected = select_replicated_text_realization(
-                    &requirements,
-                    &request,
-                    &super::replicated_text::capabilities(&requirements, &request),
-                )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                Some((requirements, selected))
-            }
-            Err(
-                eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(
-                    _,
-                ),
-            ) => None,
-            Err(error) => return Err(Error::ArchitectureModel(error.to_string())),
-        }
-    };
-    if let Some((requirements, selected)) = replicated {
-        let max_cached_shards = selected.residency().max_cached_shards();
-        let (artifact, architecture_plan, _policy, _route) = plan.into_parts();
-        let kind = prepared_model_kind(&architecture_plan);
-        let executable = match artifact {
-            ModelArtifact::SafeTensors {
-                path: _,
-                configuration,
-                tensors,
-                shards,
-            } => {
-                let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+    let options = match selected.into_route() {
+        MlxSelectedPreparationRoute::ReplicatedText {
+            requirements,
+            realization,
+        } => {
+            let max_cached_shards = realization.residency().max_cached_shards();
+            let state_residency = realization.state().clone();
+            let architecture_plan = plan.inspection().architecture_plan().clone();
+            let artifact = plan.into_artifact();
+            let kind = prepared_model_kind(&architecture_plan);
+            let executable = match artifact {
+                ModelArtifact::SafeTensors {
+                    path: _,
                     configuration,
-                    prepared_safetensors_architecture(&architecture_plan)?.clone(),
                     tensors,
                     shards,
-                    max_cached_shards,
-                )?;
-                bind_replicated_text(
-                    &architecture_plan,
-                    requirements,
-                    selected,
-                    prepared.store(),
-                    stream,
-                    weights_stream,
-                )?
-            }
-            ModelArtifact::Gguf { validated, .. } => {
-                let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
-                let (source, projector) = structural::AdmittedGguf::from_admission(
-                    architecture,
-                    architecture_plan.gguf_media_projector().cloned(),
-                    validated,
-                )?;
-                if projector.is_some() {
+                } => {
+                    let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+                        configuration,
+                        prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                        tensors,
+                        shards,
+                        max_cached_shards,
+                    )?;
+                    bind_replicated_text(
+                        &architecture_plan,
+                        requirements,
+                        realization,
+                        prepared.store(),
+                        stream,
+                        weights_stream,
+                    )?
+                }
+                ModelArtifact::Gguf { validated, .. } => {
+                    let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+                    let (source, projector) = structural::AdmittedGguf::from_admission(
+                        architecture,
+                        architecture_plan.gguf_media_projector().cloned(),
+                        validated,
+                    )?;
+                    if projector.is_some() {
+                        return Err(Error::ArchitectureModel(
+                            "replicated text composition cannot bind a media projector".into(),
+                        ));
+                    }
+                    let store = Arc::new(
+                        crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                            source.checkpoint().clone(),
+                            source.plan().checkpoint(),
+                            source.plan().tensor_mapping(),
+                            max_cached_shards,
+                        )?,
+                    );
+                    bind_replicated_text(
+                        &architecture_plan,
+                        requirements,
+                        realization,
+                        store,
+                        stream,
+                        weights_stream,
+                    )?
+                }
+                _ => {
                     return Err(Error::ArchitectureModel(
-                        "replicated text composition cannot bind a media projector".into(),
+                        "unsupported artifact route for replicated text composition".into(),
                     ));
                 }
-                let store = Arc::new(
-                    crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
-                        source.checkpoint().clone(),
-                        source.plan().checkpoint(),
-                        source.plan().tensor_mapping(),
-                        max_cached_shards,
-                    )?,
-                );
-                bind_replicated_text(
-                    &architecture_plan,
-                    requirements,
-                    selected,
-                    store,
-                    stream,
-                    weights_stream,
-                )?
-            }
-        };
-        let model = MlxModel::complete(
-            Executable::replicated_text(kind, executable)?,
-            floating_state_dtype_bytes,
-        );
-        return attach_processor(model, &architecture_plan);
-    }
+            };
+            let model = MlxModel::complete(
+                Executable::replicated_text(kind, executable)?,
+                floating_state_dtype_bytes,
+                state_residency,
+            );
+            return attach_processor(model, &architecture_plan);
+        }
+        MlxSelectedPreparationRoute::Other(options) => options,
+    };
+    let state_residency = options.state_residency.clone();
     if let Some(topology) = options
         .parallel_topology()
         .filter(|topology| !topology.is_replicated())
@@ -346,12 +518,15 @@ pub fn materialize_model_plan(
                     stream,
                     weights_stream,
                 )
-                .map(|model| MlxModel::pipeline(model, floating_state_dtype_bytes))?;
+                .map(|model| {
+                    MlxModel::pipeline(model, floating_state_dtype_bytes, state_residency.clone())
+                })?;
             #[cfg(any(feature = "image", feature = "audio"))]
             let model = model.with_processor(processor);
             return Ok(model);
         }
-        let (artifact, architecture_plan, _policy, _route) = plan.into_parts();
+        let architecture_plan = plan.inspection().architecture_plan().clone();
+        let artifact = plan.into_artifact();
         return match artifact {
             artifact @ ModelArtifact::Gguf { .. } => materialize_gguf_artifact(
                 artifact,
@@ -360,7 +535,9 @@ pub fn materialize_model_plan(
                 stream,
                 weights_stream,
             )
-            .map(|model| complete_gguf_model(model, floating_state_dtype_bytes)),
+            .map(|model| {
+                complete_gguf_model(model, floating_state_dtype_bytes, state_residency.clone())
+            }),
             ModelArtifact::SafeTensors {
                 path: _,
                 configuration,
@@ -375,16 +552,28 @@ pub fn materialize_model_plan(
                     options.weight_residency.max_cached_shards(),
                 )?;
                 let model = materialize_tensor_parallel(&prepared, options, stream, weights_stream)
-                    .map(|model| MlxModel::complete(model, floating_state_dtype_bytes))?;
+                    .map(|model| {
+                        MlxModel::complete(
+                            model,
+                            floating_state_dtype_bytes,
+                            state_residency.clone(),
+                        )
+                    })?;
                 attach_processor(model, &architecture_plan)
             }
+            _ => Err(Error::ArchitectureModel(
+                "unsupported artifact route for tensor-parallel composition".into(),
+            )),
         };
     }
-    let (artifact, architecture_plan, _policy, _route) = plan.into_parts();
+    let architecture_plan = plan.inspection().architecture_plan().clone();
+    let artifact = plan.into_artifact();
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
             materialize_gguf_artifact(artifact, architecture_plan, options, stream, weights_stream)
-                .map(|model| complete_gguf_model(model, floating_state_dtype_bytes))
+                .map(|model| {
+                    complete_gguf_model(model, floating_state_dtype_bytes, state_residency.clone())
+                })
         }
         ModelArtifact::SafeTensors {
             path: _,
@@ -399,10 +588,16 @@ pub fn materialize_model_plan(
                 shards,
                 options.weight_residency.max_cached_shards(),
             )?;
-            let model = materialize_safetensors(&prepared, options, stream, weights_stream)
-                .map(|model| MlxModel::complete(model, floating_state_dtype_bytes))?;
+            let model = materialize_safetensors(&prepared, options, stream, weights_stream).map(
+                |model| {
+                    MlxModel::complete(model, floating_state_dtype_bytes, state_residency.clone())
+                },
+            )?;
             attach_processor(model, &architecture_plan)
         }
+        _ => Err(Error::ArchitectureModel(
+            "unsupported artifact route for model composition".into(),
+        )),
     }
 }
 
@@ -444,6 +639,11 @@ fn inspected_floating_state_dtype_bytes(
                 inspection.tensors(),
             )
         }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact format for floating-state dtype inspection".into(),
+            ));
+        }
     }
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     mlx_floating_state_dtype_bytes(source.dtype()).map_err(|dtype| {
@@ -483,8 +683,8 @@ mod floating_state_dtype_tests {
         inspected_floating_state_dtype_bytes, mlx_floating_state_dtype_bytes,
         reject_complete_tensor_parallel_quantization,
     };
-    use crate::backend::{DeviceAssignment, MlxParallelContext};
     use crate::composition::mlx::realization::requires_distributed_stage;
+    use crate::{backend::DeviceAssignment, native::MlxParallelPlan};
     use eredu_architectures::ModelKind;
     use eredu_checkpoint::WeightQuantization;
     use eredu_core::checkpoint::TensorDtype;
@@ -540,7 +740,7 @@ mod floating_state_dtype_tests {
     #[test]
     fn deepseek_pure_tp_uses_distributed_stage_loader() {
         let topology =
-            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelPlan::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         for kind in [ModelKind::DeepSeekV3, ModelKind::DeepSeekV4] {
             assert!(requires_distributed_stage(kind, topology.topology()));
@@ -565,7 +765,7 @@ mod floating_state_dtype_tests {
     #[test]
     fn specialized_qwen_tp_uses_distributed_stage_loader() {
         let topology =
-            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelPlan::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         for kind in [
             ModelKind::Qwen3Next,
@@ -584,7 +784,7 @@ mod floating_state_dtype_tests {
     #[test]
     fn expert_parallel_topology_unconditionally_uses_distributed_stage_loader() {
         let topology =
-            MlxParallelContext::for_rank(0, 1, 1, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelPlan::for_rank(0, 1, 1, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         assert!(requires_distributed_stage(
             ModelKind::Llama,
@@ -748,8 +948,13 @@ fn attach_processor(
 fn complete_gguf_model(
     materialized: MaterializedGgufModel,
     floating_state_dtype_bytes: std::num::NonZeroU8,
+    state_residency: CacheResidencyPolicy,
 ) -> MlxModel {
-    let model = MlxModel::complete(materialized.model, floating_state_dtype_bytes);
+    let model = MlxModel::complete(
+        materialized.model,
+        floating_state_dtype_bytes,
+        state_residency,
+    );
     #[cfg(any(feature = "image", feature = "audio"))]
     let model = model.with_processor(materialized.processor);
     model
@@ -757,7 +962,7 @@ fn complete_gguf_model(
 
 fn materialize_tensor_parallel(
     artifact: &super::artifact::PreparedSafetensorsArtifact,
-    options: ModelLoadOptions,
+    options: SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
@@ -778,26 +983,26 @@ fn materialize_tensor_parallel(
     let topology = options.parallel_topology().ok_or_else(|| {
         Error::Parallel("tensor-parallel materialization requires a topology".into())
     })?;
-    if topology.tensor_parallel_size <= 1
-        || topology.pipeline_parallel_size != 1
-        || topology.expert_parallel_size != 1
+    if topology.tensor_parallel_size() <= 1
+        || topology.pipeline_parallel_size() != 1
+        || topology.expert_parallel_size() != 1
     {
         return Err(Error::Parallel(
             "complete executable materialization supports pure tensor parallelism only".into(),
         ));
     }
-    if options.weight_residency.expert_cache().is_some() {
+    if options.weight_residency.parameter_bank_cache().is_some() {
         return Err(Error::Parallel(
             "tensor-parallel model materialization does not compose with independent expert caching"
                 .into(),
         ));
     }
     reject_complete_tensor_parallel_quantization(
-        options.weight_quantization()?,
+        options.weight_quantization(),
         kind.canonical_name(),
     )?;
     let execution = options.weight_residency.layers();
-    let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::composition::mlx::distributed::topology::ParallelBuildContext::new(
         topology,
         eredu_runtime::ShardingPolicy::Require,
     );
@@ -895,32 +1100,10 @@ fn materialize_tensor_parallel(
     }
 }
 
-pub(super) fn validate_plan_options(
-    plan: &ModelPreparationPlan<ArtifactArchitecturePlan>,
-    options: ModelLoadOptions,
-) -> Result<(), Error> {
-    if let Some(kind) = plan
-        .inspection()
-        .architecture_plan()
-        .required_gguf_special_tokens()
-    {
-        return Err(Error::ArchitectureModel(format!(
-            "GGUF {kind:?} media token IDs must be resolved by the facade before MLX preparation"
-        )));
-    }
-    if plan.policy() != options.preparation_policy()? {
-        return Err(Error::ArchitectureModel(
-            "MLX materialization options do not match the backend-neutral preparation plan".into(),
-        ));
-    }
-    super::structural::validate_inspected_preparation(plan.inspection(), plan.policy())?;
-    Ok(())
-}
-
 fn materialize_gguf_artifact(
     artifact: ModelArtifact,
     architecture_plan: ArtifactArchitecturePlan,
-    options: ModelLoadOptions,
+    options: SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MaterializedGgufModel, Error> {
@@ -941,7 +1124,7 @@ fn materialize_gguf_artifact(
         structural::AdmittedGguf::from_admission(architecture, projector_plan, validated)?;
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
-    validate_gguf_quantization_source(checkpoint, metadata, options.weight_quantization()?)?;
+    validate_gguf_quantization_source(checkpoint, metadata, options.weight_quantization())?;
     #[cfg(any(feature = "image", feature = "audio"))]
     let processor = ModelProcessor::from_plan(&architecture_plan);
     if options
@@ -973,7 +1156,7 @@ fn materialize_gguf_artifact(
 fn materialize_gguf_tensor_parallel(
     source: &structural::AdmittedGguf,
     projector: Option<&structural::AdmittedGgufProjector>,
-    options: ModelLoadOptions,
+    options: SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
@@ -996,11 +1179,11 @@ fn materialize_gguf_tensor_parallel(
         Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
     })?;
     reject_complete_tensor_parallel_quantization(
-        options.weight_quantization()?,
+        options.weight_quantization(),
         architecture.metadata_name(),
     )?;
     let residency = options.weight_residency.layers();
-    let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::composition::mlx::distributed::topology::ParallelBuildContext::new(
         topology,
         eredu_runtime::ShardingPolicy::Require,
     );
@@ -1158,15 +1341,15 @@ pub fn validate_gguf_quantization_source(
 
 pub(super) fn materialize_safetensors(
     artifact: &super::artifact::PreparedSafetensorsArtifact,
-    options: ModelLoadOptions,
+    options: SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = artifact.architecture().model_kind();
-    let quantization = options.weight_quantization()?;
+    let quantization = options.weight_quantization();
     if let (Some(parameter_bank), Some(non_expert)) = (
-        options.weight_residency.expert_cache(),
-        options.weight_residency.non_experts(),
+        options.weight_residency.parameter_bank_cache(),
+        options.weight_residency.ordinary_residency(),
     ) {
         let binding = AddressableParameterBankBinding::for_kind(kind)
             .ok_or_else(|| Error::ArchitectureModel(format!(
@@ -1178,7 +1361,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::kimi_linear::load_kimi_linear_model(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1188,7 +1374,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 Box::new(crate::composition::deepseek::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1208,7 +1397,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::gemma4::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1218,7 +1410,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::inkling::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1228,7 +1423,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::lfm2::load_lfm2_model(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1238,7 +1436,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::muse_glimmer::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1248,7 +1449,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::nemotron_h::load_nemotron_h_model(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1258,7 +1462,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::qwen::load_safetensors(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1268,7 +1475,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1278,7 +1488,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::qwen::vl::load_safetensors_with_residency(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,
@@ -1288,7 +1501,10 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, parameter_bank),
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        non_expert,
+                        parameter_bank,
+                    ),
                     quantization,
                     stream,
                     weights_stream,

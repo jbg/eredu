@@ -417,15 +417,16 @@ pub fn state_identity(
             "GPT-OSS owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: "gpt_oss".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        "gpt_oss",
+        args.model_type.clone(),
+        prompt_cache_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(|error| invalid(error.to_string()))
 }
 
 /// Returns the stable cache-relevant architecture fingerprint.
@@ -1311,18 +1312,15 @@ mod tests {
             assert_eq!(num_key_value_heads.get(), 8);
             assert_eq!(head_dim.get(), 64);
         }
-        let topology = PromptCacheTopology {
-            tensor_parallel: Some((2, 1)),
-            ..PromptCacheTopology::default()
-        };
+        let topology = PromptCacheTopology::new(None, Some((2, 1)), None, true).unwrap();
         let identity = state_identity(&args, &layout, 0, topology.clone())
             .unwrap()
             .prompt_cache_identity(&layout)
             .unwrap();
-        assert_eq!(identity.model_family, "gpt_oss");
-        assert_eq!(identity.architecture_fingerprint, fingerprint);
-        assert_eq!(identity.layer_prefix_offsets, vec![0; 4]);
-        assert_eq!(identity.topology, topology);
+        assert_eq!(identity.model_family(), "gpt_oss");
+        assert_eq!(identity.architecture_fingerprint(), fingerprint);
+        assert_eq!(identity.layer_prefix_offsets(), vec![0; 4]);
+        assert_eq!(identity.topology(), &topology);
         assert!(state_identity(&args, &layout, 1, PromptCacheTopology::default()).is_err());
     }
 }

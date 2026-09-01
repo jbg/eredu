@@ -53,16 +53,16 @@ where
     /// Registers and prefills one independently progressing lane.
     pub fn submit(
         &mut self,
-        lane: PreparedSpeculativeLane<'a, E, S, C, P>,
+        mut lane: PreparedSpeculativeLane<'a, E, S, C, P>,
     ) -> Result<eredu_core::generation::SpeculativeRequestId, SpeculativeDriverError<E::Error>>
     {
         self.requests.submit(
             self.executor,
-            lane.cache,
-            lane.input,
-            lane.config,
-            lane.runtime,
-            lane.randomness,
+            lane.take_cache(),
+            lane.take_input(),
+            lane.take_config(),
+            lane.take_runtime(),
+            lane.take_randomness(),
             self.component_timings_collected,
             self.context,
         )
@@ -83,12 +83,12 @@ where
         Ok(())
     }
 
-    /// Returns the current portable phase for one lane.
-    pub fn phase(
+    /// Returns the current portable status for one lane.
+    pub fn status(
         &self,
         id: eredu_core::generation::SpeculativeRequestId,
-    ) -> Option<eredu_core::generation::SpeculativeRequestPhase> {
-        self.requests.phase(id)
+    ) -> Option<eredu_core::generation::SpeculativeRequestStatus> {
+        self.requests.status(id)
     }
 
     /// Requests cancellation at the next exact safe boundary.
@@ -159,28 +159,28 @@ impl SpeculativeGenerationVisitor for RunSpeculativeGeneration {
             scheduler.submit(lane)?;
         }
         scheduler.run()?;
-        let completed = scheduler.finish()?;
+        let mut completed = scheduler.finish()?;
         let requests = completed
-            .requests
+            .take_requests()
             .into_iter()
             .map(|request| -> Result<_, SpeculativeDriverError<E::Error>> {
-                let finish_reason = request.finish_reason.ok_or_else(|| {
+                let finish_reason = request.finish_reason().ok_or_else(|| {
                     SpeculativeDriverError::Generation(
                         eredu_core::generation::GenerationError::MissingSpeculativeFinishReason {
-                            index: request.id.index(),
+                            index: request.id().index(),
                         },
                     )
                 })?;
-                Ok(SpeculativeGenerationOutput {
-                    token_ids: request.token_ids,
+                Ok(SpeculativeGenerationOutput::new(
+                    request.token_ids().to_vec(),
                     finish_reason,
-                    stats: request.stats,
-                })
+                    request.stats().clone(),
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(SpeculativeGenerationBatchOutput {
+        Ok(SpeculativeGenerationBatchOutput::new(
             requests,
-            scheduler: completed.scheduler,
-        })
+            completed.take_scheduler(),
+        ))
     }
 }

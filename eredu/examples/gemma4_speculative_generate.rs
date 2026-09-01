@@ -140,14 +140,14 @@ fn run_speculative(
     prepared: &PreparedChat,
     max_tokens: usize,
 ) -> anyhow::Result<GenerationResult> {
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
-    plan.drafting = DraftingPlan::External {
-        model: assistant_dir.display().to_string(),
-        placement: DraftPlacementPlan::Target,
-        max_draft_tokens: 3,
-        lookahead: false,
-        adaptive_lookahead: false,
-    };
+    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?)
+        .with_drafting(DraftingPlan::External {
+            model: assistant_dir.display().to_string(),
+            placement: DraftPlacementPlan::Target,
+            max_draft_tokens: 3,
+            lookahead: false,
+            adaptive_lookahead: false,
+        });
     let planned =
         LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
     let (mut target, mut drafting) = planned.into_parts();
@@ -175,8 +175,8 @@ fn run_speculative(
             on_event: |_| {},
         },
     )?;
-    let mut generated = output.token_ids;
-    let stats = output.stats;
+    let mut generated = output.token_ids().to_vec();
+    let stats = output.stats();
     if generated
         .last()
         .is_some_and(|token| target.eos_token_ids().contains(token))
@@ -187,8 +187,8 @@ fn run_speculative(
     Ok(GenerationResult {
         token_ids: generated,
         text,
-        elapsed: stats.elapsed,
-        accept_lens: stats.accept_lens,
+        elapsed: stats.elapsed(),
+        accept_lens: stats.accept_lens().to_vec(),
     })
 }
 

@@ -120,17 +120,17 @@ fn run_full_path(
             .expect("one queued realtime frame")
             .into_parts()
             .1;
-        if let Some(output_tokens) = output.output_audio_tokens {
-            let output_tokens = MlxTensor::from_array(output_tokens);
+        if let Some(output_tokens) = output.output_audio_tokens() {
+            let output_tokens = MlxTensor::from_array(output_tokens.clone());
             let pcm = mimi.decode_step(&output_tokens, stream)?;
             eval([
-                &output.text_token,
-                &output.sampled_audio_tokens,
+                output.text_token(),
+                output.sampled_audio_tokens(),
                 pcm.as_array(),
             ])?;
             emitted_frames += 1;
         } else {
-            eval([&output.text_token, &output.sampled_audio_tokens])?;
+            eval([output.text_token(), output.sampled_audio_tokens()])?;
         }
         stream.synchronize()?;
     }

@@ -14,7 +14,6 @@ use crate::{
             cache::state::MlxHybridState, distributed::parallel::ParallelExecutionContext,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::RoutingStatistics,
     composition::mlx::distributed::pipeline::{
@@ -27,6 +26,7 @@ use crate::{
         PipelineLoadAccumulator, PipelineModel, PipelinePartitionMetadata, PipelineStageInput,
         PipelineStageOutput, PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
 };
 
 impl PipelinePartitionMetadata for LlamaPipelinePartition {
@@ -106,7 +106,7 @@ pub(super) fn load_llama_pipeline(
     source_args: LlamaModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -154,7 +154,7 @@ pub(super) fn load_llama_pipeline(
     )?;
     topology.preflight(Some(target_units), None)?;
     let range = topology.layer_range(target_units)?;
-    let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
+    let (architecture, parallel_layout) = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::llama::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -171,7 +171,7 @@ pub(super) fn load_llama_pipeline(
     };
     let placement = Arc::new(decoder_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,

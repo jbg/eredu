@@ -250,6 +250,29 @@ three values into one
 `SelectedReplicatedTextRealization` before architecture modules or weight
 payloads are constructed.
 
+Each architecture-derived parameter requirement also retains exact physical
+provenance: the canonical admitted shard, physical tensor identity, and the
+selected logical output. This distinguishes multiple outputs converted from a
+single GGUF tensor and prevents a materializer from rediscovering shard
+membership after selection. Validated parallel topology fields are private;
+callers construct them through checked constructors and consume named
+accessors. Preparation is consumed as an opaque plan through named policy,
+route, inspection, and artifact operations rather than a positional tuple.
+
+The MLX adapter packages that result in opaque `MlxSelectedPreparation` and
+passes it as the only materializer policy input. `MlxLoadRequest` lives with
+MLX composition and is consumed during selection. Non-replicated text paths
+receive a distinct `SelectedMlxConstruction` containing resolved physical
+quantization, topology, residency, and admitted session facilities. Reusable
+MLX loading, residency, and cache mechanisms receive only selected formats,
+generic limits, rank-local placement, or opaque group handles. The
+mechanism-only `MlxRankContext` contains a world rank and local device
+assignment. Semantic tensor, pipeline, and addressable axes remain in the
+composition-owned `MlxParallelPlan` and are lowered before reusable
+distributed facilities are invoked. Prompt-cache manifests record those
+lowered dimensions as generic stage, state-shard, and addressable-group
+coordinates.
+
 Selection compares the complete architecture transform constraint with an
 exact backend lowering descriptor. A lowering descriptor identifies the source
 encoding, target executable format, logical shape, and packed axis. A request
@@ -299,14 +322,30 @@ required collective operations before invoking a backend. Backend sessions
 materialize groups by opaque identity and never infer why a group exists.
 Tensor-parallel grouped partials are a required additive mechanism separate
 from ordinary grouped execution; selection rejects the missing extension
-before construction. Partitioning adds
-`PartitionedLayeredArchitecture`, boundary schemas, and collective contexts;
+before construction. Routed architecture plans derive those requirements from
+their normalized expert configuration and selected topology, including the
+tensor-parallel partial, before any payload is opened or module constructor is
+called. Architectures requiring mixed mutable-state components
+opt into the separate `ArchitectureStateFactory` realization contract.
+Partitioning adds `PartitionedLayeredArchitecture`, boundary schemas, and
+driver-owned boundary exchange through opaque collective contexts;
 composite models use `PreparedModelInput` and architecture-owned execution
 groups; embedded prediction uses separately identified prediction groups and
-`DraftStateTransaction`; and realtime models use the frame-oriented realtime
-contracts.
+`DraftStateTransaction`; and realtime models opt into `RealtimeFrameTransition`,
+which consumes `RealtimeInputFrame` on an unpublished branch and attaches the
+exact completion before atomic publication.
 None of these execution classes adds routing, media, partition, prediction, or
 frame requirements to replicated text selection or to `NeuralBackend`.
+
+Grouped execution is exposed through the required `GroupedNeuralBackend`
+extension rather than a permissive base-trait fallback. Distributed vocabulary
+and sum operations similarly live on the required
+`DistributedNeuralBackend` extension. Public execution-plan, topology, and
+speculative handoff records keep their fields private, use checked or named
+constructors and accessors, and mark open semantic enums non-exhaustive.
+Move-only multi-value architecture handoffs are represented by named artifacts
+instead of positional tuples, so later fields can be added without changing a
+cross-crate destructuring contract.
 
 Execution-group transport is also architecture policy. The runtime defines the
 neutral placement, semantic-kind, merge-destination, parallel-subgroup, and
@@ -834,7 +873,7 @@ intersection: the architecture declares whether its normalized parameter
 topology can be transformed before bounded materialization, and the backend
 declares whether its family composition implements that route. Core preserves
 the neutral quantization and residency request without maintaining a family
-allowlist. Public backend load options carry `QuantizationRequest`, whose
+allowlist. The composition-owned MLX load request carries `QuantizationRequest`, whose
 variants describe load-time transforms only; checkpoint storage encodings such
 as native GGUF blocks remain internal to artifact inspection and
 materialization.
@@ -1469,6 +1508,13 @@ builds:
 
 Dependency direction and semantic ownership are review rules recorded in
 `AGENTS.md` and expressed by the crate manifests and public type boundaries:
+
+In-memory preparation, session, topology, state-identity, and prompt-cache
+handoffs expose validated constructors and read-only accessors rather than
+public fields. Versioned persistence records are the deliberate exception:
+prompt-cache manifests, blocks, and tensor records remain plain public-field
+wire schemas for stable Serde encoding, and every decoded record is validated
+at the persistence ingress before it can become runtime state.
 
 - `eredu-architectures` contains model-family policy but no concrete backend
   imports;

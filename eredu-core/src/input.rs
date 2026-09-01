@@ -9,6 +9,7 @@ use crate::checkpoint::TensorDtype;
 /// Modality of one ordered model-input part.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InputModality {
     /// Text token IDs or precomputed text embeddings.
     Text,
@@ -57,6 +58,7 @@ impl InputModality {
 /// Semantic role of a prepared part's primary tensor.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InputPayloadKind {
     /// Tokenizer vocabulary IDs.
     TokenIds,
@@ -100,6 +102,7 @@ impl InputPayloadKind {
 /// Architecture-neutral metadata attached to a prepared input part.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InputMetadataKey {
     /// One or more `(time, height, width)` patch-grid rows.
     PatchGrid,
@@ -113,6 +116,7 @@ pub enum InputMetadataKey {
 /// back from the accelerator.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InputExtent {
     /// Exact `(time, height, width)` of one image or video patch grid.
     PatchGrid {
@@ -483,6 +487,7 @@ impl PreparedInputIdentity {
 
 /// Invalid portable prepared-input identity.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PreparedInputError {
     /// At least one ordered part is required.
     #[error("prepared model input must contain at least one part")]

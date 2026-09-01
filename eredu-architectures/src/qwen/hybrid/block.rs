@@ -23,7 +23,7 @@ use super::{HybridConfig, HybridLayerPolicy, LinearAttention};
 /// Scheduled hybrid token mixer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum TokenMixer<B: GroupedNeuralBackend> {
+pub enum TokenMixer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Gated-delta recurrent attention.
     Linear(LinearAttention<B>),
     /// Gated grouped-query self attention.
@@ -33,7 +33,7 @@ pub enum TokenMixer<B: GroupedNeuralBackend> {
 /// Routed experts plus the always-on Qwen shared expert.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct SharedRoutedGatedProduct<B: GroupedNeuralBackend> {
+pub struct SharedRoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Learned top-k router.
@@ -46,7 +46,7 @@ pub struct SharedRoutedGatedProduct<B: GroupedNeuralBackend> {
     pub shared_expert_gate: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend> SharedRoutedGatedProduct<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedGatedProduct<B> {
     fn new(
         config: &HybridConfig,
         layer: usize,
@@ -224,14 +224,14 @@ pub(crate) fn localized_expert_bank_spec(
 /// Dense or routed/shared-expert feed-forward policy selected by configuration.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: GroupedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Dense SwiGLU.
     Dense(Mlp<B>),
     /// Routed SwiGLU plus an always-on shared expert.
     Routed(SharedRoutedGatedProduct<B>),
 }
 
-impl<B: GroupedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
     fn new(
         config: &HybridConfig,
         layer: usize,
@@ -272,7 +272,7 @@ impl<B: GroupedNeuralBackend> FeedForward<B> {
 /// One pre-normalized hybrid decoder block for every dense/MoE family form.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Block<B: GroupedNeuralBackend> {
+pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Recurrent or full-attention policy.
     pub mixer: TokenMixer<B>,
     /// Dense or routed/shared-expert policy.
@@ -283,7 +283,7 @@ pub struct Block<B: GroupedNeuralBackend> {
     pub post_attention_norm: B::Normalization,
 }
 
-impl<B: GroupedNeuralBackend> Block<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     /// Builds one global-geometry physical decoder layer.
     pub fn new(
         config: &HybridConfig,
@@ -463,7 +463,7 @@ impl<B: GroupedNeuralBackend> Block<B> {
     }
 }
 
-fn new_attention<B: GroupedNeuralBackend>(
+fn new_attention<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &HybridConfig,
     root: &str,
     context: &<B::Tensor as Tensor>::Context,
@@ -533,7 +533,7 @@ fn new_attention<B: GroupedNeuralBackend>(
     )
 }
 
-fn new_mlp<B: GroupedNeuralBackend>(
+fn new_mlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &HybridConfig,
     prefix: &str,
     intermediate: i32,
@@ -568,7 +568,7 @@ fn new_mlp<B: GroupedNeuralBackend>(
     ))
 }
 
-fn new_linear<B: GroupedNeuralBackend>(
+fn new_linear<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &HybridConfig,
     prefix: &str,
     input: i32,

@@ -40,7 +40,7 @@ pub struct AttentionInput<'a, T, C> {
 /// Gemma 4 grouped-query attention with local, publishing, or shared KV state.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Attention<B: NeuralBackend> {
+pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     query_heads: i32,
     #[parameter(skip)]
@@ -67,7 +67,7 @@ pub struct Attention<B: NeuralBackend> {
     pub rotary: B::Rotary,
 }
 
-impl<B: NeuralBackend> Attention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     /// Builds one unloaded attention unit from normalized layer policy.
     pub fn new(
         args: &ModelArgs,
@@ -277,7 +277,7 @@ impl<B: NeuralBackend> Attention<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: GroupedNeuralBackend,
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let attended = self.attend(input, context)?;
         B::row_parallel_linear(&mut self.output, &attended, parallel, context)
@@ -311,7 +311,7 @@ fn partial_rotary_dimensions(
 /// Dense GELU-gated feed-forward branch.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseMlp<B: NeuralBackend> {
+pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// GELU gate projection.
     pub gate: B::Linear,
     /// Multiplicative up projection.
@@ -320,7 +320,7 @@ pub struct DenseMlp<B: NeuralBackend> {
     pub down: B::Linear,
 }
 
-impl<B: NeuralBackend> DenseMlp<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
     fn new(
         args: &ModelArgs,
         layer: usize,
@@ -371,7 +371,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: GroupedNeuralBackend,
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let gate = self.gate.forward(input, context)?;
         let gate = B::Tensor::gelu(&gate, context)?;
@@ -385,7 +385,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
 /// routed block wrapper so the dense residual is shared exactly.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseBlock<B: GroupedNeuralBackend> {
+pub struct DenseBlock<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
     /// Stateful self attention.
@@ -436,7 +436,7 @@ pub struct BlockInput<'a, T, C> {
     pub rotary_position: Option<RotaryPosition<'a, T>>,
 }
 
-impl<B: GroupedNeuralBackend> DenseBlock<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B> {
     /// Builds one unloaded dense block.
     pub fn new(
         args: &ModelArgs,
@@ -767,7 +767,7 @@ impl<B: GroupedNeuralBackend> DenseBlock<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let pass = if input.hidden.dim(1) > 1 {
             ExpertPass::Prefill

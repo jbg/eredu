@@ -13,7 +13,7 @@ use super::{HybridConfig, HybridVariant};
 /// One recurrent gated-delta attention operator.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct LinearAttention<B: NeuralBackend> {
+pub struct LinearAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     key_heads: i32,
     #[parameter(skip)]
@@ -40,7 +40,7 @@ pub struct LinearAttention<B: NeuralBackend> {
     output: B::Linear,
 }
 
-impl<B: NeuralBackend> LinearAttention<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LinearAttention<B> {
     /// Creates unloaded parameters for one physical decoder layer.
     pub fn new(
         config: &HybridConfig,

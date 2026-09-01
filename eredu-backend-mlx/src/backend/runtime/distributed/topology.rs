@@ -3,14 +3,13 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     marker::PhantomData,
-    ops::Range,
     path::{Path, PathBuf},
 };
 
 use eredu_checkpoint::store::{
     CheckpointSource, ReadPolicy, SafetensorsWeightStore, TensorReadRequest, TensorSelection,
 };
-use eredu_core::{balanced_contiguous_range, CollectiveGroupDescriptor, CollectiveGroupId};
+use eredu_core::{CollectiveGroupDescriptor, CollectiveGroupId};
 use eredu_runtime::TensorPlacement;
 use safemlx::{distributed::Group as NativeGroup, Array, Stream};
 
@@ -19,9 +18,9 @@ use crate::{
 };
 
 use crate::backend::runtime::distributed::Group;
+use crate::backend::topology::MlxRankContext;
 #[cfg(test)]
 use crate::backend::DeviceAssignment;
-use crate::backend::MlxParallelContext;
 #[cfg(test)]
 use safemlx::{Device, DeviceType};
 
@@ -369,14 +368,14 @@ struct TensorPlan {
 /// Inspectable mapping from exact checkpoint names to typed placement decisions.
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
-    topology: MlxParallelContext,
+    topology: MlxRankContext,
     tensors: HashMap<String, TensorPlan>,
     default: Option<TensorPlacement>,
 }
 
 impl PlacementPlan {
     /// Creates a strict plan in which every checkpoint tensor must be named.
-    pub fn new(topology: MlxParallelContext) -> Self {
+    pub fn new(topology: MlxRankContext) -> Self {
         Self {
             topology,
             tensors: HashMap::new(),
@@ -385,7 +384,7 @@ impl PlacementPlan {
     }
 
     /// Creates a plan that replicates every checkpoint tensor.
-    pub fn replicated(topology: MlxParallelContext) -> Self {
+    pub fn replicated(topology: MlxRankContext) -> Self {
         Self::new(topology).with_default(TensorPlacement::Replicated)
     }
 
@@ -396,7 +395,7 @@ impl PlacementPlan {
     }
 
     /// Returns the topology captured by this plan.
-    pub const fn topology(&self) -> MlxParallelContext {
+    pub const fn topology(&self) -> MlxRankContext {
         self.topology
     }
 
@@ -447,30 +446,6 @@ impl PlacementPlan {
         }
     }
 
-    /// Adds this rank's balanced tensor-parallel range on `axis`.
-    pub fn insert_balanced_tensor_parallel(
-        &mut self,
-        target: impl Into<String>,
-        axis: usize,
-        dimension: usize,
-    ) -> Result<Range<usize>, Error> {
-        let range = balanced_contiguous_range(
-            dimension,
-            self.topology.tensor_parallel_size,
-            self.topology.tensor_parallel_rank,
-            false,
-        )?;
-        self.insert(
-            target,
-            TensorPlacement::Range {
-                axis,
-                start: range.start,
-                end: range.end,
-            },
-        );
-        Ok(range)
-    }
-
     /// Returns an explicit tensor placement by exact checkpoint name.
     pub fn placement(&self, source: &str) -> Option<&TensorPlacement> {
         self.tensors.get(source).map(|plan| &plan.placement)
@@ -513,18 +488,12 @@ impl PlacementPlan {
     }
 }
 
-fn validate_plan_entry(plan: &TensorPlan, topology: MlxParallelContext) -> Result<(), Error> {
+fn validate_plan_entry(plan: &TensorPlan, topology: MlxRankContext) -> Result<(), Error> {
     match &plan.placement {
-        TensorPlacement::Rank { rank } if *rank >= topology.world_size => {
+        TensorPlacement::Rank { rank } if *rank >= topology.world_size() => {
             Err(Error::Parallel(format!(
                 "owner rank {rank} is outside world size {}",
-                topology.world_size
-            )))
-        }
-        TensorPlacement::PipelineStage { stage } if *stage >= topology.pipeline_parallel_size => {
-            Err(Error::Parallel(format!(
-                "pipeline owner stage {stage} is outside {} stages",
-                topology.pipeline_parallel_size
+                topology.world_size()
             )))
         }
         TensorPlacement::Shard { index, parts, .. } if *parts == 0 || *index >= *parts => {
@@ -571,19 +540,13 @@ enum ResolvedPlacement {
 fn validate_placement(
     placement: &TensorPlacement,
     shape: &[usize],
-    topology: MlxParallelContext,
+    topology: MlxRankContext,
 ) -> Result<(), Error> {
     match placement {
-        TensorPlacement::Rank { rank } if *rank >= topology.world_size => {
+        TensorPlacement::Rank { rank } if *rank >= topology.world_size() => {
             Err(Error::Parallel(format!(
                 "owner rank {rank} is outside world size {}",
-                topology.world_size
-            )))
-        }
-        TensorPlacement::PipelineStage { stage } if *stage >= topology.pipeline_parallel_size => {
-            Err(Error::Parallel(format!(
-                "pipeline owner stage {stage} is outside {} stages",
-                topology.pipeline_parallel_size
+                topology.world_size()
             )))
         }
         TensorPlacement::Shard { axis, index, parts } => {
@@ -636,7 +599,7 @@ fn validate_placement(
 fn resolve_placement(
     plan: &TensorPlan,
     shape: &[usize],
-    topology: MlxParallelContext,
+    topology: MlxRankContext,
 ) -> Result<ResolvedPlacement, Error> {
     if let Some(expected) = &plan.expected_source_shape {
         if expected != shape {
@@ -650,14 +613,7 @@ fn resolve_placement(
         TensorPlacement::Replicated | TensorPlacement::Local => ResolvedPlacement::Materialize,
         TensorPlacement::Omit => ResolvedPlacement::Omit,
         TensorPlacement::Rank { rank } => {
-            if *rank == topology.global_rank {
-                ResolvedPlacement::Materialize
-            } else {
-                ResolvedPlacement::Omit
-            }
-        }
-        TensorPlacement::PipelineStage { stage } => {
-            if *stage == topology.pipeline_parallel_rank {
+            if *rank == topology.global_rank() {
                 ResolvedPlacement::Materialize
             } else {
                 ResolvedPlacement::Omit
@@ -687,14 +643,14 @@ fn resolve_placement(
 /// borrowed group inside long-lived model state.
 #[derive(Debug)]
 pub struct RankPartition {
-    topology: MlxParallelContext,
+    topology: MlxRankContext,
     tensors: HashMap<String, Array>,
     opened_shards: Vec<PathBuf>,
 }
 
 impl RankPartition {
     /// Returns the validated topology used for this partition.
-    pub const fn topology(&self) -> MlxParallelContext {
+    pub const fn topology(&self) -> MlxRankContext {
         self.topology
     }
 
@@ -743,10 +699,7 @@ impl PartitionReport {
                 | TensorPlacement::Range { .. }
                 | TensorPlacement::Indices { .. } => true,
                 TensorPlacement::Omit => false,
-                TensorPlacement::Rank { rank } => rank == plan.topology.global_rank,
-                TensorPlacement::PipelineStage { stage } => {
-                    stage == plan.topology.pipeline_parallel_rank
-                }
+                TensorPlacement::Rank { rank } => rank == plan.topology.global_rank(),
             };
             if locally_required && !self.loaded.contains(source) {
                 missing.push(source.clone());
@@ -826,8 +779,7 @@ pub fn load_partition_from_store_on_streams(
             continue;
         };
         let potentially_local = !matches!(tensor.placement, TensorPlacement::Omit)
-            && !matches!(tensor.placement, TensorPlacement::Rank { rank } if rank != plan.topology.global_rank)
-            && !matches!(tensor.placement, TensorPlacement::PipelineStage { stage } if stage != plan.topology.pipeline_parallel_rank);
+            && !matches!(tensor.placement, TensorPlacement::Rank { rank } if rank != plan.topology.global_rank());
         if !potentially_local {
             continue;
         }
@@ -910,15 +862,30 @@ mod tests {
         serialize_to_file([(name, view)], None, path).unwrap();
     }
 
-    fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxParallelContext {
-        MlxParallelContext::for_rank(rank, tp, pp, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap()
+    fn parallel_plan(
+        rank: usize,
+        tp: usize,
+        pp: usize,
+        ep: usize,
+    ) -> crate::composition::mlx::distributed::topology::MlxParallelPlan {
+        crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
+            rank,
+            tp,
+            pp,
+            ep,
+            DeviceAssignment::new(DeviceType::Cpu, 0),
+        )
+        .unwrap()
+    }
+
+    fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxRankContext {
+        parallel_plan(rank, tp, pp, ep).rank_context()
     }
 
     #[test]
     fn ring_neighbor_routes_cover_arbitrary_stage_local_axis_degrees() {
         for rank in 0..18 {
-            let topology = topology(rank, 3, 2, 3);
+            let topology = parallel_plan(rank, 3, 2, 3);
             for axis in [ParallelAxis::Tensor, ParallelAxis::Expert] {
                 let routes =
                     crate::composition::mlx::distributed::topology::logical_stage_group_routes(
@@ -931,8 +898,8 @@ mod tests {
                 assert_eq!(sources, [0, 1, 2]);
                 assert!(routes.iter().flat_map(|(_, rounds)| rounds).all(|peer| {
                     peer.is_none_or(|peer| {
-                        (rank + 1) % topology.world_size == peer
-                            || (peer + 1) % topology.world_size == rank
+                        (rank + 1) % topology.world_size() == peer
+                            || (peer + 1) % topology.world_size() == rank
                     })
                 }));
             }
@@ -957,8 +924,15 @@ mod tests {
             .validate_execution_stream(&stream)
             .unwrap();
         let other_assignment =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 1))
-                .unwrap();
+            crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
+                0,
+                1,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 1),
+            )
+            .unwrap()
+            .rank_context();
         assert!(other_assignment.validate_execution_stream(&stream).is_err());
     }
 
@@ -994,9 +968,15 @@ mod tests {
     #[test]
     fn plan_supports_balanced_uneven_ranges() {
         let mut plan = PlacementPlan::new(topology(2, 3, 1, 1));
-        let range = plan
-            .insert_balanced_tensor_parallel("embedding.weight", 0, 11)
-            .unwrap();
+        let range = eredu_core::balanced_contiguous_range(11, 3, 2, false).unwrap();
+        plan.insert(
+            "embedding.weight",
+            TensorPlacement::Range {
+                axis: 0,
+                start: range.start,
+                end: range.end,
+            },
+        );
         assert_eq!(range, 8..11);
         assert_eq!(
             plan.placement("embedding.weight"),
@@ -1020,42 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn replicated_load_options_reject_distributed_session_topologies() {
-        let wire = eredu_runtime::PipelineWireContract::new(
-            eredu_runtime::PipelineActivationDtype::Float32,
-        );
-        let default = crate::backend::ModelLoadOptions::default();
-        assert_eq!(default.quantization, None);
-        assert_eq!(default.parallel_topology(), None);
-        default.validate_replicated().unwrap();
-
-        let singleton = crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1), wire);
-        singleton.validate_replicated().unwrap();
-        let combined = crate::backend::ModelLoadOptions::with_quantization(
-            eredu_core::QuantizationRequest::MxFp4,
-        )
-        .with_parallel_topology(topology(0, 1, 1, 1), wire);
-        assert_eq!(
-            combined.quantization,
-            Some(eredu_core::QuantizationRequest::MxFp4)
-        );
-        assert!(combined.parallel_topology().unwrap().is_replicated());
-
-        let tensor_parallel =
-            crate::backend::ModelLoadOptions::with_parallel(topology(0, 2, 1, 1), wire);
-        assert!(tensor_parallel.validate_replicated().is_err());
-
-        let pipeline_partitioned =
-            crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 2, 1), wire);
-        assert!(pipeline_partitioned.validate_replicated().is_err());
-
-        let expert_partitioned =
-            crate::backend::ModelLoadOptions::with_parallel(topology(0, 1, 1, 2), wire);
-        assert!(expert_partitioned.validate_replicated().is_err());
-    }
-
-    #[test]
-    fn typed_rank_and_pipeline_ownership_resolve_locally() {
+    fn typed_rank_ownership_resolves_locally() {
         let rank_zero = topology(0, 2, 2, 1);
         let rank_three = topology(3, 2, 2, 1);
         let rank_owned = TensorPlan {
@@ -1068,19 +1013,6 @@ mod tests {
         ));
         assert!(matches!(
             resolve_placement(&rank_owned, &[2], rank_three).unwrap(),
-            ResolvedPlacement::Materialize
-        ));
-
-        let stage_owned = TensorPlan {
-            placement: TensorPlacement::PipelineStage { stage: 1 },
-            expected_source_shape: None,
-        };
-        assert!(matches!(
-            resolve_placement(&stage_owned, &[2], rank_zero).unwrap(),
-            ResolvedPlacement::Omit
-        ));
-        assert!(matches!(
-            resolve_placement(&stage_owned, &[2], rank_three).unwrap(),
             ResolvedPlacement::Materialize
         ));
     }

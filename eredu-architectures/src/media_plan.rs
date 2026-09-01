@@ -60,6 +60,7 @@ impl MediaAdmissionInput {
                 width,
             } => Some([time, height, width]),
             InputExtent::AudioValidFrames(_) => None,
+            _ => None,
         })
     }
 
@@ -67,6 +68,7 @@ impl MediaAdmissionInput {
         self.descriptor.extents().find_map(|extent| match extent {
             InputExtent::AudioValidFrames(frames) => Some(frames),
             InputExtent::PatchGrid { .. } => None,
+            _ => None,
         })
     }
 }
@@ -76,6 +78,7 @@ fn payload_name(kind: InputPayloadKind) -> &'static str {
         InputPayloadKind::TokenIds => "token-ID",
         InputPayloadKind::Tensor => "tensor",
         InputPayloadKind::Embeddings => "embedding",
+        _ => unreachable!("unsupported input payload kind requires explicit admission"),
     }
 }
 
@@ -766,6 +769,7 @@ fn qwen_vision_ingress_with_shape(
         InputModality::Image => image_token_id,
         InputModality::Video => video_token_id,
         InputModality::Audio | InputModality::Text => None,
+        _ => None,
     }
     .ok_or_else(|| unsupported(architecture, "prepared media placeholder token is absent"))?;
     let placeholder_token_id =
@@ -1006,6 +1010,7 @@ fn gemma_placeholder_token(
         InputModality::Image => args.image_token_id,
         InputModality::Video => args.video_token_id,
         InputModality::Audio => args.audio_token_id,
+        _ => None,
     };
     token
         .and_then(|token| u32::try_from(token).ok())
@@ -1473,6 +1478,10 @@ fn gemma4(
             &args.model_type,
             "text is not a Gemma media modality",
         )),
+        _ => Err(unsupported(
+            &args.model_type,
+            "unknown modality is not supported by Gemma",
+        )),
     }
 }
 
@@ -1614,6 +1623,10 @@ fn inkling(
             &args.model_type,
             "text is not an Inkling media modality",
         )),
+        _ => Err(unsupported(
+            &args.model_type,
+            "unknown modality is not supported by Inkling",
+        )),
     }
 }
 
@@ -1657,6 +1670,12 @@ pub fn inkling_input_part<Tensor>(
                 InputModality::Image => args.image_token_id,
                 InputModality::Audio => args.audio_token_id,
                 InputModality::Text | InputModality::Video => unreachable!(),
+                _ => {
+                    return Err(unsupported(
+                        &args.model_type,
+                        "unknown projected Inkling modality",
+                    ));
+                }
             };
             Ok(InklingInputPartPlan::Projected {
                 modality,

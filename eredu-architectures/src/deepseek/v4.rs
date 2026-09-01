@@ -58,21 +58,22 @@ pub fn state_identity(
             "V4 owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: "deepseek_v4".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: super::v4_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        "deepseek_v4",
+        args.model_type.clone(),
+        super::v4_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }
 
 /// Pinned DSpark projections and heads shared by its ordinary draft blocks.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DsparkStatic<B: HyperNeuralBackend> {
+pub struct DsparkStatic<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     main_projection: B::Linear,
     main_norm: B::Normalization,
     output_norm: B::Normalization,
@@ -84,7 +85,9 @@ pub struct DsparkStatic<B: HyperNeuralBackend> {
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: HyperNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -112,7 +115,9 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: HyperNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -144,7 +149,7 @@ where
 #[parameterized(tensor = "B::Tensor")]
 pub enum Unit<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     /// Ordinary target decoder block.
     Target(V4Block<B>),
@@ -156,7 +161,7 @@ where
 
 impl<B> Unit<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     /// Returns the exact routed bank specification retained by this realized unit.
     pub fn expert_bank_spec(&self) -> &eredu_nn::GroupedGatedProductSpec {
@@ -170,7 +175,7 @@ where
 /// V4 pinned modules shared by resident and bounded layer execution.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: HyperNeuralBackend> {
+pub struct StaticModules<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Shared embedding, final normalization, and vocabulary head lifecycle.
     pub text: TextStaticModules<B>,
     /// Learned collapse from hyper-connection streams to final hidden state.
@@ -381,7 +386,7 @@ impl<T> ForwardContext<T> {
 /// Thin V4 target-model architecture over the shared layered runtime.
 pub struct Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     args: V4Args,
     static_modules: StaticModules<B>,
@@ -392,7 +397,7 @@ where
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     type DefinitionError = Error;
 
@@ -455,7 +460,7 @@ where
 
 impl<B> Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     /// Enters a target partition using the canonical layered execution context.
     pub fn begin_routed_target_partition(
@@ -1823,7 +1828,7 @@ fn static_modules<B>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<StaticModules<B>, Error>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     let hyper_head = HyperHead::new(
         HyperHeadSpec {
@@ -1849,7 +1854,7 @@ where
     })
 }
 
-impl<B: HyperNeuralBackend> DsparkStatic<B> {
+impl<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> DsparkStatic<B> {
     fn new(
         args: &V4Args,
         config: &DsparkConfig,
@@ -1921,7 +1926,7 @@ impl<B: HyperNeuralBackend> DsparkStatic<B> {
 
 impl<B, S> LayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -2338,7 +2343,7 @@ fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransport {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -2672,7 +2677,9 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend + eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: HyperNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -2999,7 +3006,7 @@ fn projection<B: eredu_nn::NeuralBackend>(
     )
 }
 
-fn broadcast_streams<B: HyperNeuralBackend>(
+fn broadcast_streams<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     hidden: &B::Tensor,
     args: &V4Args,
     context: &<B::Tensor as Tensor>::Context,

@@ -15,14 +15,14 @@ use eredu_runtime::{ArchitectureParameters, StaticParameterVisitor, StaticUnitBi
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
 
-impl From<eredu_runtime::ExpertCacheLoadOptions>
+impl From<eredu_runtime::ParameterBankLoadOptions>
     for crate::backend::runtime::residency::parameter_bank::ParameterBankOptions
 {
-    fn from(options: eredu_runtime::ExpertCacheLoadOptions) -> Self {
+    fn from(options: eredu_runtime::ParameterBankLoadOptions) -> Self {
         Self::new(
-            options.experts,
-            options.compact_bank_scratch_bytes,
-            options.prefill_compact_bank_target_bytes,
+            options.offload(),
+            options.compact_bank_scratch_bytes(),
+            options.prefill_compact_bank_target_bytes(),
         )
         .expect("architecture-owned expert-cache options were already validated")
     }
@@ -200,7 +200,7 @@ where
 /// Lowers the architecture-owned parameter topology into this rank's native
 /// tensor-parallel layout.
 pub(crate) fn parallel_layout_from_description(
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     description: &eredu_runtime::ArchitectureParameterDescription,
 ) -> Result<eredu_runtime::LocalModelLayout, Error> {
     let mut planner = build.planner();
@@ -230,7 +230,11 @@ pub(crate) fn architecture_expert_units(
                 .into_parameters()
                 .into_iter()
                 .map(|parameter| {
-                    let (binding_name, logical_target, mut recipe, role) = parameter.into_parts();
+                    let mut parameter = parameter.into_artifact();
+                    let binding_name = parameter.take_binding_name();
+                    let logical_target = parameter.take_logical_target();
+                    let mut recipe = parameter.take_recipe();
+                    let role = parameter.take_role();
                     if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
                         recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
                             recipe, store,
@@ -262,8 +266,8 @@ pub(crate) fn architecture_expert_units(
                 })
             })?;
             let key = crate::backend::runtime::residency::parameter_bank::ParameterBankKey::new(
-                identity.layer,
-                identity.global_expert,
+                identity.unit(),
+                identity.member(),
             );
             Ok(ParameterBankEntry::new(
                 key,
@@ -282,7 +286,7 @@ pub(crate) fn architecture_expert_units(
 pub(crate) fn select_architecture_expert_units(
     units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
     mut owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
-    mut owns_expert: impl FnMut(eredu_runtime::ExpertIdentity) -> bool,
+    mut owns_expert: impl FnMut(eredu_runtime::ParameterBankKey) -> bool,
 ) -> impl Iterator<Item = eredu_architectures::ExpertResidencyUnit> {
     units.into_iter().filter(move |unit| {
         owns_unit(unit.owner_group(), unit.owner_unit())
@@ -291,6 +295,7 @@ pub(crate) fn select_architecture_expert_units(
                     owns_expert(unit.identity())
                 }
                 eredu_architectures::ExpertResidencyDistribution::Replicated => true,
+                _ => false,
             }
     })
 }
@@ -339,10 +344,10 @@ mod expert_selection_tests {
         ExpertResidencyUnit,
     };
     use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-    use eredu_runtime::{ExecutionGroupId, ExpertIdentity};
+    use eredu_runtime::{ExecutionGroupId, ParameterBankKey};
 
     fn expert_unit(
-        identity: ExpertIdentity,
+        identity: ParameterBankKey,
         group: &str,
         owner_unit: usize,
         distribution: ExpertResidencyDistribution,
@@ -369,19 +374,19 @@ mod expert_selection_tests {
     fn expert_selection_uses_owner_address_and_distribution_before_lowering() {
         let units = vec![
             expert_unit(
-                ExpertIdentity::new(1, 0),
+                ParameterBankKey::new(1, 0),
                 "target",
                 7,
                 ExpertResidencyDistribution::ExpertParallel,
             ),
             expert_unit(
-                ExpertIdentity::new(7, 1),
+                ParameterBankKey::new(7, 1),
                 "mtp.0",
                 1,
                 ExpertResidencyDistribution::ExpertParallel,
             ),
             expert_unit(
-                ExpertIdentity::new(9, 2),
+                ParameterBankKey::new(9, 2),
                 "mtp.0",
                 1,
                 ExpertResidencyDistribution::Replicated,
@@ -391,14 +396,14 @@ mod expert_selection_tests {
         let selected = super::select_architecture_expert_units(
             units,
             |group, unit| group.as_str() == "mtp.0" && unit == 1,
-            |identity| identity.global_expert == 1,
+            |identity| identity.member() == 1,
         )
         .map(|unit| unit.identity())
         .collect::<Vec<_>>();
 
         assert_eq!(
             selected,
-            vec![ExpertIdentity::new(7, 1), ExpertIdentity::new(9, 2)]
+            vec![ParameterBankKey::new(7, 1), ParameterBankKey::new(9, 2)]
         );
     }
 }

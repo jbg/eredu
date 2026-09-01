@@ -1,8 +1,6 @@
 //! MLX backend adapter.
 
-pub(crate) mod cache;
 pub(crate) mod compaction;
-pub mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 /// Errors produced by MLX model loading and execution.
@@ -20,13 +18,10 @@ pub mod residency;
 pub mod runtime;
 /// MLX process-local device binding for composition-owned rank topology.
 pub(crate) mod topology;
-pub(crate) use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub(crate) use distributed::MlxDistributedSession;
 pub use execution::ExecutionContext;
-#[cfg(test)]
-pub(crate) use topology::DeviceAssignment;
-pub(crate) use topology::MlxParallelContext;
+pub use topology::{DeviceAssignment, MlxRankContext};
 
 use eredu_core::backend::{
     BackendDescriptor, BackendProvider, Completion, DeviceCapabilities, DeviceDescriptor,
@@ -41,14 +36,11 @@ use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::error::Error,
     composition::mlx::{distributed::pipeline::PipelineModel, Executable, MlxModelSession},
+    MlxLoadRequest,
 };
 
 fn device_capabilities(has_world: bool) -> DeviceCapabilities {
-    DeviceCapabilities {
-        exact_completion: true,
-        transfers: true,
-        collectives: has_world,
-    }
+    DeviceCapabilities::new(true, true, has_world)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -146,12 +138,12 @@ impl MlxDeviceIdentity {
     }
 
     fn descriptor(&self) -> DeviceDescriptor {
-        DeviceDescriptor {
-            id: format!("{}:{}", self.family, self.index),
-            name: format!("MLX {} {}", self.family, self.index),
-            family: self.family.into(),
-            memory_bytes: None,
-        }
+        DeviceDescriptor::new(
+            format!("{}:{}", self.family, self.index),
+            format!("MLX {} {}", self.family, self.index),
+            self.family,
+            None,
+        )
     }
 }
 
@@ -189,6 +181,7 @@ fn infer_native_device_identity(device: &Device) -> Result<MlxDeviceIdentity, Er
 pub struct MlxModel {
     inner: MlxModelKind,
     floating_state_dtype_bytes: NonZeroU8,
+    state_residency: eredu_runtime::CacheResidencyPolicy,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
@@ -199,22 +192,29 @@ pub(crate) enum MlxModelKind {
 }
 
 impl MlxModel {
-    pub(crate) const fn complete(model: Executable, floating_state_dtype_bytes: NonZeroU8) -> Self {
+    pub(crate) fn complete(
+        model: Executable,
+        floating_state_dtype_bytes: NonZeroU8,
+        state_residency: eredu_runtime::CacheResidencyPolicy,
+    ) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
             floating_state_dtype_bytes,
+            state_residency,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
     }
 
-    pub(crate) const fn pipeline(
+    pub(crate) fn pipeline(
         model: PipelineModel,
         floating_state_dtype_bytes: NonZeroU8,
+        state_residency: eredu_runtime::CacheResidencyPolicy,
     ) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
             floating_state_dtype_bytes,
+            state_residency,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
@@ -222,15 +222,20 @@ impl MlxModel {
 
     /// Wraps a directly constructed replicated model for backend integration tests.
     #[cfg(test)]
-    pub const fn complete_for_test(
-        model: Executable,
-        floating_state_dtype_bytes: NonZeroU8,
-    ) -> Self {
-        Self::complete(model, floating_state_dtype_bytes)
+    pub fn complete_for_test(model: Executable, floating_state_dtype_bytes: NonZeroU8) -> Self {
+        Self::complete(
+            model,
+            floating_state_dtype_bytes,
+            eredu_runtime::CacheResidencyPolicy::Device,
+        )
     }
 
     pub(crate) const fn floating_state_dtype_bytes(&self) -> NonZeroU8 {
         self.floating_state_dtype_bytes
+    }
+
+    pub(crate) const fn state_residency(&self) -> &eredu_runtime::CacheResidencyPolicy {
+        &self.state_residency
     }
 
     /// Reports speculative-weight readiness to backend integration tests.
@@ -269,16 +274,17 @@ impl MlxModel {
         }
     }
 
-    /// Returns the selected model's canonical architecture family.
-    pub fn model_family(&self) -> eredu_architectures::ModelKind {
+    #[cfg(test)]
+    /// Returns the selected model's canonical architecture family in crate tests.
+    pub(crate) fn model_family(&self) -> eredu_architectures::ModelKind {
         match &self.inner {
             MlxModelKind::Complete(model) => model.model_family(),
             MlxModelKind::Pipeline(model) => model.model_family(),
         }
     }
 
-    /// Returns the effective model type preserved from the parsed configuration.
-    pub fn effective_model_type(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn effective_model_type(&self) -> &str {
         match &self.inner {
             MlxModelKind::Complete(model) => model.effective_model_type(),
             MlxModelKind::Pipeline(model) => model.effective_model_type(),
@@ -286,10 +292,12 @@ impl MlxModel {
     }
 
     /// Returns the rank-local topology for a distributed executable.
-    pub fn topology(&self) -> Option<crate::backend::MlxParallelContext> {
+    pub(crate) fn topology(
+        &self,
+    ) -> Option<crate::composition::mlx::distributed::topology::MlxParallelPlan> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.parallel_info().map(|info| info.topology()),
-            MlxModelKind::Pipeline(model) => Some(model.stage_info().topology),
+            MlxModelKind::Pipeline(model) => Some(model.stage_info().topology()),
         }
         .filter(|topology| !topology.is_replicated())
     }
@@ -332,17 +340,6 @@ impl MlxModel {
             MlxModelKind::Pipeline(model) => model.parameter_bank_report(),
         }
     }
-}
-
-/// Request to prepare any facade-supported model on MLX.
-#[derive(Debug, Clone)]
-pub struct MlxModelConfig {
-    /// Backend-neutral inspected artifact and materialization route.
-    pub plan: eredu_core::ModelPreparationPlan<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-    /// MLX materialization details for the selected neutral route.
-    pub options: ModelLoadOptions,
 }
 
 /// MLX backend selected for a complete model/session.
@@ -405,9 +402,9 @@ impl<'a> MlxBackend<'a> {
 
     #[cfg(test)]
     /// Creates test communication for a topology using the backend stream.
-    pub fn communication_for_topology(
+    pub(crate) fn communication_for_topology(
         &self,
-        topology: crate::backend::MlxParallelContext,
+        topology: crate::composition::mlx::distributed::topology::MlxParallelPlan,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
         let realization =
@@ -418,16 +415,13 @@ impl<'a> MlxBackend<'a> {
 }
 
 impl<'a> BackendProvider for MlxBackend<'a> {
-    type ModelConfig = MlxModelConfig;
+    type ModelConfig = crate::composition::mlx::loading::MlxModelConfig;
     type Model = MlxModel;
     type Session = MlxModelSession<'a>;
     type Error = Error;
 
     fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor {
-            name: "mlx".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-        }
+        BackendDescriptor::new("mlx", env!("CARGO_PKG_VERSION"))
     }
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
@@ -449,10 +443,15 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        let capabilities = config.plan.admitted_session_capabilities();
+        let capabilities = config.selected.session_capabilities();
+        if config.plan.admitted_session_capabilities() != capabilities {
+            return Err(Error::ArchitectureModel(
+                "selected session facilities differ from the admitted preparation plan".into(),
+            ));
+        }
         crate::composition::mlx::loading::materialize_model_plan(
             config.plan,
-            config.options,
+            config.selected,
             &self.stream,
             &self.weights_stream,
         )
@@ -511,8 +510,8 @@ mod tests {
 
     #[test]
     fn collective_capability_requires_an_attached_world() {
-        assert!(!device_capabilities(false).collectives);
-        assert!(device_capabilities(true).collectives);
+        assert!(!device_capabilities(false).collectives());
+        assert!(device_capabilities(true).collectives());
     }
 
     #[test]
@@ -521,7 +520,7 @@ mod tests {
         let backend = MlxBackend::new(execution.stream(), execution.stream());
         let devices = backend.devices().unwrap();
         assert_eq!(devices.len(), 1);
-        assert!(!devices[0].1.collectives);
+        assert!(!devices[0].1.collectives());
     }
 
     #[test]
@@ -539,7 +538,8 @@ mod tests {
 }
 
 impl ModelLoadingBackend for MlxBackend<'_> {
-    type LoadOptions = ModelLoadOptions;
+    type LoadOptions = MlxLoadRequest;
+    type SelectedPreparation = crate::composition::mlx::loading::MlxSelectedPreparation;
     type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
 
     fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
@@ -553,14 +553,15 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         options.preparation_policy()
     }
 
-    fn validate_preparation(
+    fn select_preparation(
         &self,
         inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
+        options: &Self::LoadOptions,
         policy: eredu_core::PreparationPolicy,
-    ) -> Result<(), Self::Error> {
-        crate::composition::mlx::structural::validate_inspected_preparation(inspection, policy)
+    ) -> Result<Self::SelectedPreparation, Self::Error> {
+        crate::composition::mlx::loading::select_preparation(inspection, options.clone(), policy)
     }
 
     fn session_capabilities(
@@ -578,9 +579,11 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         plan: eredu_core::ModelPreparationPlan<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
-        options: Self::LoadOptions,
+        selected: Self::SelectedPreparation,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        Ok(MlxModelConfig { plan, options })
+        Ok(crate::composition::mlx::loading::MlxModelConfig::new(
+            plan, selected,
+        ))
     }
 }
 

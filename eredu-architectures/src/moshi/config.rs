@@ -1267,6 +1267,7 @@ fn architecture_fingerprint(
     let convention = match frame.frame_convention() {
         RealtimeFrameConvention::FeedbackAlignedHistory => "feedback_aligned_history",
         RealtimeFrameConvention::AbsoluteDelayedSlots => "absolute_delayed_slots",
+        _ => unreachable!("unsupported realtime frame convention requires explicit identity"),
     };
     let delays = frame
         .delays()

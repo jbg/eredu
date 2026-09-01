@@ -13,7 +13,7 @@ use super::{AttentionKind, FeedForward, KimiDeltaAttention, KimiLatentAttention,
 #[parameterized(tensor = "B::Tensor")]
 pub enum TokenMixer<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Kimi Delta Attention.
     Kda(KimiDeltaAttention<B>),
@@ -26,7 +26,7 @@ where
 #[parameterized(tensor = "B::Tensor")]
 pub struct Block<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Scheduled heterogeneous token mixer.
     pub mixer: TokenMixer<B>,
@@ -68,7 +68,7 @@ impl BlockGeometry {
 
 impl<B> Block<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Builds one unloaded block from the validated physical schedule.
     pub fn new(
@@ -208,7 +208,7 @@ where
     ) -> Result<B::Tensor, Error>
     where
         C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         self.forward_parallel_with_feed_forward(
             hidden,

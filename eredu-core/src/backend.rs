@@ -22,47 +22,166 @@ use crate::{
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendDescriptor {
     /// Backend implementation name, such as `example-backend`.
-    pub name: String,
+    name: String,
     /// Backend implementation version.
-    pub version: String,
+    version: String,
+}
+
+impl BackendDescriptor {
+    /// Creates a backend identity without freezing future descriptor fields.
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+
+    /// Returns the backend implementation name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the backend implementation version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
 }
 
 /// Portable description of one backend-visible device.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceDescriptor {
     /// Backend-stable device identifier.
-    pub id: String,
+    id: String,
     /// Human-readable device name.
-    pub name: String,
+    name: String,
     /// Backend-specific device family without a closed core enum.
-    pub family: String,
+    family: String,
     /// Total memory when discoverable.
-    pub memory_bytes: Option<u64>,
+    memory_bytes: Option<u64>,
+}
+
+impl DeviceDescriptor {
+    /// Creates a backend-stable device description.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        family: impl Into<String>,
+        memory_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            family: family.into(),
+            memory_bytes,
+        }
+    }
+
+    /// Returns the backend-stable device identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Returns the human-readable device name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// Returns the backend-defined device family.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+    /// Returns total device memory when known.
+    pub const fn memory_bytes(&self) -> Option<u64> {
+        self.memory_bytes
+    }
 }
 
 /// Fail-closed capabilities discovered from a backend and device.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceCapabilities {
     /// Supports exact completion observation for submissions.
-    pub exact_completion: bool,
+    exact_completion: bool,
     /// Supports device-to-device transfer for backend-owned values.
-    pub transfers: bool,
+    transfers: bool,
     /// Supports collective execution for a complete session.
-    pub collectives: bool,
+    collectives: bool,
+}
+
+impl DeviceCapabilities {
+    /// Creates an exact fail-closed device mechanism report.
+    pub const fn new(exact_completion: bool, transfers: bool, collectives: bool) -> Self {
+        Self {
+            exact_completion,
+            transfers,
+            collectives,
+        }
+    }
+
+    /// Returns whether exact completion observation is available.
+    pub const fn exact_completion(&self) -> bool {
+        self.exact_completion
+    }
+    /// Returns whether device transfers are available.
+    pub const fn transfers(&self) -> bool {
+        self.transfers
+    }
+    /// Returns whether collective execution is available.
+    pub const fn collectives(&self) -> bool {
+        self.collectives
+    }
 }
 
 /// Fail-closed capabilities of one exact prepared model session.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionCapabilities {
     /// Supports backend-managed persistent decode caches.
-    pub persistent_cache: bool,
+    persistent_cache: bool,
     /// Supports explicit host observation of completed session outputs.
-    pub output_observation: bool,
+    output_observation: bool,
     /// Supports named activation inspection for instrumented session passes.
-    pub activation_inspection: bool,
+    activation_inspection: bool,
 }
 
 impl SessionCapabilities {
+    /// Creates an exact fail-closed session mechanism report.
+    pub const fn new(
+        persistent_cache: bool,
+        output_observation: bool,
+        activation_inspection: bool,
+    ) -> Self {
+        Self {
+            persistent_cache,
+            output_observation,
+            activation_inspection,
+        }
+    }
+
+    /// Returns whether persistent cache storage is available.
+    pub const fn persistent_cache(self) -> bool {
+        self.persistent_cache
+    }
+    /// Returns whether completed outputs may be observed on the host.
+    pub const fn output_observation(self) -> bool {
+        self.output_observation
+    }
+    /// Returns whether named activation inspection is available.
+    pub const fn activation_inspection(self) -> bool {
+        self.activation_inspection
+    }
+
+    /// Returns a report with persistent cache storage configured.
+    pub const fn with_persistent_cache(mut self, supported: bool) -> Self {
+        self.persistent_cache = supported;
+        self
+    }
+    /// Returns a report with output observation configured.
+    pub const fn with_output_observation(mut self, supported: bool) -> Self {
+        self.output_observation = supported;
+        self
+    }
+    /// Returns a report with activation inspection configured.
+    pub const fn with_activation_inspection(mut self, supported: bool) -> Self {
+        self.activation_inspection = supported;
+        self
+    }
     /// Validates fail-closed requirements against an exact available report.
     pub fn validate(&self, available: &Self) -> Result<(), SessionCapabilityError> {
         for (required, supported, capability) in [
@@ -367,6 +486,7 @@ impl<'de> Deserialize<'de> for DistributedSessionDescriptor {
 
 /// Structured backend failure that does not expose a runtime exception type.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BackendError {
     /// A required capability is absent.
     #[error("backend {backend} does not support required capability {capability}")]
@@ -538,6 +658,10 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// Backend load policy exposed to a generic caller.
     type LoadOptions;
 
+    /// Exact pre-materialization realization selected from the inspected
+    /// artifact, caller request, and backend mechanisms.
+    type SelectedPreparation;
+
     /// Architecture registry selected by this backend adapter.
     type ConfigurationResolver: ModelConfigurationResolver;
 
@@ -550,19 +674,21 @@ pub trait ModelLoadingBackend: BackendProvider {
         options: &Self::LoadOptions,
     ) -> Result<PreparationPolicy, Self::Error>;
 
-    /// Intersects normalized architecture requirements with backend support.
+    /// Intersects normalized architecture requirements and the caller request
+    /// with backend support, returning the sole construction-policy handoff.
     ///
     /// Core deliberately does not infer architecture capabilities from a
     /// coarse model-family identity. Implementations must fail closed for
     /// requested routes that the exact normalized architecture or backend
     /// cannot realize.
-    fn validate_preparation(
+    fn select_preparation(
         &self,
         inspection: &ArtifactInspection<
             <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
         >,
+        options: &Self::LoadOptions,
         policy: PreparationPolicy,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<Self::SelectedPreparation, Self::Error>;
 
     /// Derives exact session capabilities from header/configuration state only.
     fn session_capabilities(
@@ -573,18 +699,20 @@ pub trait ModelLoadingBackend: BackendProvider {
         policy: PreparationPolicy,
     ) -> Result<SessionCapabilities, Self::Error>;
 
-    /// Binds a neutral preparation plan to backend-owned materialization input.
+    /// Binds a neutral preparation plan and its authoritative selected
+    /// realization to backend-owned materialization input.
     fn model_config(
         &self,
         plan: ModelPreparationPlan<
             <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
         >,
-        options: Self::LoadOptions,
+        selected: Self::SelectedPreparation,
     ) -> Result<Self::ModelConfig, Self::Error>;
 }
 
 /// Failure while inspecting, planning, or materializing a model artifact.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     /// Portable artifact inspection or preparation planning failed.
     #[error(transparent)]
@@ -626,8 +754,8 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     let policy = backend
         .preparation_policy(&options)
         .map_err(ModelLoadError::Backend)?;
-    backend
-        .validate_preparation(&inspection, policy)
+    let selected = backend
+        .select_preparation(&inspection, &options, policy)
         .map_err(ModelLoadError::Backend)?;
     let capabilities = backend
         .session_capabilities(&inspection, policy)
@@ -637,7 +765,7 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
         .map_err(ModelLoadError::SessionCapability)?;
     let plan = plan_model_preparation(inspection, policy, capabilities)?;
     let config = backend
-        .model_config(plan, options)
+        .model_config(plan, selected)
         .map_err(ModelLoadError::Backend)?;
     backend
         .prepare_model(config)
@@ -1521,10 +1649,7 @@ mod tests {
         type Session = MockSession;
         type Error = Infallible;
         fn descriptor(&self) -> BackendDescriptor {
-            BackendDescriptor {
-                name: "mock".into(),
-                version: "1".into(),
-            }
+            BackendDescriptor::new("mock", "1")
         }
         fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
             Ok(vec![])
@@ -1557,13 +1682,13 @@ mod tests {
             json: &serde_json::Value,
         ) -> Result<crate::ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
             Ok(crate::ResolvedModelConfiguration::new(
-                crate::ModelConfiguration {
-                    declared_model_type: "llama".into(),
-                    effective_model_type: "llama".into(),
-                    family: "llama".into(),
-                    loading_protocol: crate::LoadingProtocol::Model,
-                    json: Some(json.clone()),
-                },
+                crate::ModelConfiguration::new(
+                    "llama",
+                    "llama",
+                    "llama",
+                    crate::LoadingProtocol::Model,
+                    Some(json.clone()),
+                )?,
                 (),
             ))
         }
@@ -1579,13 +1704,13 @@ mod tests {
                 ));
             }
             Ok(crate::ResolvedModelConfiguration::new(
-                crate::ModelConfiguration {
-                    declared_model_type: architecture.into(),
-                    effective_model_type: architecture.into(),
-                    family: "llama".into(),
-                    loading_protocol: crate::LoadingProtocol::Model,
-                    json: None,
-                },
+                crate::ModelConfiguration::new(
+                    architecture,
+                    architecture,
+                    "llama",
+                    crate::LoadingProtocol::Model,
+                    None,
+                )?,
                 (),
             ))
         }
@@ -1609,10 +1734,7 @@ mod tests {
         type Error = std::convert::Infallible;
 
         fn descriptor(&self) -> BackendDescriptor {
-            BackendDescriptor {
-                name: "loading-mock".into(),
-                version: "1".into(),
-            }
+            BackendDescriptor::new("loading-mock", "1")
         }
 
         fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
@@ -1625,7 +1747,7 @@ mod tests {
         ) -> Result<PreparedModel<Self::Model>, Self::Error> {
             self.materializations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            assert_eq!(plan.inspection().configuration().family, "llama");
+            assert_eq!(plan.inspection().configuration().family(), "llama");
             Ok(PreparedModel::new(
                 model,
                 plan.admitted_session_capabilities(),
@@ -1698,6 +1820,7 @@ mod tests {
 
     impl ModelLoadingBackend for LoadingMock {
         type LoadOptions = u32;
+        type SelectedPreparation = u32;
         type ConfigurationResolver = LoadingConfigurationResolver;
 
         fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
@@ -1708,21 +1831,20 @@ mod tests {
             &self,
             options: &Self::LoadOptions,
         ) -> Result<PreparationPolicy, Self::Error> {
-            Ok(PreparationPolicy {
-                required_session_capabilities: SessionCapabilities {
-                    activation_inspection: *options == 99,
-                    ..SessionCapabilities::default()
-                },
-                ..PreparationPolicy::default()
-            })
+            Ok(
+                PreparationPolicy::default().with_required_session_capabilities(
+                    SessionCapabilities::default().with_activation_inspection(*options == 99),
+                ),
+            )
         }
 
-        fn validate_preparation(
+        fn select_preparation(
             &self,
             _: &ArtifactInspection,
+            options: &Self::LoadOptions,
             _: PreparationPolicy,
-        ) -> Result<(), Self::Error> {
-            Ok(())
+        ) -> Result<Self::SelectedPreparation, Self::Error> {
+            Ok(*options)
         }
 
         fn session_capabilities(
@@ -1736,9 +1858,9 @@ mod tests {
         fn model_config(
             &self,
             plan: ModelPreparationPlan,
-            options: Self::LoadOptions,
+            selected: Self::SelectedPreparation,
         ) -> Result<Self::ModelConfig, Self::Error> {
-            Ok((plan, options))
+            Ok((plan, selected))
         }
     }
 

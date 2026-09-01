@@ -22,6 +22,7 @@ pub const MAX_REALTIME_FRAME_DELAY: usize = i32::MAX as usize;
 /// Coordinate convention used by a realtime text-plus-audio frame schedule.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RealtimeFrameConvention {
     /// Inputs are retained as undelayed history while generated values are
     /// written back to the history frame selected by their delay.
@@ -203,6 +204,7 @@ impl RealtimeSpeechConfig {
 
 /// Invalid portable realtime configuration.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RealtimeConfigError {
     /// Every realtime codebook dimension must be nonzero.
     #[error("realtime codebook geometry must be nonzero")]
@@ -285,6 +287,7 @@ pub enum RealtimeConfigError {
 
 /// Canonical stream slot in a text-plus-audio realtime schedule.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum RealtimeFrameSlot {
     /// Text stream.
     Text,
@@ -329,6 +332,7 @@ impl RealtimeSlotCoordinate {
 ///
 /// This records only scheduling metadata. Token payloads remain backend-owned.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RealtimeSlotOccupancy {
     /// Live input-side audio supplied for this transition.
     Input,
@@ -342,6 +346,7 @@ pub enum RealtimeSlotOccupancy {
 
 /// Source selected for one temporal model input slot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RealtimeTemporalSource {
     /// The model consumes the configured text or audio padding token.
     Padding(RealtimeFrameSlot),
@@ -356,6 +361,7 @@ pub enum RealtimeTemporalSource {
 
 /// How one text or depth-codebook decision is resolved.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RealtimeTargetSource {
     /// Caller forcing resolves this decision.
     Forced,
@@ -841,6 +847,7 @@ impl SemanticStateTransaction for RealtimeFrameScheduleState {
 
 /// Invalid portable frame-schedule transition or state handoff.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RealtimeScheduleError {
     /// State belongs to a different normalized schedule.
     #[error("realtime frame schedule state does not match the normalized schedule")]
@@ -1422,6 +1429,7 @@ impl<O> RealtimeCompletedStep<O> {
 
 /// Realtime coordination failure with structured backend context.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RealtimeError<E: std::error::Error + 'static> {
     /// Selected backend rejected model, session, input, or execution.
     #[error("realtime backend failed: {0}")]
@@ -1818,11 +1826,7 @@ mod tests {
             *model
         }
         fn session_capabilities(&self, _: &u64) -> crate::SessionCapabilities {
-            crate::SessionCapabilities {
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: false,
-            }
+            crate::SessionCapabilities::new(true, true, false)
         }
         fn speech_config(&self, _: &u64) -> RealtimeSpeechConfig {
             RealtimeSpeechConfig::new(
@@ -1918,11 +1922,7 @@ mod tests {
         assert_eq!(model.backend().name(), "mock-realtime");
         assert_eq!(
             model.session_capabilities(),
-            crate::SessionCapabilities {
-                persistent_cache: true,
-                output_observation: true,
-                activation_inspection: false,
-            }
+            crate::SessionCapabilities::new(true, true, false)
         );
     }
 

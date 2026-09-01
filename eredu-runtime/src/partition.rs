@@ -12,12 +12,14 @@ use crate::{
 
 /// Architecture-owned location of one neutral parameter group.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[non_exhaustive]
 pub enum ParameterGroupOwner {
     /// A pinned module selected by an explicit architecture static role.
     StaticRole(String),
     /// A shared pinned module selected when any declared static consumer is local.
     StaticAnyOf(Vec<String>),
     /// One architecture-global unit in a canonical execution group.
+    #[non_exhaustive]
     ExecutionUnit {
         /// Canonical execution-group identity.
         group: ExecutionGroupId,
@@ -305,6 +307,7 @@ fn parameter_targets(
 
 /// Invalid architecture-owned parameter ownership declaration.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArchitectureParameterError {
     /// The supplied graph/layout is not canonical.
     #[error("invalid architecture parameter layout: {0}")]
@@ -361,6 +364,7 @@ pub enum ArchitectureParameterError {
 /// `Activation` is resolved by a concrete backend to the execution dtype
 /// selected for the surrounding pipeline activation. Integer kinds are exact.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum BoundaryTensorDtype {
     /// The selected execution activation dtype.
     Activation,
@@ -376,6 +380,7 @@ pub enum BoundaryTensorDtype {
 /// concrete backend must lower the selected dtype to its native tensor dtype
 /// and normalize outgoing activations to it before transport.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum PipelineActivationDtype {
     /// IEEE 16-bit floating point.
     Float16,
@@ -406,6 +411,7 @@ impl PipelineWireContract {
 
 /// One symbolic dimension in an architecture-owned boundary tensor.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum BoundaryTensorDimension {
     /// Invocation batch size.
     Batch,
@@ -725,6 +731,7 @@ where
 
 /// Invalid architecture-owned partition boundary declaration or payload.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArchitectureBoundaryError {
     /// A family boundary omitted its stable identity.
     #[error("architecture boundary identity must not be empty")]
@@ -1409,6 +1416,23 @@ impl LayeredPartitionDriver {
         }
     }
 
+    /// Transports this partition's realized boundary through the selected
+    /// opaque collective group.
+    ///
+    /// Keeping the operation on the validated driver makes boundary movement
+    /// part of partition execution rather than an unrelated backend call.
+    pub fn exchange_boundary<B>(
+        &self,
+        value: B::Tensor,
+        group: &B::Group,
+        executor: &B::Executor,
+    ) -> Result<B::Tensor, B::CollectiveError>
+    where
+        B: crate::CollectiveBackend,
+    {
+        B::all_to_all(value, group, executor)
+    }
+
     /// Prepares the partition and starts its canonical execution group.
     #[allow(clippy::too_many_arguments)]
     pub fn begin<'a, B, S, M>(
@@ -1493,6 +1517,7 @@ impl LayeredPartitionDriver {
 
 /// Invalid concrete realization or boundary use of a layered partition.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LayeredPartitionError {
     /// The selected architecture execution group is not owned by this partition.
     #[error("layered partition does not own execution group {group}")]
@@ -1624,6 +1649,7 @@ fn validate_canonical_layout(
 
 /// Invalid backend-neutral architecture partition declaration.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArchitecturePartitionError {
     /// The architecture supplied an invalid partition-boundary wire schema.
     #[error("invalid architecture partition boundary: {0}")]

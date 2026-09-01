@@ -138,7 +138,9 @@ pub struct PredictionOutput<T> {
 /// One V3/R1 embedded prediction layer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct V3PredictionLayer<B: GroupedNeuralBackend + BlockwiseAttentionBackend> {
+pub struct V3PredictionLayer<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+> {
     embedding_norm: B::Normalization,
     hidden_norm: B::Normalization,
     fusion: B::Linear,
@@ -147,7 +149,9 @@ pub struct V3PredictionLayer<B: GroupedNeuralBackend + BlockwiseAttentionBackend
     output_head: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
+    V3PredictionLayer<B>
+{
     /// Builds one unloaded V3 prediction depth.
     pub fn new(
         args: &V3Args,
@@ -339,7 +343,7 @@ impl<B: GroupedNeuralBackend + BlockwiseAttentionBackend> V3PredictionLayer<B> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct V4PredictionLayer<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     embedding_projection: B::Linear,
     hidden_projection: B::Linear,
@@ -352,7 +356,7 @@ where
 
 impl<B> V4PredictionLayer<B>
 where
-    B: HyperNeuralBackend + GroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     /// Builds one unloaded V4 prediction depth.
     pub fn new(
@@ -587,7 +591,7 @@ where
     }
 }
 
-fn linear<B: NeuralBackend>(
+fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     name: impl Into<String>,
     input: i32,
     output: i32,

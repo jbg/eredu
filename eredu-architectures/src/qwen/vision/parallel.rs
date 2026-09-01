@@ -47,7 +47,7 @@ pub fn local_block_geometry(
 }
 
 /// Declares one vision block's attention, MLP, and replicated norms.
-pub fn block_parallel_parameter_groups<B: NeuralBackend>(
+pub fn block_parallel_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     block: &VisionBlock<B>,
     config: &VisionConfig,
     root: &str,
@@ -112,7 +112,7 @@ pub fn block_parallel_parameter_groups<B: NeuralBackend>(
     ])
 }
 
-fn merger_groups<B: NeuralBackend>(
+fn merger_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     merger: &super::model::Merger<B>,
     root: &str,
     width: usize,
@@ -137,7 +137,7 @@ fn merger_groups<B: NeuralBackend>(
 }
 
 /// Declares replicated patch/position modules and TP merger channels.
-pub fn static_parallel_parameter_groups<B: NeuralBackend>(
+pub fn static_parallel_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     modules: &VisionStatic<B>,
     config: &VisionConfig,
     root: &str,

@@ -464,7 +464,7 @@ impl QwenVlModel {
 
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>> {
         None
     }
 
@@ -538,7 +538,7 @@ impl QwenVlModel {
             tensors,
             i32::try_from(prefix_token_ids.len())
                 .map_err(|_| Exception::custom("prompt-cache prefix exceeds i32"))?,
-            &identity.layer_prefix_offsets,
+            identity.layer_prefix_offsets(),
         )?;
         Ok((cache, manifest))
     }
@@ -1021,7 +1021,7 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
     let (mut args, store) =
         prepare_gguf_pipeline(source, projector, options.max_cached_shards())?;
@@ -1091,7 +1091,7 @@ pub fn load_safetensors_with_residency(
         })
         .transpose()?
         .flatten();
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
     let store = artifact.store();
     let store = if let Some(quantization) = quantize_on_load {
@@ -1117,7 +1117,7 @@ pub fn load_safetensors_with_residency(
 
 fn attach_parameter_bank(
     model: &mut QwenVlModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {

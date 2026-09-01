@@ -1,4 +1,4 @@
-//! MLX model materialization options.
+//! Composition-owned MLX preparation request.
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::QuantizationRequest;
@@ -6,28 +6,31 @@ use eredu_core::QuantizationRequest;
 use crate::backend::error::Error;
 use eredu_runtime::{PipelineWireContract, WeightResidency};
 
-use super::MlxParallelContext;
+use super::distributed::topology::MlxParallelPlan;
 
-/// Options for materializing model weights with MLX.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub struct ModelLoadOptions {
+/// Caller request translated into an authoritative realization before materialization.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct MlxLoadRequest {
     /// Optional weight transformation requested during dense checkpoint loading.
     pub(crate) quantization: Option<QuantizationRequest>,
     /// Validated runtime topology paired with its required wire contract.
-    parallel: Option<(MlxParallelContext, PipelineWireContract)>,
+    parallel: Option<(MlxParallelPlan, PipelineWireContract)>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub(crate) weight_residency: WeightResidency,
+    /// Exact mutable-state residency and paging controls.
+    pub(crate) state_residency: eredu_runtime::CacheResidencyPolicy,
     /// Capabilities required from the exact realized model session.
     pub(crate) required_session_capabilities: eredu_core::SessionCapabilities,
 }
 
-impl ModelLoadOptions {
+impl MlxLoadRequest {
     /// Creates load options that quantize eligible dense weights on load.
     pub fn with_quantization(quantization: QuantizationRequest) -> Self {
         Self {
             quantization: Some(quantization),
             parallel: None,
             weight_residency: WeightResidency::fully_resident(),
+            state_residency: eredu_runtime::CacheResidencyPolicy::Device,
             required_session_capabilities: eredu_core::SessionCapabilities::default(),
         }
     }
@@ -35,7 +38,7 @@ impl ModelLoadOptions {
     /// Adds a validated MLX parallel topology and its activation wire contract.
     pub(crate) fn with_parallel_topology(
         mut self,
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
         pipeline_wire: PipelineWireContract,
     ) -> Self {
         self.parallel = Some((topology, pipeline_wire));
@@ -45,7 +48,7 @@ impl ModelLoadOptions {
     /// Creates load options for a validated MLX parallel topology and
     /// activation wire contract.
     pub(crate) fn with_parallel(
-        topology: MlxParallelContext,
+        topology: MlxParallelPlan,
         pipeline_wire: PipelineWireContract,
     ) -> Self {
         Self::default().with_parallel_topology(topology, pipeline_wire)
@@ -54,6 +57,12 @@ impl ModelLoadOptions {
     /// Selects fully resident or bounded layer execution for checkpoint weights.
     pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
         self.weight_residency = residency;
+        self
+    }
+
+    /// Selects the exact mutable-state residency and paging controls.
+    pub fn with_state_residency(mut self, residency: eredu_runtime::CacheResidencyPolicy) -> Self {
+        self.state_residency = residency;
         self
     }
 
@@ -67,7 +76,7 @@ impl ModelLoadOptions {
     }
 
     /// Returns the selected distributed topology, if any.
-    pub(crate) const fn parallel_topology(self) -> Option<MlxParallelContext> {
+    pub(crate) const fn parallel_topology(&self) -> Option<MlxParallelPlan> {
         match self.parallel {
             Some((topology, _)) => Some(topology),
             None => None,
@@ -76,7 +85,7 @@ impl ModelLoadOptions {
 
     /// Returns the activation wire contract paired with the distributed
     /// topology, if any.
-    pub const fn pipeline_wire_contract(self) -> Option<PipelineWireContract> {
+    pub const fn pipeline_wire_contract(&self) -> Option<PipelineWireContract> {
         match self.parallel {
             Some((_, wire_contract)) => Some(wire_contract),
             None => None,
@@ -84,32 +93,37 @@ impl ModelLoadOptions {
     }
 
     /// Reports whether composition attached a native parallel execution plan.
-    pub const fn has_parallel_execution(self) -> bool {
+    pub const fn has_parallel_execution(&self) -> bool {
         self.parallel.is_some()
     }
 
     /// Returns the requested dense-weight transformation, if any.
-    pub const fn quantization(self) -> Option<QuantizationRequest> {
+    pub const fn quantization(&self) -> Option<QuantizationRequest> {
         self.quantization
     }
 
     /// Returns the selected immutable-weight residency policy.
-    pub const fn weight_residency(self) -> WeightResidency {
+    pub const fn weight_residency(&self) -> WeightResidency {
         self.weight_residency
     }
 
+    /// Returns the selected mutable-state residency policy.
+    pub const fn state_residency(&self) -> &eredu_runtime::CacheResidencyPolicy {
+        &self.state_residency
+    }
+
     /// Returns the capabilities required from the realized session.
-    pub const fn required_session_capabilities(self) -> eredu_core::SessionCapabilities {
+    pub const fn required_session_capabilities(&self) -> eredu_core::SessionCapabilities {
         self.required_session_capabilities
     }
 
     pub(crate) const fn parallel_execution(
-        self,
-    ) -> Option<(MlxParallelContext, PipelineWireContract)> {
+        &self,
+    ) -> Option<(MlxParallelPlan, PipelineWireContract)> {
         self.parallel
     }
 
-    pub(crate) fn weight_quantization(self) -> Result<Option<WeightQuantization>, Error> {
+    pub(crate) fn weight_quantization(&self) -> Result<Option<WeightQuantization>, Error> {
         self.quantization
             .map(|request| match request {
                 QuantizationRequest::Affine { group_size, bits } => {
@@ -122,11 +136,14 @@ impl ModelLoadOptions {
                     )?))
                 }
                 QuantizationRequest::MxFp4 => Ok(WeightQuantization::MxFp4),
+                _ => Err(Error::Quantization(
+                    "unknown load-time transformation request".into(),
+                )),
             })
             .transpose()
     }
 
-    pub(crate) fn validate_replicated(self) -> Result<(), Error> {
+    pub(crate) fn validate_replicated(&self) -> Result<(), Error> {
         if self
             .parallel_topology()
             .is_some_and(|topology| !topology.is_replicated())
@@ -140,26 +157,31 @@ impl ModelLoadOptions {
     }
 
     /// Converts these MLX load options into the portable preparation policy.
-    pub fn preparation_policy(self) -> Result<eredu_core::PreparationPolicy, Error> {
+    pub fn preparation_policy(&self) -> Result<eredu_core::PreparationPolicy, Error> {
         use eredu_core::ResidencyRequest;
         use eredu_runtime::LayerWeightResidency;
 
         self.weight_quantization()?;
-        let residency = if self.weight_residency.expert_cache().is_some() {
-            ResidencyRequest::ExpertCache
+        let residency = if self.weight_residency.parameter_bank_cache().is_some() {
+            ResidencyRequest::AddressableParameterBanks
         } else {
             match self.weight_residency.layers() {
                 LayerWeightResidency::FullyResident => ResidencyRequest::FullyResident,
                 LayerWeightResidency::LayerwiseHost(_) => ResidencyRequest::LayerwiseHost,
                 LayerWeightResidency::DenseDiskStream(_) => ResidencyRequest::DenseDiskStream,
+                _ => {
+                    return Err(Error::Parallel(
+                        "unsupported additive layer residency policy".into(),
+                    ));
+                }
             }
         };
-        Ok(eredu_core::PreparationPolicy {
-            quantization: self.quantization,
-            residency,
-            topology: self.parallel_topology().map(MlxParallelContext::topology),
-            required_session_capabilities: self.required_session_capabilities,
-        })
+        let mut policy = eredu_core::PreparationPolicy::new(self.quantization, residency)
+            .with_required_session_capabilities(self.required_session_capabilities);
+        if let Some(topology) = self.parallel_topology().map(MlxParallelPlan::topology) {
+            policy = policy.with_topology(topology);
+        }
+        Ok(policy)
     }
 }
 
@@ -168,30 +190,30 @@ mod tests {
     use eredu_core::QuantizationRequest;
     use eredu_runtime::LayerwiseLoadOptions;
 
-    use super::{MlxParallelContext, ModelLoadOptions};
+    use super::{MlxLoadRequest, MlxParallelPlan};
     use crate::backend::DeviceAssignment;
     use eredu_runtime::WeightResidency;
 
     #[test]
     fn preparation_policy_preserves_quantized_nonresident_request() {
-        let options = ModelLoadOptions::with_quantization(QuantizationRequest::MxFp4)
+        let options = MlxLoadRequest::with_quantization(QuantizationRequest::MxFp4)
             .with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::default(),
             ));
         let policy = options.preparation_policy().unwrap();
         assert_eq!(
-            policy.quantization,
+            policy.quantization(),
             Some(eredu_core::QuantizationRequest::MxFp4)
         );
         assert_eq!(
-            policy.residency,
+            policy.residency(),
             eredu_core::ResidencyRequest::LayerwiseHost
         );
     }
 
     #[test]
     fn preparation_policy_rejects_invalid_affine_geometry() {
-        let error = ModelLoadOptions::with_quantization(QuantizationRequest::Affine {
+        let error = MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
             group_size: 17,
             bits: 4,
         })
@@ -207,7 +229,7 @@ mod tests {
 
     #[test]
     fn preparation_policy_preserves_exact_parallel_topology() {
-        let topology = MlxParallelContext::for_rank(
+        let topology = MlxParallelPlan::for_rank(
             5,
             2,
             3,
@@ -215,7 +237,7 @@ mod tests {
             DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
         )
         .unwrap();
-        let policy = ModelLoadOptions::with_parallel(
+        let policy = MlxLoadRequest::with_parallel(
             topology,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
@@ -223,15 +245,15 @@ mod tests {
         )
         .preparation_policy()
         .unwrap();
-        assert_eq!(policy.topology, Some(topology.topology()));
+        assert_eq!(policy.topology(), Some(topology.topology()));
     }
 
     #[test]
     fn preparation_policies_distinguish_parallel_axes() {
         let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
-        let tensor_pipeline = MlxParallelContext::for_rank(0, 2, 3, 1, device).unwrap();
-        let tensor_expert = MlxParallelContext::for_rank(0, 2, 1, 3, device).unwrap();
-        let tensor_pipeline_policy = ModelLoadOptions::with_parallel(
+        let tensor_pipeline = MlxParallelPlan::for_rank(0, 2, 3, 1, device).unwrap();
+        let tensor_expert = MlxParallelPlan::for_rank(0, 2, 1, 3, device).unwrap();
+        let tensor_pipeline_policy = MlxLoadRequest::with_parallel(
             tensor_pipeline,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
@@ -239,7 +261,7 @@ mod tests {
         )
         .preparation_policy()
         .unwrap();
-        let tensor_expert_policy = ModelLoadOptions::with_parallel(
+        let tensor_expert_policy = MlxLoadRequest::with_parallel(
             tensor_expert,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,

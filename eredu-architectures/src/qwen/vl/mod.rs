@@ -28,7 +28,9 @@ pub use positions::{
 };
 
 /// Derives complete expert ownership and rank-local text-bank geometry from Qwen3-VL.
-pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
+pub fn expert_realization_plan<
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
     architecture: &LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
@@ -42,8 +44,8 @@ pub fn expert_realization_plan<B: eredu_nn::GroupedNeuralBackend>(
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
-            topology.expert_parallel_size,
-            topology.expert_parallel_rank,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
             false,
         )
         .map_err(eredu_nn::Error::backend)?

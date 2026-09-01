@@ -8,8 +8,8 @@ use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
-    LayeredArchitecture,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, LayeredArchitecture,
+    ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -26,7 +26,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -53,6 +52,7 @@ use crate::{
         QwenConditionalPipelinePartition, QwenHybridPipelinePartition, QwenPipelinePartition,
         QwenVlPipelinePartition,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
     composition::{
         mlx::speculative::embedded::EmbeddedMtpOutput,
         qwen::{
@@ -99,7 +99,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
     let capabilities =
         eredu_architectures::preparation::prepared_safetensors_capabilities(&resolved.architecture)
             .unwrap();
-    let topology = MlxParallelContext::for_rank(
+    let topology = MlxParallelPlan::for_rank(
         0,
         2,
         2,
@@ -134,7 +134,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
     .unwrap_err();
     assert!(error.to_string().contains("expert-parallel"));
 
-    let topology = MlxParallelContext::for_rank(
+    let topology = MlxParallelPlan::for_rank(
         0,
         2,
         2,
@@ -1522,11 +1522,11 @@ pub(super) fn load_qwen_pipeline(
     source_args: eredu_architectures::qwen::ModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -1592,7 +1592,7 @@ pub(super) fn load_qwen_pipeline(
         .architecture
         .take()
         .expect("Qwen partition constructor owns a neutral architecture");
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
+    let parallel_layout = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -1616,7 +1616,7 @@ pub(super) fn load_qwen_pipeline(
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let placement = Arc::new(decoder_architecture_transport::<_, PipelineRangeState<'_>>(
         stage.architecture.as_ref().unwrap(),
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -1845,7 +1845,7 @@ pub(super) fn load_qwen_pipeline(
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
             |identity| {
                 stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                    assignment.owner(identity.member()) == Some(assignment.rank())
                 })
             },
         );
@@ -1881,11 +1881,11 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
     source_args: eredu_architectures::qwen::vl::ModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -1895,7 +1895,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
         "Qwen3-VL",
     )?;
     let parameter_bank_options = parameter_bank_options
-        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+        .or_else(|| (topology.expert_parallel_size() > 1).then(ParameterBankLoadOptions::default));
     let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         QwenVlPipelineBindings::new_external_experts()
@@ -1956,7 +1956,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
             .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
+    let parallel_layout = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::vl::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -1972,7 +1972,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
     };
     let placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -2245,7 +2245,7 @@ pub(super) fn load_neutral_qwen_vl_pipeline(
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
             |identity| {
                 stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                    assignment.owner(identity.member()) == Some(assignment.rank())
                 })
             },
         );
@@ -2935,11 +2935,11 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
     source_args: eredu_architectures::qwen::hybrid::HybridConfig,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -2950,7 +2950,7 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
     )?;
     let explicit_parameter_bank = parameter_bank_options.is_some();
     let parameter_bank_options = parameter_bank_options
-        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+        .or_else(|| (topology.expert_parallel_size() > 1).then(ParameterBankLoadOptions::default));
     let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         QwenHybridPipelineBindings::new_external_experts()
@@ -3018,7 +3018,7 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
             .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
+    let parallel_layout = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = eredu_architectures::qwen::hybrid::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -3035,7 +3035,7 @@ pub(super) fn load_neutral_qwen_hybrid_pipeline(
     };
     let placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -3383,18 +3383,18 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
     source: eredu_architectures::qwen::hybrid::ParsedHybridConfig,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Qwen35], "conditional Qwen3.5")?;
     let explicit_parameter_bank = parameter_bank_options.is_some();
     let parameter_bank_options = parameter_bank_options
-        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+        .or_else(|| (topology.expert_parallel_size() > 1).then(ParameterBankLoadOptions::default));
     let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         QwenConditionalPipelineBindings::new_external_experts()
@@ -3467,7 +3467,7 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
             .map(eredu_architectures::ExpertRealizationPlan::global_expert_count),
     )?;
     let range = topology.layer_range(target_units)?;
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
+    let parallel_layout = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry =
             eredu_architectures::qwen::hybrid::conditional_local_geometry(&target, &layout)
@@ -3482,7 +3482,7 @@ pub(super) fn load_neutral_qwen_conditional_pipeline(
     };
     let placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,

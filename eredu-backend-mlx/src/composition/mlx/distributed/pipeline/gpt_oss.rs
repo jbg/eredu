@@ -7,7 +7,7 @@ use eredu_architectures::{gpt_oss as gpt_oss_arch, ModelKind};
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -20,7 +20,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::RoutingStatistics,
     composition::gpt_oss as neutral_gpt_oss,
@@ -37,6 +36,7 @@ use crate::{
         PipelinePartitionMetadata, PipelineRangeState, PipelineStageInput, PipelineStageOutput,
         PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
 };
 
 impl PipelinePartitionMetadata for GptOssPipelinePartition {
@@ -194,17 +194,17 @@ pub(super) fn load_gpt_oss_pipeline(
     source_args: gpt_oss_arch::ModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::GptOss], "GPT-OSS")?;
     let parameter_bank_options = parameter_bank_options
-        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+        .or_else(|| (topology.expert_parallel_size() > 1).then(ParameterBankLoadOptions::default));
     let binding_adapter = if parameter_bank_options.is_some() {
         neutral_gpt_oss::GptOssPipelineBindings::new_external_experts()
     } else {
@@ -280,7 +280,7 @@ pub(super) fn load_gpt_oss_pipeline(
         .architecture
         .take()
         .expect("GPT-OSS neutral architecture");
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
+    let parallel_layout = if topology.tensor_parallel_size() > 1 {
         let layout = architecture_parallel_layout(&binding_parameter_description, topology)?;
         let geometry = gpt_oss_arch::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -299,7 +299,7 @@ pub(super) fn load_gpt_oss_pipeline(
     };
     let placement = Arc::new(decoder_architecture_transport::<_, PipelineRangeState<'_>>(
         stage.architecture.as_ref().unwrap(),
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -522,7 +522,7 @@ pub(super) fn load_gpt_oss_pipeline(
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
             |identity| {
                 stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                    assignment.owner(identity.member()) == Some(assignment.rank())
                 })
             },
         );

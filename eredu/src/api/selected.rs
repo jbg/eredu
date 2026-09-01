@@ -114,6 +114,9 @@ pub enum LocalModelLoadError {
     /// Portable tokenizer, chat-template, or generation metadata loading failed.
     #[error(transparent)]
     Metadata(#[from] super::TextMetadataError),
+    /// The execution plan contains an unsupported speculative drafting mode.
+    #[error("execution plan selects an unsupported speculative drafting mode")]
+    UnsupportedDraftingPlan,
 }
 
 /// Failure while planning and loading a model through the local facade.
@@ -139,6 +142,9 @@ fn map_local_model_load_error(
             LocalModelLoadError::SessionCapability(error)
         }
         super::LoadedModelLoadError::Metadata(error) => LocalModelLoadError::Metadata(error),
+        super::LoadedModelLoadError::UnsupportedDraftingPlan => {
+            LocalModelLoadError::UnsupportedDraftingPlan
+        }
     }
 }
 
@@ -703,14 +709,12 @@ impl LocalLoadOptions {
         self.required_session_capabilities
     }
 
-    fn into_backend(self) -> eredu_backend_mlx::backend::config::ModelLoadOptions {
+    fn into_backend(self) -> eredu_backend_mlx::MlxLoadRequest {
         let options = match self.quantization {
             Some(quantization) => {
-                eredu_backend_mlx::backend::config::ModelLoadOptions::with_quantization(
-                    quantization,
-                )
+                eredu_backend_mlx::MlxLoadRequest::with_quantization(quantization)
             }
-            None => eredu_backend_mlx::backend::config::ModelLoadOptions::default(),
+            None => eredu_backend_mlx::MlxLoadRequest::default(),
         };
         options
             .with_weight_residency(self.weight_residency)
@@ -718,7 +722,7 @@ impl LocalLoadOptions {
     }
 
     fn from_backend(
-        options: eredu_backend_mlx::backend::config::ModelLoadOptions,
+        options: eredu_backend_mlx::MlxLoadRequest,
     ) -> Result<Self, crate::AutomaticPlanningError> {
         if options.has_parallel_execution() {
             return Err(crate::AutomaticPlanningError::Invalid(
@@ -748,10 +752,20 @@ impl Default for LocalLoadOptions {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct LocalInspectionOptions {
     /// The exact facade loading policy that admission should validate.
-    pub load: LocalLoadOptions,
+    load: LocalLoadOptions,
 }
 
 impl LocalInspectionOptions {
+    /// Creates inspection options for one exact facade load request.
+    pub const fn new(load: LocalLoadOptions) -> Self {
+        Self { load }
+    }
+
+    /// Returns the load request whose feasibility is being inspected.
+    pub const fn load(&self) -> LocalLoadOptions {
+        self.load
+    }
+
     /// Derives inspection options from a portable execution plan.
     pub fn for_execution_plan(
         factory: &LocalBackendFactory,
@@ -759,9 +773,7 @@ impl LocalInspectionOptions {
     ) -> Result<Self, crate::AutomaticPlanningError> {
         let realization = eredu_core::realize_execution_plan_target(&factory.inner, plan)?;
         let (_, options) = realization.into_parts();
-        Ok(Self {
-            load: LocalLoadOptions::from_backend(options)?,
-        })
+        Ok(Self::new(LocalLoadOptions::from_backend(options)?))
     }
 }
 
@@ -772,9 +784,7 @@ pub fn inspect_local_model(
 ) -> Result<crate::ModelInspectionReport, LocalBackendError> {
     eredu_backend_mlx::native::inspect_model(
         path,
-        eredu_backend_mlx::native::MlxInspectionOptions {
-            load: options.load.into_backend(),
-        },
+        eredu_backend_mlx::native::MlxInspectionOptions::new(options.load().into_backend()),
     )
     .map_err(|error| LocalBackendError::new("model inspection", error))
 }
@@ -1170,6 +1180,9 @@ fn map_local_realtime_error(
         eredu_core::RealtimeError::Asynchronous { work, message } => {
             eredu_core::RealtimeError::Asynchronous { work, message }
         }
+        error => {
+            eredu_core::RealtimeError::Backend(LocalBackendError::new("realtime execution", error))
+        }
     }
 }
 
@@ -1520,9 +1533,9 @@ mod tests {
     fn local_accelerator_plan_names_the_compiled_family() {
         let plan = local_device_plan(LocalDevice::Accelerator(3));
         if cfg!(feature = "cuda") {
-            assert_eq!(plan.unwrap().device, "cuda:3");
+            assert_eq!(plan.unwrap().device(), "cuda:3");
         } else if cfg!(all(feature = "metal", target_vendor = "apple")) {
-            assert_eq!(plan.unwrap().device, "metal:3");
+            assert_eq!(plan.unwrap().device(), "metal:3");
         } else {
             assert_eq!(plan, Err(LocalDevicePlanError::AcceleratorNotCompiled));
         }

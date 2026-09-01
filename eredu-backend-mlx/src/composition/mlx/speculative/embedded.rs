@@ -289,11 +289,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
                 self.target.draft_cache(cache),
                 stream,
             )?;
-            Ok(SpeculativePrefill {
-                logits,
-                state,
-                evaluated_tokens: sequence as usize,
-            })
+            Ok(SpeculativePrefill::new(logits, state, sequence as usize))
         })
     }
 
@@ -453,9 +449,6 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
             self.target.draft_cache(cache),
             stream,
         )?;
-        Ok(SpeculativeCommit {
-            state,
-            replayed_tokens,
-        })
+        Ok(SpeculativeCommit::new(state, replayed_tokens))
     }
 }

@@ -31,10 +31,13 @@ fn wrap_parallel_output(
     )
 }
 
-fn bank_access_class(pass: ExpertPass) -> BankAccessClass {
+fn bank_access_class(pass: ExpertPass) -> Result<BankAccessClass, Error> {
     match pass {
-        ExpertPass::Prefill => BankAccessClass::Bulk,
-        ExpertPass::Decode => BankAccessClass::Incremental,
+        ExpertPass::Prefill => Ok(BankAccessClass::Bulk),
+        ExpertPass::Decode => Ok(BankAccessClass::Incremental),
+        _ => Err(Error::ArchitectureModel(
+            "unsupported expert pass requires an explicit bank-access policy".into(),
+        )),
     }
 }
 
@@ -810,7 +813,7 @@ fn execute_cached_gated_product_inner(
             &flattened,
             group_indices,
             coefficients,
-            bank_access_class(pass),
+            bank_access_class(pass)?,
         ),
         stream,
         |hidden, acquired, weights, stream| {
@@ -907,7 +910,7 @@ pub fn execute_cached_relu2(
             &flattened,
             group_indices,
             coefficients,
-            bank_access_class(pass),
+            bank_access_class(pass)?,
         ),
         stream,
         |hidden, acquired, weights, stream| {

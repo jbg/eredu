@@ -7,7 +7,7 @@ use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -20,7 +20,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -38,6 +37,7 @@ use crate::{
         PipelineLayerStorage, PipelineLoadAccumulator, PipelineModel, PipelinePartitionMetadata,
         PipelineStageInput, PipelineStageOutput, PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
 };
 
 /// Executes an LFM2 partition through its neutral hybrid architecture.
@@ -306,17 +306,17 @@ pub(super) fn load_lfm2_pipeline(
     source_args: eredu_architectures::lfm2::ModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Lfm2], "LFM2")?;
     let parameter_bank_options = parameter_bank_options
-        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+        .or_else(|| (topology.expert_parallel_size() > 1).then(ParameterBankLoadOptions::default));
     let binding_adapter = if parameter_bank_options.is_some() {
         Lfm2Bindings::new_external_experts()
     } else {
@@ -410,7 +410,7 @@ pub(super) fn load_lfm2_pipeline(
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let placement = Arc::new(decoder_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -427,7 +427,7 @@ pub(super) fn load_lfm2_pipeline(
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
-            topology.pipeline_parallel_rank,
+            topology.pipeline_parallel_rank(),
             Arc::clone(&geometry),
             &parameter_description,
         )?;
@@ -453,7 +453,7 @@ pub(super) fn load_lfm2_pipeline(
             info.local_group_indices = assignment.local_global_group_indices().to_vec();
         }
     }
-    let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
+    let parallel_layout = (topology.tensor_parallel_size() > 1).then_some(planned_layout.clone());
     stage.layers = stage
         .range()
         .map(|global_layer| stage.build_unit(global_layer, stream))
@@ -629,7 +629,7 @@ pub(super) fn load_lfm2_pipeline(
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
             |identity| {
                 stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(identity.global_expert) == Some(assignment.rank())
+                    assignment.owner(identity.member()) == Some(assignment.rank())
                 })
             },
         );

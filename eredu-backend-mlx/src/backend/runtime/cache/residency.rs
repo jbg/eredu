@@ -2521,13 +2521,13 @@ impl CacheResidencyManager {
     ) -> Result<PromptCacheManifest, CacheResidencyError> {
         let destination = destination.as_ref();
         descriptor.validate()?;
-        let publication = PromptCachePublication::begin(destination, options.replace_existing)?;
+        let publication = PromptCachePublication::begin(destination, options.replace_existing())?;
         let temporary = publication.staging_directory().to_path_buf();
 
         let result = (|| {
             let records = {
                 let state = self.lock()?;
-                let owned_layers = descriptor.global_layer_start..descriptor.global_layer_end;
+                let owned_layers = descriptor.global_layer_start()..descriptor.global_layer_end();
                 let mut records = Vec::new();
                 for record in state
                     .blocks
@@ -2615,24 +2615,24 @@ impl CacheResidencyManager {
             }
             let manifest = PromptCacheManifest {
                 schema_version: PROMPT_CACHE_SCHEMA_VERSION,
-                model_family: descriptor.model_family,
-                effective_model_type: descriptor.effective_model_type,
-                checkpoint_fingerprint: descriptor.checkpoint_fingerprint,
-                prefix_content_fingerprint: descriptor.prefix_content_fingerprint,
-                architecture_fingerprint: descriptor.architecture_fingerprint,
-                layer_count: descriptor.layer_count,
-                global_layer_start: descriptor.global_layer_start,
-                global_layer_end: descriptor.global_layer_end,
+                model_family: descriptor.model_family().to_owned(),
+                effective_model_type: descriptor.effective_model_type().to_owned(),
+                checkpoint_fingerprint: descriptor.checkpoint_fingerprint().to_owned(),
+                prefix_content_fingerprint: descriptor.prefix_content_fingerprint().to_owned(),
+                architecture_fingerprint: descriptor.architecture_fingerprint().to_owned(),
+                layer_count: descriptor.layer_count(),
+                global_layer_start: descriptor.global_layer_start(),
+                global_layer_end: descriptor.global_layer_end(),
                 block_size_tokens: self.options().block_size_tokens(),
-                batch_size: descriptor.batch_size,
+                batch_size: descriptor.batch_size(),
                 total_prefix_tokens: prefix_token_ids.len(),
                 prefix_sha256: prompt_cache_token_fingerprint(prefix_token_ids),
-                layer_layout: descriptor.layer_layout,
-                layer_prefix_offsets: descriptor.layer_prefix_offsets,
-                state_segments: descriptor.state_segments,
-                sink_tokens: descriptor.sink_tokens,
-                topology: descriptor.topology,
-                application_namespace: options.application_namespace.clone(),
+                layer_layout: descriptor.layer_layout().clone(),
+                layer_prefix_offsets: descriptor.layer_prefix_offsets().to_vec(),
+                state_segments: descriptor.state_segments().to_vec(),
+                sink_tokens: descriptor.sink_tokens(),
+                topology: descriptor.topology().clone(),
+                application_namespace: options.application_namespace().map(str::to_owned),
                 blocks: manifest_blocks,
                 state_tensors: manifest_state,
             };
@@ -3989,24 +3989,23 @@ mod tests {
     }
 
     fn prompt_descriptor() -> PromptCacheDescriptor {
-        PromptCacheDescriptor {
-            model_family: "decoder".into(),
-            effective_model_type: "decoder".into(),
-            checkpoint_fingerprint: "checkpoint".into(),
-            prefix_content_fingerprint: "text:prefix".into(),
-            architecture_fingerprint: "architecture".into(),
-            layer_count: 1,
-            global_layer_start: 0,
-            global_layer_end: 1,
-            batch_size: 1,
-            layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0],
-            state_segments: vec![
-                eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap(),
-            ],
-            topology: PromptCacheTopology::default(),
-        }
+        PromptCacheDescriptor::new(
+            "decoder",
+            "decoder",
+            "checkpoint",
+            "text:prefix",
+            "architecture",
+            1,
+            0,
+            1,
+            1,
+            PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
+            vec![0],
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap()],
+            0,
+            PromptCacheTopology::default(),
+        )
+        .unwrap()
     }
 
     fn key_value_layout(
@@ -4023,19 +4022,20 @@ mod tests {
 
     fn prompt_model_identity() -> PromptCacheModelIdentity {
         let descriptor = prompt_descriptor();
-        PromptCacheModelIdentity {
-            model_family: descriptor.model_family,
-            effective_model_type: descriptor.effective_model_type,
-            architecture_fingerprint: descriptor.architecture_fingerprint,
-            layer_count: descriptor.layer_count,
-            global_layer_start: descriptor.global_layer_start,
-            global_layer_end: descriptor.global_layer_end,
-            sink_tokens: descriptor.sink_tokens,
-            layer_prefix_offsets: descriptor.layer_prefix_offsets,
-            state_segments: descriptor.state_segments,
-            topology: descriptor.topology,
-            layer_layout: descriptor.layer_layout,
-        }
+        PromptCacheModelIdentity::new(
+            descriptor.model_family(),
+            descriptor.effective_model_type(),
+            descriptor.architecture_fingerprint(),
+            descriptor.layer_count(),
+            descriptor.global_layer_start(),
+            descriptor.global_layer_end(),
+            descriptor.sink_tokens(),
+            descriptor.topology().clone(),
+            descriptor.layer_layout().clone(),
+            descriptor.layer_prefix_offsets().to_vec(),
+            descriptor.state_segments().to_vec(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -4079,10 +4079,7 @@ mod tests {
                 );
             }
         }
-        let descriptor = PromptCacheDescriptor {
-            layer_count: 3,
-            ..prompt_descriptor()
-        };
+        let descriptor = prompt_descriptor().with_layer_count(3).unwrap();
         let destination = tempfile::tempdir().unwrap();
 
         let manifest = manager
@@ -4143,11 +4140,11 @@ mod tests {
         let descriptor = prompt_descriptor();
         let manifest = PromptCacheManifest {
             schema_version: PROMPT_CACHE_SCHEMA_VERSION,
-            model_family: descriptor.model_family,
-            effective_model_type: descriptor.effective_model_type,
-            checkpoint_fingerprint: descriptor.checkpoint_fingerprint,
-            prefix_content_fingerprint: descriptor.prefix_content_fingerprint,
-            architecture_fingerprint: descriptor.architecture_fingerprint,
+            model_family: descriptor.model_family().to_owned(),
+            effective_model_type: descriptor.effective_model_type().to_owned(),
+            checkpoint_fingerprint: descriptor.checkpoint_fingerprint().to_owned(),
+            prefix_content_fingerprint: descriptor.prefix_content_fingerprint().to_owned(),
+            architecture_fingerprint: descriptor.architecture_fingerprint().to_owned(),
             layer_count: 1,
             global_layer_start: 0,
             global_layer_end: 1,
@@ -4155,10 +4152,10 @@ mod tests {
             batch_size: 1,
             total_prefix_tokens: 1,
             prefix_sha256: prompt_cache_token_fingerprint(&[7]),
-            layer_layout: descriptor.layer_layout,
+            layer_layout: descriptor.layer_layout().clone(),
             sink_tokens: 0,
             layer_prefix_offsets: vec![0],
-            state_segments: descriptor.state_segments,
+            state_segments: descriptor.state_segments().to_vec(),
             topology: PromptCacheTopology::default(),
             application_namespace: Some(namespace.into()),
             blocks: vec![PromptCacheBlock {
@@ -4208,29 +4205,27 @@ mod tests {
 
     #[test]
     fn prompt_cache_topology_preserves_parallel_coordinates_and_rank_identity() {
-        use crate::backend::{DeviceAssignment, MlxParallelContext};
+        use crate::{backend::DeviceAssignment, native::MlxParallelPlan};
 
         let topology =
-            MlxParallelContext::for_rank(5, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelPlan::for_rank(5, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
-        let cache_topology = crate::backend::cache::prompt_cache_topology(topology);
+        let cache_topology =
+            crate::composition::mlx::distributed::topology::prompt_cache_topology(topology);
 
-        assert_eq!(cache_topology.pipeline, Some((2, 1)));
-        assert_eq!(cache_topology.tensor_parallel, Some((2, 0)));
-        assert_eq!(cache_topology.expert_parallel, Some((2, 1)));
+        assert_eq!(cache_topology.stage(), Some((2, 1)));
+        assert_eq!(cache_topology.shard(), Some((2, 0)));
+        assert_eq!(cache_topology.addressable(), Some((2, 1)));
         assert_eq!(
             cache_topology.cache_rank_identity(),
-            Some(CacheRankIdentity {
-                pipeline_rank: Some(1),
-                tensor_parallel_rank: Some(0),
-                expert_parallel_rank: Some(1),
-            })
+            Some(CacheRankIdentity::new(Some(1), Some(0), Some(1)))
         );
 
         let replicated =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelPlan::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
-        let replicated = crate::backend::cache::prompt_cache_topology(replicated);
+        let replicated =
+            crate::composition::mlx::distributed::topology::prompt_cache_topology(replicated);
         assert_eq!(replicated, PromptCacheTopology::default());
         assert_eq!(replicated.cache_rank_identity(), None);
     }
@@ -4279,17 +4274,30 @@ mod tests {
         let hashes = variants
             .into_iter()
             .map(|layer_layout| {
-                stable_hash(&PromptCacheDescriptor {
-                    layer_count: layer_layout.len(),
-                    global_layer_end: layer_layout.len(),
-                    state_segments: vec![eredu_core::cache::PromptCacheStateSegment::new(
-                        "state",
-                        0..layer_layout.len(),
+                let layer_count = layer_layout.len();
+                stable_hash(
+                    &PromptCacheDescriptor::new(
+                        base.model_family(),
+                        base.effective_model_type(),
+                        base.checkpoint_fingerprint(),
+                        base.prefix_content_fingerprint(),
+                        base.architecture_fingerprint(),
+                        layer_count,
+                        0,
+                        layer_count,
+                        base.batch_size(),
+                        layer_layout,
+                        vec![0; layer_count],
+                        vec![eredu_core::cache::PromptCacheStateSegment::new(
+                            "state",
+                            0..layer_count,
+                        )
+                        .unwrap()],
+                        base.sink_tokens(),
+                        base.topology().clone(),
                     )
-                    .unwrap()],
-                    layer_layout,
-                    ..base.clone()
-                })
+                    .unwrap(),
+                )
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(hashes.len(), 6);
@@ -4664,24 +4672,37 @@ mod tests {
 
     #[test]
     fn loaded_model_identity_rejects_a_forged_caller_descriptor() {
-        let mut descriptor = prompt_descriptor();
-        descriptor.layer_count = 2;
-        descriptor.global_layer_end = 2;
-        let loaded_model = PromptCacheModelIdentity {
-            model_family: "decoder".into(),
-            effective_model_type: "decoder".into(),
-            architecture_fingerprint: descriptor.architecture_fingerprint.clone(),
-            layer_count: 1,
-            global_layer_start: 0,
-            global_layer_end: 1,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0],
-            state_segments: vec![
-                eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap(),
-            ],
-            topology: PromptCacheTopology::default(),
-            layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
-        };
+        let descriptor = PromptCacheDescriptor::new(
+            "decoder",
+            "decoder",
+            "checkpoint",
+            "text:prefix",
+            "architecture",
+            2,
+            0,
+            2,
+            1,
+            PromptCacheModelIdentity::key_value_layouts([None, None], 1, 1).unwrap(),
+            vec![0, 0],
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..2).unwrap()],
+            0,
+            PromptCacheTopology::default(),
+        )
+        .unwrap();
+        let loaded_model = PromptCacheModelIdentity::new(
+            "decoder",
+            "decoder",
+            descriptor.architecture_fingerprint(),
+            1,
+            0,
+            1,
+            0,
+            PromptCacheTopology::default(),
+            PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
+            vec![0],
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap()],
+        )
+        .unwrap();
         assert!(matches!(
             validate_prompt_cache_model_identity(&descriptor, &loaded_model),
             Err(PromptCacheError::Incompatible(_))
@@ -4690,30 +4711,47 @@ mod tests {
 
     #[test]
     fn loaded_model_identity_rejects_a_forged_architecture_fingerprint() {
-        let mut descriptor = prompt_descriptor();
-        let loaded_model = PromptCacheModelIdentity {
-            model_family: descriptor.model_family.clone(),
-            effective_model_type: descriptor.effective_model_type.clone(),
-            architecture_fingerprint: "sha256:derived-from-loaded-model".into(),
-            layer_count: descriptor.layer_count,
-            global_layer_start: descriptor.global_layer_start,
-            global_layer_end: descriptor.global_layer_end,
-            sink_tokens: descriptor.sink_tokens,
-            layer_prefix_offsets: descriptor.layer_prefix_offsets.clone(),
-            state_segments: descriptor.state_segments.clone(),
-            topology: descriptor.topology.clone(),
-            layer_layout: descriptor.layer_layout.clone(),
-        };
-        descriptor.architecture_fingerprint = "sha256:caller-repeated-stale-value".into();
+        let descriptor = prompt_descriptor()
+            .with_architecture_fingerprint("sha256:caller-repeated-stale-value")
+            .unwrap();
+        let loaded_model = PromptCacheModelIdentity::new(
+            descriptor.model_family(),
+            descriptor.effective_model_type(),
+            "sha256:derived-from-loaded-model",
+            descriptor.layer_count(),
+            descriptor.global_layer_start(),
+            descriptor.global_layer_end(),
+            descriptor.sink_tokens(),
+            descriptor.topology().clone(),
+            descriptor.layer_layout().clone(),
+            descriptor.layer_prefix_offsets().to_vec(),
+            descriptor.state_segments().to_vec(),
+        )
+        .unwrap();
         let error = validate_prompt_cache_model_identity(&descriptor, &loaded_model).unwrap_err();
         assert!(error.to_string().contains("architecture_fingerprint"));
     }
 
     #[test]
     fn loaded_model_identity_rejects_a_forged_layer_frontier() {
-        let mut descriptor = prompt_descriptor();
+        let descriptor = PromptCacheDescriptor::new(
+            "decoder",
+            "decoder",
+            "checkpoint",
+            "text:prefix",
+            "architecture",
+            1,
+            0,
+            1,
+            1,
+            PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
+            vec![-1],
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap()],
+            0,
+            PromptCacheTopology::default(),
+        )
+        .unwrap();
         let loaded_model = prompt_model_identity();
-        descriptor.layer_prefix_offsets = vec![-1];
         let error = validate_prompt_cache_model_identity(&descriptor, &loaded_model).unwrap_err();
         assert!(error.to_string().contains("layer_prefix_offsets"));
     }
@@ -5592,10 +5630,7 @@ mod tests {
                 prompt_descriptor(),
                 &[7],
                 &[],
-                &PromptCacheOptions {
-                    application_namespace: Some("backend-verification".into()),
-                    replace_existing: false,
-                },
+                &PromptCacheOptions::new(Some("backend-verification".into()), false).unwrap(),
             )
             .unwrap();
         let (restored, manifest) = open_prompt_cache(

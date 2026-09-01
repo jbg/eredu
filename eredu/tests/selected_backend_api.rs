@@ -42,10 +42,7 @@ fn facade_exposes_complete_selected_realtime_operations() {
 
 #[test]
 fn selected_load_policy_is_facade_owned_and_portable() {
-    let required = SessionCapabilities {
-        persistent_cache: true,
-        ..SessionCapabilities::default()
-    };
+    let required = SessionCapabilities::default().with_persistent_cache(true);
     let options = LocalLoadOptions::with_quantization(QuantizationRequest::MxFp4)
         .with_required_session_capabilities(required);
 
@@ -59,7 +56,7 @@ fn selected_load_policy_is_facade_owned_and_portable() {
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
     let planned =
         LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), &plan).unwrap();
-    assert_eq!(planned.load, LocalLoadOptions::default());
+    assert_eq!(planned.load(), LocalLoadOptions::default());
 }
 
 #[test]

@@ -144,6 +144,7 @@ pub fn packed_grouped_linear_with_options(
 
 /// Selector score transform used before top-k group selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TopKGroupScoring {
     /// Softmax scores before top-k selection.
     Softmax,
@@ -170,104 +171,161 @@ impl TopKGroupScoring {
     }
 }
 
-/// Configuration for a reusable top-k MoE selector.
+/// Configuration for reusable top-k grouped selection.
 #[derive(Debug, Clone, Copy)]
 pub struct TopKGroupSelectorConfig {
     /// Number of selected groups per token.
-    pub top_k: i32,
+    top_k: i32,
     /// Total number of selectable groups.
-    pub group_count: i32,
+    group_count: i32,
     /// Hidden dimension consumed by the selector projection.
-    pub hidden_size: i32,
+    hidden_size: i32,
     /// Score transform to apply to selector logits.
-    pub score_function: TopKGroupScoring,
+    score_function: TopKGroupScoring,
     /// Whether selected top-k weights are normalized after gathering.
-    pub norm_topk_prob: bool,
+    norm_topk_prob: bool,
     /// Optional epsilon added to the normalization denominator.
-    pub normalization_epsilon: f32,
+    normalization_epsilon: f32,
     /// Final multiplier applied to gathered selection weights.
-    pub coefficient_scale: f32,
+    coefficient_scale: f32,
     /// Number of selection groups.
-    pub n_group: i32,
+    n_group: i32,
     /// Number of selection groups selected before group top-k.
-    pub topk_group: i32,
+    topk_group: i32,
     /// Whether to allocate an ordinary per-group projection output bias.
-    pub projection_bias: bool,
+    projection_bias: bool,
     /// Whether to allocate a selection-only group score correction bias.
-    pub score_correction_bias: bool,
+    score_correction_bias: bool,
     /// Optional epsilon for weightless RMS normalization before projection.
-    pub input_rms_epsilon: Option<f32>,
+    input_rms_epsilon: Option<f32>,
     /// Whether normalized inputs receive an additional inverse-sqrt-width scale.
-    pub input_inverse_sqrt_dimensions: bool,
+    input_inverse_sqrt_dimensions: bool,
     /// Whether to allocate learned per-group selection multipliers.
-    pub learned_coefficient_scale: bool,
+    learned_coefficient_scale: bool,
 }
 
-/// Reusable top-k selector for sparse MoE layers.
+impl TopKGroupSelectorConfig {
+    /// Creates and validates a complete grouped-selector configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        top_k: i32,
+        group_count: i32,
+        hidden_size: i32,
+        score_function: TopKGroupScoring,
+        norm_topk_prob: bool,
+        normalization_epsilon: f32,
+        coefficient_scale: f32,
+        n_group: i32,
+        topk_group: i32,
+        projection_bias: bool,
+        score_correction_bias: bool,
+        input_rms_epsilon: Option<f32>,
+        input_inverse_sqrt_dimensions: bool,
+        learned_coefficient_scale: bool,
+    ) -> Result<Self, Exception> {
+        if top_k <= 0 || group_count <= 0 || top_k > group_count || hidden_size <= 0 {
+            return Err(Exception::custom(
+                "grouped selector requires positive dimensions and top_k no larger than group_count",
+            ));
+        }
+        if n_group <= 0 || topk_group <= 0 || topk_group > n_group || group_count % n_group != 0 {
+            return Err(Exception::custom(
+                "grouped selector partitions must divide group_count and select a non-empty subset",
+            ));
+        }
+        if !normalization_epsilon.is_finite()
+            || normalization_epsilon < 0.0
+            || !coefficient_scale.is_finite()
+            || input_rms_epsilon.is_some_and(|epsilon| !epsilon.is_finite() || epsilon < 0.0)
+        {
+            return Err(Exception::custom(
+                "grouped selector scaling values must be finite and epsilons non-negative",
+            ));
+        }
+        Ok(Self {
+            top_k,
+            group_count,
+            hidden_size,
+            score_function,
+            norm_topk_prob,
+            normalization_epsilon,
+            coefficient_scale,
+            n_group,
+            topk_group,
+            projection_bias,
+            score_correction_bias,
+            input_rms_epsilon,
+            input_inverse_sqrt_dimensions,
+            learned_coefficient_scale,
+        })
+    }
+}
+
+/// Reusable top-k grouped selector.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct TopKGroupSelector {
     /// Number of selected groups per token.
-    pub top_k: i32,
+    pub(crate) top_k: i32,
     /// Total number of selectable groups.
-    pub group_count: i32,
+    pub(crate) group_count: i32,
     /// Logical input width of the selector projection.
-    pub input_dims: i32,
+    pub(crate) input_dims: i32,
     /// Selector score transform.
-    pub score_function: TopKGroupScoring,
+    pub(crate) score_function: TopKGroupScoring,
     /// Whether selected probabilities are normalized.
-    pub norm_topk_prob: bool,
+    pub(crate) norm_topk_prob: bool,
     /// Optional epsilon added to the normalization denominator.
-    pub normalization_epsilon: f32,
+    pub(crate) normalization_epsilon: f32,
     /// Final multiplier applied to selection weights.
-    pub coefficient_scale: f32,
+    pub(crate) coefficient_scale: f32,
     /// Number of selection groups.
-    pub n_group: i32,
+    pub(crate) n_group: i32,
     /// Number of selected partitions.
-    pub topk_group: i32,
+    pub(crate) topk_group: i32,
     #[param]
     /// Selector projection weight.
-    pub weight: PhysicalParam<Array>,
+    pub(crate) weight: PhysicalParam<Array>,
     #[param]
     /// Optional ordinary projection output bias applied to selector logits.
-    pub bias: PhysicalParam<Option<Array>>,
+    pub(crate) bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional affine scales for a packed selector projection.
-    pub scales: PhysicalParam<Option<Array>>,
+    pub(crate) scales: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional affine biases for a packed selector projection.
-    pub biases: PhysicalParam<Option<Array>>,
+    pub(crate) biases: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional score correction bias used only when choosing groups.
-    pub e_score_correction_bias: PhysicalParam<Option<Array>>,
+    pub(crate) e_score_correction_bias: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional learned feature scale applied to RMS-normalized inputs.
-    pub input_scale: PhysicalParam<Option<Array>>,
+    pub(crate) input_scale: PhysicalParam<Option<Array>>,
     #[param]
     /// Optional learned multiplier gathered for each selected group.
-    pub learned_coefficient_scale: PhysicalParam<Option<Array>>,
+    pub(crate) learned_coefficient_scale: PhysicalParam<Option<Array>>,
     /// Optional selector-input RMS epsilon.
-    pub input_rms_epsilon: Option<f32>,
+    pub(crate) input_rms_epsilon: Option<f32>,
     /// Whether normalized selector inputs are divided by the square root of width.
-    pub input_inverse_sqrt_dimensions: bool,
+    pub(crate) input_inverse_sqrt_dimensions: bool,
     /// Affine group size, or zero for a dense selector.
-    pub group_size: i32,
+    pub(crate) group_size: i32,
     /// Affine bit width, or zero for a dense selector.
-    pub bits: i32,
+    pub(crate) bits: i32,
     /// Packed quantization encoding.
-    pub mode: QuantizationMode,
+    pub(crate) mode: QuantizationMode,
     /// Checkpoint-native GGML encoding and byte order.
-    pub iquant: Option<WeightQuantization>,
+    pub(crate) iquant: Option<WeightQuantization>,
 }
 
 /// Selected group ids plus the score and weight arrays produced by a top-k selector.
 pub struct GroupSelectionOutput {
     /// Selected group ids with shape `[tokens, top_k]`.
-    pub indices: Array,
+    pub(crate) indices: Array,
     /// Selector probabilities or scores gathered at the selected ids.
-    pub scores: Array,
+    pub(crate) scores: Array,
     /// Final selection weights after optional normalization/scaling.
-    pub weights: Array,
+    pub(crate) weights: Array,
 }
 
 impl TopKGroupSelector {
@@ -659,7 +717,7 @@ impl TopKGroupSelector {
 }
 
 /// Applies selection weights and reduces group-major selection outputs back to source tokens.
-pub(crate) fn weighted_route_sum(
+pub(crate) fn weighted_group_sum(
     current: Array,
     top_k_weights: &Array,
     plan: &GroupedSelectionPlan,
@@ -937,7 +995,7 @@ impl PackedRelu2Groups {
                 )?,
             }
         };
-        weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
+        weighted_group_sum(current, top_k_weights, &plan, num_tokens, stream)
     }
 
     /// Returns the rank-local ReLU2 contribution for one tensor-parallel sum.
@@ -1362,7 +1420,7 @@ impl PackedGatedProductGroups {
             Some(bias) => output.add(bias.take_axis(&plan.sorted_group_ids, 0, stream)?, stream)?,
             None => output,
         };
-        weighted_route_sum(output, top_k_weights, &plan, num_tokens, stream)
+        weighted_group_sum(output, top_k_weights, &plan, num_tokens, stream)
     }
 
     /// Evaluates selected groups and reduces selection outputs back to source tokens.
@@ -1413,7 +1471,7 @@ impl PackedGatedProductGroups {
         };
         let plan = topk_group_plan(top_k_index, stream)?;
         let selected_bias = bias.take_axis(&plan.sorted_group_ids, 0, stream)?;
-        let bias = weighted_route_sum(
+        let bias = weighted_group_sum(
             selected_bias,
             top_k_weights,
             &plan,
@@ -1439,22 +1497,23 @@ mod tests {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
         let mut selector = TopKGroupSelector::new_with_quantization(
-            TopKGroupSelectorConfig {
-                top_k: 2,
-                group_count: 3,
-                hidden_size: 2,
-                score_function: TopKGroupScoring::SelectedSoftmax,
-                norm_topk_prob: false,
-                normalization_epsilon: 0.0,
-                coefficient_scale: 1.0,
-                n_group: 1,
-                topk_group: 1,
-                projection_bias: false,
-                score_correction_bias: false,
-                input_rms_epsilon: Some(0.0),
-                input_inverse_sqrt_dimensions: true,
-                learned_coefficient_scale: true,
-            },
+            TopKGroupSelectorConfig::new(
+                2,
+                3,
+                2,
+                TopKGroupScoring::SelectedSoftmax,
+                false,
+                0.0,
+                1.0,
+                1,
+                1,
+                false,
+                false,
+                Some(0.0),
+                true,
+                true,
+            )
+            .unwrap(),
             None,
             stream,
         )
@@ -1506,22 +1565,23 @@ mod tests {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
         let mut selector = TopKGroupSelector::new_with_quantization(
-            TopKGroupSelectorConfig {
-                top_k: 2,
-                group_count: 3,
-                hidden_size: 1,
-                score_function: TopKGroupScoring::SelectedSoftmax,
-                norm_topk_prob: false,
-                normalization_epsilon: 0.0,
-                coefficient_scale: 1.0,
-                n_group: 1,
-                topk_group: 1,
-                projection_bias: true,
-                score_correction_bias: true,
-                input_rms_epsilon: None,
-                input_inverse_sqrt_dimensions: false,
-                learned_coefficient_scale: false,
-            },
+            TopKGroupSelectorConfig::new(
+                2,
+                3,
+                1,
+                TopKGroupScoring::SelectedSoftmax,
+                false,
+                0.0,
+                1.0,
+                1,
+                1,
+                true,
+                true,
+                None,
+                false,
+                false,
+            )
+            .unwrap(),
             None,
             stream,
         )

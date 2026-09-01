@@ -1,5 +1,4 @@
 use eredu_backend_mlx::backend::{
-    config::ModelLoadOptions,
     error::Error,
     nn::shared::MlxNeuralBackend,
     runtime::{
@@ -8,13 +7,13 @@ use eredu_backend_mlx::backend::{
         checkpoint::store::CheckpointMaterializationError,
         generation::MlxSamplingBackend,
     },
-    MlxBackend, MlxCompletion, MlxModel, MlxModelConfig,
+    MlxBackend, MlxCompletion, MlxModel,
 };
 use eredu_backend_mlx::native::{
     DeviceAssignment, MlxDrafter, MlxInspectionOptions, MlxModelInput, MlxModelOutput,
-    MlxModelSession, MlxParallelContext, MlxRealtimeModel, MlxSessionCompletion,
+    MlxModelSession, MlxParallelPlan, MlxRealtimeModel, MlxSessionCompletion,
 };
-use eredu_backend_mlx::MlxTensor;
+use eredu_backend_mlx::{MlxLoadRequest, MlxModelConfig, MlxTensor};
 use eredu_core::InspectableBackendSession;
 
 fn assert_public_type<T: ?Sized>() {}
@@ -34,13 +33,13 @@ fn reusable_sampling_primitives_are_rooted_under_backend() {
 }
 
 #[test]
-fn backend_owned_types_are_rooted_under_backend_ownership_modules() {
+fn backend_and_composition_types_are_rooted_under_their_ownership_modules() {
     assert_public_type::<CheckpointQuantizationOptions>();
     assert_public_type::<CheckpointQuantizationReport>();
     assert_public_type::<MlxCompletion>();
     assert_public_type::<MlxModel>();
     assert_public_type::<MlxModelConfig>();
-    assert_public_type::<ModelLoadOptions>();
+    assert_public_type::<MlxLoadRequest>();
 }
 
 #[test]
@@ -51,7 +50,7 @@ fn composition_owned_native_types_have_one_public_native_path() {
     assert_public_type::<MlxModelInput>();
     assert_public_type::<MlxModelOutput>();
     assert_public_type::<MlxModelSession<'static>>();
-    assert_public_type::<MlxParallelContext>();
+    assert_public_type::<MlxParallelPlan>();
     assert_public_type::<MlxSessionCompletion>();
 }
 

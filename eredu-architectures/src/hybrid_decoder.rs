@@ -19,12 +19,12 @@ enum HybridExecutionGroups {
 /// Family modules retain their closed operator policies and block equations. This
 /// assembly owns only the common embedding/finalization and stable layered-group
 /// lifecycle used by those blocks.
-pub struct HybridDecoder<B: NeuralBackend> {
+pub struct HybridDecoder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     static_modules: StaticModules<B>,
     groups: HybridExecutionGroups,
 }
 
-impl<B: NeuralBackend> HybridDecoder<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> HybridDecoder<B> {
     /// Builds pinned modules and one validated heterogeneous target group.
     pub fn new(
         static_spec: StaticModuleSpec,

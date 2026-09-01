@@ -6,7 +6,7 @@ use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
-use eredu_runtime::{ArchitectureBoundary, ExpertCacheLoadOptions, ExpertPass, WeightBinding};
+use eredu_runtime::{ArchitectureBoundary, ExpertPass, ParameterBankLoadOptions, WeightBinding};
 use safemlx::{error::Exception, Array, Stream};
 
 use crate::{
@@ -27,7 +27,6 @@ use crate::{
             execution::layerwise::shard_layer_bindings,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -47,6 +46,7 @@ use crate::{
         PipelineMtpCache, PipelinePartitionMetadata, PipelineRangeState, PipelineStageInput,
         PipelineStageOutput, PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
     composition::mlx::speculative::embedded::EmbeddedMtpOutput,
 };
 
@@ -593,21 +593,21 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
-        let pinned_prefix_tokens = i32::try_from(identity.sink_tokens)
+        let pinned_prefix_tokens = i32::try_from(identity.sink_tokens())
             .map_err(|_| Error::Parallel("V4 attention sink count exceeds i32".into()))?;
         let range = self.range();
-        if (identity.global_layer_start..identity.global_layer_end) != range
-            || identity.layer_layout.len() != range.len()
+        if (identity.global_layer_start()..identity.global_layer_end()) != range
+            || identity.layer_layout().len() != range.len()
         {
             return Err(Error::Parallel(format!(
                 "V4 prompt-cache identity owns layers {}..{} with {} policies, expected stage range {range:?}",
-                identity.global_layer_start,
-                identity.global_layer_end,
-                identity.layer_layout.len()
+                identity.global_layer_start(),
+                identity.global_layer_end(),
+                identity.layer_layout().len()
             )));
         }
         range
-            .zip(identity.layer_layout.iter())
+            .zip(identity.layer_layout().iter())
             .map(|(global_layer, policy)| {
                 let cache = match &paged {
                     Some((manager, rank)) => MlxPoolingAttentionCache::paged_from_policy(
@@ -1142,16 +1142,16 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
     source_args: eredu_architectures::deepseek::V3Args,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV3], "DeepSeek-V3")?;
-    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
+    let external_experts = topology.expert_parallel_size() > 1 || parameter_bank_options.is_some();
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v3_store(
@@ -1204,7 +1204,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
             .transpose()?,
     )?;
     let range = topology.layer_range(target_units)?;
-    let tensor_parallel = topology.tensor_parallel_size > 1;
+    let tensor_parallel = topology.tensor_parallel_size() > 1;
     let parallel_layout = tensor_parallel
         .then(|| architecture_parallel_layout(&parameter_description, topology))
         .transpose()?;
@@ -1240,7 +1240,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&architecture)?;
     let placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -1314,7 +1314,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
                 None => crate::composition::deepseek::v3_unit_bindings(
                     &args,
                     global_layer,
-                    unit,
+                    &*unit,
                     store.as_ref(),
                     external_experts,
                 )?,
@@ -1326,7 +1326,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
                         decoder_group,
                         global_layer,
                     )?,
-                    unit,
+                    &mut *unit,
                     store.as_ref(),
                     &bindings,
                     None,
@@ -1341,7 +1341,7 @@ pub(super) fn load_neutral_deepseek_v3_pipeline(
                         decoder_group,
                         global_layer,
                     )?,
-                    unit,
+                    &mut *unit,
                     store.as_ref(),
                     &bindings,
                     None,
@@ -1572,16 +1572,16 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
     source_args: eredu_architectures::deepseek::V4Args,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::DeepSeekV4], "DeepSeek-V4")?;
-    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
+    let external_experts = topology.expert_parallel_size() > 1 || parameter_bank_options.is_some();
     let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
             let (store, args, report) = crate::composition::deepseek::quantize_v4_store(
@@ -1629,7 +1629,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
         external_experts.then_some(seed_expert_realization.global_expert_count()),
     )?;
     let range = topology.layer_range(target_units)?;
-    let tensor_parallel = topology.tensor_parallel_size > 1;
+    let tensor_parallel = topology.tensor_parallel_size() > 1;
     let parallel_layout = tensor_parallel
         .then(|| architecture_parallel_layout(&parameter_description, topology))
         .transpose()?;
@@ -1661,7 +1661,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
     let placement = Arc::new(prediction_architecture_transport::<
         _,
         eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
-    >(&architecture, topology.pipeline_parallel_size)?);
+    >(&architecture, topology.pipeline_parallel_size())?);
     let mut info = base_info(
         topology,
         wire_contract,
@@ -1738,7 +1738,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
                 None => crate::composition::deepseek::v4_unit_bindings(
                     &args,
                     global_layer,
-                    unit,
+                    &*unit,
                     store.as_ref(),
                     external_experts,
                 )?,
@@ -1749,7 +1749,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
                         _,
                         eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                     >(&architecture, decoder_group, global_layer)?,
-                    unit,
+                    &mut *unit,
                     store.as_ref(),
                     &bindings,
                     None,
@@ -1763,7 +1763,7 @@ pub(super) fn load_neutral_deepseek_v4_pipeline(
                         _,
                         eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                     >(&architecture, decoder_group, global_layer)?,
-                    unit,
+                    &mut *unit,
                     store.as_ref(),
                     &bindings,
                     None,

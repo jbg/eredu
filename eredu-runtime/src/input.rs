@@ -9,6 +9,7 @@ use eredu_core::{
 
 /// Primary tensor and its semantic role for one prepared input part.
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PreparedInputPayload<Tensor> {
     /// Tokenizer vocabulary IDs.
     TokenIds(Tensor),
@@ -221,6 +222,12 @@ impl<Tensor> PreparedModelInput<Tensor> {
                 InputPayloadKind::TokenIds => PreparedInputPayload::TokenIds(payload),
                 InputPayloadKind::Tensor => PreparedInputPayload::Tensor(payload),
                 InputPayloadKind::Embeddings => PreparedInputPayload::Embeddings(payload),
+                payload_kind => {
+                    return Err(PreparedInputError::IncompatiblePayload {
+                        modality: descriptor.modality(),
+                        payload: payload_kind,
+                    });
+                }
             };
             let metadata = descriptor
                 .metadata()

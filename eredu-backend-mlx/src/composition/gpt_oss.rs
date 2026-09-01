@@ -327,7 +327,7 @@ fn load_neutral_parallel_with_store(
     store: Arc<dyn CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
     external_experts: bool,
@@ -462,7 +462,8 @@ fn load_neutral_parallel_with_store(
         maximum_device_parameter_bytes,
     );
     let parallel_rank =
-        crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
+            .cache_rank_identity();
     let execution = if options.is_fully_resident() {
         GptOssExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -487,7 +488,8 @@ fn load_neutral_parallel_with_store(
         parallel_info: Some(parallel_info),
         parallel_rank,
         planned_external_experts,
-        prompt_cache_topology: crate::backend::cache::prompt_cache_topology(build.topology()),
+        prompt_cache_topology:
+            crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology()),
         execution,
         parameter_bank: None,
     })
@@ -750,7 +752,8 @@ impl GptOssPipelineBindings {
 pub struct GptOssModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     planned_external_experts: Option<Vec<ParameterBankEntry>>,
     prompt_cache_topology: PromptCacheTopology,
@@ -764,7 +767,10 @@ impl GptOssModel {
         &self.args
     }
 
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -875,7 +881,7 @@ impl GptOssModel {
         )
         .map_err(|error| Exception::custom(error.to_string()))?;
         let state =
-            self.new_paged_cache_from_manager(manager, identity.topology.cache_rank_identity())?;
+            self.new_paged_cache_from_manager(manager, identity.topology().cache_rank_identity())?;
         let _ = stream;
         Ok((state, manifest))
     }
@@ -1393,7 +1399,7 @@ impl CausalModel<Cache> for GptOssModel {
 
 fn attach_parameter_bank(
     model: &mut GptOssModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
@@ -1417,7 +1423,7 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
-    let expert_options = weight_residency.expert_cache();
+    let expert_options = weight_residency.parameter_bank_cache();
     let execution_options = weight_residency.layers();
     let eredu_architectures::configuration::SafetensorsModelConfig::GptOss(args) = artifact.model()
     else {
@@ -1459,7 +1465,7 @@ pub fn load_safetensors(
 pub fn load_gpt_oss_tensor_parallel_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
@@ -1518,7 +1524,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
         source.plan().tensor_mapping(),
         residency.max_cached_shards(),
     )?);
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let execution_options = residency.layers();
     let (store, args) = match quantization {
         Some(quantization) => {
@@ -1546,7 +1552,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
 pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {

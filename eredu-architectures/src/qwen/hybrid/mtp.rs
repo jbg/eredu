@@ -57,7 +57,7 @@ pub enum ForwardMode {
 /// One configured prediction depth using the checkpoint-shared fusion policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct PredictionUnit<B: GroupedNeuralBackend> {
+pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Learned-offset normalization of the target hidden state.
     pub hidden_norm: B::Normalization,
     /// Learned-offset normalization of the next-token embedding.
@@ -70,7 +70,7 @@ pub struct PredictionUnit<B: GroupedNeuralBackend> {
     pub final_norm: B::Normalization,
 }
 
-impl<B: GroupedNeuralBackend> PredictionUnit<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUnit<B> {
     /// Builds one actual configured prediction depth.
     pub fn new(
         config: &HybridConfig,

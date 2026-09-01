@@ -37,8 +37,8 @@ use crate::backend::{
         },
         generation::MlxSamplingBackend,
     },
-    ModelLoadOptions,
 };
+use crate::MlxLoadRequest;
 
 type Architecture = LayeredModel<MlxNeuralBackend>;
 type MoshiUnit = Unit<MlxNeuralBackend>;
@@ -94,7 +94,7 @@ pub struct MoshiModel {
     artifact_identity: LoadedArtifactIdentity,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    topology: Option<crate::backend::MlxParallelContext>,
+    topology: Option<crate::composition::mlx::distributed::topology::MlxParallelPlan>,
     execution: Execution,
 }
 
@@ -125,7 +125,9 @@ impl MoshiModel {
     }
 
     /// Rank-local topology when this instance owns tensor-parallel parameters.
-    pub fn topology(&self) -> Option<crate::backend::MlxParallelContext> {
+    pub fn topology(
+        &self,
+    ) -> Option<crate::composition::mlx::distributed::topology::MlxParallelPlan> {
         self.topology
     }
 
@@ -274,12 +276,16 @@ impl MoshiModel {
 /// Loads either admitted Moshi-family SafeTensors layout into the neutral model.
 pub fn load(
     preparation: RealtimePreparationPlan,
-    options: ModelLoadOptions,
+    options: MlxLoadRequest,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiModel, Error> {
-    let (model_dir, source_path, source_config, checkpoint_plan, source_recipes) =
-        preparation.into_parts();
+    let mut preparation = preparation.into_artifact();
+    let model_dir = preparation.take_artifact_root();
+    let source_path = preparation.take_checkpoint_source();
+    let source_config = preparation.take_config();
+    let checkpoint_plan = preparation.take_checkpoint_plan();
+    let source_recipes = preparation.take_recipes();
     let artifact_identity = artifact_identity(&model_dir, &source_path, &source_config)?;
     let source_store = open_safetensors_weight_store(
         &source_path,
@@ -434,20 +440,20 @@ fn load_parallel(
     artifact_identity: LoadedArtifactIdentity,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     residency: eredu_runtime::LayerWeightResidency,
-    topology: crate::backend::MlxParallelContext,
+    topology: crate::composition::mlx::distributed::topology::MlxParallelPlan,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiModel, Error> {
-    if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
+    if topology.pipeline_parallel_size() != 1 || topology.expert_parallel_size() != 1 {
         return Err(Error::Parallel(format!(
             "neutral Moshi supports tensor parallelism only, got TP/PP/EP={}/{}/{}",
-            topology.tensor_parallel_size,
-            topology.pipeline_parallel_size,
-            topology.expert_parallel_size
+            topology.tensor_parallel_size(),
+            topology.pipeline_parallel_size(),
+            topology.expert_parallel_size()
         )));
     }
     topology.validate_execution_stream(stream)?;
-    let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::composition::mlx::distributed::topology::ParallelBuildContext::new(
         topology,
         ShardingPolicy::Require,
     );
@@ -525,8 +531,8 @@ fn load_parallel(
         execution_architecture: format!(
             "{};tp-rank={}/{}",
             target_config.architecture_fingerprint(),
-            topology.tensor_parallel_rank,
-            topology.tensor_parallel_size
+            topology.tensor_parallel_rank(),
+            topology.tensor_parallel_size()
         ),
     };
     Ok(MoshiModel {
@@ -710,7 +716,7 @@ mod tests {
         let preparation = eredu_architectures::moshi::prepare_realtime_model(&fixture).unwrap();
         let model = load(
             preparation,
-            ModelLoadOptions::default(),
+            MlxLoadRequest::default(),
             &stream,
             &weights_stream,
         )

@@ -19,12 +19,42 @@ pub enum CacheRepresentation {
 /// Optional rank identity included in a stable cache block identifier.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CacheRankIdentity {
-    /// Pipeline rank, when pipeline partitioning is active.
-    pub pipeline_rank: Option<usize>,
-    /// Tensor-parallel rank, when cache heads are sharded.
-    pub tensor_parallel_rank: Option<usize>,
-    /// Expert-parallel rank for replicated attention state.
-    pub expert_parallel_rank: Option<usize>,
+    /// Ordered-stage rank, when stage partitioning is active.
+    stage_rank: Option<usize>,
+    /// State-shard rank, when cache state is partitioned.
+    shard_rank: Option<usize>,
+    /// Addressable-group rank for replicated cache state.
+    addressable_rank: Option<usize>,
+}
+
+impl CacheRankIdentity {
+    /// Creates a generic rank identity for persisted cache state.
+    pub const fn new(
+        stage_rank: Option<usize>,
+        shard_rank: Option<usize>,
+        addressable_rank: Option<usize>,
+    ) -> Self {
+        Self {
+            stage_rank,
+            shard_rank,
+            addressable_rank,
+        }
+    }
+
+    /// Returns the ordered-stage rank, when present.
+    pub const fn stage_rank(&self) -> Option<usize> {
+        self.stage_rank
+    }
+
+    /// Returns the state-shard rank, when present.
+    pub const fn shard_rank(&self) -> Option<usize> {
+        self.shard_rank
+    }
+
+    /// Returns the addressable-group rank, when present.
+    pub const fn addressable_rank(&self) -> Option<usize> {
+        self.addressable_rank
+    }
 }
 
 /// Stable identity for one immutable sealed cache block.
@@ -306,15 +336,42 @@ impl StateComponentRole {
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct StateComponentPolicy {
     /// Stable semantic role.
-    pub role: StateComponentRole,
+    role: StateComponentRole,
     /// Symbolic shape resolved from batch and prefix geometry.
-    pub shape: Vec<StateTensorDimension>,
+    shape: Vec<StateTensorDimension>,
     /// Accepted persisted dtype family.
-    pub dtype: StateTensorDtype,
+    dtype: StateTensorDtype,
     /// Runtime residency behavior.
-    pub residency: StateResidencyClass,
+    residency: StateResidencyClass,
     /// Condition under which persisted state materializes this component.
-    pub presence: StateTensorPresence,
+    presence: StateTensorPresence,
+}
+
+impl StateComponentPolicy {
+    /// Returns the stable semantic component role.
+    pub const fn role(&self) -> StateComponentRole {
+        self.role
+    }
+
+    /// Returns the symbolic component shape.
+    pub fn shape(&self) -> &[StateTensorDimension] {
+        &self.shape
+    }
+
+    /// Returns the accepted persisted dtype family.
+    pub const fn dtype(&self) -> StateTensorDtype {
+        self.dtype
+    }
+
+    /// Returns the runtime residency class.
+    pub const fn residency(&self) -> StateResidencyClass {
+        self.residency
+    }
+
+    /// Returns the conditional persistence rule.
+    pub const fn presence(&self) -> StateTensorPresence {
+        self.presence
+    }
 }
 
 impl LayerCachePolicy {

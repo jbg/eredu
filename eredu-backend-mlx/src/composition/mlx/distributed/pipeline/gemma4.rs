@@ -6,8 +6,8 @@ use crate::backend::runtime::distributed::Group;
 use eredu_architectures::ModelKind;
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
-    LayeredArchitecture,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, LayeredArchitecture,
+    ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -30,7 +30,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -52,6 +51,7 @@ use crate::{
         PipelinePartitionMetadata, PipelinePayload, PipelineStageInput, PipelineStageOutput,
         PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
 };
 
 impl Gemma4PipelinePartition {
@@ -875,16 +875,16 @@ pub(super) fn load_neutral_gemma4_pipeline(
     source_args: eredu_architectures::gemma4::FamilyConfig,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::Gemma4], "Gemma 4")?;
-    let external_experts = topology.expert_parallel_size > 1 || parameter_bank_options.is_some();
+    let external_experts = topology.expert_parallel_size() > 1 || parameter_bank_options.is_some();
     let binding_adapter = Gemma4Bindings::new(external_experts);
     let quantize_on_load = requested_quantization
         .map(|requested| {
@@ -946,7 +946,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
     )?;
     let ranges = target_args
         .text
-        .pipeline_layer_ranges(topology.pipeline_parallel_size)
+        .pipeline_layer_ranges(topology.pipeline_parallel_size())
         .map_err(|error| Error::Parallel(error.to_string()))?;
     if ranges.iter().map(Range::len).sum::<usize>() != target_units {
         return Err(Error::Parallel(
@@ -954,7 +954,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
         ));
     }
     let range = ranges
-        .get(topology.pipeline_parallel_rank)
+        .get(topology.pipeline_parallel_rank())
         .cloned()
         .ok_or_else(|| Error::Parallel("Gemma 4 pipeline rank has no layer range".into()))?;
     let decoder_group_id = architecture_group_id::<_, MlxHybridState>(
@@ -964,7 +964,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
     let neutral_placement = Arc::new(
         media_architecture_transport::<_, MlxHybridState>(
             &architecture,
-            topology.pipeline_parallel_size,
+            topology.pipeline_parallel_size(),
         )?
         .with_group_unit_ranges(&decoder_group_id, ranges.clone())?,
     );
@@ -982,7 +982,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
     let partition = neutral_placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
-            topology.pipeline_parallel_rank,
+            topology.pipeline_parallel_rank(),
             Arc::clone(&geometry),
             &parameter_description,
         )?;
@@ -1006,7 +1006,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
         stage.expert_assignment = Some(assignment);
         stage.expert_storage = PipelineExpertStorage::ExternalEmpty;
     }
-    let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
+    let parallel_layout = (topology.tensor_parallel_size() > 1).then_some(planned_layout.clone());
     let vision_group = architecture_group_by_id::<_, MlxHybridState>(
         &stage.architecture,
         eredu_architectures::gemma4::VISION_EXECUTION_GROUP,
@@ -1253,7 +1253,7 @@ pub(super) fn load_neutral_gemma4_pipeline(
         let units = crate::composition::select_architecture_expert_units(
             catalog,
             |group, unit| stage.partition.owns_unit(group.as_str(), unit),
-            |identity| assignment.owner(identity.global_expert) == Some(assignment.rank()),
+            |identity| assignment.owner(identity.member()) == Some(assignment.rank()),
         );
         let entries = crate::composition::architecture_expert_units(units, store.as_ref(), None)?;
         let cache = build_pipeline_parameter_bank(

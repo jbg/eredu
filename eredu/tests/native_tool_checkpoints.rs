@@ -208,12 +208,11 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
 
 fn qwen_residency_smoke(environment: &str) {
     smoke_with_plan(environment, "qwen.", accelerator_plan());
-    let mut layerwise = accelerator_plan();
-    layerwise.residency = ResidencyPlan::LayerwiseHost {
+    let layerwise = accelerator_plan().with_residency(ResidencyPlan::LayerwiseHost {
         device_layer_window: 1,
         device_budget_bytes: None,
         host_budget_bytes: None,
-    };
+    });
     smoke_with_plan(environment, "qwen.", layerwise);
 }
 

@@ -4093,11 +4093,7 @@ mod tests {
         let stream = context.stream();
         let options = paged_options(true);
         let manager = CacheResidencyManager::new(options.clone()).unwrap();
-        let rank = CacheRankIdentity {
-            pipeline_rank: Some(1),
-            tensor_parallel_rank: None,
-            expert_parallel_rank: None,
-        };
+        let rank = CacheRankIdentity::new(Some(1), None, None);
         let mut cache =
             PagedKeyValueCache::new_with_layout(manager.clone(), 0, None, 0, Some(rank)).unwrap();
         let states = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0], &[1, 1, 5, 1]);
@@ -4107,31 +4103,29 @@ mod tests {
         cache.finalize().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
-        let descriptor = PromptCacheDescriptor {
-            model_family: "decoder".into(),
-            effective_model_type: "decoder".into(),
-            checkpoint_fingerprint: "sha256:test-checkpoint".into(),
-            prefix_content_fingerprint: "tokens:11,12,13,14,15".into(),
-            architecture_fingerprint: "sha256:test-architecture".into(),
-            layer_count: 1,
-            global_layer_start: 0,
-            global_layer_end: 1,
-            batch_size: 1,
-            layer_prefix_offsets: vec![0],
-            state_segments: vec![
-                eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap(),
-            ],
-            layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
-            sink_tokens: 0,
-            topology: PromptCacheTopology {
-                pipeline: Some((2, 1)),
-                ..PromptCacheTopology::default()
-            },
-        };
+        let descriptor = PromptCacheDescriptor::new(
+            "decoder",
+            "decoder",
+            "sha256:test-checkpoint",
+            "tokens:11,12,13,14,15",
+            "sha256:test-architecture",
+            1,
+            0,
+            1,
+            1,
+            PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
+            vec![0],
+            vec![eredu_core::cache::PromptCacheStateSegment::new("state", 0..1).unwrap()],
+            0,
+            PromptCacheTopology::new(Some((2, 1)), None, None, true).unwrap(),
+        )
+        .unwrap();
         let tokens = [11u32, 12, 13, 14, 15];
         let invalid_destination = directory.path().join("invalid-prompt-cache");
-        let mut invalid_descriptor = descriptor.clone();
-        invalid_descriptor.topology.pipeline = Some((2, 0));
+        let invalid_descriptor = descriptor
+            .clone()
+            .with_topology(PromptCacheTopology::new(Some((2, 0)), None, None, true).unwrap())
+            .unwrap();
         assert!(manager
             .save_prompt_cache(
                 &invalid_destination,
@@ -4164,21 +4158,24 @@ mod tests {
             .join("manifest.json")
             .is_file());
 
-        let mut incompatible = descriptor.clone();
-        incompatible.topology.pipeline = Some((2, 0));
-        let identity = PromptCacheModelIdentity {
-            model_family: descriptor.model_family.clone(),
-            effective_model_type: descriptor.effective_model_type.clone(),
-            architecture_fingerprint: descriptor.architecture_fingerprint.clone(),
-            layer_count: 1,
-            global_layer_start: 0,
-            global_layer_end: 1,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0],
-            state_segments: descriptor.state_segments.clone(),
-            topology: descriptor.topology.clone(),
-            layer_layout: descriptor.layer_layout.clone(),
-        };
+        let incompatible = descriptor
+            .clone()
+            .with_topology(PromptCacheTopology::new(Some((2, 0)), None, None, true).unwrap())
+            .unwrap();
+        let identity = PromptCacheModelIdentity::new(
+            descriptor.model_family(),
+            descriptor.effective_model_type(),
+            descriptor.architecture_fingerprint(),
+            1,
+            0,
+            1,
+            0,
+            descriptor.topology().clone(),
+            descriptor.layer_layout().clone(),
+            vec![0],
+            descriptor.state_segments().to_vec(),
+        )
+        .unwrap();
         assert!(open_prompt_cache(
             &destination,
             &incompatible,
@@ -4255,26 +4252,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(retained_before, vec![vec![(0, 2), (2, 4), (4, 6)]; 4]);
         let layer_layout = PromptCacheModelIdentity::key_value_layouts(windows, 1, 1).unwrap();
-        let descriptor = PromptCacheDescriptor {
-            model_family: "schedule-fixture".into(),
-            effective_model_type: "schedule-fixture".into(),
-            checkpoint_fingerprint: "checkpoint".into(),
-            prefix_content_fingerprint: "tokens:0..6".into(),
-            architecture_fingerprint: "architecture".into(),
-            layer_count: windows.len(),
-            global_layer_start: 0,
-            global_layer_end: windows.len(),
-            batch_size: 1,
-            layer_prefix_offsets: vec![0; windows.len()],
-            state_segments: vec![eredu_core::cache::PromptCacheStateSegment::new(
-                "state",
-                0..windows.len(),
-            )
-            .unwrap()],
-            layer_layout: layer_layout.clone(),
-            sink_tokens: 0,
-            topology: PromptCacheTopology::default(),
-        };
+        let descriptor = PromptCacheDescriptor::new(
+            "schedule-fixture",
+            "schedule-fixture",
+            "checkpoint",
+            "tokens:0..6",
+            "architecture",
+            windows.len(),
+            0,
+            windows.len(),
+            1,
+            layer_layout.clone(),
+            vec![0; windows.len()],
+            vec![
+                eredu_core::cache::PromptCacheStateSegment::new("state", 0..windows.len()).unwrap(),
+            ],
+            0,
+            PromptCacheTopology::default(),
+        )
+        .unwrap();
         let tokens = [10, 11, 12, 13, 14, 15];
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("distinct-windows");
@@ -4316,22 +4312,23 @@ mod tests {
         drop(caches);
         drop(manager);
 
-        let identity = PromptCacheModelIdentity {
-            model_family: descriptor.model_family.clone(),
-            effective_model_type: descriptor.effective_model_type.clone(),
-            architecture_fingerprint: descriptor.architecture_fingerprint.clone(),
-            layer_count: windows.len(),
-            global_layer_start: 0,
-            global_layer_end: windows.len(),
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; windows.len()],
-            state_segments: descriptor.state_segments.clone(),
-            topology: PromptCacheTopology::default(),
+        let identity = PromptCacheModelIdentity::new(
+            descriptor.model_family(),
+            descriptor.effective_model_type(),
+            descriptor.architecture_fingerprint(),
+            windows.len(),
+            0,
+            windows.len(),
+            0,
+            PromptCacheTopology::default(),
             layer_layout,
-        };
+            vec![0; windows.len()],
+            descriptor.state_segments().to_vec(),
+        )
+        .unwrap();
         let (manager, manifest) =
             open_prompt_cache(&destination, &descriptor, &identity, &tokens, options).unwrap();
-        assert_eq!(manifest.layer_layout, descriptor.layer_layout);
+        assert_eq!(&manifest.layer_layout, descriptor.layer_layout());
 
         for (layer, window) in windows.into_iter().enumerate() {
             let retained_after = manager

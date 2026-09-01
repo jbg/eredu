@@ -189,7 +189,8 @@ pub struct MuseGlimmerModel {
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
 }
 
 /// Fully resident DFlash assistant built from neutral equations.
@@ -241,7 +242,7 @@ impl MuseGlimmerDFlashModel {
 pub fn load_dflash_safetensors(
     store: SharedCheckpointSource,
     source_config: eredu_architectures::muse_glimmer::DFlashConfig,
-    options: crate::backend::ModelLoadOptions,
+    options: crate::MlxLoadRequest,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerDFlashModel, Error> {
@@ -298,7 +299,7 @@ pub fn load_dflash_gguf(
     resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     source_config: eredu_architectures::muse_glimmer::DFlashConfig,
-    options: crate::backend::ModelLoadOptions,
+    options: crate::MlxLoadRequest,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerDFlashModel, Error> {
@@ -597,7 +598,10 @@ impl MuseGlimmerModel {
         &self.args
     }
 
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -614,8 +618,10 @@ impl MuseGlimmerModel {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
                 let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::backend::cache::prompt_cache_topology(info.topology())
-                        .cache_rank_identity()
+                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                        info.topology(),
+                    )
+                    .cache_rank_identity()
                 });
                 MlxKeyValueState::paged(
                     self.state_layout.clone(),
@@ -631,12 +637,14 @@ impl MuseGlimmerModel {
     pub(crate) fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        let topology = self
-            .parallel_info
-            .as_ref()
-            .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
-                crate::backend::cache::prompt_cache_topology(info.topology())
-            });
+        let topology = self.parallel_info.as_ref().map_or_else(
+            eredu_core::cache::PromptCacheTopology::default,
+            |info| {
+                crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                    info.topology(),
+                )
+            },
+        );
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
             topology,
@@ -652,7 +660,7 @@ impl MuseGlimmerModel {
         _stream: &Stream,
     ) -> Result<(MlxKeyValueState, eredu_core::cache::PromptCacheManifest), Error> {
         let identity = self.prompt_cache_model_identity()?;
-        let rank = identity.topology.cache_rank_identity();
+        let rank = identity.topology().cache_rank_identity();
         let (manager, manifest) = open_prompt_cache(
             directory.as_ref(),
             expected,
@@ -1683,7 +1691,7 @@ fn load_parallel_store(
     store: SharedCheckpointSource,
     args: DecoderConfig,
     residency: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
@@ -1854,7 +1862,7 @@ fn load_parallel_store(
 pub fn load_safetensors_tensor_parallel(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     residency: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
@@ -1874,7 +1882,7 @@ pub fn load_gguf_tensor_parallel(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     residency: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
@@ -1884,7 +1892,7 @@ pub fn load_gguf_tensor_parallel(
 
 fn attach_parameter_bank(
     model: &mut MuseGlimmerModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
@@ -1909,7 +1917,7 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let eredu_architectures::configuration::SafetensorsModelConfig::MuseGlimmer(args) =
         artifact.model()
     else {
@@ -1956,7 +1964,7 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let (store, args) = open_gguf_store(source, projector, residency.max_cached_shards())?;
     let mut model = load_store(
         store,

@@ -13,7 +13,7 @@ use super::ModelArgs;
 /// One unloaded Mamba2 mixer with architecture-authored parameter identity.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Mamba2<B: NeuralBackend> {
+pub struct Mamba2<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Joint gate, convolution-input, and timestep projection.
     pub in_proj: B::Linear,
     /// Shared neutral causal depthwise convolution.
@@ -48,7 +48,7 @@ pub struct Mamba2<B: NeuralBackend> {
     epsilon: f32,
 }
 
-impl<B: NeuralBackend> Mamba2<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Mamba2<B> {
     /// Builds one global-geometry mixer.
     pub fn new(
         args: &ModelArgs,

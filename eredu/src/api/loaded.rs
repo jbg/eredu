@@ -64,6 +64,9 @@ pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     /// Portable tokenizer, chat-template, or generation sidecar loading failed.
     #[error(transparent)]
     Metadata(#[from] TextMetadataError),
+    /// The execution plan contains a drafting mode unknown to this facade version.
+    #[error("execution plan selects an unsupported speculative drafting mode")]
+    UnsupportedDraftingPlan,
 }
 
 /// Failure while planning, realizing, or loading a model through a backend factory.
@@ -262,23 +265,24 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         )?;
         let output = B::with_speculative_execution(
             &mut self.runtime,
-            SpeculativeGenerationBatchRequest {
+            SpeculativeGenerationBatchRequest::new(
                 drafting,
-                lanes: vec![SpeculativeGenerationLane {
+                vec![SpeculativeGenerationLane::new(
                     prompt,
                     generation,
                     config,
                     constraint,
                     semantic,
                     cancellation,
-                    on_event: Box::new(on_event),
-                }],
-                tokenizer_fingerprint: self.tokenizer_fingerprint,
-            },
+                    Box::new(on_event),
+                )],
+                self.tokenizer_fingerprint,
+            ),
             eredu_runtime::RunSpeculativeGeneration::new(options.scheduler),
         )
         .map_err(PreparedChatSpeculativeError::Backend)?;
-        let request: Result<[SpeculativeGenerationOutput; 1], _> = output.requests.try_into();
+        let request: Result<[SpeculativeGenerationOutput; 1], _> =
+            output.into_requests().try_into();
         match request {
             Ok([request]) => Ok(request),
             Err(requests) => Err(PreparedChatSpeculativeError::OutputCardinality {
@@ -314,23 +318,23 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                     lane.max_draft_tokens,
                     lane.caller_stop_sequences,
                 )?;
-            prepared_lanes.push(SpeculativeGenerationLane {
+            prepared_lanes.push(SpeculativeGenerationLane::new(
                 prompt,
                 generation,
                 config,
                 constraint,
                 semantic,
-                cancellation: lane.cancellation,
-                on_event: lane.on_event,
-            });
+                lane.cancellation,
+                lane.on_event,
+            ));
         }
         B::with_speculative_execution(
             &mut self.runtime,
-            SpeculativeGenerationBatchRequest {
+            SpeculativeGenerationBatchRequest::new(
                 drafting,
-                lanes: prepared_lanes,
-                tokenizer_fingerprint: self.tokenizer_fingerprint,
-            },
+                prepared_lanes,
+                self.tokenizer_fingerprint,
+            ),
             eredu_runtime::RunSpeculativeGeneration::new(scheduler),
         )
         .map_err(PreparedChatSpeculativeError::Backend)
@@ -482,7 +486,7 @@ where
             loaded_text_artifact(&inspection).map_err(LoadedModelLoadError::Metadata)?;
         let target_tokenizer_fingerprint =
             eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
-        let external_artifact = match &plan.drafting {
+        let external_artifact = match plan.drafting() {
             DraftingPlan::External { model, .. } => {
                 let preparation = eredu_architectures::prepare_external_assistant(model)
                     .map_err(LoadedModelLoadError::Artifact)?;
@@ -502,6 +506,7 @@ where
                 })
             }
             DraftingPlan::Disabled | DraftingPlan::Embedded { .. } => None,
+            _ => return Err(LoadedModelLoadError::UnsupportedDraftingPlan.into()),
         };
         let realization = eredu_core::realize_execution_plan_target(factory, plan)?;
         let (backend, options) = realization.into_parts();
@@ -576,6 +581,13 @@ where
             Err(eredu_core::ModelLoadError::SessionCapability(error)) => {
                 return Err(LoadedModelLoadError::SessionCapability(error));
             }
+            Err(error) => {
+                return Err(LoadedModelLoadError::Artifact(
+                    eredu_core::artifact::ArtifactError::InvalidArtifact(format!(
+                        "unsupported model-loading failure: {error}"
+                    )),
+                ));
+            }
         };
         let runtime = eredu_core::ModelRuntime::from_prepared(backend, prepared)
             .map_err(LoadedModelLoadError::Backend)?;
@@ -639,6 +651,11 @@ fn loaded_text_artifact(
     let sidecar_dir = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => path,
         eredu_core::ArtifactFormat::Gguf => gguf_sidecar_dir(path),
+        _ => {
+            return Err(TextMetadataError::UnsupportedArchitecture(
+                "unsupported artifact format for text metadata".into(),
+            ));
+        }
     };
     let checkpoint_generation_config = read_checkpoint_generation_config(sidecar_dir)?;
     let sidecar_eos_token_ids = eos_token_ids_from_sidecar_dir(sidecar_dir)?;
@@ -650,7 +667,7 @@ fn loaded_text_artifact(
                 ChatTokenizer::from_tokenizer(tokenizer),
                 load_chat_template(path, Some(kind))?,
                 sidecar_eos_token_ids,
-                configuration.effective_model_type.clone(),
+                configuration.effective_model_type().to_owned(),
             )
         }
         eredu_core::ArtifactFormat::Gguf => {
@@ -685,6 +702,11 @@ fn loaded_text_artifact(
                 path.display().to_string(),
             )
         }
+        _ => {
+            return Err(TextMetadataError::UnsupportedArchitecture(
+                "unsupported artifact format for tokenizer loading".into(),
+            ));
+        }
     };
     if inspection.format() == eredu_core::ArtifactFormat::SafeTensors {
         tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(path)?);
@@ -694,7 +716,7 @@ fn loaded_text_artifact(
         tokenizer,
         LoadedTextModelConfig {
             model_family: kind,
-            effective_model_type: configuration.effective_model_type.clone(),
+            effective_model_type: configuration.effective_model_type().to_owned(),
             model_id,
             chat_template,
             eos_token_ids,

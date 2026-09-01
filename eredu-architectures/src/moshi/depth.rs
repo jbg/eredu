@@ -11,7 +11,7 @@ use super::{block, MoshiConfig, MoshiTransformerConfig};
 /// One ordered codebook slice with its own projections and shared decoder blocks.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DepthSlice<B: NeuralBackend> {
+pub struct DepthSlice<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Previous-decision embedding.
     pub embedding: B::Embedding,
     /// Temporal-to-depth projection.
@@ -24,7 +24,7 @@ pub struct DepthSlice<B: NeuralBackend> {
     index: usize,
 }
 
-impl<B: NeuralBackend> DepthSlice<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
     /// Builds one canonical depth slice.
     pub fn new(
         config: &MoshiConfig,

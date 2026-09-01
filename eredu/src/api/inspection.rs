@@ -67,6 +67,12 @@ pub fn inspect_text_model(
                 );
             }
         },
+        _ => {
+            report.tokenizer = InspectionReadiness::Unverified;
+            report.chat_template = InspectionReadiness::Unverified;
+            report.semantic_streaming = InspectionReadiness::Unverified;
+            report.native_tools = InspectionReadiness::Unverified;
+        }
     }
     finalize_text_readiness(&mut report);
     report

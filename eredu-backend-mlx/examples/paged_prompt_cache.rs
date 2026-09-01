@@ -3,16 +3,18 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use eredu_backend_mlx::backend::{
-    config::ModelLoadOptions,
-    runtime::media::input::{token_ids_part, ModelInput},
-    MlxBackend,
-};
 use eredu_backend_mlx::native::{ExecutionContext, MlxModelInput, MlxModelSession};
 use eredu_backend_mlx::MlxTensor;
+use eredu_backend_mlx::{
+    backend::{
+        runtime::media::input::{token_ids_part, ModelInput},
+        MlxBackend,
+    },
+    MlxLoadRequest,
+};
 use eredu_core::{
     cache::{PromptCacheDescriptor, PromptCacheOptions},
-    load_model, AttentionPolicy, BackendProvider as _, BackendSession as _,
+    load_model, BackendProvider as _, BackendSession as _,
 };
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_text::tokenizer::Tokenizer;
@@ -94,7 +96,29 @@ fn main() -> anyhow::Result<()> {
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let backend = eredu_backend_mlx::native::backend(stream, weights.stream());
-    let model = load_model(&backend, &args.model_dir, ModelLoadOptions::default())?;
+    let selected_paged = if args.device_cache {
+        None
+    } else {
+        let mut paged = PagedCacheOptions::new(
+            args.block_tokens,
+            args.device_cache_bytes,
+            args.host_cache_bytes,
+            args.recent_device_blocks,
+        )?
+        .with_full_attention(true)
+        .with_persistence_retention(true)
+        .with_process_sampling(true);
+        if let Some(directory) = &args.live_disk_dir {
+            paged = paged.with_live_disk(directory, args.live_disk_bytes, 2)?;
+        }
+        Some(paged)
+    };
+    let request = selected_paged
+        .clone()
+        .map_or_else(MlxLoadRequest::default, |paged| {
+            MlxLoadRequest::default().with_state_residency(CacheResidencyPolicy::Paged(paged))
+        });
+    let model = load_model(&backend, &args.model_dir, request)?;
     let mut session = backend.create_session(model)?;
     let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -122,24 +146,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     let prompt_cache_identity = session.prompt_cache_model_identity()?;
-    let has_full_attention = prompt_cache_identity
-        .layer_layout
-        .iter()
-        .any(|policy| matches!(policy.attention(), Some(AttentionPolicy::Full)));
-    let mut paged = PagedCacheOptions::new(
-        args.block_tokens,
-        args.device_cache_bytes,
-        args.host_cache_bytes,
-        args.recent_device_blocks,
-    )?
-    .with_full_attention(has_full_attention)
-    .with_persistence_retention(true)
-    .with_process_sampling(true);
-    if let Some(directory) = &args.live_disk_dir {
-        paged = paged.with_live_disk(directory, args.live_disk_bytes, 2)?;
-    }
-
-    session.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
     let _ = prefill_tokens(&prefix, &backend, &mut session)?;
     let uninterrupted_logits = decode_tokens(&suffix, &backend, &mut session)?;
     async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
@@ -148,7 +154,7 @@ fn main() -> anyhow::Result<()> {
         session.cache_residency_report()?
     );
 
-    session.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    session.reset()?;
     let _ = prefill_tokens(&prefix, &backend, &mut session)?;
     let descriptor = PromptCacheDescriptor::from_model_identity(
         prompt_cache_identity,
@@ -161,16 +167,13 @@ fn main() -> anyhow::Result<()> {
         &args.cache_dir,
         descriptor.clone(),
         &prefix_ids,
-        &PromptCacheOptions {
-            application_namespace: Some("paged-prompt-cache-example".into()),
-            replace_existing: args.replace,
-        },
+        &PromptCacheOptions::new(Some("paged-prompt-cache-example".into()), args.replace)?,
     )?;
     println!("saved blocks: {}", manifest.blocks.len());
     println!("save report: {:#?}", session.cache_residency_report()?);
 
     let inspected =
-        session.load_prompt_cache(&backend, &args.cache_dir, &descriptor, &prefix_ids, paged)?;
+        session.load_prompt_cache(&backend, &args.cache_dir, &descriptor, &prefix_ids)?;
     println!("cataloged blocks: {}", inspected.blocks.len());
     println!("load report: {:#?}", session.cache_residency_report()?);
     let restored_logits = decode_tokens(&suffix, &backend, &mut session)?;

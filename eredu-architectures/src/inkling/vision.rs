@@ -10,7 +10,7 @@ use super::VisionConfig;
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 /// One folded projection stage in the fixed hMLP image tower.
-pub struct VisionLayer<B: NeuralBackend> {
+pub struct VisionLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     projection: B::Linear,
     norm: Option<B::Normalization>,
     #[parameter(skip)]
@@ -19,7 +19,7 @@ pub struct VisionLayer<B: NeuralBackend> {
     spatial_fold: i32,
 }
 
-impl<B: NeuralBackend> VisionLayer<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
     /// Builds one unloaded folded projection unit.
     pub fn new(
         config: &VisionConfig,
@@ -81,13 +81,13 @@ impl<B: NeuralBackend> VisionLayer<B> {
 /// Pinned final normalization for the hMLP tower.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionStatic<B: NeuralBackend> {
+pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     final_norm: B::Normalization,
     #[parameter(skip)]
     hidden_size: i32,
 }
 
-impl<B: NeuralBackend> VisionStatic<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
     /// Builds the unloaded pinned image normalization.
     pub fn new(
         config: &VisionConfig,
@@ -120,14 +120,14 @@ impl<B: NeuralBackend> VisionStatic<B> {
 /// Fixed four-layer Inkling hMLP image tower.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct VisionTower<B: NeuralBackend> {
+pub struct VisionTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Pinned final normalization.
     pub static_modules: VisionStatic<B>,
     /// Independently streamable folded projection stages.
     pub layers: Vec<VisionLayer<B>>,
 }
 
-impl<B: NeuralBackend> VisionTower<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
     /// Builds the released folded hMLP tower.
     pub fn new(
         config: &VisionConfig,

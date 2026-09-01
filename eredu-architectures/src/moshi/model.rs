@@ -72,7 +72,7 @@ pub fn observation_points(config: &MoshiConfig) -> Vec<ObservationPoint> {
 /// Pinned parameters that are not residency execution units.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: NeuralBackend> {
+pub struct StaticModules<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Text followed by temporal audio-codebook embedding tables.
     pub embeddings: MultiTableEmbedding<B>,
     /// Final temporal normalization.
@@ -81,7 +81,7 @@ pub struct StaticModules<B: NeuralBackend> {
     pub text_output: B::Linear,
 }
 
-impl<B: NeuralBackend> StaticModules<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
     fn embedding_specs(config: &MoshiConfig) -> Result<Vec<NamedEmbeddingSpec>, Error> {
         let text_input_vocabulary = config
             .text_vocabulary_size()
@@ -229,7 +229,7 @@ impl<B: NeuralBackend> StaticModules<B> {
 /// One resident or bounded execution unit in the two-group graph.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum Unit<B: NeuralBackend> {
+pub enum Unit<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// One temporal shared decoder block.
     Temporal(block::Block<B>),
     /// One complete ordered depth-codebook slice.
@@ -323,13 +323,15 @@ pub fn state_layout(config: &MoshiConfig) -> Result<StateLayout, Error> {
 }
 
 /// One portable Moshi-family model shared by resident and bounded runtimes.
-pub struct LayeredModel<B: NeuralBackend> {
+pub struct LayeredModel<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: MoshiConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<super::LocalGeometry>,
 }
 
-impl<B: NeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
+    for LayeredModel<B>
+{
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
@@ -353,15 +355,16 @@ impl<B: NeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel
                 state.global_layer_offset()
             )));
         }
-        Ok(eredu_runtime::ModelStateIdentity {
-            model_family: self.config.family().into(),
-            effective_model_type: self.config.effective_model_type().as_str().into(),
-            architecture_fingerprint: self.config.architecture_fingerprint().into(),
+        eredu_runtime::ModelStateIdentity::new(
+            self.config.family(),
+            self.config.effective_model_type().as_str(),
+            self.config.architecture_fingerprint(),
             layer_count,
-            global_layer_start: state.global_layer_offset(),
-            sink_tokens: 0,
+            state.global_layer_offset(),
+            0,
             topology,
-        })
+        )
+        .map_err(Error::backend)
     }
 
     fn parameter_description(
@@ -446,7 +449,7 @@ impl<B: NeuralBackend> eredu_runtime::ArchitectureParameters<B> for LayeredModel
     }
 }
 
-impl<B: NeuralBackend> LayeredModel<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules from one normalized configuration.
     pub fn new(
         config: MoshiConfig,
@@ -594,7 +597,7 @@ fn group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B> + ResettableRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -884,7 +887,7 @@ mod transport_tests {
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: NeuralBackend,
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B> + ResettableRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {

@@ -13,8 +13,8 @@ use eredu_nn::{AttentionCache, NeuralBackend, NeuralOperatorCapabilities, Tensor
 use eredu_runtime::{
     LayerRuntimeState, ParameterTransformConstraint, ReplicatedTextArchitecture,
     ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextRequirements,
-    RuntimeState, SelectedReplicatedTextRealization,
+    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+    ReplicatedTextRequirements, RuntimeState, SelectedReplicatedTextRealization,
 };
 
 use crate::{
@@ -117,6 +117,8 @@ where
     type Output;
     /// Backend binding failure.
     type Error;
+    /// Records that validated dispatch is about to invoke architecture constructors.
+    fn construction_started(&mut self);
     /// Binds one opaque selected-format-aware architecture to backend mechanisms.
     fn visit<A>(
         self,
@@ -149,7 +151,7 @@ pub fn visit_replicated_text_architecture<B, S, V>(
     requirements: ReplicatedTextRequirements,
     selected: SelectedReplicatedTextRealization,
     context: &<B::Tensor as Tensor>::Context,
-    visitor: V,
+    mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: NeuralBackend,
@@ -159,7 +161,9 @@ where
 {
     validate_selected_handoff(&requirements, &selected)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    match eligible_config(plan)? {
+    let eligible = eligible_config(plan)?;
+    visitor.construction_started();
+    match eligible {
         EligibleConfig::Llama(args) => {
             let capability_estimate = crate::capability::llama(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -244,6 +248,7 @@ fn validate_selected_handoff(
             .find(|parameter| parameter.name() == requirement.name())
             .expect("parameter identity sets were compared above");
         if realization.sources() != requirement.sources()
+            || realization.physical_sources() != requirement.physical_sources()
             || Some(realization.source_encoding()) != requirement.source_encoding()
         {
             return Err(format!(
@@ -560,9 +565,16 @@ pub fn replicated_text_requirements(
         plan.gguf_plan(),
         inspection.gguf_checkpoint(),
     ) {
-        (Some(architecture), None, None) => {
-            safetensors_parameters(architecture, inspection.tensors(), &config)?
-        }
+        (Some(architecture), None, None) => safetensors_parameters(
+            architecture,
+            inspection.tensors(),
+            inspection.safetensors_shards().ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArtifact(
+                    "SafeTensors inspection omitted its admitted shard set".into(),
+                )
+            })?,
+            &config,
+        )?,
         (None, Some(architecture), Some(checkpoint)) => {
             gguf_parameters(architecture, checkpoint, &config)?
         }
@@ -683,6 +695,7 @@ fn eligible_config(
 fn safetensors_parameters(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
     catalog: &TensorCatalog,
+    shards: &eredu_checkpoint::safetensors::SafetensorsShards,
     config: &EligibleConfig<'_>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
     let linear_shapes = config
@@ -761,7 +774,29 @@ fn safetensors_parameters(
         };
         parameters.push(parameter_requirement(
             constraint.key.clone(),
-            source.into_iter().collect(),
+            source.clone().into_iter().collect(),
+            source
+                .as_ref()
+                .map(|source| {
+                    let shard = shards
+                        .tensor_locations()
+                        .and_then(|locations| locations.get(source))
+                        .or_else(|| {
+                            (shards.payload_paths().len() == 1)
+                                .then(|| &shards.payload_paths()[0])
+                        })
+                        .ok_or_else(|| {
+                            ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                                "admitted SafeTensors source {source:?} has no exact shard membership"
+                            ))
+                        })?;
+                    ReplicatedTextPhysicalSource::new(source, shard, source).map_err(|error| {
+                        ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
+                    })
+                })
+                .transpose()?
+                .into_iter()
+                .collect(),
             constraint.aliases.clone(),
             descriptor
                 .map(|descriptor| stored_dtype(&descriptor.dtype))
@@ -780,6 +815,7 @@ fn safetensors_parameters(
         parameters.retain(|parameter| parameter.name() != "lm_head.weight");
         parameters.push(parameter_requirement(
             "lm_head.weight".into(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
@@ -829,6 +865,7 @@ fn gguf_parameters(
                 tensor.descriptor().name.as_str(),
                 (
                     tensor,
+                    shard.path(),
                     SourceTensorEncoding::Gguf {
                         ggml_type: tensor.descriptor().ggml_type,
                         endian: shard.endian(),
@@ -839,7 +876,8 @@ fn gguf_parameters(
     }
     let mut parameters = Vec::new();
     for mapping in architecture.tensor_mapping() {
-        let Some((tensor, source_encoding)) = physical.get(mapping.physical_name.as_str()) else {
+        let Some((tensor, shard, source_encoding)) = physical.get(mapping.physical_name.as_str())
+        else {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
                 "admitted GGUF mapping references absent tensor {:?}",
                 mapping.physical_name
@@ -915,6 +953,14 @@ fn gguf_parameters(
                 .then(|| mapping.physical_name.clone())
                 .into_iter()
                 .collect(),
+            vec![ReplicatedTextPhysicalSource::new(
+                mapping.physical_name.clone(),
+                *shard,
+                mapping.original_name.clone(),
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
+            })?],
             vec![mapping.original_name.clone()],
             (!companion).then(|| source_encoding.clone()),
             (!companion)
@@ -951,6 +997,7 @@ fn gguf_parameters(
 fn parameter_requirement(
     name: String,
     sources: Vec<String>,
+    physical_sources: Vec<ReplicatedTextPhysicalSource>,
     aliases: Vec<String>,
     source_encoding: Option<SourceTensorEncoding>,
     physical_shape: Option<Vec<usize>>,
@@ -975,6 +1022,7 @@ fn parameter_requirement(
     ReplicatedTextParameterRequirement::new(
         name,
         sources,
+        physical_sources,
         aliases,
         source_encoding,
         physical_shape,
@@ -1138,7 +1186,7 @@ mod tests {
             .resolve_safetensors(&config)
             .unwrap();
         let architecture = resolved
-            .architecture_plan
+            .architecture_plan()
             .safetensors_architecture()
             .unwrap();
         let plan = architecture.checkpoint();
@@ -1204,11 +1252,7 @@ mod tests {
                 )
                 .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap())
                 .with_quantization(eredu_core::QuantizationRequest::MxFp4)
-                .with_session(eredu_core::SessionCapabilities {
-                    persistent_cache: true,
-                    output_observation: true,
-                    activation_inspection: true,
-                })
+                .with_session(eredu_core::SessionCapabilities::new(true, true, true))
                 .with_prompt_cache(true)
                 .with_exact_completion(true),
             ];
@@ -1263,9 +1307,20 @@ mod tests {
                         Some(descriptor.shape.as_slice())
                     );
                     assert!(parameter.source_encoding().is_some());
+                    let physical = parameter.physical_sources();
+                    assert_eq!(physical.len(), 1);
+                    assert_eq!(physical[0].tensor(), source);
+                    assert_eq!(physical[0].output(), source);
+                    let shards = inspection.safetensors_shards().unwrap();
+                    let expected_shard = shards
+                        .tensor_locations()
+                        .and_then(|locations| locations.get(source))
+                        .unwrap_or(&shards.payload_paths()[0]);
+                    assert_eq!(physical[0].shard(), expected_shard);
                 }
                 ReplicatedTextParameterPresence::OptionalAbsent => {
                     assert!(parameter.sources().is_empty());
+                    assert!(parameter.physical_sources().is_empty());
                     assert!(parameter.source_encoding().is_none());
                 }
                 ReplicatedTextParameterPresence::Tied { .. }
@@ -1289,7 +1344,6 @@ mod tests {
                 && parameter.role() == ReplicatedTextParameterRole::Normalization
                 && parameter.transform_constraint() == ParameterTransformConstraint::None
         }));
-
         let mut tied_config = config("llama");
         tied_config["tie_word_embeddings"] = serde_json::json!(true);
         let (_root, tied_inspection) = inspected_config(tied_config);
@@ -1305,6 +1359,7 @@ mod tests {
                 if target == "model.embed_tokens.weight"
         ));
         assert!(output.sources().is_empty());
+        assert!(output.physical_sources().is_empty());
     }
 
     #[test]
@@ -1318,7 +1373,7 @@ mod tests {
             .resolve_safetensors(&config)
             .unwrap();
         assert!(matches!(
-            eligible_config(&resolved.architecture_plan),
+            eligible_config(resolved.architecture_plan()),
             Err(ReplicatedTextIneligibility::Routed)
         ));
     }
@@ -1360,7 +1415,7 @@ mod tests {
             .resolve_safetensors(&config)
             .unwrap();
         assert!(matches!(
-            eligible_config(&resolved.architecture_plan),
+            eligible_config(resolved.architecture_plan()),
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
         ));
     }

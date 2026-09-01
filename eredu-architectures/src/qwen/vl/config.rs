@@ -391,15 +391,16 @@ pub fn state_identity(
             "Qwen3-VL owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: args.model_kind().canonical_name().into(),
-        effective_model_type: args.effective_model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        args.model_kind().canonical_name(),
+        args.effective_model_type.clone(),
+        prompt_cache_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(|error| invalid(error.to_string()))
 }
 
 fn token_id(value: Option<&Value>, name: &str) -> Result<i32, VlConfigError> {
@@ -493,8 +494,8 @@ mod tests {
                 .prompt_cache_identity(&layout)
                 .unwrap();
 
-            assert_eq!(identity.model_family, family);
-            assert_eq!(identity.effective_model_type, inner);
+            assert_eq!(identity.model_family(), family);
+            assert_eq!(identity.effective_model_type(), inner);
         }
     }
 

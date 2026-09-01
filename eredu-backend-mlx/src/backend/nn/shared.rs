@@ -1266,169 +1266,6 @@ impl NeuralBackend for MlxNeuralBackend {
         })
     }
 
-    fn vocabulary_parallel_embedding(
-        spec: EmbeddingSpec,
-        range: VocabularyParallelRange,
-        context: &Stream,
-    ) -> Result<MlxEmbedding, ComputeError> {
-        range.validate_global_rows(spec.vocabulary)?;
-        let global = i32::try_from(range.global_vocabulary).map_err(ComputeError::backend)?;
-        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
-        let module = compute(common::linear::unloaded_embedding(
-            local,
-            spec.dimensions,
-            spec.format.encoding().weight_quantization(),
-            context,
-        ))?;
-        let topology = parameter_topology(&module, spec.weight, None, &spec.format)?;
-        Ok(MlxEmbedding {
-            module,
-            topology,
-            vocabulary: global,
-            vocabulary_range: Some(range),
-        })
-    }
-
-    fn vocabulary_parallel_linear(
-        spec: LinearSpec,
-        range: VocabularyParallelRange,
-        context: &Stream,
-    ) -> Result<MlxLinear, ComputeError> {
-        range.validate_global_rows(spec.output)?;
-        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
-        let module = compute(common::linear::PhysicalLinear::unloaded(
-            spec.input,
-            local,
-            spec.bias.is_some(),
-            spec.format.encoding(),
-            context,
-        ))?;
-        let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
-        Ok(MlxLinear {
-            module,
-            topology,
-            vocabulary_range: Some(range),
-        })
-    }
-
-    fn vocabulary_parallel_lookup(
-        embedding: &mut MlxEmbedding,
-        input: &MlxTensor,
-        policy: EmbeddingLookupPolicy,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        policy.validate()?;
-        let range = embedding
-            .vocabulary_range
-            .as_ref()
-            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let sentinel = match policy {
-            EmbeddingLookupPolicy::Strict => None,
-            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
-        };
-        let input = compute(validate_token_domain(
-            input.as_array(),
-            embedding.vocabulary,
-            sentinel,
-            context,
-        ))?;
-        let start =
-            Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
-        let end = Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
-        let valid = compute(input.ge(&start, context))?
-            .logical_and(&compute(input.lt(&end, context))?, context)
-            .map_err(ComputeError::backend)?;
-        let local = compute(input.subtract(&start, context))?;
-        let safe = compute(safemlx::ops::r#where(
-            &valid,
-            &local,
-            Array::from_int(0),
-            context,
-        ))?;
-        let value = compute(embedding.module.forward(&safe, context))?;
-        let mask = compute(valid.expand_dims(-1, context))?;
-        let zero_value = compute(safemlx::ops::zeros_like(&value, context))?;
-        let value = compute(safemlx::ops::r#where(&mask, &value, &zero_value, context))?;
-        compute_tensor(crate::backend::runtime::distributed::all_sum(
-            &value, parallel, context,
-        ))
-    }
-
-    fn vocabulary_parallel_project(
-        linear: &mut MlxLinear,
-        input: &MlxTensor,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        let range = linear
-            .vocabulary_range
-            .as_ref()
-            .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
-        let local = compute(linear.module.forward(input.as_array(), context))?;
-        let widths = (0..parallel.size())
-            .map(|rank| {
-                eredu_core::balanced_contiguous_range(
-                    range.global_vocabulary,
-                    parallel.size(),
-                    rank,
-                    false,
-                )
-                .map(|range| range.len())
-                .map_err(ComputeError::backend)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        compute_tensor(
-            crate::backend::distributed::all_gather_uneven_axis(
-                &local, -1, &widths, parallel, context,
-            )
-            .map_err(|error| {
-                safemlx::error::Exception::custom(format!(
-                    "vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
-                    range.local,
-                    local.shape(),
-                ))
-            }),
-        )
-    }
-
-    fn vocabulary_parallel_embedding_project(
-        embedding: &mut MlxEmbedding,
-        input: &MlxTensor,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        let range = embedding
-            .vocabulary_range
-            .clone()
-            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let local = compute(embedding.module.as_linear(input.as_array(), context))?;
-        let widths = (0..parallel.size())
-            .map(|rank| {
-                eredu_core::balanced_contiguous_range(
-                    range.global_vocabulary,
-                    parallel.size(),
-                    rank,
-                    false,
-                )
-                .map(|range| range.len())
-                .map_err(ComputeError::backend)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        compute_tensor(
-            crate::backend::distributed::all_gather_uneven_axis(
-                &local, -1, &widths, parallel, context,
-            )
-            .map_err(|error| {
-                safemlx::error::Exception::custom(format!(
-                    "tied vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
-                    range.local,
-                    local.shape(),
-                ))
-            }),
-        )
-    }
-
     fn normalization(
         spec: NormalizationConstructionSpec,
         context: &Stream,
@@ -2177,44 +2014,6 @@ impl NeuralBackend for MlxNeuralBackend {
         compute_tensor(output.as_dtype(input.as_array().dtype(), context))
     }
 
-    fn grouped_linear(
-        linear: &mut MlxLinear,
-        input: &MlxTensor,
-        groups: i32,
-        output_per_group: i32,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        let input = input.as_array();
-        if input.ndim() != 4 || input.dim(1) != groups || groups <= 0 || output_per_group <= 0 {
-            return Err(ComputeError::backend(format!(
-                "grouped linear expects [batch, {groups}, tokens, input] and positive output width, got {:?}",
-                input.shape()
-            )));
-        }
-        let projected = compute(linear.module.forward(input, context))?;
-        if projected.dim(-1) != groups * output_per_group {
-            return Err(ComputeError::backend(format!(
-                "grouped linear produced width {}, expected {}",
-                projected.dim(-1),
-                groups * output_per_group
-            )));
-        }
-        let mut pieces = Vec::with_capacity(groups as usize);
-        for group in 0..groups {
-            let selected = compute(projected.try_index_device(
-                (
-                    ..,
-                    group,
-                    ..,
-                    group * output_per_group..(group + 1) * output_per_group,
-                ),
-                context,
-            ))?;
-            pieces.push(compute(selected.expand_dims(1, context))?);
-        }
-        compute_tensor(concatenate_axis(&pieces, 1, context))
-    }
-
     fn sliding_window_attention(
         queries: MlxTensor,
         keys: MlxTensor,
@@ -2268,6 +2067,175 @@ impl NeuralBackend for MlxNeuralBackend {
         )
     }
 
+    fn parallel_size(parallel: &Group) -> usize {
+        parallel.size()
+    }
+}
+
+impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        context: &Stream,
+    ) -> Result<MlxEmbedding, ComputeError> {
+        range.validate_global_rows(spec.vocabulary)?;
+        let global = i32::try_from(range.global_vocabulary).map_err(ComputeError::backend)?;
+        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
+        let module = compute(common::linear::unloaded_embedding(
+            local,
+            spec.dimensions,
+            spec.format.encoding().weight_quantization(),
+            context,
+        ))?;
+        let topology = parameter_topology(&module, spec.weight, None, &spec.format)?;
+        Ok(MlxEmbedding {
+            module,
+            topology,
+            vocabulary: global,
+            vocabulary_range: Some(range),
+        })
+    }
+
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        context: &Stream,
+    ) -> Result<MlxLinear, ComputeError> {
+        range.validate_global_rows(spec.output)?;
+        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
+        let module = compute(common::linear::PhysicalLinear::unloaded(
+            spec.input,
+            local,
+            spec.bias.is_some(),
+            spec.format.encoding(),
+            context,
+        ))?;
+        let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
+        Ok(MlxLinear {
+            module,
+            topology,
+            vocabulary_range: Some(range),
+        })
+    }
+
+    fn vocabulary_parallel_lookup(
+        embedding: &mut MlxEmbedding,
+        input: &MlxTensor,
+        policy: EmbeddingLookupPolicy,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        policy.validate()?;
+        let range = embedding
+            .vocabulary_range
+            .as_ref()
+            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
+        let sentinel = match policy {
+            EmbeddingLookupPolicy::Strict => None,
+            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
+        };
+        let input = compute(validate_token_domain(
+            input.as_array(),
+            embedding.vocabulary,
+            sentinel,
+            context,
+        ))?;
+        let start =
+            Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
+        let end = Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
+        let valid = compute(input.ge(&start, context))?
+            .logical_and(&compute(input.lt(&end, context))?, context)
+            .map_err(ComputeError::backend)?;
+        let local = compute(input.subtract(&start, context))?;
+        let safe = compute(safemlx::ops::r#where(
+            &valid,
+            &local,
+            Array::from_int(0),
+            context,
+        ))?;
+        let value = compute(embedding.module.forward(&safe, context))?;
+        let mask = compute(valid.expand_dims(-1, context))?;
+        let zero_value = compute(safemlx::ops::zeros_like(&value, context))?;
+        let value = compute(safemlx::ops::r#where(&mask, &value, &zero_value, context))?;
+        compute_tensor(crate::backend::runtime::distributed::all_sum(
+            &value, parallel, context,
+        ))
+    }
+
+    fn vocabulary_parallel_project(
+        linear: &mut MlxLinear,
+        input: &MlxTensor,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        let range = linear
+            .vocabulary_range
+            .as_ref()
+            .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
+        let local = compute(linear.module.forward(input.as_array(), context))?;
+        let widths = (0..parallel.size())
+            .map(|rank| {
+                eredu_core::balanced_contiguous_range(
+                    range.global_vocabulary,
+                    parallel.size(),
+                    rank,
+                    false,
+                )
+                .map(|range| range.len())
+                .map_err(ComputeError::backend)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        compute_tensor(
+            crate::backend::distributed::all_gather_uneven_axis(
+                &local, -1, &widths, parallel, context,
+            )
+            .map_err(|error| {
+                safemlx::error::Exception::custom(format!(
+                    "vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
+                    range.local,
+                    local.shape(),
+                ))
+            }),
+        )
+    }
+
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut MlxEmbedding,
+        input: &MlxTensor,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        let range = embedding
+            .vocabulary_range
+            .clone()
+            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
+        let local = compute(embedding.module.as_linear(input.as_array(), context))?;
+        let widths = (0..parallel.size())
+            .map(|rank| {
+                eredu_core::balanced_contiguous_range(
+                    range.global_vocabulary,
+                    parallel.size(),
+                    rank,
+                    false,
+                )
+                .map(|range| range.len())
+                .map_err(ComputeError::backend)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        compute_tensor(
+            crate::backend::distributed::all_gather_uneven_axis(
+                &local, -1, &widths, parallel, context,
+            )
+            .map_err(|error| {
+                safemlx::error::Exception::custom(format!(
+                    "tied vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
+                    range.local,
+                    local.shape(),
+                ))
+            }),
+        )
+    }
+
     fn sum_parallel(
         value: MlxTensor,
         parallel: &Group,
@@ -2278,10 +2246,6 @@ impl NeuralBackend for MlxNeuralBackend {
             parallel,
             context,
         ))
-    }
-
-    fn parallel_size(parallel: &Group) -> usize {
-        parallel.size()
     }
 }
 
@@ -2337,6 +2301,44 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
     type Selector = MlxTopKGroupSelector;
     type GatedProductGroups = MlxGroupedGatedProduct;
     type Relu2Groups = MlxGroupedRelu2;
+
+    fn grouped_linear(
+        linear: &mut MlxLinear,
+        input: &MlxTensor,
+        groups: i32,
+        output_per_group: i32,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        let input = input.as_array();
+        if input.ndim() != 4 || input.dim(1) != groups || groups <= 0 || output_per_group <= 0 {
+            return Err(ComputeError::backend(format!(
+                "grouped linear expects [batch, {groups}, tokens, input] and positive output width, got {:?}",
+                input.shape()
+            )));
+        }
+        let projected = compute(linear.module.forward(input, context))?;
+        if projected.dim(-1) != groups * output_per_group {
+            return Err(ComputeError::backend(format!(
+                "grouped linear produced width {}, expected {}",
+                projected.dim(-1),
+                groups * output_per_group
+            )));
+        }
+        let mut pieces = Vec::with_capacity(groups as usize);
+        for group in 0..groups {
+            let selected = compute(projected.try_index_device(
+                (
+                    ..,
+                    group,
+                    ..,
+                    group * output_per_group..(group + 1) * output_per_group,
+                ),
+                context,
+            ))?;
+            pieces.push(compute(selected.expand_dims(1, context))?);
+        }
+        compute_tensor(concatenate_axis(&pieces, 1, context))
+    }
 
     fn joint_group_selection(
         input: JointGroupSelectionInput<'_, MlxTensor>,
@@ -2396,24 +2398,23 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
             _ => return Err(ComputeError::backend("unsupported group scoring policy")),
         };
         let module = compute(common::grouped::TopKGroupSelector::new_with_quantization(
-            common::grouped::TopKGroupSelectorConfig {
-                top_k: selection.top_k(),
-                group_count: selection.group_count(),
-                hidden_size: spec.input_dimensions(),
+            compute(common::grouped::TopKGroupSelectorConfig::new(
+                selection.top_k(),
+                selection.group_count(),
+                spec.input_dimensions(),
                 score_function,
-                norm_topk_prob: selection.normalize_selected(),
-                normalization_epsilon: selection.normalization_epsilon(),
-                coefficient_scale: selection.coefficient_scale(),
-                n_group: selection.selection_partitions(),
-                topk_group: selection.selected_groups(),
-                projection_bias: spec.bias().is_some(),
-                score_correction_bias: spec.correction_bias().is_some(),
-                input_rms_epsilon: spec.input_transform().map(|transform| transform.epsilon()),
-                input_inverse_sqrt_dimensions: spec
-                    .input_transform()
+                selection.normalize_selected(),
+                selection.normalization_epsilon(),
+                selection.coefficient_scale(),
+                selection.selection_partitions(),
+                selection.selected_groups(),
+                spec.bias().is_some(),
+                spec.correction_bias().is_some(),
+                spec.input_transform().map(|transform| transform.epsilon()),
+                spec.input_transform()
                     .is_some_and(|transform| transform.inverse_sqrt_dimensions()),
-                learned_coefficient_scale: spec.coefficient_scale().is_some(),
-            },
+                spec.coefficient_scale().is_some(),
+            ))?,
             spec.format().encoding().weight_quantization(),
             context,
         ))?;

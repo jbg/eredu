@@ -689,7 +689,7 @@ pub(crate) fn load_gguf(
             source.architecture()
         )));
     }
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
     let (mut parsed, store) = prepare_hybrid_gguf_store(
         source,
@@ -827,7 +827,7 @@ impl QwenHybridModel {
     /// This initial binder is replicated; distributed construction installs topology separately.
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>> {
         None
     }
     /// Allocates the declared recurrent, convolution, KV, and MTP state.
@@ -941,7 +941,7 @@ impl QwenHybridModel {
             tensors,
             i32::try_from(prefix_token_ids.len())
                 .map_err(|_| Exception::custom("prompt-cache prefix exceeds i32"))?,
-            &identity.layer_prefix_offsets,
+            identity.layer_prefix_offsets(),
         )?;
         Ok((cache, manifest))
     }
@@ -1916,7 +1916,7 @@ pub fn load_safetensors_with_residency(
         })
         .transpose()?
         .flatten();
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
     let store = artifact.store();
     if parsed.vision.is_some() {
@@ -2119,7 +2119,7 @@ fn load_store(
 
 fn attach_parameter_bank(
     model: &mut QwenHybridModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {

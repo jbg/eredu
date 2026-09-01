@@ -311,7 +311,8 @@ pub fn quantize_neutral_qwen_store(
 pub struct QwenModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: QwenExecution,
     parameter_bank: Option<AddressableParameterBank>,
@@ -324,7 +325,10 @@ impl QwenModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -417,7 +421,7 @@ impl QwenModel {
         )
         .map_err(|error| Exception::custom(error.to_string()))?;
         let state =
-            self.new_paged_cache_from_manager(manager, identity.topology.cache_rank_identity())?;
+            self.new_paged_cache_from_manager(manager, identity.topology().cache_rank_identity())?;
         let _ = stream;
         Ok((state, manifest))
     }
@@ -901,12 +905,14 @@ impl QwenModel {
     }
 
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let topology = self
-            .parallel_info
-            .as_ref()
-            .map_or_else(PromptCacheTopology::default, |info| {
-                crate::backend::cache::prompt_cache_topology(info.topology())
-            });
+        let topology =
+            self.parallel_info
+                .as_ref()
+                .map_or_else(PromptCacheTopology::default, |info| {
+                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                        info.topology(),
+                    )
+                });
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
             topology,
@@ -962,7 +968,7 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
-    let expert_options = weight_residency.expert_cache();
+    let expert_options = weight_residency.parameter_bank_cache();
     let execution_options = weight_residency.layers();
     let eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args) = artifact.model()
     else {
@@ -1015,7 +1021,7 @@ pub fn load_safetensors(
 
 fn attach_qwen_parameter_bank(
     model: &mut QwenModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
@@ -1048,7 +1054,7 @@ fn load_neutral_qwen_parallel(
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
     external_experts: bool,
@@ -1185,7 +1191,8 @@ fn load_neutral_qwen_parallel(
         maximum_device_parameter_bytes,
     );
     let parallel_rank =
-        crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
+            .cache_rank_identity();
     let execution = if options.is_fully_resident() {
         QwenExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -1215,7 +1222,7 @@ fn load_neutral_qwen_parallel(
 pub fn load_qwen_tensor_parallel_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
@@ -1264,7 +1271,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
 pub(crate) fn load_qwen_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
@@ -1312,7 +1319,7 @@ pub(crate) fn load_qwen_gguf_model(
             "ordinary replicated Qwen must use replicated text composition".into(),
         ));
     }
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let execution_options = residency.layers();
     let model = if let Some(quantization) = quantization {
         let (store, args, _) = quantize_neutral_qwen_store(store, &args, quantization, stream)?;
@@ -1635,11 +1642,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(identity.global_layer_start, 0);
-        assert_eq!(identity.layer_count, layout.len());
-        assert_eq!(identity.layer_layout, *layout.layers());
+        assert_eq!(identity.global_layer_start(), 0);
+        assert_eq!(identity.layer_count(), layout.len());
+        assert_eq!(identity.layer_layout(), layout.layers());
         assert_eq!(
-            identity.architecture_fingerprint,
+            identity.architecture_fingerprint(),
             eredu_architectures::qwen::prompt_cache_architecture_fingerprint(architecture.args())
         );
     }

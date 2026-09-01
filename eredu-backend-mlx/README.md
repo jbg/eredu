@@ -21,8 +21,8 @@ for implementation architecture, native platform setup, and low-level
 
 ```rust,no_run
 use eredu_backend_mlx::{
-    backend::config::ModelLoadOptions,
     native::{backend, ExecutionContext},
+    MlxLoadRequest,
 };
 use eredu_core::load_model;
 use safemlx::{Device, DeviceType};
@@ -30,7 +30,7 @@ use safemlx::{Device, DeviceType};
 let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
 let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
 let backend = backend(execution.stream(), weights.stream());
-let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?;
+let model = load_model(&backend, "/path/to/model", MlxLoadRequest::default())?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

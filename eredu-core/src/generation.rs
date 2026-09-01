@@ -434,7 +434,8 @@ impl SpeculativeRequestId {
 /// Explicit speculative request/round state.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SpeculativeRequestPhase {
+#[non_exhaustive]
+pub enum SpeculativeRequestStatus {
     /// Target prompt prefill and first-token sampling.
     Prefill,
     /// Committed target state is ready to seed proposals.
@@ -444,7 +445,7 @@ pub enum SpeculativeRequestPhase {
     /// Target verification is submitted and unresolved.
     TargetVerificationInFlight,
     /// Same-request continuation is being drafted optimistically.
-    OptimisticDraftInProgress,
+    OptimisticDraftRunning,
     /// Verification is in flight and its optimistic branch is ready.
     OptimisticDraftReady,
     /// Target results are being accepted/rejected and committed.
@@ -469,7 +470,7 @@ pub enum SpeculativeCancellationDisposition {
 /// Validated backend-neutral lifecycle of one speculative request.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpeculativeRequestLifecycle {
-    phase: SpeculativeRequestPhase,
+    status: SpeculativeRequestStatus,
     cancellation_pending: bool,
 }
 
@@ -483,7 +484,7 @@ impl SpeculativeRequestLifecycle {
     /// Starts a request at prompt prefill.
     pub const fn new() -> Self {
         Self {
-            phase: SpeculativeRequestPhase::Prefill,
+            status: SpeculativeRequestStatus::Prefill,
             cancellation_pending: false,
         }
     }
@@ -491,7 +492,7 @@ impl SpeculativeRequestLifecycle {
     /// Creates a request completed before backend submission.
     pub const fn completed() -> Self {
         Self {
-            phase: SpeculativeRequestPhase::Completed,
+            status: SpeculativeRequestStatus::Completed,
             cancellation_pending: false,
         }
     }
@@ -499,14 +500,14 @@ impl SpeculativeRequestLifecycle {
     /// Creates a request cancelled before backend submission.
     pub const fn cancelled() -> Self {
         Self {
-            phase: SpeculativeRequestPhase::Cancelled,
+            status: SpeculativeRequestStatus::Cancelled,
             cancellation_pending: false,
         }
     }
 
-    /// Current lifecycle phase.
-    pub const fn phase(&self) -> SpeculativeRequestPhase {
-        self.phase
+    /// Current lifecycle status.
+    pub const fn status(&self) -> SpeculativeRequestStatus {
+        self.status
     }
 
     /// Whether cancellation must be applied after an exact backend boundary.
@@ -517,8 +518,8 @@ impl SpeculativeRequestLifecycle {
     /// Whether the request can own no further submissions.
     pub const fn is_terminal(&self) -> bool {
         matches!(
-            self.phase,
-            SpeculativeRequestPhase::Completed | SpeculativeRequestPhase::Cancelled
+            self.status,
+            SpeculativeRequestStatus::Completed | SpeculativeRequestStatus::Cancelled
         )
     }
 
@@ -534,69 +535,69 @@ impl SpeculativeRequestLifecycle {
             self.cancellation_pending = true;
             Ok(SpeculativeCancellationDisposition::Deferred)
         } else {
-            self.transition(SpeculativeRequestPhase::Cancelled)?;
+            self.transition(SpeculativeRequestStatus::Cancelled)?;
             Ok(SpeculativeCancellationDisposition::CancelNow)
         }
     }
 
     /// Applies one legal lifecycle transition.
-    pub fn transition(&mut self, next: SpeculativeRequestPhase) -> Result<(), GenerationError> {
+    pub fn transition(&mut self, next: SpeculativeRequestStatus) -> Result<(), GenerationError> {
         let allowed = matches!(
-            (self.phase, next),
+            (self.status, next),
             (
-                SpeculativeRequestPhase::Prefill,
-                SpeculativeRequestPhase::ReadyToDraft
+                SpeculativeRequestStatus::Prefill,
+                SpeculativeRequestStatus::ReadyToDraft
             ) | (
-                SpeculativeRequestPhase::Prefill,
-                SpeculativeRequestPhase::Completed
+                SpeculativeRequestStatus::Prefill,
+                SpeculativeRequestStatus::Completed
             ) | (
-                SpeculativeRequestPhase::Prefill,
-                SpeculativeRequestPhase::Cancelled
+                SpeculativeRequestStatus::Prefill,
+                SpeculativeRequestStatus::Cancelled
             ) | (
-                SpeculativeRequestPhase::ReadyToDraft,
-                SpeculativeRequestPhase::ReadyToSubmitVerification
+                SpeculativeRequestStatus::ReadyToDraft,
+                SpeculativeRequestStatus::ReadyToSubmitVerification
             ) | (
-                SpeculativeRequestPhase::ReadyToDraft,
-                SpeculativeRequestPhase::Completed
+                SpeculativeRequestStatus::ReadyToDraft,
+                SpeculativeRequestStatus::Completed
             ) | (
-                SpeculativeRequestPhase::ReadyToDraft,
-                SpeculativeRequestPhase::Cancelled
+                SpeculativeRequestStatus::ReadyToDraft,
+                SpeculativeRequestStatus::Cancelled
             ) | (
-                SpeculativeRequestPhase::ReadyToSubmitVerification,
-                SpeculativeRequestPhase::TargetVerificationInFlight
+                SpeculativeRequestStatus::ReadyToSubmitVerification,
+                SpeculativeRequestStatus::TargetVerificationInFlight
             ) | (
-                SpeculativeRequestPhase::ReadyToSubmitVerification,
-                SpeculativeRequestPhase::Cancelled
+                SpeculativeRequestStatus::ReadyToSubmitVerification,
+                SpeculativeRequestStatus::Cancelled
             ) | (
-                SpeculativeRequestPhase::TargetVerificationInFlight,
-                SpeculativeRequestPhase::OptimisticDraftInProgress
+                SpeculativeRequestStatus::TargetVerificationInFlight,
+                SpeculativeRequestStatus::OptimisticDraftRunning
             ) | (
-                SpeculativeRequestPhase::TargetVerificationInFlight,
-                SpeculativeRequestPhase::VerificationResolution
+                SpeculativeRequestStatus::TargetVerificationInFlight,
+                SpeculativeRequestStatus::VerificationResolution
             ) | (
-                SpeculativeRequestPhase::OptimisticDraftInProgress,
-                SpeculativeRequestPhase::OptimisticDraftReady
+                SpeculativeRequestStatus::OptimisticDraftRunning,
+                SpeculativeRequestStatus::OptimisticDraftReady
             ) | (
-                SpeculativeRequestPhase::OptimisticDraftReady,
-                SpeculativeRequestPhase::VerificationResolution
+                SpeculativeRequestStatus::OptimisticDraftReady,
+                SpeculativeRequestStatus::VerificationResolution
             ) | (
-                SpeculativeRequestPhase::VerificationResolution,
-                SpeculativeRequestPhase::ReadyToDraft
+                SpeculativeRequestStatus::VerificationResolution,
+                SpeculativeRequestStatus::ReadyToDraft
             ) | (
-                SpeculativeRequestPhase::VerificationResolution,
-                SpeculativeRequestPhase::Completed
+                SpeculativeRequestStatus::VerificationResolution,
+                SpeculativeRequestStatus::Completed
             ) | (
-                SpeculativeRequestPhase::VerificationResolution,
-                SpeculativeRequestPhase::Cancelled
+                SpeculativeRequestStatus::VerificationResolution,
+                SpeculativeRequestStatus::Cancelled
             )
         );
         if !allowed {
-            return Err(GenerationError::InvalidSpeculativePhaseTransition {
-                from: self.phase,
+            return Err(GenerationError::InvalidSpeculativeStatusTransition {
+                from: self.status,
                 to: next,
             });
         }
-        self.phase = next;
+        self.status = next;
         if self.is_terminal() {
             self.cancellation_pending = false;
         }
@@ -920,12 +921,12 @@ pub enum GenerationError {
     #[error("speculative scheduler reached a non-terminal state with no eligible operation")]
     StalledSpeculativeSchedule,
     /// The requested speculative lifecycle edge is invalid.
-    #[error("invalid speculative request phase transition from {from:?} to {to:?}")]
-    InvalidSpeculativePhaseTransition {
-        /// Current phase.
-        from: SpeculativeRequestPhase,
-        /// Requested phase.
-        to: SpeculativeRequestPhase,
+    #[error("invalid speculative request status transition from {from:?} to {to:?}")]
+    InvalidSpeculativeStatusTransition {
+        /// Current status.
+        from: SpeculativeRequestStatus,
+        /// Requested status.
+        to: SpeculativeRequestStatus,
     },
 }
 
@@ -1080,13 +1081,13 @@ mod tests {
     fn speculative_request_lifecycle_defers_cancellation_exactly() {
         let mut lifecycle = SpeculativeRequestLifecycle::new();
         lifecycle
-            .transition(SpeculativeRequestPhase::ReadyToDraft)
+            .transition(SpeculativeRequestStatus::ReadyToDraft)
             .unwrap();
         lifecycle
-            .transition(SpeculativeRequestPhase::ReadyToSubmitVerification)
+            .transition(SpeculativeRequestStatus::ReadyToSubmitVerification)
             .unwrap();
         lifecycle
-            .transition(SpeculativeRequestPhase::TargetVerificationInFlight)
+            .transition(SpeculativeRequestStatus::TargetVerificationInFlight)
             .unwrap();
         assert_eq!(
             lifecycle.request_cancellation(true).unwrap(),
@@ -1094,16 +1095,16 @@ mod tests {
         );
         assert!(lifecycle.cancellation_pending());
         lifecycle
-            .transition(SpeculativeRequestPhase::VerificationResolution)
+            .transition(SpeculativeRequestStatus::VerificationResolution)
             .unwrap();
         lifecycle
-            .transition(SpeculativeRequestPhase::Cancelled)
+            .transition(SpeculativeRequestStatus::Cancelled)
             .unwrap();
         assert!(lifecycle.is_terminal());
         assert!(!lifecycle.cancellation_pending());
         assert!(matches!(
-            lifecycle.transition(SpeculativeRequestPhase::ReadyToDraft),
-            Err(GenerationError::InvalidSpeculativePhaseTransition { .. })
+            lifecycle.transition(SpeculativeRequestStatus::ReadyToDraft),
+            Err(GenerationError::InvalidSpeculativeStatusTransition { .. })
         ));
     }
 }

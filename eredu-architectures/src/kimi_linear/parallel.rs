@@ -298,7 +298,7 @@ pub fn static_parallel_parameter_groups<B>(
     modules: &StaticModules<B>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     let mut groups = vec![
         module_parameter_group::<B::Tensor, _>(
@@ -342,7 +342,7 @@ pub fn layer_parallel_parameter_groups<B>(
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     let root = format!("model.layers.{layer}");
     let mut groups = Vec::new();

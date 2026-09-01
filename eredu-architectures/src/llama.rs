@@ -38,15 +38,16 @@ pub fn state_identity(
             "Llama owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: "llama".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        "llama",
+        args.model_type.clone(),
+        prompt_cache_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }
 
 /// Derives rank-local construction geometry for one tensor-parallel block.

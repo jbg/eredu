@@ -131,7 +131,8 @@ pub fn quantize_neutral_llama_store(
 pub struct PartitionedLlamaModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: PartitionedLlamaExecution,
 }
@@ -143,7 +144,10 @@ impl PartitionedLlamaModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -210,7 +214,7 @@ impl PartitionedLlamaModel {
         )
         .map_err(|error| Exception::custom(error.to_string()))?;
         let state =
-            self.new_paged_cache_from_manager(manager, identity.topology.cache_rank_identity())?;
+            self.new_paged_cache_from_manager(manager, identity.topology().cache_rank_identity())?;
         let _ = stream;
         Ok((state, manifest))
     }
@@ -385,12 +389,14 @@ impl PartitionedLlamaModel {
     }
 
     pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let topology = self
-            .parallel_info
-            .as_ref()
-            .map_or_else(PromptCacheTopology::default, |info| {
-                crate::backend::cache::prompt_cache_topology(info.topology())
-            });
+        let topology =
+            self.parallel_info
+                .as_ref()
+                .map_or_else(PromptCacheTopology::default, |info| {
+                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                        info.topology(),
+                    )
+                });
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
             topology,
@@ -443,7 +449,7 @@ fn load_partitioned_llama(
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PartitionedLlamaModel, Error> {
@@ -548,7 +554,8 @@ fn load_partitioned_llama(
         maximum_device_parameter_bytes,
     );
     let parallel_rank =
-        crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
+            .cache_rank_identity();
     let execution = if options.is_fully_resident() {
         PartitionedLlamaExecution::TensorParallelResident(Box::new(
             LayerwiseRuntime::new_policy_first(
@@ -579,7 +586,7 @@ fn load_partitioned_llama(
 pub fn load_partitioned_llama_safetensors(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PartitionedLlamaModel, Error> {
@@ -598,7 +605,7 @@ pub fn load_partitioned_llama_safetensors(
 pub(crate) fn load_partitioned_llama_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PartitionedLlamaModel, Error> {

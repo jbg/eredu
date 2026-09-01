@@ -13,8 +13,8 @@ use eredu_architectures::{
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionMask, AttentionRequest,
-    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GroupSelection,
-    GroupSelectionOperator, GroupedGatedProductOperator, GroupedGatedProductSpec,
+    DistributedNeuralBackend, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
+    GroupSelection, GroupSelectionOperator, GroupedGatedProductOperator, GroupedGatedProductSpec,
     GroupedNeuralBackend, GroupedRelu2Operator, GroupedRelu2Spec, Index, LinearOperator,
     LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
     NormalizationScale, PadMode, ParameterMetadata, ParameterVisitor, ParameterVisitorMut,
@@ -481,57 +481,6 @@ impl NeuralBackend for ReferenceBackend {
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
         })
     }
-    fn vocabulary_parallel_embedding(
-        spec: EmbeddingSpec,
-        range: VocabularyParallelRange,
-        _: &(),
-    ) -> Result<Self::Embedding, Error> {
-        range.validate()?;
-        Ok(ReferenceEmbedding {
-            vocabulary: spec.vocabulary,
-            dimensions: spec.dimensions,
-            weight: ReferenceTensor(vec![range.local.len() as i32, spec.dimensions]),
-            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
-        })
-    }
-    fn vocabulary_parallel_linear(
-        spec: LinearSpec,
-        range: VocabularyParallelRange,
-        _: &(),
-    ) -> Result<Self::Linear, Error> {
-        range.validate()?;
-        Ok(ReferenceLinear {
-            output: spec.output,
-            weight: ReferenceTensor(vec![range.local.len() as i32, spec.input]),
-            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
-            expert_spec: None,
-        })
-    }
-    fn vocabulary_parallel_lookup(
-        embedding: &mut Self::Embedding,
-        input: &Self::Tensor,
-        policy: EmbeddingLookupPolicy,
-        _: &(),
-        context: &(),
-    ) -> Result<Self::Tensor, Error> {
-        embedding.lookup(input, policy, context)
-    }
-    fn vocabulary_parallel_project(
-        linear: &mut Self::Linear,
-        input: &Self::Tensor,
-        _: &(),
-        context: &(),
-    ) -> Result<Self::Tensor, Error> {
-        linear.forward(input, context)
-    }
-    fn vocabulary_parallel_embedding_project(
-        embedding: &mut Self::Embedding,
-        input: &Self::Tensor,
-        _: &(),
-        context: &(),
-    ) -> Result<Self::Tensor, Error> {
-        embedding.as_linear(input, context)
-    }
     fn normalization(
         spec: NormalizationConstructionSpec,
         _: &(),
@@ -617,10 +566,94 @@ impl NeuralBackend for ReferenceBackend {
     }
 }
 
+impl eredu_nn::DistributedNeuralBackend for ReferenceBackend {
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        _: &(),
+    ) -> Result<Self::Embedding, Error> {
+        range.validate()?;
+        Ok(ReferenceEmbedding {
+            vocabulary: spec.vocabulary,
+            dimensions: spec.dimensions,
+            weight: ReferenceTensor(vec![range.local.len() as i32, spec.dimensions]),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+        })
+    }
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        _: &(),
+    ) -> Result<Self::Linear, Error> {
+        range.validate()?;
+        Ok(ReferenceLinear {
+            output: spec.output,
+            weight: ReferenceTensor(vec![range.local.len() as i32, spec.input]),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            expert_spec: None,
+        })
+    }
+    fn vocabulary_parallel_lookup(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        policy: EmbeddingLookupPolicy,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        embedding.lookup(input, policy, context)
+    }
+    fn vocabulary_parallel_project(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        linear.forward(input, context)
+    }
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        embedding.as_linear(input, context)
+    }
+    fn sum_parallel(
+        value: Self::Tensor,
+        _: &Self::ParallelContext,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        Ok(value)
+    }
+}
+
 impl GroupedNeuralBackend for ReferenceBackend {
     type Selector = ReferenceLinear;
     type GatedProductGroups = ReferenceLinear;
     type Relu2Groups = ReferenceLinear;
+
+    fn grouped_linear(
+        _: &mut Self::Linear,
+        input: &Self::Tensor,
+        groups: i32,
+        output_per_group: i32,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        let [batch, input_groups, tokens, _] = input.shape() else {
+            return Err(Error::backend(
+                "structural grouped-linear input must have rank four",
+            ));
+        };
+        if *input_groups != groups {
+            return Err(Error::backend("structural grouped-linear group mismatch"));
+        }
+        Ok(ReferenceTensor(vec![
+            *batch,
+            groups,
+            *tokens,
+            output_per_group,
+        ]))
+    }
 
     fn joint_group_selection(
         input: eredu_nn::JointGroupSelectionInput<'_, Self::Tensor>,
@@ -1336,6 +1369,16 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
     serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
     let inspection = configuration::inspect_artifact(artifact.path()).unwrap();
     let requirements = replicated_text_requirements(&inspection).unwrap();
+    let physical_requirements = requirements
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.presence().has_physical_source())
+        .map(|parameter| parameter.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        physical_requirements,
+        authoritative.keys().cloned().collect()
+    );
 
     for (target, (shape, owner)) in &authoritative {
         let requirement = requirements
@@ -1356,7 +1399,9 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
                 ReplicatedTextParameterOwner::StaticRole(actual),
             ) => assert_eq!(actual, expected),
             (
-                ParameterGroupOwner::ExecutionUnit { group, global_unit },
+                ParameterGroupOwner::ExecutionUnit {
+                    group, global_unit, ..
+                },
                 ReplicatedTextParameterOwner::ExecutionUnit {
                     group: actual_group,
                     unit,

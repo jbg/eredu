@@ -117,9 +117,9 @@ impl LiveCacheBlockPublication {
             |rank| {
                 format!(
                     "rank-p{}-t{}-e{}",
-                    rank_component(rank.pipeline_rank),
-                    rank_component(rank.tensor_parallel_rank),
-                    rank_component(rank.expert_parallel_rank)
+                    rank_component(rank.stage_rank()),
+                    rank_component(rank.shard_rank()),
+                    rank_component(rank.addressable_rank())
                 )
             },
         );
@@ -861,33 +861,34 @@ mod tests {
         )
         .unwrap();
         let hash = finalize_prompt_cache_shard(shard).unwrap();
-        let descriptor = PromptCacheDescriptor {
-            model_family: "test".into(),
-            effective_model_type: "test".into(),
-            checkpoint_fingerprint: "checkpoint".into(),
-            prefix_content_fingerprint: "content".into(),
-            architecture_fingerprint: "architecture".into(),
-            layer_count: 1,
-            global_layer_start: 0,
-            global_layer_end: 1,
-            batch_size: 1,
-            layer_layout: LayerSchedule::new(
+        let descriptor = PromptCacheDescriptor::new(
+            "test",
+            "test",
+            "checkpoint",
+            "content",
+            "architecture",
+            1,
+            0,
+            1,
+            1,
+            LayerSchedule::new(
                 1,
                 vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 2).unwrap()],
             )
             .unwrap(),
-            layer_prefix_offsets: vec![0],
-            state_segments: vec![PromptCacheStateSegment::new("state", 0..1).unwrap()],
-            sink_tokens: 0,
-            topology: PromptCacheTopology::default(),
-        };
+            vec![0],
+            vec![PromptCacheStateSegment::new("state", 0..1).unwrap()],
+            0,
+            PromptCacheTopology::default(),
+        )
+        .unwrap();
         PromptCacheManifest {
             schema_version: PROMPT_CACHE_SCHEMA_VERSION,
-            model_family: descriptor.model_family,
-            effective_model_type: descriptor.effective_model_type,
-            checkpoint_fingerprint: descriptor.checkpoint_fingerprint,
-            prefix_content_fingerprint: descriptor.prefix_content_fingerprint,
-            architecture_fingerprint: descriptor.architecture_fingerprint,
+            model_family: descriptor.model_family().into(),
+            effective_model_type: descriptor.effective_model_type().into(),
+            checkpoint_fingerprint: descriptor.checkpoint_fingerprint().into(),
+            prefix_content_fingerprint: descriptor.prefix_content_fingerprint().into(),
+            architecture_fingerprint: descriptor.architecture_fingerprint().into(),
             layer_count: 1,
             global_layer_start: 0,
             global_layer_end: 1,
@@ -895,11 +896,11 @@ mod tests {
             batch_size: 1,
             total_prefix_tokens: 2,
             prefix_sha256: "00".repeat(32),
-            layer_layout: descriptor.layer_layout,
+            layer_layout: descriptor.layer_layout().clone(),
             layer_prefix_offsets: vec![0],
-            state_segments: descriptor.state_segments,
+            state_segments: descriptor.state_segments().to_vec(),
             sink_tokens: 0,
-            topology: descriptor.topology,
+            topology: descriptor.topology().clone(),
             application_namespace: None,
             blocks: vec![PromptCacheBlock {
                 global_layer: 0,
@@ -1037,11 +1038,11 @@ mod tests {
             representation: CacheRepresentation::KeyValue,
             start: 4,
             end: 8,
-            rank: Some(eredu_core::cache::CacheRankIdentity {
-                pipeline_rank: Some(1),
-                tensor_parallel_rank: Some(2),
-                expert_parallel_rank: None,
-            }),
+            rank: Some(eredu_core::cache::CacheRankIdentity::new(
+                Some(1),
+                Some(2),
+                None,
+            )),
         };
         let first = LiveCacheBlockPublication::begin(directory.path(), &id);
         let second = LiveCacheBlockPublication::begin(directory.path(), &id);

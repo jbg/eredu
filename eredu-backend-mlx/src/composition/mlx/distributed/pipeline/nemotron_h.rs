@@ -8,7 +8,7 @@ use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_core::cache::{CacheRankIdentity, PromptCacheModelIdentity};
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureParameters, ExpertCacheLoadOptions, ExpertPass,
+    ArchitectureBoundary, ArchitectureParameters, ExpertPass, ParameterBankLoadOptions,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -22,7 +22,6 @@ use crate::{
             execution::layerwise::PipelineStageQuantizationSelection,
             residency::parameter_bank::AddressableParameterBank,
         },
-        MlxParallelContext,
     },
     composition::expert_dispatch::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -44,6 +43,7 @@ use crate::{
         PipelineMtpCache, PipelinePartitionMetadata, PipelineStageInput, PipelineStageOutput,
         PipelineStep,
     },
+    composition::mlx::distributed::topology::MlxParallelPlan,
     composition::{mlx::speculative::embedded::EmbeddedMtpOutput, nemotron_h::NemotronHBindings},
 };
 
@@ -318,18 +318,18 @@ pub(super) fn load_nemotron_h_pipeline(
     source_args: eredu_architectures::nemotron_h::ModelArgs,
     model_kind: ModelKind,
     store: SharedCheckpointSource,
-    topology: MlxParallelContext,
+    topology: MlxParallelPlan,
     wire_contract: eredu_runtime::PipelineWireContract,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
-    parameter_bank_options: Option<ExpertCacheLoadOptions>,
+    parameter_bank_options: Option<ParameterBankLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     validate_admitted_pipeline_kind(model_kind, &[ModelKind::NemotronH], "Nemotron-H")?;
     let explicit_parameter_bank = parameter_bank_options.is_some();
     let parameter_bank_options = parameter_bank_options
-        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+        .or_else(|| (topology.expert_parallel_size() > 1).then(ParameterBankLoadOptions::default));
     let external_experts = parameter_bank_options.is_some();
     let binding_adapter = if external_experts {
         NemotronHBindings::new_external_experts()
@@ -417,7 +417,7 @@ pub(super) fn load_nemotron_h_pipeline(
     let range = topology.layer_range(target_units)?;
     let neutral_placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
-        topology.pipeline_parallel_size,
+        topology.pipeline_parallel_size(),
     )?);
     let mut info = base_info(
         topology,
@@ -433,7 +433,7 @@ pub(super) fn load_nemotron_h_pipeline(
     let partition = neutral_placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
-            topology.pipeline_parallel_rank,
+            topology.pipeline_parallel_rank(),
             Arc::clone(&geometry),
             &parameter_description,
         )?;
@@ -455,7 +455,7 @@ pub(super) fn load_nemotron_h_pipeline(
             info.local_group_indices = assignment.local_global_group_indices().to_vec();
         }
     }
-    let parallel_layout = (topology.tensor_parallel_size > 1).then_some(planned_layout.clone());
+    let parallel_layout = (topology.tensor_parallel_size() > 1).then_some(planned_layout.clone());
     stage.layers = stage
         .range()
         .map(|global_layer| stage.build_unit(decoder_group, global_layer, stream))

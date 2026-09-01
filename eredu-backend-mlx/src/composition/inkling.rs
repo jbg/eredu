@@ -376,7 +376,8 @@ pub struct InklingModel {
     state_layouts: eredu_architectures::inkling::InklingStateLayouts,
     execution: Execution,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
+    parallel_info:
+        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
 }
 
 /// Collective context adapter for the neutral tensor-parallel MTP target.
@@ -399,7 +400,10 @@ impl InklingModel {
         &self.args
     }
 
-    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
+    {
         self.parallel_info.as_ref()
     }
 
@@ -441,8 +445,10 @@ impl InklingModel {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::backend::cache::prompt_cache_topology(info.topology())
-                        .cache_rank_identity()
+                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                        info.topology(),
+                    )
+                    .cache_rank_identity()
                 });
                 Ok(InklingState {
                     target: MlxHybridState::paged(
@@ -471,12 +477,14 @@ impl InklingModel {
     pub(crate) fn prompt_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        let topology = self
-            .parallel_info
-            .as_ref()
-            .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
-                crate::backend::cache::prompt_cache_topology(info.topology())
-            });
+        let topology = self.parallel_info.as_ref().map_or_else(
+            eredu_core::cache::PromptCacheTopology::default,
+            |info| {
+                crate::composition::mlx::distributed::topology::prompt_cache_topology(
+                    info.topology(),
+                )
+            },
+        );
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
             topology,
@@ -492,7 +500,7 @@ impl InklingModel {
         stream: &Stream,
     ) -> Result<(InklingState, eredu_core::cache::PromptCacheManifest), Error> {
         let identity = self.prompt_identity()?;
-        let rank = identity.topology.cache_rank_identity();
+        let rank = identity.topology().cache_rank_identity();
         let (manager, manifest) = open_prompt_cache(
             directory.as_ref(),
             expected,
@@ -919,6 +927,7 @@ impl InklingModel {
                     InputModality::Image => DecoderInputPart::Image(value),
                     InputModality::Audio => DecoderInputPart::Audio(value),
                     InputModality::Video => unreachable!(),
+                    _ => unreachable!("validated Inkling input modality"),
                 },
             })
             .collect::<Vec<_>>();
@@ -1019,6 +1028,7 @@ impl InklingModel {
                     InputModality::Image => DecoderInputPart::Image(value),
                     InputModality::Audio => DecoderInputPart::Audio(value),
                     InputModality::Video => unreachable!(),
+                    _ => unreachable!("validated Inkling input modality"),
                 },
             })
             .collect::<Vec<_>>();
@@ -1093,6 +1103,7 @@ impl InklingModel {
                     InputModality::Image => DecoderInputPart::Image(value),
                     InputModality::Audio => DecoderInputPart::Audio(value),
                     InputModality::Video => unreachable!(),
+                    _ => unreachable!("validated Inkling input modality"),
                 },
             })
             .collect::<Vec<_>>();
@@ -1228,6 +1239,7 @@ impl InklingModel {
                     InputModality::Image => DecoderInputPart::Image(value),
                     InputModality::Audio => DecoderInputPart::Audio(value),
                     InputModality::Video => unreachable!(),
+                    _ => unreachable!("validated Inkling input modality"),
                 },
             })
             .collect::<Vec<_>>();
@@ -1336,6 +1348,7 @@ impl InklingModel {
                     InputModality::Image => DecoderInputPart::Image(value),
                     InputModality::Audio => DecoderInputPart::Audio(value),
                     InputModality::Video => unreachable!(),
+                    _ => unreachable!("validated Inkling input modality"),
                 },
             })
             .collect::<Vec<_>>();
@@ -1534,6 +1547,7 @@ impl PreparedInklingInput {
                         InputModality::Image => InputModality::Image,
                         InputModality::Audio => InputModality::Audio,
                         InputModality::Text | InputModality::Video => unreachable!(),
+                        _ => unreachable!("validated Inkling input modality"),
                     });
                     projected.push(Some(crate::MlxTensor::from_array(value.clone())));
                 }
@@ -2041,7 +2055,7 @@ fn load_parallel_store(
     store: SharedCheckpointSource,
     args: ModelArgs,
     layer_policy: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
@@ -2214,7 +2228,7 @@ fn load_parallel_store(
 pub fn load_safetensors_tensor_parallel(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
     layer_policy: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
@@ -2235,7 +2249,7 @@ pub fn load_gguf_tensor_parallel(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
     layer_policy: LayerWeightResidency,
-    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
@@ -2245,7 +2259,7 @@ pub fn load_gguf_tensor_parallel(
 
 fn attach_parameter_bank(
     model: &mut InklingModel,
-    options: eredu_runtime::ExpertCacheLoadOptions,
+    options: eredu_runtime::ParameterBankLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(), Error> {
@@ -2269,7 +2283,7 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let eredu_architectures::configuration::SafetensorsModelConfig::Inkling(args) =
         artifact.model()
     else {
@@ -2315,7 +2329,7 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let expert_options = residency.expert_cache();
+    let expert_options = residency.parameter_bank_cache();
     let (store, args) = open_gguf_store(source, projector, residency.max_cached_shards())?;
     let layer_policy = residency.layers();
     let mut model = load_store(

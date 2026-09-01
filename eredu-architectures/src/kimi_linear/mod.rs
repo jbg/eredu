@@ -63,7 +63,7 @@ impl<T> ForwardContext<T> {
 /// Layered Kimi lifecycle over one heterogeneous physical schedule.
 pub struct LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     args: ModelArgs,
     static_modules: StaticModules<B>,
@@ -73,7 +73,7 @@ where
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     type DefinitionError = Error;
 
@@ -128,7 +128,7 @@ where
 
 impl<B> LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
     /// Builds unloaded static modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
@@ -540,7 +540,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         self.group.unit_path(0, index)?;
         block.forward_parallel(
@@ -589,7 +589,7 @@ where
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -713,7 +713,9 @@ where
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -770,7 +772,9 @@ where
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -855,7 +859,7 @@ where
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: GroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -901,7 +905,9 @@ where
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + BlockwiseAttentionBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
@@ -954,13 +960,14 @@ pub fn state_identity(
             "Kimi owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    Ok(ModelStateIdentity {
-        model_family: crate::ModelKind::KimiLinear.canonical_name().into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new(
+        crate::ModelKind::KimiLinear.canonical_name(),
+        args.model_type.clone(),
+        prompt_cache_architecture_fingerprint(args),
         layer_count,
         global_layer_start,
-        sink_tokens: 0,
+        0,
         topology,
-    })
+    )
+    .map_err(Error::backend)
 }
