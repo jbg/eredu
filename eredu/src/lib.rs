@@ -1,20 +1,4 @@
-//! Backend-neutral model loading, generation, and realtime facade.
-//!
-//! [`api`] and [`runtime`] remain available without an execution backend. The
-//! `mlx` feature selects the optional MLX backend adapter. Platform and
-//! capability features configure that backend without selecting it.
-//!
-//! The facade does not re-export contracts from its dependency crates. Import
-//! architecture, artifact, planning, generation, and scheduling contracts from
-//! their owning crates, and import facade-owned operations from [`api`] or
-//! [`runtime`].
-//!
-//! Backend implementation contracts are imported from their owning crates.
-//!
-//! Generic realtime scheduling and speculative execution infrastructure also
-//! comes from `eredu-core`; the facade exposes selected-backend realtime
-//! wrappers and prepared-chat speculative requests instead.
-
+#![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]
 // Backend execution boundaries intentionally pass complete runtime context;

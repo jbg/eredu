@@ -42,6 +42,7 @@ let plan = ExecutionPlan::fully_resident(device);
 let factory = LocalBackendFactory::default();
 let planned = LocalModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
 let (mut model, drafting) = planned.into_parts();
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `default_local_device` selects accelerator zero in CUDA and Apple Metal builds,
