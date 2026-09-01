@@ -24,7 +24,7 @@ use crate::{
 use safetensors::SafeTensors;
 
 /// Copies decoded GGUF metadata into a name-addressable map.
-pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
+pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
     checkpoint
         .metadata()
         .iter()
@@ -33,7 +33,7 @@ pub fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadat
 }
 
 /// Lowers affine GGUF encodings under an admitted canonical tensor mapping.
-pub fn gguf_affine_configs(
+fn gguf_affine_configs(
     checkpoint: &GgufCheckpoint,
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
 ) -> Result<HashMap<String, AffineQuantization>, Error> {
@@ -64,7 +64,7 @@ pub fn gguf_affine_configs(
 
 /// Lowers exact mixed affine and native-block GGUF encodings under an admitted
 /// canonical tensor mapping.
-pub fn gguf_quantization_configs(
+pub(crate) fn gguf_quantization_configs(
     checkpoint: &GgufCheckpoint,
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
 ) -> Result<HashMap<String, WeightQuantization>, Error> {
@@ -220,7 +220,7 @@ impl StrictLoadReport {
 }
 
 /// Visits every tensor in one safetensors file as an MLX-owned array.
-pub fn for_each_safetensor_array<F>(
+pub(super) fn for_each_safetensor_array<F>(
     path: impl AsRef<Path>,
     stream: &Stream,
     mut f: F,
@@ -373,7 +373,7 @@ fn load_arrays_quantized_strict<M: PhysicalParameters>(
 }
 
 /// Returns the validated safetensors payloads referenced by a model directory.
-pub fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
+pub(crate) fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
     Ok(eredu_checkpoint::safetensors::SafetensorsShards::discover(model_dir)?.into_payload_paths())
 }
 

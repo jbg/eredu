@@ -37,6 +37,13 @@ architecture-owned parameter identities, bindings, recipes, execution-unit
 layouts, and parallel plans; they do not reconstruct family policy from names,
 shapes, or configuration fields.
 
+Public checkpoint runtime types are the MLX-owned materializers, materialized
+tensors, errors, and explicit conversion options and reports used by backend
+tooling. Raw SafeTensors visitation, shard discovery, GGUF metadata copying and
+format lowering, and strict module assignment remain crate-internal composition
+helpers; portable catalogs, stores, selections, recipes, and I/O errors use
+their canonical `eredu-checkpoint` and `eredu-gguf` APIs.
+
 GGUF family selection and portable structural admission remain architecture
 registry concerns. MLX composition consumes the admitted family and schema,
 then validates only native encoding, operator, placement, and device

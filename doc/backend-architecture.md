@@ -963,7 +963,10 @@ likewise retain `eredu-checkpoint`'s `StoreError`; a concrete backend error
 covers only failures introduced while converting or materializing a neutral
 lease. In particular, GGUF metadata, descriptors, encoded spans, and selection
 plans are imported from `eredu-gguf`; backend GGUF APIs expose only their owned
-checkpoints, materializers, and materialized tensors.
+checkpoints, materializers, and materialized tensors. Concrete-backend shard
+discovery, raw tensor visitation, metadata copying, strict assignment, and
+format-lowering helpers are composition details, not public alternatives to
+the neutral checkpoint contracts.
 
 Neutral contracts use associated concrete types for these values. They do not
 use `Any`, untyped pointers, string-dispatched operations, or erased calls in
