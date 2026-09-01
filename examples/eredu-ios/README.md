@@ -51,6 +51,8 @@ and decode throughput in tokens per second.
 
 - `ModelStore` owns the Hugging Face cache index and the screen state.
 - `EreduEngine` wraps a small C ABI exposed by the Rust `staticlib` crate.
+- The native crate and its MLX/Metal dependencies are enabled only for iOS
+  targets, so host workspace builds do not compile an unusable platform bridge.
 - Each loaded model lives on one dedicated Rust thread. Loading and generation
   therefore preserve MLX's thread-affine runtime state while Swift remains
   asynchronous.

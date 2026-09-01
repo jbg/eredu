@@ -1,3 +1,5 @@
+#![cfg(target_os = "ios")]
+
 //! Small C ABI used by the Eredu iOS example.
 
 use std::{
