@@ -34,9 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: matrix.rust == '1.89.0'
+        id: msrv-toolchain
         uses: dtolnay/rust-toolchain@1.89.0
+      - if: matrix.rust == '1.89.0'
+        name: Select the installed MSRV
+        shell: bash
+        run: echo "RUSTUP_TOOLCHAIN=${{ steps.msrv-toolchain.outputs.name }}" >> "$GITHUB_ENV"
       - if: matrix.rust == 'stable'
-        uses: dtolnay/rust-toolchain@stable
+        name: Install the repository Rust toolchain
+        run: rustup toolchain install
       - name: Install native CPU build dependencies
         run: |
           sudo apt-get update

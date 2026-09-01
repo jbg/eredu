@@ -23,6 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
+        id: msrv-toolchain
+      - name: Select the installed MSRV
+        shell: bash
+        run: echo "RUSTUP_TOOLCHAIN=${{ steps.msrv-toolchain.outputs.name }}" >> "$GITHUB_ENV"
       - name: Install MLX CPU build dependencies
         run: |
           sudo apt-get update
@@ -52,7 +56,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
       - name: Install MLX CPU build dependencies
         run: |
           sudo apt-get update
@@ -90,6 +95,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
+        id: msrv-toolchain
+      - name: Select the installed MSRV
+        shell: bash
+        run: echo "RUSTUP_TOOLCHAIN=${{ steps.msrv-toolchain.outputs.name }}" >> "$GITHUB_ENV"
       - name: Install NVIDIA repository
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
@@ -130,7 +139,8 @@ jobs:
     runs-on: [self-hosted, linux, x64, cuda]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
       - name: Run CUDA device smoke test
         run: cargo run --release -p safemlx --no-default-features --features cuda --example cuda_smoke
       - name: Run Eredu facade tests on CUDA

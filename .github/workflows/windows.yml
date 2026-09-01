@@ -30,7 +30,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
       - name: Configure the Visual Studio 2022 environment
         shell: cmd
         run: |
@@ -81,7 +82,8 @@ jobs:
       SAFEMLX_CUDA_ARCHITECTURES: "75"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
       - name: Configure the Visual Studio 2022 environment
         shell: cmd
         run: |
@@ -153,7 +155,8 @@ jobs:
       SAFEMLX_CUDA_ARCHITECTURES: "75"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
       - name: Record GPU and toolkit versions
         run: |
           nvidia-smi
