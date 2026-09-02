@@ -37,7 +37,7 @@ use eredu_core::{
     WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
-use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
+use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2932,21 +2932,15 @@ fn resolve_model(
 
     let (repo_id, quantization) = split_hf_model_spec(spec)?;
 
-    let client = HFClientSync::new().context("failed to initialize the Hugging Face cache")?;
-    let cache = client
-        .scan_cache()
-        .send()
+    let cache_dir = resolve_cache_dir();
+    let cache = scan_repo(&cache_dir, RepoType::Model, repo_id)
         .context("failed to scan the Hugging Face cache")?;
-    let repo = cache
-        .repos
-        .iter()
-        .find(|repo| repo.repo_type == "model" && repo.repo_id == repo_id)
-        .with_context(|| {
-            format!(
-                "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
-                cache.cache_dir.display()
-            )
-        })?;
+    let repo = cache.repo.as_ref().with_context(|| {
+        format!(
+            "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
+            cache.cache_dir.display()
+        )
+    })?;
     match quantization {
         Some(quantization) => {
             let path = select_cached_gguf_from_revisions(
@@ -2963,7 +2957,7 @@ fn resolve_model(
             let commit_hash = repo
                 .revisions
                 .iter()
-                .find(|revision| revision.files.iter().any(|file| file.file_path == path))
+                .find(|revision| revision.files.iter().any(|file| file.snapshot_path == path))
                 .map(|revision| revision.commit_hash.clone())
                 .with_context(|| {
                     format!(
@@ -2984,7 +2978,7 @@ fn resolve_model(
                 })?;
             let path = if gguf_role == CachedGgufRole::SpeculativeDraft
                 && !revision.files.iter().any(|file| {
-                    file.file_path
+                    file.snapshot_path
                         .extension()
                         .and_then(|extension| extension.to_str())
                         .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
@@ -3048,16 +3042,10 @@ fn resolve_common_cached_gguf_pair(
         return Ok(None);
     }
 
-    let client = HFClientSync::new().context("failed to initialize the Hugging Face cache")?;
-    let cache = client
-        .scan_cache()
-        .send()
+    let cache_dir = resolve_cache_dir();
+    let cache = scan_repo(cache_dir, RepoType::Model, target_repo)
         .context("failed to scan the Hugging Face cache")?;
-    let Some(repo) = cache
-        .repos
-        .iter()
-        .find(|repo| repo.repo_type == "model" && repo.repo_id == target_repo)
-    else {
+    let Some(repo) = cache.repo.as_ref() else {
         return Ok(None);
     };
     let Some((revision, target_path, draft_path)) = select_cached_gguf_pair_from_revisions(
@@ -3139,27 +3127,27 @@ enum CachedGgufRole {
 }
 
 fn select_cached_gguf(
-    revision: &CachedRevisionInfo,
+    revision: &CachedRevision,
     quantization: &str,
     role: CachedGgufRole,
 ) -> Result<PathBuf> {
     let files = revision
         .files
         .iter()
-        .map(|file| file.file_path.as_path())
+        .map(|file| file.snapshot_path.as_path())
         .collect::<Vec<_>>();
     select_cached_gguf_path(&files, quantization, role)
 }
 
 fn select_unique_cached_gguf(
-    revision: &CachedRevisionInfo,
+    revision: &CachedRevision,
     role: CachedGgufRole,
 ) -> Result<Option<PathBuf>> {
     let mut candidates = revision
         .files
         .iter()
         .filter_map(|file| {
-            let path = file.file_path.as_path();
+            let path = file.snapshot_path.as_path();
             if !path
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -3186,7 +3174,7 @@ fn select_unique_cached_gguf(
 }
 
 fn select_cached_gguf_from_revisions(
-    revisions: &[CachedRevisionInfo],
+    revisions: &[CachedRevision],
     requested_revision: Option<&str>,
     quantization: &str,
     role: CachedGgufRole,
@@ -3199,7 +3187,7 @@ fn select_cached_gguf_from_revisions(
         return Ok(path);
     }
 
-    // Individual `hf_hub_download` calls can leave files from one repository
+    // Individual downloads can leave files from one repository
     // in separate commit snapshots. Search all cached snapshots when `main`
     // does not contain the requested quantization, while treating repeated
     // pointers to the same content-addressed blob as one candidate.
@@ -3208,16 +3196,16 @@ fn select_cached_gguf_from_revisions(
         .iter()
         .flat_map(|revision| &revision.files)
         .filter(|file| seen_blobs.insert(&file.blob_path))
-        .map(|file| file.file_path.as_path())
+        .map(|file| file.snapshot_path.as_path())
         .collect::<Vec<_>>();
     select_cached_gguf_path(&files, quantization, role)
 }
 
 fn select_cached_gguf_pair_from_revisions<'a>(
-    revisions: &'a [CachedRevisionInfo],
+    revisions: &'a [CachedRevision],
     target_quantization: &str,
     draft_quantization: &str,
-) -> Option<(&'a CachedRevisionInfo, PathBuf, PathBuf)> {
+) -> Option<(&'a CachedRevision, PathBuf, PathBuf)> {
     let mut ordered = revisions.iter().collect::<Vec<_>>();
     ordered.sort_unstable_by(|left, right| {
         let left_is_main = left.refs.iter().any(|name| name == "main");
@@ -3360,9 +3348,9 @@ fn format_cached_paths(paths: &[&Path]) -> String {
 }
 
 fn select_revision<'a>(
-    revisions: &'a [CachedRevisionInfo],
+    revisions: &'a [CachedRevision],
     requested: Option<&str>,
-) -> Result<&'a CachedRevisionInfo> {
+) -> Result<&'a CachedRevision> {
     if let Some(requested) = requested {
         return revisions
             .iter()
@@ -3392,7 +3380,7 @@ mod tests {
     };
 
     use clap::{CommandFactory, FromArgMatches, Parser};
-    use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
+    use hf_cache_reader::{scan_repo, CachedFile, CachedRevision, RepoType};
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
@@ -3411,15 +3399,31 @@ mod tests {
         WeightTransformationPlan,
     };
 
-    fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
-        CachedRevisionInfo {
-            commit_hash: hash.to_owned(),
-            snapshot_path: hash.into(),
-            files: Vec::new(),
-            size_on_disk: 0,
-            refs: refs.iter().map(|value| (*value).to_owned()).collect(),
-            last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified),
-        }
+    fn scanned_revision() -> CachedRevision {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory
+            .path()
+            .join("models--test--repo/snapshots/template");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("placeholder"), []).unwrap();
+        scan_repo(directory.path(), RepoType::Model, "test/repo")
+            .unwrap()
+            .repo
+            .unwrap()
+            .revisions
+            .pop()
+            .unwrap()
+    }
+
+    fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevision {
+        let mut revision = scanned_revision();
+        revision.commit_hash = hash.to_owned();
+        revision.snapshot_path = hash.into();
+        revision.files.clear();
+        revision.size_on_disk = 0;
+        revision.refs = refs.iter().map(|value| (*value).to_owned()).collect();
+        revision.last_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(modified);
+        revision
     }
 
     #[test]
@@ -3684,15 +3688,15 @@ mod tests {
         assert!(model_advertises_embedded_mtp(directory.path()));
     }
 
-    fn cached_file(file_path: &str, blob_path: &str) -> CachedFileInfo {
-        CachedFileInfo {
-            file_name: file_path.to_owned(),
-            file_path: file_path.into(),
-            blob_path: blob_path.into(),
-            size_on_disk: 0,
-            blob_last_accessed: SystemTime::UNIX_EPOCH,
-            blob_last_modified: SystemTime::UNIX_EPOCH,
-        }
+    fn cached_file(file_path: &str, blob_path: &str) -> CachedFile {
+        let mut file = scanned_revision().files.pop().unwrap();
+        file.relative_path = file_path.into();
+        file.snapshot_path = file_path.into();
+        file.blob_path = blob_path.into();
+        file.size_on_disk = 0;
+        file.last_accessed = SystemTime::UNIX_EPOCH;
+        file.last_modified = SystemTime::UNIX_EPOCH;
+        file
     }
 
     #[test]
@@ -4458,7 +4462,7 @@ mod tests {
                 &revision
                     .files
                     .iter()
-                    .map(|file| file.file_path.as_path())
+                    .map(|file| file.snapshot_path.as_path())
                     .collect::<Vec<_>>(),
                 "dflash-kquant",
                 CachedGgufRole::SpeculativeDraft,
