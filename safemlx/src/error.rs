@@ -222,6 +222,18 @@ fn setup_mlx_error_handler() {
     unsafe {
         safemlx_sys::mlx_set_error_handler(Some(handler), std::ptr::null_mut(), None);
     }
+
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    {
+        let status = unsafe {
+            safemlx_sys::mlx_metal_set_embedded_metallib(
+                safemlx_sys::MLX_METALLIB_LZFSE.as_ptr(),
+                safemlx_sys::MLX_METALLIB_LZFSE.len(),
+                safemlx_sys::MLX_METALLIB_UNCOMPRESSED_SIZE,
+            )
+        };
+        assert_eq!(status, 0, "failed to register the embedded MLX metallib");
+    }
 }
 
 pub(crate) fn ensure_mlx_error_handler() {

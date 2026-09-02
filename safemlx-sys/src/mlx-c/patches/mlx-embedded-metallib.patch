@@ -1,0 +1,157 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 93e7472..436ec93 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1,7 +1,10 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
++#include <compression.h>
+ #include <cstdlib>
++#include <dispatch/dispatch.h>
+ #include <sstream>
++#include <vector>
+ 
+ #include <fmt/format.h>
+ 
+@@ -108,6 +111,36 @@ std::pair<MTL::Library*, NS::Error*> load_library_from_path(
+   return std::make_pair(lib, error);
+ }
+ 
++std::pair<MTL::Library*, NS::Error*> load_embedded_library(
++    MTL::Device* device) {
++  const auto& embedded = get_embedded_metallib();
++  if (embedded.compressed_data == nullptr) {
++    return {nullptr, nullptr};
++  }
++
++  std::vector<uint8_t> decoded(embedded.uncompressed_size);
++  size_t decoded_size = compression_decode_buffer(
++      decoded.data(),
++      decoded.size(),
++      embedded.compressed_data,
++      embedded.compressed_size,
++      nullptr,
++      COMPRESSION_LZFSE);
++  if (decoded_size != decoded.size()) {
++    throw std::runtime_error(fmt::format(
++        "Failed to decompress the embedded metallib: expected {} bytes but decoded {}.",
++        decoded.size(),
++        decoded_size));
++  }
++
++  dispatch_data_t data = dispatch_data_create(
++      decoded.data(), decoded.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
++  if (data == nullptr) {
++    throw std::runtime_error(
++        "Failed to create dispatch data for the embedded metallib.");
++  }
++  NS::Error* error = nullptr;
++  auto lib = device->newLibrary(data, &error);
++  dispatch_release(data);
++  return {lib, error};
++}
++
+ #ifdef SWIFTPM_BUNDLE
+ MTL::Library* try_load_bundle(
+     MTL::Device* device,
+@@ -204,6 +237,19 @@ MTL::Library* load_default_library(MTL::Device* device) {
+     return lib;
+   }
+ 
++  // Prefer the metallib embedded by a static-library consumer over paths from
++  // the build machine or a separately copied application resource.
++  if (get_embedded_metallib().compressed_data != nullptr) {
++    auto [lib, error] = load_embedded_library(device);
++    if (!lib) {
++      auto detail = error == nullptr
++          ? "Metal returned no diagnostic"
++          : error->localizedDescription()->utf8String();
++      throw std::runtime_error(
++          fmt::format("Failed to load the embedded metallib: {}.", detail));
++    }
++    return lib;
++  }
++
+   NS::Error* error[5];
+   MTL::Library* lib;
+   // First try the colocated mlx.metallib
+diff --git a/mlx/backend/metal/metal.cpp b/mlx/backend/metal/metal.cpp
+index fa2ccf5..5febf1d 100644
+--- a/mlx/backend/metal/metal.cpp
++++ b/mlx/backend/metal/metal.cpp
+@@ -9,6 +9,7 @@ namespace mlx::core::metal {
+ namespace {
+ 
+ std::string g_metallib_path;
++EmbeddedMetallib g_embedded_metallib;
+ 
+ } // namespace
+ 
+@@ -60,4 +61,16 @@ const std::string& get_metallib_path() {
+   return g_metallib_path;
+ }
+ 
++void set_embedded_metallib(
++    const uint8_t* compressed_data,
++    size_t compressed_size,
++    size_t uncompressed_size) {
++  g_embedded_metallib = {
++      compressed_data, compressed_size, uncompressed_size};
++}
++
++const EmbeddedMetallib& get_embedded_metallib() {
++  return g_embedded_metallib;
++}
++
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+index 73171a2..7fa0e50 100644
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -2,6 +2,8 @@
+ 
+ #pragma once
+ 
++#include <cstddef>
++#include <cstdint>
+ #include <string>
+ #include <unordered_map>
+ #include <variant>
+@@ -27,4 +29,18 @@ MLX_API void stop_capture();
+ MLX_API void set_metallib_path(const std::string& path);
+ MLX_API const std::string& get_metallib_path();
+ 
++struct EmbeddedMetallib {
++  const uint8_t* compressed_data{nullptr};
++  size_t compressed_size{0};
++  size_t uncompressed_size{0};
++};
++
++/* Set an LZFSE-compressed in-memory fallback for mlx.metallib. The caller must
++ * keep compressed_data alive for the lifetime of the process. */
++MLX_API void set_embedded_metallib(
++    const uint8_t* compressed_data,
++    size_t compressed_size,
++    size_t uncompressed_size);
++MLX_API const EmbeddedMetallib& get_embedded_metallib();
++
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+index 4554575..3234442 100644
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -28,6 +28,18 @@ const std::string& get_metallib_path() {
+       "[metal::get_metallib_path] Cannot get metallib path without metal backend");
+ }
+ 
++void set_embedded_metallib(const uint8_t*, size_t, size_t) {}
++
++const EmbeddedMetallib& get_embedded_metallib() {
++  throw std::runtime_error(
++      "[metal::get_embedded_metallib] Cannot get embedded metallib without "
++      "metal backend");
++}
++
+ } // namespace metal
+ 
+ } // namespace mlx::core

@@ -310,6 +310,48 @@ fn export_metallib(dst: &Path, out_path: &Path) -> PathBuf {
     output
 }
 
+#[cfg(feature = "metal")]
+fn compress_metallib(metallib: &Path, out_path: &Path) -> (PathBuf, u64) {
+    let uncompressed_size = std::fs::metadata(metallib)
+        .expect("Couldn't inspect mlx.metallib")
+        .len();
+    let compressed = out_path.join("mlx.metallib.lzfse");
+    if compressed.exists() {
+        std::fs::remove_file(&compressed).expect("Couldn't replace compressed mlx.metallib");
+    }
+    let status = std::process::Command::new("/usr/bin/compression_tool")
+        .args(["-encode", "-a", "lzfse", "-i"])
+        .arg(metallib)
+        .arg("-o")
+        .arg(&compressed)
+        .status()
+        .expect("Couldn't run compression_tool to compress mlx.metallib");
+    assert!(
+        status.success(),
+        "compression_tool failed to compress mlx.metallib"
+    );
+    (compressed, uncompressed_size)
+}
+
+fn write_embedded_metallib_module(out_path: &Path, metallib: Option<(&Path, u64)>) {
+    let source = match metallib {
+        Some((path, uncompressed_size)) => {
+            let path = path
+                .to_str()
+                .expect("compressed metallib path is not valid UTF-8");
+            format!(
+                "#[doc(hidden)]\npub static MLX_METALLIB_LZFSE: &[u8] = include_bytes!({path:?});\n\
+                 #[doc(hidden)]\npub const MLX_METALLIB_UNCOMPRESSED_SIZE: usize = {uncompressed_size};\n"
+            )
+        }
+        None => "#[doc(hidden)]\npub static MLX_METALLIB_LZFSE: &[u8] = &[];\n\
+                 #[doc(hidden)]\npub const MLX_METALLIB_UNCOMPRESSED_SIZE: usize = 0;\n"
+            .to_owned(),
+    };
+    std::fs::write(out_path.join("embedded_metallib.rs"), source)
+        .expect("Couldn't write embedded metallib metadata");
+}
+
 fn build_and_link_mlx_c(out_path: &Path) {
     #[cfg(not(feature = "metal"))]
     let _ = out_path;
@@ -393,6 +435,10 @@ fn build_and_link_mlx_c(out_path: &Path) {
     if is_apple {
         config.define("MLX_METAL_COMPILER", find_metal_compiler());
         config.define("MLX_BUILD_METAL", "ON");
+        // Compile only MLX's baseline library. Most kernels are embedded as
+        // source and compiled lazily by Metal, whose persistent cache absorbs
+        // the one-time cost while keeping the distributable library small.
+        config.define("MLX_METAL_JIT", "ON");
     }
 
     #[cfg(feature = "accelerate")]
@@ -482,6 +528,7 @@ fn build_and_link_mlx_c(out_path: &Path) {
 
     #[cfg(feature = "metal")]
     if is_apple {
+        println!("cargo:rustc-link-lib=dylib=compression");
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
@@ -496,6 +543,8 @@ fn build_and_link_mlx_c(out_path: &Path) {
     #[cfg(feature = "metal")]
     if is_apple {
         let metallib = export_metallib(&dst, out_path);
+        let (compressed, uncompressed_size) = compress_metallib(&metallib, out_path);
+        write_embedded_metallib_module(out_path, Some((&compressed, uncompressed_size)));
         println!("cargo:metadata=metallib_path={}", metallib.display());
         println!(
             "cargo:rustc-env=SAFEMLX_METALLIB_PATH={}",
@@ -546,6 +595,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx-c");
     println!("cargo:rerun-if-changed=vendor");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    write_embedded_metallib_module(&out_path, None);
 
     if is_docs_rs() {
         println!("cargo:warning=Using pregenerated bindings on docs.rs");

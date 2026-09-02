@@ -30,6 +30,10 @@ extern "C" {
 
 int mlx_metal_is_available(bool* res);
 int mlx_metal_set_metallib_path(const char* path);
+int mlx_metal_set_embedded_metallib(
+    const uint8_t* compressed_data,
+    size_t compressed_size,
+    size_t uncompressed_size);
 int mlx_metal_start_capture(const char* path);
 int mlx_metal_stop_capture(void);
 

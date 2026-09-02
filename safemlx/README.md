@@ -54,8 +54,9 @@ completion events, asynchronous device timing, and host-transfer buffers.
 
 Eredu's MLX implementation supports Apple silicon on macOS and selected Apple
 device targets, x86-64 Linux with CPU or CUDA, and native x86-64 Windows with
-CPU or CUDA. Backend prerequisites and application-bundling requirements are
-documented in the MLX backend's [platform setup
+CPU or CUDA. The compressed Metal library is embedded automatically. Backend
+prerequisites and platform packaging details are documented in the MLX
+backend's [platform setup
 guide](https://github.com/jbg/eredu/blob/main/eredu-backend-mlx/doc/platforms.md).
 
 The minimum supported Rust version is 1.89.

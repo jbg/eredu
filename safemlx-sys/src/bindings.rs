@@ -2593,6 +2593,13 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn mlx_metal_set_embedded_metallib(
+        compressed_data: *const u8,
+        compressed_size: usize,
+        uncompressed_size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn mlx_metal_start_capture(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
 }
 extern "C" {

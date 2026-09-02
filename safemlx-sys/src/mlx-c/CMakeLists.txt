@@ -93,6 +93,9 @@ else()
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
       COMMAND ${CMAKE_COMMAND}
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-cuda-jit-include-dirs.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-embedded-metallib.patch
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
   FetchContent_MakeAvailable(mlx)
 endif()

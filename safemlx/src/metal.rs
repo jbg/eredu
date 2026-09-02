@@ -3,11 +3,11 @@
 use crate::error::{self, Exception, Result};
 use std::{ffi::CString, path::Path};
 
-/// Path to the `mlx.metallib` exported by `safemlx-sys` for this build.
+/// Path to the uncompressed `mlx.metallib` exported for this build.
 ///
-/// This is a build-machine path. Add the file to the Xcode application's Copy
-/// Bundle Resources phase under the name `mlx.metallib`; it is not a path that
-/// can be used directly on an iOS, tvOS, or visionOS device.
+/// The compressed library is embedded automatically, so normal applications
+/// do not need this build-machine path. It is retained for diagnostics and
+/// explicit custom-library overrides.
 pub const BUILT_METALLIB_PATH: Option<&str> = option_env!("SAFEMLX_METALLIB_PATH");
 
 fn check_status(status: i32) -> Result<()> {
@@ -30,9 +30,8 @@ pub fn is_available() -> Result<bool> {
 
 /// Overrides the path from which MLX loads its default Metal library.
 ///
-/// Call this before creating arrays or performing any other MLX operation. An
-/// application that copies `mlx.metallib` into the root of its bundle normally
-/// does not need this override because MLX discovers that location itself.
+/// Call this before creating arrays or performing any other MLX operation. The
+/// explicit path takes precedence over the library embedded by `safemlx`.
 pub fn set_metallib_path(path: impl AsRef<Path>) -> Result<()> {
     error::ensure_mlx_error_handler();
     let path = path

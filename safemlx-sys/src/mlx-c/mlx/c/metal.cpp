@@ -29,6 +29,24 @@ extern "C" int mlx_metal_set_metallib_path(const char* path) {
   }
   return 0;
 }
+extern "C" int mlx_metal_set_embedded_metallib(
+    const uint8_t* compressed_data,
+    size_t compressed_size,
+    size_t uncompressed_size) {
+  try {
+    if (compressed_data == nullptr || compressed_size == 0 ||
+        uncompressed_size == 0) {
+      throw std::invalid_argument(
+          "[mlx_metal_set_embedded_metallib] metallib data and sizes must be non-empty");
+    }
+    mlx::core::metal::set_embedded_metallib(
+        compressed_data, compressed_size, uncompressed_size);
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_metal_start_capture(const char* path) {
   try {
     mlx::core::metal::start_capture(std::string(path));

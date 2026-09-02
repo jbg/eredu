@@ -21,7 +21,7 @@ packed-quantization support required by Eredu's MLX backend.
 | x86-64 Windows MSVC | CPU by default; optional CUDA |
 
 Native compilers, CMake, platform libraries, CUDA/cuDNN setup, Apple deployment
-targets, and `mlx.metallib` bundling are covered in [Platform
+targets, and the embedded Metal library are covered in [Platform
 setup](https://github.com/jbg/eredu/blob/main/eredu-backend-mlx/doc/platforms.md).
 
 ## Features

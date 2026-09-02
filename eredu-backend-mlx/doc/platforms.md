@@ -44,11 +44,17 @@ Some Xcode installations provide the Metal toolchain as a separate component:
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-The build writes `mlx.metallib` to
-`target/<rust-target>/<profile>/safemlx-resources/mlx.metallib`. Add that file
-to the application's Copy Bundle Resources phase without renaming it. To stage
-it directly into an Xcode product, set `SAFEMLX_METALLIB_OUTPUT_DIR` before the
-Cargo build.
+The MLX kernel library is built in JIT mode, compressed with LZFSE, and embedded
+in the Rust library. Executables and application bundles therefore do not need
+to copy or install `mlx.metallib`. Most kernels compile lazily on first use and
+are then covered by Metal's persistent cache, so a newly installed application
+can have a one-time cold-start cost.
+
+For diagnostics or an intentional custom-library override, the build also
+writes the uncompressed baseline library to
+`target/<rust-target>/<profile>/safemlx-resources/mlx.metallib`.
+`SAFEMLX_METALLIB_OUTPUT_DIR` changes that export location; it is not needed for
+normal packaging.
 
 The build honors `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, and
 `XROS_DEPLOYMENT_TARGET`. Mac Catalyst and watchOS are not supported.
