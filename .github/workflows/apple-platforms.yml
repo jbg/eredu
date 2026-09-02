@@ -19,7 +19,7 @@ on:
 
 jobs:
   macos:
-    runs-on: macos-26-arm64
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain
@@ -82,7 +82,7 @@ jobs:
         run: cargo test --workspace concurrent_safe -- --test-threads=1
 
   target-mapping:
-    runs-on: macos-26-arm64
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain
@@ -93,7 +93,7 @@ jobs:
           /tmp/safemlx-build-support-tests
 
   cross-build:
-    runs-on: macos-26-arm64
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
