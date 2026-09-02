@@ -91,6 +91,7 @@ jobs:
     name: Rust 1.89 CUDA and NCCL compatibility
     runs-on: ubuntu-22.04
     env:
+      CARGO_INCREMENTAL: "0"
       SAFEMLX_CUDA_ARCHITECTURES: "80"
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +118,13 @@ jobs:
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "/usr/local/cuda-12.9/bin" >> "$GITHUB_PATH"
+      - name: Cache CUDA build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: cuda-target-v1-ubuntu-22.04-${{ runner.arch }}-cuda12.9-cudnn9-nccl-sm${{ env.SAFEMLX_CUDA_ARCHITECTURES }}-rust1.89-test-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'safemlx-sys/**') }}
+          restore-keys: |
+            cuda-target-v1-ubuntu-22.04-${{ runner.arch }}-cuda12.9-cudnn9-nccl-sm${{ env.SAFEMLX_CUDA_ARCHITECTURES }}-rust1.89-test-
       - name: Build and link safemlx with CUDA and NCCL
         # Some generated CUDA translation units are memory-intensive. Keep the
         # native build serialized so standard hosted runners do not OOM.
