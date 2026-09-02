@@ -22,6 +22,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: windows-builds-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CMAKE_GENERATOR: Ninja
 

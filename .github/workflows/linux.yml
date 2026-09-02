@@ -16,6 +16,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: linux-builds-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   msrv:
     name: Rust 1.89 compatibility
