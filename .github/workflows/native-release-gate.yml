@@ -10,7 +10,7 @@ permissions:
 jobs:
   macos:
     name: Native MLX and self-contained Ring conformance
-    runs-on: macos-15
+    runs-on: macos-26-arm64
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain

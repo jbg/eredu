@@ -8,10 +8,11 @@ Rust version is 1.89.
 ## macOS on Apple silicon
 
 The default `eredu` features enable the MLX backend with Accelerate and Metal.
-Install Xcode or the Xcode Command Line Tools and CMake, then build normally:
+MLX's JIT-generated NAX kernels require Xcode 26.2 or newer. Install Xcode and
+CMake, then build normally:
 
 ```sh
-xcode-select --install
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
 brew install cmake
 cargo build --release -p eredu
 ```
