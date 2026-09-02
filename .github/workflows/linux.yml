@@ -128,11 +128,11 @@ jobs:
         run: |
           cargo test -j 1 --locked -p eredu --no-default-features --features "nccl,image,audio" --lib --no-run
           cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --no-run
-          cargo check -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency
+          cargo test -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency --no-run
       - name: Compile the CUDA codec backend
         run: cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image,codec" --test mimi_codec --no-run
-      - name: Check the CUDA language-model CLI
-        run: cargo check -j 1 --locked -p eredu-cli --no-default-features --features nccl
+      - name: Build and final-link the CUDA language-model CLI tests
+        run: cargo test -j 1 --locked -p eredu-cli --no-default-features --features nccl --no-run
 
   cuda-gpu-smoke:
     if: github.event_name == 'workflow_dispatch'

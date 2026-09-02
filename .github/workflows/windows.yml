@@ -138,11 +138,11 @@ jobs:
           cargo test -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
           cargo test -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
       - name: Build the linked CUDA smoke executable
-        run: cargo build -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features
+        run: cargo test -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features --no-run
       - name: Build and final-link eredu configurations
         run: cargo test -j 1 -p eredu --no-default-features --features "cuda,image,audio" --no-run
-      - name: Build the linked eredu CLI
-        run: cargo build -j 1 -p eredu-cli --no-default-features --features cuda
+      - name: Build and final-link the eredu CLI tests
+        run: cargo test -j 1 -p eredu-cli --no-default-features --features cuda --no-run
       - name: Compile CUDA codec and integration tests
         run: |
           cargo test -j 1 -p eredu-backend-mlx --features "cuda,codec" --test mimi_codec --no-run
@@ -162,10 +162,10 @@ jobs:
           nvidia-smi
           nvcc --version
       - name: Test the pure-Rust GGUF backend
-        run: cargo test -p eredu-gguf
+        run: cargo test --release -p eredu-gguf
       - name: Run safemlx CUDA tests
-        run: cargo test -p safemlx --features cuda --lib --no-default-features
+        run: cargo test --release -p safemlx --features cuda --lib --no-default-features
       - name: Run CUDA device and numerical smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke --no-default-features
       - name: Run Eredu MLX integration tests on CUDA
-        run: cargo test -p eredu --no-default-features --features cuda
+        run: cargo test --release -p eredu --no-default-features --features cuda
