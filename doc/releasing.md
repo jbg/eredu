@@ -50,13 +50,18 @@ keep optional facade features from accidentally activating the native backend
 or depending on its availability.
 
 The manually dispatched `Native release gate` workflow must pass before
-publication. Its macOS job first proves that native MLX execution is available;
-failure to initialize Metal is a test failure, never a skip. The same job runs
-every self-contained ignored distributed Ring test serially across the
-Cartesian-topology, expert-exchange, checkpoint-partition, pipeline, and
-realtime suites rather than sampling the representative cases used by
-pull-request CI. To run these gates locally on an Apple silicon host, outside a
-sandbox:
+publication. Its Windows jobs compile and link the complete CUDA surface with
+CUDA 12.9.1 and 13.0.2; the same matrix runs nightly and can be dispatched
+manually through the `Windows CUDA compatibility` workflow. Normal pull-request
+and main-branch CI requires only the CUDA 12.9.1 build.
+
+The release gate's macOS job first proves that native MLX execution is
+available; failure to initialize Metal is a test failure, never a skip. The
+same job runs every self-contained ignored distributed Ring test serially
+across the Cartesian-topology, expert-exchange, checkpoint-partition, pipeline,
+and realtime suites rather than sampling the representative cases used by
+pull-request CI. To run the Apple portion locally on an Apple silicon host,
+outside a sandbox:
 
 ```bash
 cargo test -p eredu-backend-mlx --features metal --lib \

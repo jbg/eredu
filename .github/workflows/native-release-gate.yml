@@ -8,6 +8,30 @@ permissions:
   contents: read
 
 jobs:
+  windows-cuda:
+    name: Windows CUDA ${{ matrix.cuda }} release compatibility
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.9"
+            toolkit_version: "12.9.1"
+            cudnn_version: "9.23.2.1"
+            installer: "https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_576.57_windows.exe"
+            cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda12-archive.zip"
+          - cuda: "13.0"
+            toolkit_version: "13.0.2"
+            cudnn_version: "9.23.2.1"
+            installer: "https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_windows.exe"
+            cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda13-archive.zip"
+    uses: ./.github/workflows/windows-cuda-build.yml
+    with:
+      cuda: ${{ matrix.cuda }}
+      toolkit_version: ${{ matrix.toolkit_version }}
+      cudnn_version: ${{ matrix.cudnn_version }}
+      installer: ${{ matrix.installer }}
+      cudnn: ${{ matrix.cudnn }}
+
   macos:
     name: Native MLX and self-contained Ring conformance
     runs-on: macos-26-arm64
