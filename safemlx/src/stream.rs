@@ -32,13 +32,28 @@ impl Clone for Stream {
 }
 
 impl Stream {
-    /// Create a new stream on the given device
-    pub fn new_with_device(device: &Device) -> Stream {
+    /// Tries to create a new stream on the given device.
+    #[track_caller]
+    pub fn try_new_with_device(device: &Device) -> Result<Stream> {
+        crate::error::ensure_mlx_error_handler();
         let _guard = runtime_lock::enter();
-        unsafe {
-            let c_stream = safemlx_sys::mlx_stream_new_device(device.c_device);
-            Stream { c_stream }
+        let c_stream = unsafe { safemlx_sys::mlx_stream_new_device(device.c_device) };
+        if c_stream.ctx.is_null() {
+            return Err(crate::error::get_and_clear_last_mlx_error()
+                .expect("MLX stream initialization failed but no error was set")
+                .into());
         }
+        Ok(Stream { c_stream })
+    }
+
+    /// Creates a new stream on the given device.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the underlying MLX error when stream initialization fails.
+    #[track_caller]
+    pub fn new_with_device(device: &Device) -> Stream {
+        Self::try_new_with_device(device).expect("Failed to initialize stream")
     }
 
     /// Get the underlying C pointer.
@@ -159,5 +174,15 @@ mod tests {
     fn streams_can_move_between_threads() {
         fn assert_send<T: Send>() {}
         assert_send::<Stream>();
+    }
+
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    #[test]
+    fn gpu_stream_initialization_returns_the_original_error() {
+        let error = Stream::try_new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0))
+            .unwrap_err();
+        assert!(error
+            .what()
+            .contains("Cannot make gpu stream without gpu backend"));
     }
 }

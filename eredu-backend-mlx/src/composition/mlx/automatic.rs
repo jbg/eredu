@@ -181,8 +181,8 @@ impl RealtimeBackend for MlxRealtimeAdapter {
 pub fn create_realtime_backend(device: &DevicePlan) -> Result<MlxRealtimeAdapter, Error> {
     let realized =
         mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
-    let stream = Stream::new_with_device(&realized.device);
-    let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let stream = Stream::try_new_with_device(&realized.device)?;
+    let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))?;
     Ok(MlxRealtimeAdapter {
         backend: MlxRealtimeBackend::new(&stream, &weights_stream),
     })
@@ -495,8 +495,10 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         };
         probe = probe.with_residency(residency);
         let realized = mlx_device(probe.device())?;
-        let stream = Stream::new_with_device(&realized.device);
-        let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let stream = Stream::try_new_with_device(&realized.device)
+            .map_err(|error| planning_backend_error("create_execution_stream", error))?;
+        let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
+            .map_err(|error| planning_backend_error("create_weights_stream", error))?;
         let backend = MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity);
         let options = mlx_load_options(self, &probe)
             .map_err(|error| planning_backend_error("realize_probe", error))?;
@@ -536,8 +538,10 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
         let realized = mlx_device(plan.device())?;
-        let stream = Stream::new_with_device(&realized.device);
-        let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let stream = Stream::try_new_with_device(&realized.device)
+            .map_err(|error| planning_backend_error("create_execution_stream", error))?;
+        let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
+            .map_err(|error| planning_backend_error("create_weights_stream", error))?;
         let options = mlx_load_options(self, plan)
             .map_err(|error| planning_backend_error("realize_execution_plan_target", error))?;
         Ok(ExecutionPlanTarget::new(
@@ -587,7 +591,9 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                     DraftPlacementPlan::Target => target.backend().stream().clone(),
                     DraftPlacementPlan::Device { device } => {
                         let realized = mlx_device(device)?;
-                        Stream::new_with_device(&realized.device)
+                        Stream::try_new_with_device(&realized.device).map_err(|error| {
+                            planning_backend_error("create_draft_execution_stream", error)
+                        })?
                     }
                     _ => {
                         return Err(AutomaticPlanningError::Invalid(
@@ -808,7 +814,7 @@ mod tests {
     fn realized_cpu_identity_is_derived_from_the_native_device() {
         let plan = DevicePlan::new("mlx", "cpu:0").unwrap();
         let realized = mlx_device(&plan).unwrap();
-        let stream = Stream::new_with_device(&realized.device);
+        let stream = Stream::try_new_with_device(&realized.device).unwrap();
         let backend = MlxBackend::for_execution_plan(&stream, &stream, realized.identity);
 
         let devices = backend.devices().unwrap();
