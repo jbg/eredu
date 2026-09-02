@@ -233,6 +233,29 @@ pub(crate) fn localized_expert_bank_spec(
     expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
+/// Derives the complete replicated expert plan directly from normalized geometry.
+pub fn replicated_expert_realization_plan(
+    args: &ModelArgs,
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let unit_specs = (0..layers)
+        .map(|layer| expert_bank_spec(args, layer).map(|spec| ((owner_group.clone(), layer), spec)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(
+        global_experts,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
+            0,
+        )
+        .map_err(Error::backend)?,
+        unit_specs,
+    )
+    .map_err(Error::backend)
+}
+
 /// Derives complete expert ownership and rank-local bank geometry from GPT-OSS.
 pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     architecture: &super::LayeredModel<B>,

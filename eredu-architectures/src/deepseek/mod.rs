@@ -102,6 +102,40 @@ where
         .map_err(eredu_nn::Error::backend)
 }
 
+/// Derives the exact target-only replicated V3 routed realization.
+pub fn v3_replicated_expert_realization_plan(
+    args: &V3Args,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    if args.num_nextn_predict_layers != 0 || !args.has_sparse_moe_layers() {
+        return Err(eredu_nn::Error::backend(
+            "DeepSeek-V3 routed text requires sparse target units and no prediction units",
+        ));
+    }
+    let global_experts =
+        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    let local_experts = i32::try_from(global_experts).map_err(eredu_nn::Error::backend)?;
+    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let target_group =
+        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
+    let unit_specs = (0..target)
+        .filter(|layer| args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe))
+        .map(|layer| {
+            v3::localized_expert_bank_spec(args, layer, local_experts, args.moe_intermediate_size)
+                .map(|spec| ((target_group.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(
+        global_experts,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+            0,
+        )
+        .map_err(eredu_nn::Error::backend)?,
+        unit_specs,
+    )
+    .map_err(eredu_nn::Error::backend)
+}
+
 /// Derives complete V4 routed-expert ownership and rank-local bank geometry.
 pub fn v4_expert_realization_plan<B>(
     architecture: &v4::Model<B>,
@@ -154,4 +188,37 @@ where
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map_err(eredu_nn::Error::backend)
+}
+
+/// Derives the exact target-only replicated V4 routed realization.
+pub fn v4_replicated_expert_realization_plan(
+    args: &V4Args,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    if args.num_nextn_predict_layers != 0 {
+        return Err(eredu_nn::Error::backend(
+            "DeepSeek-V4 routed text does not admit prediction units",
+        ));
+    }
+    let global_experts =
+        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    let local_experts = i32::try_from(global_experts).map_err(eredu_nn::Error::backend)?;
+    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let target_group =
+        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
+    let unit_specs = (0..target)
+        .map(|layer| {
+            v4::localized_expert_bank_spec(args, layer, local_experts, args.moe_intermediate_size)
+                .map(|spec| ((target_group.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(
+        global_experts,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+            0,
+        )
+        .map_err(eredu_nn::Error::backend)?,
+        unit_specs,
+    )
+    .map_err(eredu_nn::Error::backend)
 }

@@ -235,7 +235,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
@@ -266,7 +266,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             combined_output: Some(&combined),
             expert_count,
         })?;
-        Ok(combined)
+        eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &combined)
     }
 
     /// Executes TP shared projections while the provider owns routed experts.

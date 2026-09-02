@@ -943,6 +943,49 @@ where
     where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display;
+
+    /// Executes one provider-backed unit while exposing its architecture-owned
+    /// routed/shared/combined observation stages.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+        Self::Error: std::fmt::Display,
+    {
+        match self.routed_observation_point(group, index)? {
+            Some(point) => {
+                let mut observed = ObservedExpertProvider::new(provider, observer, point);
+                self.forward_unit_with_provider(
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    pass,
+                    &mut observed,
+                    context,
+                )
+            }
+            None => self.forward_unit_with_provider(
+                group, index, unit, hidden, state, forward, pass, provider, context,
+            ),
+        }
+    }
 }
 
 /// Tensor-parallel provider-aware unit execution.
@@ -1588,25 +1631,9 @@ where
             |architecture, group, index, unit, hidden, state, forward, context| {
                 let path = architecture.unit_path(group, index)?;
                 let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
-                let output = match architecture.routed_observation_point(group, index)? {
-                    Some(point) => {
-                        let mut observed = ObservedExpertProvider::new(provider, observer, point);
-                        architecture.forward_unit_with_provider(
-                            group,
-                            index,
-                            unit,
-                            &input,
-                            state,
-                            forward,
-                            pass,
-                            &mut observed,
-                            context,
-                        )?
-                    }
-                    None => architecture.forward_unit_with_provider(
-                        group, index, unit, &input, state, forward, pass, provider, context,
-                    )?,
-                };
+                let output = architecture.forward_unit_observed_with_provider(
+                    group, index, unit, &input, state, forward, pass, provider, context, observer,
+                )?;
                 observe_and_intervene(observer, &format!("{path}.output"), &output)
             },
         )

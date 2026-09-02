@@ -289,6 +289,14 @@ fn binding_from_exact_replicated_text_task(
                     task.name()
                 )));
             }
+            let recipe = if task.executable() == eredu_checkpoint::LinearFormat::MxFp4
+                && metadata.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4
+            {
+                crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, store)?
+            } else {
+                recipe
+            };
+            let metadata = recipe.infer(store)?;
             WeightBinding::from_recipe(task.name(), recipe, metadata.byte_len())?
         }
         _ => {
@@ -309,6 +317,7 @@ pub fn build_exact_replicated_text_bindings<M>(
     module: &M,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     tasks: &[&ReplicatedTextMaterializationTask],
+    addressable_parameters: &BTreeSet<String>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
 where
     M: Parameterized<crate::MlxTensor>,
@@ -413,6 +422,7 @@ where
     }
     let missing = parameter_names
         .difference(&covered)
+        .filter(|name| !addressable_parameters.contains(*name))
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {

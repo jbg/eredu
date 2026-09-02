@@ -314,6 +314,7 @@ struct ReferenceLinear {
     weight: ReferenceTensor,
     metadata: ParameterMetadata,
     expert_spec: Option<GroupedGatedProductSpec>,
+    relu2_spec: Option<GroupedRelu2Spec>,
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceLinear {
@@ -392,6 +393,12 @@ impl GroupedGatedProductOperator<ReferenceTensor> for ReferenceLinear {
 }
 
 impl GroupedRelu2Operator<ReferenceTensor> for ReferenceLinear {
+    fn spec(&self) -> &GroupedRelu2Spec {
+        self.relu2_spec
+            .as_ref()
+            .expect("reference ReLU-squared bank retains its construction spec")
+    }
+
     fn forward_grouped(
         &mut self,
         input: &ReferenceTensor,
@@ -531,6 +538,7 @@ impl NeuralBackend for ReferenceBackend {
             weight: ReferenceTensor(vec![spec.output, spec.input]),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
             expert_spec: None,
+            relu2_spec: None,
         })
     }
     fn embedding(spec: EmbeddingSpec, _: &()) -> Result<Self::Embedding, Error> {
@@ -651,6 +659,7 @@ impl eredu_nn::DistributedNeuralBackend for ReferenceBackend {
             weight: ReferenceTensor(vec![range.local.len() as i32, spec.input]),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
             expert_spec: None,
+            relu2_spec: None,
         })
     }
     fn vocabulary_parallel_lookup(
@@ -739,6 +748,7 @@ impl GroupedNeuralBackend for ReferenceBackend {
             ]),
             metadata: ParameterMetadata::from_spec(spec.weight(), spec.weight().trainable),
             expert_spec: None,
+            relu2_spec: None,
         })
     }
 
@@ -762,6 +772,7 @@ impl GroupedNeuralBackend for ReferenceBackend {
             ]),
             metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
             expert_spec: Some(spec),
+            relu2_spec: None,
         })
     }
 
@@ -779,6 +790,7 @@ impl GroupedNeuralBackend for ReferenceBackend {
                 spec.up().weight().trainable,
             ),
             expert_spec: None,
+            relu2_spec: Some(spec),
         })
     }
 }

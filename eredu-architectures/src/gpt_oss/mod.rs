@@ -19,7 +19,9 @@ pub use config::{
     MxFp4Config,
 };
 pub use model::{new_layered_model, LayeredModel};
-pub use moe::{expert_bank_spec, expert_realization_plan, RoutedMlp};
+pub use moe::{
+    expert_bank_spec, expert_realization_plan, replicated_expert_realization_plan, RoutedMlp,
+};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
     static_parameter_groups, LocalGeometry,

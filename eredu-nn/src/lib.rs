@@ -2205,7 +2205,7 @@ pub trait GroupSelectionOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 }
 
 /// Parameter identities for one gated-product group or one packed group axis.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GatedProductGroupParameters {
     /// Gating projection weight.
     gate: GroupedProjectionSpec,
@@ -2239,7 +2239,7 @@ impl GatedProductGroupParameters {
 }
 
 /// One group projection identity and optional physical encoding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GroupedProjectionSpec {
     /// Stable logical parameter identity.
     weight: ParameterSpec,
@@ -2293,7 +2293,8 @@ impl GroupedProjectionSpec {
         Ok(())
     }
 
-    fn parameters(&self) -> Vec<&ParameterSpec> {
+    /// Returns weight, optional bias, and physical companions in binding order.
+    pub fn parameters(&self) -> Vec<&ParameterSpec> {
         let mut parameters = vec![&self.weight];
         parameters.extend(self.bias.as_ref());
         parameters.extend(self.format.scale());
@@ -2303,7 +2304,7 @@ impl GroupedProjectionSpec {
 }
 
 /// Logical parameter layout for a gated-product bank.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Packed layout stays inline on the construction hot path.
 #[non_exhaustive]
 pub enum GatedProductGroupLayout {
@@ -2320,7 +2321,7 @@ pub enum GatedProductGroupLayout {
 }
 
 /// Complete architecture-owned construction specification for grouped gated-product groups.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupedGatedProductSpec {
     /// Number of groups.
     group_count: i32,
@@ -2504,7 +2505,7 @@ pub trait TensorParallelGroupedGatedProductOperator<T: Tensor>:
 }
 
 /// Complete construction specification for packed grouped ReLU-squared groups.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GroupedRelu2Spec {
     /// Number of groups.
     group_count: i32,
@@ -2536,6 +2537,12 @@ impl GroupedRelu2Spec {
         };
         spec.validate()?;
         Ok(spec)
+    }
+    /// Returns a copy with placement-resolved group geometry.
+    pub fn with_group_count(mut self, group_count: i32) -> Result<Self, Error> {
+        self.group_count = group_count;
+        self.validate()?;
+        Ok(self)
     }
     /// Returns the number of parameter groups.
     pub const fn group_count(&self) -> i32 {
@@ -2582,6 +2589,9 @@ impl GroupedRelu2Spec {
 
 /// Statically dispatched grouped ReLU-squared bank.
 pub trait GroupedRelu2Operator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Returns the exact grouped specification used to construct this bank.
+    fn spec(&self) -> &GroupedRelu2Spec;
+
     /// Executes selected groups and combines their outputs by selection weight.
     fn forward_grouped(
         &mut self,
@@ -2880,10 +2890,18 @@ impl<B: HyperNeuralBackend> HyperConnection<B> {
 }
 
 /// Neutral, statically dispatched final stream-collapse layer.
-#[derive(Debug, Clone, Parameterized)]
+#[derive(Debug, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct HyperHead<B: HyperNeuralBackend> {
     operator: B::HyperHead,
+}
+
+impl<B: HyperNeuralBackend> Clone for HyperHead<B> {
+    fn clone(&self) -> Self {
+        Self {
+            operator: self.operator.clone(),
+        }
+    }
 }
 
 impl<B: HyperNeuralBackend> HyperHead<B> {

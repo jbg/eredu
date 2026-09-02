@@ -27,7 +27,10 @@ pub use config::{
 };
 pub use kda::KimiDeltaAttention;
 pub use mla::KimiLatentAttention;
-pub use moe::{expert_realization_plan, DenseSwiGlu, FeedForward, SparseMoe};
+pub use moe::{
+    expert_realization_plan, replicated_expert_realization_plan, DenseSwiGlu, FeedForward,
+    SparseMoe,
+};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
     static_parallel_parameter_groups, LocalGeometry,
@@ -898,6 +901,42 @@ where
             context,
             |policy, normalized, context| {
                 policy.forward_with_provider(normalized, pass, context, provider)
+            },
+        )
+    }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let unit_path = self.group.unit_path(group, index)?;
+        let point = self.args.routed_observation_point(&unit_path, index);
+        self.forward_block_with_feed_forward(
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            context,
+            |policy, normalized, context| match point.clone() {
+                Some(point) => policy.forward_observed_with_provider(
+                    point, normalized, pass, context, provider, observer,
+                ),
+                None => policy.forward_with_provider(normalized, pass, context, provider),
             },
         )
     }

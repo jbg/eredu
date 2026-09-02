@@ -16,12 +16,13 @@ use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     observe_model_logits, replicated_text_materialization_tasks, ActivationObserver,
-    ExecutionResidency, LayerWeightResidency, LayerwisePolicy, LayerwiseRuntime,
+    ExecutionResidency, ExpertPass, LayerWeightResidency, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParameterGroupOwner, PartitionState, ReplicatedTextArchitecture,
     ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
     ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization, StateError,
-    SubmissionBackend, WeightLoweringKind,
+    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeState,
+    SelectedReplicatedTextRealization, SelectedStateRealization, StateError, SubmissionBackend,
+    WeightLoweringKind,
 };
 
 /// Backend mechanisms used by the generic replicated-text constructor.
@@ -66,6 +67,7 @@ where
         source_architecture: Option<&mut A>,
         source_units: Option<&mut [A::Unit]>,
         tasks: &[ReplicatedTextMaterializationTask],
+        addressable_parameters: &[String],
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error>;
 
@@ -158,7 +160,7 @@ where
 }
 
 /// Resident or bounded execution selected before construction.
-enum ReplicatedTextExecution<A, B, S, R, P>
+enum ReplicatedTextRuntimeKind<A, B, S, R, P>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
@@ -172,7 +174,23 @@ where
     Bounded(LayerwiseRuntime<A, B, S, P>),
 }
 
-impl<A, B, S, R, P> ReplicatedTextExecution<A, B, S, R, P>
+/// Resident or bounded layered runtime paired before session construction.
+///
+/// The wrapper lets additive execution strategies reuse one text-session
+/// lifecycle without exposing the selected runtime branch or permitting a
+/// backend to reconstruct it.
+pub struct ReplicatedTextRuntime<A, B, S, R, P>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    S: RuntimeState<B>,
+    A: ReplicatedTextArchitecture<B, S>,
+    R: LayerwisePolicy<B, A::Unit>,
+    P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
+{
+    kind: ReplicatedTextRuntimeKind<A, B, S, R, P>,
+}
+
+impl<A, B, S, R, P> ReplicatedTextRuntime<A, B, S, R, P>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
@@ -192,33 +210,176 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        match self {
-            Self::Resident(runtime) => runtime
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => runtime
                 .forward_with_observer(input, state, context, observer)
                 .map_err(map_layerwise_error),
-            Self::Bounded(runtime) => runtime
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
                 .forward_with_observer(input, state, context, observer)
+                .map_err(map_layerwise_error),
+        }
+    }
+
+    fn forward_with_provider_and_observer<'a, Provider, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => runtime
+                .forward_with_provider_and_observer(input, state, pass, provider, context, observer)
+                .map_err(map_layerwise_error),
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
+                .forward_with_provider_and_observer(input, state, pass, provider, context, observer)
                 .map_err(map_layerwise_error),
         }
     }
 
     fn bounded_policy(&self) -> Option<&P> {
-        match self {
-            Self::Resident(_) => None,
-            Self::Bounded(runtime) => Some(runtime.policy()),
+        match &self.kind {
+            ReplicatedTextRuntimeKind::Resident(_) => None,
+            ReplicatedTextRuntimeKind::Bounded(runtime) => Some(runtime.policy()),
         }
     }
 }
 
+/// Statically dispatched extension point for one replicated text unit strategy.
+///
+/// Ordinary execution and routed execution share the surrounding session,
+/// state, prompt-cache, observation, report, rollback, and completion logic.
+pub trait ReplicatedTextExecutionStrategy<A, B, S, R, P>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    S: RuntimeState<B>,
+    A: ReplicatedTextArchitecture<B, S>,
+    R: LayerwisePolicy<B, A::Unit>,
+    P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
+    A::Error: std::fmt::Display,
+    R::Error: std::fmt::Display,
+{
+    /// Executes one complete layered pass through the selected unit strategy.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_observer<'a, O>(
+        &mut self,
+        runtime: &mut ReplicatedTextRuntime<A, B, S, R, P>,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized;
+}
+
+/// Ordinary unit execution for replicated text architectures.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DirectReplicatedTextExecution;
+
+impl<A, B, S, R, P> ReplicatedTextExecutionStrategy<A, B, S, R, P> for DirectReplicatedTextExecution
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    S: RuntimeState<B>,
+    A: ReplicatedTextArchitecture<B, S>,
+    R: LayerwisePolicy<B, A::Unit>,
+    P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
+    A::Error: std::fmt::Display,
+    P::Error: std::fmt::Display,
+{
+    fn forward_with_observer<'a, O>(
+        &mut self,
+        runtime: &mut ReplicatedTextRuntime<A, B, S, R, P>,
+        input: A::Input<'a>,
+        state: &mut S,
+        _pass: ExpertPass,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        runtime.forward_with_observer(input, state, context, observer)
+    }
+}
+
+/// Provider-backed routed unit execution using the shared replicated session.
+pub struct RoutedReplicatedTextExecution<P> {
+    provider: P,
+}
+
+impl<P> RoutedReplicatedTextExecution<P> {
+    /// Creates routed unit execution from one neutral provider strategy.
+    pub const fn new(provider: P) -> Self {
+        Self { provider }
+    }
+
+    /// Returns the live provider for mechanism telemetry and reports.
+    pub const fn provider(&self) -> &P {
+        &self.provider
+    }
+}
+
+impl<A, B, S, R, P, Provider> ReplicatedTextExecutionStrategy<A, B, S, R, P>
+    for RoutedReplicatedTextExecution<Provider>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + eredu_nn::GroupedNeuralBackend,
+    S: RuntimeState<B>,
+    A: ReplicatedTextArchitecture<B, S> + RoutedLayeredArchitecture<B, S>,
+    R: LayerwisePolicy<B, A::Unit>,
+    P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
+    Provider: RoutedExpertProvider<B>,
+    Provider::Error: std::fmt::Display,
+    A::Error: std::fmt::Display,
+    P::Error: std::fmt::Display,
+{
+    fn forward_with_observer<'a, O>(
+        &mut self,
+        runtime: &mut ReplicatedTextRuntime<A, B, S, R, P>,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        runtime.forward_with_provider_and_observer(
+            input,
+            state,
+            pass,
+            &mut self.provider,
+            context,
+            observer,
+        )
+    }
+}
+
 /// Complete backend-neutral replicated-text session.
-pub struct ReplicatedTextSession<A, B, M>
+pub struct ReplicatedTextSession<A, B, M, D = DirectReplicatedTextExecution>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
     A: ReplicatedTextArchitecture<B, M::State>,
+    D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
+    A::Error: std::fmt::Display,
+    M::PolicyError: std::fmt::Display,
 {
     selected: SelectedReplicatedTextRealization,
-    execution: ReplicatedTextExecution<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
+    execution: ReplicatedTextRuntime<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
+    driver: D,
     state: M::State,
     mechanisms: M,
     prompt_cache_identity: PromptCacheModelIdentity,
@@ -269,6 +430,7 @@ pub struct ReplicatedTextSessionReport<E, S> {
 pub struct PreparedReplicatedTextContract {
     selected: SelectedReplicatedTextRealization,
     tasks: Vec<ReplicatedTextMaterializationTask>,
+    addressable_parameters: Vec<String>,
     prompt_cache_identity: PromptCacheModelIdentity,
     output_selection: ReplicatedTextOutputSelection,
 }
@@ -299,12 +461,14 @@ impl PreparedReplicatedTextContract {
     ) -> (
         SelectedReplicatedTextRealization,
         Vec<ReplicatedTextMaterializationTask>,
+        Vec<String>,
         PromptCacheModelIdentity,
         ReplicatedTextOutputSelection,
     ) {
         (
             self.selected,
             self.tasks,
+            self.addressable_parameters,
             self.prompt_cache_identity,
             self.output_selection,
         )
@@ -326,6 +490,40 @@ where
     A: ReplicatedTextArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
+    prepare_replicated_text_contract_with_addressable_parameters::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        std::iter::empty::<&str>(),
+        context,
+    )
+}
+
+/// Validates a concrete architecture while assigning an exact parameter set
+/// to independently addressable storage.
+///
+/// Addressable parameters remain part of full topology, shape, owner, source,
+/// and executable-format validation. Only their ordinary materialization tasks
+/// are removed after that validation succeeds.
+pub fn prepare_replicated_text_contract_with_addressable_parameters<'a, A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    addressable_parameters: impl IntoIterator<Item = &'a str>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextContract, String>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: ReplicatedTextArchitecture<B, S>,
+    A::Error: std::fmt::Display,
+{
+    let mut addressable_parameters = addressable_parameters
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     validate_selected_state(&selected)?;
     validate_architecture_geometry::<A, B, S>(architecture, &selected)?;
     if let Some(source) = source_architecture {
@@ -349,6 +547,25 @@ where
         validate_architecture_parameters::<A, B, S>(architecture, &selected, true, context)?;
     let mut tasks =
         replicated_text_materialization_tasks(&selected).map_err(|error| error.to_string())?;
+    let selected_parameter_names = tasks
+        .iter()
+        .map(|task| task.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if !addressable_parameters.is_subset(&selected_parameter_names) {
+        return Err(format!(
+            "addressable parameter catalog contains unknown selected parameters: {:?}",
+            addressable_parameters
+                .difference(&selected_parameter_names)
+                .collect::<Vec<_>>()
+        ));
+    }
+    let addressable_companions = addressable_parameters
+        .iter()
+        .filter_map(|name| output_companions.get(name))
+        .flatten()
+        .map(|companion| companion.name().to_owned())
+        .collect::<Vec<_>>();
+    addressable_parameters.extend(addressable_companions);
     let companion_names = output_companions
         .values()
         .flatten()
@@ -386,6 +603,7 @@ where
     // validation, but their primary packed output owns their one causal
     // materialization task. Do not consume them again as standalone tasks.
     tasks.retain(|task| !companion_names.contains(task.name()));
+    tasks.retain(|task| !addressable_parameters.contains(task.name()));
     let state = PartitionState::new(selected.state().layout().clone(), 0)
         .map_err(|error| error.to_string())?;
     let prompt_cache_identity = state
@@ -404,6 +622,7 @@ where
     Ok(PreparedReplicatedTextContract {
         selected,
         tasks,
+        addressable_parameters: addressable_parameters.into_iter().collect(),
         prompt_cache_identity,
         output_selection,
     })
@@ -429,10 +648,10 @@ impl<E, S> ReplicatedTextSessionReport<E, S> {
 /// Constructs one complete replicated-text session from selected policy and
 /// mechanism implementations.
 pub fn construct_replicated_text_session<A, B, M>(
-    mut architecture: A,
-    mut source_architecture: Option<A>,
+    architecture: A,
+    source_architecture: Option<A>,
     prepared: PreparedReplicatedTextContract,
-    mut mechanisms: M,
+    mechanisms: M,
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
     ReplicatedTextSession<A, B, M>,
@@ -446,7 +665,43 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
-    let (selected, tasks, prompt_cache_identity, output_selection) = prepared.into_parts();
+    construct_replicated_text_session_with_execution(
+        architecture,
+        source_architecture,
+        prepared,
+        mechanisms,
+        DirectReplicatedTextExecution,
+        context,
+    )
+}
+
+/// Constructs one replicated text session with an additive unit-execution strategy.
+///
+/// Architecture-owned prepared execution classes use this shared entry point
+/// after validating their additional proof. The surrounding lifecycle remains
+/// identical to ordinary replicated text construction.
+pub fn construct_replicated_text_session_with_execution<A, B, M, D>(
+    mut architecture: A,
+    mut source_architecture: Option<A>,
+    prepared: PreparedReplicatedTextContract,
+    mut mechanisms: M,
+    driver: D,
+    context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+) -> Result<
+    ReplicatedTextSession<A, B, M, D>,
+    ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+    A: ReplicatedTextArchitecture<B, M::State>,
+    D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
+    A::Error: std::fmt::Display,
+    M::PolicyError: std::fmt::Display,
+    M::Error: std::fmt::Display,
+{
+    let (selected, tasks, addressable_parameters, prompt_cache_identity, output_selection) =
+        prepared.into_parts();
     let mut units = construct_units::<A, B, M::State>(
         &architecture,
         selected.requirements().execution_units(),
@@ -472,6 +727,7 @@ where
             source_architecture.as_mut(),
             source_units.as_deref_mut(),
             &tasks,
+            &addressable_parameters,
             context,
         )
         .map_err(ReplicatedTextSessionError::Mechanism)?;
@@ -484,18 +740,29 @@ where
             let policy = mechanisms
                 .resident_policy(&mut architecture, units, &selected, context)
                 .map_err(ReplicatedTextSessionError::Mechanism)?;
-            ReplicatedTextExecution::Resident(LayerwiseRuntime::new(architecture, policy))
+            ReplicatedTextRuntime {
+                kind: ReplicatedTextRuntimeKind::Resident(LayerwiseRuntime::new(
+                    architecture,
+                    policy,
+                )),
+            }
         }
         LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
             let policy = mechanisms
                 .bounded_policy(&mut architecture, &selected, context)
                 .map_err(ReplicatedTextSessionError::Mechanism)?;
-            ReplicatedTextExecution::Bounded(LayerwiseRuntime::new(architecture, policy))
+            ReplicatedTextRuntime {
+                kind: ReplicatedTextRuntimeKind::Bounded(LayerwiseRuntime::new(
+                    architecture,
+                    policy,
+                )),
+            }
         }
     };
     Ok(ReplicatedTextSession {
         selected,
         execution,
+        driver,
         state,
         mechanisms,
         prompt_cache_identity,
@@ -524,15 +791,21 @@ where
         .collect()
 }
 
-impl<A, B, M> ReplicatedTextSession<A, B, M>
+impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
     A: ReplicatedTextArchitecture<B, M::State>,
+    D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
     A::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
+    /// Borrows the statically paired unit-execution strategy for generic telemetry.
+    pub const fn execution_strategy(&self) -> &D {
+        &self.driver
+    }
+
     /// Runs one direct forward and returns the complete architecture output.
     pub fn forward(
         &mut self,
@@ -554,7 +827,14 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint) = self.execute_with_observer(tokens, mask, context, observer)?;
+        let pass = tokens
+            .shape()
+            .last()
+            .copied()
+            .filter(|length| *length > 1)
+            .map_or(ExpertPass::Decode, |_| ExpertPass::Prefill);
+        let (output, checkpoint) =
+            self.execute_with_observer(tokens, mask, pass, context, observer)?;
         self.publish(output, checkpoint, context)
     }
 
@@ -579,7 +859,8 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint) = self.execute_with_observer(tokens, mask, context, observer)?;
+        let (output, checkpoint) =
+            self.execute_with_observer(tokens, mask, ExpertPass::Prefill, context, observer)?;
         let sequence_index = self.output_selection.sequence_index();
         let output = match self
             .mechanisms
@@ -603,7 +884,7 @@ where
         tokens: &B::Tensor,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.prefill(tokens, None, context)
+        self.decode_with_observer(tokens, context, &mut crate::NoopObserver)
     }
 
     /// Runs one observed decode step and selects the declared text output.
@@ -616,7 +897,23 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.prefill_with_observer(tokens, None, context, observer)
+        let (output, checkpoint) =
+            self.execute_with_observer(tokens, None, ExpertPass::Decode, context, observer)?;
+        let sequence_index = self.output_selection.sequence_index();
+        let output = match self
+            .mechanisms
+            .index_text_output(output, sequence_index, context)
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return self.rollback_failure(
+                    checkpoint,
+                    ReplicatedTextSessionError::Mechanism(error),
+                    context,
+                )
+            }
+        };
+        self.publish(output, checkpoint, context)
     }
 
     /// Captures all mutable state for a later transactional rollback.
@@ -735,6 +1032,7 @@ where
         &mut self,
         tokens: &B::Tensor,
         mask: Option<&B::Tensor>,
+        pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<
@@ -750,8 +1048,15 @@ where
             .map_err(ReplicatedTextSessionError::Mechanism)?;
         let input = A::text_input(tokens, mask);
         let output = match self
-            .execution
-            .forward_with_observer(input, &mut self.state, context, observer)
+            .driver
+            .forward_with_observer(
+                &mut self.execution,
+                input,
+                &mut self.state,
+                pass,
+                context,
+                observer,
+            )
             .map_err(widen_infallible)
         {
             Ok(output) => output,
@@ -974,40 +1279,59 @@ where
             _ => false,
         };
         let mut expected_shape = parameter.logical_shape().to_vec();
-        if selected_formats {
-            if let Some(last) = expected_shape.last_mut() {
-                let executable = selected
+        let realization = selected_formats
+            .then(|| {
+                selected
                     .parameters()
                     .iter()
                     .find(|realization| realization.name() == parameter.name())
-                    .map_or(parameter.native_executable(), |realization| {
-                        realization.executable()
-                    });
-                match executable {
-                    eredu_checkpoint::LinearFormat::Affine(config) => {
-                        *last = last.saturating_mul(config.bits as usize) / 32;
-                    }
-                    eredu_checkpoint::LinearFormat::MxFp4 => {
-                        *last = last.saturating_mul(4) / 32;
-                    }
-                    eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
-                        if let Ok((block, bytes)) = ggml_type.block_and_bytes() {
-                            if let (Ok(block), Ok(bytes)) =
-                                (usize::try_from(block), usize::try_from(bytes))
-                            {
-                                *last = last.saturating_mul(bytes) / block;
-                            }
+            })
+            .flatten();
+        let executable = realization.map_or(parameter.native_executable(), |realization| {
+            realization.executable()
+        });
+        if (!selected_formats
+            || realization.is_some_and(|realization| {
+                realization.lowering() == crate::WeightLoweringKind::Direct
+            }))
+            && executable == eredu_checkpoint::LinearFormat::MxFp4
+            && matches!(
+                parameter.source_encoding(),
+                Some(eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                    eredu_checkpoint::StoredDtype::U8
+                ))
+            )
+        {
+            expected_shape = parameter
+                .physical_shape()
+                .expect("direct native realization has admitted physical geometry")
+                .to_vec();
+        } else if let Some(last) = expected_shape.last_mut() {
+            match executable {
+                eredu_checkpoint::LinearFormat::Affine(config) => {
+                    *last = last.saturating_mul(config.bits as usize) / 32;
+                }
+                eredu_checkpoint::LinearFormat::MxFp4 => {
+                    *last = last.saturating_mul(4) / 32;
+                }
+                eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
+                    if let Ok((block, bytes)) = ggml_type.block_and_bytes() {
+                        if let (Ok(block), Ok(bytes)) =
+                            (usize::try_from(block), usize::try_from(bytes))
+                        {
+                            *last = last.saturating_mul(bytes) / block;
                         }
                     }
-                    eredu_checkpoint::LinearFormat::Dense
-                    | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => {}
                 }
+                eredu_checkpoint::LinearFormat::Dense
+                | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => {}
             }
         }
         if shape != &expected_shape || !owner_matches {
             return Err(format!(
-                "selected parameter {:?} differs from constructed shape or owner",
-                parameter.name()
+                "selected parameter {:?} expects shape {expected_shape:?} and owner {:?}, constructed shape {shape:?} and owner {owner:?}",
+                parameter.name(),
+                parameter.owner()
             ));
         }
     }

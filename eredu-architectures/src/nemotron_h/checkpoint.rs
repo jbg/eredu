@@ -475,7 +475,9 @@ pub fn expert_residency_catalog(
             experts,
         )?;
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(store))
+        .map_err(|error| error.to_string())
 }
 
 struct SparseUnitResidency {

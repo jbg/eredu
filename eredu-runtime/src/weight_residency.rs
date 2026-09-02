@@ -407,6 +407,26 @@ pub enum ExpertPass {
     Decode,
 }
 
+/// Generic workload class for independently addressable storage access.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum ParameterBankAccess {
+    /// A multi-row access eligible for bounded partitioning.
+    Bulk,
+    /// A latency-sensitive incremental access.
+    Incremental,
+}
+
+impl ExpertPass {
+    /// Projects text execution semantics into a generic storage access class.
+    pub const fn parameter_bank_access(self) -> ParameterBankAccess {
+        match self {
+            Self::Prefill => ParameterBankAccess::Bulk,
+            Self::Decode => ParameterBankAccess::Incremental,
+        }
+    }
+}
+
 /// Backend-neutral controls for independently addressable parameter-bank residency.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ParameterBankLoadOptions {

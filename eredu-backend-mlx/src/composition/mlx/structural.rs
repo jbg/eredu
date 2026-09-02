@@ -279,6 +279,35 @@ pub(crate) fn validate_inspected_preparation(
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
     eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol(), policy)?;
+    if policy
+        .topology()
+        .is_none_or(|topology| topology.is_replicated())
+    {
+        let execution =
+            eredu_architectures::replicated_text::replicated_text_execution_class(inspection)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        if matches!(
+            execution,
+            eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Replicated(_)
+        ) && policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks
+        {
+            return Err(Error::Artifact(
+                eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(
+                    "independent parameter banks require an architecture-routed text class".into(),
+                ),
+            ));
+        }
+        if matches!(
+            execution,
+            eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Replicated(_)
+                | eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Routed(_)
+        ) {
+            // Generic text classes validate concrete MLX mechanisms through
+            // their neutral selection immediately after this protocol check.
+            // Excluded-family bindings are only authoritative for `Other`.
+            return Ok(());
+        }
+    }
     if !requires_architecture_capabilities(policy) {
         return Ok(());
     }

@@ -48,6 +48,8 @@ mod replicated_model;
 pub mod replicated_text;
 /// Architecture-owned external rotary configuration values.
 pub mod rotary;
+/// Architecture-owned routed execution over generic backend mechanisms.
+pub mod routed_text;
 mod static_parameters;
 mod transport;
 pub use expert_residency::{
@@ -55,6 +57,17 @@ pub use expert_residency::{
     ExpertRealizationPlan, ExpertRealizationPlanError, ExpertResidencyCatalog,
     ExpertResidencyCatalogError, ExpertResidencyDistribution, ExpertResidencyUnit,
     RoutedMechanismExecutionError,
+};
+pub use routed_text::{
+    routed_text_requirements, select_routed_text_realization, visit_gated_routed_text_architecture,
+    visit_pooling_routed_text_architecture, visit_relu2_routed_text_architecture,
+    GatedProductOperation, GatedRoutedTextArchitectureVisitor, PlannedAddressableGatedProduct,
+    PlannedAddressableRelu2, PlannedResidentGatedProduct, PlannedResidentRelu2,
+    PreparedRelu2RoutedTextArchitecture, PreparedRoutedTextArchitecture, Relu2Operation,
+    Relu2RoutedTextArchitectureVisitor, RoutedGroupedOperation, RoutedGroupedOperationValidation,
+    RoutedGroupedPlan, RoutedTextDispatchError, RoutedTextExecutionError,
+    RoutedTextPreparationError, RoutedTextRequirements, RoutedTextRequirementsError,
+    RoutedTextSelectionError, RoutedTextSelectionRequest, SelectedRoutedTextRealization,
 };
 
 /// Shared decoder mechanics used by backend-neutral text architectures.

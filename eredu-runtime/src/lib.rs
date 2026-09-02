@@ -90,8 +90,9 @@ pub use execution::{
 pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     reduce_routed_expert_tensor_parallel, reduce_tensor_parallel_expert_output,
-    AddressableGatedProductBank, ObservedExpertProvider, ObservedExpertProviderError,
-    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    AddressableBankMember, AddressableBankMemberError, AddressableGatedProductBank,
+    AddressableGroupedBank, IndexedMovement, ObservedExpertProvider, ObservedExpertProviderError,
+    ParameterBankAcquisition, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
     RoutedExpertTensorParallelOutput, RoutedObservationPoint, TensorParallelRoutedExpertProvider,
 };
 pub use generation::{
@@ -141,19 +142,22 @@ pub use realtime::{
     RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
 };
 pub use replicated_session::{
-    construct_replicated_text_session, prepare_replicated_text_contract,
-    PreparedReplicatedTextContract, ReplicatedTextSession, ReplicatedTextSessionError,
-    ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport,
+    construct_replicated_text_session, construct_replicated_text_session_with_execution,
+    prepare_replicated_text_contract, prepare_replicated_text_contract_with_addressable_parameters,
+    DirectReplicatedTextExecution, PreparedReplicatedTextContract, ReplicatedTextExecutionStrategy,
+    ReplicatedTextRuntime, ReplicatedTextSession, ReplicatedTextSessionError,
+    ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport, RoutedReplicatedTextExecution,
 };
 pub use replicated_text::{
     replicated_text_materialization_tasks, select_replicated_text_realization,
-    BackendMechanismCapabilities, GroupedOperationRequirement, ParameterTransformConstraint,
-    ParameterTransformTarget, ReplicatedTextArchitecture, ReplicatedTextContractError,
-    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
-    ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
-    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
-    ReplicatedTextStateAccess, SelectedParameterRealization, SelectedReplicatedTextRealization,
+    AddressableStorageCapabilities, AddressableStorageTiers, BackendMechanismCapabilities,
+    GroupedOperationRequirement, ParameterTransformConstraint, ParameterTransformTarget,
+    ReplicatedTextArchitecture, ReplicatedTextContractError, ReplicatedTextMaterializationTask,
+    ReplicatedTextOutputCompanion, ReplicatedTextOutputSelection, ReplicatedTextParameterOwner,
+    ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
+    ReplicatedTextParameterRole, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
+    ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, ReplicatedTextStateAccess,
+    SelectedParameterRealization, SelectedReplicatedTextRealization,
     SelectedStateComponentRealization, SelectedStateRealization, StateComponentMechanism,
     StateComponentPlacement, StateMechanismCapabilities, WeightLoweringCapability,
     WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
@@ -177,7 +181,7 @@ pub use state::{
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,
     ExecutionResidency, ExpertPass, LayerWeightResidency, LayerwiseLoadOptions,
-    LayerwiseModelMetadata, OrdinaryWeightResidency, ParameterBankKey, ParameterBankLoadOptions,
-    ParameterBankResidency, StaticUnitBindings, WeightResidency, WeightResidencyPolicyError,
-    DENSE_TRANSFER_WINDOW,
+    LayerwiseModelMetadata, OrdinaryWeightResidency, ParameterBankAccess, ParameterBankKey,
+    ParameterBankLoadOptions, ParameterBankResidency, StaticUnitBindings, WeightResidency,
+    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };

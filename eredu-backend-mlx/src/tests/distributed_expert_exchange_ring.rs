@@ -13,12 +13,13 @@ use crate::{
     backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
     backend::runtime::residency::parameter_bank::{
         AddressableParameterBank, BankAccessClass, ParameterBankEntry,
-        ParameterBankKey as BackendParameterBankKey, ParameterBankSelection,
+        ParameterBankKey as BackendParameterBankKey,
     },
     composition::expert_dispatch::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
     },
+    composition::grouped_provider::{execute_selections_bounded, ParameterBankSelection},
     module::PhysicalParam,
 };
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
@@ -162,7 +163,8 @@ fn execute_cached_qwen_routes(
         ExpertPass::Decode => BankAccessClass::Incremental,
         _ => unreachable!("unsupported expert pass requires explicit test coverage"),
     };
-    Ok(cache.execute_selections_bounded(
+    execute_selections_bounded(
+        cache,
         ParameterBankSelection::new(
             0,
             &routes.hidden,
@@ -171,7 +173,7 @@ fn execute_cached_qwen_routes(
             access,
         ),
         stream,
-        |hidden, acquired, _weights, stream| {
+        |hidden, acquired, compact_selections, _weights, stream| {
             let started = Instant::now();
             let mut bank = PackedGatedProductGroups {
                 policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
@@ -193,12 +195,12 @@ fn execute_cached_qwen_routes(
                 down_proj_biases: PhysicalParam::new(None),
             };
             cache.record_compact_bank(access, acquired.scratch_bytes(), started.elapsed())?;
-            let compact_selections = acquired.compact_selections().reshape(&[-1, 1], stream)?;
+            let compact_selections = compact_selections.reshape(&[-1, 1], stream)?;
             let unit_weights =
                 safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
             Ok(bank.forward(hidden, &compact_selections, &unit_weights, stream)?)
         },
-    )?)
+    )
 }
 
 #[test]

@@ -6,7 +6,206 @@ use eredu_nn::{
 };
 
 use crate::ExpertPass;
-use crate::{ActivationObserver, ParameterBankKey, RoutingObservation};
+use crate::{
+    observe_and_intervene, ActivationObserver, OffloadUnit, ParameterBankAccess, ParameterBankKey,
+    ResidencyDeclarationError, RoutingObservation, WeightBinding,
+};
+
+/// Exact generic storage member projected from an architecture-owned bank catalog.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AddressableBankMember {
+    key: ParameterBankKey,
+    source: OffloadUnit,
+    source_bytes: u64,
+    selected_bytes: u64,
+}
+
+impl AddressableBankMember {
+    /// Validates one atomic source unit and its selected executable byte geometry.
+    pub fn new(
+        key: ParameterBankKey,
+        bindings: impl IntoIterator<Item = WeightBinding>,
+        selected_bytes: u64,
+    ) -> Result<Self, AddressableBankMemberError> {
+        if selected_bytes == 0 {
+            return Err(AddressableBankMemberError::ZeroSelectedBytes { key });
+        }
+        let source = OffloadUnit::new(key.unit_id(), bindings)?;
+        let source_bytes = source.bindings().iter().try_fold(0u64, |total, binding| {
+            total
+                .checked_add(binding.expected_bytes())
+                .ok_or(AddressableBankMemberError::SourceByteOverflow { key })
+        })?;
+        Ok(Self {
+            key,
+            source,
+            source_bytes,
+            selected_bytes,
+        })
+    }
+
+    /// Returns the generic bank key selected by neutral composition.
+    pub const fn key(&self) -> ParameterBankKey {
+        self.key
+    }
+
+    /// Returns exact source bindings without architecture roles or naming policy.
+    pub const fn source(&self) -> &OffloadUnit {
+        &self.source
+    }
+
+    /// Returns admitted source bytes before an optional lowering.
+    pub const fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    /// Returns executable bytes after the selected lowering.
+    pub const fn selected_bytes(&self) -> u64 {
+        self.selected_bytes
+    }
+}
+
+/// Invalid generic addressable-bank member projection.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum AddressableBankMemberError {
+    /// Source binding declarations were invalid.
+    #[error(transparent)]
+    Residency(#[from] ResidencyDeclarationError),
+    /// Source binding byte accounting overflowed.
+    #[error("addressable bank member {key:?} source byte geometry overflowed")]
+    SourceByteOverflow {
+        /// Invalid member.
+        key: ParameterBankKey,
+    },
+    /// Selected executable storage was empty.
+    #[error("addressable bank member {key:?} selected byte geometry is zero")]
+    ZeroSelectedBytes {
+        /// Invalid member.
+        key: ParameterBankKey,
+    },
+}
+
+/// Generic indexed tensor movement required by bounded grouped execution.
+///
+/// Implementations expose integer-index discovery and tensor movement without
+/// receiving architecture plans, bank meaning, or text lifecycle policy.
+pub trait IndexedMovement<B>
+where
+    B: GroupedNeuralBackend,
+{
+    /// Indexed movement failure.
+    type Error;
+
+    /// Returns deterministic demand counts for integer indices below `upper_bound`.
+    fn index_demands(
+        &mut self,
+        indices: &B::Tensor,
+        upper_bound: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Vec<(usize, u64)>, Self::Error>;
+
+    /// Rewrites source indices through one exact source-to-compact mapping.
+    fn remap_indices(
+        &mut self,
+        indices: &B::Tensor,
+        mapping: &[(usize, usize)],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Selects a contiguous range along the leading row axis.
+    fn select_rows(
+        &mut self,
+        value: &B::Tensor,
+        start: usize,
+        end: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Concatenates row partitions in their original order.
+    fn concatenate_rows(
+        &mut self,
+        values: &[B::Tensor],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+}
+
+/// Exact generic request for an independently addressable bank acquisition.
+#[derive(Debug, Clone, Copy)]
+pub struct ParameterBankAcquisition<'a> {
+    entries: &'a [(ParameterBankKey, u64)],
+    access: ParameterBankAccess,
+}
+
+impl<'a> ParameterBankAcquisition<'a> {
+    /// Creates one deterministic acquisition request in compact-bank order.
+    pub const fn new(entries: &'a [(ParameterBankKey, u64)], access: ParameterBankAccess) -> Self {
+        Self { entries, access }
+    }
+
+    /// Returns generic bank keys and duplicate-preserving demand counts.
+    pub const fn entries(&self) -> &'a [(ParameterBankKey, u64)] {
+        self.entries
+    }
+
+    /// Returns the selected generic storage access class.
+    pub const fn access(&self) -> ParameterBankAccess {
+        self.access
+    }
+}
+
+/// Generic addressable storage and grouped-operator construction mechanisms.
+///
+/// The mechanism receives already translated bank keys, compact specifications,
+/// and access classes. Architecture identity, routing policy, global identity
+/// mapping, chunking, and text-session behavior remain outside this contract.
+pub trait AddressableGroupedBank<B>
+where
+    B: GroupedNeuralBackend,
+{
+    /// Live native storage retained across grouped execution.
+    type Acquisition;
+    /// Generic bank telemetry snapshot.
+    type Report;
+    /// Storage, transfer, lowering, or construction failure.
+    type Error;
+
+    /// Returns the selected byte geometry for one admitted bank member.
+    fn member_bytes(&self, key: ParameterBankKey) -> Option<u64>;
+
+    /// Acquires exact generic keys in caller-supplied compact order.
+    fn acquire(
+        &mut self,
+        request: ParameterBankAcquisition<'_>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Acquisition, Self::Error>;
+
+    /// Constructs one compact gated-product operator from acquired bindings.
+    fn gated_product_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::GatedProductGroups, Self::Error>;
+
+    /// Constructs one compact ReLU-squared operator from acquired bindings.
+    fn relu2_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedRelu2Spec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Relu2Groups, Self::Error>;
+
+    /// Retains acquired storage until the grouped output is natively complete.
+    fn complete(
+        &mut self,
+        acquisition: Self::Acquisition,
+        output: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Self::Error>;
+
+    /// Returns generic key, byte, tier, acquisition, and eviction telemetry.
+    fn report(&self) -> Result<Self::Report, Self::Error>;
+}
 
 /// Mechanism-only lookup of one grouped operator in an addressable parameter bank.
 pub trait AddressableGatedProductBank<B>
@@ -265,8 +464,9 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
         &mut self,
         routes: &eredu_nn::GroupSelection<T>,
         output: &T,
-    ) -> Result<(), ObservationError>
+    ) -> Result<T, ObservationError>
     where
+        T: Clone,
         O: ActivationObserver<T, ObservationError>,
     {
         self.observer.observe_routing(RoutingObservation {
@@ -280,7 +480,12 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
             shared_output: None,
             combined_output: None,
             expert_count: self.point.expert_count(),
-        })
+        })?;
+        observe_and_intervene(
+            self.observer,
+            &format!("{}.output", self.point.path()),
+            output,
+        )
     }
 }
 
@@ -304,8 +509,7 @@ where
             .forward_grouped(resident_bank, request, context)
             .map_err(ObservedExpertProviderError::Provider)?;
         self.observe(routes, &output)
-            .map_err(ObservedExpertProviderError::Observer)?;
-        Ok(output)
+            .map_err(ObservedExpertProviderError::Observer)
     }
 
     fn forward_relu2_routed(
@@ -320,8 +524,7 @@ where
             .forward_relu2_routed(resident_bank, request, context)
             .map_err(ObservedExpertProviderError::Provider)?;
         self.observe(routes, &output)
-            .map_err(ObservedExpertProviderError::Observer)?;
-        Ok(output)
+            .map_err(ObservedExpertProviderError::Observer)
     }
 }
 

@@ -71,7 +71,7 @@ pub fn state_identity(
 }
 
 /// Pinned DSpark projections and heads shared by its ordinary draft blocks.
-#[derive(Debug, Clone, Parameterized)]
+#[derive(Debug, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct DsparkStatic<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     main_projection: B::Linear,
@@ -83,11 +83,26 @@ pub struct DsparkStatic<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBacke
     confidence_head: B::Linear,
 }
 
+impl<B> Clone for DsparkStatic<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    fn clone(&self) -> Self {
+        Self {
+            main_projection: self.main_projection.clone(),
+            main_norm: self.main_norm.clone(),
+            output_norm: self.output_norm.clone(),
+            hyper_head: self.hyper_head.clone(),
+            markov_embedding: self.markov_embedding.clone(),
+            markov_output: self.markov_output.clone(),
+            confidence_head: self.confidence_head.clone(),
+        }
+    }
+}
+
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: HyperNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend,
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
@@ -109,6 +124,29 @@ where
     {
         Model::forward_unit_with_provider(
             self, group, index, unit, hidden, state, forward, pass, provider, context,
+        )
+    }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        Model::forward_unit_observed_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, provider, context, observer,
         )
     }
 }
@@ -173,7 +211,7 @@ where
 }
 
 /// V4 pinned modules shared by resident and bounded layer execution.
-#[derive(Debug, Clone, Parameterized)]
+#[derive(Debug, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct StaticModules<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Shared embedding, final normalization, and vocabulary head lifecycle.
@@ -182,6 +220,19 @@ pub struct StaticModules<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBack
     pub hyper_head: HyperHead<B>,
     /// Optional fused-drafter projections and heads.
     pub dspark: Option<DsparkStatic<B>>,
+}
+
+impl<B> Clone for StaticModules<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            hyper_head: self.hyper_head.clone(),
+            dspark: self.dspark.clone(),
+        }
+    }
 }
 
 /// V4 values retained for one target-model forward.
@@ -2335,7 +2386,7 @@ where
     }
 }
 
-fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransport {
+pub(crate) fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransport {
     let mut transport = crate::transport::decoder();
     transport.last_owner_static_roles.push("hyper_head".into());
     transport

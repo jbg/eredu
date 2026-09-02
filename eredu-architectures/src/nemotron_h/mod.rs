@@ -34,6 +34,47 @@ pub use parallel::{
     static_parallel_parameter_groups, unit_parallel_parameter_groups, LocalGeometry,
 };
 
+/// Derives the complete replicated target expert plan from normalized geometry.
+pub fn replicated_expert_realization_plan(
+    args: &ModelArgs,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>, eredu_nn::Error> {
+    if !args.has_sparse_moe_layers() || args.num_nextn_predict_layers != 0 {
+        return Err(eredu_nn::Error::backend(
+            "Nemotron-H replicated routed text requires target-only sparse units",
+        ));
+    }
+    let global_experts =
+        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    let target_group =
+        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
+    let unit_specs = args
+        .layer_schedule
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, policy)| *policy == LayerPolicy::SparseMoe)
+        .map(|(layer, _)| {
+            localized_expert_bank_spec(
+                args,
+                layer,
+                args.n_routed_experts,
+                args.moe_intermediate_size,
+            )
+            .map(|spec| ((target_group.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(
+        global_experts,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+            0,
+        )
+        .map_err(eredu_nn::Error::backend)?,
+        unit_specs,
+    )
+    .map_err(eredu_nn::Error::backend)
+}
+
 /// Derives complete expert ownership and rank-local ReLU-squared bank geometry.
 pub fn expert_realization_plan<
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,

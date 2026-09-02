@@ -54,6 +54,29 @@ where
             self, group, index, unit, hidden, state, forward, provider, context,
         )
     }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        LayeredModel::forward_unit_observed_with_provider(
+            self, group, index, unit, hidden, state, forward, observer, provider, context,
+        )
+    }
 }
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
@@ -958,7 +981,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {

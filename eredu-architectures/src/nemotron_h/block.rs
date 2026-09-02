@@ -369,7 +369,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {

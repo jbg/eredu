@@ -238,7 +238,11 @@ impl Config for ModelArgs {
         self.num_hidden_layers
     }
     fn intermediate_size(&self) -> i32 {
-        self.intermediate_size
+        if self.is_moe() {
+            self.moe_intermediate_size
+        } else {
+            self.intermediate_size
+        }
     }
     fn num_attention_heads(&self) -> i32 {
         self.num_attention_heads

@@ -60,7 +60,7 @@ pub(crate) fn standard_linear_format(
     }
 }
 
-fn standard_expert_format(
+pub(crate) fn standard_expert_format(
     weight_name: &str,
     format: LinearFormat,
 ) -> Result<LinearFormatSpec, Error> {

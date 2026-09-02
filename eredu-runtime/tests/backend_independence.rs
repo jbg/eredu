@@ -1719,6 +1719,7 @@ impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for Refer
         _: Option<&mut OrdinaryTextFixture>,
         _: Option<&mut [FakeUnit]>,
         tasks: &[ReplicatedTextMaterializationTask],
+        _: &[String],
         _: &(),
     ) -> Result<(), Self::Error> {
         self.counters.update(|counts| counts.materializations += 1);

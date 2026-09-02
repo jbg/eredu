@@ -17,7 +17,7 @@ use eredu_runtime::{
 /// The plan is deliberately independent of a concrete collective runtime. It
 /// fixes the global-to-owner mapping once and carries the architecture's exact
 /// rank-local construction specification for every routed execution unit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExpertRealizationPlan<S> {
     global_expert_count: usize,
     expert_parallel_size: usize,
@@ -118,6 +118,27 @@ impl<S> ExpertRealizationPlan<S> {
     /// Returns every routed execution unit and its rank-local bank specification.
     pub fn unit_specs(&self) -> &BTreeMap<(ExecutionGroupId, usize), S> {
         &self.unit_specs
+    }
+
+    pub(crate) fn try_map_unit_specs<T>(
+        self,
+        mut map: impl FnMut(S) -> Result<T, String>,
+    ) -> Result<ExpertRealizationPlan<T>, String> {
+        let unit_specs = self
+            .unit_specs
+            .into_iter()
+            .map(|(address, spec)| map(spec).map(|mapped| (address, mapped)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(ExpertRealizationPlan {
+            global_expert_count: self.global_expert_count,
+            expert_parallel_size: self.expert_parallel_size,
+            expert_parallel_rank: self.expert_parallel_rank,
+            owners: self.owners,
+            local_global_group_indices: self.local_global_group_indices,
+            collective_members: self.collective_members,
+            collective_local_rank: self.collective_local_rank,
+            unit_specs,
+        })
     }
 
     /// Translates the architecture's semantic route axis to an opaque generic group.
@@ -280,6 +301,7 @@ pub struct ExpertParameterRecipe {
     logical_target: String,
     recipe: DerivedWeightRecipe,
     role: ExpertParameterRole,
+    metadata: Option<eredu_checkpoint::recipe::RecipeMetadata>,
 }
 
 /// Quantization semantics of one independently resident expert parameter.
@@ -366,6 +388,7 @@ impl ExpertParameterRecipe {
             logical_target,
             recipe,
             role,
+            metadata: None,
         })
     }
 
@@ -387,6 +410,11 @@ impl ExpertParameterRecipe {
     /// Returns the architecture-declared parameter and quantization semantics.
     pub const fn role(&self) -> &ExpertParameterRole {
         &self.role
+    }
+
+    /// Returns admission-time metadata for this expert-local recipe output.
+    pub const fn metadata(&self) -> Option<&eredu_checkpoint::recipe::RecipeMetadata> {
+        self.metadata.as_ref()
     }
 
     /// Consumes the declaration into a named handoff artifact.
@@ -442,6 +470,7 @@ pub struct ExpertResidencyUnit {
     unit_path: String,
     distribution: ExpertResidencyDistribution,
     parameters: Vec<ExpertParameterRecipe>,
+    byte_len: Option<u64>,
 }
 
 impl ExpertResidencyUnit {
@@ -504,6 +533,7 @@ impl ExpertResidencyUnit {
             unit_path,
             distribution,
             parameters,
+            byte_len: None,
         })
     }
 
@@ -535,6 +565,23 @@ impl ExpertResidencyUnit {
     /// Returns every exact expert-local parameter recipe.
     pub fn parameters(&self) -> &[ExpertParameterRecipe] {
         &self.parameters
+    }
+
+    /// Attaches exact admitted materialized bytes when already derived upstream.
+    pub fn with_byte_len(mut self, byte_len: u64) -> Result<Self, ExpertResidencyCatalogError> {
+        if byte_len == 0 {
+            return Err(ExpertResidencyCatalogError::InvalidByteGeometry {
+                identity: self.identity,
+                detail: "materialized byte count is zero".into(),
+            });
+        }
+        self.byte_len = Some(byte_len);
+        Ok(self)
+    }
+
+    /// Returns exact admitted materialized bytes for this atomic unit.
+    pub const fn byte_len(&self) -> Option<u64> {
+        self.byte_len
     }
 
     /// Consumes the unit into its parameter recipes.
@@ -572,6 +619,56 @@ impl ExpertResidencyCatalog {
     /// Returns the deterministic architecture order of resident expert units.
     pub fn units(&self) -> &[ExpertResidencyUnit] {
         &self.units
+    }
+
+    /// Returns one atomic unit by its architecture-translated bank identity.
+    pub fn unit(&self, identity: ParameterBankKey) -> Option<&ExpertResidencyUnit> {
+        self.units.iter().find(|unit| unit.identity == identity)
+    }
+
+    /// Returns every canonical parameter assigned to addressable storage.
+    pub fn logical_targets(&self) -> BTreeSet<&str> {
+        self.units
+            .iter()
+            .flat_map(|unit| unit.parameters.iter())
+            .map(ExpertParameterRecipe::logical_target)
+            .collect()
+    }
+
+    /// Infers and retains exact materialized bytes from admitted recipe metadata.
+    pub fn with_inferred_byte_geometry<C: RecipeCatalog + ?Sized>(
+        mut self,
+        catalog: &C,
+    ) -> Result<Self, ExpertResidencyCatalogError> {
+        for unit in &mut self.units {
+            let bytes = unit
+                .parameters
+                .iter_mut()
+                .try_fold(0u64, |total, parameter| {
+                    let metadata = parameter.recipe().infer(catalog).map_err(|error| {
+                        ExpertResidencyCatalogError::InvalidByteGeometry {
+                            identity: unit.identity,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                    let bytes = metadata.byte_len;
+                    parameter.metadata = Some(metadata);
+                    total.checked_add(bytes).ok_or_else(|| {
+                        ExpertResidencyCatalogError::InvalidByteGeometry {
+                            identity: unit.identity,
+                            detail: "materialized byte count overflowed".into(),
+                        }
+                    })
+                })?;
+            if bytes == 0 {
+                return Err(ExpertResidencyCatalogError::InvalidByteGeometry {
+                    identity: unit.identity,
+                    detail: "materialized byte count is zero".into(),
+                });
+            }
+            unit.byte_len = Some(bytes);
+        }
+        Ok(self)
     }
 
     /// Consumes the catalog into its deterministic architecture order.
@@ -646,6 +743,14 @@ pub enum ExpertResidencyCatalogError {
     EmptyUnit {
         /// Invalid expert identity.
         identity: ParameterBankKey,
+    },
+    /// Admitted recipes did not yield a finite nonzero atomic byte count.
+    #[error("expert {identity:?} has invalid materialized byte geometry: {detail}")]
+    InvalidByteGeometry {
+        /// Invalid unit.
+        identity: ParameterBankKey,
+        /// Metadata inference failure.
+        detail: String,
     },
     /// One acquired bank name is repeated inside an expert.
     #[error("expert {identity:?} repeats local binding {binding:?}")]

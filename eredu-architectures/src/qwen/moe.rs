@@ -171,6 +171,31 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
         .map_err(Error::backend)
 }
 
+/// Derives the complete replicated expert plan before architecture construction.
+pub fn replicated_expert_realization_plan(
+    args: &ModelArgs,
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    if !args.is_moe() {
+        return Err(Error::backend(
+            "replicated expert planning requires a routed Qwen configuration",
+        ));
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let unit_specs = (0..layers)
+        .map(|layer| expert_bank_spec(args, layer).map(|spec| ((owner_group.clone(), layer), spec)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
+        0,
+    )
+    .map_err(Error::backend)?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map_err(Error::backend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

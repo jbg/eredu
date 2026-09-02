@@ -216,6 +216,38 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
         .map_err(Error::backend)
 }
 
+/// Derives the complete replicated target expert plan from normalized geometry.
+pub fn replicated_expert_realization_plan(
+    args: &ModelArgs,
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    if !args.has_sparse_moe_layers() {
+        return Err(Error::backend("LFM2 routed text requires sparse units"));
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(Error::backend)?;
+    let unit_specs = args
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, policy)| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+        .map(|(layer, _)| {
+            expert_bank_spec_with_width(args, layer, args.moe_intermediate_size)
+                .map(|spec| ((owner_group.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(
+        global_experts,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
+            0,
+        )
+        .map_err(Error::backend)?,
+        unit_specs,
+    )
+    .map_err(Error::backend)
+}
+
 /// Per-layer dense or routed feed-forward policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]

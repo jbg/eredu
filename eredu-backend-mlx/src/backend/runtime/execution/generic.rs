@@ -22,7 +22,10 @@ use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
-        checkpoint::binding::{binding_bytes, build_module_bindings, populate_module_from_lease},
+        checkpoint::binding::{
+            binding_bytes, build_module_bindings, populate_module_from_lease,
+            populate_module_from_lease_excluding,
+        },
         execution::layerwise::{
             validate_device_budget, validate_host_budget, validate_unused, DensePreparedTransfer,
             DenseStreamController, DenseStreamForwardGuard, DenseStreamGroupGuard,
@@ -137,6 +140,31 @@ pub trait MlxUnitPopulator<U> {
 }
 
 impl<U> MlxUnitPopulator<U> for () {}
+
+/// Exact parameter exclusions for units with independently stored members.
+#[derive(Clone)]
+pub struct MlxSelectiveUnitPopulator {
+    excluded: Arc<BTreeSet<String>>,
+}
+
+impl MlxSelectiveUnitPopulator {
+    /// Creates one generic logical-parameter exclusion set.
+    pub fn new(excluded: BTreeSet<String>) -> Self {
+        Self {
+            excluded: Arc::new(excluded),
+        }
+    }
+}
+
+impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
+    fn populate(&mut self, unit: &mut MlxModule<U>, lease: &ResidentUnitLease) -> Result<(), Error>
+    where
+        U: Parameterized<MlxTensor>,
+    {
+        populate_module_from_lease_excluding(unit, lease, |name| self.excluded.contains(name))?;
+        Ok(())
+    }
+}
 
 /// Builds one unloaded unit through the neutral architecture's declared flat layout.
 pub fn construct_architecture_unit<A, S>(

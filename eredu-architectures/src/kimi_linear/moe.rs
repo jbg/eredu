@@ -229,6 +229,41 @@ where
         .map_err(Error::backend)
 }
 
+/// Derives the complete replicated target expert plan from normalized geometry.
+pub fn replicated_expert_realization_plan(
+    args: &ModelArgs,
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    if !args.has_sparse_moe_layers() {
+        return Err(Error::backend(
+            "Kimi Linear routed text requires sparse units",
+        ));
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let unit_specs = (0..layers)
+        .filter(|layer| {
+            args.layer_policy(*layer).map(|policy| policy.feed_forward)
+                == Some(FeedForwardPolicy::SparseMoe)
+        })
+        .map(|layer| {
+            expert_bank_spec_with_width(args, layer, args.moe_intermediate_size)
+                .map(|spec| ((owner_group.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(
+        global_experts,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
+            0,
+        )
+        .map_err(Error::backend)?,
+        unit_specs,
+    )
+    .map_err(Error::backend)
+}
+
 /// Per-layer dense-prefix or sparse Kimi feed-forward policy.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -313,6 +348,60 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     )
                     .map_err(|error| Error::backend(error.to_string()))?;
                 routed.add(&sparse.shared.forward(input, context)?, context)
+            }
+        }
+    }
+
+    /// Executes sparse routed/shared work with one complete semantic observation.
+    pub fn forward_observed_with_provider<P, O>(
+        &mut self,
+        point: eredu_runtime::RoutedObservationPoint,
+        input: &B::Tensor,
+        pass: eredu_runtime::ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        match self {
+            Self::Dense(dense) => dense.forward(input, context),
+            Self::Sparse(sparse) => {
+                let routes = sparse.router.select(input, context)?;
+                let routed = provider
+                    .forward_grouped(
+                        &mut sparse.experts,
+                        RoutedExpertRequest {
+                            layer: sparse.layer,
+                            input,
+                            routes: &routes,
+                            pass,
+                        },
+                        context,
+                    )
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                let shared = sparse.shared.forward(input, context)?;
+                let combined = routed.add(&shared, context)?;
+                observer.observe_routing(eredu_runtime::RoutingObservation {
+                    path: point.path(),
+                    selected_experts: routes.group_indices(),
+                    selected_scores: routes.selected_scores(),
+                    coefficients: routes.coefficients(),
+                    routed_output: &routed,
+                    local_routed_output: None,
+                    reduced_routed_output: None,
+                    shared_output: Some(&shared),
+                    combined_output: Some(&combined),
+                    expert_count: point.expert_count(),
+                })?;
+                eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{}.output", point.path()),
+                    &combined,
+                )
             }
         }
     }

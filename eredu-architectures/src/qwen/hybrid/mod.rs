@@ -51,6 +51,22 @@ pub fn expert_realization_plan<
     realization_plan(architecture.config(), geometry.as_deref(), topology)
 }
 
+/// Derives the complete replicated target expert plan from normalized geometry.
+pub fn replicated_expert_realization_plan(
+    config: &HybridConfig,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    realization_plan(
+        config,
+        None,
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+            0,
+        )
+        .map_err(eredu_nn::Error::backend)?,
+    )?
+    .ok_or_else(|| eredu_nn::Error::backend("Qwen hybrid routed text requires sparse units"))
+}
+
 /// Derives complete expert ownership and local bank geometry for conditional Qwen hybrid units.
 pub fn conditional_expert_realization_plan<
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,

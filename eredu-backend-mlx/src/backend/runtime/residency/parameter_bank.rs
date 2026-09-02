@@ -5,7 +5,12 @@
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
 use eredu_checkpoint::{store::TensorSelection, WeightQuantization};
-use eredu_runtime::{OffloadUnit, ResidencyReport, WeightBinding, WeightMaterializationReport};
+use eredu_nn::GroupedNeuralBackend;
+use eredu_runtime::{
+    AddressableGroupedBank, IndexedMovement, OffloadUnit, ParameterBankAccess,
+    ParameterBankAcquisition, ParameterBankKey as NeutralParameterBankKey, ResidencyReport,
+    WeightBinding, WeightMaterializationReport,
+};
 
 use std::{
     collections::BTreeMap,
@@ -21,8 +26,10 @@ use safemlx::{
 
 #[cfg(test)]
 use crate::backend::runtime::residency::manager::ResidentUnitLease;
+use crate::MlxTensor;
 use crate::{
     backend::error::Error,
+    backend::nn::shared::MlxNeuralBackend,
     backend::runtime::checkpoint::bounded_quantization::{
         BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
@@ -148,35 +155,6 @@ pub enum ParameterBankOptionsError {
     },
 }
 
-/// One grouped hidden-state batch and its namespace-local entry assignments.
-#[derive(Debug, Clone, Copy)]
-pub struct ParameterBankSelection<'a> {
-    namespace: usize,
-    hidden: &'a Array,
-    group_indices: &'a Array,
-    weights: &'a Array,
-    pass: BankAccessClass,
-}
-
-impl<'a> ParameterBankSelection<'a> {
-    /// Binds grouped activations, entry ids, and weights to one namespace.
-    pub const fn new(
-        namespace: usize,
-        hidden: &'a Array,
-        group_indices: &'a Array,
-        weights: &'a Array,
-        pass: BankAccessClass,
-    ) -> Self {
-        Self {
-            namespace,
-            hidden,
-            group_indices,
-            weights,
-            pass,
-        }
-    }
-}
-
 /// One atomic entry definition supplied by a caller.
 #[derive(Clone)]
 pub struct ParameterBankEntry {
@@ -223,6 +201,52 @@ impl ParameterBankEntry {
     fn into_parts(self) -> (ParameterBankKey, OffloadUnit) {
         (self.identity, self.unit)
     }
+}
+
+/// Lowers generic selected storage members into MLX residency entries.
+pub fn entries_from_selected_members(
+    members: &[eredu_runtime::AddressableBankMember],
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<ParameterBankEntry>, Error> {
+    members
+        .iter()
+        .map(|member| {
+            let key = ParameterBankKey::new(member.key().unit(), member.key().member());
+            let bindings = member
+                .source()
+                .bindings()
+                .iter()
+                .map(|binding| {
+                    let mut recipe = binding.source_recipe();
+                    if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
+                        recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
+                            recipe, store,
+                        )?;
+                    }
+                    let metadata = recipe.infer(store)?;
+                    let mut selected =
+                        WeightBinding::from_recipe(binding.name(), recipe, metadata.byte_len())?;
+                    if let Some(target) = binding.logical_target() {
+                        selected = selected.with_logical_target(target)?;
+                    }
+                    if let Some((scales, biases)) = binding.quantization_companions() {
+                        selected = selected.with_quantization_companions(scales, biases)?;
+                    }
+                    Ok(selected)
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::ArchitectureModel(format!(
+                        "addressable member {:?} source byte total overflowed",
+                        member.key()
+                    ))
+                })
+            })?;
+            ParameterBankEntry::new(key, OffloadUnit::new(key.unit_id(), bindings)?, bytes)
+                .map_err(Into::into)
+        })
+        .collect()
 }
 
 /// Result of replacing dense entry bindings with a disk-backed packed overlay.
@@ -851,208 +875,35 @@ impl AddressableParameterBank {
         &self.manager
     }
 
-    /// Returns a conservative row count whose worst-case distinct selections fit
-    /// the configured bulk compact-bank target.
-    fn selection_chunk_rows(&self, selections_per_row: usize) -> usize {
-        if selections_per_row == 0 {
-            return 1;
-        }
-        let max_entry_bytes = self.catalog.values().copied().max().unwrap_or(1);
-        let bytes_per_row =
-            max_entry_bytes.saturating_mul(u64::try_from(selections_per_row).unwrap_or(u64::MAX));
-        let budget = self.scratch_limit.min(self.bulk_bank_target).max(1);
-        let rows = budget.checked_div(bytes_per_row).unwrap_or(0).max(1);
-        usize::try_from(rows).unwrap_or(usize::MAX)
+    /// Returns the largest source member in the generic storage catalog.
+    pub(crate) fn maximum_member_bytes(&self) -> u64 {
+        self.catalog.values().copied().max().unwrap_or(0)
     }
 
-    /// Executes grouped entries through bounded compact banks.
-    ///
-    /// Bulk rows are split conservatively from the catalog's largest entry
-    /// and the configured target. Incremental remains a single bank. The callback
-    /// constructs and executes one caller-supplied compact bank; this
-    /// method owns acquisition, output evaluation, lease completion, and
-    /// concatenation in original row order.
-    pub fn execute_selections_bounded<F>(
-        &self,
-        batch: ParameterBankSelection<'_>,
-        stream: &Stream,
-        mut execute_bank: F,
-    ) -> Result<Array, AddressableParameterBankError>
-    where
-        F: FnMut(
-            &Array,
-            &AcquiredParameterGroups,
-            &Array,
-            &Stream,
-        ) -> Result<Array, AddressableParameterBankError>,
-    {
-        let ParameterBankSelection {
-            namespace,
-            hidden: grouped_hidden,
-            group_indices: grouped_ids,
-            weights: coefficients,
-            pass,
-        } = batch;
-        if grouped_hidden.ndim() == 0
-            || grouped_ids.ndim() == 0
-            || coefficients.ndim() == 0
-            || grouped_hidden.dim(0) != grouped_ids.dim(0)
-            || grouped_hidden.dim(0) != coefficients.dim(0)
-        {
-            return Err(AddressableParameterBankError::GroupedBatchShapeMismatch {
-                hidden: grouped_hidden.shape().to_vec(),
-                selections: grouped_ids.shape().to_vec(),
-                weights: coefficients.shape().to_vec(),
-            });
-        }
-        let selections_per_row = grouped_ids.shape()[1..]
-            .iter()
-            .try_fold(1usize, |total, dimension| {
-                usize::try_from(*dimension)
-                    .ok()
-                    .and_then(|dimension| total.checked_mul(dimension))
-            })
-            .ok_or_else(|| {
-                AddressableParameterBankError::InvalidSelectionShape(grouped_ids.shape().to_vec())
-            })?;
-        let row_count = grouped_hidden.dim(0);
-        let chunk_rows = if pass == BankAccessClass::Bulk {
-            i32::try_from(self.selection_chunk_rows(selections_per_row)).unwrap_or(i32::MAX)
-        } else {
-            row_count.max(1)
-        };
-        let mut outputs = Vec::new();
-        let mut start = 0;
-        while start < row_count {
-            let end = (start + chunk_rows).min(row_count);
-            let hidden = grouped_hidden.try_index_device(start..end, stream)?;
-            let selections = grouped_ids.try_index_device(start..end, stream)?;
-            let weights = coefficients.try_index_device(start..end, stream)?;
-            let mut acquired = self.acquire_selections(namespace, &selections, pass, stream)?;
-            let output = execute_bank(&hidden, &acquired, &weights, stream)?;
-            if output.ndim() == 0 || output.dim(0) != end - start {
-                return Err(
-                    AddressableParameterBankError::CompactBankOutputShapeMismatch {
-                        expected_rows: end - start,
-                        actual: output.shape().to_vec(),
-                    },
-                );
-            }
-            eval([&output])?;
-            acquired.transfer.synchronize()?;
-            outputs.push(output);
-            start = end;
-        }
-        if outputs.is_empty() {
-            let mut acquired = self.acquire_selections(namespace, grouped_ids, pass, stream)?;
-            let output = execute_bank(grouped_hidden, &acquired, coefficients, stream)?;
-            if output.ndim() == 0 || output.dim(0) != row_count {
-                return Err(
-                    AddressableParameterBankError::CompactBankOutputShapeMismatch {
-                        expected_rows: row_count,
-                        actual: output.shape().to_vec(),
-                    },
-                );
-            }
-            eval([&output])?;
-            acquired.transfer.synchronize()?;
-            return Ok(output);
-        }
-        Ok(concatenate_axis(&outputs, 0, stream)?)
+    /// Returns the hard compact-bank byte limit.
+    pub(crate) const fn compact_bank_scratch_bytes(&self) -> u64 {
+        self.scratch_limit
     }
 
-    /// Discovers, validates, coalesces, and acquires grouped entries.
-    ///
-    /// A device-side demand histogram bounds host readback by the namespace's
-    /// global entry count. Original selections remain on-device and are rewritten
-    /// through a compact-id lookup table after validation.
-    fn acquire_selections(
+    /// Returns the bulk compact-bank working-set target.
+    pub(crate) const fn bulk_compact_bank_target_bytes(&self) -> u64 {
+        self.bulk_bank_target
+    }
+
+    /// Returns the admitted global member span for a caller-owned namespace.
+    pub(crate) fn namespace_global_span(&self, namespace: usize) -> Option<usize> {
+        self.namespace_global_spans.get(&namespace).copied()
+    }
+
+    /// Completes one generic acquisition after its dependent output is evaluated.
+    pub(crate) fn complete_acquisition(
         &self,
-        namespace: usize,
-        grouped_ids: &Array,
-        pass: BankAccessClass,
-        stream: &Stream,
-    ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
-        if !matches!(
-            grouped_ids.dtype(),
-            Dtype::Int32 | Dtype::Uint32 | Dtype::Int64 | Dtype::Uint64
-        ) {
-            return Err(AddressableParameterBankError::InvalidSelectionDtype {
-                actual: grouped_ids.dtype(),
-            });
-        }
-        let global_span = self
-            .namespace_global_spans
-            .get(&namespace)
-            .copied()
-            .ok_or(AddressableParameterBankError::UnknownNamespace { namespace })?;
-        let global_span_i32 = i32::try_from(global_span).map_err(|_| {
-            AddressableParameterBankError::EntryCountOverflow {
-                namespace,
-                global_span,
-            }
-        })?;
-        let flat_selections = grouped_ids.reshape(&[-1], stream)?;
-        let below_span = flat_selections.lt(Array::from_int(global_span_i32), stream)?;
-        let valid = if matches!(grouped_ids.dtype(), Dtype::Uint32 | Dtype::Uint64) {
-            below_span
-        } else {
-            flat_selections
-                .ge(Array::from_int(0), stream)?
-                .logical_and(below_span, stream)?
-        };
-        let invalid =
-            crate::backend::compaction::count_nonzero(&valid.logical_not(stream)?, stream)?;
-        let flat = if grouped_ids.dtype() == Dtype::Int32 {
-            flat_selections
-        } else {
-            flat_selections.as_dtype(Dtype::Int32, stream)?
-        };
-        let safe_ids = r#where(
-            &valid,
-            flat.clone(),
-            Array::zeros::<i32>(&[flat.size() as i32], stream)?,
-            stream,
-        )?;
-        let demand_values = Array::ones::<i32>(&[flat.size() as i32], stream)?;
-        let histogram = segment_sum(&demand_values, &safe_ids, global_span_i32, 0, stream)?;
-        eval([&histogram, &invalid])?;
-        let invalid_count = invalid.evaluated()?.as_slice::<i32>()[0];
-        if invalid_count != 0 {
-            return Err(AddressableParameterBankError::InvalidSelectionSet {
-                namespace,
-                invalid_count: invalid_count as usize,
-                global_span,
-            });
-        }
-        let histogram = histogram.evaluated()?;
-        let mut demand = BTreeMap::new();
-        for (global_entry, count) in histogram.as_slice::<i32>().iter().copied().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let identity = ParameterBankKey::new(namespace, global_entry);
-            if !self.catalog.contains_key(&identity) {
-                return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
-            }
-            demand.insert(identity, count as u64);
-        }
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        let mut lookup = vec![-1i32; global_span];
-        for (compact, identity) in compact_ids.iter().enumerate() {
-            lookup[identity.index] = compact as i32;
-        }
-        let lookup = Array::from_slice(&lookup, &[global_span_i32]).copy(stream)?;
-        let normalized = flat.reshape(grouped_ids.shape(), stream)?;
-        let compact_selections = lookup.take(&normalized, stream)?;
-        self.acquire_demand(
-            demand,
-            compact_ids,
-            compact_selections,
-            grouped_ids.size() as u64,
-            pass,
-            stream,
-        )
+        mut acquisition: AcquiredParameterGroups,
+        output: &Array,
+    ) -> Result<(), AddressableParameterBankError> {
+        eval([output])?;
+        acquisition.transfer.synchronize()?;
+        Ok(())
     }
 
     /// Acquires a caller-provided selection table while preserving its exact shape and order.
@@ -1104,32 +955,13 @@ impl AddressableParameterBank {
         }
 
         let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        let translations = compact_ids
-            .iter()
-            .enumerate()
-            .map(|(compact, identity)| (*identity, compact as i32))
-            .collect::<BTreeMap<_, _>>();
-        let compact_values = grouped_ids
-            .iter()
-            .map(|id| translations[&ParameterBankKey::new(namespace, *id as usize)])
-            .collect::<Vec<_>>();
-        let compact_selections =
-            Array::from_slice(&compact_values, selection_shape).copy(stream)?;
-        self.acquire_demand(
-            demand,
-            compact_ids,
-            compact_selections,
-            grouped_ids.len() as u64,
-            pass,
-            stream,
-        )
+        self.acquire_demand(demand, compact_ids, grouped_ids.len() as u64, pass, stream)
     }
 
     fn acquire_demand(
         &self,
         demand: BTreeMap<ParameterBankKey, u64>,
         compact_ids: Vec<ParameterBankKey>,
-        compact_selections: Array,
         selection_count: u64,
         pass: BankAccessClass,
         stream: &Stream,
@@ -1229,11 +1061,40 @@ impl AddressableParameterBank {
         Ok(AcquiredParameterGroups {
             identities: compact_ids,
             demand: demand.into_values().collect(),
-            compact_selections,
             scratch_bytes,
             pass,
             transfer,
         })
+    }
+
+    /// Acquires a deterministic, already coalesced generic entry demand.
+    pub fn acquire_entry_demand(
+        &self,
+        entries: &[(ParameterBankKey, u64)],
+        pass: BankAccessClass,
+        stream: &Stream,
+    ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+        if entries.is_empty() {
+            return Err(AddressableParameterBankError::EmptyDemand);
+        }
+        let mut demand = BTreeMap::new();
+        let mut selection_count = 0u64;
+        for &(identity, count) in entries {
+            if count == 0 {
+                return Err(AddressableParameterBankError::ZeroDemand { identity });
+            }
+            if !self.catalog.contains_key(&identity) {
+                return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
+            }
+            if demand.insert(identity, count).is_some() {
+                return Err(AddressableParameterBankError::DuplicateDemand { identity });
+            }
+            selection_count = selection_count
+                .checked_add(count)
+                .ok_or(AddressableParameterBankError::ByteOverflow)?;
+        }
+        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
+        self.acquire_demand(demand, compact_ids, selection_count, pass, stream)
     }
 
     /// Records a completed compact-bank construction.
@@ -1352,7 +1213,6 @@ impl ResidentSnapshot {
 pub struct AcquiredParameterGroups {
     identities: Vec<ParameterBankKey>,
     demand: Vec<u64>,
-    compact_selections: Array,
     scratch_bytes: u64,
     pass: BankAccessClass,
     transfer: ResidentTransfer,
@@ -1367,11 +1227,6 @@ impl AcquiredParameterGroups {
     /// Returns duplicate-preserving demand counts in compact-bank order.
     pub fn demand(&self) -> &[u64] {
         &self.demand
-    }
-
-    /// Returns selections rewritten bijectively to compact-bank ids.
-    pub const fn compact_selections(&self) -> &Array {
-        &self.compact_selections
     }
 
     /// Returns the conservatively reserved compact-bank byte count.
@@ -1439,6 +1294,245 @@ impl AcquiredParameterGroups {
     }
 }
 
+/// MLX integer discovery and device-side indexed movement mechanism.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MlxIndexedMovement;
+
+impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
+    type Error = Error;
+
+    fn index_demands(
+        &mut self,
+        indices: &MlxTensor,
+        upper_bound: usize,
+        stream: &Stream,
+    ) -> Result<Vec<(usize, u64)>, Self::Error> {
+        if !matches!(
+            indices.as_array().dtype(),
+            Dtype::Int32 | Dtype::Uint32 | Dtype::Int64 | Dtype::Uint64
+        ) {
+            return Err(AddressableParameterBankError::InvalidSelectionDtype {
+                actual: indices.as_array().dtype(),
+            }
+            .into());
+        }
+        let upper = i32::try_from(upper_bound).map_err(|_| {
+            Error::ArchitectureModel("indexed movement upper bound exceeds MLX i32 indexing".into())
+        })?;
+        if upper == 0 {
+            return Err(Error::ArchitectureModel(
+                "indexed movement upper bound must be nonzero".into(),
+            ));
+        }
+        let flat = indices.as_array().reshape(&[-1], stream)?;
+        let below = flat.lt(Array::from_int(upper), stream)?;
+        let valid = if matches!(flat.dtype(), Dtype::Uint32 | Dtype::Uint64) {
+            below
+        } else {
+            flat.ge(Array::from_int(0), stream)?
+                .logical_and(below, stream)?
+        };
+        let invalid =
+            crate::backend::compaction::count_nonzero(&valid.logical_not(stream)?, stream)?;
+        let flat_i32 = if flat.dtype() == Dtype::Int32 {
+            flat
+        } else {
+            flat.as_dtype(Dtype::Int32, stream)?
+        };
+        let safe = r#where(
+            &valid,
+            flat_i32,
+            Array::zeros::<i32>(&[indices.as_array().size() as i32], stream)?,
+            stream,
+        )?;
+        let ones = Array::ones::<i32>(&[safe.size() as i32], stream)?;
+        let histogram = segment_sum(&ones, &safe, upper, 0, stream)?;
+        eval([&histogram, &invalid])?;
+        let invalid_count = invalid.evaluated()?.as_slice::<i32>()[0];
+        if invalid_count != 0 {
+            return Err(AddressableParameterBankError::InvalidSelectionSet {
+                namespace: 0,
+                invalid_count: invalid_count as usize,
+                global_span: upper_bound,
+            }
+            .into());
+        }
+        Ok(histogram
+            .evaluated()?
+            .as_slice::<i32>()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, count)| *count != 0)
+            .map(|(index, count)| (index, count as u64))
+            .collect())
+    }
+
+    fn remap_indices(
+        &mut self,
+        indices: &MlxTensor,
+        mapping: &[(usize, usize)],
+        stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        let span = mapping
+            .iter()
+            .map(|(source, _)| source.saturating_add(1))
+            .max()
+            .ok_or_else(|| Error::ArchitectureModel("indexed remapping is empty".into()))?;
+        let mut lookup = vec![-1i32; span];
+        for &(source, destination) in mapping {
+            let destination = i32::try_from(destination).map_err(|_| {
+                Error::ArchitectureModel("compact index exceeds MLX i32 indexing".into())
+            })?;
+            if source >= span || lookup[source] != -1 {
+                return Err(Error::ArchitectureModel(
+                    "indexed remapping contains a duplicate source".into(),
+                ));
+            }
+            lookup[source] = destination;
+        }
+        let lookup = Array::from_slice(&lookup, &[span as i32]).copy(stream)?;
+        let normalized = if indices.as_array().dtype() == Dtype::Int32 {
+            indices.as_array().clone()
+        } else {
+            indices.as_array().as_dtype(Dtype::Int32, stream)?
+        };
+        Ok(MlxTensor::from_array(lookup.take(&normalized, stream)?))
+    }
+
+    fn select_rows(
+        &mut self,
+        value: &MlxTensor,
+        start: usize,
+        end: usize,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        let start = i32::try_from(start)
+            .map_err(|_| Error::ArchitectureModel("row start exceeds MLX indexing".into()))?;
+        let end = i32::try_from(end)
+            .map_err(|_| Error::ArchitectureModel("row end exceeds MLX indexing".into()))?;
+        Ok(MlxTensor::from_array(
+            value.as_array().try_index_device(start..end, stream)?,
+        ))
+    }
+
+    fn concatenate_rows(
+        &mut self,
+        values: &[MlxTensor],
+        stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        if values.is_empty() {
+            return Err(Error::ArchitectureModel(
+                "row concatenation requires at least one partition".into(),
+            ));
+        }
+        let values = values.iter().map(MlxTensor::as_array).collect::<Vec<_>>();
+        Ok(MlxTensor::from_array(concatenate_axis(&values, 0, stream)?))
+    }
+}
+
+impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
+    type Acquisition = AcquiredParameterGroups;
+    type Report = ParameterBankResidencyReport;
+    type Error = Error;
+
+    fn member_bytes(&self, key: NeutralParameterBankKey) -> Option<u64> {
+        self.catalog
+            .get(&ParameterBankKey::new(key.unit(), key.member()))
+            .copied()
+    }
+
+    fn acquire(
+        &mut self,
+        request: ParameterBankAcquisition<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Acquisition, Self::Error> {
+        let entries = request
+            .entries()
+            .iter()
+            .map(|(key, count)| (ParameterBankKey::new(key.unit(), key.member()), *count))
+            .collect::<Vec<_>>();
+        let pass = match request.access() {
+            ParameterBankAccess::Bulk => BankAccessClass::Bulk,
+            ParameterBankAccess::Incremental => BankAccessClass::Incremental,
+            _ => {
+                return Err(Error::ArchitectureModel(
+                    "unsupported addressable storage access class".into(),
+                ))
+            }
+        };
+        self.acquire_entry_demand(&entries, pass, stream)
+            .map_err(Into::into)
+    }
+
+    fn gated_product_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedGatedProductSpec,
+        stream: &Stream,
+    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups, Self::Error> {
+        let started = Instant::now();
+        let mut groups = MlxNeuralBackend::grouped_gated_product(spec.clone(), stream)?;
+        let bindings = groups
+            .local_parameter_names()
+            .into_iter()
+            .map(|name| {
+                acquisition
+                    .compact_binding(&name, stream)
+                    .map(|value| (name, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        groups.bind_local_parameters(bindings)?;
+        self.record_compact_bank(
+            acquisition.pass(),
+            acquisition.scratch_bytes(),
+            started.elapsed(),
+        )?;
+        Ok(groups)
+    }
+
+    fn relu2_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedRelu2Spec,
+        stream: &Stream,
+    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::Relu2Groups, Self::Error> {
+        let started = Instant::now();
+        let mut groups = MlxNeuralBackend::grouped_relu2(spec.clone(), stream)?;
+        let bindings = groups
+            .local_parameter_names()
+            .into_iter()
+            .map(|name| {
+                acquisition
+                    .compact_binding(&name, stream)
+                    .map(|value| (name, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        groups.bind_local_parameters(bindings)?;
+        self.record_compact_bank(
+            acquisition.pass(),
+            acquisition.scratch_bytes(),
+            started.elapsed(),
+        )?;
+        Ok(groups)
+    }
+
+    fn complete(
+        &mut self,
+        mut acquisition: Self::Acquisition,
+        output: &MlxTensor,
+        _: &Stream,
+    ) -> Result<(), Self::Error> {
+        eval([output.as_array()])?;
+        acquisition.transfer.synchronize()?;
+        Ok(())
+    }
+
+    fn report(&self) -> Result<Self::Report, Self::Error> {
+        AddressableParameterBank::report(self).map_err(Into::into)
+    }
+}
+
 /// Structured sparse entry cache failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1456,6 +1550,21 @@ pub enum AddressableParameterBankError {
     /// No entry definitions were supplied.
     #[error("sparse entry cache requires at least one owned entry")]
     EmptyCatalog,
+    /// A generic acquisition contained no entries.
+    #[error("addressable entry demand must not be empty")]
+    EmptyDemand,
+    /// A generic acquisition assigned no uses to one entry.
+    #[error("addressable entry {identity:?} has zero demand")]
+    ZeroDemand {
+        /// Entry with invalid demand.
+        identity: ParameterBankKey,
+    },
+    /// A generic acquisition repeated one entry identity.
+    #[error("addressable entry demand repeats {identity:?}")]
+    DuplicateDemand {
+        /// Repeated entry.
+        identity: ParameterBankKey,
+    },
     /// One logical entry declared no materialized bytes.
     #[error("entry {identity:?} must contain at least one byte")]
     ZeroSizedEntry {
@@ -1607,6 +1716,7 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 
     use super::*;
+    use crate::composition::grouped_provider::ParameterBankSelection;
     use eredu_core::residency::CacheEvictionPolicy;
     use eredu_runtime::WeightBinding;
 
@@ -1899,14 +2009,6 @@ mod tests {
             &[ParameterBankKey::new(2, 0), ParameterBankKey::new(2, 2)]
         );
         assert_eq!(first.demand(), &[2, 2]);
-        assert_eq!(
-            first
-                .compact_selections()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[1, 0, 1, 0]
-        );
         drop(first);
 
         let host = cache
@@ -1980,22 +2082,6 @@ mod tests {
     }
 
     #[test]
-    fn selection_chunk_size_respects_scratch_target_and_worst_case_entry_bytes() {
-        let (_dir, store) = fixture();
-        let bounded = cache(
-            Arc::clone(&store),
-            48,
-            0,
-            64,
-            CacheEvictionPolicy::LeastRecentlyUsed,
-        );
-        assert_eq!(bounded.selection_chunk_rows(2), 2);
-        assert_eq!(bounded.selection_chunk_rows(0), 1);
-        let small = cache(store, 48, 0, 16, CacheEvictionPolicy::LeastRecentlyUsed);
-        assert_eq!(small.selection_chunk_rows(2), 1);
-    }
-
-    #[test]
     fn bulk_target_is_required_and_cannot_exceed_scratch() {
         let storage = OffloadConfig::new(Some(48), Some(0), 1).unwrap();
         assert!(matches!(
@@ -2017,22 +2103,16 @@ mod tests {
         let selections = Array::from_slice(&[0i32, 1, 1, 2, 2, 0], &[3, 2]);
         let weights = Array::from_slice(&[0.5f32; 6], &[3, 2]);
         let mut bulk_banks = 0;
-        let output = cache
-            .execute_selections_bounded(
-                ParameterBankSelection::new(
-                    2,
-                    &hidden,
-                    &selections,
-                    &weights,
-                    BankAccessClass::Bulk,
-                ),
-                &execution,
-                |hidden, _acquired, _weights, _stream| {
-                    bulk_banks += 1;
-                    Ok(hidden.clone())
-                },
-            )
-            .unwrap();
+        let output = crate::composition::grouped_provider::execute_selections_bounded(
+            &cache,
+            ParameterBankSelection::new(2, &hidden, &selections, &weights, BankAccessClass::Bulk),
+            &execution,
+            |hidden, _acquired, _compact, _weights, _stream| {
+                bulk_banks += 1;
+                Ok(hidden.clone())
+            },
+        )
+        .unwrap();
         assert_eq!(bulk_banks, 3);
         assert_eq!(
             output.evaluated().unwrap().as_slice::<f32>(),
@@ -2040,93 +2120,84 @@ mod tests {
         );
 
         let mut incremental_banks = 0;
-        cache
-            .execute_selections_bounded(
-                ParameterBankSelection::new(
-                    2,
-                    &hidden,
-                    &selections,
-                    &weights,
-                    BankAccessClass::Incremental,
-                ),
-                &execution,
-                |hidden, _acquired, _weights, _stream| {
-                    incremental_banks += 1;
-                    Ok(hidden.clone())
-                },
-            )
-            .unwrap();
+        crate::composition::grouped_provider::execute_selections_bounded(
+            &cache,
+            ParameterBankSelection::new(
+                2,
+                &hidden,
+                &selections,
+                &weights,
+                BankAccessClass::Incremental,
+            ),
+            &execution,
+            |hidden, _acquired, _compact, _weights, _stream| {
+                incremental_banks += 1;
+                Ok(hidden.clone())
+            },
+        )
+        .unwrap();
         assert_eq!(incremental_banks, 1);
 
         let distributed_selections = Array::from_slice(&[0i32, 1, 2], &[3]);
         let distributed_weights = Array::from_slice(&[1f32; 3], &[3]);
         let mut distributed_banks = 0;
-        cache
-            .execute_selections_bounded(
-                ParameterBankSelection::new(
-                    2,
-                    &hidden,
-                    &distributed_selections,
-                    &distributed_weights,
-                    BankAccessClass::Bulk,
-                ),
-                &execution,
-                |hidden, _acquired, _weights, _stream| {
-                    distributed_banks += 1;
-                    Ok(hidden.clone())
-                },
-            )
-            .unwrap();
+        crate::composition::grouped_provider::execute_selections_bounded(
+            &cache,
+            ParameterBankSelection::new(
+                2,
+                &hidden,
+                &distributed_selections,
+                &distributed_weights,
+                BankAccessClass::Bulk,
+            ),
+            &execution,
+            |hidden, _acquired, _compact, _weights, _stream| {
+                distributed_banks += 1;
+                Ok(hidden.clone())
+            },
+        )
+        .unwrap();
         assert_eq!(distributed_banks, 2);
     }
 
     #[test]
-    fn device_histogram_preserves_duplicate_selections_and_validates_before_loading() {
+    fn indexed_movement_validates_before_loading_and_bank_coalesces_demand() {
         let (_dir, store) = fixture();
         let cache = cache(store, 32, 32, 32, CacheEvictionPolicy::LeastRecentlyUsed);
         let execution = stream();
-        let selections = Array::from_slice(&[2i32, 0, 2, 0], &[2, 2]);
         let acquired = cache
-            .acquire_selections(2, &selections, BankAccessClass::Bulk, &execution)
+            .acquire_selection_slice(2, &[2, 0, 2, 0], &[2, 2], BankAccessClass::Bulk, &execution)
             .unwrap();
         assert_eq!(
             acquired.identities(),
             &[ParameterBankKey::new(2, 0), ParameterBankKey::new(2, 2)]
         );
         assert_eq!(acquired.demand(), &[2, 2]);
-        assert_eq!(
-            acquired
-                .compact_selections()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[1, 0, 1, 0]
-        );
         drop(acquired);
 
-        let invalid = Array::from_slice(&[-1i32, 0], &[2]);
+        let mut movement = MlxIndexedMovement;
+        let invalid = MlxTensor::from_array(Array::from_slice(&[-1i32, 0], &[2]));
         assert!(matches!(
-            cache.acquire_selections(2, &invalid, BankAccessClass::Incremental, &execution),
-            Err(AddressableParameterBankError::InvalidSelectionSet {
-                invalid_count: 1,
-                ..
-            })
+            movement.index_demands(&invalid, 3, &execution),
+            Err(Error::AddressableParameterBank(
+                AddressableParameterBankError::InvalidSelectionSet {
+                    invalid_count: 1,
+                    ..
+                }
+            ))
         ));
         let report = cache.report().unwrap();
         assert_eq!(report.incremental.requested_selections, 0);
 
-        let narrowing_alias = Array::from_slice(&[1u64 << 32], &[1]);
+        let narrowing_alias = MlxTensor::from_array(Array::from_slice(&[1u64 << 32], &[1]));
         assert!(matches!(
-            cache.acquire_selections(
-                2,
-                &narrowing_alias,
-                BankAccessClass::Incremental,
-                &execution
-            ),
-            Err(AddressableParameterBankError::InvalidSelectionSet {
-                invalid_count: 1,
-                ..
-            })
+            movement.index_demands(&narrowing_alias, 3, &execution),
+            Err(Error::AddressableParameterBank(
+                AddressableParameterBankError::InvalidSelectionSet {
+                    invalid_count: 1,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -2161,7 +2232,6 @@ mod tests {
             .unwrap();
         assert!(acquired.is_empty());
         assert_eq!(acquired.scratch_bytes(), 0);
-        assert_eq!(acquired.compact_selections().shape(), &[0, 2]);
         drop(acquired);
         let report = cache.report().unwrap();
         assert_eq!(report.host_resident_entries, 0);

@@ -7,8 +7,8 @@ use eredu_nn::{
     GroupedRelu2Spec, TensorParallelGroupedOutput,
 };
 use eredu_runtime::{
-    ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    TensorParallelRoutedExpertProvider,
+    ExpertPass, IndexedMovement, RoutedExpertProvider, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput, TensorParallelRoutedExpertProvider,
 };
 use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
 
@@ -18,9 +18,147 @@ use crate::backend::error::Error;
 use crate::backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups};
 use crate::backend::nn::shared::MlxNeuralBackend;
 use crate::backend::runtime::residency::parameter_bank::{
-    AddressableParameterBank, BankAccessClass, ParameterBankSelection,
+    AcquiredParameterGroups, AddressableParameterBank, AddressableParameterBankError,
+    BankAccessClass, MlxIndexedMovement, ParameterBankKey,
 };
 use crate::MlxTensor;
+
+/// Composition-owned route batch for excluded distributed/composite provider adapters.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParameterBankSelection<'a> {
+    namespace: usize,
+    hidden: &'a Array,
+    group_indices: &'a Array,
+    weights: &'a Array,
+    pass: BankAccessClass,
+}
+
+impl<'a> ParameterBankSelection<'a> {
+    pub(crate) const fn new(
+        namespace: usize,
+        hidden: &'a Array,
+        group_indices: &'a Array,
+        weights: &'a Array,
+        pass: BankAccessClass,
+    ) -> Self {
+        Self {
+            namespace,
+            hidden,
+            group_indices,
+            weights,
+            pass,
+        }
+    }
+}
+
+fn selection_chunk_rows(cache: &AddressableParameterBank, selections_per_row: usize) -> usize {
+    if selections_per_row == 0 {
+        return 1;
+    }
+    let bytes_per_row = cache
+        .maximum_member_bytes()
+        .max(1)
+        .saturating_mul(u64::try_from(selections_per_row).unwrap_or(u64::MAX));
+    let budget = cache
+        .compact_bank_scratch_bytes()
+        .min(cache.bulk_compact_bank_target_bytes())
+        .max(1);
+    usize::try_from(budget.checked_div(bytes_per_row).unwrap_or(0).max(1)).unwrap_or(usize::MAX)
+}
+
+/// Owns route interpretation, bounded row partitioning, and compact-id remapping
+/// for composition-only cached-provider integrations.
+pub(crate) fn execute_selections_bounded<F>(
+    cache: &AddressableParameterBank,
+    batch: ParameterBankSelection<'_>,
+    stream: &Stream,
+    mut execute_bank: F,
+) -> Result<Array, Error>
+where
+    F: FnMut(&Array, &AcquiredParameterGroups, &Array, &Array, &Stream) -> Result<Array, Error>,
+{
+    let ParameterBankSelection {
+        namespace,
+        hidden: grouped_hidden,
+        group_indices: grouped_ids,
+        weights: coefficients,
+        pass,
+    } = batch;
+    if grouped_hidden.ndim() == 0
+        || grouped_ids.ndim() == 0
+        || coefficients.ndim() == 0
+        || grouped_hidden.dim(0) != grouped_ids.dim(0)
+        || grouped_hidden.dim(0) != coefficients.dim(0)
+    {
+        return Err(AddressableParameterBankError::GroupedBatchShapeMismatch {
+            hidden: grouped_hidden.shape().to_vec(),
+            selections: grouped_ids.shape().to_vec(),
+            weights: coefficients.shape().to_vec(),
+        }
+        .into());
+    }
+    let selections_per_row = grouped_ids.shape()[1..]
+        .iter()
+        .try_fold(1usize, |total, dimension| {
+            usize::try_from(*dimension)
+                .ok()
+                .and_then(|dimension| total.checked_mul(dimension))
+        })
+        .ok_or_else(|| {
+            AddressableParameterBankError::InvalidSelectionShape(grouped_ids.shape().to_vec())
+        })?;
+    let global_span = cache
+        .namespace_global_span(namespace)
+        .ok_or(AddressableParameterBankError::UnknownNamespace { namespace })?;
+    let row_count = grouped_hidden.dim(0);
+    let chunk_rows = if pass == BankAccessClass::Bulk {
+        i32::try_from(selection_chunk_rows(cache, selections_per_row)).unwrap_or(i32::MAX)
+    } else {
+        row_count.max(1)
+    };
+    let mut movement = MlxIndexedMovement;
+    let mut outputs = Vec::new();
+    let mut execute_chunk = |hidden: &Array, selections: &Array, weights: &Array| {
+        let indexed = MlxTensor::from_array(selections.clone());
+        let demands = movement.index_demands(&indexed, global_span, stream)?;
+        let backend_demands = demands
+            .iter()
+            .map(|(member, count)| (ParameterBankKey::new(namespace, *member), *count))
+            .collect::<Vec<_>>();
+        let acquired = cache.acquire_entry_demand(&backend_demands, pass, stream)?;
+        let mapping = demands
+            .iter()
+            .enumerate()
+            .map(|(compact, (source, _))| (*source, compact))
+            .collect::<Vec<_>>();
+        let compact = movement.remap_indices(&indexed, &mapping, stream)?;
+        let output = execute_bank(hidden, &acquired, compact.as_array(), weights, stream)?;
+        if output.ndim() == 0 || output.dim(0) != hidden.dim(0) {
+            return Err(
+                AddressableParameterBankError::CompactBankOutputShapeMismatch {
+                    expected_rows: hidden.dim(0),
+                    actual: output.shape().to_vec(),
+                }
+                .into(),
+            );
+        }
+        cache.complete_acquisition(acquired, &output)?;
+        Ok(output)
+    };
+    let mut start = 0;
+    while start < row_count {
+        let end = (start + chunk_rows).min(row_count);
+        let hidden = grouped_hidden.try_index_device(start..end, stream)?;
+        let selections = grouped_ids.try_index_device(start..end, stream)?;
+        let weights = coefficients.try_index_device(start..end, stream)?;
+        outputs.push(execute_chunk(&hidden, &selections, &weights)?);
+        start = end;
+    }
+    if outputs.is_empty() {
+        return execute_chunk(grouped_hidden, grouped_ids, coefficients);
+    }
+    Ok(safemlx::ops::concatenate_axis(&outputs, 0, stream)?)
+}
 
 fn wrap_parallel_output(
     output: TensorParallelGroupedOutput<Array>,
@@ -807,7 +945,8 @@ fn execute_cached_gated_product_inner(
     // cached banks must do the same before entering the row-oriented cache.
     let original_shape = hidden.shape().to_vec();
     let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
-    let output = cache.execute_selections_bounded(
+    let output = execute_selections_bounded(
+        cache,
         ParameterBankSelection::new(
             layer,
             &flattened,
@@ -816,7 +955,7 @@ fn execute_cached_gated_product_inner(
             bank_access_class(pass)?,
         ),
         stream,
-        |hidden, acquired, weights, stream| {
+        |hidden, acquired, compact_selections, weights, stream| {
             let started = Instant::now();
             let load_time = cache.weight_quantization();
             let mut bank = PackedGatedProductGroups::new(
@@ -859,7 +998,7 @@ fn execute_cached_gated_product_inner(
                 Some(partitions) => {
                     let output = bank.forward_tensor_parallel(
                         hidden,
-                        acquired.compact_selections(),
+                        compact_selections,
                         weights,
                         partitions,
                         stream,
@@ -873,7 +1012,7 @@ fn execute_cached_gated_product_inner(
                     };
                     safemlx::ops::concatenate_axis(&[reducible, post_reduce], -1, stream)?
                 }
-                None => bank.forward(hidden, acquired.compact_selections(), weights, stream)?,
+                None => bank.forward(hidden, compact_selections, weights, stream)?,
             })
         },
     )?;
@@ -904,7 +1043,8 @@ pub fn execute_cached_relu2(
     spec.validate()?;
     let original_shape = hidden.shape().to_vec();
     let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
-    let output = cache.execute_selections_bounded(
+    let output = execute_selections_bounded(
+        cache,
         ParameterBankSelection::new(
             layer,
             &flattened,
@@ -913,7 +1053,7 @@ pub fn execute_cached_relu2(
             bank_access_class(pass)?,
         ),
         stream,
-        |hidden, acquired, weights, stream| {
+        |hidden, acquired, compact_selections, weights, stream| {
             let started = Instant::now();
             let load_time = cache.weight_quantization();
             let mut bank = PackedRelu2Groups::new(
@@ -949,7 +1089,7 @@ pub fn execute_cached_relu2(
                 acquired.scratch_bytes(),
                 started.elapsed(),
             )?;
-            Ok(bank.forward(hidden, acquired.compact_selections(), weights, stream)?)
+            Ok(bank.forward(hidden, compact_selections, weights, stream)?)
         },
     )?;
     Ok(output.reshape(&original_shape, stream)?)

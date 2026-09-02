@@ -126,6 +126,55 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         routed.add(&shared.multiply(&shared_gate, context)?, context)
     }
 
+    fn forward_observed_with_provider<P, O>(
+        &mut self,
+        point: eredu_runtime::RoutedObservationPoint,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let routes = self.router.select(input, context)?;
+        let routed = provider
+            .forward_grouped(
+                &mut self.experts,
+                RoutedExpertRequest {
+                    layer: self.layer,
+                    input,
+                    routes: &routes,
+                    pass: pass(input),
+                },
+                context,
+            )
+            .map_err(Error::backend)?;
+        let shared = self.shared_expert.forward_feed_forward(input, context)?;
+        let shared_gate = B::sigmoid(self.shared_expert_gate.forward(input, context)?, context)?;
+        let shared = shared.multiply(&shared_gate, context)?;
+        let combined = routed.add(&shared, context)?;
+        observer.observe_routing(eredu_runtime::RoutingObservation {
+            path: point.path(),
+            selected_experts: routes.group_indices(),
+            selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(),
+            routed_output: &routed,
+            local_routed_output: None,
+            reduced_routed_output: None,
+            shared_output: Some(&shared),
+            combined_output: Some(&combined),
+            expert_count: point.expert_count(),
+        })?;
+        eredu_runtime::observe_and_intervene(
+            observer,
+            &format!("{}.output", point.path()),
+            &combined,
+        )
+    }
+
     fn forward_tensor_parallel_with_provider<P>(
         &mut self,
         input: &B::Tensor,
@@ -265,6 +314,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         match self {
             Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
             Self::Routed(moe) => moe.forward_with_provider(input, context, provider),
+        }
+    }
+
+    fn forward_observed_with_provider<P, O>(
+        &mut self,
+        point: eredu_runtime::RoutedObservationPoint,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        match self {
+            Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
+            Self::Routed(moe) => {
+                moe.forward_observed_with_provider(point, input, context, provider, observer)
+            }
         }
     }
 }
@@ -502,6 +572,49 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         let feed_forward =
             self.feed_forward
                 .forward_with_provider(&normalized, context, provider)?;
+        hidden.add(&feed_forward, context)
+    }
+
+    /// Executes one block while exposing the complete routed/shared contribution.
+    pub fn forward_observed_with_provider<S, P, O>(
+        &mut self,
+        point: eredu_runtime::RoutedObservationPoint,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let normalized = self.input_norm.forward(hidden, context)?;
+        let mixed = match &mut self.mixer {
+            TokenMixer::Linear(linear) => linear.forward(&normalized, state, context)?,
+            TokenMixer::Attention(attention) => attention.forward(
+                AttentionInput {
+                    hidden: &normalized,
+                    mask,
+                    cache: Some(&mut *state),
+                    allow_sliding_prefill: true,
+                    rotary_position: None,
+                },
+                context,
+            )?,
+        };
+        let hidden = hidden.add(&mixed, context)?;
+        let normalized = self.post_attention_norm.forward(&hidden, context)?;
+        let feed_forward = self.feed_forward.forward_observed_with_provider(
+            point,
+            &normalized,
+            context,
+            provider,
+            observer,
+        )?;
         hidden.add(&feed_forward, context)
     }
 

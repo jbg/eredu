@@ -50,6 +50,7 @@ impl MlxModelConfig {
 pub struct MlxSelectedPreparation {
     execution: eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
         eredu_runtime::SelectedReplicatedTextRealization,
+        eredu_architectures::SelectedRoutedTextRealization,
         SelectedMlxConstruction,
     >,
     session: eredu_core::SessionCapabilities,
@@ -59,6 +60,7 @@ impl MlxSelectedPreparation {
     const fn new(
         execution: eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
             eredu_runtime::SelectedReplicatedTextRealization,
+            eredu_architectures::SelectedRoutedTextRealization,
             SelectedMlxConstruction,
         >,
         session: eredu_core::SessionCapabilities,
@@ -335,6 +337,7 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
     for MlxExecutionClassSelection
 {
     type Replicated = eredu_runtime::SelectedReplicatedTextRealization;
+    type Routed = eredu_architectures::SelectedRoutedTextRealization;
     type Other = SelectedMlxConstruction;
     type Error = Error;
 
@@ -362,6 +365,39 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
             &requirements,
             &request,
             &super::replicated_text::capabilities(&requirements, &request),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn routed(
+        self,
+        requirements: eredu_architectures::RoutedTextRequirements,
+    ) -> Result<Self::Routed, Self::Error> {
+        let mut text = ReplicatedTextSelectionRequest::new(
+            self.options.weight_residency.layers(),
+            self.options.state_residency().clone(),
+        )
+        .with_session(self.admitted_session)
+        .with_prompt_cache(matches!(
+            self.options.state_residency(),
+            CacheResidencyPolicy::Paged(_)
+        ))
+        .with_exact_completion(true);
+        if let Some(topology) = self.policy.topology() {
+            text = text.with_topology(topology);
+        }
+        if let Some(quantization) = self.policy.quantization() {
+            text = text.with_quantization(quantization);
+        }
+        let request = eredu_architectures::RoutedTextSelectionRequest::new(
+            text,
+            self.options.weight_residency,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        eredu_architectures::select_routed_text_realization(
+            &requirements,
+            &request,
+            &super::replicated_text::capabilities(requirements.text(), request.text()),
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
@@ -443,6 +479,7 @@ struct MlxSelectedExecutionMaterializer<'a> {
 impl
     eredu_architectures::replicated_text::SelectedReplicatedTextExecutionDispatcher<
         eredu_runtime::SelectedReplicatedTextRealization,
+        eredu_architectures::SelectedRoutedTextRealization,
         SelectedMlxConstruction,
     > for MlxSelectedExecutionMaterializer<'_>
 {
@@ -454,6 +491,13 @@ impl
         selected: eredu_runtime::SelectedReplicatedTextRealization,
     ) -> Result<Self::Output, Self::Error> {
         materialize_replicated_text_plan(self.plan, selected, self.stream, self.weights_stream)
+    }
+
+    fn routed(
+        self,
+        selected: eredu_architectures::SelectedRoutedTextRealization,
+    ) -> Result<Self::Output, Self::Error> {
+        materialize_routed_text_plan(self.plan, selected, self.stream, self.weights_stream)
     }
 
     fn other(self, selected: SelectedMlxConstruction) -> Result<Self::Output, Self::Error> {
@@ -535,6 +579,85 @@ fn materialize_replicated_text_plan(
         _ => {
             return Err(Error::ArchitectureModel(
                 "unsupported artifact route for replicated text composition".into(),
+            ));
+        }
+    };
+    let model = MlxModel::complete(
+        Executable::replicated_text(kind, executable)?,
+        floating_state_dtype_bytes,
+        state_residency,
+    );
+    attach_processor(model, &architecture_plan)
+}
+
+fn materialize_routed_text_plan(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    realization: eredu_architectures::SelectedRoutedTextRealization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxModel, Error> {
+    let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
+    let max_cached_shards = realization.text().residency().max_cached_shards();
+    let state_residency = realization.text().state().policy().clone();
+    let inspection = plan.inspection().clone();
+    let architecture_plan = inspection.architecture_plan().clone();
+    let artifact = plan.into_artifact();
+    let kind = prepared_model_kind(&architecture_plan);
+    let executable = match artifact {
+        ModelArtifact::SafeTensors {
+            path: _,
+            configuration,
+            tensors,
+            shards,
+        } => {
+            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+                configuration,
+                prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                tensors,
+                shards,
+                max_cached_shards,
+            )?;
+            super::replicated_text::bind_routed_text(
+                &inspection,
+                realization,
+                prepared.store(),
+                stream,
+                weights_stream,
+            )?
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+            let (source, projector) = structural::AdmittedGguf::from_admission(
+                architecture,
+                architecture_plan.gguf_media_projector().cloned(),
+                validated,
+            )?;
+            if projector.is_some() {
+                return Err(Error::ArchitectureModel(
+                    "replicated routed text composition cannot bind a media projector".into(),
+                ));
+            }
+            #[cfg(test)]
+            super::path_instrumentation::payload_open();
+            let store = Arc::new(
+                crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                    source.checkpoint().clone(),
+                    source.plan().checkpoint(),
+                    source.plan().tensor_mapping(),
+                    max_cached_shards,
+                )?,
+            );
+            super::replicated_text::bind_routed_text(
+                &inspection,
+                realization,
+                store,
+                stream,
+                weights_stream,
+            )?
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact route for replicated routed text composition".into(),
             ));
         }
     };

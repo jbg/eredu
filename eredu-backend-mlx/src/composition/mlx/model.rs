@@ -227,6 +227,9 @@ impl Executable {
                 ModelKind::NemotronH,
                 ModelKind::Qwen3Next,
                 ModelKind::Qwen35,
+                ModelKind::GptOss,
+                ModelKind::DeepSeekV3,
+                ModelKind::DeepSeekV4,
             ],
         )?;
         Ok(Self::ReplicatedText(identity, model))
@@ -458,9 +461,8 @@ impl Executable {
             }
             Self::Qwen3VlMoe(_, model, _) => model.parameter_bank_report(),
             Self::MuseGlimmer(_, model, _) => model.parameter_bank_report(),
-            Self::PartitionedLlama(_, _, _)
-            | Self::ReplicatedText(_, _)
-            | Self::Qwen3Vl(_, _, _) => Ok(None),
+            Self::ReplicatedText(_, model) => model.parameter_bank_report(),
+            Self::PartitionedLlama(_, _, _) | Self::Qwen3Vl(_, _, _) => Ok(None),
         }
     }
 

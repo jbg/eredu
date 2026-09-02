@@ -280,12 +280,13 @@ selection and exact tasks. That contract is the proof-bearing handoff to
 construction; later code does not repeat those checks from family
 configuration or caller options.
 
-The MLX adapter consumes its load request while neutral selection is still in
-progress. Non-replicated paths retain their distinct selected construction
-values for routed, partitioned, composite, prediction, drafting, and realtime
-behavior. Reusable MLX loading, residency, cache, stream, transfer, and
-completion mechanisms receive only exact tasks, generic limits, rank-local
-placement, or opaque group handles. The mechanism-only `MlxRankContext`
+The MLX adapter consumes its load request before neutral selection completes.
+Replicated routed text has its own architecture-owned requirements
+and selected realization layered over the shared replicated-text contract.
+Partitioned, composite, prediction, drafting, and realtime paths retain their
+distinct selected construction values. Reusable MLX loading, residency, cache,
+stream, transfer, and completion mechanisms receive only exact tasks, generic
+limits, rank-local placement, or opaque group handles. The mechanism-only `MlxRankContext`
 contains a world rank and local device assignment. Semantic tensor, pipeline,
 and addressable axes remain in the composition-owned `MlxParallelPlan` and are
 lowered before reusable distributed facilities are invoked. Prompt-cache
@@ -308,9 +309,13 @@ into a model-wide transform or rediscovers policy from parameter names.
 
 Architecture-owned typed dispatch admits replicated Llama/Mistral, dense
 Qwen2/Qwen3, dense LFM2, dense Kimi Linear, target-only dense Nemotron-H, and
-target-only text Qwen3-Next/Qwen3.5 configurations. It rejects routed,
-partitioned, prediction-bearing, and conditional-media graphs from this
-construction class. The architecture registry selects both the replicated
+target-only text Qwen3-Next/Qwen3.5 configurations. Its additive routed class
+admits replicated Qwen3 MoE, GPT-OSS, routed LFM2, Kimi Linear, Nemotron-H,
+target-only text Qwen3-Next/Qwen3.5, and target-only DeepSeek V3/V4. It rejects
+partitioned, prediction-bearing, and conditional-media graphs from replicated
+routed construction. Gemma 4 remains composite even when its normalized
+configuration omits media modules, so it does not enter this class. The
+architecture registry selects both the replicated
 execution class and the exact stateless, ordinary key/value, fixed-only,
 attention-with-fixed, compressed-only, or compressed-with-fixed access profile.
 It constructs modules with the selected executable formats, validates the
@@ -318,9 +323,10 @@ proof-bearing architecture value, and invokes the corresponding typed neutral
 constructor adapter. Optional profiles are additive, so an ordinary backend
 does not acquire heterogeneous-state bounds.
 
-`eredu-runtime::construct_replicated_text_session` is the single production
-constructor for these profiles. The typed architecture adapter consumes the
-prepared handoff and passes its concrete architecture, opaque validated
+`eredu-runtime::construct_replicated_text_session` and its execution-strategy
+form are the single production construction family for these profiles. The
+typed architecture adapter consumes the prepared handoff and passes its
+concrete architecture, opaque validated
 contract, cache identity, and `ReplicatedTextSessionMechanisms` to that
 constructor. It chooses resident or bounded `LayerwiseRuntime` traversal,
 realizes exact selected state, and returns a `ReplicatedTextSession`. That
@@ -329,21 +335,55 @@ selection, state publication, reset, checkpoint and rollback, prompt-cache
 identity validation and replacement, residency reports, and exact completion
 sequencing. A non-MLX backend supplies its own tensor, policy, state,
 persistence, and completion mechanisms to this same constructor and executes
-the same lifecycle.
+the same lifecycle. Routed sessions supply a `RoutedReplicatedTextExecution`
+strategy to this constructor; they do not define a second prefill, decode,
+state, prompt-cache, reporting, observation, or completion lifecycle.
+
+`RoutedTextRequirements` retains the architecture-global grouped-operation
+plan, exact `ExpertResidencyCatalog`, and configured routes-per-token
+cardinality alongside the shared text contract.
+Neutral selection combines those facts with caller bank residency and generic
+backend capabilities for grouped operations, indexed movement, addressable
+storage, each required disk/host/device storage tier, compact-bank limits,
+leases, and exact completion. Admission computes the largest selected compact
+working set for one token row by summing the largest configured number of
+members from the selected, post-transform byte geometry. It rejects an
+undersized scratch bound before construction. The selected cardinality remains
+in the checked handoff and every planned provider rejects a route tensor whose
+last dimension differs before it can acquire storage. Resident and independently addressable
+strategies consume the same grouped specifications. The addressable strategy
+maps selected global identities to `ParameterBankKey` values, partitions bulk
+requests to the selected byte bounds, processes incremental requests one token
+row at a time, acquires keys in deterministic order,
+remaps compact indices, invokes the selected grouped operation, reduces the
+partial outputs, and completes each acquisition. Gated-product and ReLU² are
+operation profiles of this one neutral driver.
+
+Before the backend adapter runs, architecture composition projects the
+`ExpertResidencyCatalog` into generic `AddressableBankMember` records. Each
+record contains only its stable bank key, exact compact bindings, and source
+and selected byte geometry. The selected geometry includes any load-time
+transform and is therefore the geometry used for capacity checks, acquisition,
+and telemetry. A backend adapter consumes these generic records; it does not
+receive the architecture catalog or interpret family recipe policy.
 
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
-streams, indexed tensor operations, and completion objects. Neutral lifecycle
-code chooses the final causal sequence position; MLX only applies that exact
-index. State allocation iterates the exact selected components and placements
+streams, indexed tensor operations, generic addressable member storage,
+compact grouped-bank construction, leases, telemetry, and completion objects.
+Neutral lifecycle code chooses the final causal sequence position; MLX only
+applies that exact index. State allocation iterates the exact selected components and placements
 without deriving policy from architecture roles. Its
-adapter neither selects a family or state profile nor owns a peer
-replicated-text lifecycle. It invokes the neutral constructor and performs the
+adapter selects neither router policy nor a family-specific provider and owns
+no peer replicated-text lifecycle. It invokes the neutral constructor and performs the
 final backend-private erasure of the completed typed session. SafeTensors
 aliases, derived recipes, GGUF translated outputs, and selected transformations
 feed the same exact task interface. Erasure performs one dispatch per outer
 session operation; tensor operations, state-component access, and
 execution-unit traversal remain statically dispatched.
+The erased public session delegates the addressable-bank report from the typed
+session, so hit, miss, movement, tier, and byte accounting remain observable at
+the facade boundary. Resident routed execution reports no addressable bank.
 
 The selected realization is also the sole construction authority for exact
 weight-residency limits, mutable-state paging, topology realization, session
@@ -364,10 +404,15 @@ backend reports resulting storage separately from residency telemetry.
 
 `ReplicatedTextArchitecture` adds only ordinary borrowed text-input formation
 to the layered lifecycle and remains generic over its runtime state. Hybrid
-component state uses the `RuntimeStateComponents` extension; architecture-owned
-routing translates expert identity and assignment into `GroupedNeuralBackend`
-selection and projection mechanisms, independently addressable parameter-bank
-keys, and opaque collective-group realizations. Architecture/runtime semantic
+component state uses the `RuntimeStateComponents` extension. Architectures own
+router equations, top-k semantics, shared contributions, grouped geometry,
+parameter topology, and stable group/unit identity. Neutral routed composition
+translates the resulting identities through the architecture plan into grouped
+operations and independently addressable parameter-bank keys. Concrete
+backends receive exact generic keys, grouped specifications, bindings, access
+classes, and completion requests; reusable backend modules receive no expert
+plan, routed request, family configuration, or router policy.
+Architecture/runtime semantic
 plans translate tensor, pipeline, routed, data, or later axes into ordered
 world-rank memberships, group-local ranks, generic point-to-point routes, and
 required collective operations before invoking a backend. Backend sessions
@@ -592,19 +637,28 @@ and Qwen expert recipe callers provide only the catalog, normalized
 configuration, and layer identity, never a backend-selected layer namespace.
 Independent expert residency is exposed to composition as a validated neutral
 architecture catalog. Each entry carries expert identity, its owning group,
-unit index, parameter path, and placement. Composition maps that identity to a
-generic `ParameterBankKey` and supplies atomic bindings plus byte geometry to
-the backend's addressable parameter bank. Backend cache policy and telemetry
-refer only to keys, access classes, storage tiers, compact banks, and bytes.
+unit index, parameter path, and placement. Architecture composition maps that
+identity to a generic `ParameterBankKey` and projects exact atomic bindings,
+source bytes, and selected executable bytes into `AddressableBankMember`
+records. Backend cache policy and telemetry refer only to those generic keys,
+access classes, storage tiers, compact banks, and bytes.
 Each architecture entry also carries exact acquired-bank binding names, logical
 parameter targets, and checkpoint-derived recipes. Each parameter declares
 whether it must be preserved or is a load-time-quantizable projection;
 quantizable projections carry exact local scale and affine-bias companion
-binding names. Composition filters the architecture catalog by owning group and
-group-local unit before lowering it to backend bank entries. Expert identity is
-not a backend ownership address. The backend consumes the resulting atomic
-declaration directly and never infers eligibility or companion identity from
-binding spelling, dtype, or rank. Family code owns
+binding names. Architecture composition validates catalog targets, owners, and
+grouped-plan coherence before producing the neutral members. It compares every
+member recipe to the exact one-expert selection of the admitted whole-bank
+recipe, including inferred physical weight, scale, affine-bias, MXFP4, and
+block-FP8 geometry. The union of routed plan addresses and catalog paths must
+also exactly match the independently derived family layer schedule, so a
+coordinated omission from both plan and catalog is invalid.
+Expert identity is not a backend ownership address. The backend consumes the
+resulting atomic declaration directly and never infers eligibility or companion
+identity from binding spelling, dtype, or rank. Addressable exclusions in the
+ordinary replicated binding plan expand each architecture-selected primary to
+its exact generated output companions, so quantization scales and affine
+biases cannot be loaded twice. Family code owns
 sparse-layer selection, routed versus shared-bank scheduling, expert counts,
 and cache-layer numbering. Physical checkpoint keys excluded from ordinary
 layer residency while experts are independently resident are projected from
@@ -613,8 +667,11 @@ them by walking family layer policies or rebuilding per-layer recipes.
 This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, LFM2,
 Kimi Linear, and other sparse families: each architecture checkpoint module emits its complete
 `ExpertResidencyCatalog`, including compact acquired-bank names and every
-per-expert or rank-local selection recipe. Backend family adapters may request
-and filter that catalog, but do not calculate a parallel expert topology.
+per-expert or rank-local selection recipe. Replicated routed architecture
+composition consumes the catalog and publishes only generic bank members to
+the backend adapter. Adapters for distributed, composite, or
+prediction graphs may filter it to the exact realized partition but do not
+calculate a parallel expert topology.
 Resident rank-local expert banks follow the same rule: architecture checkpoint
 APIs select canonical parameter outputs for the assigned global expert IDs and
 push those selections through their derived recipes. Backend composition only
@@ -795,11 +852,14 @@ Distributed architecture callbacks also
 carry whether the requested result is globally complete or a rank-local
 tensor-parallel contribution, so EP recombination preserves the reducible and
 post-reduction terms without inventing or repeating a TP collective.
-Observed routed execution asks the neutral `RoutedLayeredArchitecture` for each
-unit's optional observation point. The architecture supplies both the semantic
-module path and expert cardinality; composition adapts native tensors to the
-neutral observer before calling grouped backend mechanisms and cannot invent
-family path segments.
+Observed routed execution calls the neutral `RoutedLayeredArchitecture`
+observation hook for each unit. Its default uses the architecture's semantic
+module path and expert cardinality around provider execution. Families with
+shared or post-routed work override the hook and report routed, shared, and
+combined tensors at the actual combination point, then apply intervention to
+the combined output before downstream execution. Composition only adapts
+native tensors to the neutral observer and cannot invent family path segments
+or claim that a provider-only output is the family result.
 Activation observers likewise derive unit input, output, and nested operator
 names from the architecture's canonical `unit_path`; concrete composition must
 not reconstruct a family path from a group or layer index.
@@ -1172,7 +1232,12 @@ Artifact loading has four stages:
 
 Concrete backend preflight reports mechanisms rather than family support or a
 parallel execution-class table. Architecture dispatch is authoritative for
-replicated text. Complete-model GGUF load-time quantization is encoded in the
+replicated text. For the generic replicated and routed classes, MLX performs
+only loading-protocol validation before execution-class dispatch and then lets
+neutral selection validate the concrete mechanisms. Excluded-family binding
+tables apply only to the `Other` class. Addressable parameter banks requested
+for dense replicated text are rejected explicitly rather than being silently
+discarded. Complete-model GGUF load-time quantization is encoded in the
 selected per-parameter tasks, so selection and materialization cannot disagree
 about whether a format or lowering is accepted. Execution classes handled by a
 distinct protocol, such as realtime Moshi, do not enter replicated dispatch.

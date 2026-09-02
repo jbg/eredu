@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-architectures"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-backend-mlx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-nn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn-macros",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",

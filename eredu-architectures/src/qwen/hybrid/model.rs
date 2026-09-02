@@ -59,6 +59,44 @@ where
             self, group, index, unit, hidden, state, forward, provider, context,
         )
     }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        match unit {
+            Unit::Target(block) if group == 0 => block.forward_observed_with_provider(
+                eredu_runtime::RoutedObservationPoint::new(
+                    format!("{path}.mlp"),
+                    self.config.num_experts,
+                ),
+                hidden,
+                forward.mask.as_ref(),
+                state.layer(index).map_err(Error::backend)?,
+                context,
+                provider,
+                observer,
+            ),
+            _ => LayeredModel::forward_unit_with_provider(
+                self, group, index, unit, hidden, state, forward, provider, context,
+            ),
+        }
+    }
 }
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>

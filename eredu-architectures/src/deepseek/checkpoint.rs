@@ -806,7 +806,9 @@ pub fn v3_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             intermediate.clone(),
         )?;
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
 }
 
 /// Builds the complete V4 schedule for independently resident routed experts.
@@ -845,7 +847,9 @@ pub fn v4_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             intermediate.clone(),
         )?;
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]

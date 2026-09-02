@@ -511,7 +511,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             );
         }
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
 }
 
 fn add_gguf_unit_transforms(

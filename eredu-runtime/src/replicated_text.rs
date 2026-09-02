@@ -965,13 +965,11 @@ impl ReplicatedTextRequirements {
             parameter.presence = ReplicatedTextParameterPresence::Derived {
                 recipe: "architecture.recipe".into(),
             };
-            if parameter.role != ReplicatedTextParameterRole::FormatCompanion {
-                parameter.sources = recipe
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect();
-            }
+            parameter.sources = recipe
+                .source_keys()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
         }
         self.derived_recipes = recipes;
         self.derived_recipe_outputs = outputs;
@@ -1114,6 +1112,95 @@ pub enum GroupedOperationRequirement {
     Relu2TensorParallelPartial,
 }
 
+/// Generic independently addressable storage facilities implemented by a backend.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AddressableStorageCapabilities {
+    bulk_access: bool,
+    incremental_access: bool,
+    lease_completion: bool,
+    maximum_compact_bytes: u64,
+    tiers: AddressableStorageTiers,
+}
+
+/// Generic storage tiers usable by an independently addressable bank.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AddressableStorageTiers {
+    device: bool,
+    host: bool,
+    disk: bool,
+}
+
+impl AddressableStorageTiers {
+    /// Creates one exact tier capability set.
+    pub const fn new(device: bool, host: bool, disk: bool) -> Self {
+        Self { device, host, disk }
+    }
+
+    /// Returns whether executable device storage is available.
+    pub const fn device(self) -> bool {
+        self.device
+    }
+
+    /// Returns whether host staging storage is available.
+    pub const fn host(self) -> bool {
+        self.host
+    }
+
+    /// Returns whether lazy checkpoint-backed storage is available.
+    pub const fn disk(self) -> bool {
+        self.disk
+    }
+}
+
+impl AddressableStorageCapabilities {
+    /// Creates an exact addressable-storage capability report.
+    pub const fn new(
+        bulk_access: bool,
+        incremental_access: bool,
+        lease_completion: bool,
+        maximum_compact_bytes: u64,
+    ) -> Self {
+        Self {
+            bulk_access,
+            incremental_access,
+            lease_completion,
+            maximum_compact_bytes,
+            tiers: AddressableStorageTiers::new(true, true, true),
+        }
+    }
+
+    /// Replaces the exact supported storage-tier set.
+    pub const fn with_tiers(mut self, tiers: AddressableStorageTiers) -> Self {
+        self.tiers = tiers;
+        self
+    }
+
+    /// Returns whether bounded multi-row access is implemented.
+    pub const fn bulk_access(self) -> bool {
+        self.bulk_access
+    }
+
+    /// Returns whether latency-sensitive incremental access is implemented.
+    pub const fn incremental_access(self) -> bool {
+        self.incremental_access
+    }
+
+    /// Returns whether acquisitions remain leased through native completion.
+    pub const fn lease_completion(self) -> bool {
+        self.lease_completion
+    }
+
+    /// Returns the largest supported per-acquisition compact bank.
+    pub const fn maximum_compact_bytes(self) -> u64 {
+        self.maximum_compact_bytes
+    }
+
+    /// Returns the exact independently addressable storage tiers.
+    pub const fn tiers(self) -> AddressableStorageTiers {
+        self.tiers
+    }
+}
+
 /// Family- and execution-class-neutral backend mechanism report.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BackendMechanismCapabilities {
@@ -1132,6 +1219,8 @@ pub struct BackendMechanismCapabilities {
     /// Exact completion ownership is implemented for submitted work.
     exact_completion: bool,
     grouped_operations: Vec<GroupedOperationRequirement>,
+    indexed_movement: bool,
+    addressable_storage: Option<AddressableStorageCapabilities>,
 }
 
 impl BackendMechanismCapabilities {
@@ -1151,6 +1240,8 @@ impl BackendMechanismCapabilities {
             prompt_cache: false,
             exact_completion: false,
             grouped_operations: Vec::new(),
+            indexed_movement: false,
+            addressable_storage: None,
         }
     }
 
@@ -1175,6 +1266,19 @@ impl BackendMechanismCapabilities {
         operations: impl IntoIterator<Item = GroupedOperationRequirement>,
     ) -> Self {
         self.grouped_operations = operations.into_iter().collect();
+        self
+    }
+    /// Declares generic indexed discovery, slicing, remapping, and concatenation.
+    pub const fn with_indexed_movement(mut self, supported: bool) -> Self {
+        self.indexed_movement = supported;
+        self
+    }
+    /// Declares generic independently addressable storage facilities.
+    pub const fn with_addressable_storage(
+        mut self,
+        capabilities: AddressableStorageCapabilities,
+    ) -> Self {
+        self.addressable_storage = Some(capabilities);
         self
     }
     /// Returns neural-operation mechanisms.
@@ -1208,6 +1312,14 @@ impl BackendMechanismCapabilities {
     /// Returns exact grouped operation mechanisms.
     pub fn grouped_operations(&self) -> &[GroupedOperationRequirement] {
         &self.grouped_operations
+    }
+    /// Returns whether generic indexed movement is implemented.
+    pub const fn indexed_movement(&self) -> bool {
+        self.indexed_movement
+    }
+    /// Returns independently addressable storage facilities, when implemented.
+    pub const fn addressable_storage(&self) -> Option<AddressableStorageCapabilities> {
+        self.addressable_storage
     }
 }
 

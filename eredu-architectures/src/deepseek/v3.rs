@@ -90,9 +90,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + BlockwiseAttentionBackend,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
@@ -114,6 +112,29 @@ where
     {
         Model::forward_unit_with_provider(
             self, group, index, unit, hidden, state, forward, pass, provider, context,
+        )
+    }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        Model::forward_unit_observed_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, provider, context, observer,
         )
     }
 }

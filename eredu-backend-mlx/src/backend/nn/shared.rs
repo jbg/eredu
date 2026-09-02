@@ -376,6 +376,39 @@ impl<M: PhysicalParameters> MlxNamedModule<M> {
         let topology = exact_parameter_topology(&inner, specs)?;
         Ok(Self { inner, topology })
     }
+
+    fn local_parameter_names(&self) -> Vec<String> {
+        self.topology.keys().cloned().collect()
+    }
+
+    fn bind_local_parameters(
+        &mut self,
+        mut bindings: BTreeMap<String, Array>,
+    ) -> Result<(), ComputeError> {
+        let expected = self.topology.keys().cloned().collect::<BTreeSet<_>>();
+        let actual = bindings.keys().cloned().collect::<BTreeSet<_>>();
+        if expected != actual {
+            return Err(ComputeError::backend(format!(
+                "compact grouped bindings differ: missing {:?}, unexpected {:?}",
+                expected.difference(&actual).collect::<Vec<_>>(),
+                actual.difference(&expected).collect::<Vec<_>>()
+            )));
+        }
+        for (local, parameter) in self.inner.parameters_mut().flatten() {
+            let value = bindings
+                .remove(local.as_ref())
+                .expect("equal compact binding sets contain every native parameter");
+            if parameter.shape() != value.shape() {
+                return Err(ComputeError::backend(format!(
+                    "compact grouped binding {local:?} has shape {:?}, expected {:?}",
+                    value.shape(),
+                    parameter.shape()
+                )));
+            }
+            *parameter = value;
+        }
+        Ok(())
+    }
 }
 
 impl<M> std::ops::Deref for MlxNamedModule<M> {
@@ -838,6 +871,19 @@ pub struct MlxGroupedGatedProduct {
     module: MlxNamedModule<common::grouped::PackedGatedProductGroups>,
 }
 
+impl MlxGroupedGatedProduct {
+    pub(crate) fn local_parameter_names(&self) -> Vec<String> {
+        self.module.local_parameter_names()
+    }
+
+    pub(crate) fn bind_local_parameters(
+        &mut self,
+        bindings: BTreeMap<String, Array>,
+    ) -> Result<(), ComputeError> {
+        self.module.bind_local_parameters(bindings)
+    }
+}
+
 impl Parameterized<MlxTensor> for MlxGroupedGatedProduct {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
@@ -918,6 +964,17 @@ impl MlxGroupedRelu2 {
     pub const fn spec(&self) -> &GroupedRelu2Spec {
         &self.spec
     }
+
+    pub(crate) fn local_parameter_names(&self) -> Vec<String> {
+        self.module.local_parameter_names()
+    }
+
+    pub(crate) fn bind_local_parameters(
+        &mut self,
+        bindings: BTreeMap<String, Array>,
+    ) -> Result<(), ComputeError> {
+        self.module.bind_local_parameters(bindings)
+    }
 }
 
 impl Parameterized<MlxTensor> for MlxGroupedRelu2 {
@@ -941,6 +998,10 @@ impl Parameterized<MlxTensor> for MlxGroupedRelu2 {
 }
 
 impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
+    fn spec(&self) -> &GroupedRelu2Spec {
+        &self.spec
+    }
+
     fn forward_grouped(
         &mut self,
         input: &MlxTensor,

@@ -1731,7 +1731,7 @@ fn complete_family_adapters_return_final_output_interventions() {
         write_fixture(checkpoint.path());
         let backend = crate::native::backend(&stream, &stream);
         let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default())
-            .unwrap()
+            .unwrap_or_else(|error| panic!("{family} load failed: {error}"))
             .into_inner();
         let mut session = MlxModelSession::from_model(
             model,
@@ -2961,7 +2961,7 @@ fn mxfp4_payload(elements: u64, phase: usize) -> Vec<u8> {
     data
 }
 
-fn write_gpt_oss_gguf_fixture(path: &Path) {
+pub(crate) fn write_gpt_oss_gguf_fixture(path: &Path) {
     let metadata = BTreeMap::from([
         (
             "general.architecture".into(),
