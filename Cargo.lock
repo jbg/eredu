@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-backend-mlx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2813,7 +2813,7 @@ checksum = "3944826ff8fa8093089aba3acb4ef44b9446a99a16f3bf4e74af3f77d340ab7d"
 
 [[package]]
 name = "safemlx"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "float_eq",
