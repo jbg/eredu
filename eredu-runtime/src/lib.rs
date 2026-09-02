@@ -37,6 +37,8 @@ pub mod partition;
 pub mod prefetch;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
 pub mod realtime;
+/// Backend-neutral replicated-text execution and session ownership.
+pub mod replicated_session;
 /// Selection contracts for replicated text architectures.
 pub mod replicated_text;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
@@ -138,10 +140,17 @@ pub use realtime::{
     RealtimeCompletionAttachmentError, RealtimeFrameExecutionError, RealtimeFrameTransition,
     RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
 };
+pub use replicated_session::{
+    construct_replicated_text_session, prepare_replicated_text_contract,
+    PreparedReplicatedTextContract, ReplicatedTextSession, ReplicatedTextSessionError,
+    ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport,
+};
 pub use replicated_text::{
-    select_replicated_text_realization, BackendMechanismCapabilities, GroupedOperationRequirement,
-    ParameterTransformConstraint, ParameterTransformTarget, ReplicatedTextArchitecture,
-    ReplicatedTextContractError, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
+    replicated_text_materialization_tasks, select_replicated_text_realization,
+    BackendMechanismCapabilities, GroupedOperationRequirement, ParameterTransformConstraint,
+    ParameterTransformTarget, ReplicatedTextArchitecture, ReplicatedTextContractError,
+    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
+    ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
     ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
     ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
     ReplicatedTextStateAccess, SelectedParameterRealization, SelectedReplicatedTextRealization,

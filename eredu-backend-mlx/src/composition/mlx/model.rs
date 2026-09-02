@@ -150,15 +150,6 @@ pub enum Executable {
 }
 
 impl Executable {
-    pub(super) fn selected_session_binding(
-        &self,
-    ) -> Option<&super::replicated_text::SelectedSessionBinding> {
-        match self {
-            Self::ReplicatedText(_, executable) => Some(executable.selected_session_binding()),
-            _ => None,
-        }
-    }
-
     pub(super) fn deepseek(
         kind: ModelKind,
         model: Box<crate::composition::deepseek::DeepSeekModel>,

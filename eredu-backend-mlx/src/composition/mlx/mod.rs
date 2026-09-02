@@ -41,7 +41,12 @@ pub(crate) mod path_instrumentation {
         pub(crate) architecture_constructions: usize,
         pub(crate) state_allocations: usize,
         pub(crate) payload_opens: usize,
+        pub(crate) constructors: usize,
+        pub(crate) unit_constructions: usize,
+        pub(crate) materializations: usize,
         pub(crate) forwards: usize,
+        pub(crate) state_publications: usize,
+        pub(crate) completions: usize,
     }
 
     thread_local! {
@@ -84,6 +89,46 @@ pub(crate) mod path_instrumentation {
         COUNTS.with(|cell| {
             let mut counts = cell.get();
             counts.forwards += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn constructor() {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.constructors += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn unit_construction() {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.unit_constructions += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn materialization() {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.materializations += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn state_publication() {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.state_publications += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn completion() {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.completions += 1;
             cell.set(counts);
         });
     }

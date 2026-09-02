@@ -8,8 +8,8 @@ use std::{
 
 use eredu_core::cache::{
     LayerCachePolicy, PoolingStateComponent, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheOptions, StateTensorDimension, StateTensorOwner, StateTensorPresence,
-    StateTensorRole,
+    PromptCacheOptions, StateComponentRole, StateTensorDimension, StateTensorOwner,
+    StateTensorPresence, StateTensorRole,
 };
 use eredu_core::scheduler::SemanticStateTransaction;
 use eredu_nn::{
@@ -19,8 +19,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     CacheResidencyReport, DeviceState, LayerRuntimeState, ResettableRuntimeLayerState,
-    ResettableRuntimeState, RuntimeLayerState, RuntimeState, RuntimeStateComponents, StateError,
-    StateLayout, StateSegmentId, StateSegmentSpec,
+    ResettableRuntimeState, RuntimeLayerState, RuntimeState, RuntimeStateComponents,
+    SelectedStateComponentRealization, SelectedStateRealization, StateComponentPlacement,
+    StateError, StateLayout, StateSegmentId, StateSegmentSpec,
 };
 use safemlx::{
     error::Exception,
@@ -1034,6 +1035,65 @@ impl DerefMut for MlxKeyValueTransactionBranch {
     }
 }
 
+fn selected_state_layers(
+    selected: &SelectedStateRealization,
+) -> Result<Vec<&[SelectedStateComponentRealization]>, Exception> {
+    let layout = selected.layout();
+    let mut cursor: usize = 0;
+    let mut layers = Vec::with_capacity(layout.len());
+    for layer in 0..layout.len() {
+        let expected = layout.components(layer).ok_or_else(|| {
+            Exception::custom(format!(
+                "selected state layout has no component contract for layer {layer}"
+            ))
+        })?;
+        let end = cursor
+            .checked_add(expected.len())
+            .ok_or_else(|| Exception::custom("selected state component count overflowed"))?;
+        let realized = selected.components().get(cursor..end).ok_or_else(|| {
+            Exception::custom(format!(
+                "selected state omits declared components at layer {layer}"
+            ))
+        })?;
+        for (component, expected) in realized.iter().zip(expected) {
+            if component.layer() != layer || component.component() != expected {
+                return Err(Exception::custom(format!(
+                    "selected state component contract differs from the layout at layer {layer}"
+                )));
+            }
+        }
+        layers.push(realized);
+        cursor = end;
+    }
+    if cursor != selected.components().len() {
+        return Err(Exception::custom(format!(
+            "selected state contains {} components beyond its layout",
+            selected.components().len() - cursor
+        )));
+    }
+    Ok(layers)
+}
+
+fn common_selected_placement(
+    layer: usize,
+    kind: &str,
+    components: &[SelectedStateComponentRealization],
+) -> Result<Option<StateComponentPlacement>, Exception> {
+    let Some(first) = components.first() else {
+        return Ok(None);
+    };
+    let placement = first.placement();
+    if components
+        .iter()
+        .any(|component| component.placement() != placement)
+    {
+        return Err(Exception::custom(format!(
+            "MLX {kind} components select incompatible placements at layer {layer}"
+        )));
+    }
+    Ok(Some(placement))
+}
+
 impl MlxKeyValueState {
     /// Creates contiguous execution-device state for every declared layer.
     pub fn device(layout: StateLayout) -> Result<Self, Exception> {
@@ -1070,6 +1130,64 @@ impl MlxKeyValueState {
                 let window = key_value_window(layer, policy)?;
                 PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
                     .map(MlxKeyValueLayerState::Paged)
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+        Ok(Self {
+            layout,
+            layers,
+            paged_transaction_branch: false,
+        })
+    }
+
+    /// Creates the exact component placements selected before allocation.
+    ///
+    /// A paging manager is required when any selected component is paged. The
+    /// rank identifies the local cache shard when one is present.
+    pub fn from_selected(
+        selected: &SelectedStateRealization,
+        manager: Option<CacheResidencyManager>,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let selected_layers = selected_state_layers(selected)?;
+        let layout = selected.layout().clone();
+        let layers = layout
+            .layers()
+            .iter()
+            .zip(selected_layers)
+            .enumerate()
+            .map(|(layer, (policy, components))| {
+                let window = key_value_window(layer, policy)?;
+                match common_selected_placement(layer, "key/value", components)? {
+                    Some(StateComponentPlacement::Device) => {
+                        Ok(MlxKeyValueLayerState::Device(match window {
+                            Some(window) => {
+                                ConcatKeyValueCache::new_for_sliding_attention(window)
+                            }
+                            None => ConcatKeyValueCache::new(),
+                        }))
+                    }
+                    Some(StateComponentPlacement::Paged) => {
+                        let manager = manager.as_ref().ok_or_else(|| {
+                            Exception::custom(format!(
+                                "MLX paged key/value state has no residency manager at layer {layer}"
+                            ))
+                        })?;
+                        PagedKeyValueCache::new_with_layout(
+                            manager.clone(),
+                            layer,
+                            window,
+                            0,
+                            rank,
+                        )
+                        .map(MlxKeyValueLayerState::Paged)
+                    }
+                    Some(placement) => Err(Exception::custom(format!(
+                        "MLX key/value state does not support selected placement {placement:?} at layer {layer}"
+                    ))),
+                    None => Err(Exception::custom(format!(
+                        "MLX key/value state has no selected components at layer {layer}"
+                    ))),
+                }
             })
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
@@ -1510,6 +1628,122 @@ impl MlxHybridLayerState {
         })
     }
 
+    fn from_selected(
+        layer: usize,
+        policy: &LayerCachePolicy,
+        components: &[SelectedStateComponentRealization],
+        manager: Option<&CacheResidencyManager>,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let attention_policy = hybrid_attention_policy(layer, policy)?;
+        let attention_components = match policy {
+            LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => 0,
+            LayerCachePolicy::KeyOnly { .. } | LayerCachePolicy::KeyOnlyWithFixedState { .. } => 1,
+            LayerCachePolicy::KeyValue { .. }
+            | LayerCachePolicy::KeyValueWithFixedState { .. }
+            | LayerCachePolicy::CompressedLatentRotary { .. } => 2,
+        };
+        let (attention_components, fixed_components) = components
+            .split_at_checked(attention_components)
+            .ok_or_else(|| {
+                Exception::custom(format!(
+                    "selected hybrid state omits attention components at layer {layer}"
+                ))
+            })?;
+        if fixed_components.len() != policy.fixed_state().len() {
+            return Err(Exception::custom(format!(
+                "selected hybrid state fixed-component count differs at layer {layer}"
+            )));
+        }
+        for component in fixed_components {
+            if !matches!(component.component().role(), StateComponentRole::Fixed(_)) {
+                return Err(Exception::custom(format!(
+                    "selected hybrid fixed-state contract differs at layer {layer}"
+                )));
+            }
+            if component.placement() != StateComponentPlacement::Device {
+                return Err(Exception::custom(format!(
+                    "MLX hybrid fixed state does not support selected placement {:?} at layer {layer}",
+                    component.placement()
+                )));
+            }
+        }
+        let placement = common_selected_placement(layer, "hybrid attention", attention_components)?;
+        let attention = match (attention_policy, placement) {
+            (None, None) => None,
+            (Some(policy), Some(StateComponentPlacement::Device)) => Some(match policy {
+                HybridAttentionPolicy::KeyValue { window, key_only } => {
+                    MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
+                        match (window, key_only) {
+                            (Some(window), true) => {
+                                ConcatKeyValueCache::new_key_only_for_sliding_attention(window)
+                            }
+                            (Some(window), false) => {
+                                ConcatKeyValueCache::new_for_sliding_attention(window)
+                            }
+                            (None, true) => ConcatKeyValueCache::new_key_only(),
+                            (None, false) => ConcatKeyValueCache::new(),
+                        },
+                    ))
+                }
+                HybridAttentionPolicy::Compressed => {
+                    MlxHybridAttentionState::Compressed(CompressedLatentCache::new())
+                }
+            }),
+            (Some(policy), Some(StateComponentPlacement::Paged)) => {
+                let manager = manager.ok_or_else(|| {
+                    Exception::custom(format!(
+                        "MLX paged hybrid attention has no residency manager at layer {layer}"
+                    ))
+                })?;
+                Some(match policy {
+                    HybridAttentionPolicy::KeyValue { window, key_only } => {
+                        let cache = if key_only {
+                            PagedKeyValueCache::new_key_only_with_layout(
+                                manager.clone(),
+                                layer,
+                                window,
+                                0,
+                                rank,
+                            )
+                        } else {
+                            PagedKeyValueCache::new_with_layout(
+                                manager.clone(),
+                                layer,
+                                window,
+                                0,
+                                rank,
+                            )
+                        }?;
+                        MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))
+                    }
+                    HybridAttentionPolicy::Compressed => MlxHybridAttentionState::Compressed(
+                        CompressedLatentCache::new_paged(manager.clone(), layer, rank)?,
+                    ),
+                })
+            }
+            (Some(_), Some(placement)) => {
+                return Err(Exception::custom(format!(
+                    "MLX hybrid attention does not support selected placement {placement:?} at layer {layer}"
+                )))
+            }
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(Exception::custom(format!(
+                    "selected hybrid attention contract differs from the layout at layer {layer}"
+                )))
+            }
+        };
+        Ok(Self {
+            attention,
+            fixed: policy
+                .fixed_state()
+                .iter()
+                .map(|tensor| (tensor.role, None))
+                .collect(),
+            fixed_offset: 0,
+        })
+    }
+
     /// Clears attention and fixed components while retaining their policies.
     pub fn clear(&mut self) -> Result<(), Exception> {
         if let Some(attention) = &mut self.attention {
@@ -1772,6 +2006,53 @@ impl MlxHybridState {
                     Exception::custom("hybrid state global layer index overflowed")
                 })?;
                 MlxHybridLayerState::paged(global_layer, policy, &manager, rank)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            layout,
+            global_layer_start,
+            layers,
+        })
+    }
+
+    /// Creates the exact component placements selected before allocation.
+    ///
+    /// A paging manager is required when any selected attention component is
+    /// paged. Fixed components are accepted only with explicit device
+    /// placement.
+    pub fn from_selected(
+        selected: &SelectedStateRealization,
+        manager: Option<CacheResidencyManager>,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        Self::from_selected_with_global_layer_start(selected, manager, rank, 0)
+    }
+
+    /// Creates selected state addressed from an architecture-global layer.
+    pub fn from_selected_with_global_layer_start(
+        selected: &SelectedStateRealization,
+        manager: Option<CacheResidencyManager>,
+        rank: Option<CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Exception> {
+        let selected_layers = selected_state_layers(selected)?;
+        let layout = selected.layout().clone();
+        let layers = layout
+            .layers()
+            .iter()
+            .zip(selected_layers)
+            .enumerate()
+            .map(|(layer, (policy, components))| {
+                let global_layer = global_layer_start.checked_add(layer).ok_or_else(|| {
+                    Exception::custom("hybrid state global layer index overflowed")
+                })?;
+                MlxHybridLayerState::from_selected(
+                    global_layer,
+                    policy,
+                    components,
+                    manager.as_ref(),
+                    rank,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -2276,8 +2557,22 @@ fn hybrid_attention_policy(
 #[cfg(test)]
 mod semantic_transaction_tests {
     use super::*;
-    use eredu_core::{cache::CacheRepresentation, AttentionPolicy, LayerSchedule};
-    use eredu_runtime::{PagedCacheOptions, StateSegmentLifetime};
+    use eredu_core::{
+        cache::{
+            CacheRepresentation, MutableStateResidency, StateResidencyClass, StateTensorDimension,
+            StateTensorDtype, StateTensorPolicy,
+        },
+        AttentionPolicy, LayerSchedule,
+    };
+    use eredu_nn::NeuralOperatorCapabilities;
+    use eredu_runtime::{
+        select_replicated_text_realization, ArchitectureGroupKind, ArchitectureGroupPlacement,
+        ArchitectureGroupTransport, ArchitectureMergeDestination, BackendMechanismCapabilities,
+        CacheResidencyPolicy, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
+        LayerWeightResidency, PagedCacheOptions, ReplicatedTextRequirements,
+        ReplicatedTextSelectionRequest, ReplicatedTextStateAccess, StateComponentMechanism,
+        StateMechanismCapabilities, StateSegmentLifetime, WeightResidencyMechanism,
+    };
 
     fn layout(window: Option<i32>) -> StateLayout {
         StateLayout::new(
@@ -2304,6 +2599,75 @@ mod semantic_transaction_tests {
         .unwrap()
     }
 
+    fn selected_state(
+        layout: StateLayout,
+        access: ReplicatedTextStateAccess,
+        policy: CacheResidencyPolicy,
+    ) -> SelectedStateRealization {
+        let graph =
+            ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+        let units = ExecutionUnitLayout::new(&graph, [layout.len()]).unwrap();
+        let requirements = ReplicatedTextRequirements::new(
+            "test.mlx-selected-state",
+            NeuralOperatorCapabilities::NONE,
+            graph,
+            units,
+            vec![ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::Decoder,
+                first_owner_static_roles: Vec::new(),
+                last_owner_static_roles: Vec::new(),
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            }],
+            layout,
+            access,
+            Vec::new(),
+        )
+        .unwrap();
+        let components = (0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    let paged = match component.residency() {
+                        StateResidencyClass::SealablePaged => StateComponentPlacement::Paged,
+                        StateResidencyClass::AlwaysDeviceMutable
+                        | StateResidencyClass::LayerScopedOffloadable => {
+                            StateComponentPlacement::Device
+                        }
+                    };
+                    StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(StateComponentPlacement::Device),
+                        Some(paged),
+                    )
+                })
+        });
+        let state = StateMechanismCapabilities::new(components)
+            .with_transactions(true, true)
+            .with_reset(true);
+        let capabilities = BackendMechanismCapabilities::new(
+            NeuralOperatorCapabilities::NONE,
+            Vec::new(),
+            vec![WeightResidencyMechanism::Resident],
+            state,
+        );
+        select_replicated_text_realization(
+            &requirements,
+            &ReplicatedTextSelectionRequest::new(LayerWeightResidency::FullyResident, policy),
+            &capabilities,
+        )
+        .unwrap()
+        .state()
+        .clone()
+    }
+
     fn segmented_layout() -> StateLayout {
         let policy = LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap();
         StateLayout::segmented(
@@ -2315,6 +2679,82 @@ mod semantic_transaction_tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn key_value_constructor_uses_selected_component_placement() {
+        let layout = layout(Some(4));
+        let device = selected_state(
+            layout.clone(),
+            ReplicatedTextStateAccess::KeyValue,
+            CacheResidencyPolicy::Device,
+        );
+        let device = MlxKeyValueState::from_selected(&device, None, None).unwrap();
+        assert!(matches!(
+            device.as_ref(),
+            [MlxKeyValueLayerState::Device(_)]
+        ));
+
+        let paged_policy = CacheResidencyPolicy::Paged(
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        );
+        let paged = selected_state(layout, ReplicatedTextStateAccess::KeyValue, paged_policy);
+        assert!(MlxKeyValueState::from_selected(&paged, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("no residency manager"));
+        let paged = MlxKeyValueState::from_selected(&paged, Some(manager()), None).unwrap();
+        assert!(matches!(paged.as_ref(), [MlxKeyValueLayerState::Paged(_)]));
+    }
+
+    #[test]
+    fn hybrid_constructor_preserves_paged_attention_and_device_fixed_state() {
+        let fixed = StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![StateTensorDimension::fixed(4).unwrap()],
+            StateTensorDtype::Float32,
+            MutableStateResidency::LayerScopedOffloadable,
+        )
+        .unwrap();
+        let policy =
+            LayerCachePolicy::key_value_with_fixed_state(AttentionPolicy::Full, 1, 8, vec![fixed])
+                .unwrap();
+        let layout = StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
+        let paged_policy = CacheResidencyPolicy::Paged(
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        );
+        let selected = selected_state(
+            layout,
+            ReplicatedTextStateAccess::AttentionWithFixed,
+            paged_policy,
+        );
+        assert_eq!(
+            selected
+                .components()
+                .iter()
+                .map(SelectedStateComponentRealization::placement)
+                .collect::<Vec<_>>(),
+            vec![
+                StateComponentPlacement::Paged,
+                StateComponentPlacement::Paged,
+                StateComponentPlacement::Device,
+            ]
+        );
+
+        let state = MlxHybridState::from_selected(&selected, Some(manager()), None).unwrap();
+        assert!(matches!(
+            state.layers[0].attention,
+            Some(MlxHybridAttentionState::KeyValue(
+                MlxKeyValueLayerState::Paged(_)
+            ))
+        ));
+        assert!(state.layers[0]
+            .fixed
+            .contains_key(&StateTensorRole::Recurrent));
     }
 
     #[test]

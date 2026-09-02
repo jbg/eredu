@@ -107,8 +107,10 @@ configuration, allocator telemetry, and diagnostic benchmarks, while
 `LocalModel::synchronize` is the sole application-facing synchronization entry
 point. These APIs do not expose native tensors, streams, devices, or random
 state. Direct native binding access remains an explicit backend-author concern
-through `safemlx`; composition-owned native sessions remain in the
-implementation crate. Neither is an application dependency.
+through `safemlx`; native session adapters remain in the implementation crate.
+Those adapters own native resources and outer type erasure, while shared
+replicated-text execution and stateful lifecycle orchestration remain in the
+neutral runtime. Neither surface is an application dependency.
 `LocalLoadOptions` and `LocalInspectionOptions` contain only neutral
 quantization, residency, and session-capability policy, while native
 device-bound contexts are selected only by backend tooling. `LocalBackendError`
@@ -119,9 +121,11 @@ for device and topology selection.
 Backend-generic sampling policy lives in `eredu-runtime`. Concrete backends
 implement `SamplingBackend` primitives and bind the runtime-owned `Sampler` and
 `SpeculativeSampler` traits directly; they do not publish backend-local policy
-traits or compatibility re-exports. Concrete cache-state, session, completion,
-and model-input types stay in the selected backend. Facade examples construct
-local sessions through `eredu::api`, while backend-author probes that
+traits or compatibility re-exports. Concrete cache storage, completion, and
+model-input types stay in the selected backend. A replicated-text session is a
+neutral generic session over those concrete mechanisms; its backend adapter
+erases the completed session only at the outer boundary. Facade examples
+construct local sessions through `eredu::api`, while backend-author probes that
 manipulate native resources live with their implementation and depend downward
 on neutral contracts.
 All selected sessions expose completed outputs through
@@ -231,28 +235,31 @@ plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
-Replicated text composition has one checked cross-crate construction flow.
-`eredu-architectures` derives `ReplicatedTextRequirements` from the normalized
-architecture and the exact admitted artifact. The requirements contain the
-execution graph and unit layout, group transport, complete state layout and
-typed access profile,
-complete canonical parameter topology, admitted physical sources and
-encodings, aliases and derivations, logical and physical shapes, ownership,
-presence, architecture-native executable formats, and exact transform
-constraints. Transform constraints include the packed axis, linear input
-extent, affine group size and bit width, or the physical block geometry needed
-by the requested format. Caller-selected topology,
-weight residency, mutable-state residency, load-time transformation, cache,
-observation, persistence, and completion facilities live in a separate
-`ReplicatedTextSelectionRequest`. A concrete backend reports only reusable
-neural, lowering, residency, session, and completion mechanisms through
-`BackendMechanismCapabilities`. Mutable-state capabilities enumerate exact
-layer components with their semantic role, shape, dtype, and device or paged
-placement, plus checkpoint, rollback, reset, persistence, and observation
-facilities. They contain no architecture-family identity. The neutral selector
-resolves those three values into one `SelectedReplicatedTextRealization` before
-architecture modules or weight payloads are constructed. Its opaque
-`SelectedStateRealization` records the accepted layout, access profile,
+Replicated text composition has one checked cross-crate construction flow and
+one backend-neutral execution/session implementation. `eredu-architectures`
+derives `ReplicatedTextRequirements` from the normalized architecture and the
+exact admitted artifact after selecting the replicated execution class. The
+requirements contain the execution graph and unit layout, group transport,
+complete state layout and typed access profile, canonical parameter topology,
+admitted physical sources and encodings, aliases and derivations, logical and
+physical shapes, ownership, presence, architecture-native executable formats,
+and exact transform constraints. Transform constraints include the packed
+axis, linear input extent, affine group size and bit width, or the physical
+block geometry needed by the requested format.
+
+Caller-selected topology, weight residency, mutable-state residency, load-time
+transformation, cache, observation, persistence, and completion facilities
+live in a separate `ReplicatedTextSelectionRequest`. A concrete backend reports
+only reusable neural, lowering, residency, state-storage, session, and
+completion mechanisms through `BackendMechanismCapabilities`. Mutable-state
+capabilities enumerate exact layer components with their declared semantic
+role, shape, dtype, and supported device or paged placement, plus checkpoint,
+rollback, reset, persistence, and observation facilities. They contain no
+architecture-family or execution-class identity. The neutral selector resolves
+requirements, request, and capabilities into one
+`SelectedReplicatedTextRealization` before architecture modules or weight
+payloads are constructed. Its opaque
+`SelectedStateRealization` records the accepted layout, typed access profile,
 per-component placement, residency policy, and lifecycle facilities.
 
 Each architecture-derived parameter requirement also retains exact physical
@@ -264,19 +271,26 @@ callers construct them through checked constructors and consume named
 accessors. Preparation is consumed as an opaque plan through named policy,
 route, inspection, and artifact operations rather than a positional tuple.
 
-The MLX adapter packages that result in opaque `MlxSelectedPreparation` and
-passes it as the only materializer policy input. `MlxLoadRequest` lives with
-MLX composition and is consumed during selection. Non-replicated text paths
-receive a distinct `SelectedMlxConstruction` containing resolved physical
-quantization, topology, residency, and admitted session facilities. Reusable
-MLX loading, residency, and cache mechanisms receive only selected formats,
-generic limits, rank-local placement, or opaque group handles. The
-mechanism-only `MlxRankContext` contains a world rank and local device
-assignment. Semantic tensor, pipeline, and addressable axes remain in the
-composition-owned `MlxParallelPlan` and are lowered before reusable
-distributed facilities are invoked. Prompt-cache manifests record those
-lowered dimensions as generic stage, state-shard, and addressable-group
-coordinates.
+Architecture preparation pairs that selected realization with a concrete
+architecture and validates the graph, unit and transport layout, parameter
+owners and shapes, state layout, lifecycle facilities, and cache-identity
+inputs before a backend mechanism can allocate state or open a payload. The
+prepared value contains an opaque neutral contract carrying the validated
+selection and exact tasks. That contract is the proof-bearing handoff to
+construction; later code does not repeat those checks from family
+configuration or caller options.
+
+The MLX adapter consumes its load request while neutral selection is still in
+progress. Non-replicated paths retain their distinct selected construction
+values for routed, partitioned, composite, prediction, drafting, and realtime
+behavior. Reusable MLX loading, residency, cache, stream, transfer, and
+completion mechanisms receive only exact tasks, generic limits, rank-local
+placement, or opaque group handles. The mechanism-only `MlxRankContext`
+contains a world rank and local device assignment. Semantic tensor, pipeline,
+and addressable axes remain in the composition-owned `MlxParallelPlan` and are
+lowered before reusable distributed facilities are invoked. Prompt-cache
+manifests record those lowered dimensions as generic stage, state-shard, and
+addressable-group coordinates.
 
 Selection compares the complete architecture transform constraint with an
 exact backend lowering descriptor. A lowering descriptor identifies the source
@@ -285,48 +299,68 @@ is rejected atomically when either side rejects the geometry; selection never
 silently transforms only the convenient matrices. Rank-one normalization,
 optional bias, tied, derived, and checkpoint-companion parameters remain in the
 requirements even when no transform applies. The resulting per-parameter
-realizations are the only source and format choices consumed by module
-construction and materialization.
+realizations are projected into exact `ReplicatedTextMaterializationTask`
+values. Each task retains its logical target, physical source and selected
+output, recipe and companions, source encoding, executable format, and selected
+lowering. These tasks are the only source, recipe, format, and lowering choices
+consumed by module construction and materialization; no backend collapses them
+into a model-wide transform or rediscovers policy from parameter names.
 
 Architecture-owned typed dispatch admits replicated Llama/Mistral, dense
 Qwen2/Qwen3, dense LFM2, dense Kimi Linear, target-only dense Nemotron-H, and
 target-only text Qwen3-Next/Qwen3.5 configurations. It rejects routed,
 partitioned, prediction-bearing, and conditional-media graphs from this
-construction class. Dispatch constructs modules with the selected executable
-formats and hands the selected value, exact requirements, and concrete
-architecture to a generic backend visitor. Separate typed visitors express
-the exact stateless, ordinary key/value, fixed-only, attention-with-fixed,
-compressed-only, or compressed-with-fixed state-access profile without
-imposing broader mechanisms on ordinary backends.
+construction class. The architecture registry selects both the replicated
+execution class and the exact stateless, ordinary key/value, fixed-only,
+attention-with-fixed, compressed-only, or compressed-with-fixed access profile.
+It constructs modules with the selected executable formats, validates the
+proof-bearing architecture value, and invokes the corresponding typed neutral
+constructor adapter. Optional profiles are additive, so an ordinary backend
+does not acquire heterogeneous-state bounds.
 
-MLX binds each opaque architecture through `ArchitectureParameters` and
-`Parameterized`, verifies the requirement catalog against the constructed
-parameter description, and uses one resident or layerwise runtime traversal.
-Its state factory consumes only `SelectedStateRealization`, producing
-`MlxKeyValueState` or `MlxHybridState` with the selected component layout and
-placements. SafeTensors aliases, derived recipes, GGUF translated outputs, and
-selected transformations feed the same generic binding. The complete paired
-architecture and state are erased only at the session boundary. The erased
-interface performs one dispatch per session operation; tensor operations,
-state-component access, and execution-unit traversal remain statically
-dispatched.
+`eredu-runtime::construct_replicated_text_session` is the single production
+constructor for these profiles. The typed architecture adapter consumes the
+prepared handoff and passes its concrete architecture, opaque validated
+contract, cache identity, and `ReplicatedTextSessionMechanisms` to that
+constructor. It chooses resident or bounded `LayerwiseRuntime` traversal,
+realizes exact selected state, and returns a `ReplicatedTextSession`. That
+session owns direct and observed forward, prefill, decode, causal output
+selection, state publication, reset, checkpoint and rollback, prompt-cache
+identity validation and replacement, residency reports, and exact completion
+sequencing. A non-MLX backend supplies its own tensor, policy, state,
+persistence, and completion mechanisms to this same constructor and executes
+the same lifecycle.
+
+MLX implements the mechanism bundle with native operators, module stores,
+resident and bounded policies, selected state allocation, prompt-cache bytes,
+streams, indexed tensor operations, and completion objects. Neutral lifecycle
+code chooses the final causal sequence position; MLX only applies that exact
+index. State allocation iterates the exact selected components and placements
+without deriving policy from architecture roles. Its
+adapter neither selects a family or state profile nor owns a peer
+replicated-text lifecycle. It invokes the neutral constructor and performs the
+final backend-private erasure of the completed typed session. SafeTensors
+aliases, derived recipes, GGUF translated outputs, and selected transformations
+feed the same exact task interface. Erasure performs one dispatch per outer
+session operation; tensor operations, state-component access, and
+execution-unit traversal remain statically dispatched.
 
 The selected realization is also the sole construction authority for exact
 weight-residency limits, mutable-state paging, topology realization, session
 facilities, prompt-cache persistence, and completion ownership. Backend stream,
 device, and native group handles are execution contexts rather than policy.
-Once selection succeeds, the binding visitor receives no second copy of caller
-load options from which it could choose a conflicting policy.
+Once selection succeeds, neutral construction and backend mechanisms receive
+no second copy of caller load options or family configuration from which they
+could choose a conflicting policy.
 
 Source storage, executable format, and native lowering are independent values.
 SafeTensors handoff carries the admitted `SafetensorsShards`, including index
 validation and canonical shard order, into the bounded store without directory
 rediscovery. GGUF handoff carries the admitted translated output map and exact
 physical encoding; backend lowering does not reconstruct canonical names from
-GGUF strings. A selected transform builds a source-format architecture and a
-target-format architecture from the same neutral topology, materializes the
-declared targets, and reports the resulting storage separately from residency
-telemetry.
+GGUF strings. Native and transformed parameters may coexist in one selected
+plan because materialization consumes each exact task independently. The
+backend reports resulting storage separately from residency telemetry.
 
 `ReplicatedTextArchitecture` adds only ordinary borrowed text-input formation
 to the layered lifecycle and remains generic over its runtime state. Hybrid
@@ -816,29 +850,30 @@ its state layout. Advertised draft proposal capacity is a distinct
 architecture-owned graph property: sequential MTP derives it from prediction
 depth, while fused DSpark derives it from the validated block width rather than
 the number of DSpark layers. Parsed model-family arguments are not a second
-source of execution or state geometry. Backend
-composition obtains the layout through `ArchitectureParameters::state_layout`
-on the realized architecture before transferring that architecture into its
-runtime. When a family owns additional state outside the ordinary layered
-target, its architecture publishes the target, prediction placement, and
-composite persistence layout together; the backend consumes that value without
-reassembling segments or recovering offsets from layer-count fields. Ingress
-state is a distinct transient contract when it does not span that
-composite persistence layout. Inkling publishes its realized target-only
+source of execution or state geometry. Architecture preparation obtains the
+layout through `ArchitectureParameters::state_layout` on the realized
+architecture before the proof-bearing handoff enters neutral composition.
+When a family owns additional state outside the ordinary layered target, its
+architecture publishes the target, prediction placement, and composite
+persistence layout together; its dedicated execution contract consumes that
+value without reassembling segments or recovering offsets from layer-count
+fields. Ingress state is a distinct transient contract when it does not span
+that composite persistence layout. Inkling publishes its realized target-only
 ingress layout explicitly: ordinary execution receives global target geometry,
 parallel execution receives rank-local target geometry, and neither receives
 embedded-prediction state. Both neutral forward entry and concrete pipeline
 allocation consume that same architecture-owned layout. Prompt-cache identity
 for both replicated and pipeline execution is derived from
 `ArchitectureParameters::state_identity` and a canonical `PartitionState`; a
-backend lowers only its parallel topology. Pipeline execution uses its exact
-placed partition, while replicated execution attaches the architecture's
-complete realized state layout at global offset zero. Target or
-embedded-prediction cache allocation uses that identity and does not recreate
-a global layout, offsets, or family identity after placement. Pipeline cache
-validation likewise consumes the placed partition's localized `StateLayout`,
-including its architecture-global offset; it does not reread a family
-attention schedule or interpret configuration fields as a second cache policy.
+backend lowers only native storage or parallel topology. Pipeline execution
+uses its exact placed partition, while neutral replicated composition attaches
+the architecture's complete realized state layout at global offset zero.
+Target or embedded-prediction cache allocation uses that identity and does not
+recreate a global layout, offsets, or family identity after placement.
+Pipeline cache validation likewise consumes the placed partition's localized
+`StateLayout`, including its architecture-global offset; it does not reread a
+family attention schedule or interpret configuration fields as a second cache
+policy.
 Composite model layouts, such as a target decoder plus embedded prediction
 state, are
 assembled by the architecture before a backend consumes them. Architecture
@@ -871,11 +906,13 @@ live in the manager but do not enter that descriptor's manifest.
 Architecture identity functions declare family, fingerprint, composite global
 layer count, and placement; backends must not reconstruct family identity,
 target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
-Architecture-erased backend executables own their concrete model and correctly
-typed mutable state in the same exhaustive variant. Model state is not exposed
-as a second extensible erased enum: prefill, decode, inspection, prompt-cache,
-residency, parallel, and speculative hooks dispatch on the executable, so a new
-family makes every operation site non-exhaustive until its behavior is defined.
+Architecture-erased backend executables own the correctly typed execution
+value in the same exhaustive outer variant; the replicated variant owns the
+complete neutral session that pairs its architecture and concrete state. Model
+state is not exposed as a second extensible erased enum: prefill, decode,
+inspection, prompt-cache, residency, parallel, and speculative hooks dispatch
+on the executable, so a new execution variant makes every operation site
+non-exhaustive until its behavior is defined.
 Draft commit and pipeline prompt-cache persistence likewise select the
 architecture's named prediction segment; family configuration layer counts are
 not commit-range metadata.
@@ -1120,23 +1157,25 @@ Artifact loading has four stages:
 1. Portable inspection validates checkpoint metadata and tensor catalogs,
    asks the architecture registry for a canonical family, neutral loading
    protocol, and companion requirements, then resolves any sibling artifacts.
-2. The selected backend validates the exact requested topology and remaining
-   policy against normalized architecture facts and its own capabilities.
+2. Architecture dispatch selects the semantic execution class and state-access
+   profile. Neutral selection validates the exact requested topology and policy
+   against normalized architecture facts and the selected backend's reported
+   mechanisms.
 3. Portable planning binds the artifact description to that exact topology,
-   quantization, and residency policy. Materialization options must reproduce
-   the bound topology rather than supplying a merely distributed/non-distributed
-   equivalent.
-4. The selected backend materializes the plan into its executable model and
-   creates a stateful session.
+   quantization, residency, state, and session policy. Materialization options
+   must reproduce the selected values rather than supplying a merely
+   equivalent class of request.
+4. The selected backend adapter realizes native mechanisms from the plan. For
+   replicated text it passes those mechanisms to the neutral session
+   constructor and erases the completed typed session at the outer boundary;
+   other execution classes retain their dedicated neutral contracts.
 
-Concrete backend preflight must derive family support from the typed bindings
-consumed by its materializers, not from a parallel boolean capability table.
-For MLX, ordinary family, GGUF, complete tensor-parallel, and expert-cache
-bindings are the dispatch authority. Complete-model GGUF load-time
-quantization is encoded in the GGUF route itself, so preflight and that loader
-cannot disagree about whether a quantization policy is accepted. Families
-handled by a distinct protocol, such as realtime Moshi, have no ordinary
-decoder binding.
+Concrete backend preflight reports mechanisms rather than family support or a
+parallel execution-class table. Architecture dispatch is authoritative for
+replicated text. Complete-model GGUF load-time quantization is encoded in the
+selected per-parameter tasks, so selection and materialization cannot disagree
+about whether a format or lowering is accepted. Execution classes handled by a
+distinct protocol, such as realtime Moshi, do not enter replicated dispatch.
 
 For GGUF artifacts, `ArtifactInspection::validated_gguf` is the authoritative
 handoff from stage 1. Core validates format-generic tensor-count, required
@@ -1165,10 +1204,11 @@ or sibling filename policy after planning; payload stores may still map weight
 members during materialization, but those reads do not replace the plan's
 configuration, checkpoint metadata, companion selection, or route.
 
-`ModelLoadingBackend` implements backend policy, architecture/backend
-capability intersection, and materialization.
-`BackendProvider::create_session` consumes a `PreparedModel`, so an executable
-cannot be paired with a cache or session created by another backend.
+`ModelLoadingBackend` implements backend capability reporting, native
+materialization, and outer adaptation. `BackendProvider::create_session`
+consumes a `PreparedModel`, so an executable cannot be paired with state or
+session mechanisms created by another backend. Replicated prepared models
+already contain the neutral lifecycle paired with their concrete mechanisms.
 
 `ModelRuntime<B>` owns a backend and its sole session. Backend-generic clients
 use `eredu::api::LoadedModel<B>`, whose runtime remains private while portable
@@ -1221,9 +1261,11 @@ normalizes embedded depth to zero and capability reporting does not expose it.
 `BackendSession` provides high-level prefill and decode submissions. Associated
 types keep prompts, tokens, outputs, session state, and completions opaque.
 Concrete sessions dispatch complete-model and pipeline variants internally;
-they do not expose model/cache parts or variant-specific constructors to
-callers. Operations unavailable for a valid session topology return typed
-errors rather than relying on unreachable or panicking accessors.
+their replicated variant delegates prefill, decode, state controls, reports,
+and observation to the neutral `ReplicatedTextSession`. They do not expose
+model/cache parts or variant-specific constructors to callers. Operations
+unavailable for a valid session topology return typed errors rather than
+relying on unreachable or panicking accessors.
 
 Every submission returns an exact completion object. A completion observes
 only the submitted work; it must not drain unrelated backend work. Schedulers
@@ -1489,17 +1531,19 @@ A new backend should:
    completion capabilities;
 3. implement concrete runtime-state/cache storage when cached or paged
    execution is desired;
-4. implement collective operations when distributed execution is desired;
-5. bind those capabilities to neutral architecture and runtime contracts inside
+4. implement `ReplicatedTextSessionMechanisms` and pass them to the neutral
+   replicated constructor rather than defining a text-session lifecycle;
+5. implement collective operations when distributed execution is desired;
+6. bind those capabilities to neutral architecture and runtime contracts inside
    the concrete backend adapter;
-6. expose a narrow adapter for selection by the facade, where
+7. expose a narrow adapter for selection by the facade, where
    backend-independent application orchestration remains;
-7. populate portable capability, resource, admission, and telemetry reports;
-8. add optional multimodal, speculative, realtime, transfer, or distributed
+8. populate portable capability, resource, admission, and telemetry reports;
+9. add optional multimodal, speculative, realtime, transfer, or distributed
    capabilities only when supported;
-9. realize portable execution plans through an
+10. realize portable execution plans through an
    `ExecutionPlanBackendFactory`; and
-10. run the reusable backend and architecture conformance suites.
+11. run the reusable backend and architecture conformance suites.
 
 Facade selection is an upward dependency on the backend's adapter, not
 ownership of concrete composition: the facade may select and opaquely wrap the

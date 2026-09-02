@@ -10,13 +10,8 @@ use eredu_architectures::{
     decoder, deepseek, execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2,
     llama, moshi, muse_glimmer, nemotron_h, qwen,
     replicated_text::{
-        visit_replicated_attention_state_text_architecture,
-        visit_replicated_component_state_text_architecture,
-        visit_replicated_compressed_only_text_architecture,
-        visit_replicated_compressed_state_text_architecture,
-        visit_replicated_fixed_state_text_architecture,
-        visit_replicated_stateless_text_architecture, PreparedReplicatedTextArchitecture,
-        ReplicatedTextArchitectureVisitor,
+        dispatch_replicated_text_architecture, PreparedReplicatedTextArchitecture,
+        ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
     },
 };
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
@@ -48,13 +43,14 @@ use eredu_nn::{
     TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    AddressableGatedProductBank, ArchitectureParameters, CollectiveBackend,
-    CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress, ExpertPass,
-    LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook, LayerwiseAcquireError,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParameterBankKey, ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
+    construct_replicated_text_session, AddressableGatedProductBank, ArchitectureParameters,
+    CollectiveBackend, CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress,
+    ExpertPass, LayerRuntimeState, LayerWeightResidency, LayeredArchitecture, LayeredTraversalHook,
+    LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, ParameterBankKey, ParameterGroupSpec, ParameterRole, PenaltyConfig,
+    PredictionDirective, ReplicatedTextMaterializationTask, ReplicatedTextSessionMechanisms,
     ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
-    RoutedExpertRequest, RoutedExpertTensorParallelOutput, RuntimeLayerState,
+    RoutedExpertRequest, RoutedExpertTensorParallelOutput, RuntimeLayerState, RuntimeState,
     RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
     SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
     SubmissionBackend, TensorParallelRoutedExpertProvider, TensorPlacement, TokenDomain,
@@ -11638,6 +11634,265 @@ fn assert_state_exact(
     }
 }
 
+struct NumericReplicatedMechanisms;
+
+struct NumericReplicatedLease<U> {
+    ordinal: usize,
+    unit: U,
+}
+
+impl<U> std::ops::Deref for NumericReplicatedLease<U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        &self.unit
+    }
+}
+
+impl<U> std::ops::DerefMut for NumericReplicatedLease<U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.unit
+    }
+}
+
+struct NumericReplicatedPolicy<U> {
+    resident: Option<Vec<Option<U>>>,
+}
+
+impl<U> NumericReplicatedPolicy<U> {
+    fn resident(units: Vec<U>) -> Self {
+        Self {
+            resident: Some(units.into_iter().map(Some).collect()),
+        }
+    }
+
+    fn bounded() -> Self {
+        Self { resident: None }
+    }
+}
+
+impl<U> LayerwisePolicy<NumericBackend, U> for NumericReplicatedPolicy<U> {
+    type Lease = NumericReplicatedLease<U>;
+    type Error = Error;
+
+    fn begin(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn acquire<E, F>(
+        &mut self,
+        ordinal: usize,
+        _: ExecutionUnitAddress,
+        build: F,
+        context: &NumericContext,
+    ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&NumericContext) -> Result<U, E>,
+    {
+        let unit = match &mut self.resident {
+            Some(units) => units
+                .get_mut(ordinal)
+                .and_then(Option::take)
+                .ok_or_else(|| Error::backend("numeric resident unit is unavailable"))
+                .map_err(LayerwiseAcquireError::Policy)?,
+            None => build(context).map_err(LayerwiseAcquireError::Architecture)?,
+        };
+        Ok(NumericReplicatedLease { ordinal, unit })
+    }
+
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        ordinal: usize,
+        _: ExecutionUnitAddress,
+        lease: Self::Lease,
+        _: &'a NumericTensor,
+        _: StateValues,
+        _: ContextValues,
+        _: &NumericContext,
+    ) -> Result<(), Self::Error>
+    where
+        NumericTensor: 'a,
+        StateValues: Iterator<Item = &'a NumericTensor>,
+        ContextValues: Iterator<Item = &'a NumericTensor>,
+    {
+        if lease.ordinal != ordinal {
+            return Err(Error::backend("numeric resident unit ordinal drifted"));
+        }
+        if let Some(units) = &mut self.resident {
+            units[ordinal] = Some(lease.unit);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+fn numeric_text_output(output: NumericTensor) -> Result<NumericTensor, Error> {
+    if output.shape.len() != 3 || output.shape[1] <= 0 {
+        return Err(Error::backend(
+            "numeric replicated output is not a nonempty logits tensor",
+        ));
+    }
+    let end = usize::try_from(output.shape[1]).map_err(Error::backend)?;
+    Ok(output.axis_slice(1, end - 1, end))
+}
+
+impl<A> ReplicatedTextSessionMechanisms<A, NumericBackend> for NumericReplicatedMechanisms
+where
+    A: eredu_runtime::ReplicatedTextArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        Error = Error,
+    >,
+{
+    type State = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type PolicyError = Error;
+    type ResidentPolicy = NumericReplicatedPolicy<A::Unit>;
+    type BoundedPolicy = NumericReplicatedPolicy<A::Unit>;
+    type StateCheckpoint = Self::State;
+    type StateReport = Self::State;
+    type ExecutionReport = LayerWeightResidency;
+    type Error = Error;
+
+    fn prepare_materialization(
+        &mut self,
+        _: &mut A,
+        _: &eredu_runtime::ExecutionUnitLayout,
+        _: &mut [A::Unit],
+        _: Option<&mut A>,
+        _: Option<&mut [A::Unit]>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        _: &NumericContext,
+    ) -> Result<(), Self::Error> {
+        if tasks.is_empty() {
+            return Err(Error::backend(
+                "numeric replicated construction received no materialization tasks",
+            ));
+        }
+        Ok(())
+    }
+
+    fn realize_state(
+        &mut self,
+        selected: &eredu_runtime::SelectedStateRealization,
+        _: &NumericContext,
+    ) -> Result<Self::State, Self::Error> {
+        if selected.components().iter().any(|component| {
+            component.placement() != eredu_runtime::StateComponentPlacement::Device
+        }) {
+            return Err(Error::backend(
+                "numeric replicated mechanisms support device state only",
+            ));
+        }
+        DeviceState::create(selected.layout().clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+    }
+
+    fn resident_policy(
+        &mut self,
+        _: &mut A,
+        units: Vec<A::Unit>,
+        _: &eredu_runtime::SelectedReplicatedTextRealization,
+        _: &NumericContext,
+    ) -> Result<Self::ResidentPolicy, Self::Error> {
+        Ok(NumericReplicatedPolicy::resident(units))
+    }
+
+    fn bounded_policy(
+        &mut self,
+        _: &mut A,
+        _: &eredu_runtime::SelectedReplicatedTextRealization,
+        _: &NumericContext,
+    ) -> Result<Self::BoundedPolicy, Self::Error> {
+        Ok(NumericReplicatedPolicy::bounded())
+    }
+
+    fn index_text_output(
+        &mut self,
+        output: NumericTensor,
+        sequence_index: i32,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        assert_eq!(sequence_index, -1);
+        numeric_text_output(output)
+    }
+
+    fn checkpoint_state(
+        &mut self,
+        state: &Self::State,
+        _: &NumericContext,
+    ) -> Result<Self::StateCheckpoint, Self::Error> {
+        Ok(state.clone())
+    }
+
+    fn restore_state(
+        &mut self,
+        state: &mut Self::State,
+        checkpoint: Self::StateCheckpoint,
+        _: &NumericContext,
+    ) -> Result<(), Self::Error> {
+        *state = checkpoint;
+        Ok(())
+    }
+
+    fn load_prompt_cache(
+        &mut self,
+        _: &std::path::Path,
+        _: &eredu_core::cache::PromptCacheDescriptor,
+        _: &eredu_core::cache::PromptCacheModelIdentity,
+        _: &[u32],
+        _: &eredu_runtime::SelectedStateRealization,
+        _: &NumericContext,
+    ) -> Result<(Self::State, eredu_core::cache::PromptCacheManifest), Self::Error> {
+        Err(Error::backend(
+            "numeric replicated prompt-cache persistence is not selected",
+        ))
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        _: &mut Self::State,
+        _: &std::path::Path,
+        _: eredu_core::cache::PromptCacheDescriptor,
+        _: &[u32],
+        _: &eredu_core::cache::PromptCacheOptions,
+        _: &NumericContext,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Self::Error> {
+        Err(Error::backend(
+            "numeric replicated prompt-cache persistence is not selected",
+        ))
+    }
+
+    fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error> {
+        Ok(state.clone())
+    }
+
+    fn execution_report(
+        &self,
+        residency: LayerWeightResidency,
+        _: Option<&Self::BoundedPolicy>,
+    ) -> Result<Self::ExecutionReport, Self::Error> {
+        Ok(residency)
+    }
+
+    fn complete(
+        &mut self,
+        _: &NumericTensor,
+        _: &Self::State,
+        _: &NumericContext,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct NumericReplicatedRun {
+    outputs: Vec<NumericTensor>,
+    state: DeviceState<NumericBackend, NumericHybridLayerState>,
+}
+
 struct NumericReplicatedVisitor<'a> {
     context: &'a NumericContext,
     tokens: &'a NumericTensor,
@@ -11650,10 +11905,7 @@ impl<'a>
         DeviceState<NumericBackend, NumericHybridLayerState>,
     > for NumericReplicatedVisitor<'a>
 {
-    type Output = (
-        NumericTensor,
-        DeviceState<NumericBackend, NumericHybridLayerState>,
-    );
+    type Output = NumericReplicatedRun;
     type Error = String;
 
     fn construction_started(&mut self) {
@@ -11676,21 +11928,81 @@ impl<'a>
     {
         assert!(self.construction_started);
         let layout = prepared.requirements().state_layout().clone();
-        let unit_count = prepared.requirements().execution_units().len();
-        let architecture = prepared.into_modules().take_architecture();
-        let units = (0..unit_count)
-            .map(|unit| A::build_unit(&architecture, 0, unit, self.context))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
-        let mut state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
-            Ok::<_, Error>(NumericHybridLayerState::new(policy))
-        })
+        assert_eq!(prepared.prompt_cache_identity().layer_count(), layout.len());
+        assert_eq!(
+            prepared.prompt_cache_identity().topology(),
+            &PromptCacheTopology::default()
+        );
+        let mut modules = prepared.into_modules();
+        let architecture = modules.take_architecture();
+        let source_architecture = modules.take_source_architecture();
+        let contract = modules.take_contract();
+        let mut session = construct_replicated_text_session::<_, NumericBackend, _>(
+            architecture,
+            source_architecture,
+            contract,
+            NumericReplicatedMechanisms,
+            self.context,
+        )
         .map_err(|error| error.to_string())?;
-        let logits = runtime
-            .forward(A::text_input(self.tokens, None), &mut state, self.context)
-            .map_err(|error| error.to_string())?;
-        Ok((logits, state))
+        let mut outputs = vec![session
+            .prefill(self.tokens, None, self.context)
+            .map_err(|error| error.to_string())?];
+        for token in [4, 5] {
+            outputs.push(
+                session
+                    .decode(&NumericTensor::token_ids(&[token]), self.context)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let state = session
+            .report()
+            .map_err(|error| error.to_string())?
+            .state_report()
+            .clone();
+        assert_eq!(state.layout(), &layout);
+        Ok(NumericReplicatedRun { outputs, state })
+    }
+}
+
+impl<'a> ReplicatedTextProfileDispatcher<NumericBackend> for NumericReplicatedVisitor<'a> {
+    type Output = NumericReplicatedRun;
+    type Error = String;
+    type StatelessState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type AttentionState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type ComponentState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type AttentionComponentState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type CompressedState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type CompressedComponentState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    type StatelessVisitor = Self;
+    type AttentionVisitor = Self;
+    type ComponentVisitor = Self;
+    type AttentionComponentVisitor = Self;
+    type CompressedVisitor = Self;
+    type CompressedComponentVisitor = Self;
+
+    fn into_stateless_visitor(self) -> Self::StatelessVisitor {
+        self
+    }
+
+    fn into_attention_visitor(self) -> Self::AttentionVisitor {
+        self
+    }
+
+    fn into_component_visitor(self) -> Self::ComponentVisitor {
+        self
+    }
+
+    fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor {
+        self
+    }
+
+    fn into_compressed_visitor(self) -> Self::CompressedVisitor {
+        self
+    }
+
+    fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor {
+        self
     }
 }
 
@@ -11699,10 +12011,7 @@ fn execute_numeric_replicated_visitor(
     parameters: Vec<(String, Vec<usize>)>,
     context: &NumericContext,
     tokens: &NumericTensor,
-) -> (
-    NumericTensor,
-    DeviceState<NumericBackend, NumericHybridLayerState>,
-) {
+) -> NumericReplicatedRun {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     let artifact = tempfile::tempdir().unwrap();
@@ -11785,63 +12094,13 @@ fn execute_numeric_replicated_visitor(
         tokens,
         construction_started: false,
     };
-    match requirements.state_access() {
-        eredu_runtime::ReplicatedTextStateAccess::Stateless => {
-            visit_replicated_stateless_text_architecture(
-                inspection.architecture_plan(),
-                selected,
-                store,
-                context,
-                visitor,
-            )
-        }
-        eredu_runtime::ReplicatedTextStateAccess::KeyValue => {
-            visit_replicated_attention_state_text_architecture(
-                inspection.architecture_plan(),
-                selected,
-                store,
-                context,
-                visitor,
-            )
-        }
-        eredu_runtime::ReplicatedTextStateAccess::Fixed => {
-            visit_replicated_component_state_text_architecture(
-                inspection.architecture_plan(),
-                selected,
-                store,
-                context,
-                visitor,
-            )
-        }
-        eredu_runtime::ReplicatedTextStateAccess::AttentionWithFixed => {
-            visit_replicated_fixed_state_text_architecture(
-                inspection.architecture_plan(),
-                selected,
-                store,
-                context,
-                visitor,
-            )
-        }
-        eredu_runtime::ReplicatedTextStateAccess::CompressedAttentionWithFixed => {
-            visit_replicated_compressed_state_text_architecture(
-                inspection.architecture_plan(),
-                selected,
-                store,
-                context,
-                visitor,
-            )
-        }
-        eredu_runtime::ReplicatedTextStateAccess::CompressedAttention => {
-            visit_replicated_compressed_only_text_architecture(
-                inspection.architecture_plan(),
-                selected,
-                store,
-                context,
-                visitor,
-            )
-        }
-        access => panic!("unsupported numeric replicated state profile {access:?}"),
-    }
+    dispatch_replicated_text_architecture(
+        inspection.architecture_plan(),
+        selected,
+        store,
+        context,
+        visitor,
+    )
     .unwrap()
 }
 
@@ -11901,7 +12160,7 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
         let context = NumericContext::default();
         let tokens = NumericTensor::token_ids(&[1, 3, 2]);
         macro_rules! reference_case {
-            ($architecture:expr, $input:expr) => {{
+            ($architecture:expr, |$step_tokens:ident| $input:expr) => {{
                 let architecture = $architecture;
                 let description = architecture.parameter_description(&context).unwrap();
                 let parameters = description
@@ -11919,8 +12178,14 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
                 })
                 .unwrap();
                 let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
-                let logits = runtime.forward($input, &mut state, &context).unwrap();
-                (logits, state, parameters, layers)
+                let decode_one = NumericTensor::token_ids(&[4]);
+                let decode_two = NumericTensor::token_ids(&[5]);
+                let mut outputs = Vec::new();
+                for $step_tokens in [&tokens, &decode_one, &decode_two] {
+                    let logits = runtime.forward($input, &mut state, &context).unwrap();
+                    outputs.push(numeric_text_output(logits).unwrap());
+                }
+                (outputs, state, parameters, layers)
             }};
         }
         let (expected, expected_state, parameters, layers) = match config["model_type"].as_str() {
@@ -11928,8 +12193,8 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
                 let args = lfm2::model_args_from_config_value(&config).unwrap();
                 reference_case!(
                     lfm2::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
-                    decoder::LayeredInput {
-                        tokens: &tokens,
+                    |step_tokens| decoder::LayeredInput {
+                        tokens: step_tokens,
                         mask: None
                     }
                 )
@@ -11938,8 +12203,8 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
                 let args = kimi_linear::model_args_from_config_value(&config).unwrap();
                 reference_case!(
                     kimi_linear::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
-                    decoder::LayeredInput {
-                        tokens: &tokens,
+                    |step_tokens| decoder::LayeredInput {
+                        tokens: step_tokens,
                         mask: None
                     }
                 )
@@ -11948,7 +12213,7 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
                 let args = nemotron_h::model_args_from_config_value(&config).unwrap();
                 reference_case!(
                     nemotron_h::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
-                    nemotron_h::EmbeddedInput::target(&tokens, None)
+                    |step_tokens| nemotron_h::EmbeddedInput::target(step_tokens, None)
                 )
             }
             Some("qwen3_5_text") | Some("qwen3_next") => {
@@ -11957,17 +12222,23 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
                     .text;
                 reference_case!(
                     qwen::hybrid::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
-                    qwen::hybrid::EmbeddedInput::target(&tokens, None)
+                    |step_tokens| qwen::hybrid::EmbeddedInput::target(step_tokens, None)
                 )
             }
             kind => panic!("unexpected numeric visitor fixture {kind:?}"),
         };
-        let (actual, actual_state) =
-            execute_numeric_replicated_visitor(&config, parameters, &context, &tokens);
+        let actual = execute_numeric_replicated_visitor(&config, parameters, &context, &tokens);
         let label = config["model_type"].as_str().unwrap();
-        assert_tensor_close(&actual, &expected, &format!("{label} replicated logits"));
+        assert_eq!(actual.outputs.len(), 3);
+        for (step, (actual, expected)) in actual.outputs.iter().zip(&expected).enumerate() {
+            assert_tensor_close(
+                actual,
+                expected,
+                &format!("{label} replicated step {step} logits"),
+            );
+        }
         assert_state_exact(
-            &actual_state,
+            &actual.state,
             &expected_state,
             layers,
             &format!("{label} replicated state"),

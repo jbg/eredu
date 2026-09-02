@@ -355,6 +355,52 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             _transfer: transfer,
         })
     }
+
+    /// Populates architecture units already constructed by neutral
+    /// orchestration and converts this loader into a resident policy.
+    pub fn into_resident_units(
+        mut self,
+        units: Vec<U>,
+        stream: &Stream,
+    ) -> Result<MlxResidentPolicy<U>, Error>
+    where
+        U: Parameterized<MlxTensor>,
+        P: MlxUnitPopulator<U>,
+    {
+        self.drain()?;
+        if units.len() != self.unit_ids.len() {
+            return Err(Error::ArchitectureModel(format!(
+                "neutral resident construction supplied {} units for layout length {}",
+                units.len(),
+                self.unit_ids.len()
+            )));
+        }
+        let requests = self
+            .unit_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, 1))
+            .collect::<Vec<_>>();
+        let transfer = self
+            .residency
+            .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
+        transfer.order_after(stream)?;
+        let mut populated = Vec::with_capacity(units.len());
+        for (unit, lease) in units.into_iter().zip(transfer.leases()) {
+            let mut unit = MlxModule::new(unit);
+            self.populator.populate(&mut unit, lease)?;
+            populated.push(Some(unit));
+        }
+        Ok(MlxResidentPolicy {
+            units: populated,
+            residency: self.residency.clone(),
+            store: Arc::clone(&self.store),
+            unit_ids: self.unit_ids.clone(),
+            layout: self.layout.clone(),
+            window_depth: self.window_depth,
+            _transfer: transfer,
+        })
+    }
 }
 
 impl<U> MlxResidentPolicy<U> {
@@ -713,6 +759,202 @@ where
             .build_unit(address.group(), address.index(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
+        let bytes = binding_bytes(&bindings)?;
+        layer_parameter_bytes = layer_parameter_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
+        let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
+        total_host_bytes = total_host_bytes
+            .checked_add(host_bytes)
+            .ok_or_else(|| Error::Parallel("generic host unit bytes overflowed".into()))?;
+        maximum_host_bytes = maximum_host_bytes.max(host_bytes);
+        consumed.extend(
+            bindings
+                .iter()
+                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
+        );
+        let group_id = layout
+            .group_id(address.group())
+            .expect("validated layout names every execution group");
+        let id = OffloadUnitId::new(format!(
+            "model.{}.{:05}",
+            group_id.as_str(),
+            address.index()
+        ))?;
+        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
+        specs.push(OffloadUnitSpec::new(
+            id.clone(),
+            bytes,
+            if fully_resident {
+                ResidencyPolicy::Pinned
+            } else if dense.is_some() {
+                ResidencyPolicy::Cacheable
+            } else {
+                ResidencyPolicy::Windowed
+            },
+            if fully_resident {
+                MemoryTier::Device
+            } else if dense.is_some() {
+                MemoryTier::Disk
+            } else {
+                MemoryTier::Host
+            },
+        )?);
+        unit_ids.push(id);
+        unit_bytes.push(bytes);
+    }
+    consumed.extend(store.materialized_source_keys());
+    validate_unused(store.as_ref(), &consumed, ignored)?;
+    let device_window_bytes = (0..layout.group_count())
+        .map(|group| {
+            let range = layout
+                .group_range(group)
+                .expect("validated layout covers every execution group");
+            largest_window_bytes(&unit_bytes[range], depth)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let host_required = match dense {
+        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
+            .checked_mul(dense.host_lookahead() as u64)
+            .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
+        Some(_) => 0,
+        None if fully_resident => 0,
+        None => total_host_bytes,
+    };
+    validate_host_budget(offload, host_required)?;
+    validate_device_budget(offload, static_bytes, device_window_bytes, depth)?;
+
+    let plan = OffloadPlan::new(offload, specs)?;
+    let residency_stream = if dense.is_some() {
+        Stream::new_with_device(&stream.get_device()?)
+    } else {
+        stream.clone()
+    };
+    let residency = ResidencyManager::new_shared(
+        Arc::clone(&store),
+        plan,
+        definitions,
+        weights_stream.clone(),
+        residency_stream,
+    )?;
+    residency.initialize()?;
+    let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
+    populate_parameterized(architecture.static_modules_mut(), &static_lease)?;
+    let metadata = LayerwiseModelMetadata::new(
+        "generic",
+        None,
+        unit_count,
+        static_bytes,
+        options.execution_residency(),
+        layer_parameter_bytes,
+        device_window_bytes,
+        maximum_host_bytes,
+        depth,
+    );
+    let dense_controller = dense
+        .map(|options| {
+            DenseStreamController::new(
+                &residency,
+                options,
+                unit_count,
+                layer_parameter_bytes,
+                maximum_host_bytes,
+                static_bytes,
+                (0..layout.group_count()).map(|group| {
+                    let range = layout
+                        .group_range(group)
+                        .expect("validated layout covers every execution group");
+                    let id = layout
+                        .group_id(group)
+                        .expect("validated layout names every execution group")
+                        .as_str()
+                        .to_owned();
+                    (id, unit_ids[range].to_vec())
+                }),
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
+    let policy = MlxLayerwisePolicy::new(
+        residency,
+        Arc::clone(&store),
+        unit_ids,
+        layout,
+        depth,
+        populator,
+        vec![static_lease],
+        dense_controller,
+        options.sample_backend_memory(),
+        options.sample_process_memory(),
+    )?;
+    Ok((policy, metadata))
+}
+
+/// Builds an MLX residency policy from exact binding definitions projected by
+/// a neutral constructor over its already-constructed execution units.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
+    store: SharedCheckpointSource,
+    architecture: &mut A,
+    populator: P,
+    _state: std::marker::PhantomData<S>,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    ignored: I,
+    layout: ExecutionUnitLayout,
+    static_bindings: Vec<WeightBinding>,
+    unit_bindings: Vec<Vec<WeightBinding>>,
+) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
+where
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: RuntimeState<MlxNeuralBackend>,
+    A::Error: std::fmt::Display,
+    P: MlxUnitPopulator<A::Unit>,
+    I: Fn(&str) -> bool,
+{
+    let unit_count = layout.len();
+    if unit_count == 0 || unit_bindings.len() != unit_count {
+        return Err(Error::Parallel(format!(
+            "exact MLX binding definitions contain {} units for a layout of {unit_count}",
+            unit_bindings.len()
+        )));
+    }
+    let fully_resident = options.is_fully_resident();
+    let dense = options.dense();
+    let offload = options.offload()?;
+    let depth = options.device_depth(unit_count);
+    let mut definitions = Vec::new();
+    let mut specs = Vec::new();
+    let mut consumed = BTreeSet::new();
+
+    let static_id = OffloadUnitId::new("model.static")?;
+    let static_bytes = binding_bytes(&static_bindings)?;
+    consumed.extend(
+        static_bindings
+            .iter()
+            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
+    );
+    definitions.push(OffloadUnit::new(static_id.clone(), static_bindings)?);
+    specs.push(OffloadUnitSpec::new(
+        static_id.clone(),
+        static_bytes,
+        ResidencyPolicy::Pinned,
+        MemoryTier::Device,
+    )?);
+
+    let mut unit_ids = Vec::with_capacity(unit_count);
+    let mut unit_bytes = Vec::with_capacity(unit_count);
+    let mut layer_parameter_bytes = 0u64;
+    let mut total_host_bytes = 0u64;
+    let mut maximum_host_bytes = 0u64;
+    for (index, bindings) in unit_bindings.into_iter().enumerate() {
+        let address = layout
+            .address(index)
+            .expect("validated layout covers every flat unit");
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
             .checked_add(bytes)

@@ -19,27 +19,36 @@ use eredu_core::{
 use eredu_nn::{
     AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
     GatedProductPolicy, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, PadMode, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    NeuralOperatorCapabilities, NormalizationConstructionSpec, NormalizationOperator, PadMode,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, realize_architecture_state,
-    ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitecturePartition, ArchitectureStateFactory, CollectiveBackend,
+    bind_materialized_unit, construct_replicated_text_session, materialize_bindings,
+    prepare_replicated_text_contract, realize_architecture_state,
+    select_replicated_text_realization, ArchitectureGroupKind, ArchitectureGroupPlacement,
+    ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParameterDescription,
+    ArchitectureParameters, ArchitecturePartition, ArchitectureStateFactory,
+    BackendMechanismCapabilities, CacheResidencyPolicy, CollectiveBackend,
     CompositeLayeredTraversalHook, DeviceState, ExecutionGraph, ExecutionGroupSpec,
-    ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture, LayeredForwardState,
-    LayeredPartitionDriver, LayeredPartitionInput, LayeredPartitionOutput, LayeredTraversalHook,
-    LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime,
-    NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture, ParameterBackend,
-    PartitionOwnership, PartitionedLayeredArchitecture, PenaltyConfig, PredictionDirective,
-    PreparedInputPart, PreparedInputPayload, PreparedModelInput, ResettableRuntimeLayerState,
-    ResettableRuntimeState, ResidentRuntime, RuntimeLayerState, RuntimeState,
-    RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionBoundary,
+    ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency, LayeredArchitecture,
+    LayeredForwardState, LayeredPartitionDriver, LayeredPartitionInput, LayeredPartitionOutput,
+    LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy,
+    LayerwiseRuntime, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture,
+    ParameterBackend, PartitionOwnership, PartitionedLayeredArchitecture, PenaltyConfig,
+    PredictionDirective, PreparedInputPart, PreparedInputPayload, PreparedModelInput,
+    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner,
+    ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
+    ReplicatedTextParameterRole, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
+    ReplicatedTextSelectionRequest, ReplicatedTextSessionMechanisms, ReplicatedTextStateAccess,
+    ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime, RuntimeLayerState,
+    RuntimeState, RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionBoundary,
     SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
-    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId,
+    SequentialDecisionSource, SequentialDecisionTraversal, StateComponentMechanism,
+    StateComponentPlacement, StateError, StateLayout, StateMechanismCapabilities, StateSegmentId,
     StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut,
-    SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
+    SubmissionBackend, TokenDomain, TransferBackend, WeightBinding, WeightLoweringCapability,
+    WeightLoweringKind, WeightResidencyMechanism,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -732,6 +741,9 @@ fn minimal_text_backend_compiles_without_optional_execution_extensions() {
     let architecture = OrdinaryTextFixture {
         static_modules: FakeOperator,
         trace: Vec::new(),
+        counters: ReplicatedSessionCounters::default(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
     };
     let layout = architecture.state_layout().unwrap();
     let mut state =
@@ -860,7 +872,7 @@ fn invalid_alias_graph_fails_before_any_physical_read() {
     assert_eq!(leases.load(Ordering::SeqCst), 0);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FakeLayerState(i32);
 
 impl RuntimeLayerState<FakeBackend> for FakeLayerState {
@@ -878,9 +890,39 @@ impl ResettableRuntimeLayerState<FakeBackend> for FakeLayerState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct ReplicatedSessionCounts {
+    materializations: usize,
+    resident_policies: usize,
+    bounded_policies: usize,
+    unit_constructions: usize,
+    state_allocations: usize,
+    forward_calls: usize,
+    completion_attempts: usize,
+    publications: usize,
+}
+
+#[derive(Clone, Default)]
+struct ReplicatedSessionCounters(Rc<Cell<ReplicatedSessionCounts>>);
+
+impl ReplicatedSessionCounters {
+    fn snapshot(&self) -> ReplicatedSessionCounts {
+        self.0.get()
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ReplicatedSessionCounts)) {
+        let mut counts = self.snapshot();
+        update(&mut counts);
+        self.0.set(counts);
+    }
+}
+
 struct OrdinaryTextFixture {
     static_modules: FakeOperator,
     trace: Vec<&'static str>,
+    counters: ReplicatedSessionCounters,
+    inconsistent_transport: bool,
+    inconsistent_identity: bool,
 }
 
 impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
@@ -905,7 +947,11 @@ impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
         eredu_runtime::ModelStateIdentity::new(
             "ordinary-text-fixture",
             "ordinary-text-fixture",
-            "ordinary-text-fixture",
+            if self.inconsistent_identity {
+                "different-architecture"
+            } else {
+                "ordinary-text-fixture"
+            },
             1,
             state.global_layer_offset(),
             0,
@@ -920,7 +966,27 @@ impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
         let graph = self.execution_graph()?;
         let layout = ExecutionUnitLayout::new(&graph, [1]).map_err(Error::backend)?;
-        ArchitectureParameterDescription::new(&graph, &layout, [], []).map_err(Error::backend)
+        let group = eredu_runtime::ParameterGroupSpec::new(
+            "decoder.weight",
+            eredu_runtime::ParameterRole::Replicated,
+            [eredu_runtime::ParameterMemberSpec::new(
+                "decoder.weight",
+                [1, 1],
+                eredu_runtime::MemberSharding::Replicated,
+            )],
+        )
+        .map_err(Error::backend)?;
+        let owner = eredu_runtime::ParameterGroupOwner::execution_unit(
+            layout.group_id(0).expect("decoder group").clone(),
+            0,
+        );
+        ArchitectureParameterDescription::new(
+            &graph,
+            &layout,
+            [group.clone()],
+            [eredu_runtime::OwnedParameterGroupSpec::new(owner, group)],
+        )
+        .map_err(Error::backend)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -956,7 +1022,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
             last_owner_static_roles: Vec::new(),
             merge_destination: ArchitectureMergeDestination::LastOwner,
             parallel_subgroup: None,
-            request_optional: false,
+            request_optional: self.inconsistent_transport,
         }
     }
 
@@ -997,6 +1063,8 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
     }
 
     fn build_unit(&self, _: usize, _: usize, _: &()) -> Result<Self::Unit, Self::Error> {
+        self.counters
+            .update(|counts| counts.unit_constructions += 1);
         Ok(FakeUnit { marker: 5 })
     }
 
@@ -1035,6 +1103,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
         _: &mut Self::ForwardContext,
         _: &(),
     ) -> Result<FakeTensor, Self::Error> {
+        self.counters.update(|counts| counts.forward_calls += 1);
         state.as_mut()[0].0 += 1;
         self.trace.push("unit");
         let mut output = hidden.clone();
@@ -1541,6 +1610,15 @@ impl RecordingPolicy {
             aborts: 0,
         }
     }
+
+    fn bounded(unit_count: usize) -> Self {
+        Self {
+            units: (0..unit_count).map(|_| None).collect(),
+            addresses: Vec::new(),
+            forward_active: false,
+            aborts: 0,
+        }
+    }
 }
 
 impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
@@ -1568,20 +1646,23 @@ impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
         &mut self,
         ordinal: usize,
         address: ExecutionUnitAddress,
-        _: F,
-        _: &(),
+        build: F,
+        context: &(),
     ) -> Result<Self::Lease, eredu_runtime::LayerwiseAcquireError<E, Self::Error>>
     where
         F: FnOnce(&()) -> Result<FakeUnit, E>,
     {
         self.addresses
             .push((ordinal, address.group(), address.index()));
-        let unit = self
+        let slot = self
             .units
             .get_mut(ordinal)
-            .and_then(Option::take)
             .ok_or("invalid fixture acquisition")
             .map_err(eredu_runtime::LayerwiseAcquireError::Policy)?;
+        let unit = match slot.take() {
+            Some(unit) => unit,
+            None => build(context).map_err(eredu_runtime::LayerwiseAcquireError::Architecture)?,
+        };
         Ok(RecordingLease { ordinal, unit })
     }
 
@@ -1610,6 +1691,528 @@ impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
     fn finish(&mut self, _: &FakeTensor, _: &()) -> Result<(), Self::Error> {
         self.forward_active = false;
         Ok(())
+    }
+}
+
+struct ReferenceTextMechanisms {
+    tasks: Rc<RefCell<Vec<ReplicatedTextMaterializationTask>>>,
+    completions: Rc<RefCell<Vec<FakeTensor>>>,
+    counters: ReplicatedSessionCounters,
+    fail_completion: Rc<Cell<bool>>,
+}
+
+impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for ReferenceTextMechanisms {
+    type State = DeviceState<FakeBackend, FakeLayerState>;
+    type PolicyError = &'static str;
+    type ResidentPolicy = RecordingPolicy;
+    type BoundedPolicy = RecordingPolicy;
+    type StateCheckpoint = DeviceState<FakeBackend, FakeLayerState>;
+    type StateReport = Vec<i32>;
+    type ExecutionReport = (LayerWeightResidency, bool);
+    type Error = &'static str;
+
+    fn prepare_materialization(
+        &mut self,
+        _: &mut OrdinaryTextFixture,
+        _: &eredu_runtime::ExecutionUnitLayout,
+        _: &mut [FakeUnit],
+        _: Option<&mut OrdinaryTextFixture>,
+        _: Option<&mut [FakeUnit]>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        _: &(),
+    ) -> Result<(), Self::Error> {
+        self.counters.update(|counts| counts.materializations += 1);
+        self.tasks.borrow_mut().extend_from_slice(tasks);
+        Ok(())
+    }
+
+    fn realize_state(
+        &mut self,
+        selected: &eredu_runtime::SelectedStateRealization,
+        _: &(),
+    ) -> Result<Self::State, Self::Error> {
+        self.counters.update(|counts| counts.state_allocations += 1);
+        DeviceState::create(selected.layout().clone(), |_, _| {
+            Ok::<_, &'static str>(FakeLayerState(0))
+        })
+    }
+
+    fn resident_policy(
+        &mut self,
+        _: &mut OrdinaryTextFixture,
+        units: Vec<FakeUnit>,
+        _: &eredu_runtime::SelectedReplicatedTextRealization,
+        _: &(),
+    ) -> Result<Self::ResidentPolicy, Self::Error> {
+        self.counters.update(|counts| counts.resident_policies += 1);
+        Ok(RecordingPolicy::new(units))
+    }
+
+    fn bounded_policy(
+        &mut self,
+        _: &mut OrdinaryTextFixture,
+        selected: &eredu_runtime::SelectedReplicatedTextRealization,
+        _: &(),
+    ) -> Result<Self::BoundedPolicy, Self::Error> {
+        self.counters.update(|counts| counts.bounded_policies += 1);
+        Ok(RecordingPolicy::bounded(
+            selected.requirements().execution_units().len(),
+        ))
+    }
+
+    fn index_text_output(
+        &mut self,
+        output: FakeTensor,
+        sequence_index: i32,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        assert_eq!(sequence_index, -1);
+        output
+            .0
+            .last()
+            .copied()
+            .map(|value| FakeTensor(vec![value]))
+            .ok_or("empty text output")
+    }
+
+    fn checkpoint_state(
+        &mut self,
+        state: &Self::State,
+        _: &(),
+    ) -> Result<Self::StateCheckpoint, Self::Error> {
+        Ok(state.clone())
+    }
+
+    fn restore_state(
+        &mut self,
+        state: &mut Self::State,
+        checkpoint: Self::StateCheckpoint,
+        _: &(),
+    ) -> Result<(), Self::Error> {
+        *state = checkpoint;
+        Ok(())
+    }
+
+    fn load_prompt_cache(
+        &mut self,
+        _: &std::path::Path,
+        _: &eredu_core::cache::PromptCacheDescriptor,
+        _: &eredu_core::cache::PromptCacheModelIdentity,
+        _: &[u32],
+        _: &eredu_runtime::SelectedStateRealization,
+        _: &(),
+    ) -> Result<(Self::State, eredu_core::cache::PromptCacheManifest), Self::Error> {
+        Err("prompt cache is not selected by this fixture")
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        _: &mut Self::State,
+        _: &std::path::Path,
+        _: eredu_core::cache::PromptCacheDescriptor,
+        _: &[u32],
+        _: &eredu_core::cache::PromptCacheOptions,
+        _: &(),
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Self::Error> {
+        Err("prompt cache is not selected by this fixture")
+    }
+
+    fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error> {
+        Ok(state.as_ref().iter().map(|layer| layer.0).collect())
+    }
+
+    fn execution_report(
+        &self,
+        residency: LayerWeightResidency,
+        bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<Self::ExecutionReport, Self::Error> {
+        Ok((residency, bounded.is_some()))
+    }
+
+    fn complete(
+        &mut self,
+        output: &FakeTensor,
+        _: &Self::State,
+        _: &(),
+    ) -> Result<(), Self::Error> {
+        self.counters
+            .update(|counts| counts.completion_attempts += 1);
+        if self.fail_completion.get() {
+            return Err("fixture completion failed");
+        }
+        self.completions.borrow_mut().push(output.clone());
+        self.counters.update(|counts| counts.publications += 1);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DeniedReferenceMechanism {
+    Storage,
+    State,
+    Observation,
+    Persistence,
+    Completion,
+}
+
+fn try_select_reference_text(
+    architecture: &OrdinaryTextFixture,
+    residency: LayerWeightResidency,
+    denied: Option<DeniedReferenceMechanism>,
+) -> Result<
+    eredu_runtime::SelectedReplicatedTextRealization,
+    eredu_runtime::ReplicatedTextSelectionError,
+> {
+    let graph = architecture.execution_graph().unwrap();
+    let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+    let state_layout = architecture.state_layout().unwrap();
+    let source =
+        eredu_checkpoint::SourceTensorEncoding::Safetensors(eredu_checkpoint::StoredDtype::F32);
+    let parameter = ReplicatedTextParameterRequirement::new(
+        "decoder.weight",
+        vec!["decoder.weight".into()],
+        vec![ReplicatedTextPhysicalSource::new(
+            "decoder.weight",
+            "model.safetensors",
+            "decoder.weight",
+        )
+        .unwrap()],
+        vec!["decoder.weight.alias".into()],
+        Some(source.clone()),
+        Some(vec![1, 1]),
+        vec![1, 1],
+        eredu_checkpoint::LinearFormat::Dense,
+        ReplicatedTextParameterRole::LinearWeight,
+        ReplicatedTextParameterOwner::ExecutionUnit {
+            group: "decoder".into(),
+            unit: 0,
+        },
+        ReplicatedTextParameterPresence::Required,
+        eredu_runtime::ParameterTransformConstraint::None,
+    )
+    .unwrap();
+    let lowering = WeightLoweringCapability::new(
+        parameter
+            .lowering_descriptor(eredu_checkpoint::LinearFormat::Dense)
+            .unwrap(),
+        WeightLoweringKind::Direct,
+    );
+    let requirements = ReplicatedTextRequirements::new(
+        "ordinary-text-fixture",
+        NeuralOperatorCapabilities::NONE,
+        graph,
+        units,
+        vec![architecture.group_transport(0)],
+        state_layout.clone(),
+        ReplicatedTextStateAccess::KeyValue,
+        vec![parameter],
+    )
+    .unwrap();
+    let component_mechanisms = if denied == Some(DeniedReferenceMechanism::State) {
+        Vec::new()
+    } else {
+        state_layout
+            .layers()
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, policy)| {
+                policy
+                    .components()
+                    .into_iter()
+                    .map(move |component| {
+                        StateComponentMechanism::new(
+                            layer,
+                            component,
+                            Some(StateComponentPlacement::Device),
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let state_mechanisms = StateMechanismCapabilities::new(component_mechanisms)
+        .with_transactions(true, true)
+        .with_reset(true)
+        .with_prompt_cache(denied != Some(DeniedReferenceMechanism::Persistence))
+        .with_observation_retention(denied != Some(DeniedReferenceMechanism::Observation));
+    let weight_residencies = if denied == Some(DeniedReferenceMechanism::Storage) {
+        vec![WeightResidencyMechanism::Windowed]
+    } else {
+        vec![
+            WeightResidencyMechanism::Resident,
+            WeightResidencyMechanism::Windowed,
+        ]
+    };
+    let session_capabilities = if denied == Some(DeniedReferenceMechanism::Observation) {
+        eredu_core::SessionCapabilities::default()
+    } else {
+        eredu_core::SessionCapabilities::new(false, true, true)
+    };
+    let capabilities = BackendMechanismCapabilities::new(
+        NeuralOperatorCapabilities::NONE,
+        vec![lowering],
+        weight_residencies,
+        state_mechanisms,
+    )
+    .with_session(session_capabilities)
+    .with_prompt_cache(denied != Some(DeniedReferenceMechanism::Persistence))
+    .with_exact_completion(denied != Some(DeniedReferenceMechanism::Completion));
+    let mut request = ReplicatedTextSelectionRequest::new(residency, CacheResidencyPolicy::Device)
+        .with_session(eredu_core::SessionCapabilities::new(false, true, true))
+        .with_exact_completion(true);
+    if denied == Some(DeniedReferenceMechanism::Persistence) {
+        request = request.with_prompt_cache(true);
+    }
+    select_replicated_text_realization(&requirements, &request, &capabilities)
+}
+
+fn selected_reference_text(
+    architecture: &OrdinaryTextFixture,
+    residency: LayerWeightResidency,
+) -> eredu_runtime::SelectedReplicatedTextRealization {
+    try_select_reference_text(architecture, residency, None).unwrap()
+}
+
+struct FinalOutputReplacement;
+
+impl eredu_runtime::ActivationObserver<FakeTensor, Error> for FinalOutputReplacement {
+    fn observe(&mut self, _: &str, _: &FakeTensor) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn intervene(&mut self, path: &str, _: &FakeTensor) -> Result<Option<FakeTensor>, Error> {
+        Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH).then(|| FakeTensor(vec![99])))
+    }
+}
+
+#[test]
+fn production_replicated_text_constructor_executes_reference_mechanisms() {
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+    ] {
+        let counters = ReplicatedSessionCounters::default();
+        let architecture = OrdinaryTextFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+            counters: counters.clone(),
+            inconsistent_transport: false,
+            inconsistent_identity: false,
+        };
+        let selected = selected_reference_text(&architecture, residency);
+        let expected_identity = selected.requirements().architecture_identity().to_owned();
+        let contract = prepare_replicated_text_contract::<
+            _,
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >(&architecture, None, selected, &expected_identity, &())
+        .unwrap();
+        let tasks = Rc::new(RefCell::new(Vec::new()));
+        let completions = Rc::new(RefCell::new(Vec::new()));
+        let fail_completion = Rc::new(Cell::new(false));
+        let mechanisms = ReferenceTextMechanisms {
+            tasks: Rc::clone(&tasks),
+            completions: Rc::clone(&completions),
+            counters: counters.clone(),
+            fail_completion: Rc::clone(&fail_completion),
+        };
+        let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
+            architecture,
+            None,
+            contract,
+            mechanisms,
+            &(),
+        )
+        .unwrap();
+
+        let expected_policy_counts = if residency.is_fully_resident() {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        assert_eq!(
+            counters.snapshot(),
+            ReplicatedSessionCounts {
+                materializations: 1,
+                resident_policies: expected_policy_counts.0,
+                bounded_policies: expected_policy_counts.1,
+                unit_constructions: 1,
+                state_allocations: 1,
+                ..ReplicatedSessionCounts::default()
+            }
+        );
+
+        assert_eq!(tasks.borrow().len(), 1);
+        let task = &tasks.borrow()[0];
+        assert_eq!(task.name(), "decoder.weight");
+        assert_eq!(task.sources(), ["decoder.weight"]);
+        assert_eq!(task.physical_sources()[0].output(), "decoder.weight");
+        assert_eq!(task.logical_shape(), [1, 1]);
+        assert_eq!(task.physical_shape(), [1, 1]);
+        assert_eq!(task.lowering(), WeightLoweringKind::Direct);
+
+        assert_eq!(
+            session.prefill(&FakeTensor(vec![1, 2]), None, &()).unwrap(),
+            FakeTensor(vec![5])
+        );
+        assert_eq!(
+            session.decode(&FakeTensor(vec![3]), &()).unwrap(),
+            FakeTensor(vec![5])
+        );
+        assert_eq!(session.report().unwrap().state_report(), &[2]);
+        assert_eq!(counters.snapshot().forward_calls, 2);
+        assert_eq!(counters.snapshot().completion_attempts, 2);
+        assert_eq!(counters.snapshot().publications, 2);
+
+        let checkpoint = session.checkpoint(&()).unwrap();
+        session.decode(&FakeTensor(vec![4]), &()).unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[3]);
+        assert_eq!(counters.snapshot().publications, 3);
+        session.rollback(checkpoint, &()).unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[2]);
+
+        fail_completion.set(true);
+        assert!(session.decode(&FakeTensor(vec![8]), &()).is_err());
+        assert_eq!(session.report().unwrap().state_report(), &[2]);
+        assert_eq!(counters.snapshot().forward_calls, 4);
+        assert_eq!(counters.snapshot().completion_attempts, 4);
+        assert_eq!(counters.snapshot().publications, 3);
+        fail_completion.set(false);
+
+        let observed = session
+            .forward_with_observer(&FakeTensor(vec![7]), None, &(), &mut FinalOutputReplacement)
+            .unwrap();
+        assert_eq!(observed, FakeTensor(vec![99]));
+        assert_eq!(completions.borrow().last(), Some(&FakeTensor(vec![99])));
+        assert_eq!(counters.snapshot().forward_calls, 5);
+        assert_eq!(counters.snapshot().completion_attempts, 5);
+        assert_eq!(counters.snapshot().publications, 4);
+
+        session.reset(&()).unwrap();
+        let report = session.report().unwrap();
+        assert_eq!(report.execution(), residency.execution_residency());
+        assert_eq!(report.state_report(), &[0]);
+        assert_eq!(
+            report.execution_report(),
+            &(residency, !residency.is_fully_resident())
+        );
+        assert_eq!(counters.snapshot().state_allocations, 2);
+        assert_eq!(completions.borrow().len(), counters.snapshot().publications);
+    }
+}
+
+#[test]
+fn replicated_text_contract_mismatch_fails_before_backend_work() {
+    let counters = ReplicatedSessionCounters::default();
+    let selected_architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected =
+        selected_reference_text(&selected_architecture, LayerWeightResidency::FullyResident);
+    let expected_identity = selected.requirements().architecture_identity().to_owned();
+    let constructed_architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: true,
+        inconsistent_identity: false,
+    };
+    let error = prepare_replicated_text_contract::<
+        _,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+    >(
+        &constructed_architecture,
+        None,
+        selected,
+        &expected_identity,
+        &(),
+    )
+    .err()
+    .expect("inconsistent architecture entered backend construction");
+    assert!(error.contains("architecture execution group 0 differs from selection"));
+    assert_eq!(counters.snapshot(), ReplicatedSessionCounts::default());
+}
+
+#[test]
+fn replicated_text_identity_mismatch_fails_before_backend_work() {
+    let counters = ReplicatedSessionCounters::default();
+    let selected_architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected =
+        selected_reference_text(&selected_architecture, LayerWeightResidency::FullyResident);
+    let expected_identity = selected.requirements().architecture_identity().to_owned();
+    let constructed_architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: true,
+    };
+    let error = prepare_replicated_text_contract::<
+        _,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+    >(
+        &constructed_architecture,
+        None,
+        selected,
+        &expected_identity,
+        &(),
+    )
+    .err()
+    .expect("inconsistent identity entered backend construction");
+    assert!(error.contains("prompt-cache identity differs from selection"));
+    assert_eq!(counters.snapshot(), ReplicatedSessionCounts::default());
+}
+
+#[test]
+fn replicated_text_selection_denies_each_required_mechanism_before_backend_work() {
+    for (denied, expected) in [
+        (
+            DeniedReferenceMechanism::Storage,
+            "weight residency Resident",
+        ),
+        (DeniedReferenceMechanism::State, "state component"),
+        (DeniedReferenceMechanism::Observation, "observation"),
+        (
+            DeniedReferenceMechanism::Persistence,
+            "prompt-cache persistence",
+        ),
+        (
+            DeniedReferenceMechanism::Completion,
+            "exact completion ownership",
+        ),
+    ] {
+        let counters = ReplicatedSessionCounters::default();
+        let architecture = OrdinaryTextFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+            counters: counters.clone(),
+            inconsistent_transport: false,
+            inconsistent_identity: false,
+        };
+        let error = try_select_reference_text(
+            &architecture,
+            LayerWeightResidency::FullyResident,
+            Some(denied),
+        )
+        .expect_err("missing mechanism was selected");
+        assert!(
+            error.issues().iter().any(|issue| issue.contains(expected)),
+            "{denied:?}: {error}"
+        );
+        assert_eq!(counters.snapshot(), ReplicatedSessionCounts::default());
     }
 }
 

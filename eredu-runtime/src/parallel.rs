@@ -162,6 +162,8 @@ pub struct ParameterMemberSpec {
     target: String,
     global_shape: Vec<usize>,
     sharding: MemberSharding,
+    linear_companion: Option<eredu_nn::LinearCompanionRole>,
+    linear_companion_of: Option<String>,
 }
 
 impl ParameterMemberSpec {
@@ -175,7 +177,23 @@ impl ParameterMemberSpec {
             target: target.into(),
             global_shape: global_shape.into(),
             sharding,
+            linear_companion: None,
+            linear_companion_of: None,
         }
+    }
+
+    fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
+        self.linear_companion = metadata.linear_companion;
+        self.linear_companion_of = metadata
+            .linear_companion_of
+            .as_ref()
+            .map(|parameter| parameter.as_str().to_owned());
+        self
+    }
+
+    fn with_sharding(mut self, sharding: MemberSharding) -> Self {
+        self.sharding = sharding;
+        self
     }
 
     /// Returns the rewritten checkpoint target.
@@ -191,6 +209,16 @@ impl ParameterMemberSpec {
     /// Returns the requested rank-local selection.
     pub const fn sharding(&self) -> &MemberSharding {
         &self.sharding
+    }
+
+    /// Returns this member's encoded-linear companion role, when present.
+    pub const fn linear_companion(&self) -> Option<eredu_nn::LinearCompanionRole> {
+        self.linear_companion
+    }
+
+    /// Returns the primary linear weight owning this companion.
+    pub fn linear_companion_of(&self) -> Option<&str> {
+        self.linear_companion_of.as_deref()
     }
 }
 
@@ -344,11 +372,10 @@ where
                 }
             };
             match (self.sharding)(&metadata, &shape) {
-                Ok(sharding) => self.members.push(ParameterMemberSpec::new(
-                    metadata.id.as_str(),
-                    shape,
-                    sharding,
-                )),
+                Ok(sharding) => self.members.push(
+                    ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding)
+                        .with_parameter_metadata(&metadata),
+                ),
                 Err(error) => self.error = Some(error),
             }
         }
@@ -410,8 +437,10 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>();
             match shape.and_then(|shape| {
-                (self.sharding)(&metadata, &shape)
-                    .map(|sharding| ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding))
+                (self.sharding)(&metadata, &shape).map(|sharding| {
+                    ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding)
+                        .with_parameter_metadata(&metadata)
+                })
             }) {
                 Ok(member) => self.members.push(member),
                 Err(error) => self.error = Some(error),
@@ -488,11 +517,7 @@ where
                 (ProjectionSharding::Column, _) => MemberSharding::Partitioned { axis: 0 },
                 (ProjectionSharding::Row, _) => MemberSharding::Partitioned { axis: 1 },
             };
-            members.push(ParameterMemberSpec::new(
-                member.target,
-                member.global_shape,
-                sharding,
-            ));
+            members.push(member.with_sharding(sharding));
         }
     }
     partitioned_group_with_preferred_units(logical_name, role, preferred_units, members)
@@ -569,14 +594,10 @@ fn assemble_segmented_projection_group(
                 member.target
             )));
         }
-        members.push(ParameterMemberSpec::new(
-            member.target,
-            member.global_shape,
-            MemberSharding::PartitionedSegments {
-                axis: 0,
-                segments: segments.clone(),
-            },
-        ));
+        members.push(member.with_sharding(MemberSharding::PartitionedSegments {
+            axis: 0,
+            segments: segments.clone(),
+        }));
     }
     for member in row_group.members {
         let sharding = if member.global_shape.len() >= 2 {
@@ -584,11 +605,7 @@ fn assemble_segmented_projection_group(
         } else {
             MemberSharding::Replicated
         };
-        members.push(ParameterMemberSpec::new(
-            member.target,
-            member.global_shape,
-            sharding,
-        ));
+        members.push(member.with_sharding(sharding));
     }
     partitioned_group_with_preferred_units(logical_name, role, units, members)
 }

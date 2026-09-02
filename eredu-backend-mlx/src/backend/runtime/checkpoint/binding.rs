@@ -6,10 +6,13 @@
 
 use eredu_checkpoint::{
     store::{ReadPolicy, TensorReadRequest},
-    WeightQuantization,
+    SourceTensorEncoding, WeightQuantization,
 };
 use eredu_nn::{validate_parameter_topology, LinearCompanionRole, Parameterized};
-use eredu_runtime::{ParameterGroupSpec, ParameterRole, WeightBinding, WeightBindingPlan};
+use eredu_runtime::{
+    ParameterGroupSpec, ParameterRole, ReplicatedTextMaterializationTask, WeightBinding,
+    WeightBindingPlan, WeightLoweringKind,
+};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -229,6 +232,198 @@ where
         parameters, "", store, selected, exclude,
     )?
     .build_bindings(store)
+}
+
+/// Resolves one exact replicated-text task partition to native module handles.
+///
+/// The task partition is authoritative for source identity, recipes, lowering,
+/// and transformed companion identities. Module traversal only verifies that
+/// every selected destination has one native handle, while the checkpoint
+/// source supplies byte metadata without opening payloads.
+fn binding_from_exact_replicated_text_task(
+    task: &ReplicatedTextMaterializationTask,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<WeightBinding, ModuleBindingError> {
+    let binding = match task.lowering() {
+        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform => {
+            if !store.is_authoritative_materialized_key(task.name()) {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact transformed task {:?} has no authoritative materialized output",
+                    task.name()
+                )));
+            }
+            let metadata = store.source_metadata(task.name())?;
+            WeightBinding::new(
+                task.name(),
+                task.name(),
+                TensorSelection::Full,
+                metadata.encoded_byte_len,
+            )?
+        }
+        WeightLoweringKind::Direct => {
+            let [source] = task.sources() else {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact direct task {:?} must name exactly one source",
+                    task.name()
+                )));
+            };
+            let metadata = store.source_metadata(source)?;
+            WeightBinding::new(
+                task.name(),
+                source,
+                TensorSelection::Full,
+                metadata.encoded_byte_len,
+            )?
+        }
+        WeightLoweringKind::Derived => {
+            let recipe = task
+                .source_recipe()
+                .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+            let metadata = recipe.infer(store)?;
+            if task
+                .derived_output()
+                .is_some_and(|expected| expected != &metadata)
+            {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact derived task {:?} differs from its admitted output",
+                    task.name()
+                )));
+            }
+            WeightBinding::from_recipe(task.name(), recipe, metadata.byte_len())?
+        }
+        _ => {
+            return Err(ModuleBindingError::BindingPlan(format!(
+                "exact task {:?} selected an unsupported lowering",
+                task.name()
+            )))
+        }
+    };
+    binding.with_logical_target(task.name()).map_err(Into::into)
+}
+
+/// Resolves one exact replicated-text task partition to native module handles.
+///
+/// Each primary and companion binding consumes its complete selected task;
+/// checkpoint target-name probing is not a source-selection mechanism.
+pub fn build_exact_replicated_text_bindings<M>(
+    module: &M,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    tasks: &[&ReplicatedTextMaterializationTask],
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    let parameter_names = neutral_parameter_refs(module, false)
+        .flatten()
+        .into_keys()
+        .map(|name| name.as_ref().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut covered = BTreeSet::new();
+    let mut bindings = Vec::new();
+    for task in tasks {
+        if !parameter_names.contains(task.name()) {
+            return Err(ModuleBindingError::BindingPlan(format!(
+                "exact materialization task {:?} has no native module destination",
+                task.name()
+            )));
+        }
+        if !covered.insert(task.name().to_owned()) {
+            return Err(ModuleBindingError::BindingPlan(format!(
+                "exact materialization task {:?} was consumed more than once",
+                task.name()
+            )));
+        }
+        bindings.push(binding_from_exact_replicated_text_task(task, store)?);
+
+        for companion in task.output_companions() {
+            if !parameter_names.contains(companion.name()) {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact task {:?} companion {:?} has no native module destination",
+                    task.name(),
+                    companion.name()
+                )));
+            }
+            if !covered.insert(companion.name().to_owned()) {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact companion {:?} was consumed more than once",
+                    companion.name()
+                )));
+            }
+            let binding = if let Some(exact) = companion.materialization_task() {
+                binding_from_exact_replicated_text_task(exact, store)?
+            } else if let (Some(recipe), Some(expected)) =
+                (companion.derived_recipe(), companion.derived_output())
+            {
+                let metadata = recipe.infer(store)?;
+                if &metadata != expected {
+                    return Err(ModuleBindingError::BindingPlan(format!(
+                        "exact companion {:?} differs from its admitted derived output",
+                        companion.name()
+                    )));
+                }
+                WeightBinding::from_recipe(companion.name(), recipe.clone(), metadata.byte_len())?
+                    .with_logical_target(companion.name())?
+            } else if let Some(source) = companion.catalog_source() {
+                let provenance = store.source_provenance(companion.name())?;
+                if provenance.physical_tensor != source.tensor()
+                    || provenance.output != source.output()
+                    || provenance.backing_shard.as_deref() != Some(source.shard())
+                    || &provenance.source_encoding != task.source_encoding()
+                {
+                    return Err(ModuleBindingError::BindingPlan(format!(
+                        "translated catalog companion {:?} differs from its admitted provenance",
+                        companion.name()
+                    )));
+                }
+                let metadata = store.source_metadata(companion.name())?;
+                WeightBinding::new(
+                    companion.name(),
+                    companion.name(),
+                    TensorSelection::Full,
+                    metadata.encoded_byte_len,
+                )?
+                .with_logical_target(companion.name())?
+            } else if matches!(
+                task.lowering(),
+                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+            ) || matches!(task.source_encoding(), SourceTensorEncoding::Gguf { .. })
+            {
+                if !store.is_authoritative_materialized_key(companion.name()) {
+                    return Err(ModuleBindingError::BindingPlan(format!(
+                        "generated companion {:?} has no authoritative materialized output",
+                        companion.name()
+                    )));
+                }
+                let metadata = store.source_metadata(companion.name())?;
+                WeightBinding::new(
+                    companion.name(),
+                    companion.name(),
+                    TensorSelection::Full,
+                    metadata.encoded_byte_len,
+                )?
+                .with_logical_target(companion.name())?
+            } else {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact companion {:?} has neither a selected task nor a causal primary output",
+                    companion.name()
+                )));
+            };
+            bindings.push(binding);
+        }
+    }
+    let missing = parameter_names
+        .difference(&covered)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let selected = tasks.iter().map(|task| task.name()).collect::<Vec<_>>();
+        return Err(ModuleBindingError::BindingPlan(format!(
+            "native module parameters have no exact materialization tasks: {missing:?}; selected tasks: {selected:?}"
+        )));
+    }
+    WeightBindingPlan::new(&bindings)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+    Ok(bindings)
 }
 
 /// Materializes a set of direct or derived bindings without constructing a

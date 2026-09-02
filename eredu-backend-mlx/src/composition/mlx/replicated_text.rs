@@ -5,19 +5,22 @@ use std::{marker::PhantomData, path::Path, sync::Arc};
 use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    StateComponentRole,
+    StateResidencyClass,
 };
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
-    ArchitectureStateFactory, BackendMechanismCapabilities, CacheResidencyPolicy,
-    CacheResidencyReport, DenseDiskStreamReport, GroupedOperationRequirement, LayerRuntimeState,
-    LayerwiseRuntime, ReplicatedTextArchitecture, ReplicatedTextRequirements,
-    ReplicatedTextSelectionRequest, ResidencyReport, SelectedReplicatedTextRealization,
-    SelectedStateRealization, StateComponentMechanism, StateComponentPlacement,
-    StateMechanismCapabilities, WeightLoweringCapability, WeightLoweringDescriptor,
-    WeightLoweringKind, WeightResidencyMechanism,
+    BackendMechanismCapabilities, CacheResidencyPolicy, CacheResidencyReport,
+    DenseDiskStreamReport, GroupedOperationRequirement, LayerRuntimeState,
+    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextRequirements,
+    ReplicatedTextSelectionRequest, ReplicatedTextSession, ReplicatedTextSessionMechanisms,
+    ResidencyReport, SelectedReplicatedTextRealization, SelectedStateRealization,
+    StateComponentMechanism, StateComponentPlacement, StateMechanismCapabilities, WeightBinding,
+    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
+    WeightResidencyMechanism,
 };
-use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx::{
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
+};
 
 #[cfg(test)]
 use eredu_runtime::PagedCacheOptions;
@@ -42,20 +45,15 @@ use crate::{
 };
 
 use crate::backend::nn::shared::MlxModule;
-use crate::backend::runtime::checkpoint::binding::{
-    build_module_bindings_with_recipes_excluding,
-    build_neutral_module_bindings_with_recipes_excluding,
-};
+use crate::backend::runtime::checkpoint::binding::build_exact_replicated_text_bindings;
 use crate::backend::runtime::execution::{
-    generic::{
-        architecture_execution_layout, construct_architecture_unit,
-        prepare_layerwise_policy_with_bindings,
-    },
-    layerwise::quantize_module_store_with_bindings,
+    generic::prepare_layerwise_policy_from_bindings,
+    layerwise::quantize_exact_replicated_text_tasks,
 };
 
 use eredu_architectures::replicated_text::{
     PreparedReplicatedTextArchitecture, ReplicatedTextArchitectureVisitor,
+    ReplicatedTextProfileDispatcher,
 };
 
 /// Reports the exact MLX mechanisms applicable to one neutral requirement set.
@@ -110,12 +108,12 @@ pub(crate) fn capabilities(
                 .expect("validated state layout exposes every layer")
                 .iter()
                 .filter_map(move |component| {
-                    let paged = match component.role() {
-                        StateComponentRole::AttentionKeys
-                        | StateComponentRole::AttentionValues
-                        | StateComponentRole::CompressedLatent
-                        | StateComponentRole::RotaryKeys => StateComponentPlacement::Paged,
-                        StateComponentRole::Fixed(_) => StateComponentPlacement::Device,
+                    let paged = match component.residency() {
+                        StateResidencyClass::SealablePaged => StateComponentPlacement::Paged,
+                        StateResidencyClass::AlwaysDeviceMutable
+                        | StateResidencyClass::LayerScopedOffloadable => {
+                            StateComponentPlacement::Device
+                        }
                     };
                     mlx_supports_state_component(component).then(|| {
                         StateComponentMechanism::new(
@@ -196,7 +194,6 @@ type CheckpointRestoreProbe = (
 pub trait ErasedReplicatedTextExecutable {
     fn effective_model_type(&self) -> &str;
     fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate;
-    fn selected_session_binding(&self) -> &SelectedSessionBinding;
     #[cfg(test)]
     fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency;
     #[cfg(test)]
@@ -237,158 +234,22 @@ pub trait ErasedReplicatedTextExecutable {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error>;
+    fn prefill_with_observer(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error>;
+    fn decode_with_observer(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error>;
 }
 
-/// Session mechanisms admitted by the authoritative realization.
-pub struct SelectedSessionBinding {
-    capabilities: eredu_core::SessionCapabilities,
-    prompt_cache: bool,
-    exact_completion: bool,
-}
-
-impl SelectedSessionBinding {
-    fn from_selected(selected: &SelectedReplicatedTextRealization) -> Self {
-        Self {
-            capabilities: selected.session(),
-            prompt_cache: selected.prompt_cache(),
-            exact_completion: selected.exact_completion(),
-        }
-    }
-
-    pub(crate) fn validate_bound_mechanisms(
-        &self,
-        capabilities: eredu_core::SessionCapabilities,
-        prompt_cache: bool,
-        exact_completion: bool,
-    ) -> Result<(), String> {
-        self.capabilities
-            .validate(&capabilities)
-            .map_err(|error| error.to_string())?;
-        if self.prompt_cache && !prompt_cache {
-            return Err("selected prompt-cache persistence was not bound by the session".into());
-        }
-        if self.exact_completion && !exact_completion {
-            return Err("selected exact completion was not bound by the session".into());
-        }
-        Ok(())
-    }
-
-    fn prompt_cache(&self) -> bool {
-        self.prompt_cache
-    }
-}
-
-struct MlxKeyValueStateFactory<'a> {
-    selected: &'a SelectedStateRealization,
-}
-
-impl ArchitectureStateFactory<MlxNeuralBackend> for MlxKeyValueStateFactory<'_> {
-    type State = MlxKeyValueState;
-    type Error = Error;
-
-    fn realize(&mut self, layout: &eredu_runtime::StateLayout) -> Result<Self::State, Self::Error> {
-        validate_selected_state(self.selected, layout)?;
-        #[cfg(test)]
-        super::path_instrumentation::state_allocation();
-        match self.selected.policy() {
-            CacheResidencyPolicy::Device => {
-                MlxKeyValueState::device(layout.clone()).map_err(Into::into)
-            }
-            CacheResidencyPolicy::Paged(options) => MlxKeyValueState::paged(
-                layout.clone(),
-                CacheResidencyManager::new(options.clone())
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )
-            .map_err(Into::into),
-        }
-    }
-}
-
-struct MlxHybridStateFactory<'a> {
-    selected: &'a SelectedStateRealization,
-}
-
-impl ArchitectureStateFactory<MlxNeuralBackend> for MlxHybridStateFactory<'_> {
-    type State = MlxHybridState;
-    type Error = Error;
-
-    fn realize(&mut self, layout: &eredu_runtime::StateLayout) -> Result<Self::State, Self::Error> {
-        validate_selected_state(self.selected, layout)?;
-        #[cfg(test)]
-        super::path_instrumentation::state_allocation();
-        match self.selected.policy() {
-            CacheResidencyPolicy::Device => {
-                MlxHybridState::device(layout.clone()).map_err(Into::into)
-            }
-            CacheResidencyPolicy::Paged(options) => MlxHybridState::paged(
-                layout.clone(),
-                CacheResidencyManager::new(options.clone())
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )
-            .map_err(Into::into),
-        }
-    }
-}
-
-fn validate_selected_state(
-    selected: &SelectedStateRealization,
-    layout: &eredu_runtime::StateLayout,
-) -> Result<(), Error> {
-    if selected.layout() != layout {
-        return Err(Error::ArchitectureModel(
-            "selected state layout differs from constructed architecture".into(),
-        ));
-    }
-    let expected = (0..layout.len())
-        .flat_map(|layer| {
-            layout
-                .components(layer)
-                .expect("validated state layout exposes every layer")
-                .iter()
-                .map(move |component| {
-                    let placement = match (selected.policy(), component.role()) {
-                        (CacheResidencyPolicy::Device, _) => StateComponentPlacement::Device,
-                        (
-                            CacheResidencyPolicy::Paged(_),
-                            StateComponentRole::AttentionKeys
-                            | StateComponentRole::AttentionValues
-                            | StateComponentRole::CompressedLatent
-                            | StateComponentRole::RotaryKeys,
-                        ) => StateComponentPlacement::Paged,
-                        (CacheResidencyPolicy::Paged(_), StateComponentRole::Fixed(_)) => {
-                            StateComponentPlacement::Device
-                        }
-                    };
-                    (layer, component, placement)
-                })
-        })
-        .collect::<Vec<_>>();
-    let exact = selected.components().len() == expected.len()
-        && selected
-            .components()
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| {
-                actual.layer() == expected.0
-                    && actual.component() == expected.1
-                    && actual.placement() == expected.2
-            });
-    if !exact {
-        return Err(Error::ArchitectureModel(
-            "selected state component realization differs from MLX mechanisms".into(),
-        ));
-    }
-    if !selected.checkpoint() || !selected.rollback() || !selected.reset() {
-        return Err(Error::ArchitectureModel(
-            "selected state lifecycle omits required replicated facilities".into(),
-        ));
-    }
-    Ok(())
-}
-
-trait MlxReplicatedState: LayerRuntimeState<MlxNeuralBackend> + Sized {
+trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
     fn realize(selected: &SelectedStateRealization) -> Result<Self, Error>;
     fn load_prompt_cache(
         selected: &SelectedStateRealization,
@@ -406,9 +267,8 @@ trait MlxReplicatedState: LayerRuntimeState<MlxNeuralBackend> + Sized {
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error>;
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
-    #[cfg(test)]
+    fn retained_arrays(&self) -> Vec<&Array>;
     fn deep_checkpoint(&self) -> Result<Self, Exception>;
-    #[cfg(test)]
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception>;
     #[cfg(test)]
     fn state_snapshot(&self) -> Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
@@ -428,9 +288,30 @@ trait MlxReplicatedState: LayerRuntimeState<MlxNeuralBackend> + Sized {
     fn retained_numeric_snapshot(&self) -> Result<RetainedNumericStateSnapshot, Exception>;
 }
 
-impl MlxReplicatedState for MlxKeyValueState {
+fn selected_state_manager(
+    selected: &SelectedStateRealization,
+) -> Result<Option<CacheResidencyManager>, Error> {
+    let needs_paging = selected
+        .components()
+        .iter()
+        .any(|component| component.placement() == StateComponentPlacement::Paged);
+    match (needs_paging, selected.policy()) {
+        (false, _) => Ok(None),
+        (true, CacheResidencyPolicy::Paged(options)) => CacheResidencyManager::new(options.clone())
+            .map(Some)
+            .map_err(|error| Error::Parallel(error.to_string())),
+        (true, CacheResidencyPolicy::Device) => Err(Error::Parallel(
+            "selected paged state component has no paging policy".into(),
+        )),
+    }
+}
+
+impl MlxStateMechanisms for MlxKeyValueState {
     fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
-        MlxKeyValueStateFactory { selected }.realize(selected.layout())
+        #[cfg(test)]
+        super::path_instrumentation::state_allocation();
+        let manager = selected_state_manager(selected)?;
+        MlxKeyValueState::from_selected(selected, manager, None).map_err(Into::into)
     }
 
     fn load_prompt_cache(
@@ -454,7 +335,7 @@ impl MlxReplicatedState for MlxKeyValueState {
             options.clone(),
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        let state = MlxKeyValueState::paged(selected.layout().clone(), manager, None)?;
+        let state = MlxKeyValueState::from_selected(selected, Some(manager), None)?;
         Ok((state, manifest))
     }
 
@@ -479,12 +360,14 @@ impl MlxReplicatedState for MlxKeyValueState {
         MlxKeyValueState::residency_report(self)
     }
 
-    #[cfg(test)]
+    fn retained_arrays(&self) -> Vec<&Array> {
+        MlxKeyValueState::retained_arrays(self)
+    }
+
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         self.deep_clone_state()
     }
 
-    #[cfg(test)]
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
         MlxKeyValueState::restore_checkpoint(self, checkpoint, stream)
     }
@@ -518,9 +401,12 @@ impl MlxReplicatedState for MlxKeyValueState {
     }
 }
 
-impl MlxReplicatedState for MlxHybridState {
+impl MlxStateMechanisms for MlxHybridState {
     fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
-        MlxHybridStateFactory { selected }.realize(selected.layout())
+        #[cfg(test)]
+        super::path_instrumentation::state_allocation();
+        let manager = selected_state_manager(selected)?;
+        MlxHybridState::from_selected(selected, manager, None).map_err(Into::into)
     }
 
     fn load_prompt_cache(
@@ -546,7 +432,7 @@ impl MlxReplicatedState for MlxHybridState {
         .map_err(|error| Error::Parallel(error.to_string()))?;
         let tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let mut state = MlxHybridState::paged(selected.layout().clone(), manager, None)?;
+        let mut state = MlxHybridState::from_selected(selected, Some(manager), None)?;
         state.restore_prompt_cache_state(
             tensors,
             i32::try_from(prefix_token_ids.len())
@@ -571,12 +457,14 @@ impl MlxReplicatedState for MlxHybridState {
         MlxHybridState::residency_report(self)
     }
 
-    #[cfg(test)]
+    fn retained_arrays(&self) -> Vec<&Array> {
+        MlxHybridState::retained_arrays(self)
+    }
+
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         self.deep_clone_state()
     }
 
-    #[cfg(test)]
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
         MlxHybridState::restore_checkpoint(self, checkpoint, stream)
     }
@@ -606,56 +494,445 @@ impl MlxReplicatedState for MlxHybridState {
         self.retained_numeric_snapshot()
     }
 }
-
-type ResidentRuntime<A, S> = LayerwiseRuntime<
-    A,
-    MlxNeuralBackend,
-    S,
-    MlxResidentPolicy<<A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>>::Unit>,
->;
-type BoundedRuntime<A, S> = LayerwiseRuntime<
-    A,
-    MlxNeuralBackend,
-    S,
-    MlxLayerwisePolicy<<A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>>::Unit>,
->;
-
-enum Execution<A, S>
-where
-    S: MlxReplicatedState,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
-    A::StaticModules: Clone,
-    A::Error: std::fmt::Display,
-{
-    Resident(ResidentRuntime<A, S>),
-    Bounded(BoundedRuntime<A, S>),
+struct MlxExecutionReport {
+    residency: ResidencyReport,
+    dense: Option<DenseDiskStreamReport>,
 }
 
-struct BoundReplicatedText<A, S>
+struct MlxStateReport {
+    residency: Option<CacheResidencyReport>,
+    #[cfg(test)]
+    presence: StatePresenceSnapshot,
+    #[cfg(test)]
+    fixed_numeric: FixedNumericStateSnapshot,
+    #[cfg(test)]
+    retained_numeric: RetainedNumericStateSnapshot,
+}
+
+struct MlxReplicatedTextMechanisms<A, S>
 where
-    S: MlxReplicatedState,
+    S: MlxStateMechanisms,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+{
+    store: Arc<dyn CheckpointSource>,
+    prepared_bindings: Option<PreparedExactBindings>,
+    resident_report: Option<ResidencyReport>,
+    materialization: Arc<std::sync::Mutex<Option<eredu_runtime::WeightMaterializationReport>>>,
+    stream: Stream,
+    weights_stream: Stream,
+    state: PhantomData<fn() -> (A, S)>,
+}
+
+struct PreparedExactBindings {
+    layout: eredu_runtime::ExecutionUnitLayout,
+    static_bindings: Vec<WeightBinding>,
+    unit_bindings: Vec<Vec<WeightBinding>>,
+}
+
+type ExactTaskPartitions<'a> = (
+    Vec<&'a ReplicatedTextMaterializationTask>,
+    Vec<Vec<&'a ReplicatedTextMaterializationTask>>,
+);
+
+fn partition_materialization_tasks<'a>(
+    tasks: &'a [ReplicatedTextMaterializationTask],
+    layout: &eredu_runtime::ExecutionUnitLayout,
+) -> Result<ExactTaskPartitions<'a>, Error> {
+    let mut static_tasks = Vec::new();
+    let mut unit_tasks = vec![Vec::new(); layout.len()];
+    for task in tasks {
+        match task.owner() {
+            eredu_runtime::ReplicatedTextParameterOwner::StaticRole(_) => {
+                static_tasks.push(task);
+            }
+            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
+                let group_index = (0..layout.group_count())
+                    .find(|index| {
+                        layout
+                            .group_id(*index)
+                            .is_some_and(|id| id.as_str() == group)
+                    })
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(format!(
+                            "exact task {:?} names unknown execution group {group:?}",
+                            task.name()
+                        ))
+                    })?;
+                let ordinal = layout.ordinal(group_index, *unit).ok_or_else(|| {
+                    Error::ArchitectureModel(format!(
+                        "exact task {:?} names unknown unit {unit} in group {group:?}",
+                        task.name()
+                    ))
+                })?;
+                unit_tasks[ordinal].push(task);
+            }
+            _ => {
+                return Err(Error::ArchitectureModel(format!(
+                    "exact task {:?} has an unsupported parameter owner",
+                    task.name()
+                )))
+            }
+        }
+    }
+    let consumed = static_tasks.len() + unit_tasks.iter().map(Vec::len).sum::<usize>();
+    if consumed != tasks.len() {
+        return Err(Error::ArchitectureModel(
+            "exact materialization tasks were not partitioned exactly once".into(),
+        ));
+    }
+    Ok((static_tasks, unit_tasks))
+}
+
+impl<A, S> MlxReplicatedTextMechanisms<A, S>
+where
+    S: MlxStateMechanisms,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+{
+    fn new(
+        store: Arc<dyn CheckpointSource>,
+        materialization: Arc<std::sync::Mutex<Option<eredu_runtime::WeightMaterializationReport>>>,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Self {
+        Self {
+            store,
+            prepared_bindings: None,
+            resident_report: None,
+            materialization,
+            stream: stream.clone(),
+            weights_stream: weights_stream.clone(),
+            state: PhantomData,
+        }
+    }
+
+    fn take_prepared_policy(
+        &mut self,
+        architecture: &mut A,
+        selected: &SelectedReplicatedTextRealization,
+    ) -> Result<MlxLayerwisePolicy<A::Unit>, Error> {
+        let prepared = self.prepared_bindings.take().ok_or_else(|| {
+            Error::ArchitectureModel("execution policy requested before materialization".into())
+        })?;
+        let (policy, _) = prepare_layerwise_policy_from_bindings(
+            Arc::clone(&self.store),
+            architecture,
+            (),
+            PhantomData::<S>,
+            selected.residency(),
+            &self.stream,
+            &self.weights_stream,
+            |_| false,
+            prepared.layout,
+            prepared.static_bindings,
+            prepared.unit_bindings,
+        )?;
+        Ok(policy)
+    }
+}
+
+impl<A, S> ReplicatedTextSessionMechanisms<A, MlxNeuralBackend>
+    for MlxReplicatedTextMechanisms<A, S>
+where
+    S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
-    execution: Execution<A, S>,
-    state_layout: eredu_runtime::StateLayout,
-    state: S,
+    type State = S;
+    type PolicyError = Error;
+    type ResidentPolicy = MlxResidentPolicy<A::Unit>;
+    type BoundedPolicy = MlxLayerwisePolicy<A::Unit>;
+    type StateCheckpoint = S;
+    type StateReport = MlxStateReport;
+    type ExecutionReport = MlxExecutionReport;
+    type Error = Error;
+
+    fn prepare_materialization(
+        &mut self,
+        architecture: &mut A,
+        target_layout: &eredu_runtime::ExecutionUnitLayout,
+        target_units: &mut [A::Unit],
+        source_architecture: Option<&mut A>,
+        source_units: Option<&mut [A::Unit]>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        _context: &Stream,
+    ) -> Result<(), Self::Error> {
+        if target_units.len() != target_layout.len() {
+            return Err(Error::ArchitectureModel(
+                "neutral target unit set differs from the selected execution layout".into(),
+            ));
+        }
+        if let Some(source) = source_architecture {
+            let source_units = source_units.ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "selected source architecture has no neutral materialization units".into(),
+                )
+            })?;
+            let mut task_groups = Vec::<(
+                eredu_checkpoint::WeightQuantization,
+                Vec<&ReplicatedTextMaterializationTask>,
+            )>::new();
+            for task in tasks.iter().filter(|task| {
+                matches!(
+                    task.lowering(),
+                    WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+                )
+            }) {
+                let format = task.executable().weight_quantization().ok_or_else(|| {
+                    Error::Quantization(format!(
+                        "selected materialization task {:?} has no packed output format",
+                        task.name()
+                    ))
+                })?;
+                match task_groups
+                    .iter_mut()
+                    .find(|(selected, _)| *selected == format)
+                {
+                    Some((_, tasks)) => tasks.push(task),
+                    None => task_groups.push((format, vec![task])),
+                }
+            }
+            if task_groups.is_empty() {
+                return Err(Error::Quantization(
+                    "selected source architecture has no materialization tasks".into(),
+                ));
+            }
+            if source_units.len() != target_layout.len() {
+                return Err(Error::Quantization(
+                    "selected materialization tasks changed the execution-unit layout".into(),
+                ));
+            }
+            let source_static = source.static_modules().clone();
+            let target_static = architecture.static_modules().clone();
+            let mut combined = eredu_runtime::WeightMaterializationReport::default();
+            for (quantization, exact_tasks) in task_groups {
+                #[cfg(test)]
+                super::path_instrumentation::materialization();
+                let (store, report) = quantize_exact_replicated_text_tasks(
+                    Arc::clone(&self.store),
+                    &source_static,
+                    &target_static,
+                    source_units,
+                    target_units,
+                    quantization,
+                    &exact_tasks,
+                    &self.stream,
+                )?;
+                self.store = store;
+                combined.admitted_working_set_bytes = combined
+                    .admitted_working_set_bytes
+                    .max(report.admitted_working_set_bytes);
+                combined.transformed_weights += report.transformed_weights;
+                combined.source_tiles += report.source_tiles;
+                combined.peak_in_flight_tiles = combined
+                    .peak_in_flight_tiles
+                    .max(report.peak_in_flight_tiles);
+                combined.source_bytes_read += report.source_bytes_read;
+                combined.output_bytes += report.output_bytes;
+                combined.peak_planned_working_set_bytes = combined
+                    .peak_planned_working_set_bytes
+                    .max(report.peak_planned_working_set_bytes);
+                combined.largest_source_tile_bytes = combined
+                    .largest_source_tile_bytes
+                    .max(report.largest_source_tile_bytes);
+                combined.largest_output_tile_bytes = combined
+                    .largest_output_tile_bytes
+                    .max(report.largest_output_tile_bytes);
+            }
+            *self.materialization.lock().map_err(|_| {
+                Error::ArchitectureModel("materialization report lock was poisoned".into())
+            })? = Some(combined);
+        } else if tasks.iter().any(|task| {
+            matches!(
+                task.lowering(),
+                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+            )
+        }) {
+            return Err(Error::Quantization(
+                "selected transform tasks have no source architecture".into(),
+            ));
+        }
+
+        let (static_tasks, unit_tasks) = partition_materialization_tasks(tasks, target_layout)?;
+        let static_bindings = build_exact_replicated_text_bindings(
+            &MlxModule::new(architecture.static_modules().clone()),
+            self.store.as_ref(),
+            &static_tasks,
+        )?;
+        let unit_bindings = target_units
+            .iter()
+            .zip(&unit_tasks)
+            .enumerate()
+            .map(|(ordinal, (unit, tasks))| {
+                #[cfg(test)]
+                super::path_instrumentation::unit_construction();
+                build_exact_replicated_text_bindings(unit, self.store.as_ref(), tasks).map_err(
+                    |error| {
+                        Error::ArchitectureModel(format!(
+                            "execution unit {ordinal} exact bindings failed: {error}"
+                        ))
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.prepared_bindings = Some(PreparedExactBindings {
+            layout: target_layout.clone(),
+            static_bindings,
+            unit_bindings,
+        });
+        Ok(())
+    }
+
+    fn realize_state(
+        &mut self,
+        selected: &SelectedStateRealization,
+        _context: &Stream,
+    ) -> Result<S, Error> {
+        S::realize(selected)
+    }
+
+    fn resident_policy(
+        &mut self,
+        architecture: &mut A,
+        units: Vec<A::Unit>,
+        selected: &SelectedReplicatedTextRealization,
+        context: &Stream,
+    ) -> Result<Self::ResidentPolicy, Self::Error> {
+        let policy = self.take_prepared_policy(architecture, selected)?;
+        let resident = policy.into_resident_units(units, context)?;
+        self.resident_report = Some(resident.residency_report()?);
+        Ok(resident)
+    }
+
+    fn bounded_policy(
+        &mut self,
+        architecture: &mut A,
+        selected: &SelectedReplicatedTextRealization,
+        _context: &Stream,
+    ) -> Result<Self::BoundedPolicy, Self::Error> {
+        self.take_prepared_policy(architecture, selected)
+    }
+
+    fn index_text_output(
+        &mut self,
+        output: MlxTensor,
+        sequence_index: i32,
+        context: &Stream,
+    ) -> Result<MlxTensor, Error> {
+        output
+            .as_array()
+            .try_index_device((.., sequence_index, ..), context)
+            .map(MlxTensor::from_array)
+            .map_err(Into::into)
+    }
+
+    fn checkpoint_state(&mut self, state: &S, _context: &Stream) -> Result<S, Error> {
+        state.deep_checkpoint().map_err(Into::into)
+    }
+
+    fn restore_state(
+        &mut self,
+        state: &mut S,
+        checkpoint: S,
+        context: &Stream,
+    ) -> Result<(), Error> {
+        state
+            .restore_checkpoint(&checkpoint, context)
+            .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        selected: &SelectedStateRealization,
+        context: &Stream,
+    ) -> Result<(S, PromptCacheManifest), Error> {
+        S::load_prompt_cache(
+            selected,
+            directory,
+            expected,
+            identity,
+            prefix_token_ids,
+            context,
+        )
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        state: &mut S,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        _context: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        S::save_prompt_cache(state, destination, descriptor, prefix_token_ids, options)
+    }
+
+    fn state_report(&self, state: &S) -> Result<Self::StateReport, Error> {
+        Ok(MlxStateReport {
+            residency: state.residency_report()?,
+            #[cfg(test)]
+            presence: S::state_snapshot(state),
+            #[cfg(test)]
+            fixed_numeric: S::fixed_numeric_snapshot(state)?,
+            #[cfg(test)]
+            retained_numeric: S::retained_numeric_snapshot(state)?,
+        })
+    }
+
+    fn execution_report(
+        &self,
+        _residency: eredu_runtime::LayerWeightResidency,
+        bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<Self::ExecutionReport, Error> {
+        match bounded {
+            Some(policy) => Ok(MlxExecutionReport {
+                residency: policy.residency_report()?,
+                dense: policy.dense_stream_report()?,
+            }),
+            None => Ok(MlxExecutionReport {
+                residency: self.resident_report.clone().ok_or_else(|| {
+                    Error::ArchitectureModel("resident report was not captured".into())
+                })?,
+                dense: None,
+            }),
+        }
+    }
+
+    fn complete(&mut self, output: &MlxTensor, state: &S, _context: &Stream) -> Result<(), Error> {
+        #[cfg(test)]
+        super::path_instrumentation::completion();
+        async_eval_with_event(std::iter::once(output.as_array()).chain(state.retained_arrays()))?
+            .synchronize()
+            .map_err(Into::into)
+    }
+}
+
+struct CompletedReplicatedText<A, S>
+where
+    S: MlxStateMechanisms,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+{
+    session: ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>>,
     prompt_cache_identity: PromptCacheModelIdentity,
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
-    selected_session: SelectedSessionBinding,
-    selected_state: SelectedStateRealization,
     stream: Stream,
 }
 
-impl<A, S> BoundReplicatedText<A, S>
+impl<A, S> CompletedReplicatedText<A, S>
 where
-    S: MlxReplicatedState,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
@@ -665,343 +942,60 @@ where
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        let requirements = prepared.requirements().clone();
-        let selected = prepared.selected().clone();
-        let selected_session = SelectedSessionBinding::from_selected(&selected);
-        let selected_state = selected.state().clone();
+        #[cfg(test)]
+        let selected_residency = prepared.selected().residency();
+        let prompt_cache_identity = prepared.prompt_cache_identity().clone();
         let capability_estimate = prepared.capability_estimate().clone();
         let effective_model_type = prepared.effective_model_type().to_owned();
-        let residency = selected.residency();
         let mut modules = prepared.into_modules();
-        let mut architecture = modules.take_architecture();
+        let architecture = modules.take_architecture();
         let source_architecture = modules.take_source_architecture();
-        let static_recipes = modules.take_static_recipes();
-        let unit_recipes = modules.take_unit_recipes();
-        validate_architecture_contract(&architecture, &requirements)?;
-        validate_parameter_contract(
-            source_architecture.as_ref().unwrap_or(&architecture),
-            &requirements,
-            stream,
-        )?;
-        let (store, materialization) = match source_architecture {
-            Some(source) => {
-                let quantization = selected_transform_quantization(&selected)?;
-                let source_layout = architecture_execution_layout::<_, S>(&source)?;
-                let target_layout = architecture_execution_layout::<_, S>(&architecture)?;
-                if source_layout != target_layout {
-                    return Err(Error::Quantization(
-                        "selected weight transform changed the execution-unit layout".into(),
-                    ));
-                }
-                let unit_count = source_layout.len();
-                let source_static = source.static_modules().clone();
-                let target_static = architecture.static_modules().clone();
-                let quantization_static_recipes = static_recipes.clone();
-                let quantization_unit_recipes = unit_recipes.clone();
-                let (store, report) = quantize_module_store_with_bindings(
-                    store,
-                    &source_static,
-                    &target_static,
-                    |ordinal, context| {
-                        construct_architecture_unit(
-                            &source,
-                            &source_layout,
-                            ordinal,
-                            context,
-                            PhantomData::<S>,
-                        )
-                    },
-                    |ordinal, context| {
-                        construct_architecture_unit(
-                            &architecture,
-                            &target_layout,
-                            ordinal,
-                            context,
-                            PhantomData::<S>,
-                        )
-                    },
-                    unit_count,
-                    quantization,
-                    stream,
-                    move |modules, store| {
-                        let mut recipes = quantization_static_recipes;
-                        build_neutral_module_bindings_with_recipes_excluding(
-                            modules,
-                            store,
-                            &mut recipes,
-                            |_| false,
-                        )
-                        .map_err(Into::into)
-                    },
-                    move |ordinal, unit, store| {
-                        let mut recipes = quantization_unit_recipes
-                            .get(ordinal)
-                            .cloned()
-                            .unwrap_or_default();
-                        build_neutral_module_bindings_with_recipes_excluding(
-                            unit,
-                            store,
-                            &mut recipes,
-                            |_| false,
-                        )
-                        .map_err(Into::into)
-                    },
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
-        };
-        let state_layout = architecture
-            .state_layout()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let prompt_cache_identity = crate::composition::replicated_prompt_cache_identity(
-            &architecture,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )?;
-        let (policy, _) = prepare_layerwise_policy_with_bindings(
+        let contract = modules.take_contract();
+        let materialization = Arc::new(std::sync::Mutex::new(None));
+        let mechanisms = MlxReplicatedTextMechanisms::new(
             store,
-            &mut architecture,
-            (),
-            PhantomData::<S>,
-            residency,
+            Arc::clone(&materialization),
             stream,
             weights_stream,
-            |_| false,
-            move |modules, store| {
-                build_module_bindings_with_recipes_excluding(
-                    &MlxModule::new(modules.clone()),
-                    "",
-                    store,
-                    static_recipes,
-                    |_| false,
-                )
-                .map_err(Into::into)
-            },
-            move |ordinal, _address, _path, unit, store, _stream| {
-                let recipes = unit_recipes.get(ordinal).cloned().unwrap_or_default();
-                build_module_bindings_with_recipes_excluding(
-                    &MlxModule::new(unit),
-                    "",
-                    store,
-                    recipes,
-                    |_| false,
-                )
-                .map_err(Into::into)
-            },
-        )?;
-        let execution = if residency.is_fully_resident() {
-            Execution::Resident(LayerwiseRuntime::new_policy_first(
-                policy.into_resident(&architecture, stream, PhantomData::<S>)?,
-                architecture,
-            ))
-        } else {
-            Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
-        };
-        let state = S::realize(&selected_state)?;
+        );
+        #[cfg(test)]
+        super::path_instrumentation::constructor();
+        let session = eredu_runtime::construct_replicated_text_session(
+            architecture,
+            source_architecture,
+            contract,
+            mechanisms,
+            stream,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let materialization = materialization
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("materialization report lock was poisoned".into())
+            })?
+            .clone();
         Ok(Self {
-            execution,
-            state_layout,
-            state,
+            session,
             prompt_cache_identity,
             capability_estimate,
             effective_model_type,
             materialization,
             #[cfg(test)]
-            selected_residency: residency,
-            selected_session,
-            selected_state,
+            selected_residency,
             stream: stream.clone(),
         })
     }
 
-    fn forward(
-        &mut self,
-        tokens: &Array,
-        mask: Option<&Array>,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
+    fn published<T>(&self, value: T) -> T {
         #[cfg(test)]
-        super::path_instrumentation::forward();
-        self.validate_state()?;
-        let tokens = MlxTensor::from_array(tokens.clone());
-        let mask = mask.cloned().map(MlxTensor::from_array);
-        let input = A::text_input(&tokens, mask.as_ref());
-        let output = match &mut self.execution {
-            Execution::Resident(runtime) => runtime.forward(input, &mut self.state, stream),
-            Execution::Bounded(runtime) => runtime.forward(input, &mut self.state, stream),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(output.into_array())
-    }
-
-    fn validate_state(&self) -> Result<(), Error> {
-        if self.state.layout() != &self.state_layout {
-            return Err(Error::ArchitectureModel(
-                "replicated text state layout does not match its paired architecture".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn new_state(&self) -> Result<S, Error> {
-        S::realize(&self.selected_state)
+        super::path_instrumentation::state_publication();
+        value
     }
 }
 
-fn validate_architecture_contract<A, S>(
-    architecture: &A,
-    requirements: &ReplicatedTextRequirements,
-) -> Result<(), Error>
+impl<A, S> ErasedReplicatedTextExecutable for CompletedReplicatedText<A, S>
 where
-    S: MlxReplicatedState,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
-    A::StaticModules: Clone,
-    A::Error: std::fmt::Display,
-{
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    if &graph != requirements.execution_graph() {
-        return Err(Error::ArchitectureModel(
-            "constructed execution graph differs from selected replicated requirements".into(),
-        ));
-    }
-    let units = architecture_execution_layout::<_, S>(architecture)?;
-    if &units != requirements.execution_units() {
-        return Err(Error::ArchitectureModel(
-            "constructed execution-unit geometry differs from selected replicated requirements"
-                .into(),
-        ));
-    }
-    let transports = (0..graph.groups().len())
-        .map(|group| architecture.group_transport(group))
-        .collect::<Vec<_>>();
-    if transports != requirements.group_transports() {
-        return Err(Error::ArchitectureModel(
-            "constructed group transport differs from selected replicated requirements".into(),
-        ));
-    }
-    let state_layout = architecture
-        .state_layout()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    if &state_layout != requirements.state_layout() {
-        return Err(Error::ArchitectureModel(
-            "constructed mutable-state layout differs from selected replicated requirements".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_parameter_contract<A, S>(
-    architecture: &A,
-    requirements: &ReplicatedTextRequirements,
-    context: &Stream,
-) -> Result<(), Error>
-where
-    S: MlxReplicatedState,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
-    A::StaticModules: Clone,
-    A::Error: std::fmt::Display,
-{
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use eredu_runtime::{ParameterGroupOwner, ReplicatedTextParameterOwner};
-
-    let description = architecture
-        .parameter_description(context)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut actual = BTreeMap::new();
-    for group in description.groups() {
-        for member in group.group().members() {
-            actual.insert(member.target(), (member.global_shape(), group.owner()));
-        }
-    }
-    let expected = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| {
-            !matches!(
-                parameter.presence(),
-                eredu_runtime::ReplicatedTextParameterPresence::OptionalAbsent
-                    | eredu_runtime::ReplicatedTextParameterPresence::Tied { .. }
-            )
-        })
-        .map(|parameter| parameter.name())
-        .collect::<BTreeSet<_>>();
-    let actual_names = actual.keys().copied().collect::<BTreeSet<_>>();
-    if expected != actual_names {
-        return Err(Error::ArchitectureModel(format!(
-            "replicated parameter requirements differ from architecture topology: missing {:?}, unexpected {:?}",
-            expected.difference(&actual_names).collect::<Vec<_>>(),
-            actual_names.difference(&expected).collect::<Vec<_>>()
-        )));
-    }
-    for parameter in requirements.parameters().iter().filter(|parameter| {
-        !matches!(
-            parameter.presence(),
-            eredu_runtime::ReplicatedTextParameterPresence::OptionalAbsent
-                | eredu_runtime::ReplicatedTextParameterPresence::Tied { .. }
-        )
-    }) {
-        let (shape, owner) = actual
-            .get(parameter.name())
-            .expect("equal parameter-name sets contain every requirement");
-        let owner_matches = match (owner, parameter.owner()) {
-            (
-                ParameterGroupOwner::StaticRole(actual),
-                ReplicatedTextParameterOwner::StaticRole(expected),
-            ) => actual == expected,
-            (
-                ParameterGroupOwner::StaticAnyOf(actual),
-                ReplicatedTextParameterOwner::StaticRole(expected),
-            ) => actual.iter().any(|role| role == expected),
-            (
-                ParameterGroupOwner::ExecutionUnit {
-                    group, global_unit, ..
-                },
-                ReplicatedTextParameterOwner::ExecutionUnit {
-                    group: expected_group,
-                    unit: expected_unit,
-                },
-            ) => group.as_str() == expected_group && global_unit == expected_unit,
-            _ => false,
-        };
-        let mut expected_shape = parameter.logical_shape().to_vec();
-        if let Some(last) = expected_shape.last_mut() {
-            match parameter.native_executable() {
-                LinearFormat::Affine(config) => {
-                    *last = last.saturating_mul(config.bits as usize) / 32;
-                }
-                LinearFormat::MxFp4 => *last = last.saturating_mul(4) / 32,
-                LinearFormat::GgufIQuant { ggml_type, .. } => {
-                    if let Ok((block, bytes)) = ggml_type.block_and_bytes() {
-                        if let (Ok(block), Ok(bytes)) =
-                            (usize::try_from(block), usize::try_from(bytes))
-                        {
-                            *last = last.saturating_mul(bytes) / block;
-                        }
-                    }
-                }
-                LinearFormat::Dense | LinearFormat::E4M3BlockFp8(_) => {}
-            }
-        }
-        if *shape != expected_shape || !owner_matches {
-            return Err(Error::ArchitectureModel(format!(
-                "replicated parameter requirement {:?} differs from architecture shape/owner: requirement {:?} {:?}, architecture {:?} {:?}",
-                parameter.name(),
-                expected_shape,
-                parameter.owner(),
-                shape,
-                owner,
-            )));
-        }
-    }
-    Ok(())
-}
-
-impl<A, S> ErasedReplicatedTextExecutable for BoundReplicatedText<A, S>
-where
-    S: MlxReplicatedState + 'static,
+    S: MlxStateMechanisms + 'static,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
@@ -1014,10 +1008,6 @@ where
         &self.capability_estimate
     }
 
-    fn selected_session_binding(&self) -> &SelectedSessionBinding {
-        &self.selected_session
-    }
-
     #[cfg(test)]
     fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency {
         self.selected_residency
@@ -1025,12 +1015,20 @@ where
 
     #[cfg(test)]
     fn state_snapshot(&self) -> StatePresenceSnapshot {
-        MlxReplicatedState::state_snapshot(&self.state)
+        self.session
+            .report()
+            .expect("MLX state report")
+            .state_report()
+            .presence
+            .clone()
     }
 
     #[cfg(test)]
     fn fixed_numeric_state_snapshot(&self) -> Result<FixedNumericStateSnapshot, Exception> {
-        MlxReplicatedState::fixed_numeric_snapshot(&self.state)
+        self.session
+            .report()
+            .map(|report| report.state_report().fixed_numeric.clone())
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 
     #[cfg(test)]
@@ -1039,21 +1037,41 @@ where
         tokens: &Array,
         stream: &Stream,
     ) -> Result<CheckpointRestoreProbe, Error> {
-        let before = MlxReplicatedState::state_snapshot(&self.state);
-        let before_numeric = MlxReplicatedState::fixed_numeric_snapshot(&self.state)?;
-        let before_retained = MlxReplicatedState::retained_numeric_snapshot(&self.state)?;
-        let checkpoint = self.state.deep_checkpoint()?;
+        let before_report = self
+            .session
+            .report()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let before = before_report.state_report().presence.clone();
+        let before_numeric = before_report.state_report().fixed_numeric.clone();
+        let before_retained = before_report.state_report().retained_numeric.clone();
+        let checkpoint = self
+            .session
+            .checkpoint(stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let continuation = self
-            .forward(tokens, None, stream)?
+            .session
+            .forward(&MlxTensor::from_array(tokens.clone()), None, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .into_array()
             .evaluated()?
             .as_slice::<f32>()
             .to_vec();
-        let advanced = MlxReplicatedState::state_snapshot(&self.state);
-        let advanced_numeric = MlxReplicatedState::fixed_numeric_snapshot(&self.state)?;
-        self.state.restore_checkpoint(&checkpoint, stream)?;
-        let restored = MlxReplicatedState::state_snapshot(&self.state);
-        let restored_numeric = MlxReplicatedState::fixed_numeric_snapshot(&self.state)?;
-        let restored_retained = MlxReplicatedState::retained_numeric_snapshot(&self.state)?;
+        let advanced_report = self
+            .session
+            .report()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let advanced = advanced_report.state_report().presence.clone();
+        let advanced_numeric = advanced_report.state_report().fixed_numeric.clone();
+        self.session
+            .rollback(checkpoint, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let restored_report = self
+            .session
+            .report()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let restored = restored_report.state_report().presence.clone();
+        let restored_numeric = restored_report.state_report().fixed_numeric.clone();
+        let restored_retained = restored_report.state_report().retained_numeric.clone();
         assert_eq!(restored_retained, before_retained);
         Ok((
             before,
@@ -1067,18 +1085,17 @@ where
     }
 
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
-        let report = match &self.execution {
-            Execution::Resident(runtime) => runtime.policy().residency_report()?,
-            Execution::Bounded(runtime) => runtime.policy().residency_report()?,
-        };
-        Ok(Some(report))
+        self.session
+            .report()
+            .map(|report| Some(report.execution_report().residency.clone()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        match &self.execution {
-            Execution::Resident(_) => Ok(None),
-            Execution::Bounded(runtime) => runtime.policy().dense_stream_report(),
-        }
+        self.session
+            .report()
+            .map(|report| report.execution_report().dense.clone())
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
@@ -1090,10 +1107,9 @@ where
     }
 
     fn reset_cache(&mut self) -> Result<(), Exception> {
-        self.state = self
-            .new_state()
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(())
+        self.session
+            .reset(&self.stream)
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 
     fn load_prompt_cache(
@@ -1102,26 +1118,9 @@ where
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
-        if !self.selected_session.prompt_cache() {
-            return Err(Error::ArchitectureModel(
-                "prompt-cache persistence was not selected for this state realization".into(),
-            ));
-        }
-        eredu_core::cache::validate_prompt_cache_model_identity(
-            expected,
-            &self.prompt_cache_identity,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (state, manifest) = S::load_prompt_cache(
-            &self.selected_state,
-            directory,
-            expected,
-            &self.prompt_cache_identity,
-            prefix_token_ids,
-            &self.stream,
-        )?;
-        self.state = state;
-        Ok(manifest)
+        self.session
+            .load_prompt_cache(directory, expected, prefix_token_ids, &self.stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn save_prompt_cache(
@@ -1131,40 +1130,45 @@ where
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
-        if !self.selected_session.prompt_cache() {
-            return Err(Error::ArchitectureModel(
-                "prompt-cache persistence was not selected for this state realization".into(),
-            ));
-        }
-        eredu_core::cache::validate_prompt_cache_model_identity(
-            &descriptor,
-            &self.prompt_cache_identity,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        MlxReplicatedState::save_prompt_cache(
-            &mut self.state,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-        )
+        self.session
+            .save_prompt_cache(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
-        MlxReplicatedState::residency_report(&self.state)
+        self.session
+            .report()
+            .map(|report| report.state_report().residency.clone())
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
         let tokens = input::text_token_ids(input, stream)?;
-        self.forward(&tokens, None, stream)?
-            .try_index_device((.., -1, ..), stream)
-            .map_err(Into::into)
+        let output = self
+            .session
+            .prefill(&MlxTensor::from_array(tokens), None, stream)
+            .map(MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
     }
 
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
-        self.forward(tokens, None, stream)?
-            .try_index_device((.., -1, ..), stream)
-            .map_err(Into::into)
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let output = self
+            .session
+            .decode(&MlxTensor::from_array(tokens.clone()), stream)
+            .map(MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
     }
 
     fn forward_with_observer(
@@ -1176,61 +1180,57 @@ where
     ) -> Result<Array, Error> {
         #[cfg(test)]
         super::path_instrumentation::forward();
-        self.validate_state()?;
         let tokens = MlxTensor::from_array(tokens.clone());
         let mask = mask.cloned().map(MlxTensor::from_array);
-        let input = A::text_input(&tokens, mask.as_ref());
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-        let output = match &mut self.execution {
-            Execution::Resident(runtime) => {
-                runtime.forward_with_observer(input, &mut self.state, stream, &mut observer)
-            }
-            Execution::Bounded(runtime) => {
-                runtime.forward_with_observer(input, &mut self.state, stream, &mut observer)
-            }
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        eredu_runtime::observe_model_logits(&mut observer, &output)
+        let output = self
+            .session
+            .forward_with_observer(&tokens, mask.as_ref(), stream, &mut observer)
             .map(MlxTensor::into_array)
-            .map_err(Into::into)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
+    }
+
+    fn prefill_with_observer(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let tokens = MlxTensor::from_array(tokens.clone());
+        let mask = mask.cloned().map(MlxTensor::from_array);
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let output = self
+            .session
+            .prefill_with_observer(&tokens, mask.as_ref(), stream, &mut observer)
+            .map(MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
+    }
+
+    fn decode_with_observer(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let tokens = MlxTensor::from_array(tokens.clone());
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let output = self
+            .session
+            .decode_with_observer(&tokens, stream, &mut observer)
+            .map(MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
     }
 }
-
-fn selected_transform_quantization(
-    selected: &SelectedReplicatedTextRealization,
-) -> Result<eredu_checkpoint::WeightQuantization, Error> {
-    let mut quantization = None;
-    for parameter in selected.parameters() {
-        if !matches!(
-            parameter.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        ) {
-            continue;
-        }
-        let current = parameter
-            .executable()
-            .weight_quantization()
-            .ok_or_else(|| {
-                Error::Quantization(format!(
-                    "selected transform for {:?} has no materializable packed format",
-                    parameter.name()
-                ))
-            })?;
-        if quantization
-            .replace(current)
-            .is_some_and(|prior| prior != current)
-        {
-            return Err(Error::Quantization(
-                "one replicated text realization selected multiple transform formats".into(),
-            ));
-        }
-    }
-    quantization.ok_or_else(|| {
-        Error::Quantization("selected transform contains no transformed parameters".into())
-    })
-}
-
 /// Family-agnostic MLX visitor that binds neutral parameter topology.
+#[derive(Clone, Copy)]
 pub(crate) struct BindingVisitor<'a> {
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
@@ -1256,7 +1256,7 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for B
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        BoundReplicatedText::new(prepared, store, self.stream, self.weights_stream)
+        CompletedReplicatedText::new(prepared, store, self.stream, self.weights_stream)
             .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
 }
@@ -1281,8 +1281,49 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState> for Bin
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        BoundReplicatedText::new(prepared, store, self.stream, self.weights_stream)
+        CompletedReplicatedText::new(prepared, store, self.stream, self.weights_stream)
             .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
+}
+
+impl ReplicatedTextProfileDispatcher<MlxNeuralBackend> for BindingVisitor<'_> {
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+    type StatelessState = MlxHybridState;
+    type AttentionState = MlxKeyValueState;
+    type ComponentState = MlxHybridState;
+    type AttentionComponentState = MlxHybridState;
+    type CompressedState = MlxHybridState;
+    type CompressedComponentState = MlxHybridState;
+    type StatelessVisitor = Self;
+    type AttentionVisitor = Self;
+    type ComponentVisitor = Self;
+    type AttentionComponentVisitor = Self;
+    type CompressedVisitor = Self;
+    type CompressedComponentVisitor = Self;
+
+    fn into_stateless_visitor(self) -> Self::StatelessVisitor {
+        self
+    }
+
+    fn into_attention_visitor(self) -> Self::AttentionVisitor {
+        self
+    }
+
+    fn into_component_visitor(self) -> Self::ComponentVisitor {
+        self
+    }
+
+    fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor {
+        self
+    }
+
+    fn into_compressed_visitor(self) -> Self::CompressedVisitor {
+        self
+    }
+
+    fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor {
+        self
     }
 }
 
@@ -1611,6 +1652,67 @@ mod tests {
     }
 
     #[test]
+    fn selected_graph_mismatch_rejects_before_module_construction() {
+        super::super::path_instrumentation::reset();
+        let artifact = tiny_artifact("llama", false);
+        let inspection =
+            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        let forged_graph = eredu_runtime::ExecutionGraph::chain(["forged-decoder"]).unwrap();
+        let forged_units = eredu_runtime::ExecutionUnitLayout::new(
+            &forged_graph,
+            [requirements.execution_units().len()],
+        )
+        .unwrap();
+        let forged_requirements = ReplicatedTextRequirements::new(
+            requirements.architecture_identity().to_owned(),
+            requirements.operators(),
+            forged_graph,
+            forged_units,
+            requirements.group_transports().to_vec(),
+            requirements.state_layout().clone(),
+            requirements.state_access(),
+            requirements.parameters().to_vec(),
+        )
+        .unwrap()
+        .with_derived_recipes(
+            requirements.derived_recipes().clone(),
+            requirements.derived_recipe_outputs().clone(),
+        )
+        .unwrap();
+        let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+            eredu_runtime::LayerWeightResidency::FullyResident,
+            CacheResidencyPolicy::Device,
+        );
+        let selected = eredu_runtime::select_replicated_text_realization(
+            &forged_requirements,
+            &request,
+            &capabilities(&forged_requirements, &request),
+        )
+        .unwrap();
+        let source: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
+            eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+        );
+        let (stream, weights_stream) = execution_streams();
+        let error = super::super::loading::bind_replicated_text(
+            inspection.architecture_plan(),
+            selected,
+            source,
+            &stream,
+            &weights_stream,
+        )
+        .err()
+        .expect("forged graph must fail");
+        assert!(error.to_string().contains("structure differs"), "{error}");
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
+    }
+
+    #[test]
     fn report_distinguishes_native_and_transforming_lowerings() {
         let parameter = ReplicatedTextParameterRequirement::new(
             "projection.weight",
@@ -1682,14 +1784,23 @@ mod tests {
     }
 
     fn tiny_artifact(model_type: &str, tied: bool) -> tempfile::TempDir {
-        tiny_safetensors_artifact(model_type, tied, false)
+        tiny_safetensors_artifact(model_type, tied, false, false)
     }
 
     fn tiny_sharded_artifact(model_type: &str, tied: bool) -> tempfile::TempDir {
-        tiny_safetensors_artifact(model_type, tied, true)
+        tiny_safetensors_artifact(model_type, tied, true, false)
     }
 
-    fn tiny_safetensors_artifact(model_type: &str, tied: bool, sharded: bool) -> tempfile::TempDir {
+    fn tiny_packed_safetensors_artifact(model_type: &str) -> tempfile::TempDir {
+        tiny_safetensors_artifact(model_type, false, false, true)
+    }
+
+    fn tiny_safetensors_artifact(
+        model_type: &str,
+        tied: bool,
+        sharded: bool,
+        packed: bool,
+    ) -> tempfile::TempDir {
         use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
 
         let root = tempfile::tempdir().unwrap();
@@ -1721,6 +1832,9 @@ mod tests {
             config["num_experts_per_tok"] = 1.into();
             config["moe_intermediate_size"] = 16.into();
         }
+        if packed {
+            config["quantization_config"] = serde_json::json!({ "group_size": 32, "bits": 4 });
+        }
         std::fs::write(
             root.path().join("config.json"),
             serde_json::to_vec(&config).unwrap(),
@@ -1749,36 +1863,66 @@ mod tests {
             })
             .map(|constraint| {
                 let elements = constraint.shape.iter().product::<usize>();
-                let bytes: Vec<u8> = if constraint.key.ends_with(".A_log") {
-                    (-1.0_f32)
-                        .to_le_bytes()
-                        .into_iter()
-                        .cycle()
-                        .take(elements * 4)
-                        .collect()
+                let (dtype, bytes): (Dtype, Vec<u8>) = if matches!(
+                    constraint.dtype,
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                        eredu_checkpoint::StoredDtype::U32
+                    )
+                ) {
+                    (
+                        Dtype::U32,
+                        (0..elements).flat_map(|_| 0_u32.to_le_bytes()).collect(),
+                    )
+                } else if constraint.key.ends_with(".A_log") {
+                    (
+                        Dtype::F32,
+                        (-1.0_f32)
+                            .to_le_bytes()
+                            .into_iter()
+                            .cycle()
+                            .take(elements * 4)
+                            .collect(),
+                    )
                 } else if constraint.key.contains("norm") && constraint.key.ends_with(".weight") {
-                    (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect()
+                    (
+                        Dtype::F32,
+                        (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect(),
+                    )
+                } else if constraint.role == eredu_checkpoint::schema::TensorRole::Companion {
+                    (
+                        Dtype::F32,
+                        (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect(),
+                    )
                 } else {
                     let seed = constraint.key.bytes().fold(1_u32, |value, byte| {
                         value.wrapping_mul(31) ^ u32::from(byte)
                     });
-                    (0..elements)
-                        .flat_map(|index| {
-                            let signed = i32::try_from((seed as usize + index) % 29).unwrap() - 14;
-                            (signed as f32 * 0.001).to_le_bytes()
-                        })
-                        .collect()
+                    (
+                        Dtype::F32,
+                        (0..elements)
+                            .flat_map(|index| {
+                                let signed =
+                                    i32::try_from((seed as usize + index) % 29).unwrap() - 14;
+                                (signed as f32 * 0.001).to_le_bytes()
+                            })
+                            .collect(),
+                    )
                 };
-                (constraint.key.clone(), constraint.shape.clone(), bytes)
+                (
+                    constraint.key.clone(),
+                    constraint.shape.clone(),
+                    dtype,
+                    bytes,
+                )
             })
             .collect::<Vec<_>>();
-        let write = |path: &Path, tensors: &[(String, Vec<usize>, Vec<u8>)]| {
+        let write = |path: &Path, tensors: &[(String, Vec<usize>, Dtype, Vec<u8>)]| {
             let views = tensors
                 .iter()
-                .map(|(name, shape, bytes)| {
+                .map(|(name, shape, dtype, bytes)| {
                     (
                         name.as_str(),
-                        TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+                        TensorView::new(*dtype, shape.clone(), bytes.as_slice()).unwrap(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1793,7 +1937,7 @@ mod tests {
             let weight_map = tensors
                 .iter()
                 .enumerate()
-                .map(|(index, (name, _, _))| {
+                .map(|(index, (name, _, _, _))| {
                     (name.clone(), if index < split { first } else { second })
                 })
                 .collect::<std::collections::BTreeMap<_, _>>();
@@ -1854,35 +1998,65 @@ mod tests {
             })
             .map(|constraint| {
                 let elements = constraint.shape.iter().product::<usize>();
-                let bytes: Vec<u8> = if constraint.key.ends_with(".A_log") {
-                    (-1.0_f32)
-                        .to_le_bytes()
-                        .into_iter()
-                        .cycle()
-                        .take(elements * 4)
-                        .collect()
+                let (dtype, bytes): (Dtype, Vec<u8>) = if matches!(
+                    constraint.dtype,
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                        eredu_checkpoint::StoredDtype::U32
+                    )
+                ) {
+                    (
+                        Dtype::U32,
+                        (0..elements).flat_map(|_| 0_u32.to_le_bytes()).collect(),
+                    )
+                } else if constraint.key.ends_with(".A_log") {
+                    (
+                        Dtype::F32,
+                        (-1.0_f32)
+                            .to_le_bytes()
+                            .into_iter()
+                            .cycle()
+                            .take(elements * 4)
+                            .collect(),
+                    )
                 } else if constraint.key.contains("norm") && constraint.key.ends_with(".weight") {
-                    (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect()
+                    (
+                        Dtype::F32,
+                        (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect(),
+                    )
+                } else if constraint.role == eredu_checkpoint::schema::TensorRole::Companion {
+                    (
+                        Dtype::F32,
+                        (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect(),
+                    )
                 } else {
                     let seed = constraint.key.bytes().fold(1_u32, |value, byte| {
                         value.wrapping_mul(31) ^ u32::from(byte)
                     });
-                    (0..elements)
-                        .flat_map(|index| {
-                            let signed = i32::try_from((seed as usize + index) % 29).unwrap() - 14;
-                            (signed as f32 * 0.001).to_le_bytes()
-                        })
-                        .collect()
+                    (
+                        Dtype::F32,
+                        (0..elements)
+                            .flat_map(|index| {
+                                let signed =
+                                    i32::try_from((seed as usize + index) % 29).unwrap() - 14;
+                                (signed as f32 * 0.001).to_le_bytes()
+                            })
+                            .collect(),
+                    )
                 };
-                (constraint.key.clone(), constraint.shape.clone(), bytes)
+                (
+                    constraint.key.clone(),
+                    constraint.shape.clone(),
+                    dtype,
+                    bytes,
+                )
             })
             .collect::<Vec<_>>();
         let views = tensors
             .iter()
-            .map(|(name, shape, bytes)| {
+            .map(|(name, shape, dtype, bytes)| {
                 (
                     name.as_str(),
-                    TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+                    TensorView::new(*dtype, shape.clone(), bytes.as_slice()).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -2145,6 +2319,18 @@ mod tests {
             "num_experts_per_tok":2, "n_group":2, "topk_group":1,
             "num_nextn_predict_layers":0
         })
+    }
+
+    fn packed_alias_nemotron_h_config() -> serde_json::Value {
+        let mut config = nemotron_h_config();
+        config["hidden_size"] = 32.into();
+        config["intermediate_size"] = 32.into();
+        config["head_dim"] = 8.into();
+        config["mamba_head_dim"] = 8.into();
+        config["moe_intermediate_size"] = 32.into();
+        config["moe_shared_expert_intermediate_size"] = 32.into();
+        config["quantization"] = serde_json::json!({ "group_size": 32, "bits": 4 });
+        config
     }
 
     fn qwen_hybrid_config() -> serde_json::Value {
@@ -2428,7 +2614,12 @@ mod tests {
                 architecture_constructions: 4,
                 state_allocations: 4,
                 payload_opens: 4,
+                constructors: 4,
+                unit_constructions: 4,
+                materializations: 0,
                 forwards: 8,
+                state_publications: 8,
+                completions: 8,
             }
         );
     }
@@ -2521,7 +2712,12 @@ mod tests {
                 architecture_constructions: 5,
                 state_allocations: 5,
                 payload_opens: 5,
+                constructors: 5,
+                unit_constructions: 12,
+                materializations: 0,
                 forwards: 15,
+                state_publications: 15,
+                completions: 15,
             }
         );
     }
@@ -2786,7 +2982,12 @@ mod tests {
                 architecture_constructions: 10,
                 state_allocations: 10,
                 payload_opens: 10,
+                constructors: 10,
+                unit_constructions: 24,
+                materializations: 0,
                 forwards: 20,
+                state_publications: 20,
+                completions: 20,
             }
         );
     }
@@ -2973,17 +3174,157 @@ mod tests {
     }
 
     #[test]
-    fn admitted_gguf_media_projector_keeps_qwen_hybrid_out_of_text_binding() {
-        let (stream, _) = execution_streams();
-        let gguf = tiny_heterogeneous_gguf("qwen35", &stream);
-        let inspection = eredu_architectures::configuration::inspect_artifact(gguf.path()).unwrap();
-        let plan = inspection.architecture_plan().gguf_plan().unwrap();
-        assert!(super::super::loading::gguf_uses_replicated_text_binding(
-            plan, false
-        ));
-        assert!(!super::super::loading::gguf_uses_replicated_text_binding(
-            plan, true
-        ));
+    fn checkpoint_native_packed_safetensors_companions_are_consumed_once() {
+        let (stream, weights_stream) = execution_streams();
+        for model_type in ["llama", "qwen3"] {
+            let root = tiny_packed_safetensors_artifact(model_type);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let requirements =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .unwrap();
+            assert!(requirements.parameters().iter().any(|parameter| {
+                parameter.role() == eredu_runtime::ReplicatedTextParameterRole::FormatCompanion
+                    && parameter.source_encoding()
+                        == Some(&eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                            eredu_checkpoint::StoredDtype::F32,
+                        ))
+            }));
+            assert!(requirements.parameters().iter().any(|parameter| {
+                parameter.role() == eredu_runtime::ReplicatedTextParameterRole::LinearWeight
+                    && matches!(
+                        parameter.native_executable(),
+                        eredu_checkpoint::LinearFormat::Affine(_)
+                    )
+                    && parameter.source_encoding()
+                        == Some(&eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                            eredu_checkpoint::StoredDtype::U32,
+                        ))
+            }));
+
+            let plan = eredu_core::plan_model_preparation(
+                inspection,
+                eredu_core::PreparationPolicy::default(),
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            let model = materialize_model_plan(
+                plan,
+                crate::MlxLoadRequest::default(),
+                &stream,
+                &weights_stream,
+            )
+            .unwrap_or_else(|error| panic!("{model_type}: {error}"));
+            let mut executable = model.into_complete().unwrap();
+            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+                panic!("packed SafeTensors text must use replicated composition")
+            };
+            let logits = generic
+                .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            assert_eq!(logits.len(), 64);
+            assert!(logits.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    #[test]
+    fn alias_backed_packed_safetensors_companions_keep_their_exact_source() {
+        let (stream, weights_stream) = execution_streams();
+        let config = packed_alias_nemotron_h_config();
+        assert_eq!(
+            eredu_architectures::nemotron_h::model_args_from_config_value(&config)
+                .unwrap()
+                .hidden_size,
+            32
+        );
+        let root = tiny_heterogeneous_artifact(config);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let eredu_architectures::configuration::SafetensorsModelConfig::NemotronH(inspected) =
+            inspection
+                .architecture_plan()
+                .safetensors_architecture()
+                .unwrap()
+                .model()
+        else {
+            panic!("expected Nemotron-H inspection")
+        };
+        assert_eq!(inspected.hidden_size, 32);
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        for parameter in requirements.parameters().iter().filter(|parameter| {
+            parameter.source_encoding()
+                == Some(&eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                    eredu_checkpoint::StoredDtype::U32,
+                ))
+        }) {
+            let descriptor = parameter
+                .lowering_descriptor(parameter.native_executable())
+                .unwrap();
+            assert!(
+                supports_direct(&descriptor),
+                "unsupported native packed requirement {} {:?} {:?} logical={:?}: {descriptor:?}",
+                parameter.name(),
+                parameter.role(),
+                parameter.presence(),
+                parameter.logical_shape()
+            );
+        }
+        let aliased_companion = requirements
+            .parameters()
+            .iter()
+            .find(|parameter| {
+                parameter.role() == eredu_runtime::ReplicatedTextParameterRole::FormatCompanion
+                    && parameter.name().starts_with("model.")
+                    && parameter
+                        .sources()
+                        .first()
+                        .is_some_and(|source| source.starts_with("backbone."))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "Nemotron-H fixture must select an official alias-backed companion: {:?}",
+                    requirements
+                        .parameters()
+                        .iter()
+                        .filter(|parameter| parameter.role()
+                            == eredu_runtime::ReplicatedTextParameterRole::FormatCompanion)
+                        .map(|parameter| (parameter.name(), parameter.sources()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_ne!(aliased_companion.name(), aliased_companion.sources()[0]);
+
+        let plan = eredu_core::plan_model_preparation(
+            inspection,
+            eredu_core::PreparationPolicy::default(),
+            eredu_core::SessionCapabilities::default(),
+        )
+        .unwrap();
+        let model = materialize_model_plan(
+            plan,
+            crate::MlxLoadRequest::default(),
+            &stream,
+            &weights_stream,
+        )
+        .unwrap();
+        let mut executable = model.into_complete().unwrap();
+        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+            panic!("packed Nemotron-H must use replicated composition")
+        };
+        let logits = generic
+            .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert_eq!(logits.len(), 64);
+        assert!(logits.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -3771,71 +4112,6 @@ mod tests {
                         .unwrap()
                 );
             }
-        }
-    }
-
-    #[test]
-    fn included_safetensors_configs_cannot_enter_family_materialization() {
-        let (stream, weights_stream) = execution_streams();
-        for config in [
-            lfm2_config(),
-            kimi_linear_config(),
-            nemotron_h_config(),
-            qwen_next_config(),
-            qwen_hybrid_config(),
-        ] {
-            let root = tiny_heterogeneous_artifact(config);
-            let inspection =
-                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-            let plan = eredu_core::plan_model_preparation(
-                inspection,
-                eredu_core::PreparationPolicy::default(),
-                eredu_core::SessionCapabilities::default(),
-            )
-            .unwrap();
-            let architecture_plan = plan.inspection().architecture_plan().clone();
-            let eredu_core::ModelArtifact::SafeTensors {
-                configuration,
-                tensors,
-                shards,
-                ..
-            } = plan.into_artifact()
-            else {
-                panic!("expected SafeTensors fixture")
-            };
-            let prepared = super::super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                super::super::loading::prepared_safetensors_architecture(&architecture_plan)
-                    .unwrap()
-                    .clone(),
-                tensors,
-                shards,
-                1,
-            )
-            .unwrap();
-            let options = super::super::loading::SelectedMlxConstruction::from_request(
-                crate::MlxLoadRequest::default(),
-                eredu_core::SessionCapabilities::default(),
-            )
-            .unwrap();
-            super::super::path_instrumentation::reset();
-            let error = match super::super::loading::materialize_safetensors(
-                &prepared,
-                None,
-                options,
-                &stream,
-                &weights_stream,
-            ) {
-                Ok(_) => panic!("included configuration entered a family materializer"),
-                Err(error) => error,
-            };
-            assert!(error
-                .to_string()
-                .contains("architecture-owned eligibility requires replicated text composition"));
-            assert_eq!(
-                super::super::path_instrumentation::snapshot(),
-                super::super::path_instrumentation::Counts::default()
-            );
         }
     }
 

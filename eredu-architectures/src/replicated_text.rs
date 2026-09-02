@@ -9,6 +9,7 @@ use eredu_checkpoint::{
     AffineQuantization, LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
 };
 use eredu_core::{
+    cache::PromptCacheModelIdentity,
     checkpoint::{TensorCatalog, TensorDtype},
     ArtifactInspection,
 };
@@ -473,11 +474,9 @@ pub struct PreparedReplicatedTextArchitecture<A> {
     architecture: A,
     source_architecture: Option<A>,
     requirements: ReplicatedTextRequirements,
-    selected: SelectedReplicatedTextRealization,
+    contract: eredu_runtime::PreparedReplicatedTextContract,
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: String,
-    static_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-    unit_recipes: Vec<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>>,
 }
 
 impl<A> PreparedReplicatedTextArchitecture<A> {
@@ -488,7 +487,12 @@ impl<A> PreparedReplicatedTextArchitecture<A> {
 
     /// Returns the authoritative selected realization.
     pub const fn selected(&self) -> &SelectedReplicatedTextRealization {
-        &self.selected
+        self.contract.selected()
+    }
+
+    /// Returns the architecture-derived identity for persistent prompt state.
+    pub const fn prompt_cache_identity(&self) -> &PromptCacheModelIdentity {
+        self.contract.prompt_cache_identity()
     }
 
     /// Returns the architecture capability estimate presented by the session.
@@ -506,8 +510,7 @@ impl<A> PreparedReplicatedTextArchitecture<A> {
         PreparedReplicatedTextModules {
             architecture: Some(self.architecture),
             source_architecture: self.source_architecture,
-            static_recipes: self.static_recipes,
-            unit_recipes: self.unit_recipes,
+            contract: Some(self.contract),
         }
     }
 }
@@ -516,8 +519,7 @@ impl<A> PreparedReplicatedTextArchitecture<A> {
 pub struct PreparedReplicatedTextModules<A> {
     architecture: Option<A>,
     source_architecture: Option<A>,
-    static_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-    unit_recipes: Vec<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>>,
+    contract: Option<eredu_runtime::PreparedReplicatedTextContract>,
 }
 
 impl<A> PreparedReplicatedTextModules<A> {
@@ -533,18 +535,11 @@ impl<A> PreparedReplicatedTextModules<A> {
         self.source_architecture.take()
     }
 
-    /// Takes architecture-owned static-module recipes exactly once.
-    pub fn take_static_recipes(
-        &mut self,
-    ) -> BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe> {
-        std::mem::take(&mut self.static_recipes)
-    }
-
-    /// Takes architecture-owned execution-unit recipes in flat graph order.
-    pub fn take_unit_recipes(
-        &mut self,
-    ) -> Vec<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>> {
-        std::mem::take(&mut self.unit_recipes)
+    /// Takes the validated neutral construction contract exactly once.
+    pub fn take_contract(&mut self) -> eredu_runtime::PreparedReplicatedTextContract {
+        self.contract
+            .take()
+            .expect("prepared construction contract was already taken")
     }
 }
 
@@ -587,6 +582,41 @@ pub enum ReplicatedTextDispatchError<E> {
     Backend(E),
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_architecture_handoff<B, S, A>(
+    architecture: A,
+    source_architecture: Option<A>,
+    requirements: ReplicatedTextRequirements,
+    selected: SelectedReplicatedTextRealization,
+    capability_estimate: crate::capability::CapabilityEstimate,
+    effective_model_type: String,
+    prompt_cache_architecture_identity: String,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextArchitecture<A>, String>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+{
+    let contract = eredu_runtime::prepare_replicated_text_contract::<A, B, S>(
+        &architecture,
+        source_architecture.as_ref(),
+        selected,
+        &prompt_cache_architecture_identity,
+        context,
+    )?;
+    Ok(PreparedReplicatedTextArchitecture {
+        architecture,
+        source_architecture,
+        requirements,
+        contract,
+        capability_estimate,
+        effective_model_type,
+    })
+}
+
 /// Constructs and visits the architecture using one authoritative realization.
 pub fn visit_replicated_text_architecture<B, S, V>(
     plan: &ArtifactArchitecturePlan,
@@ -602,8 +632,6 @@ where
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
     let requirements = selected.requirements().clone();
-    validate_selected_handoff(&requirements, &selected)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
     let eligible = ordinary_eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
@@ -621,22 +649,23 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_llama_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::llama::prompt_cache_architecture_fingerprint(&args);
             let architecture = crate::llama::LayeredModel::<B>::new(args, context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
             visitor
-                .visit(
-                    PreparedReplicatedTextArchitecture {
-                        architecture,
-                        source_architecture,
-                        requirements,
-                        selected,
-                        capability_estimate,
-                        effective_model_type,
-                        static_recipes: BTreeMap::new(),
-                        unit_recipes: Vec::new(),
-                    },
-                    store,
-                )
+                .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Qwen(args) => {
@@ -650,22 +679,23 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_qwen_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::qwen::prompt_cache_architecture_fingerprint(&args);
             let architecture = crate::qwen::LayeredModel::<B>::new(args, context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
             visitor
-                .visit(
-                    PreparedReplicatedTextArchitecture {
-                        architecture,
-                        source_architecture,
-                        requirements,
-                        selected,
-                        capability_estimate,
-                        effective_model_type,
-                        static_recipes: BTreeMap::new(),
-                        unit_recipes: Vec::new(),
-                    },
-                    store,
-                )
+                .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Lfm2(_)
@@ -687,107 +717,28 @@ fn selected_uses_transform(selected: &SelectedReplicatedTextRealization) -> bool
     })
 }
 
-fn validate_selected_handoff(
-    requirements: &ReplicatedTextRequirements,
-    selected: &SelectedReplicatedTextRealization,
-) -> Result<(), String> {
-    if selected.requirements() != requirements {
-        return Err("selected realization carries different exact requirements".into());
-    }
-    if selected.state().layout() != requirements.state_layout() {
-        return Err("selected state realization does not match exact requirements".into());
-    }
-    let required = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| parameter.name())
-        .collect::<BTreeSet<_>>();
-    let realized = selected
-        .parameters()
-        .iter()
-        .map(|parameter| parameter.name())
-        .collect::<BTreeSet<_>>();
-    if required != realized || selected.parameters().len() != required.len() {
-        return Err("selected parameter realization does not match exact requirements".into());
-    }
-    for requirement in requirements.parameters() {
-        if !requirement.has_lowering_source() {
-            continue;
-        }
-        let realization = selected
-            .parameters()
-            .iter()
-            .find(|parameter| parameter.name() == requirement.name())
-            .expect("parameter identity sets were compared above");
-        if realization.sources() != requirement.sources()
-            || realization.physical_sources() != requirement.physical_sources()
-            || Some(realization.source_encoding()) != requirement.source_encoding()
-        {
-            return Err(format!(
-                "selected source facts for {:?} differ from exact artifact requirements",
-                requirement.name()
-            ));
-        }
-        let valid_format = match realization.lowering() {
-            eredu_runtime::WeightLoweringKind::Direct => {
-                realization.executable() == requirement.native_executable()
-            }
-            eredu_runtime::WeightLoweringKind::Derived => {
-                matches!(
-                    requirement.presence(),
-                    ReplicatedTextParameterPresence::Derived { .. }
-                ) && realization.executable() == requirement.native_executable()
-            }
-            eredu_runtime::WeightLoweringKind::Transform
-            | eredu_runtime::WeightLoweringKind::DerivedTransform => {
-                if realization.lowering() == eredu_runtime::WeightLoweringKind::DerivedTransform
-                    && !matches!(
-                        requirement.presence(),
-                        ReplicatedTextParameterPresence::Derived { .. }
-                    )
-                {
-                    return Err(format!(
-                        "selected derived transform for {:?} has no architecture recipe",
-                        requirement.name()
-                    ));
-                }
-                let request = match realization.executable() {
-                    LinearFormat::Affine(format) => Some(eredu_core::QuantizationRequest::Affine {
-                        group_size: u32::try_from(format.group_size)
-                            .map_err(|_| "negative selected affine group size".to_owned())?,
-                        bits: u8::try_from(format.bits)
-                            .map_err(|_| "invalid selected affine bit width".to_owned())?,
-                    }),
-                    LinearFormat::MxFp4 => Some(eredu_core::QuantizationRequest::MxFp4),
-                    _ => None,
-                };
-                match request {
-                    Some(request) => requirement
-                        .transform_target(request)
-                        .map_err(|error| error.to_string())?
-                        .is_some_and(|target| target.executable() == realization.executable()),
-                    None => false,
-                }
-            }
-            _ => false,
-        };
-        if !valid_format {
-            return Err(format!(
-                "selected executable format for {:?} is not architecture-admitted",
-                requirement.name()
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_plan_identity(
     requirements: &ReplicatedTextRequirements,
     config: &EligibleConfig<'_>,
 ) -> Result<(), String> {
     if requirements.architecture_identity() != config.architecture_identity() {
         return Err("selected realization belongs to a different normalized architecture".into());
+    }
+    let graph = eredu_runtime::ExecutionGraph::chain([config.execution_group()])
+        .map_err(|error| error.to_string())?;
+    let units = eredu_runtime::ExecutionUnitLayout::new(&graph, [config.unit_count()?])
+        .map_err(|error| error.to_string())?;
+    let state_layout = config.state_layout()?;
+    if requirements.operators() != config.operators()
+        || requirements.execution_graph() != &graph
+        || requirements.execution_units() != &units
+        || requirements.group_transports() != [crate::transport::decoder()]
+        || requirements.state_layout() != &state_layout
+        || requirements.state_access() != config.state_access()
+    {
+        return Err(
+            "selected realization structure differs from the normalized architecture".into(),
+        );
     }
     Ok(())
 }
@@ -816,6 +767,7 @@ fn validate_store_handoff(
     let mut checked = BTreeSet::new();
     for parameter in requirements.parameters() {
         let mut lowering_key = None;
+        let mut admitted_keys = BTreeSet::new();
         for source in parameter.physical_sources() {
             let identity = (
                 source.tensor().to_owned(),
@@ -840,11 +792,23 @@ fn validate_store_handoff(
                 ));
             }
             lowering_key.get_or_insert(key);
+            admitted_keys.insert(key.as_str());
             if checked.insert(identity) {
                 store.source_metadata(key).map_err(|error| {
                     format!("selected source catalog key {key:?} is unavailable: {error}")
                 })?;
             }
+        }
+        let selected_keys = parameter
+            .sources()
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if parameter.has_lowering_source() && selected_keys != admitted_keys {
+            return Err(format!(
+                "selected source catalog for {:?} differs from admitted physical provenance",
+                parameter.name()
+            ));
         }
         if let Some(physical_shape) = parameter.physical_shape() {
             let key = lowering_key.ok_or_else(|| {
@@ -1090,56 +1054,6 @@ where
     }
 }
 
-fn selected_recipe_partitions(
-    requirements: &ReplicatedTextRequirements,
-) -> Result<
-    (
-        BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-        Vec<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>>,
-    ),
-    String,
-> {
-    let mut static_recipes = BTreeMap::new();
-    let mut unit_recipes = vec![BTreeMap::new(); requirements.execution_units().len()];
-    for (target, recipe) in requirements.derived_recipes() {
-        let parameter = requirements
-            .parameters()
-            .iter()
-            .find(|parameter| parameter.name() == target)
-            .ok_or_else(|| format!("selected recipe target {target:?} is undeclared"))?;
-        match parameter.owner() {
-            ReplicatedTextParameterOwner::StaticRole(_) => {
-                static_recipes.insert(target.clone(), recipe.clone());
-            }
-            ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
-                let group_index = (0..requirements.execution_units().group_count())
-                    .find(|index| {
-                        requirements
-                            .execution_units()
-                            .group_id(*index)
-                            .is_some_and(|id| id.as_str() == group)
-                    })
-                    .ok_or_else(|| {
-                        format!("selected recipe target {target:?} has unknown group {group:?}")
-                    })?;
-                let ordinal = requirements
-                    .execution_units()
-                    .ordinal(group_index, *unit)
-                    .ok_or_else(|| {
-                        format!("selected recipe target {target:?} has unknown unit {unit}")
-                    })?;
-                unit_recipes[ordinal].insert(target.clone(), recipe.clone());
-            }
-            _ => {
-                return Err(format!(
-                    "selected recipe target {target:?} has an unsupported owner"
-                ))
-            }
-        }
-    }
-    Ok((static_recipes, unit_recipes))
-}
-
 fn visit_fixed_profile<B, S, V, P>(
     plan: &ArtifactArchitecturePlan,
     selected: SelectedReplicatedTextRealization,
@@ -1157,14 +1071,10 @@ where
         + FixedProfile<B, S, QwenHybridReplicated>,
 {
     let requirements = selected.requirements().clone();
-    validate_selected_handoff(&requirements, &selected)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     validate_store_handoff(&requirements, store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let (static_recipes, unit_recipes) = selected_recipe_partitions(&requirements)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     match eligible {
         EligibleConfig::Lfm2(args) => {
@@ -1178,22 +1088,23 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_lfm2_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::lfm2::prompt_cache_architecture_fingerprint(&args);
             let architecture = <P as FixedProfile<B, S, Lfm2Replicated>>::new(args, context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
             visitor
-                .visit(
-                    PreparedReplicatedTextArchitecture {
-                        architecture,
-                        source_architecture,
-                        requirements,
-                        selected,
-                        capability_estimate,
-                        effective_model_type,
-                        static_recipes,
-                        unit_recipes,
-                    },
-                    store,
-                )
+                .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::NemotronH(args) => {
@@ -1207,24 +1118,25 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_nemotron_h_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
             let architecture = <P as FixedProfile<B, S, NemotronHReplicated>>::new(args, context)
                 .map_err(|error| {
                 ReplicatedTextDispatchError::Architecture(error.to_string())
             })?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
             visitor
-                .visit(
-                    PreparedReplicatedTextArchitecture {
-                        architecture,
-                        source_architecture,
-                        requirements,
-                        selected,
-                        capability_estimate,
-                        effective_model_type,
-                        static_recipes,
-                        unit_recipes,
-                    },
-                    store,
-                )
+                .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::QwenHybrid(args) => {
@@ -1240,22 +1152,23 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_qwen_hybrid_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
             let architecture = <P as FixedProfile<B, S, QwenHybridReplicated>>::new(args, context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
             visitor
-                .visit(
-                    PreparedReplicatedTextArchitecture {
-                        architecture,
-                        source_architecture,
-                        requirements,
-                        selected,
-                        capability_estimate,
-                        effective_model_type,
-                        static_recipes,
-                        unit_recipes,
-                    },
-                    store,
-                )
+                .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::KimiLinear(args) => {
@@ -1271,22 +1184,23 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_kimi_linear_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::kimi_linear::prompt_cache_architecture_fingerprint(&args);
             let architecture = <P as FixedProfile<B, S, KimiLinearReplicated>>::new(args, context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
             visitor
-                .visit(
-                    PreparedReplicatedTextArchitecture {
-                        architecture,
-                        source_architecture,
-                        requirements,
-                        selected,
-                        capability_estimate,
-                        effective_model_type,
-                        static_recipes,
-                        unit_recipes,
-                    },
-                    store,
-                )
+                .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Llama(_) | EligibleConfig::Qwen(_) => {
@@ -1428,14 +1342,10 @@ where
     P: CompressedProfile<B, S>,
 {
     let requirements = selected.requirements().clone();
-    validate_selected_handoff(&requirements, &selected)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     validate_store_handoff(&requirements, store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let (static_recipes, unit_recipes) = selected_recipe_partitions(&requirements)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     let EligibleConfig::KimiLinear(args) = eligible else {
         return Err(ReplicatedTextIneligibility::Unrelated.into());
@@ -1450,22 +1360,23 @@ where
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let args = selected_kimi_linear_args(args, &selected)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let prompt_cache_architecture_identity =
+        crate::kimi_linear::prompt_cache_architecture_fingerprint(&args);
     let architecture = <P as CompressedProfile<B, S>>::new(args, context)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let prepared = prepare_architecture_handoff::<B, S, _>(
+        architecture,
+        source_architecture,
+        requirements,
+        selected,
+        capability_estimate,
+        effective_model_type,
+        prompt_cache_architecture_identity,
+        context,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
     visitor
-        .visit(
-            PreparedReplicatedTextArchitecture {
-                architecture,
-                source_architecture,
-                requirements,
-                selected,
-                capability_estimate,
-                effective_model_type,
-                static_recipes,
-                unit_recipes,
-            },
-            store,
-        )
+        .visit(prepared, store)
         .map_err(ReplicatedTextDispatchError::Backend)
 }
 
@@ -1506,6 +1417,182 @@ where
     visit_compressed_profile::<B, S, V, crate::replicated_model::CompressedState>(
         plan, selected, store, context, visitor,
     )
+}
+
+/// Supplies typed construction visitors while architecture dispatch selects the exact state profile.
+///
+/// Backends supporting only ordinary key/value text can continue implementing
+/// [`ReplicatedTextArchitectureVisitor`] and calling
+/// [`visit_replicated_text_architecture`]. A backend supporting every admitted
+/// replicated profile implements this additive dispatcher instead of matching
+/// semantic state kinds itself.
+pub trait ReplicatedTextProfileDispatcher<B>: Sized
+where
+    B: eredu_nn::BlockwiseAttentionBackend,
+{
+    /// Completed construction output.
+    type Output;
+    /// Mechanism binding failure.
+    type Error;
+    /// State representation used when no token state is retained.
+    type StatelessState: LayerRuntimeState<B>;
+    /// State representation used by ordinary key/value attention.
+    type AttentionState: LayerRuntimeState<B>;
+    /// State representation used by recurrent or convolutional components.
+    type ComponentState: LayerRuntimeState<B>;
+    /// State representation used by key/value attention with fixed components.
+    type AttentionComponentState: LayerRuntimeState<B>;
+    /// State representation used by compressed attention.
+    type CompressedState: LayerRuntimeState<B>;
+    /// State representation used by compressed attention with fixed components.
+    type CompressedComponentState: LayerRuntimeState<B>;
+
+    /// Visitor for a stateless architecture.
+    type StatelessVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::StatelessState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Visitor for an ordinary key/value architecture.
+    type AttentionVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::AttentionState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Visitor for a fixed-component architecture.
+    type ComponentVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::ComponentState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Visitor for key/value attention with fixed components.
+    type AttentionComponentVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::AttentionComponentState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Visitor for compressed attention.
+    type CompressedVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::CompressedState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Visitor for compressed attention with fixed components.
+    type CompressedComponentVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::CompressedComponentState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+
+    /// Consumes the adapter into its stateless visitor.
+    fn into_stateless_visitor(self) -> Self::StatelessVisitor;
+    /// Consumes the adapter into its ordinary attention visitor.
+    fn into_attention_visitor(self) -> Self::AttentionVisitor;
+    /// Consumes the adapter into its fixed-component visitor.
+    fn into_component_visitor(self) -> Self::ComponentVisitor;
+    /// Consumes the adapter into its attention-with-components visitor.
+    fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor;
+    /// Consumes the adapter into its compressed-attention visitor.
+    fn into_compressed_visitor(self) -> Self::CompressedVisitor;
+    /// Consumes the adapter into its compressed-attention-with-components visitor.
+    fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor;
+}
+
+/// Dispatches one selected replicated-text architecture through its exact typed state profile.
+pub fn dispatch_replicated_text_architecture<B, D>(
+    plan: &ArtifactArchitecturePlan,
+    selected: SelectedReplicatedTextRealization,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    dispatcher: D,
+) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend,
+    D: ReplicatedTextProfileDispatcher<B>,
+    <D::AttentionState as LayerRuntimeState<B>>::LayerState: AttentionCache<B::Tensor>,
+    <D::ComponentState as LayerRuntimeState<B>>::LayerState:
+        eredu_runtime::RuntimeStateComponents<B>,
+    <D::AttentionComponentState as LayerRuntimeState<B>>::LayerState:
+        AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    <D::CompressedState as LayerRuntimeState<B>>::LayerState:
+        eredu_nn::CompressedAttentionCache<B::Tensor>,
+    <D::CompressedComponentState as LayerRuntimeState<B>>::LayerState:
+        eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+{
+    let eligible = eligible_config(plan)?;
+    let ordinary = matches!(eligible, EligibleConfig::Llama(_) | EligibleConfig::Qwen(_));
+    match (ordinary, selected.state().access()) {
+        (true, ReplicatedTextStateAccess::KeyValue) => visit_replicated_text_architecture(
+            plan,
+            selected,
+            store,
+            context,
+            dispatcher.into_attention_visitor(),
+        ),
+        (false, ReplicatedTextStateAccess::Stateless) => {
+            visit_replicated_stateless_text_architecture(
+                plan,
+                selected,
+                store,
+                context,
+                dispatcher.into_stateless_visitor(),
+            )
+        }
+        (false, ReplicatedTextStateAccess::KeyValue) => {
+            visit_replicated_attention_state_text_architecture(
+                plan,
+                selected,
+                store,
+                context,
+                dispatcher.into_attention_visitor(),
+            )
+        }
+        (false, ReplicatedTextStateAccess::Fixed) => {
+            visit_replicated_component_state_text_architecture(
+                plan,
+                selected,
+                store,
+                context,
+                dispatcher.into_component_visitor(),
+            )
+        }
+        (false, ReplicatedTextStateAccess::AttentionWithFixed) => {
+            visit_replicated_fixed_state_text_architecture(
+                plan,
+                selected,
+                store,
+                context,
+                dispatcher.into_attention_component_visitor(),
+            )
+        }
+        (false, ReplicatedTextStateAccess::CompressedAttention) => {
+            visit_replicated_compressed_only_text_architecture(
+                plan,
+                selected,
+                store,
+                context,
+                dispatcher.into_compressed_visitor(),
+            )
+        }
+        (false, ReplicatedTextStateAccess::CompressedAttentionWithFixed) => {
+            visit_replicated_compressed_state_text_architecture(
+                plan,
+                selected,
+                store,
+                context,
+                dispatcher.into_compressed_component_visitor(),
+            )
+        }
+        (_, profile) => Err(ReplicatedTextDispatchError::Architecture(format!(
+            "selected state profile {profile:?} does not match the dispatched architecture"
+        ))),
+    }
 }
 
 enum EligibleConfig<'a> {
@@ -2630,6 +2717,16 @@ fn safetensors_parameters(
                 continue;
             }
         }
+        let native_executable = match role {
+            ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding => {
+                config.native_format(&canonical)
+            }
+            ReplicatedTextParameterRole::FormatCompanion
+            | ReplicatedTextParameterRole::Normalization
+            | ReplicatedTextParameterRole::LinearBias
+            | ReplicatedTextParameterRole::Other => LinearFormat::Dense,
+            _ => LinearFormat::Dense,
+        };
         parameters.push(parameter_requirement(
             canonical.clone(),
             source.clone().into_iter().collect(),
@@ -2638,7 +2735,7 @@ fn safetensors_parameters(
             source_encoding,
             physical_shape,
             logical_shape,
-            config.native_format(&canonical),
+            native_executable,
             linear_shapes.contains_key(&canonical),
             role,
             parameter_owner(config, &canonical),
@@ -2762,7 +2859,7 @@ fn gguf_parameters(
                     parameters.push(parameter_requirement(
                         target.clone(),
                         selects_lowering
-                            .then(|| mapping.physical_name.clone())
+                            .then(|| mapping.layout.name.clone())
                             .into_iter()
                             .collect(),
                         vec![provenance.clone()],
@@ -2813,7 +2910,7 @@ fn gguf_parameters(
         parameters.push(parameter_requirement(
             mapping.layout.name.clone(),
             (!derived)
-                .then(|| mapping.physical_name.clone())
+                .then(|| mapping.layout.name.clone())
                 .into_iter()
                 .collect(),
             vec![ReplicatedTextPhysicalSource::new(
@@ -2939,7 +3036,7 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
     let embedding_prefix = embedding.strip_suffix("weight").unwrap_or(&embedding);
     let role = if name == embedding || name.starts_with(embedding_prefix) {
         "embedding"
-    } else if name == "lm_head.weight" || name == "lm_head.bias" {
+    } else if name == "lm_head.weight" || name == "lm_head.bias" || name.starts_with("lm_head.") {
         "output"
     } else {
         "norm"
@@ -3008,6 +3105,166 @@ pub enum ReplicatedTextRequirementsError {
     /// Architecture geometry or a requested transform is invalid.
     #[error("invalid replicated text architecture: {0}")]
     InvalidArchitecture(String),
+}
+
+/// Architecture-owned selection of replicated text or another execution class.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReplicatedTextExecutionClass {
+    /// The admitted artifact uses the complete replicated-text lifecycle.
+    Replicated(ReplicatedTextRequirements),
+    /// The admitted artifact uses a distinct architecture execution class.
+    Other(NonReplicatedTextArchitecture),
+}
+
+/// Supplies backend policy selection without exposing the semantic branch to
+/// the backend adapter.
+pub trait ReplicatedTextExecutionClassDispatcher: Sized {
+    /// Backend-private policy retained for replicated-text construction.
+    type Replicated;
+    /// Backend-private policy retained for an excluded construction path.
+    type Other;
+    /// Backend policy-selection failure.
+    type Error;
+
+    /// Selects mechanisms for exact replicated-text requirements.
+    fn replicated(
+        self,
+        requirements: ReplicatedTextRequirements,
+    ) -> Result<Self::Replicated, Self::Error>;
+
+    /// Selects mechanisms for an architecture-owned exclusion. The semantic
+    /// reason remains private to architecture dispatch.
+    fn other(self) -> Result<Self::Other, Self::Error>;
+}
+
+enum SelectedReplicatedTextExecutionKind<R, O> {
+    Replicated(R),
+    Other(O),
+}
+
+/// Opaque architecture-owned semantic selection carrying backend-private
+/// construction policy.
+pub struct SelectedReplicatedTextExecution<R, O> {
+    kind: SelectedReplicatedTextExecutionKind<R, O>,
+}
+
+impl<R, O> std::fmt::Debug for SelectedReplicatedTextExecution<R, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectedReplicatedTextExecution")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Clone, O: Clone> Clone for SelectedReplicatedTextExecution<R, O> {
+    fn clone(&self) -> Self {
+        Self {
+            kind: match &self.kind {
+                SelectedReplicatedTextExecutionKind::Replicated(value) => {
+                    SelectedReplicatedTextExecutionKind::Replicated(value.clone())
+                }
+                SelectedReplicatedTextExecutionKind::Other(value) => {
+                    SelectedReplicatedTextExecutionKind::Other(value.clone())
+                }
+            },
+        }
+    }
+}
+
+/// Backend adapter invoked by an opaque selected execution value.
+pub trait SelectedReplicatedTextExecutionDispatcher<R, O>: Sized {
+    /// Completed adapter output.
+    type Output;
+    /// Adapter failure.
+    type Error;
+
+    /// Enters the generic replicated-text adapter.
+    fn replicated(self, selected: R) -> Result<Self::Output, Self::Error>;
+
+    /// Enters the existing excluded execution adapter.
+    fn other(self, selected: O) -> Result<Self::Output, Self::Error>;
+}
+
+impl<R, O> SelectedReplicatedTextExecution<R, O> {
+    /// Invokes exactly one backend adapter while keeping the semantic branch
+    /// inside architecture-owned code.
+    pub fn dispatch<D>(self, dispatcher: D) -> Result<D::Output, D::Error>
+    where
+        D: SelectedReplicatedTextExecutionDispatcher<R, O>,
+    {
+        match self.kind {
+            SelectedReplicatedTextExecutionKind::Replicated(selected) => {
+                dispatcher.replicated(selected)
+            }
+            SelectedReplicatedTextExecutionKind::Other(selected) => dispatcher.other(selected),
+        }
+    }
+}
+
+/// Selects the semantic execution class and lets a backend choose only the
+/// mechanisms appropriate to the architecture-owned result.
+pub fn dispatch_replicated_text_execution_class<D>(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    topology: Option<eredu_core::topology::ParallelTopology>,
+    dispatcher: D,
+) -> Result<
+    SelectedReplicatedTextExecution<D::Replicated, D::Other>,
+    ReplicatedTextDispatchError<D::Error>,
+>
+where
+    D: ReplicatedTextExecutionClassDispatcher,
+{
+    if topology.is_some_and(|topology| !topology.is_replicated()) {
+        return dispatcher
+            .other()
+            .map(|selected| SelectedReplicatedTextExecution {
+                kind: SelectedReplicatedTextExecutionKind::Other(selected),
+            })
+            .map_err(ReplicatedTextDispatchError::Backend);
+    }
+    match replicated_text_execution_class(inspection)
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
+    {
+        ReplicatedTextExecutionClass::Replicated(requirements) => dispatcher
+            .replicated(requirements)
+            .map(|selected| SelectedReplicatedTextExecution {
+                kind: SelectedReplicatedTextExecutionKind::Replicated(selected),
+            })
+            .map_err(ReplicatedTextDispatchError::Backend),
+        ReplicatedTextExecutionClass::Other(_) => dispatcher
+            .other()
+            .map(|selected| SelectedReplicatedTextExecution {
+                kind: SelectedReplicatedTextExecutionKind::Other(selected),
+            })
+            .map_err(ReplicatedTextDispatchError::Backend),
+    }
+}
+
+/// Proof that an admitted artifact must not enter replicated-text construction.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NonReplicatedTextArchitecture {
+    reason: ReplicatedTextIneligibility,
+}
+
+impl NonReplicatedTextArchitecture {
+    /// Returns why the architecture registry selected another execution class.
+    pub const fn reason(&self) -> &ReplicatedTextIneligibility {
+        &self.reason
+    }
+}
+
+/// Selects the semantic execution class and derives replicated requirements when applicable.
+pub fn replicated_text_execution_class(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+) -> Result<ReplicatedTextExecutionClass, ReplicatedTextRequirementsError> {
+    match replicated_text_requirements(inspection) {
+        Ok(requirements) => Ok(ReplicatedTextExecutionClass::Replicated(requirements)),
+        Err(ReplicatedTextRequirementsError::Ineligible(reason)) => Ok(
+            ReplicatedTextExecutionClass::Other(NonReplicatedTextArchitecture { reason }),
+        ),
+        Err(error) => Err(error),
+    }
 }
 
 impl From<eredu_checkpoint::Error> for ReplicatedTextRequirementsError {
@@ -3459,5 +3716,96 @@ mod tests {
             requirements,
             replicated_text_requirements(&inspection).unwrap()
         );
+    }
+
+    struct CountingClassDispatcher {
+        replicated: std::rc::Rc<std::cell::Cell<usize>>,
+        other: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl ReplicatedTextExecutionClassDispatcher for CountingClassDispatcher {
+        type Replicated = &'static str;
+        type Other = &'static str;
+        type Error = String;
+
+        fn replicated(
+            self,
+            _requirements: ReplicatedTextRequirements,
+        ) -> Result<Self::Replicated, Self::Error> {
+            self.replicated.set(self.replicated.get() + 1);
+            Ok("replicated")
+        }
+
+        fn other(self) -> Result<Self::Other, Self::Error> {
+            self.other.set(self.other.get() + 1);
+            Ok("other")
+        }
+    }
+
+    struct CountingSelectedDispatcher {
+        replicated: std::rc::Rc<std::cell::Cell<usize>>,
+        other: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl SelectedReplicatedTextExecutionDispatcher<&'static str, &'static str>
+        for CountingSelectedDispatcher
+    {
+        type Output = &'static str;
+        type Error = String;
+
+        fn replicated(self, selected: &'static str) -> Result<Self::Output, Self::Error> {
+            self.replicated.set(self.replicated.get() + 1);
+            Ok(selected)
+        }
+
+        fn other(self, selected: &'static str) -> Result<Self::Output, Self::Error> {
+            self.other.set(self.other.get() + 1);
+            Ok(selected)
+        }
+    }
+
+    #[test]
+    fn architecture_dispatch_never_invokes_replicated_adapter_for_excluded_class() {
+        let mut routed = config("qwen3_moe");
+        routed["num_experts"] = serde_json::json!(2);
+        routed["num_experts_per_tok"] = serde_json::json!(1);
+        routed["moe_intermediate_size"] = serde_json::json!(8);
+        let (_root, excluded) = inspected_config(routed);
+        let (_root, included) = inspected("llama");
+
+        for (inspection, expected) in [(&excluded, "other"), (&included, "replicated")] {
+            let selected_replicated = std::rc::Rc::new(std::cell::Cell::new(0));
+            let selected_other = std::rc::Rc::new(std::cell::Cell::new(0));
+            let constructed_replicated = std::rc::Rc::new(std::cell::Cell::new(0));
+            let constructed_other = std::rc::Rc::new(std::cell::Cell::new(0));
+            let selected = dispatch_replicated_text_execution_class(
+                inspection,
+                None,
+                CountingClassDispatcher {
+                    replicated: selected_replicated.clone(),
+                    other: selected_other.clone(),
+                },
+            )
+            .unwrap();
+            let actual = selected
+                .dispatch(CountingSelectedDispatcher {
+                    replicated: constructed_replicated.clone(),
+                    other: constructed_other.clone(),
+                })
+                .unwrap();
+
+            assert_eq!(actual, expected);
+            if expected == "other" {
+                assert_eq!(selected_replicated.get(), 0);
+                assert_eq!(selected_other.get(), 1);
+                assert_eq!(constructed_replicated.get(), 0);
+                assert_eq!(constructed_other.get(), 1);
+            } else {
+                assert_eq!(selected_replicated.get(), 1);
+                assert_eq!(selected_other.get(), 0);
+                assert_eq!(constructed_replicated.get(), 1);
+                assert_eq!(constructed_other.get(), 0);
+            }
+        }
     }
 }

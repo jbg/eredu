@@ -504,13 +504,6 @@ impl<'a> MlxModelSession<'a> {
                 "realized MLX session capabilities {realized_capabilities:?} do not match pre-materialization admission {admitted_capabilities:?}"
             )));
         }
-        if let MlxSessionKind::Complete(model) = &inner {
-            if let Some(selected) = model.selected_session_binding() {
-                selected
-                    .validate_bound_mechanisms(realized_capabilities, true, true)
-                    .map_err(Error::ArchitectureModel)?;
-            }
-        }
         Ok(Self {
             inner,
             floating_state_dtype_bytes,
@@ -1016,6 +1009,15 @@ impl<'a> MlxModelSession<'a> {
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         let output = input.with_borrowed(|input| {
+            if let Executable::ReplicatedText(_, family) = model {
+                let tokens = input::text_token_ids(input, stream)?;
+                return family.prefill_with_observer(
+                    &tokens,
+                    None,
+                    stream,
+                    &mut ArrayObserverAdapter { inner: observer },
+                );
+            }
             let logits = match model {
                 Executable::DeepSeek(_, family, cache) => {
                     let tokens = input::text_token_ids(input, stream)?;
@@ -1083,15 +1085,9 @@ impl<'a> MlxModelSession<'a> {
                         &mut ArrayObserverAdapter { inner: observer },
                     )?
                 }
-                Executable::ReplicatedText(_, family) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
+                Executable::ReplicatedText(_, _) => unreachable!(
+                    "replicated observed prefill returned through neutral output selection"
+                ),
                 Executable::MuseGlimmer(_, family, cache) => family
                     .forward_input_with_observer(
                         input,
@@ -1175,15 +1171,22 @@ impl<'a> MlxModelSession<'a> {
                         backend.stream(),
                         observer,
                     )?,
-                    None => Self::forward_with_observer(
-                        model,
-                        &input,
-                        None,
-                        backend.stream(),
-                        observer,
-                    )?,
-                }
-                .try_index_device((.., -1, ..), backend.stream())?;
+                    None => match model {
+                        Executable::ReplicatedText(_, family) => family.decode_with_observer(
+                            &input,
+                            backend.stream(),
+                            &mut ArrayObserverAdapter { inner: observer },
+                        )?,
+                        other => Self::forward_with_observer(
+                            other,
+                            &input,
+                            None,
+                            backend.stream(),
+                            observer,
+                        )?
+                        .try_index_device((.., -1, ..), backend.stream())?,
+                    },
+                };
                 MlxCompletion::submission(output)
             }
             MlxSessionKind::Pipeline(_, _) => unreachable!(

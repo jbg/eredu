@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
+use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::{
     cache::StateComponentPolicy, ParallelTopology, QuantizationRequest, SessionCapabilities,
 };
@@ -13,7 +13,7 @@ use eredu_nn::{NeuralBackend, NeuralOperatorCapabilities};
 
 use crate::{
     ArchitectureGroupTransport, CacheResidencyPolicy, ExecutionGraph, ExecutionUnitLayout,
-    LayerWeightResidency, LayeredArchitecture, RuntimeState, StateLayout,
+    LayerWeightResidency, LayeredArchitecture, ParameterGroupOwner, RuntimeState, StateLayout,
 };
 
 /// Statically dispatched text-input seam for a layered decoder.
@@ -27,6 +27,28 @@ where
 {
     /// Forms the architecture-owned borrowed input for one text pass.
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a>;
+
+    /// Declares how a causal-text session projects a complete architecture output.
+    fn text_output_selection(&self) -> ReplicatedTextOutputSelection {
+        ReplicatedTextOutputSelection::LastSequencePosition
+    }
+}
+
+/// Architecture-declared projection from complete logits to one causal-text output.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReplicatedTextOutputSelection {
+    /// Selects the final position on the architecture's sequence axis.
+    LastSequencePosition,
+}
+
+impl ReplicatedTextOutputSelection {
+    /// Returns the mechanical sequence-axis index requested from a backend tensor.
+    pub const fn sequence_index(self) -> i32 {
+        match self {
+            Self::LastSequencePosition => -1,
+        }
+    }
 }
 
 /// Backend implementation route for one source-to-executable weight lowering.
@@ -559,15 +581,6 @@ impl ReplicatedTextParameterRequirement {
                 "logical parameter {name:?} has inconsistent physical provenance"
             )));
         }
-        if has_source
-            && physical_sources
-                .iter()
-                .any(|source| !sources.iter().any(|name| name == source.tensor()))
-        {
-            return Err(ReplicatedTextContractError::invalid(format!(
-                "logical parameter {name:?} has provenance outside its selected sources"
-            )));
-        }
         if physical_sources.is_empty() && has_physical_facts {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "logical parameter {name:?} has physical facts without provenance"
@@ -753,10 +766,15 @@ impl ReplicatedTextParameterRequirement {
                             - 1
                     })
             });
+        let alias_backed_packed_safetensors = matches!(
+            self.source_encoding,
+            Some(SourceTensorEncoding::Safetensors(StoredDtype::U32))
+        );
         let lowering_shape = if matches!(
             self.presence,
             ReplicatedTextParameterPresence::Derived { .. }
-        ) {
+        ) && !alias_backed_packed_safetensors
+        {
             self.physical_shape.as_ref().unwrap_or(&self.logical_shape)
         } else {
             &self.logical_shape
@@ -871,6 +889,21 @@ impl ReplicatedTextRequirements {
                 execution_graph.groups().len()
             )));
         }
+        if execution_units.group_count() != execution_graph.groups().len()
+            || execution_graph
+                .groups()
+                .iter()
+                .enumerate()
+                .any(|(index, group)| {
+                    execution_units
+                        .group_id(index)
+                        .is_none_or(|id| id.as_str() != group.id())
+                })
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "execution-unit layout group identities differ from the execution graph",
+            ));
+        }
         validate_state_access_profile(&state_layout, state_access)?;
         let mut names = BTreeSet::new();
         if parameters
@@ -908,6 +941,9 @@ impl ReplicatedTextRequirements {
             ));
         }
         for target in recipes.keys() {
+            let recipe = recipes
+                .get(target)
+                .expect("recipe target came from the same map");
             let parameter = self
                 .parameters
                 .iter_mut()
@@ -929,6 +965,13 @@ impl ReplicatedTextRequirements {
             parameter.presence = ReplicatedTextParameterPresence::Derived {
                 recipe: "architecture.recipe".into(),
             };
+            if parameter.role != ReplicatedTextParameterRole::FormatCompanion {
+                parameter.sources = recipe
+                    .source_keys()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+            }
         }
         self.derived_recipes = recipes;
         self.derived_recipe_outputs = outputs;
@@ -1269,6 +1312,401 @@ pub struct SelectedParameterRealization {
     executable: LinearFormat,
     /// Backend lowering selected for materialization.
     lowering: WeightLoweringKind,
+}
+
+/// Exact backend work item for one selected logical parameter.
+///
+/// This value joins architecture-owned topology and artifact facts with the
+/// authoritative selected lowering. A materializer may batch these tasks, but
+/// it must not replace them with one model-wide transform choice.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplicatedTextMaterializationTask {
+    name: String,
+    sources: Vec<String>,
+    physical_sources: Vec<ReplicatedTextPhysicalSource>,
+    aliases: Vec<String>,
+    source_encoding: SourceTensorEncoding,
+    physical_shape: Vec<usize>,
+    logical_shape: Vec<usize>,
+    role: ReplicatedTextParameterRole,
+    owner: ReplicatedTextParameterOwner,
+    presence: ReplicatedTextParameterPresence,
+    executable: LinearFormat,
+    lowering: WeightLoweringKind,
+    lowering_descriptor: WeightLoweringDescriptor,
+    derived_recipe: Option<eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    derived_output: Option<eredu_checkpoint::recipe::RecipeMetadata>,
+    output_companions: Vec<ReplicatedTextOutputCompanion>,
+}
+
+/// Architecture-declared output companion for one materialized linear weight.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplicatedTextOutputCompanion {
+    name: String,
+    role: eredu_nn::LinearCompanionRole,
+    logical_shape: Vec<usize>,
+    owner: ParameterGroupOwner,
+    materialization_task: Option<Box<ReplicatedTextMaterializationTask>>,
+    catalog_source: Option<ReplicatedTextPhysicalSource>,
+    derived_recipe: Option<eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    derived_output: Option<eredu_checkpoint::recipe::RecipeMetadata>,
+}
+
+impl ReplicatedTextOutputCompanion {
+    /// Creates one exact output companion identity and semantic role.
+    pub fn new(
+        name: impl Into<String>,
+        role: eredu_nn::LinearCompanionRole,
+        logical_shape: Vec<usize>,
+        owner: ParameterGroupOwner,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let name = name.into();
+        if name.trim().is_empty() || logical_shape.is_empty() || logical_shape.contains(&0) {
+            return Err(ReplicatedTextContractError::invalid(
+                "materialization output companion identity or geometry is invalid",
+            ));
+        }
+        Ok(Self {
+            name,
+            role,
+            logical_shape,
+            owner,
+            materialization_task: None,
+            catalog_source: None,
+            derived_recipe: None,
+            derived_output: None,
+        })
+    }
+
+    pub(crate) fn with_derived_recipe(
+        mut self,
+        recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
+        output: eredu_checkpoint::recipe::RecipeMetadata,
+    ) -> Self {
+        self.derived_recipe = Some(recipe);
+        self.derived_output = Some(output);
+        self
+    }
+
+    /// Returns the exact architecture-declared parameter identity.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the companion's role in the encoded linear parameter.
+    pub const fn role(&self) -> eredu_nn::LinearCompanionRole {
+        self.role
+    }
+
+    /// Returns the exact architecture-declared companion geometry.
+    pub fn logical_shape(&self) -> &[usize] {
+        &self.logical_shape
+    }
+
+    /// Returns the exact architecture-declared companion owner.
+    pub const fn owner(&self) -> &ParameterGroupOwner {
+        &self.owner
+    }
+
+    pub(crate) fn with_materialization_task(
+        mut self,
+        task: ReplicatedTextMaterializationTask,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if task.name() != self.name || !task.output_companions().is_empty() {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "companion {:?} has an inconsistent standalone materialization task",
+                self.name
+            )));
+        }
+        self.materialization_task = Some(Box::new(task));
+        Ok(self)
+    }
+
+    pub(crate) fn with_catalog_source(mut self, source: ReplicatedTextPhysicalSource) -> Self {
+        self.catalog_source = Some(source);
+        self
+    }
+
+    /// Returns the standalone selected materialization task, when one exists.
+    ///
+    /// Generated transform outputs and translated checkpoint catalog outputs
+    /// instead retain their causal source on the primary task or companion.
+    pub fn materialization_task(&self) -> Option<&ReplicatedTextMaterializationTask> {
+        self.materialization_task.as_deref()
+    }
+
+    /// Returns exact translated-catalog provenance for this companion.
+    pub const fn catalog_source(&self) -> Option<&ReplicatedTextPhysicalSource> {
+        self.catalog_source.as_ref()
+    }
+
+    /// Returns the architecture-owned companion derivation, when required.
+    pub const fn derived_recipe(&self) -> Option<&eredu_checkpoint::recipe::DerivedWeightRecipe> {
+        self.derived_recipe.as_ref()
+    }
+
+    /// Returns admission-time metadata for the derived companion output.
+    pub const fn derived_output(&self) -> Option<&eredu_checkpoint::recipe::RecipeMetadata> {
+        self.derived_output.as_ref()
+    }
+}
+
+impl ReplicatedTextMaterializationTask {
+    pub(crate) fn set_output_companions(
+        &mut self,
+        mut companions: Vec<ReplicatedTextOutputCompanion>,
+    ) -> Result<(), ReplicatedTextContractError> {
+        companions.sort_by(|left, right| {
+            left.role
+                .cmp(&right.role)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        if companions
+            .windows(2)
+            .any(|pair| pair[0].name == pair[1].name || pair[0].role == pair[1].role)
+        {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "materialization task {:?} has duplicate output companions",
+                self.name
+            )));
+        }
+        let roles = companions
+            .iter()
+            .map(|companion| companion.role)
+            .collect::<Vec<_>>();
+        let expected = match self.executable {
+            LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => Vec::new(),
+            LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => {
+                vec![eredu_nn::LinearCompanionRole::Scale]
+            }
+            LinearFormat::Affine(_) => vec![
+                eredu_nn::LinearCompanionRole::Scale,
+                eredu_nn::LinearCompanionRole::AffineBias,
+            ],
+        };
+        let mut expected = expected;
+        expected.sort();
+        if roles != expected {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "materialization task {:?} executable {:?} requires companion roles {:?}, got {:?}",
+                self.name, self.executable, expected, roles
+            )));
+        }
+        self.output_companions = companions;
+        Ok(())
+    }
+
+    /// Returns the canonical logical parameter identity.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns every admitted physical source identity.
+    pub fn sources(&self) -> &[String] {
+        &self.sources
+    }
+
+    /// Returns exact shard and translated-output provenance.
+    pub fn physical_sources(&self) -> &[ReplicatedTextPhysicalSource] {
+        &self.physical_sources
+    }
+
+    /// Returns every architecture-admitted alias.
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    /// Returns the exact admitted source encoding.
+    pub const fn source_encoding(&self) -> &SourceTensorEncoding {
+        &self.source_encoding
+    }
+
+    /// Returns the admitted physical source geometry.
+    pub fn physical_shape(&self) -> &[usize] {
+        &self.physical_shape
+    }
+
+    /// Returns the architecture-declared logical geometry.
+    pub fn logical_shape(&self) -> &[usize] {
+        &self.logical_shape
+    }
+
+    /// Returns the architecture-owned semantic parameter role.
+    pub const fn role(&self) -> ReplicatedTextParameterRole {
+        self.role
+    }
+
+    /// Returns the architecture-owned module location.
+    pub const fn owner(&self) -> &ReplicatedTextParameterOwner {
+        &self.owner
+    }
+
+    /// Returns the exact admitted presence or derivation.
+    pub const fn presence(&self) -> &ReplicatedTextParameterPresence {
+        &self.presence
+    }
+
+    /// Returns the selected executable format.
+    pub const fn executable(&self) -> LinearFormat {
+        self.executable
+    }
+
+    /// Returns the selected backend lowering mechanism.
+    pub const fn lowering(&self) -> WeightLoweringKind {
+        self.lowering
+    }
+
+    /// Returns the complete geometry-bearing lowering request.
+    pub const fn lowering_descriptor(&self) -> &WeightLoweringDescriptor {
+        &self.lowering_descriptor
+    }
+
+    /// Returns the architecture-owned derivation, when this output is derived.
+    pub const fn derived_recipe(&self) -> Option<&eredu_checkpoint::recipe::DerivedWeightRecipe> {
+        self.derived_recipe.as_ref()
+    }
+
+    /// Returns admission-time metadata for the derived output.
+    pub const fn derived_output(&self) -> Option<&eredu_checkpoint::recipe::RecipeMetadata> {
+        self.derived_output.as_ref()
+    }
+
+    /// Returns exact output companion identities declared by the architecture.
+    pub fn output_companions(&self) -> &[ReplicatedTextOutputCompanion] {
+        &self.output_companions
+    }
+
+    /// Returns the exact source recipe selected for this task.
+    ///
+    /// Direct tasks are represented as a full selection of their single
+    /// admitted source. Derived tasks return the architecture-owned recipe
+    /// without reconstructing it from a checkpoint catalog.
+    pub fn source_recipe(
+        &self,
+    ) -> Result<eredu_checkpoint::recipe::DerivedWeightRecipe, ReplicatedTextContractError> {
+        let expects_recipe = matches!(
+            self.lowering,
+            WeightLoweringKind::Derived | WeightLoweringKind::DerivedTransform
+        );
+        match (expects_recipe, self.derived_recipe.as_ref()) {
+            (true, Some(recipe)) => {
+                let declared = self
+                    .sources
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                let consumed = recipe.source_keys().into_iter().collect::<BTreeSet<_>>();
+                if declared != consumed {
+                    return Err(ReplicatedTextContractError::invalid(format!(
+                        "materialization task {:?} recipe sources differ from its exact source catalog",
+                        self.name
+                    )));
+                }
+                Ok(recipe.clone())
+            }
+            (false, None) => {
+                let [source] = self.sources.as_slice() else {
+                    return Err(ReplicatedTextContractError::invalid(format!(
+                        "direct materialization task {:?} must name exactly one source",
+                        self.name
+                    )));
+                };
+                Ok(eredu_checkpoint::recipe::DerivedWeightRecipe::source(
+                    source.clone(),
+                    eredu_checkpoint::store::TensorSelection::Full,
+                ))
+            }
+            (true, None) => Err(ReplicatedTextContractError::invalid(format!(
+                "derived materialization task {:?} has no exact recipe",
+                self.name
+            ))),
+            (false, Some(_)) => Err(ReplicatedTextContractError::invalid(format!(
+                "direct materialization task {:?} unexpectedly carries a recipe",
+                self.name
+            ))),
+        }
+    }
+}
+
+/// Projects an authoritative selection into exact materialization work.
+///
+/// Every selected parameter must agree with its immutable requirement. The
+/// returned sequence preserves selected-parameter order and contains no
+/// model-wide quantization or transform value.
+pub fn replicated_text_materialization_tasks(
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<Vec<ReplicatedTextMaterializationTask>, ReplicatedTextContractError> {
+    let requirements = selected.requirements();
+    selected
+        .parameters()
+        .iter()
+        .map(|realization| {
+            let requirement = requirements
+                .parameters()
+                .iter()
+                .find(|requirement| requirement.name() == realization.name())
+                .ok_or_else(|| {
+                    ReplicatedTextContractError::invalid(format!(
+                        "selected parameter {:?} has no architecture requirement",
+                        realization.name()
+                    ))
+                })?;
+            if requirement.sources() != realization.sources()
+                || requirement.physical_sources() != realization.physical_sources()
+                || requirement.source_encoding() != Some(realization.source_encoding())
+            {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "selected parameter {:?} changed admitted source provenance",
+                    realization.name()
+                )));
+            }
+            let physical_shape = requirement.physical_shape().ok_or_else(|| {
+                ReplicatedTextContractError::invalid(format!(
+                    "selected parameter {:?} has no physical geometry",
+                    realization.name()
+                ))
+            })?;
+            let lowering_descriptor = requirement.lowering_descriptor(realization.executable())?;
+            if lowering_descriptor.source() != realization.source_encoding() {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "selected parameter {:?} changed its lowering source encoding",
+                    realization.name()
+                )));
+            }
+            let derived_recipe = requirements
+                .derived_recipes()
+                .get(realization.name())
+                .cloned();
+            let derived_output = requirements
+                .derived_recipe_outputs()
+                .get(realization.name())
+                .cloned();
+            if derived_recipe.is_some() != derived_output.is_some() {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "selected parameter {:?} has incomplete derived metadata",
+                    realization.name()
+                )));
+            }
+            Ok(ReplicatedTextMaterializationTask {
+                name: realization.name().to_owned(),
+                sources: realization.sources().to_vec(),
+                physical_sources: realization.physical_sources().to_vec(),
+                aliases: requirement.aliases().to_vec(),
+                source_encoding: realization.source_encoding().clone(),
+                physical_shape: physical_shape.to_vec(),
+                logical_shape: requirement.logical_shape().to_vec(),
+                role: requirement.role(),
+                owner: requirement.owner().clone(),
+                presence: requirement.presence().clone(),
+                executable: realization.executable(),
+                lowering: realization.lowering(),
+                lowering_descriptor,
+                derived_recipe,
+                derived_output,
+                output_companions: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 impl SelectedParameterRealization {
@@ -1822,6 +2260,26 @@ mod tests {
     }
 
     #[test]
+    fn requirements_reject_unit_layout_from_an_equally_sized_different_graph() {
+        let baseline = requirements();
+        let other_graph =
+            ExecutionGraph::new(vec![ExecutionGroupSpec::root("mutated")], "mutated").unwrap();
+        let other_layout = ExecutionUnitLayout::new(&other_graph, [1]).unwrap();
+        let error = ReplicatedTextRequirements::new(
+            baseline.architecture_identity.clone(),
+            baseline.operators,
+            baseline.execution_graph.clone(),
+            other_layout,
+            baseline.group_transports.clone(),
+            baseline.state_layout.clone(),
+            baseline.state_access,
+            baseline.parameters.clone(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("layout group identities differ"));
+    }
+
+    #[test]
     fn parameter_requirement_preserves_every_admitted_alias() {
         let requirement = ReplicatedTextParameterRequirement::new(
             "model.layers.0.mlp.weight",
@@ -2089,6 +2547,87 @@ mod tests {
             format!("{:?}", left.parameters()[0].source_encoding()),
             format!("{:?}", left.parameters()[0].executable())
         );
+    }
+
+    #[test]
+    fn exact_tasks_are_the_authority_for_direct_derived_and_transform_sources() {
+        use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, RecipeMetadata};
+
+        let direct = select_replicated_text_realization(
+            &requirements(),
+            &request(LayerWeightResidency::FullyResident),
+            &capabilities(),
+        )
+        .unwrap();
+        let direct_tasks = replicated_text_materialization_tasks(&direct).unwrap();
+        assert_eq!(
+            direct_tasks[0].source_recipe().unwrap(),
+            DerivedWeightRecipe::source(
+                "blk.0.ffn.weight",
+                eredu_checkpoint::store::TensorSelection::Full,
+            )
+        );
+
+        let recipe = DerivedWeightRecipe::source(
+            "blk.0.ffn.weight",
+            eredu_checkpoint::store::TensorSelection::Full,
+        );
+        let outputs = BTreeMap::from([(
+            "model.layers.0.mlp.weight".into(),
+            RecipeMetadata {
+                shape: vec![64, 64],
+                dtype: RecipeDtype::F16,
+                byte_len: 64 * 64 * 2,
+            },
+        )]);
+        let derived_requirements = requirements()
+            .with_derived_recipes(
+                BTreeMap::from([("model.layers.0.mlp.weight".into(), recipe.clone())]),
+                outputs,
+            )
+            .unwrap();
+        let derived = select_replicated_text_realization(
+            &derived_requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &capabilities(),
+        )
+        .unwrap();
+        let derived_tasks = replicated_text_materialization_tasks(&derived).unwrap();
+        assert_eq!(derived_tasks[0].lowering(), WeightLoweringKind::Derived);
+        assert_eq!(derived_tasks[0].source_recipe().unwrap(), recipe);
+
+        let transformed = select_replicated_text_realization(
+            &derived_requirements,
+            &request(LayerWeightResidency::FullyResident).with_quantization(
+                QuantizationRequest::Affine {
+                    group_size: 64,
+                    bits: 4,
+                },
+            ),
+            &capabilities(),
+        )
+        .unwrap();
+        let transformed_tasks = replicated_text_materialization_tasks(&transformed).unwrap();
+        assert_eq!(
+            transformed_tasks[0].lowering(),
+            WeightLoweringKind::DerivedTransform
+        );
+        assert_eq!(transformed_tasks[0].source_recipe().unwrap(), recipe);
+
+        // These corruptions fail while projecting the cold exact plan; no
+        // backend mechanism or checkpoint payload is available to perform work.
+        let mut corrupt_direct = direct_tasks[0].clone();
+        corrupt_direct.sources.push("unselected.weight".into());
+        assert!(corrupt_direct.source_recipe().is_err());
+        let mut corrupt_kind = derived_tasks[0].clone();
+        corrupt_kind.lowering = WeightLoweringKind::Direct;
+        assert!(corrupt_kind.source_recipe().is_err());
+        let mut corrupt_recipe = derived_tasks[0].clone();
+        corrupt_recipe.derived_recipe = Some(DerivedWeightRecipe::source(
+            "unselected.weight",
+            eredu_checkpoint::store::TensorSelection::Full,
+        ));
+        assert!(corrupt_recipe.source_recipe().is_err());
     }
 
     #[test]
